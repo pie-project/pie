@@ -90,9 +90,9 @@ void gemm_bf16_out_fp32_impl(
 
 void gemm_grouped_bf16_impl(
     cublasHandle_t handle,
-    const void* const* act_ptrs_host,
-    const void* const* W_ptrs_host,
-    void* const*       y_ptrs_host,
+    const void* const* act_ptrs_dev,   // DEVICE array of device pointers
+    const void* const* W_ptrs_dev,     // DEVICE array of device pointers
+    void* const*       y_ptrs_dev,     // DEVICE array of device pointers
     const int*         M_array_host,
     int group_count,
     int N,
@@ -123,10 +123,10 @@ void gemm_grouped_bf16_impl(
             transa.data(), transb.data(),
             m.data(), n.data(), k.data(),
             alpha.data(),
-            W_ptrs_host,   CUDA_R_16BF, lda.data(),
-            act_ptrs_host, CUDA_R_16BF, ldb.data(),
+            W_ptrs_dev,   CUDA_R_16BF, lda.data(),
+            act_ptrs_dev, CUDA_R_16BF, ldb.data(),
             beta_values.data(),
-            y_ptrs_host,   CUDA_R_16BF, ldc.data(),
+            y_ptrs_dev,   CUDA_R_16BF, ldc.data(),
             group_count,
             group_size.data(),
             compute);
@@ -325,7 +325,23 @@ int main() {
             off += static_cast<size_t>(g.ms[i]) * g.n;
         }
         std::vector<int> ms(g.ms, g.ms + (g.groups ? g.groups : 1));
-        gemm_grouped_bf16_impl(handle, actp.data(), wp.data(), yp.data(),
+        // The POINTER ARRAYS go to the device. cuBLAS dereferences
+        // Aarray/Barray/Carray on the device for the grouped form as for
+        // every other batched form, and this passed the host std::vectors --
+        // which the archive's own parameter names (`act_ptrs_dev`) called
+        // correct. It is `cudaErrorIllegalAddress` at the sync below on
+        // CUDA 13 / sm_120. It evidently went unpunished on whatever card
+        // recorded golden.txt, whose grouped rows hash to real products.
+        // The scalar arrays -- `ms`, and the dimensions the impl builds --
+        // stay on the host, which is where cuBLAS does read those.
+        void* d_actp = g.groups ? dev(actp.data(), actp.size() * sizeof(void*)) : nullptr;
+        void* d_wp   = g.groups ? dev(wp.data(),   wp.size()   * sizeof(void*)) : nullptr;
+        void* d_yp   = g.groups ? dev(yp.data(),   yp.size()   * sizeof(void*)) : nullptr;
+        if (d_actp) { owned.push_back(d_actp); owned.push_back(d_wp); owned.push_back(d_yp); }
+        gemm_grouped_bf16_impl(handle,
+                               static_cast<const void* const*>(d_actp),
+                               static_cast<const void* const*>(d_wp),
+                               static_cast<void* const*>(d_yp),
                                ms.data(), g.groups, g.n, g.k, g.beta);
         ck(cudaDeviceSynchronize(), "sync");
         off = 0;

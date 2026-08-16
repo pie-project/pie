@@ -51,7 +51,12 @@ pub struct Frame<'a> {
     /// [`crate::lowering::frame::sampled_rows`] is the translation, and the
     /// only one; nothing else may fill this.
     pub sampling_indices: &'a [u32],
-    /// Per token: which recurrent-state slot its request occupies.
+    /// Per ROW: which recurrent-state slot its request occupies.
+    ///
+    /// One entry per token, not per request: `gdn_prep_slotted` and
+    /// `gdn_core_recurrent_slotted` both index it by the fire's row, and
+    /// [`stage`] refuses any other length rather than let the shortfall
+    /// become a device read past this region.
     ///
     /// Empty for every stack with no linear-attention layers, which is every
     /// row this backend serves today, and `Staged::at` answers `None` for an
@@ -132,8 +137,27 @@ impl Staged {
 ///
 /// # Errors
 ///
-/// The allocation or the write.
+/// A `recurrent_slots` that is neither empty nor one entry per token, and
+/// then the allocation or the write.
 pub fn stage(context: &Context, scratch: &Scratch, frame: Frame<'_>) -> Result<Staged> {
+    // The seats are read PER TOKEN by both slotted GDN kernels, so a table
+    // that is merely non-empty is not enough: one short by a row is a device
+    // read past the end of this very region, and what it reads then indexes a
+    // device write. Checked here because this is the one place the two
+    // lengths are side by side, and because the alternative is not a wrong
+    // answer but a GPU that never retires -- see
+    // `model::qwen_3_5::forward::metal`.
+    if !frame.recurrent_slots.is_empty() && frame.recurrent_slots.len() != frame.token_ids.len() {
+        return Err(crate::error::Error::Create {
+            what: "fire tables",
+            message: format!(
+                "the fire states {} recurrent seats for {} tokens; the slotted GDN kernels \
+                 read one seat per token, so anything else is a read past this region",
+                frame.recurrent_slots.len(),
+                frame.token_ids.len()
+            ),
+        });
+    }
     let mut blob: Vec<u32> = Vec::new();
     let mut spans: Vec<(usize, usize)> = Vec::new();
     // The ORDER is the contract, and it is this list — `Staged::at` indexes
@@ -274,5 +298,43 @@ mod tests {
         let t = staged.at(FireTable::TokenIds).expect("tokens");
         let p = staged.at(FireTable::Positions).expect("positions");
         assert_eq!(p.address, t.address + t.bytes, "packed, in order");
+    }
+
+    #[test]
+    fn a_seat_table_short_of_the_rows_is_refused_rather_than_read_past() {
+        let Ok(context) = Context::new() else {
+            eprintln!("SKIP: no Metal 4 device");
+            return;
+        };
+        let tokens = [1u32, 2, 3, 4];
+        let one_seat = [0u32];
+        let why = stage(
+            &context,
+            &Scratch::new(),
+            Frame {
+                token_ids: &tokens,
+                recurrent_slots: &one_seat,
+                ..Frame::default()
+            },
+        )
+        .expect_err("one seat for four rows is a read past this region");
+        let said = why.to_string();
+        assert!(
+            said.contains('1') && said.contains('4'),
+            "the refusal has to carry both lengths, or it does not say what is wrong: {said}"
+        );
+
+        // Per token, and then it stages.
+        let seats = [0u32; 4];
+        stage(
+            &context,
+            &Scratch::new(),
+            Frame {
+                token_ids: &tokens,
+                recurrent_slots: &seats,
+                ..Frame::default()
+            },
+        )
+        .expect("one seat per row stages");
     }
 }

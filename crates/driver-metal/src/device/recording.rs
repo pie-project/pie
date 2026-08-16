@@ -2,31 +2,21 @@
 //!
 //! `encode` walks the dispatch list every step: a pipeline set, a bind per
 //! operand, an argument-table set and a dispatch, then a barrier. Measured on
-//! `qwen3_0_6b` — 424 dispatches, 3 779 address binds, about 5 000
-//! Objective-C messages, **14.8 ms**, which is 47.5 % of a prefill and
-//! **76.4 % of a decode**. And it is the same 14.8 ms every step, because the
-//! loop is proportional to the dispatch count and the dispatch count is a
-//! property of the text rather than of the batch.
+//! `qwen3_0_6b` that walk is 14.8 ms — 47.5 % of a prefill, 76.4 % of a decode
+//! — and it is the same 14.8 ms every step, because it is proportional to the
+//! dispatch count and that is a property of the text, not of the batch. This
+//! records the walk into an [`MTLIndirectCommandBuffer`] instead, so a fire
+//! costs one `executeCommandsInBuffer` on the host.
 //!
-//! This records that walk into an [`MTLIndirectCommandBuffer`] instead, so a
-//! fire costs one `executeCommandsInBuffer` on the host.
-//!
-//! # What makes it replayable
-//!
-//! Only three things differ between two fires of one `(plan, row shape)` —
-//! the arena, the params and the fire tables — and `gpu::fire::Scratch` pools all
-//! three, so their addresses are the previous fire's. Everything else (the
-//! dispatch order, the ten pipelines, the twelve grids, the weight addresses)
-//! was already stable. See `.wiki/driver/graph-metal.md` §4.
+//! Only three things differ between two fires of one `(plan, row shape)` — the
+//! arena, the params and the fire tables — and `gpu::fire::Scratch` pools all
+//! three, so their addresses are the previous fire's. See
+//! `.wiki/driver/graph-metal.md` §4.
 //!
 //! # The three preconditions, each of which fails badly
 //!
-//! Learned from `tests/device_icb.rs`, and none of them is documented by
-//! Apple in a place this tree would have found:
-//!
 //! 1. **Pipelines must be compiled `supportIndirectCommandBuffers`.** Setting
-//!    one that was not **faults** — SIGSEGV inside the recording loop, before
-//!    anything executes. `Compiler` states it for every pipeline.
+//!    one that was not **faults**, before anything executes.
 //! 2. **The command type must match the dispatch call.** Declaring
 //!    `ConcurrentDispatch` and calling `concurrentDispatchThreads` is
 //!    **silent**: the command does nothing.
@@ -49,8 +39,7 @@ use crate::error::{Error, Result};
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
 pub struct Bind {
     /// The GPU address, which [`Regions`] turns back into a buffer and an
-    /// offset. A recorded command binds a BUFFER, not an address, which is
-    /// the whole reason the registry exists.
+    /// offset. A recorded command binds a BUFFER, not an address.
     pub address: u64,
     /// Which `[[buffer(n)]]` it lands in.
     pub slot: usize,
@@ -58,48 +47,34 @@ pub struct Bind {
 
 /// One compute command, in the vocabulary a recording is made of.
 ///
-/// # Why this exists
+/// A recording needs a pipeline, some addresses and a grid — none of those
+/// words is a fire's, which keeps `lowering/` and `gpu/bind/` (both ABOVE this
+/// module) out of the cycle. The translation lives in
+/// [`crate::bind::encode::commands`], where `Dispatch`, `Pipelines` and
+/// `Params` are already in scope and the identical walk is done for encoding.
 ///
-/// `record` used to take `&[Dispatch]`, `&Pipelines` and `&Params` — three
-/// types from `lowering/` and `gpu/bind/`, both of which are ABOVE this
-/// module. `.wiki/driver/real-metal-north-star.md` §9 names the consequence:
-/// a cycle, and an ICB path that knows what a fire is.
-///
-/// What a recording actually needs is a pipeline, some addresses and a grid.
-/// That is this, and none of those three words is a fire's. The translation
-/// lives in [`crate::bind::encode::commands`], one layer up, where
-/// `Dispatch`, `Pipelines` and `Params` are already in scope and where the
-/// identical walk is done for encoding.
-///
-/// The borrow is the pipeline's, and it is deliberate: a `Command` cannot
-/// outlive the `Pipelines` that compiled it, so a recording made from stale
-/// pipelines is not constructible rather than merely discouraged.
+/// The pipeline borrow is deliberate: a `Command` cannot outlive the
+/// `Pipelines` that compiled it, so a recording made from stale pipelines is
+/// not constructible rather than merely discouraged.
 #[derive(Debug)]
 pub struct Command<'a> {
-    /// Compiled `supportIndirectCommandBuffers`, which is precondition 1 —
-    /// setting one that was not **faults**, inside the recording loop.
+    /// Compiled `supportIndirectCommandBuffers`, which is precondition 1.
     pub pipeline: &'a ProtocolObject<dyn MTLComputePipelineState>,
-    /// Every operand and scalar address this command binds, already resolved
-    /// to slots. Flat, because a recorded command does not distinguish them:
-    /// both are `setKernelBuffer_offset_atIndex`.
+    /// Every operand and scalar address this command binds, already resolved to
+    /// slots. Flat, because a recorded command does not distinguish them.
     pub binds: Vec<Bind>,
     /// Threads, not threadgroups. See precondition 2.
     pub grid: [u32; 3],
     /// Threads per threadgroup.
     pub threadgroup: [u32; 3],
-    /// For the error message only, so a refusal names the kernel rather than
-    /// an index. Not hashed: two fires that differ only in a symbol string
-    /// differ in a pipeline pointer too.
+    /// For the error message only, so a refusal names the kernel. Not hashed:
+    /// two fires differing in a symbol differ in a pipeline pointer too.
     pub symbol: &'a str,
     /// Whether this command must wait for the ones before it.
     ///
     /// The same statement `bind::encode::encode` makes, made once and read by
     /// both paths, because a recording that orders its commands differently
-    /// from the encode it stands in for is the drift `device_icb.rs` exists to
-    /// catch. `bind::encode::commands` computes it from the same [`Hazards`]
-    /// walk.
-    ///
-    /// [`Hazards`]: crate::bind::encode
+    /// from the encode it stands in for is the drift `device_icb.rs` catches.
     pub barrier: bool,
 }
 
@@ -137,39 +112,28 @@ const FOUR_GIB: u64 = 1 << 32;
 /// Record `dispatches` into an indirect command buffer.
 ///
 /// `regions` must resolve every operand address to the allocation holding it:
-/// a command binds a **buffer**, not an address, so an unregistered operand
-/// is a refusal rather than a bind to nothing.
+/// a command binds a **buffer**, not an address, so an unregistered operand is
+/// a refusal rather than a bind to nothing.
 ///
-/// # Barriers
-///
-/// A command carries one when `bind::encode::commands` said it does, which is
-/// the same rule `encode` applies between dispatches and for the same measured
-/// reason: Metal does not order two dispatches in one encoder, and three runs
-/// of one fire without any barrier gave widest activations of 11.7, 23.1 and
-/// 4.5e12. Two of the three looked plausible. It is not every command, because
-/// the operand directions say which ones can overlap; it was every command
-/// until they did.
+/// A command carries a barrier when `bind::encode::commands` said it does.
+/// Metal does not order two dispatches in one encoder, and three runs of one
+/// fire without any barrier gave widest activations of 11.7, 23.1 and 4.5e12 —
+/// two of the three looked plausible. Not every command, because the operand
+/// directions say which ones can overlap.
 ///
 /// # Errors
 ///
-/// A dispatch whose pipeline is not compiled, whose scalars were not staged,
-/// or whose operand address falls in no registered allocation. Each is drift
-/// between the plan and what the caller set up, and each would otherwise be a
-/// command reading somebody else's bytes.
+/// A dispatch whose pipeline is not compiled, whose scalars were not staged, or
+/// whose operand address falls in no registered allocation.
 pub fn record(context: &Context, regions: &Regions, commands: &[Command<'_>]) -> Result<Recording> {
     // The INDEX SPACE, not the count. `maxKernelBufferBindCount` bounds the
-    // largest `[[buffer(n)]]` a recorded command may address, and a bind past
-    // it is not an error -- Metal drops it and the kernel reads address zero.
-    //
-    // This took the widest `binds.len()`, which is the same number only when
-    // every command binds slots 0..n with no gaps. A plan whose kernels leave
-    // a hole -- an optional operand a deployment does not have, a scalar block
-    // at a fixed high slot -- has a command that binds three buffers at slots
-    // 0, 1 and 5, and `3` bounds it out of its own table.
-    //
-    // Measured: llama-3.2-1B replays bit-identically and gemma-4-31b and
-    // gemma-4-26b came back ALL NaN -- 262144 of 262144 logits, from a
-    // recording that reported success, because a dropped bind is silent.
+    // largest `[[buffer(n)]]` a recorded command may address, and a bind past it
+    // is not an error -- Metal drops it and the kernel reads address zero.
+    // The widest `binds.len()` is the same number only when every command binds
+    // slots 0..n with no gaps; a plan whose kernels leave a hole binds three
+    // buffers at slots 0, 1 and 5, and `3` bounds it out of its own table.
+    // Measured: gemma-4-31b came back ALL NaN from a recording that reported
+    // success, because a dropped bind is silent.
     let widest = commands
         .iter()
         .flat_map(|c| c.binds.iter().map(|b| b.slot + 1))
@@ -177,15 +141,14 @@ pub fn record(context: &Context, regions: &Regions, commands: &[Command<'_>]) ->
         .unwrap_or(1);
     let descriptor = MTLIndirectCommandBufferDescriptor::new();
     // BOTH spellings: the type has to match the call the command makes, and
-    // declaring one while calling the other is a command that silently does
-    // nothing. This crate dispatches threads, not threadgroups.
+    // declaring one while calling the other silently does nothing.
     descriptor.setCommandTypes(MTLIndirectCommandType(
         MTLIndirectCommandType::ConcurrentDispatch.0
             | MTLIndirectCommandType::ConcurrentDispatchThreads.0,
     ));
-    // FALSE, and it is the property that makes a fire recordable at all: 424
-    // dispatches bind DIFFERENT addresses to the same slots, so a command
-    // inheriting the encoder's bindings would take whichever was bound last.
+    // FALSE, and it is what makes a fire recordable at all: 424 dispatches bind
+    // DIFFERENT addresses to the same slots, so a command inheriting the
+    // encoder's bindings would take whichever was bound last.
     descriptor.setInheritBuffers(false);
     descriptor.setInheritPipelineState(false);
     descriptor.setMaxKernelBufferBindCount(widest.max(1));
@@ -205,8 +168,8 @@ pub fn record(context: &Context, regions: &Regions, commands: &[Command<'_>]) ->
         message: format!("the device declined {} commands", commands.len()),
     })?;
 
-    // RESIDENT: the GPU reads its commands out of this buffer, and this
-    // context tracks nothing automatically. Without it the execute faults.
+    // RESIDENT: the GPU reads its commands out of this buffer, and this context
+    // tracks nothing automatically. Without it the execute faults.
     context
         .residency()
         .addAllocation(ProtocolObject::from_ref(&*icb));
@@ -219,12 +182,10 @@ pub fn record(context: &Context, regions: &Regions, commands: &[Command<'_>]) ->
         recorded.setComputePipelineState(command.pipeline);
 
         for bind in &command.binds {
-            // UNRECORDABLE, not broken. A recorded command binds a BUFFER,
-            // and an address in no registered allocation cannot be turned
-            // into one -- but the encode path binds addresses and does not
-            // care, so a caller that has not registered its regions is
-            // un-optimised rather than wrong. Its own variant so the caller
-            // swallows THIS and not the three faults beside it.
+            // UNRECORDABLE, not broken: an address in no registered allocation
+            // cannot become a buffer, but the encode path binds addresses and
+            // does not care, so an unregistered caller is un-optimised rather
+            // than wrong. Its own variant so the caller swallows THIS only.
             let (buffer, offset) =
                 regions
                     .resolve(bind.address)
@@ -238,22 +199,13 @@ pub fn record(context: &Context, regions: &Regions, commands: &[Command<'_>]) ->
                     })?;
             // FOUR GIBIBYTES, and the device is why.
             // `setKernelBuffer:offset:atIndex:` takes an `NSUInteger` and
-            // truncates it to 32 bits on this hardware --
-            // `device_icb.rs::a_recorded_commands_buffer_offset_is_truncated_to_thirty_two_bits`
-            // binds 4 GiB + 64 into a 5 GiB buffer and reads back byte 64.
-            // The encode path binds raw GPU addresses and has no offset to
-            // lose, so it is unaffected; only a recording is.
-            //
-            // It cost a whole debugging round to find, because what it does
-            // is bind a weight to the wrong bytes of the right buffer: the
-            // fire runs, every launch succeeds, and 262 144 of 262 144 logits
-            // come back NaN. Refusing here turns that into an encoded fire --
-            // slower, and right.
-            //
-            // A checkpoint reaches this the moment it is larger than 4 GiB,
-            // which is every model this engine is for. Lifting it means
-            // staging weights in chunks no larger than 4 GiB rather than the
-            // one region `weights/stage.rs` allocates today.
+            // truncates it to 32 bits on this hardware. The encode path binds
+            // raw GPU addresses and has no offset to lose; only a recording is
+            // affected. What it does is bind a weight to the wrong bytes of the
+            // right buffer: every launch succeeds and every logit is NaN.
+            // A checkpoint reaches this the moment it is larger than 4 GiB.
+            // Lifting it means staging weights in chunks no larger than 4 GiB
+            // rather than the one region `weights/stage.rs` allocates today.
             if offset >= FOUR_GIB {
                 return Err(Error::Unrecordable {
                     what: "fire",
@@ -285,10 +237,9 @@ pub fn record(context: &Context, regions: &Regions, commands: &[Command<'_>]) ->
                 depth: command.threadgroup[2] as usize,
             },
         );
-        // See the doc: a statement reading what the previous one wrote reads
-        // whatever was there without this, and the failure is a number. Only
-        // where the operands say one is needed -- `bind::encode` decided, and
-        // a recording repeats its decision rather than making its own.
+        // A statement reading what the previous one wrote reads whatever was
+        // there without this, and the failure is a number. `bind::encode`
+        // decided; a recording repeats its decision rather than making its own.
         if command.barrier {
             recorded.setBarrier();
         }

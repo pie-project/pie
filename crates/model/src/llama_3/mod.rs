@@ -949,3 +949,7 @@ mod tests {
         assert!(large.ops.len() > small.ops.len(), "80 layers out-op 16");
     }
 }
+
+/// This generation's tensor names, in every vocabulary that spells them.
+#[cfg(feature = "contract")]
+pub mod import;

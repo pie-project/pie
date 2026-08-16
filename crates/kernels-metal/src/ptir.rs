@@ -7,7 +7,8 @@
 
 use kernels::routine::Refusal;
 
-use crate::routine::{Bind, Buf, BufMut, Ctx, Env, Fire, Routine};
+use crate::routine::{keys, Ask, Bind, Block, Buf, BufMut, Ctx, Fire, Routine};
+use crate::routine::{InSlot, OutSlot};
 
 /// Threads per threadgroup on the vocabulary axis.
 ///
@@ -41,11 +42,11 @@ const GROUP_X: u32 = 256;
 /// missing one.
 pub fn copy_logits_bf16(
     ctx: &Ctx<'_>,
-    source: Buf,
-    destination: BufMut,
-    params: Buf,
-    vocab: Env<u32>,
-    rows: Env<u32>,
+    source: InSlot<0, Buf>,
+    destination: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    vocab: Ask<keys::Width, u32>,
+    rows: Ask<keys::Rows, u32>,
 ) -> Result<(), Refusal> {
     if *rows == 0 {
         return Err(Refusal::Empty { what: "rows" });
@@ -108,7 +109,7 @@ mod tests {
     #[test]
     fn the_row_axis_is_the_grid_s_and_not_the_kernel_s() {
         let seen = Seen::default();
-        copy_logits_bf16(&seen, Buf(4), BufMut(5), Buf(6), Env(128_256), Env(16))
+        copy_logits_bf16(&seen, InSlot::new(Buf(4)), OutSlot::new(BufMut(5)), Block::new(Buf(6)), Ask::new(128_256), Ask::new(16))
             .expect("sixteen rows is a launch");
 
         let calls = seen.0.borrow();
@@ -131,7 +132,7 @@ mod tests {
             args,
             &[
                 ArgValue::Buffer(4),
-                ArgValue::Buffer(5),
+                ArgValue::BufferMut(5),
                 ArgValue::Buffer(6)
             ],
             "buffer(0..=2): source, destination, params"
@@ -149,18 +150,26 @@ mod tests {
     fn an_empty_extent_is_refused_by_name() {
         let seen = Seen::default();
         assert_eq!(
-            copy_logits_bf16(&seen, Buf(0), BufMut(1), Buf(2), Env(128_256), Env(0)),
+            copy_logits_bf16(&seen, InSlot::new(Buf(0)), OutSlot::new(BufMut(1)), Block::new(Buf(2)), Ask::new(128_256), Ask::new(0)),
             Err(Refusal::Empty { what: "rows" })
         );
         assert_eq!(
-            copy_logits_bf16(&seen, Buf(0), BufMut(1), Buf(2), Env(0), Env(16)),
+            copy_logits_bf16(&seen, InSlot::new(Buf(0)), OutSlot::new(BufMut(1)), Block::new(Buf(2)), Ask::new(0), Ask::new(16)),
             Err(Refusal::Empty { what: "vocab" })
         );
         assert!(seen.0.borrow().is_empty());
     }
 
-    /// The derived row is the signature: three buffers the trace supplies and
-    /// two extents the environment does.
+    /// The derived row is the signature: two buffers the trace supplies, and
+    /// a block and two extents the environment does.
+    ///
+    /// This said "three buffers the trace supplies" and asserted it, and was
+    /// WRONG from the moment `params` became `Env<Buf>` — it could not fail,
+    /// because stating the slots on this plane stopped the in-crate tests
+    /// compiling and a test that does not build does not disagree with
+    /// anything. `params` is `o.params_block()`, which is the environment's
+    /// by construction: the statement's scalars, staged by the driver into
+    /// one buffer the statement never names.
     ///
     /// `vocab` is the interesting one. The `kernel!` row beside this states no
     /// operands and no launch rule at all, so the vocabulary was a fact the
@@ -176,7 +185,7 @@ mod tests {
             &[
                 (kernels::Ty::Buf, crate::routine::Supplier::Trace),
                 (kernels::Ty::BufMut, crate::routine::Supplier::Trace),
-                (kernels::Ty::Buf, crate::routine::Supplier::Trace),
+                (kernels::Ty::Buf, crate::routine::Supplier::Env),
                 (kernels::Ty::U32, crate::routine::Supplier::Env),
                 (kernels::Ty::U32, crate::routine::Supplier::Env),
             ]

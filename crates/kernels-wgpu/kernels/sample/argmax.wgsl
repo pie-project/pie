@@ -9,8 +9,9 @@
 // `next_token` is bound directly as the next step's token id, with no readback,
 // and a host argmax is what forces the per-token drain.
 //
-// The row is UNSTATED in the table, so the bindings are the sibling backends'
-// and not a derivation: logits 0, next_token 1, params 2, eos_flag 3. Params
+// The bindings are the sibling backends' and not a derivation: logits 0,
+// next_token 1, params 2, eos_flag 3, which is the order
+// `sample::argmax_logits`'s signature states. Params
 // and eos_flag are append-only extensions to the original two-buffer bind, and
 // the two scalars ride INSIDE the params buffer, so there is no `@group(1)`.
 //

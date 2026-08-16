@@ -862,6 +862,42 @@ mod tests {
         assert!(kept.notices.is_empty());
     }
 
+    /// An FP8 checkpoint asked for FP8 is a second rounding like any other.
+    ///
+    /// It reads as a special case and is not one, but it took a detour to get
+    /// here. This was decided in `Builder::runtime_quant_scheme`, which
+    /// answered `Ok(None)` -- authoring an unrounded artifact for an operator
+    /// who had asked for a rounded one, and saying nothing. That guard is
+    /// gone, so this refusal is now the only thing standing between GLM-5.1's
+    /// FP8 experts and a silent re-encode.
+    ///
+    /// It only fires because `import::source_encoding` files an FP8 dtype
+    /// under `quant:`. FP8 is stored as a dtype rather than a `Quant` scheme,
+    /// so the obvious reading of the `Encoding` variant calls an
+    /// already-rounded checkpoint raw. Those two lines are one change.
+    #[test]
+    fn an_fp8_source_is_refused_a_second_fp8_rounding() {
+        let already = QuantRequest {
+            source_encoding: Some("quant:f8e4m3,raw:bf16"),
+            fp8_native: true,
+            ..req(Some("fp8"), "cuda")
+        };
+        let err = resolve_quant(&already).expect_err("cuda serves fp8 as it ships");
+        let msg = err.to_string();
+        assert!(msg.contains("f8e4m3"), "does not name the source: {msg}");
+
+        // The negative control, and the reason this is a refusal on CUDA and
+        // not everywhere: a BF16 source has been rounded zero times, so there
+        // is nothing to refuse.
+        let fresh = QuantRequest {
+            source_encoding: Some("raw:bf16"),
+            fp8_native: true,
+            ..req(Some("fp8"), "cuda")
+        };
+        let ok = resolve_quant(&fresh).expect("a bf16 source may be rounded once");
+        assert_eq!(ok.quant, RuntimeQuant::Fp8);
+    }
+
     /// The source's own encoding is the third fact, and the newest: before an
     /// archive kept the packing it was shipped with, import decoded every
     /// block to BF16 and there was nothing here to read.

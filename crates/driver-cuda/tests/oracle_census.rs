@@ -1,66 +1,13 @@
 //! Which oracles can still be run, and which are descriptions of a run that
 //! can never happen again.
 //!
-//! # The failure this exists for
+//! **Sixteen of the eighteen `run.sh` cannot run** — not "fail for want of a
+//! GPU" but cannot run anywhere, because the sources they copy were deleted.
+//! That is worse than a deleted test, because they read as live
+//! infrastructure.
 //!
-//! `tests/oracle/` holds twenty directories. Each one is a C++ program
-//! that was compiled against the real driver sources, run once, and its output
-//! transcribed into a `GOLDEN_FNV1A64` in the matching `*_parity.rs`. The
-//! goldens are not files in these directories — they are constants in the Rust
-//! tests, and only `gemm_service/` and `real_decode/` keep captured data on
-//! disk at all. What the directories hold is the *instrument*: `oracle.cpp`
-//! and a `run.sh` that copies the driver sources next to it and compiles them.
-//!
-//! **Sixteen of the eighteen `run.sh` cannot run.** Not "fail on this
-//! machine for want of a GPU" — cannot run anywhere, because the sources they
-//! copy were deleted. `4569b9e4b` removed `crates/driver-cuda/csrc` wholesale
-//! and this migration removed individual archive files, and every one of those
-//! scripts opens `set -euo pipefail` and then `cp` a path that is gone. They
-//! die on line ten of forty, before the compiler is ever reached.
-//!
-//! That is worse than a deleted test. A deleted test is absent; these read as
-//! live infrastructure. Twelve of the parity tests carried the instruction
-//! *"Run `tests/oracle/X/run.sh` to regenerate the golden"* — an instruction
-//! that has been false since a commit nobody connected to them, addressed to
-//! whoever next needs the golden and finds out the hard way. This file is the
-//! census that makes the state checkable, and the corrected wording in those
-//! twelve is what it enforces.
-//!
-//! # What this asserts, and what it deliberately does not
-//!
-//! It asserts **path existence**, nothing else. For each dead oracle it names
-//! the first input its `run.sh` reaches for and asserts that input is *still
-//! missing*. It does not parse shell, does not model `set -e`, does not try to
-//! predict whether a compiler would succeed given its inputs. A gate whose
-//! subject is approximately right reports failures that are approximately
-//! real; this one's subject is a filename.
-//!
-//! It is therefore **self-retiring in both directions**. Restore
-//! `driver-cuda/csrc/src/model/workspace.cpp` and the `workspace` entry fails,
-//! saying the oracle may be alive again and the row is stale. Delete an input
-//! an ALIVE oracle needs and [`the_alive_oracles_still_have_their_inputs`]
-//! fails. Add a twenty-first oracle directory and
-//! [`every_oracle_is_classified`] fails until it is classified. None of the
-//! three can pass by neglect.
-//!
-//! # The policy these sixteen fall under
-//!
-//! `cublas_handle_parity.rs` states it and it was written for exactly this:
-//! a golden is "a permanent record of behaviour that can be **read but not
-//! re-derived**", and `run.sh` is kept "as the description of how it was taken
-//! rather than as a command anyone can issue". The sixteen are all covered by
-//! it, because in every case the *behaviour* the golden records was the
-//! archive's and the archive is what left. Nothing was lost by the oracle
-//! dying that was not already lost by its subject dying.
-//!
-//! **The policy's precondition is a golden, and three oracles had none.**
-//! `llama_like_cfg`, `llama_like_prepare` and `qwen35_la_ws` were deleted
-//! rather than left as descriptions, and the argument is in [`RETIRED`]. It
-//! is the reason the count moved from nineteen to sixteen and from
-//! twenty-three directories to twenty.
-//!
-//! The two that sit outside the policy are the two ALIVE ones, and they sit
-//! outside it in opposite directions — see [`ALIVE`].
+//! This asserts **path existence** and nothing else, so it is self-retiring in
+//! both directions; see [`ALIVE`], [`RETIRED`] and [`every_oracle_is_classified`].
 
 use std::path::{Path, PathBuf};
 
@@ -79,33 +26,39 @@ fn oracle_dir() -> PathBuf {
 
 /// Why an oracle's `run.sh` cannot run, and the input that proves it.
 ///
-/// `at` is the phase the script dies in. The two values are not decoration:
-/// they distinguish a script that never reaches a compiler from one that does,
-/// and the second kind is the one a naive census misses. `store` and
-/// `weight_view` copy only files that still exist and then hand the compiler a
-/// path that does not, so a check that looked at `cp` arguments alone called
-/// them alive. They are not.
+/// `at` is the phase the script dies in, and the two values distinguish a
+/// script that never reaches a compiler from one that does. `store` and
+/// `weight_view` copy only files that exist and then hand the compiler a path
+/// that does not, so a check reading `cp` arguments alone called them alive.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Dies {
     /// Dies at a `cp` under `set -euo pipefail`, before any compiler runs.
     Cp,
     /// Dies at the compiler, on a positional input that is not there.
     Compile,
+    /// Does NOT die. The tree path is gone -- so the row still asserts that,
+    /// and a restore into the tree still has to be noticed -- but the script
+    /// fetches the source from git and runs to completion.
+    ///
+    /// This is not a softer `Cp`. It is the opposite finding, and it costs
+    /// something to claim: [`a_restoring_oracle_can_actually_restore`] makes
+    /// every row using it name a revision whose blobs git can still produce.
+    /// Without that, the variant would be a way to describe an oracle as
+    /// alive without ever checking, which is the failure `Cp` rows caused in
+    /// the other direction.
+    GitRestores,
 }
 
 /// The sixteen, each with the first input its `run.sh` cannot find.
 ///
-/// The path is repo-relative and is asserted MISSING. Where a script reaches
-/// for several absent inputs only the first is listed, because the first is
-/// the one `set -e` stops on and listing the rest would make this table decay
-/// every time an unrelated file moved.
+/// The path is repo-relative and is asserted MISSING. Only the first absent
+/// input is listed, because it is the one `set -e` stops on and listing the
+/// rest would make this table decay every time an unrelated file moved.
 const DEAD: &[(&str, Dies, &str, &str)] = &[
-    // ── Cause A: `crates/driver-cuda/csrc` deleted wholesale by `4569b9e4b`.
+    // ── Cause A: `crates/driver-cuda/csrc` deleted wholesale.
     //
-    // Fourteen of the sixteen. These oracles compiled the driver's own C++
-    // host layer — the workspace planner, the KV cache, the stage hooks — and
-    // that layer is now Rust. The golden each one produced is a record of what
-    // the C++ did, kept so the Rust can be compared against it by reading.
+    // Fourteen of the sixteen. These compiled the driver's own C++ host layer
+    // — workspace planner, KV cache, stage hooks — which is now Rust.
     ("attn_score", Dies::Cp, "crates/driver-cuda/csrc/src/model/attn_score.cu",
      "the attention-score observation hook"),
     ("attn_ws", Dies::Cp, "crates/driver-cuda/csrc/src/attention_workspace.cpp",
@@ -126,7 +79,23 @@ const DEAD: &[(&str, Dies, &str, &str)] = &[
     // and it will NOT be, because the shared stub tree is still gone. The row
     // is right that its reason expired; whoever reads the failure needs this
     // sentence to avoid concluding the script runs.
-    ("memory_planner", Dies::Cp, "crates/driver-cuda/csrc/src/store/memory_planner.cpp",
+    // This row is STILL TRUE and its conclusion is STILL WRONG, which is the
+    // exact inverse of the `lora_stage` note above and the reason both are
+    // written down. The path really is gone from the tree, so the assertion
+    // holds -- but this oracle is not dead. `memory_planner/run.sh` now
+    // restores the `.cpp`/`.hpp` from `e7cd33cf1` and builds them against the
+    // surviving `stub/` tree with plain `g++` and no CUDA, and it reproduces
+    // `GOLDEN_FNV1A64` exactly. Nothing about it needed the deleted tree.
+    //
+    // `memory_planner_parity.rs` spent months red on a real divergence while
+    // saying in its own failure message that the C++ could not be re-run to
+    // diff against. It could. That claim is what made the divergence look
+    // undiagnosable, so the cost of a row like this is not the row -- it is
+    // the reader who believes it and stops.
+    //
+    // Before adding a `Dies::Cp` row, check whether the input is one
+    // `git show` away, as this one was.
+    ("memory_planner", Dies::GitRestores, "crates/driver-cuda/csrc/src/store/memory_planner.cpp",
      "the memory planner's allocation decisions"),
     ("page_mask", Dies::Cp, "crates/driver-cuda/csrc/src/model/attn_page_mask.cu",
      "page-mask construction"),
@@ -141,25 +110,19 @@ const DEAD: &[(&str, Dies, &str, &str)] = &[
      "stage hook firing order"),
     ("workspace", Dies::Cp, "crates/driver-cuda/csrc/src/model/workspace.cpp",
      "the model workspace's section offsets"),
-    // The fourteenth of cause A, and the one that hides. Its `cp` list is
-    // clean — every file it copies is present — and it dies at `g++`, which is
-    // why it must be reached by looking at compiler inputs and not just `cp`.
+    // The fourteenth of cause A, and the one that hides: its `cp` list is
+    // clean and it dies at `g++`, so it is reached only by looking at
+    // compiler inputs.
     ("store", Dies::Compile, "crates/driver-cuda/csrc/src/store/kv_cache_format.cpp",
      "the on-disk KV cache format"),
     // ── Cause B: individual archive files retired by this migration.
     //
-    // Two, and they are the ones that will keep happening: an oracle whose
-    // subject is a HOST source in the kernels tree dies the day that source
-    // is ported. Both of these were live until this migration reached their
-    // file.
+    // Two, and the kind that will keep happening: an oracle whose subject is a
+    // HOST source in the kernels tree dies the day that source is ported.
     //
-    // Their two path strings are the ARCHIVE crate's — `kernels-cuda` when it
-    // was a CMake+nvcc crate whose `csrc/` held `.cu` and host `.hpp`/`.cpp`,
-    // deleted whole at `85c6c674b`. The strings are kept verbatim because
-    // they are what each `run.sh` reaches for. Nothing in this tree holds
-    // either path now and nothing is meant to, so the rows still assert what
-    // they were written to assert; a reader must not take the prefix for a
-    // crate that is alive.
+    // Their path strings are the ARCHIVE crate's — `kernels-cuda` when it was
+    // a CMake+nvcc crate — and are kept verbatim because they are what each
+    // `run.sh` reaches for. Nothing in this tree holds either path now.
     ("cublas_handle", Dies::Cp, "crates/kernels-cuda/csrc/src/gemm/gemm.cpp",
      "cuBLAS handle and workspace lifetime"),
     ("weight_view", Dies::Compile, "crates/kernels-cuda/csrc/src/tensor.cpp",
@@ -169,53 +132,28 @@ const DEAD: &[(&str, Dies, &str, &str)] = &[
 /// The three that were DELETED rather than kept as descriptions, and why the
 /// "read but not re-derived" policy did not reach them.
 ///
-/// ```text
-///   llama_like_cfg        model/llama_like/llama_like.cpp     no golden
-///   llama_like_prepare    model/llama_like/llama_like.cpp     no golden
-///   qwen35_la_ws          model/qwen3_5/qwen3_5_forward.cpp   no golden
-/// ```
-///
 /// # The policy needs a golden and there was not one
 ///
-/// `cublas_handle_parity.rs` states it: a golden is "a permanent record of
-/// behaviour that can be **read but not re-derived**", and the `run.sh` is
-/// kept "as the description of how it was taken". Both halves name the
-/// golden. **These three produced none** — no `GOLDEN_*` constant in any
-/// `.rs`, no captured file on disk, and no `.rs` in the workspace mentioned
-/// them at all except this census. The instrument was built, and either it
-/// was never run or its reading was never written down. There is no record
-/// for a description to describe.
+/// **These three produced none** — no `GOLDEN_*` constant, no captured file,
+/// and no `.rs` in the workspace mentioning them except this census. There is
+/// no record for a description to describe.
 ///
 /// # And there was nothing inside them either
 ///
-/// The reason that is decisive rather than merely tidy: **none of the three
-/// reimplements anything.** Each one `#include`s and compiles the REAL
-/// driver source — `llama_like.cpp` at 3.2k lines, `qwen3_5_forward.cpp` at
-/// 2.4k — and drives it, replacing only the flashinfer plan-cache entry
-/// points or `allocate_device_memory` with recorders. The arithmetic they
-/// were pointed at lived in the subject, not in the `oracle.cpp`. So when
-/// `4569b9e4b` deleted `crates/driver-cuda/csrc` wholesale it took the
-/// derivation with it, and what remained was 41 KB of driver code for a
-/// subject that is gone, holding no formula of its own.
-///
-/// An instrument whose subject is deleted and whose reading was never
-/// recorded holds nothing. That is the discriminator, and it is why these
-/// three separate cleanly from the sixteen in [`DEAD`] — every one of those
-/// has a golden that is still read.
+/// **None of the three reimplements anything.** Each `#include`s and compiles
+/// the REAL driver source and drives it, replacing only the flashinfer
+/// plan-cache entry points or `allocate_device_memory` with recorders, so the
+/// arithmetic lived in the subject rather than the `oracle.cpp`. Deleting
+/// `crates/driver-cuda/csrc` took the derivation with it.
 ///
 /// # No absence gate, deliberately
 ///
-/// There is no test here asserting these three directories stay gone. An
-/// absence assertion over a deleted path is a green check that can never
-/// fail again. What covers them is [`every_oracle_is_classified`]'s WALK:
-/// recreate any of the three with a `run.sh` and it is unclassified, and the
-/// walk sees directories that do not exist yet, which an absence assertion
-/// cannot.
-///
-/// The one thing the walk does not see is a directory with no `run.sh` — a
-/// bare `llama_like_prepare/stub/` recreated because `lora_stage/run.sh:29`
-/// still copies it. That is recorded at the `lora_stage` row above and in
-/// the script itself, which is where the person who would recreate it looks.
+/// An absence assertion over a deleted path is a green check that can never
+/// fail again. [`every_oracle_is_classified`]'s WALK covers them instead:
+/// recreate any of the three with a `run.sh` and it is unclassified. What the
+/// walk does not see is a directory with no `run.sh` — a bare
+/// `llama_like_prepare/stub/`, which `lora_stage/run.sh` still copies and
+/// which is recorded at the `lora_stage` row above.
 const RETIRED: &[(&str, &str)] = &[
     ("llama_like_cfg", "no golden; drove the deleted llama_like.cpp"),
     ("llama_like_prepare", "no golden; drove the deleted llama_like.cpp"),
@@ -225,32 +163,25 @@ const RETIRED: &[(&str, &str)] = &[
 /// The two that can still be run, and neither can be run *here*.
 ///
 /// They fall outside the "read but not re-derived" policy in opposite
-/// directions, which is why the policy sentence covers the sixteen and not
-/// the eighteen:
+/// directions, which is why the policy covers sixteen and not eighteen:
 ///
-/// - `dtoa` is **runnable anywhere**. It compiles `oracle.cpp` against a
-///   vendored `nlohmann/json.hpp` and touches no repo C++ at all, so nothing
-///   this migration does can break it. Its golden is re-derivable and its
-///   parity test's instruction to run it is true — the one of the thirteen
-///   that was left alone.
-/// - `gemm_service` is **runnable only on a CUDA machine**: its `run.sh`
-///   invokes `$CUDA_HOME/bin/nvcc` twice. Its golden is re-derivable in
-///   principle and not on this host, and it is the only oracle holding
-///   captured output on disk (`golden.txt`, `bias_fold.txt`) rather than a
-///   transcribed constant — which is what makes that re-derivation optional.
+/// - `dtoa` is **runnable anywhere**: it compiles against a vendored
+///   `nlohmann/json.hpp` and touches no repo C++, so its golden is
+///   re-derivable and its parity test's instruction to run it is true.
+/// - `gemm_service` is **runnable only on a CUDA machine** (`$CUDA_HOME/bin/
+///   nvcc`), and is the only oracle holding captured output on disk rather
+///   than a transcribed constant, which makes that re-derivation optional.
 const ALIVE: &[(&str, &str)] = &[
     ("dtoa", "vendored `nlohmann/json.hpp` only — reaches no repo C++"),
     ("gemm_service", "needs `$CUDA_HOME/bin/nvcc`; a CUDA host, not this one"),
 ];
 
-/// Directories with no `run.sh`, which are therefore not oracles in this
-/// sense at all.
+/// Directories with no `run.sh`, which are therefore not oracles at all.
 ///
-/// `launch_abi/` holds headers that `tests/launch_abi.rs` reads from disk, and
-/// `real_decode/` holds captured JSON that four `real_*.rs` tests read. Both
-/// are data directories that happen to live under `tests/oracle/`. Neither has
-/// ever had a script, so neither can have stopped working, and listing them
-/// here is what stops a future census from "discovering" them.
+/// `launch_abi/` holds headers `tests/launch_abi.rs` reads from disk and
+/// `real_decode/` holds captured JSON four `real_*.rs` tests read. Neither has
+/// ever had a script, so neither can have stopped working; listing them stops
+/// a future census from "discovering" them.
 const NO_SCRIPT: &[&str] = &["launch_abi", "real_decode"];
 
 fn dirs_with_script() -> Vec<String> {
@@ -271,9 +202,8 @@ fn dirs_with_script() -> Vec<String> {
 
 /// Every oracle directory is in exactly one of the three tables.
 ///
-/// This is the half that catches an oracle ARRIVING. A new directory with a
-/// `run.sh` is unclassified until someone says whether it runs, and an entry
-/// whose directory was deleted is a row describing nothing.
+/// This is the half that catches an oracle ARRIVING: a new directory with a
+/// `run.sh` is unclassified until someone says whether it runs.
 #[test]
 fn every_oracle_is_classified() {
     let on_disk = dirs_with_script();
@@ -336,9 +266,8 @@ fn every_oracle_is_classified() {
     assert_eq!(on_disk.len(), DEAD.len() + ALIVE.len());
 
     // A RETIRED oracle may be classified again only if its directory is back.
-    // A row without a directory is what `vanished` above catches; this catches
-    // the same thing one step earlier and says the specific reason the name is
-    // absent, which `vanished`'s "renamed or deleted" wording cannot.
+    // `vanished` above catches a row without a directory; this catches the
+    // same thing one step earlier and names the specific reason.
     for (name, why) in RETIRED {
         assert!(
             !classified.iter().any(|c| c.as_str() == *name)
@@ -355,9 +284,7 @@ fn every_oracle_is_classified() {
 ///
 /// This is the half that retires the row. The claim is not "this script
 /// fails" — that would need a shell — but "the input it dies on is not
-/// there", which is a filename and is exactly as true as the claim it stands
-/// for. Restore the file and this fires, which is correct: the row's reason
-/// expired and the oracle may be runnable again.
+/// there". Restore the file and this fires, which is correct.
 #[test]
 fn the_dead_oracles_inputs_are_still_missing() {
     let root = repo_root();
@@ -366,6 +293,10 @@ fn the_dead_oracles_inputs_are_still_missing() {
         let phase = match dies {
             Dies::Cp => "the `cp` that `set -euo pipefail` stops on",
             Dies::Compile => "the compiler, which is handed it as a positional input",
+            // Restoring rows assert the same absence for the same reason: a
+            // file reappearing in the tree changes which source the oracle
+            // builds, and that has to be seen. They just do not die of it.
+            Dies::GitRestores => "nothing -- the script restores it from git",
         };
         assert!(
             !path.exists(),
@@ -381,10 +312,9 @@ fn the_dead_oracles_inputs_are_still_missing() {
 
 /// Every live oracle's `run.sh` still reaches only files that exist.
 ///
-/// The cheap, exact version of that claim: neither of the two mentions
-/// `driver-cuda/csrc`, the tree that was deleted wholesale. This is not a
-/// proof that they run — `gemm_service` needs a GPU and this asserts nothing
-/// about one — it is a proof that they have not silently joined cause A.
+/// The cheap, exact version: neither mentions `driver-cuda/csrc`, the tree
+/// that was deleted wholesale. Not a proof that they run — a proof that they
+/// have not silently joined cause A.
 #[test]
 fn the_alive_oracles_still_have_their_inputs() {
     for (name, why) in ALIVE {
@@ -403,24 +333,16 @@ fn the_alive_oracles_still_have_their_inputs() {
 
 /// No dead oracle's parity test tells its reader to run it.
 ///
-/// Twenty did, in two places. Twelve said *"Run `tests/oracle/X/run.sh` to
-/// regenerate"* in the module header, and eight more said *"run
-/// tests/oracle/X/run.sh with X_ORACLE_OUT set to diff them"* inside the
-/// `assert_eq!` message — and the second location is much the worse of the
-/// two. A header is read once; a panic message is read at the exact moment
-/// someone has found a mismatch, is trying to establish which side moved, and
-/// is least inclined to doubt the infrastructure. Sending that reader to a
-/// script that dies at its first `cp` costs them the hour before they think to
-/// check whether the oracle still exists.
+/// Twenty did, in two places, and the worse of the two is inside an
+/// `assert_eq!` message: a header is read once, but a panic message is read at
+/// the exact moment someone has found a mismatch, is establishing which side
+/// moved, and is least inclined to doubt the infrastructure. The corrected
+/// messages say the C++ side cannot be re-run, so the golden is the only
+/// record of it and a divergence is this crate changing.
 ///
-/// The corrected messages say the thing the reader actually needs: the C++
-/// side cannot be re-run, so the golden is the only record of it, and a
-/// divergence is therefore this crate changing.
-///
-/// The rule is one-directional on purpose. It forbids the imperative in a dead
-/// oracle's test; it does not require any particular replacement wording,
-/// because prose that a test dictates is prose nobody edits. `dtoa` keeps its
-/// instruction and must — it is true.
+/// One-directional on purpose: it forbids the imperative in a dead oracle's
+/// test and requires no particular replacement wording, because prose a test
+/// dictates is prose nobody edits. `dtoa` keeps its instruction and must.
 #[test]
 fn no_dead_oracle_is_advertised_as_runnable() {
     let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
@@ -437,7 +359,13 @@ fn no_dead_oracle_is_advertised_as_runnable() {
         .collect();
     assert!(sources.len() > 20, "tests/ scan found only {} files", sources.len());
 
-    for (name, ..) in DEAD {
+    for (name, dies, ..) in DEAD {
+        // A restoring oracle IS runnable, so telling a reader to run it is
+        // true and this ban does not apply. The variant is what earns the
+        // exemption, and it is checked -- see the enum.
+        if *dies == Dies::GitRestores {
+            continue;
+        }
         // The imperative in every form it was found in. Matching the path
         // alone would forbid naming the script at all, and naming it is the
         // point — it is kept as the description of how the golden was taken.
@@ -455,6 +383,80 @@ fn no_dead_oracle_is_advertised_as_runnable() {
                      crate changing — there is no other side left to blame."
                 );
             }
+        }
+    }
+}
+
+/// The revision a [`Dies::GitRestores`] script fetches its source from.
+///
+/// One constant because one oracle restores today. It is here rather than
+/// only in the script so the check below and the script cannot disagree
+/// silently -- the check reads the script and requires this string in it.
+const RESTORE_REV: &str = "e7cd33cf1";
+
+/// A restoring oracle's source is really still fetchable.
+///
+/// The point of the variant is that "deleted" and "unavailable" are not the
+/// same word, and the whole reason it exists is that this repo spent months
+/// treating them as one. So the claim has to be checked, or it is just a
+/// nicer-sounding version of the assertion it replaced.
+///
+/// Two things are required, because either alone is satisfiable while the
+/// oracle stays broken: the script must actually contain the restore, and git
+/// must actually still have the blob. The second is the one that decays --
+/// history is rewritten, branches are pruned -- and it decays silently.
+#[test]
+fn a_restoring_oracle_can_actually_restore() {
+    let root = repo_root();
+    let restoring: Vec<_> = DEAD
+        .iter()
+        .filter(|(_, d, ..)| *d == Dies::GitRestores)
+        .collect();
+    assert!(
+        !restoring.is_empty(),
+        "no row uses Dies::GitRestores, so this test measures nothing. If the \
+         last restoring oracle was reclassified, delete this test and \
+         RESTORE_REV with it rather than leaving a green check over an empty \
+         loop."
+    );
+
+    for (name, _, path, subject) in restoring {
+        let script = root.join(format!("crates/driver-cuda/tests/oracle/{name}/run.sh"));
+        let text = std::fs::read_to_string(&script)
+            .unwrap_or_else(|e| panic!("read {}: {e}", script.display()));
+        assert!(
+            text.contains(RESTORE_REV),
+            "tests/oracle/{name}/run.sh is recorded as restoring its source \
+             from git, and it does not name {RESTORE_REV}. Either the script \
+             pins a different revision -- in which case this constant is \
+             stale and the check below is testing the wrong blob -- or it no \
+             longer restores anything and the row belongs back in Dies::Cp."
+        );
+
+        let object = format!("{RESTORE_REV}:{path}");
+        let found = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["cat-file", "-e"])
+            .arg(&object)
+            .status();
+        match found {
+            Ok(status) => assert!(
+                status.success(),
+                "git cannot produce `{object}`, so tests/oracle/{name}/run.sh \
+                 cannot rebuild the C++ and the oracle covering {subject} is \
+                 dead after all -- not by anyone's decision, which is why \
+                 this is checked.\n  If history was rewritten, find the \
+                 1,221-line memory_planner.cpp on the new history and repoint \
+                 RESTORE_REV and the script together. If it is unrecoverable, \
+                 move the row to Dies::Cp and say so in \
+                 memory_planner_parity.rs, which currently tells its reader \
+                 to go re-run this."
+            ),
+            // A machine without git is not a machine that has this repo, but
+            // failing to LAUNCH git is not evidence about the blob and must
+            // not be reported as if it were.
+            Err(e) => panic!("could not run git to check `{object}`: {e}"),
         }
     }
 }

@@ -26,11 +26,19 @@
 //! deployed by construction — there is no second table to fall out of.
 //!
 //! What is left is the part a type still cannot hold: a row may compile
-//! and still REFUSE at `deployment()`, because this build has no KV pool
-//! or no forward text for its shape. That refusal is a real gap and it
-//! is stated below, in the same closed-set idiom, so a row that gains a
-//! path leaves the list in a commit rather than being discovered by a
-//! checkpoint that will not boot.
+//! and still REFUSE, because this build has no KV pool or no forward text
+//! for its shape. That refusal is a real gap and it is stated below, in
+//! the same closed-set idiom, so a row that gains a path leaves the list
+//! in a commit rather than being discovered by a checkpoint that will not
+//! boot.
+//!
+//! It refuses at one of TWO places, and this file used to ask only the
+//! first. `deployment()` is the door; `trace()` is the first fire, and
+//! `Variant::trace`'s doc says plainly that a row with no text for the
+//! backend asking "refuses the other HERE". Reconciling on the door alone
+//! read `gemma-4-31b` as servable while `Gemma4::trace` refused it by
+//! name -- a checkpoint that opens and dies on its first token, which is
+//! the exact failure the MLA note below says this list exists to end.
 
 #![cfg(all(feature = "_cuda", feature = "abi"))]
 
@@ -38,20 +46,33 @@ use std::collections::BTreeSet;
 
 use model::catalog::{self, Deployed};
 
-/// Catalog rows this build cannot project a `Deployment` for.
+/// Catalog rows this build cannot SERVE -- open and fire.
 ///
 /// Every line is a model whose row EXISTS and whose author is written —
-/// what is missing is a driver-side path for the shape it projects.
+/// what is missing is a driver-side path for the shape it projects. Some
+/// are refused at the door and some at the first fire; see [`servable`],
+/// which asks both, and the gemma-4 pair, which is why it does.
 /// Grouped by what has to be written, because that is how a reader
 /// decides whether a line is theirs.
 const NOT_YET_SERVABLE: &[&str] = &[
     // Not a decode backbone at all: CSM is a codec stack, so it has no
     // fire class this shell serves.
     "csm-1b",
-    // Gemma-4's routed sibling: `attention_k_eq_v` reads V out of the K
-    // projection and the block is routed over 128 experts. This build
-    // traces neither leg, and the row says so at the door rather than
-    // deploying a stack whose first fire would find no kernel.
+    // ── THE TWO `attention_k_eq_v` ROWS ─────────────────────────────
+    //
+    // Both read V out of the K projection and ship no `v_proj`, and the
+    // hand-written CUDA text projects one unconditionally -- `Gemma4LayerW`
+    // declares it and `project::trace` is not handed `k_eq_v` to branch
+    // on. `Gemma4::trace` refuses them for that reason, in those words.
+    //
+    // `gemma-4-31b` was NOT on this list until the reconciliation below
+    // started asking `trace()` as well as `deployment()`. It is exactly
+    // as unservable as its sibling, refused by the same line of the same
+    // function, and it read as servable here for as long as servability
+    // was spelled `deployment().is_ok()`. That is the "loads and dies at
+    // the first fire" this file was written to prevent, sitting inside
+    // the file.
+    "gemma-4-31b",
     "gemma-4-26b-a4b",
     // ── THE MLA LINEAGE ─────────────────────────────────────────────
     //
@@ -71,13 +92,32 @@ const NOT_YET_SERVABLE: &[&str] = &[
     "kimi-k3",
 ];
 
+/// Can this shell actually SERVE the row -- open it and fire it.
+///
+/// Both surfaces, because a refusal can come from either and the engine
+/// meets them in order. `deployment()` is the door; `trace()` is the first
+/// fire, and `Variant::trace`'s own doc says a row "that has a text for one
+/// backend and not the other refuses the other HERE". Asking only the door
+/// is how `gemma-4-31b` sat outside `NOT_YET_SERVABLE` while being refused
+/// by the same line as the sibling that was on it.
+///
+/// Both fire classes, because they are traced separately and a build could
+/// have one and not the other -- and a row that prefills and cannot decode
+/// is servable for exactly one request.
+fn servable(row: &'static dyn catalog::Variant) -> bool {
+    use model_ir::trace::FireClass;
+    row.deployment(Deployed::single()).is_ok()
+        && row.trace(FireClass::Prefill, Deployed::single()).is_ok()
+        && row.trace(FireClass::Decode, Deployed::single()).is_ok()
+}
+
 /// Every catalog row either projects a `Deployment` or is on the list.
 #[test]
 fn every_row_deploys_or_is_stated_unservable() {
     let stated: BTreeSet<&str> = NOT_YET_SERVABLE.iter().copied().collect();
     let mut refused: BTreeSet<&str> = BTreeSet::new();
     for row in catalog::catalog() {
-        if row.deployment(Deployed::single()).is_err() {
+        if !servable(*row) {
             refused.insert(row.id());
         }
     }
@@ -88,15 +128,17 @@ fn every_row_deploys_or_is_stated_unservable() {
     let unstated: Vec<&str> = refused.difference(&stated).copied().collect();
     assert!(
         unstated.is_empty(),
-        "these rows refuse to deploy and are not stated as unservable, so a \
-         checkpoint matching one loads and then fails at the door: \
-         {unstated:?}"
+        "these rows are not servable and are not stated as unservable: \
+         {unstated:?}\n  A checkpoint matching one is admitted and then \
+         refused -- at the door if `deployment()` is what declined, or at \
+         the FIRST FIRE if it deployed and `trace()` declined, which is the \
+         worse of the two and the one this list was written for."
     );
     let stale: Vec<&str> = stated.difference(&refused).copied().collect();
     assert!(
         stale.is_empty(),
-        "these rows are listed as unservable but deploy fine; delete their \
-         lines: {stale:?}"
+        "these rows are listed as unservable but deploy AND trace fine; \
+         delete their lines: {stale:?}"
     );
 }
 
@@ -128,12 +170,15 @@ fn the_unservable_list_names_only_real_rows() {
 /// file.
 #[test]
 fn the_three_live_families_are_servable() {
-    for want in ["qwen3-0.6b", "gemma-4-e4b-it", "qwen3.5-4b"] {
+    // These are catalog ids, not checkpoint directories. `real_gemma4`
+    // opens `models--google--gemma-4-E2B-it`; the row it matches is
+    // `gemma-4-e2b`, because the instruction-tune suffix names a
+    // CHECKPOINT and the row is the shape all of them share. This test
+    // asked for `gemma-4-e4b-it` -- wrong on both counts, and it named
+    // the E4B when the A/B has always opened the E2B.
+    for want in ["qwen3-0.6b", "gemma-4-e2b", "qwen3.5-4b"] {
         let row = catalog::find(want).unwrap_or_else(|| panic!("{want} must stay in the catalog"));
-        assert!(
-            row.deployment(Deployed::single()).is_ok(),
-            "{want} must stay servable"
-        );
+        assert!(servable(row), "{want} must stay servable");
     }
 }
 
@@ -342,6 +387,12 @@ const FOLDS_UNIT_OFFSET: &[&str] = &[
     "gemma-3-4b",
     "gemma-3-12b",
     "gemma-3-27b",
+    // The gemma-3 text tower at 768 wide, and it folds because it IS a
+    // gemma-3: same sandwich, same offset-from-one gain. It joined the
+    // catalog after this list was written and landed on neither side of
+    // it, which is the case the list exists for -- a derivation would
+    // have answered for it silently and been right by luck.
+    "embeddinggemma-300m",
     "gemma-3n-e2b",
     "gemma-3n-e4b",
 ];

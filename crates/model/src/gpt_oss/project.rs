@@ -44,7 +44,7 @@ pub fn manifest(f: &GptOssFacts) -> Manifest {
     Manifest::new(f.layers)
         .with(TensorSpec::required("embed_tokens", [vocab, hidden]))
         .with(TensorSpec::required("norm", [hidden]))
-        .either(!f.tied_embeddings, "lm_head", [vocab, hidden])
+        .tie(f.tied_embeddings, "lm_head", [vocab, hidden])
         .with(TensorSpec::required(
             "layer.{}.self_attn.q_proj",
             [q, hidden],
@@ -176,6 +176,7 @@ pub fn deployment(
             // Full rotation at the head dim. gpt-oss's YaRN scaling is a
             // property of the rope TABLE, not of its width.
             rotary_dim: 0,
+            q_gate: false,
         })
         .collect();
     Deployment {
@@ -454,7 +455,7 @@ pub fn metal_facts(
 /// Two consequences worth stating, because each is a place this could have
 /// gone wrong quietly:
 ///
-///   * It cannot ride the frequency table. `Source::RopeFrequencies` carries
+///   * It cannot ride the frequency table. `Source::Named(<keys::RopeFrequencies as keys::Fact>::KEY)` carries
 ///     inverse frequencies and the shader raises its own `cos`/`sin` from
 ///     them, so an amplitude handed to `model::rope` would simply be dropped.
 ///     CUDA does not have this problem — `bind::abi` passes all four YaRN
@@ -545,6 +546,7 @@ mod tests {
             paged_multi_batch: true,
             qmm_multi_batch: true,
             add_bias: true,
+            fused_qk_rope: false,
         };
         let m = metal_facts(&f, &bind);
         let factor = 0.1f32.mul_add(32.0f32.ln(), 1.0);
@@ -608,6 +610,7 @@ mod tests {
             paged_multi_batch: true,
             qmm_multi_batch: true,
             add_bias: true,
+            fused_qk_rope: false,
         };
         assert_eq!(
             LlamaLikeMetalFacts::gpt_oss_20b(),
@@ -650,6 +653,7 @@ mod tests {
             paged_multi_batch: true,
             qmm_multi_batch: true,
             add_bias: true,
+            fused_qk_rope: false,
         };
         let shape = metal_shape(&f);
         assert!(shape.o_bias, "the row this test reads states one");

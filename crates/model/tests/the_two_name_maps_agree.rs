@@ -49,6 +49,10 @@ const BINDING: MetalBinding = MetalBinding {
     fuse_residual_gemv: true,
     paged_multi_batch: true,
     qmm_multi_batch: true,
+    // FALSE, and unlike `add_bias` that is not a wrong answer quietly taken:
+    // only `driver-vulkan` fires the fused form, and the two texts compute the
+    // same thing at different dispatch counts, so no name moves either way.
+    fused_qk_rope: false,
     // TRUE, and the only one of the four whose value is a copy of something
     // this crate cannot see. `driver-metal::model::binding::build_kernels` is
     // where the claim lives; the layering forbids a dependency on it, so this

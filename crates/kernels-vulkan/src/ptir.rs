@@ -1,26 +1,24 @@
 //! The PTIR substrate's own kernels -- the ones the tensor-compiler's
 //! emitted shader text cannot produce because they predate a region.
 
-use kernels::KernelSig;
 use kernels::routine::Refusal;
 
-use crate::routine::{Bind, Buf, BufMut, Ctx, Env, Fire, Routine};
+use crate::routine::{keys, Ask, Bind, Block, Buf, BufMut, Ctx, Fire, Routine};
+use crate::routine::{InSlot, OutSlot};
 
-pub static KERNELS: &[KernelSig] = &[
-    // NOT filled, and it is not an oversight: this backend's channel-plane
-    // interpreter never dispatches it.
-    //
-    // The kernel stages logits rows GPU-side, and its own header records why
-    // it was written -- a sixteen-request fire paid sixteen command-buffer
-    // round trips per token to move sixteen vocabulary rows, about 3ms of a
-    // 23.5ms step. That problem does not exist here. Apple silicon shares
-    // physical memory, so `pipeline::step::PassInputs` takes the read-out as a
-    // BORROWED host slice: "copying it per fire would be pure waste."
-    //
-    // A row is filled when a text names its symbol. No text names this one and
-    // none should, so it stays a declaration of what the shader tree contains
-    // rather than of what this driver dispatches.
-];
+// This family's `kernel!` row was NOT filled, and that was never an
+// oversight: this backend's channel-plane interpreter does not dispatch
+// `copy_logits_bf16`, so nothing was ever there to state.
+//
+// The kernel stages logits rows GPU-side, and its own header records why it
+// was written -- a sixteen-request fire paid sixteen command-buffer round
+// trips per token to move sixteen vocabulary rows, about 3 ms of a 23.5 ms
+// step. That problem does not exist here. Apple silicon shares physical
+// memory, so `pipeline::step::PassInputs` takes the read-out as a BORROWED
+// host slice: "copying it per fire would be pure waste."
+//
+// The routine below is crossed anyway, for the same reason the row existed:
+// it states what the shader tree CONTAINS, not what this driver fires.
 
 /// The entrypoints this family's routines spell, now that its rows are gone.
 ///
@@ -48,11 +46,11 @@ pub static ENTRYPOINTS: &[&str] = &["copy_logits_bf16"];
 /// so the caller would read the destination it passed as a staged row.
 pub fn copy_logits_bf16(
     ctx: &Ctx<'_>,
-    source: Buf,
-    destination: BufMut,
-    params: Buf,
-    vocab: Env<u32>,
-    rows: Env<u32>,
+    source: InSlot<0, Buf>,
+    destination: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    vocab: Ask<keys::Width, u32>,
+    rows: Ask<keys::Rows, u32>,
 ) -> Result<(), Refusal> {
     if *rows == 0 {
         return Err(Refusal::Empty { what: "rows" });
@@ -102,7 +100,7 @@ mod tests {
     #[test]
     fn a_staging_fires_one_lane_for_each_entry_of_each_row() {
         let seen = Seen::default();
-        copy_logits_bf16(&seen, Buf(0), BufMut(1), Buf(2), Env(262_144), Env(16)).unwrap();
+        copy_logits_bf16(&seen, InSlot::new(Buf(0)), OutSlot::new(BufMut(1)), Block::new(Buf(2)), Ask::new(262_144), Ask::new(16)).unwrap();
         let calls = seen.0.borrow();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].1, [262_144, 16, 1]);
@@ -114,11 +112,11 @@ mod tests {
     fn an_empty_vocabulary_or_row_count_is_refused() {
         let seen = Seen::default();
         assert!(matches!(
-            copy_logits_bf16(&seen, Buf(0), BufMut(1), Buf(2), Env(8), Env(0)),
+            copy_logits_bf16(&seen, InSlot::new(Buf(0)), OutSlot::new(BufMut(1)), Block::new(Buf(2)), Ask::new(8), Ask::new(0)),
             Err(Refusal::Empty { what: "rows" })
         ));
         assert!(matches!(
-            copy_logits_bf16(&seen, Buf(0), BufMut(1), Buf(2), Env(0), Env(4)),
+            copy_logits_bf16(&seen, InSlot::new(Buf(0)), OutSlot::new(BufMut(1)), Block::new(Buf(2)), Ask::new(0), Ask::new(4)),
             Err(Refusal::Empty { what: "vocab" })
         ));
         assert!(seen.0.borrow().is_empty(), "a refused shape dispatched");

@@ -59,36 +59,7 @@ pub use serde_json;
 // Re-export the attribute macro
 pub use inferlet_macros::main;
 
-// =============================================================================
-// The generated bindings
-// =============================================================================
 
-// This crate OWNS the `pie:inferlet` WIT package (`wit/`, beside this file)
-// and is the crate that generates from it. That is not a style choice:
-// `generate!`'s `path` is a filesystem path resolved at macro expansion, and
-// a .crate archive can only reach a `wit/` inside its own package directory.
-// This crate is published to crates.io, so the WIT has to live here -- a
-// `path: "../<other-crate>/wit"` compiles in a git checkout and breaks the
-// moment the package is packed. `include` in Cargo.toml keeps `wit/` in the
-// archive; the failure mode of losing it is a broken release, not a build
-// error here.
-//
-// The HOST bindings are a different generator and stay out of this crate:
-// `engine`'s `wasmtime::component::bindgen!` reads `../inferlet/wit` by path.
-// What the two share is the directory, not a rlib -- folding them together
-// would put wasmtime in a wasm guest's dependency graph.
-//
-// With no `async:` option, the WIT's own `async func` annotations drive async
-// generation: only run/execute/receive become `async fn`
-// (component-model-async); sync funcs (model::encode, chat::*, …) stay sync.
-// wit-bindgen generates the wasi:io bindings itself with versioned
-// cabi_realloc symbols so it doesn't collide with std's copy.
-//
-// `pub_export_macro` emits `export!` as a `#[macro_export]` macro taking
-// `with_types_in <path>`, so a leaf inferlet can name `::inferlet` and never
-// has to know where the generator sits. `crate::pie::…` and `crate::wasi::…`
-// are what the wrappers in this file and in `ptir`/`chat` name; `exports` +
-// `export!` are what `#[inferlet::main]` expands into.
 wit_bindgen::generate!({
     path: "wit",
     world: "inferlet",
@@ -96,17 +67,11 @@ wit_bindgen::generate!({
     generate_all,
 });
 
-// Re-exported so a guest that writes its own inline `generate!` for a private
-// world uses the same wit-bindgen that produced this one: two different
-// wit-bindgen versions emit disagreeing `cabi_realloc`/runtime glue.
 pub use wit_bindgen;
 
 // Re-export types that don't need async wrappers directly
 pub use pie::inferlet::types;
 
-// =============================================================================
-// Context
-// =============================================================================
 
 /// The runtime working-set resources (KV page-slot array + recurrent state).
 /// The generated WIT resources, unwrapped; [`ptir::WorkingSet`] is the
@@ -115,9 +80,6 @@ pub mod working_set {
     pub use crate::pie::inferlet::working_set::*;
 }
 
-// =============================================================================
-// Forward primitive
-// =============================================================================
 
 pub mod mask;
 /// The author-facing PTIR bridge (overview §3/§5): `ForwardPass`/`Pipeline`/
@@ -125,15 +87,9 @@ pub mod mask;
 /// trace `Builder`. The single home of the PTIR authoring surface.
 pub mod ptir;
 
-// =============================================================================
-// Generation state machine + decoders
-// =============================================================================
 
 pub mod chat;
 
-// =============================================================================
-// Model
-// =============================================================================
 
 /// The engine serves exactly one model; these are global functions over
 /// that single bound model. There is no `Model`/`Tokenizer` handle to pass
@@ -151,9 +107,6 @@ pub mod model {
     };
 }
 
-// =============================================================================
-// Other re-exports
-// =============================================================================
 
 pub mod runtime {
     pub use crate::pie::inferlet::system::*;
@@ -200,8 +153,3 @@ pub mod media {
     pub use crate::pie::inferlet::media::{Audio, Image, Video};
 }
 
-// Under component-model-async, the WIT `async func`s are generated as native
-// `async fn`s directly on the bindings — `forward-pass.execute().await`,
-// `session::receive().await` — so no SDK-side pollable/future polling shim
-// is needed (the old `ForwardPassExt`, `FutureStringExt`, `FutureBlobExt` and the `wstd`
-// executor have been removed); the host event loop drives all of it.

@@ -73,7 +73,7 @@ pub trait Resolver {
     /// writes it has a pointer that cannot come from the statement's args, and
     /// every backend has answered that with a hand-written arm.
     ///
-    /// [`Source::KvKeys`] and [`Source::KvValues`] let a row ask instead, and
+    /// [`Source::Named(<keys::KvKeys as keys::Fact>::KEY)`] and [`Source::Named(<keys::KvValues as keys::Fact>::KEY)`] let a row ask instead, and
     /// this is where the asking lands.
     ///
     /// Defaulted to `None` so a resolver with no pool — the binder's tests,
@@ -81,8 +81,8 @@ pub trait Resolver {
     /// statement that asks and gets `None` binds a region addressing nothing,
     /// which is the same honest answer a missing scale gets.
     ///
-    /// [`Source::KvKeys`]: kernels::Source::KvKeys
-    /// [`Source::KvValues`]: kernels::Source::KvValues
+    /// [`Source::Named(<keys::KvKeys as keys::Fact>::KEY)`]: kernels::Source::Named(<kernels::keys::KvKeys as kernels::keys::Fact>::KEY)
+    /// [`Source::Named(<keys::KvValues as keys::Fact>::KEY)`]: kernels::Source::Named(<kernels::keys::KvValues as kernels::keys::Fact>::KEY)
     fn kv(&mut self, _layer: u16, _values: bool) -> Option<Slice> {
         None
     }
@@ -288,16 +288,20 @@ const SCALE_PREFIX: &str = "scale.";
 
 /// Resolve one operand.
 ///
+/// `rows` is the launch's row count, and `None` means it is not knowable on
+/// the host — see [`bind`], which is the only caller that has one.
+///
 /// # Errors
 ///
 /// [`BindRefusal`] naming which of the three rules could not be applied.
 pub fn resolve_arg<S: Resolver>(
     arg: &Arg,
     frame: Frame,
+    rows: Option<u32>,
     resolver: &mut S,
 ) -> Result<BoundArg, BindRefusal> {
     Ok(match arg {
-        Arg::Arena { at, width, .. } => {
+        Arg::Arena { at, width, bytes: stride } => {
             let at64 = *at as u64;
             let bytes = frame.arena.bytes;
             // The row is `width` elements from `at`; the arena must hold the
@@ -310,10 +314,46 @@ pub fn resolve_arg<S: Resolver>(
                     arena_bytes: bytes,
                 });
             }
+            // THE RECTANGLE, not the rest of the arena.
+            //
+            // This used to answer `bytes - at64` — every arena operand ran
+            // from its own offset to the end of the arena. The address was
+            // right, and the address is all `encode` binds, so nothing read
+            // wrong bytes. What it cost was ORDER: `Hazards` decides whether
+            // two dispatches may overlap by intersecting these extents, and
+            // extents that all end at the same place all intersect. Measured,
+            // that was a barrier before EVERY dispatch — 604 of 604 on
+            // gpt-oss-20b, 1080 of 1080 on gemma-4-26b-a4b, 1084 of 1084 on
+            // Qwen3.6-35B-A3B — which is a fire encoded as a chain. Removing
+            // the barriers entirely took gpt-oss's 128-token prefill from
+            // 468 to 976 tok/s, so the serialisation was most of the prefill.
+            //
+            // `Arg::Arena` states the rectangle it addresses: `width`
+            // elements a row, `bytes` per element, over the launch's rows.
+            // Its own doc says so — *"The rows come from `Launch::rows`;
+            // together they are the rectangle the kernel addresses."* This
+            // takes it at its word.
+            //
+            // Conservative in the two directions that matter. Rows the host
+            // cannot know (`PeelRegion::rows_device`) arrive as `None` and
+            // keep the old answer, because a device-decided row count could
+            // be any of them. A degenerate rectangle — no rows, no width, no
+            // element — also keeps it, because zero would mean "meets
+            // nothing" and a statement that states nothing has not earned
+            // that. And every extent is clamped to the arena, so a width
+            // stated per-row for an operand the kernel shares across rows
+            // over-reports rather than under-reports.
+            let rest = bytes - at64;
+            let extent = rows
+                .map(u64::from)
+                .and_then(|r| r.checked_mul(u64::from(*width)))
+                .and_then(|r| r.checked_mul(u64::from(*stride)))
+                .filter(|extent| *extent != 0)
+                .map_or(rest, |extent| extent.min(rest));
             BoundArg {
                 slice: Slice {
                     address: frame.arena.address + at64,
-                    bytes: bytes - at64,
+                    bytes: extent,
                 },
                 width: *width,
             }
@@ -361,8 +401,15 @@ pub fn bind<'a, S: Resolver>(
 ) -> Result<BoundLaunch<'a>, BindRefusal> {
     let span = launch.args.start as usize..launch.args.end as usize;
     let mut args = Vec::with_capacity(span.len());
+    // What the launch's arena operands span. A peel region whose row count
+    // the DEVICE decides has none the host may state, and `resolve_arg`
+    // widens those back to the rest of the arena.
+    let rows = match &launch.peel {
+        Some(peel) if peel.rows_device => None,
+        _ => Some(launch.rows.end),
+    };
     for arg in &lowered.args[span] {
-        args.push(resolve_arg(arg, frame, resolver)?);
+        args.push(resolve_arg(arg, frame, rows, resolver)?);
     }
     Ok(BoundLaunch {
         kernel: &lowered.kernels[launch.kernel as usize],
@@ -408,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn an_arena_operand_addresses_its_offset_and_reports_what_is_left() {
+    fn an_arena_operand_addresses_its_offset_and_spans_its_rectangle() {
         let frame = arena(4096);
         let mut store = Store::default();
         let bound = resolve_arg(
@@ -418,12 +465,75 @@ mod tests {
                 bytes: 2,
             },
             frame,
+            Some(4),
             &mut store,
         )
         .expect("inside the arena");
         assert_eq!(bound.slice.address, 0x1_0000 + 256);
-        assert_eq!(bound.slice.bytes, 4096 - 256, "what it may still address");
+        assert_eq!(bound.slice.bytes, 4 * 64 * 2, "four rows of 64 bfloats");
         assert_eq!(bound.width, 64);
+    }
+
+    /// The extent decides whether two dispatches may overlap, so a row count
+    /// the host does not have has to mean "all of it" rather than "none".
+    #[test]
+    fn an_arena_operand_whose_rows_the_device_decides_spans_the_rest() {
+        let frame = arena(4096);
+        let mut store = Store::default();
+        let bound = resolve_arg(
+            &Arg::Arena {
+                at: 256,
+                width: 64,
+                bytes: 2,
+            },
+            frame,
+            None,
+            &mut store,
+        )
+        .expect("inside the arena");
+        assert_eq!(bound.slice.bytes, 4096 - 256, "what it may still address");
+    }
+
+    /// A rectangle with no area is a statement that said nothing about its
+    /// extent, and zero would let it overlap nothing at all.
+    #[test]
+    fn an_arena_operand_with_a_degenerate_rectangle_spans_the_rest() {
+        let frame = arena(4096);
+        let mut store = Store::default();
+        for (rows, width) in [(0, 64), (4, 0)] {
+            let bound = resolve_arg(
+                &Arg::Arena {
+                    at: 256,
+                    width,
+                    bytes: 2,
+                },
+                frame,
+                Some(rows),
+                &mut store,
+            )
+            .expect("inside the arena");
+            assert_eq!(bound.slice.bytes, 4096 - 256, "rows {rows}, width {width}");
+        }
+    }
+
+    /// An operand the kernel shares across rows states a per-row width it
+    /// does not have, and the arena is the only bound that always holds.
+    #[test]
+    fn an_arena_operand_never_spans_past_the_arena() {
+        let frame = arena(4096);
+        let mut store = Store::default();
+        let bound = resolve_arg(
+            &Arg::Arena {
+                at: 256,
+                width: 4096,
+                bytes: 2,
+            },
+            frame,
+            Some(64),
+            &mut store,
+        )
+        .expect("inside the arena");
+        assert_eq!(bound.slice.bytes, 4096 - 256, "clamped to the arena");
     }
 
     #[test]
@@ -441,6 +551,7 @@ mod tests {
                     bytes: 2
                 },
                 frame,
+                Some(1),
                 &mut store
             ),
             Err(BindRefusal::ArenaOutOfBounds {
@@ -456,7 +567,7 @@ mod tests {
         let frame = arena(64);
         let mut store = Store::default();
         assert_eq!(
-            resolve_arg(&Arg::Weight("layer.3.q_proj".into()), frame, &mut store),
+            resolve_arg(&Arg::Weight("layer.3.q_proj".into()), frame, Some(1), &mut store),
             Err(BindRefusal::UnknownWeight("layer.3.q_proj".into())),
             "a trace naming a weight the store lacks was traced against another binding"
         );
@@ -469,7 +580,7 @@ mod tests {
         store
             .weights
             .insert("layer.3.q_proj".into(), slice(0xABC0, 8192));
-        let bound = resolve_arg(&Arg::Weight("layer.3.q_proj".into()), frame, &mut store)
+        let bound = resolve_arg(&Arg::Weight("layer.3.q_proj".into()), frame, Some(1), &mut store)
             .expect("the store holds it");
         assert_eq!(bound.slice, slice(0xABC0, 8192));
         assert_eq!(bound.width, 0, "zero is not a missing value here");
@@ -482,7 +593,7 @@ mod tests {
         // dispatch constant. The store is never asked.
         let frame = arena(64);
         let mut store = Store::default();
-        let bound = resolve_arg(&Arg::Weight("scale.rope_theta".into()), frame, &mut store)
+        let bound = resolve_arg(&Arg::Weight("scale.rope_theta".into()), frame, Some(1), &mut store)
             .expect("a scale never refuses");
         assert_eq!(bound.slice, slice(0, 0));
         assert!(store.weights.is_empty(), "and nothing was looked up");
@@ -500,6 +611,7 @@ mod tests {
                     bytes: 4,
                 },
                 frame,
+                Some(1),
                 &mut store
             ),
             Err(BindRefusal::UnknownNamed(7))
@@ -513,6 +625,7 @@ mod tests {
                     bytes: 4,
                 },
                 frame,
+                Some(1),
                 &mut store
             )
             .expect("bound now")

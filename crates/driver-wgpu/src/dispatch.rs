@@ -11,28 +11,27 @@
 //!
 //! # Why the grid needs the statement and not just the fire
 //!
-//! A [`Rule`] evaluates against [`Dims`], and most of `Dims` is fire-wide: head
-//! count, head width, expert count. Most, not all. `KernelSig` carries three
-//! indices — `grid_param`, `head_param`, `heads_param` — that each name a
-//! scalar in the STATEMENT's own run, and a row that names one is saying its
-//! extent varies per layer in a way no fire-wide number can express.
+//! A grid evaluates against facts that are mostly FIRE-WIDE — head count, head
+//! width, expert count. Mostly, not all. `KernelSig` carried three indices —
+//! `grid_param`, `head_param`, `heads_param` — that each named a scalar in the
+//! STATEMENT's own run, because a kernel's extent can vary per layer in a way
+//! no fire-wide number expresses.
 //!
 //! Gemma-4 is the case that forces it: its full-attention layers rotate a
 //! quarter of each head and its sliding layers rotate all of one, and they
-//! carry four 512-wide KV heads against sixteen 256-wide ones. A driver reading
-//! the fire's `rotary_dims` describes neither. `driver-metal` learned this and
-//! states so at [`dims_of`]'s counterpart; the reading is transcribed rather
-//! than rediscovered.
+//! carry four 512-wide KV heads against sixteen 256-wide ones. A driver
+//! reading the fire's `rotary_dims` describes neither.
 //!
-//! A row naming a param its statement does not carry falls back to the fire
-//! rather than to zero, because a grid of zero is a dispatch that runs nothing,
-//! returns success, and leaves the output holding whatever it was born with.
-//! That failure mode is the one this crate refuses hardest —
-//! [`Undispatchable::Empty`] is where.
+//! A ROUTINE says this without an index: the fact is an argument, and
+//! [`crate::lowering::hold::Handles::stated`] is how an arm supplies it — the
+//! statement's scalar where there is one, the fire's where there is not, and
+//! never a zero. A grid of zero is a dispatch that runs nothing, returns
+//! success, and leaves the output holding whatever it was born with, which is
+//! the failure mode this crate refuses hardest.
 //!
 //! # The device limit is deliberately not applied here
 //!
-//! [`plan_one`] calls [`crate::geometry::groups`] and not `groups_within`,
+//! [`plan_one`] plans a grid without applying the adapter's ceiling,
 //! because a `Dispatch` is what the KERNEL needs and the limit is a property of
 //! the adapter that will run it. The device half checks
 //! [`Dispatch::groups`] against its own
@@ -40,17 +39,15 @@
 //! number. Folding the limit in here would mean a plan that this build can
 //! reason about only where it can also run.
 
-use crate::binding::{
-    Arena, Bound, ParamSlot, Params, Resolve, Slot, Unbindable, descriptors, reorder, scalars,
-};
-use crate::geometry::{Dims, Module, Rule, Ungeometric, groups};
-use kernels::KernelSig;
+use crate::binding::{Arena, Bound, ParamSlot, Params, Resolve};
+use crate::geometry::Module;
 use model_compiler::lower::{Arg, Launch, Lowered};
 
 /// The fire-wide shape a plan is executed at.
 ///
-/// Everything a [`Rule`] needs that a single statement does not state. A
-/// statement may override three of these; see [`dims_of`].
+/// Everything a grid needs that a single statement does not state. A statement
+/// may override any of these by carrying its own scalar; see
+/// [`crate::lowering::hold::Handles::stated`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Geometry {
     /// Query heads.
@@ -61,10 +58,42 @@ pub struct Geometry {
     pub head_dim: u32,
     /// Channels a partial rope rotates.
     pub rotary_dims: u32,
+    /// Recurrent value heads, or `0` for a stack with none.
+    ///
+    /// A THIRD pair beside [`Self::kv_heads`] and [`Self::head_dim`], and not
+    /// a third spelling of them: a gated-deltanet layer has no keys and
+    /// values in the attention sense at all, and its head count and width are
+    /// what size the recurrent slab, the gated norm and the scan grid.
+    ///
+    /// Before this pair existed the GDN arms read the numbers off the
+    /// STATEMENT's scalars while their signatures asked the fire for
+    /// `VHeads`/`VDim`, so the two readings of the same launch disagreed
+    /// about where the shape lives. The signatures are the ones metal states
+    /// and runs on a device; this makes the fire able to answer them.
+    pub v_heads: u32,
+    /// See [`Self::v_heads`].
+    pub v_dim: u32,
     /// Experts the router scores.
     pub n_experts: u32,
     /// Experts each token routes to.
     pub experts_per_token: u32,
+}
+
+impl Geometry {
+    /// This stack's RECURRENT head count and width.
+    ///
+    /// Falls back to the attention pair when no recurrent one is stated,
+    /// character-for-character `driver_metal`'s `recurrent_at`. A fire whose
+    /// only shape IS the recurrent shape -- which is every GDN fixture that
+    /// predates the pair -- keeps reading the numbers it always did.
+    #[must_use]
+    pub const fn recurrent(&self) -> (u32, u32) {
+        if self.v_heads > 0 && self.v_dim > 0 {
+            (self.v_heads, self.v_dim)
+        } else {
+            (self.kv_heads, self.head_dim)
+        }
+    }
 }
 
 /// One recordable dispatch: everything a command encoder needs, and nothing
@@ -94,9 +123,32 @@ pub struct Dispatch<'a, B> {
     /// `None` for the ordinary case where the scalars are the uniform block:
     /// that buffer is a bind group of its own and takes no place in this list.
     pub block_at: Option<usize>,
-    /// Workgroups in each dimension. Never contains a zero; see
-    /// [`Undispatchable::Empty`].
+    /// Workgroups in each dimension.
+    ///
+    /// Never contains a zero, and that used to be a named refusal here. A
+    /// routine builds its grid from `kernels::shader`'s helpers, which refuse
+    /// an empty extent as `Refusal::Grid` before a `Fire` is ever stated, so
+    /// the zero is caught a plane earlier and arrives as
+    /// [`Undispatchable::Routine`].
     pub groups: [u32; 3],
+    /// The `@group(1)` uniform block, when the dispatch ALSO has a storage
+    /// one.
+    ///
+    /// Empty for every kernel whose scalars ride one place or the other, which
+    /// until qwen3.5's prompt scan was all of them: [`Self::params`] carries a
+    /// `ParamSlot::Uniform` block or a `ParamSlot::Storage` one and a dispatch
+    /// needed no way to say BOTH.
+    ///
+    /// `ssm/gdn_prep.wgsl`'s prefill pair needs both, and the split is the
+    /// ABI's rather than a convenience: `GdnCoreParams` is a `@group(0)`
+    /// storage buffer because every GDN row states it as a pointer to numbers
+    /// the host already assembled, while `row_pitch` and `n_scan` are the
+    /// RECTANGLE's and reach the shader as the two fields of its `@group(1)`
+    /// block. Appending them to the storage run instead -- which is what
+    /// happened while nothing needed the distinction -- leaves the uniform
+    /// empty, and `Device::check_bindable` refuses a short block by name
+    /// because a zero pitch is a plausible number.
+    pub uniform: Vec<u8>,
     /// Which traced op produced this, for a refusal to point at.
     pub op: u32,
 }
@@ -108,52 +160,6 @@ pub enum Undispatchable {
     Unknown {
         /// The symbol the plan named.
         symbol: String,
-    },
-    /// The row's slots and the module's bindings do not line up.
-    Layout(
-        /// Which reading disagreed.
-        crate::binding::Unlayoutable,
-    ),
-    /// An operand could not be bound.
-    Operand {
-        /// Which operand of the launch, counting from zero.
-        at: usize,
-        /// Why.
-        why: Unbindable,
-    },
-    /// The scalars the plan states do not fit where the module reads them.
-    Scalars {
-        /// How many the plan states.
-        stated: usize,
-        /// How many the module's uniform block has room for.
-        room: usize,
-    },
-    /// The row names a scalar the driver cannot work out.
-    ///
-    /// Forwarded from [`crate::binding::Misplaced::Unresolved`], which says
-    /// why this is a refusal and not a zero. Carries the symbol as well as the
-    /// operand, because the row is where the repair is: either the source is
-    /// one `binding::scalars` should derive, or the row is naming the wrong
-    /// one.
-    Unresolved {
-        /// The symbol whose row named it.
-        symbol: String,
-        /// Which operand, counting from zero.
-        at: usize,
-        /// The operand's name, as the row spells it.
-        name: &'static str,
-        /// The `kernels::Source` variant, rendered.
-        source: String,
-    },
-    /// The row walks the KV cache with strides and no page table, and this
-    /// driver's pool is paged. See [`crate::binding::Misplaced::Contiguous`].
-    Contiguous {
-        /// The symbol whose row named it.
-        symbol: String,
-        /// Which operand, counting from zero.
-        at: usize,
-        /// The operand's name, as the row spells it.
-        name: &'static str,
     },
     /// A crossed routine could not be planned.
     ///
@@ -176,11 +182,6 @@ pub enum Undispatchable {
         /// How many the body asked for.
         stated: usize,
     },
-    /// The rule and dims do not describe a grid.
-    Ungeometric {
-        /// Why.
-        why: Ungeometric,
-    },
     /// The rectangle sits under a guard nothing has evaluated.
     ///
     /// Not a defect: a conditional arm is a launch a caller records only after
@@ -192,70 +193,15 @@ pub enum Undispatchable {
         /// Which conditional region, as an index into `Lowered::conds`.
         cond: u32,
     },
-    /// The plan states a different number of operands than the module binds.
-    ///
-    /// Almost always the plan being short of a resource the driver is expected
-    /// to own -- a paged KV cache, a page table -- rather than a mistake.
-    /// Refused because `wgpu` validates a bind group against its layout entry
-    /// for entry, so a set that is short is rejected at encode time with
-    /// nothing about the launch in the message, and one that is long would put
-    /// a tensor at a slot on the theory that nothing looks there.
-    Arity {
-        /// The symbol whose module disagrees.
-        symbol: String,
-        /// How many operands the plan states.
-        stated: usize,
-        /// How many bindings the module really has: its layout less its unread
-        /// slots.
-        module: usize,
-    },
-    /// The grid computed to zero in some dimension.
-    ///
-    /// Legal WebGPU and always a defect: it runs nothing, reports success, and
-    /// leaves the output holding whatever it held before. Refused here rather
-    /// than at the device so that the traced op is still in hand to name.
-    Empty {
-        /// The grid that would have been dispatched.
-        groups: [u32; 3],
-    },
 }
 
 impl std::fmt::Display for Undispatchable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unknown { symbol } => write!(f, "no kernel row states `{symbol}`"),
-            Self::Layout(why) => write!(f, "{why}"),
-            Self::Operand { at, why } => write!(f, "operand {at}: {why}"),
-            Self::Scalars { stated, room } => {
-                write!(f, "{stated} scalars stated, room for {room}")
-            }
-            Self::Unresolved {
-                symbol,
-                at,
-                name,
-                source,
-            } => write!(
-                f,
-                "`{symbol}` operand {at} (`{name}`) is sourced from {source}, \
-                 which this driver does not know how to work out"
-            ),
-            Self::Contiguous { symbol, at, name } => write!(
-                f,
-                "`{symbol}` operand {at} (`{name}`) is a contiguous KV stride, \
-                 and this driver's pool is paged: the row would read real \
-                 memory at the wrong tokens"
-            ),
+            Self::Unknown { symbol } => write!(f, "no armed stem claims `{symbol}`"),
             Self::Conditional { symbol, cond } => {
                 write!(f, "`{symbol}` sits under unevaluated guard {cond}")
             }
-            Self::Arity {
-                symbol,
-                stated,
-                module,
-            } => write!(
-                f,
-                "`{symbol}` states {stated} operands and its module binds {module}"
-            ),
             Self::Routine { symbol, why } => {
                 write!(f, "`{symbol}` could not be planned as a routine: {why}")
             }
@@ -264,13 +210,6 @@ impl std::fmt::Display for Undispatchable {
                 "`{symbol}`'s body stated {stated} dispatches and one launch \
                  carries one"
             ),
-            Self::Ungeometric { why } => write!(f, "no grid: {why}"),
-            Self::Empty { groups } => {
-                write!(
-                    f,
-                    "a grid of {groups:?} would run nothing and report success"
-                )
-            }
         }
     }
 }
@@ -287,76 +226,6 @@ fn widths<'a>(lowered: &'a Lowered, launch: &Launch) -> impl DoubleEndedIterator
         })
 }
 
-/// The scalar at `index` of this launch's own run, when it states one there and
-/// it is not zero.
-///
-/// Zero is filtered because it is what an unstated slot reads as, and a zero
-/// extent is a grid of nothing.
-fn stated(lowered: &Lowered, launch: &Launch, index: Option<u8>) -> Option<u32> {
-    let i = index?;
-    let at = launch.params.start as usize + i as usize;
-    if at >= launch.params.end as usize {
-        return None;
-    }
-    lowered.params.get(at).copied().filter(|n| *n > 0)
-}
-
-/// The dims one launch evaluates its rule at.
-///
-/// `sig` is the launch's own kernel row, and it is here because a row may say
-/// that its rule's extent comes from the STATEMENT rather than from the fire.
-/// See this module's own documentation for the case that forces it.
-///
-/// # What each of the three overrides is held by
-///
-/// `grid_param` fires 1788 times over the Vulkan port's six texts, and a driver
-/// that read only the fire would normalise over the wrong width every one of
-/// those times and produce numbers rather than an error.
-///
-/// `head_param` and `heads_param` are the two whose absence hid for longer than
-/// it looked, and the way it hid is worth keeping. Counting rows that STATE a
-/// head shape does not witness these lines USING it: for those texts the stated
-/// value EQUALS the fire's, so the overrides are no-ops there and a no-op
-/// cannot be caught by a test that only checks the answer. The model that
-/// separates them is gemma-4, whose full-attention layers carry four 512-wide
-/// KV heads against its sliding layers' sixteen 256-wide ones. A walk that
-/// hands the same launch a geometry disagreeing on purpose is what makes
-/// deleting either line fail; recorded rather than tidied away because "it is
-/// counted" read as "it is checked" for two commits, and those are different
-/// claims.
-#[must_use]
-pub fn dims_of(sig: &KernelSig, lowered: &Lowered, launch: &Launch, fire: Geometry) -> Dims {
-    // The last widthed operand, which is the launch's last OUTPUT: what sizes
-    // the rectangle for nearly every rule.
-    let width = widths(lowered, launch).next_back().unwrap_or(0);
-    let extent = stated(lowered, launch, sig.grid_param);
-    Dims {
-        // The ROW COUNT the statement's own rectangle has, when the fire's row
-        // window is not it. A mixture's sorted stack is one row per ROUTE, and
-        // there are `tokens * experts_per_token` of those, so `route_gather`
-        // states its rows as a param -- and given the fire's count instead it
-        // gathers a quarter of its own output at `top_k = 4` and leaves the
-        // rest whatever the arena held. See `kernels::KernelSig::rows_param`.
-        rows: stated(lowered, launch, sig.rows_param)
-            .unwrap_or(launch.rows.end - launch.rows.start),
-        width,
-        // The FIRST widthed operand, which is the first input. What sizes a
-        // statement that reads one packed buffer and writes several, since
-        // there no single output spells the grid.
-        in_width: widths(lowered, launch).next().unwrap_or(0),
-        q_heads: fire.q_heads,
-        kv_heads: stated(lowered, launch, sig.heads_param).unwrap_or(fire.kv_heads),
-        head_dim: stated(lowered, launch, sig.head_param).unwrap_or(fire.head_dim),
-        // The SAME stated number, read by whichever rule asked for it: a rope's
-        // rotated channels, a norm's reduction axis. A row names one scalar as
-        // its extent and its rule knows which dimension that is.
-        axis: extent.unwrap_or(width),
-        rotary_dims: extent.unwrap_or(fire.rotary_dims),
-        n_experts: fire.n_experts,
-        experts_per_token: fire.experts_per_token,
-    }
-}
-
 /// The module a launch will run, as the two things this file needs from it.
 ///
 /// Grouped because they always travel together and always come from the same
@@ -371,30 +240,6 @@ pub struct Built<'a> {
     pub module: Module,
     /// What the module binds.
     pub declared: &'a crate::reflect::Declared,
-    /// The table row this symbol resolves to, if the caller has it.
-    ///
-    /// `None` means "look it up", which is what a test does and what any
-    /// caller that has one symbol in hand should do. A caller with a LOOP over
-    /// launches should pass it: `row` is `sig_in`, which walks the table for
-    /// an exact match and then walks it AGAIN matching axis points, and a
-    /// decode fires 452 launches over ten distinct symbols.
-    ///
-    /// `driver-vulkan` carries the same field for the same reason and states
-    /// it in the same words -- "once per SYMBOL, not once per launch" -- which
-    /// is where this was found: its `serve::fire` caches the reflection and the
-    /// row together, and this backend had ported only the first half.
-    ///
-    /// # What it is worth here, which is not much
-    ///
-    /// The plan phase of a real decode: **2.0 ms to 1.3 ms**, interleaved, over
-    /// 452 launches. That is 0.7 ms of a ~28 ms step -- about 2.5%, and well
-    /// under this machine's run-to-run spread, which the same binary shows as
-    /// 33 to 45 ms. It is kept because it is free and strictly less work, and
-    /// because the alternative was to leave a `sig_in` walk in a loop after
-    /// discovering the sibling had removed exactly that; it is NOT kept on a
-    /// measured end-to-end win, and this says so rather than letting the next
-    /// reader assume one.
-    pub sig: Option<&'static KernelSig>,
 }
 
 /// Where a launch's operands are to be found.
@@ -421,30 +266,6 @@ impl<R: Resolve> Clone for Sources<'_, R> {
 
 impl<R: Resolve> Copy for Sources<'_, R> {}
 
-/// The row in `table` whose symbol the plan names.
-///
-/// [`kernels::sig_in`], not an equality test. A plan names the symbol it will
-/// dispatch, and that symbol carries the variant suffixes the specialisation
-/// axes append -- `_gs_64_b_4` for an affine group, `_bm_16_bn_32` for a routed
-/// tile, `_d_128` for a head width. The TABLE states the axes, not the points,
-/// so exact equality finds a row for the few symbols that have no axis and
-/// nothing for the rest.
-///
-/// Measured on the Vulkan side before it was fixed: over the texts of the day,
-/// exact matching found a row for 432 launches and failed on 3030, across
-/// sixteen distinct symbols that all exist and all have modules built for them.
-/// `sig_in` finds all of them.
-fn row(table: &'static [KernelSig], symbol: &str) -> Option<&'static KernelSig> {
-    kernels::sig_in(table, symbol)
-}
-
-/// `row`, for a caller that wants to resolve a symbol ONCE and hand the
-/// answer to every launch that names it. See [`Built::sig`].
-#[must_use]
-pub fn row_of(table: &'static [KernelSig], symbol: &str) -> Option<&'static KernelSig> {
-    row(table, symbol)
-}
-
 /// Turn one launch into a dispatch.
 ///
 /// `table` is `kernels_wgpu::KERNELS` in every caller; it is a parameter so
@@ -464,7 +285,6 @@ pub fn row_of(table: &'static [KernelSig], symbol: &str) -> Option<&'static Kern
 pub fn plan_one<'a, R: Resolve>(
     lowered: &'a Lowered,
     launch: &Launch,
-    table: &'static [KernelSig],
     built: Built<'_>,
     sources: Sources<'a, R>,
     fire: Geometry,
@@ -485,19 +305,28 @@ pub fn plan_one<'a, R: Resolve>(
             cond: launch.cond,
         });
     }
-    // THE FORK. A symbol this backend has both crossed and ARMED is planned
-    // by its routine: the arm finds the operands, the body states the module,
-    // the entrypoint and the lanes, and neither reads the row's `operands` or
-    // `launch` columns. One symbol qualifies today.
+    // THERE IS NO FORK ANY MORE. Every symbol is planned by its ROUTINE: the
+    // arm finds the operands, the body states the module, the entrypoint and
+    // the lanes, and nothing reads a row.
     //
-    // ABOVE THE ROW LOOKUP, which is the point. An armed symbol needs no
-    // `KernelSig` at all: the arm finds the operands, the body states the
-    // grid, and the two widths a body's `Facts` want come off the LOWERING --
-    // the last widthed operand is what the launch writes and the first is
-    // what it reads. So a family whose arms are all in can have its rows
-    // DELETED, which is Stage 3 and is what the countdown counts.
-    if let Some((routine, arm)) = crate::lowering::routine::armed(symbol) {
-        let facts = crate::lowering::arm::facts(
+    // This stood above a row lookup for the length of the refactor, and the
+    // ordering was the point -- an armed symbol needs no `KernelSig` at all,
+    // so a family whose arms were all in could have its rows deleted. All ten
+    // families are in, on all three backends, and `plan_by_row` is gone with
+    // the columns it read.
+    let Some(routine) = crate::lowering::routine::armed(symbol) else {
+        // Not "fall back to the table": there is no table. A symbol no stem
+        // claims cannot be planned by any path, and
+        // `arm::the_armed_stems_are_the_ones_registered_and_nothing_else`
+        // asserts that none exists by walking all 481 entrypoints. This is
+        // what that assertion would look like at run time if it were ever
+        // wrong.
+        return Err(Undispatchable::Unknown {
+            symbol: symbol.to_owned(),
+        });
+    };
+    {
+        let facts = crate::lowering::hold::facts(
             symbol,
             launch.rows.end - launch.rows.start,
             fire,
@@ -507,7 +336,6 @@ pub fn plan_one<'a, R: Resolve>(
         );
         let mut planned = crate::lowering::routine::plan(
             routine,
-            arm,
             lowered,
             launch,
             declared,
@@ -533,188 +361,8 @@ pub fn plan_one<'a, R: Resolve>(
                 stated: planned.len(),
             });
         }
-        return Ok(planned.remove(0));
+        Ok(planned.remove(0))
     }
-
-    plan_by_row(lowered, launch, table, built, sources, fire)
-}
-
-/// One rectangle planned from its ROW, with the fork behind it.
-///
-/// The table path, split out of [`plan_one`] so it can be CALLED — by
-/// `the_routine_path_plans_what_the_table_path_planned`, which derives every
-/// field of a live kernel's dispatch twice and compares. There is no other way
-/// to reach this once a symbol is armed, because the fork above answers first
-/// and by design.
-///
-/// # Errors
-///
-/// Every variant of [`Undispatchable`] except `Routine` and `Multiple`, which
-/// only the routine plane raises.
-pub fn plan_by_row<'a, R: Resolve>(
-    lowered: &'a Lowered,
-    launch: &Launch,
-    table: &'static [KernelSig],
-    built: Built<'_>,
-    sources: Sources<'a, R>,
-    fire: Geometry,
-) -> Result<Dispatch<'a, R::Buffer>, Undispatchable> {
-    let symbol = lowered.kernels[launch.kernel as usize].as_str();
-    let Built {
-        module,
-        declared,
-        sig: stated,
-    } = built;
-    let Sources {
-        arena,
-        resolver,
-        min_offset,
-    } = sources;
-    let sig = match stated {
-        Some(sig) => sig,
-        None => row(table, symbol).ok_or_else(|| Undispatchable::Unknown {
-            symbol: symbol.to_owned(),
-        })?,
-    };
-
-    // Not `bind`, which hands the operands over in the order the TRACE states
-    // -- inputs, outputs, weights. The shader binds them in the order its
-    // kernel row states, and for 2898 of the Vulkan port's 3992 rectangles
-    // those differ. `rms_single_row` is the plainest: `norm/rms.wgsl` is
-    // `0=x, 1=w, 2=out`, its row is `In(0), Weight(0), Out(0)`, and the trace
-    // hands over `In(0), Out(0), Weight(0)` -- so positionally the norm reads
-    // its own output as the weight and writes over the weight. A `wgpu` bind
-    // group typed by the layout accepts every one of those shuffles, because
-    // all four entries are storage buffers.
-    let slots = reorder(sig, lowered, launch, arena, resolver, min_offset)
-        .map_err(|(at, why)| Undispatchable::Operand { at, why })?;
-
-    // Where the scalars go is the ROW's decision on this backend, which is the
-    // simplification the launch ABI buys: `kernels_wgpu::bindings` states which
-    // operand takes which entry, so a row that names a `Buf` param has already
-    // said where its struct is and the reflection is a check on that rather
-    // than the source of it. An UNSTATED row still falls back to the module.
-    let placed = scalars(sig, lowered, launch, declared, resolver).map_err(|why| match why {
-        crate::binding::Misplaced::Count {
-            stated, uniform, ..
-        } => Undispatchable::Scalars {
-            stated,
-            room: uniform,
-        },
-        crate::binding::Misplaced::Unresolved { at, name, source } => Undispatchable::Unresolved {
-            symbol: symbol.to_owned(),
-            at,
-            name,
-            source,
-        },
-        crate::binding::Misplaced::Contiguous { at, name } => Undispatchable::Contiguous {
-            symbol: symbol.to_owned(),
-            at,
-            name,
-        },
-    })?;
-
-    // The plan's operands, PLUS the slot a parameter STRUCT takes, have to be
-    // the module's real bindings. Checked here so that a mismatch is refused
-    // with the traced op in hand instead of becoming a `Dispatch` no device
-    // accepts.
-    //
-    // The uniform block is deliberately not counted: it is `@group(1)`, a bind
-    // group of its own, so it takes no place in the `@group(0)` numbering. That
-    // is the whole reason this crate does not need `driver-vulkan`'s `+ 1`
-    // correction -- there a scalar block is a descriptor in the same set, and
-    // checking arity before placing the scalars refused 1439 rectangles across
-    // nine symbols that are all perfectly dispatchable.
-    let laid = descriptors(slots, &placed, declared).map_err(Undispatchable::Layout)?;
-    if laid.len() != declared.bindings as usize {
-        return Err(Undispatchable::Arity {
-            symbol: symbol.to_owned(),
-            stated: laid.len(),
-            module: declared.bindings as usize,
-        });
-    }
-
-    // The dense list, which is what a bind group is written from: a slot the
-    // row leaves EMPTY takes no entry, and its binding number is simply absent
-    // from the layout. WebGPU allows that where Vulkan does not, because a
-    // `BindGroupLayoutEntry` carries an explicit `binding: u32` -- omitting one
-    // shifts nothing.
-    let block_at = laid
-        .iter()
-        .position(|s| matches!(s, Slot::Params))
-        .map(|at| {
-            laid[..at]
-                .iter()
-                .filter(|s| !matches!(s, Slot::Nothing))
-                .count()
-        });
-    let buffers: Vec<Bound<'a, R::Buffer>> = laid
-        .into_iter()
-        .filter_map(|s| match s {
-            Slot::Buffer(b) => Some(b),
-            Slot::Params | Slot::Nothing => None,
-        })
-        .collect();
-    // Every binding the SHADER READS has to be filled, and this is the count
-    // form of that claim. It is an INEQUALITY, and the direction is the whole
-    // content of the line.
-    //
-    // `driver-vulkan` asserts equality here -- `buffers + block == bindings -
-    // holes` -- and that equality is a Vulkan coincidence, not a rule. There a
-    // "hole" is a binding number with NO declaration, because `glslc` deletes
-    // the declaration of a buffer a variant never reads; the descriptor set
-    // still needs a slot at every number up to the highest, the plan has
-    // nothing to put in it, and the row says `Unbound` at exactly those
-    // positions. So `Nothing`-slots and holes are the same slots, and equality
-    // holds.
-    //
-    // `naga` deletes nothing. A hole here means DECLARED AND NOT READ BY THIS
-    // ENTRY POINT, which is a different fact: the binding exists, the row names
-    // a real tensor for it, and the driver binds one. Measured over the
-    // complete tree, 19 entrypoints have such a slot -- `kv_append_paged` keeps
-    // six ring-ABI placeholders, and every `sdpa_paged_*` declares an
-    // attention-sink buffer its non-sink variants do not read -- and 13 of them
-    // belong to rows that state operands. Carrying the equality across refused
-    // all thirteen, including every `sdpa_paged_decode` and `router_topk`: the
-    // paged decode step and every mixture layer, which is to say most of what a
-    // model runs.
-    //
-    // So the check that survives is the useful half. A dispatch may bind MORE
-    // than the shader reads -- that is a layout entry the body ignores, and it
-    // costs a descriptor. It may not bind FEWER, because an entry the shader
-    // reads and the group does not carry is a `wgpu` validation failure at
-    // encode time, with a number in the message and no launch.
-    //
-    // Dormant today, and stated rather than deleted for that reason: it can
-    // only fire when a slot comes back `Nothing`, and no row in this table
-    // states `Source::Unbound`. `descriptors` refuses the same thing per slot
-    // and by NAME (`Unlayoutable::Unfilled`), which is the better message; this
-    // is the arithmetic backstop for a row that grows a gap.
-    let reads = declared.bindings as usize - declared.holes();
-    if buffers.len() + usize::from(block_at.is_some()) < reads {
-        return Err(Undispatchable::Arity {
-            symbol: symbol.to_owned(),
-            stated: buffers.len() + usize::from(block_at.is_some()),
-            module: reads,
-        });
-    }
-
-    let dims = dims_of(sig, lowered, launch, fire);
-
-    let groups =
-        groups(sig.launch, dims, module).map_err(|why| Undispatchable::Ungeometric { why })?;
-    if groups.contains(&0) {
-        return Err(Undispatchable::Empty { groups });
-    }
-
-    Ok(Dispatch {
-        symbol,
-        buffers,
-        params: placed,
-        block_at,
-        groups,
-        op: launch.op,
-    })
 }
 
 impl<B> Dispatch<'_, B> {
@@ -731,20 +379,6 @@ impl<B> Dispatch<'_, B> {
             Params::None => None,
         }
     }
-}
-
-/// The rule a symbol's row states, for a caller that needs the grid before it
-/// needs the operands.
-///
-/// # Errors
-///
-/// [`Undispatchable::Unknown`] when no row states the symbol.
-pub fn rule_of(table: &'static [KernelSig], symbol: &str) -> Result<Rule, Undispatchable> {
-    row(table, symbol)
-        .map(|k| k.launch)
-        .ok_or_else(|| Undispatchable::Unknown {
-            symbol: symbol.to_owned(),
-        })
 }
 
 #[cfg(test)]
@@ -764,72 +398,6 @@ mod tests {
         /// wants the refusal still gets it.
         state: Option<Placeholder>,
     }
-
-    /// A row that states no operands, so that the plan-order fallback can be
-    /// exercised end to end.
-    ///
-    /// A table of this module's own, which is exactly what `table` being a
-    /// parameter is for. It has to be invented, and the reason is a fact about
-    /// this backend's table worth stating plainly: **all 56 rows that state no
-    /// operands also state no launch RULE**, so no real one of them reaches
-    /// the grid. `driver-metal`'s fallback is about the operand ORDER and this
-    /// crate carries it -- see
-    /// `an_unstated_rows_operands_come_from_the_plan_and_its_grid_does_not` --
-    /// but a row that says nothing about its grid cannot be launched by
-    /// guessing one, and [`crate::geometry::Ungeometric::Unstated`] is where
-    /// that is refused.
-    static PLAIN: &[KernelSig] = &[KernelSig {
-        name: "plan_order",
-        symbol: "plan_order",
-        file: None,
-        launch: Rule::Elementwise,
-        whole: false,
-        lacks: &[],
-        sink: None,
-        in_place: &[],
-        depth_prefix_plan: false,
-        args: &[],
-        operands: &[],
-        axes: &[],
-        grid_param: None,
-        head_param: None,
-        heads_param: None,
-        rows_param: None,
-    }];
-
-    /// A row with every column at rest, for a test to state the two or three
-    /// its claim is about.
-    ///
-    /// SIXTEEN columns, of which any one check reads a handful. The rest used
-    /// to be borrowed from a real row -- `..*base`, over a
-    /// `KERNELS.iter().find(..)` -- and that idiom died with the table: the
-    /// find returns `None` now and every test using it panicked in its setup
-    /// rather than in its assertion. This is that base STATED instead of
-    /// borrowed, which is also the honest shape, because none of the borrowed
-    /// columns was ever the thing under test.
-    ///
-    /// `Rule::Unstated` and no operands are the resting values on purpose:
-    /// both are the "the row has not said" reading, so a test that forgets to
-    /// state one is refused by name rather than launched over a default
-    /// somebody picked.
-    const BARE: KernelSig = KernelSig {
-        name: "bare",
-        symbol: "bare",
-        file: None,
-        launch: Rule::Unstated,
-        whole: false,
-        lacks: &[],
-        sink: None,
-        in_place: &[],
-        depth_prefix_plan: false,
-        args: &[],
-        operands: &[],
-        axes: &[],
-        grid_param: None,
-        head_param: None,
-        heads_param: None,
-        rows_param: None,
-    };
 
     impl Resolve for Store {
         type Buffer = Placeholder;
@@ -873,23 +441,16 @@ mod tests {
         }
     }
 
-    /// A plan of one rectangle over `symbol`, with `args` operands.
-    /// An ARMED symbol is planned by its routine, and the row's columns are
-    /// not what decided the answer.
+    /// An ARMED symbol is planned by its routine, and nothing reads a row.
     ///
-    /// The fork's whole claim, and it is now as strong as it can get:
-    /// `argmax_logits` HAS NO ROW. `sample`'s `kernel!` rows came off when its
-    /// arm landed, so `kernels_wgpu::sig` returns `None` and there is nothing
-    /// for the table path to read — not a row without a rule, no row. A grid
-    /// coming back is therefore proof the routine path ran, because the other
-    /// path cannot even begin.
+    /// `argmax_logits` HAS NO ROW: `sample`'s rows came off when its arm
+    /// landed, and the table they were in is empty. A grid coming back is
+    /// therefore the routine plane's answer, because there is no other
+    /// answer left — [`plan_one`] finds the arm or refuses by name.
     ///
     /// Its ENTRYPOINT is still stated, by `kernels_wgpu::RETIRED`, so every
     /// sweep still compiles and covers the shader. Losing the row is not
     /// losing the kernel.
-    ///
-    /// The first assertion below pins that, so if a row is ever restored this
-    /// test says the reasoning changed rather than passing on the old one.
     ///
     /// The grid is `256` lanes over one workgroup of 256, which is
     /// `sample/argmax.wgsl`'s `@workgroup_size(256)` and the body's own
@@ -910,24 +471,15 @@ mod tests {
         let store = Store::default();
         let d = declared(0, &[]);
 
-        // The table path cannot do this: there is no row to read.
-        assert!(
-            kernels_wgpu::sig("argmax_logits").is_none(),
-            "a row for `argmax_logits` is back, so a grid no longer proves \
-             which path answered"
-        );
-
         let got = plan_one(
             &lowered,
             &lowered.launches[0],
-            kernels_wgpu::KERNELS,
             Built {
                 module: Module {
                     local: Local([256, 1, 1]),
                     tile: None,
                 },
                 declared: &d,
-                sig: None,
             },
             Sources {
                 arena: Arena {
@@ -955,7 +507,7 @@ mod tests {
         assert_eq!(got.op, 11);
     }
 
-    /// The second armed symbol halves its width, and the fork carries it.
+    /// The second armed symbol halves its width, and the routine carries it.
     ///
     /// `ptir::copy_logits_bf16` is the only place on this backend where the
     /// grid is not a function of the operand width the way every row states
@@ -989,23 +541,15 @@ mod tests {
         let store = Store::default();
         let d = declared(0, &[]);
 
-        assert!(
-            kernels_wgpu::sig("copy_logits_bf16").is_none(),
-            "a row for `copy_logits_bf16` is back, so a grid no longer proves \
-             which path answered"
-        );
-
         let got = plan_one(
             &lowered,
             &lowered.launches[0],
-            kernels_wgpu::KERNELS,
             Built {
                 module: Module {
                     local: Local([256, 1, 1]),
                     tile: None,
                 },
                 declared: &d,
-                sig: None,
             },
             Sources {
                 arena: Arena {
@@ -1024,18 +568,24 @@ mod tests {
         // y is the launch's rows. Unhalved it would be four on x, and the
         // shader would read past the row it was given.
         assert_eq!(got.groups, [2, 4, 1]);
-        // source, destination, params -- in, out, in, against a statement
-        // that states its reads first. The two U32 arguments the arm appends
-        // are widths, not buffers, and do not bind.
-        assert_eq!(got.buffers.len(), 3);
+        // Source and destination, and NOT the parameter block: `buffers`
+        // holds operands, and the block is staged into its own binding.
+        //
+        // This assertion read `3` until the arms were deleted, because
+        // `copy_logits_bf16`'s arm asked for `input(1)` where its signature
+        // says `Block<Buf>` -- so the block's binding was filled with an
+        // arena operand and the packed run went nowhere. The two U32s are
+        // widths and pack INTO the block; they were never buffers.
+        assert_eq!(got.buffers.len(), 2);
+        assert_eq!(got.block_at, Some(2), "the block takes the third binding");
     }
 
-    /// An odd vocabulary is refused by the BODY, through the fork.
+    /// An odd vocabulary is refused by the BODY.
     ///
     /// The body's own header requires `vocab` to be even, because an odd pitch
     /// starts the next row inside the previous row's last word. That refusal
     /// is a fact about the shader that no row had a column for, and this is
-    /// the first time this backend can state one: the table path would have
+    /// the first time this backend can state one: a positional row would have
     /// dispatched an odd width and written the rows into each other.
     #[test]
     fn an_odd_vocabulary_is_refused_where_the_row_had_no_column_for_it() {
@@ -1066,14 +616,12 @@ mod tests {
         let got = plan_one(
             &lowered,
             &lowered.launches[0],
-            kernels_wgpu::KERNELS,
             Built {
                 module: Module {
                     local: Local([256, 1, 1]),
                     tile: None,
                 },
                 declared: &d,
-                sig: None,
             },
             Sources {
                 arena: Arena {
@@ -1100,7 +648,7 @@ mod tests {
     ///
     /// The armed symbol against a statement of no operands: the arm asks for
     /// its first input and the statement has none, so the refusal comes back
-    /// from the arm rather than from anything the table path would have said.
+    /// from the arm rather than from the binding it never reached.
     #[test]
     fn a_routine_that_cannot_be_planned_is_refused_by_name() {
         let lowered = plan("argmax_logits", Vec::new(), Vec::new());
@@ -1110,14 +658,12 @@ mod tests {
         let got = plan_one(
             &lowered,
             &lowered.launches[0],
-            kernels_wgpu::KERNELS,
             Built {
                 module: Module {
                     local: Local([256, 1, 1]),
                     tile: None,
                 },
                 declared: &d,
-                sig: None,
             },
             Sources {
                 arena: Arena {
@@ -1168,137 +714,6 @@ mod tests {
         }
     }
 
-    /// A row whose scalars the module has no room for is refused by name.
-    ///
-    /// From the census in `tests/citations.rs`: `Undispatchable::Scalars` is
-    /// one of the refusals this crate builds and no test named. It is the
-    /// translation of `binding::Misplaced::Count`, which IS tested one layer
-    /// down -- so what this adds is the three-arm `match` between them, where a
-    /// swapped arm compiles and hands back a refusal describing a different
-    /// fault entirely.
-    ///
-    /// `Misplaced::Count`'s own doc says why the underlying defect has no
-    /// symptom: WGSL requires every access to be bounds-checked, so a block
-    /// short of what the shader reads returns ZEROS rather than faulting, and
-    /// a missing pitch is "a plausible number that no layer and no assertion
-    /// will object to". The refusal is the only thing that ever says so, which
-    /// is the argument for asserting it by name rather than by `is_err`.
-    ///
-    /// `shared_expert_combine_strided` was the row: the smallest stated one
-    /// whose buffers a default resolver could satisfy -- four arena operands,
-    /// `In` and `Out` only, no weights, no fire tables, no cache -- and it
-    /// stated two scalars. A module declaring room for one is the mismatch.
-    #[test]
-    fn a_module_with_no_room_for_the_rows_scalars_says_how_many_of_each() {
-        // Through `plan_by_row`, not `plan_one`: this is a claim about the
-        // TABLE path's refusal, and every family is armed now, so `plan_one`
-        // would answer from the routine plane and the refusal under test would
-        // never be reached.
-        //
-        // SYNTHESIZED, and the row is now synthesized WHOLE. It was
-        // `shared_expert_combine_strided`, then a real row's columns with an
-        // invented operand list spread over them (`..*base`); the table is
-        // empty, so there is no base to spread and no row to pick. The claim
-        // needs no particular family to make it: `scalars` refuses a run that
-        // does not fit the module's block -- two scalars against a block of
-        // one -- and a row is data, so a test that needs one may write one.
-        let two: &'static [kernels::Operand] = Box::leak(
-            vec![
-                kernels::Operand {
-                    name: "x",
-                    ty: kernels::Ty::Buf,
-                    source: kernels::Source::In(0),
-                    nullable: false,
-                },
-                kernels::Operand {
-                    name: "out",
-                    ty: kernels::Ty::BufMut,
-                    source: kernels::Source::Out(0),
-                    nullable: false,
-                },
-                kernels::Operand {
-                    name: "a",
-                    ty: kernels::Ty::I32,
-                    source: kernels::Source::Param(0),
-                    nullable: false,
-                },
-                kernels::Operand {
-                    name: "b",
-                    ty: kernels::Ty::I32,
-                    source: kernels::Source::Param(1),
-                    nullable: false,
-                },
-            ]
-            .into_boxed_slice(),
-        );
-        let synthetic: &'static KernelSig = Box::leak(Box::new(KernelSig {
-            name: "scalar_room",
-            symbol: "scalar_room",
-            // A rule, because the premise below has to PLAN: a row left at
-            // `Rule::Unstated` would be refused for its grid and the refusal
-            // under test would never be reached. `Elementwise` over a 64-wide
-            // rectangle of four rows is one workgroup.
-            launch: Rule::Elementwise,
-            operands: two,
-            ..BARE
-        }));
-        let symbol = synthetic
-            .entrypoints()
-            .into_iter()
-            .next()
-            .expect("the row has entrypoints");
-        let lowered = plan(
-            &symbol,
-            vec![
-                arena_arg(0),
-                arena_arg(1024),
-                arena_arg(2048),
-                arena_arg(4096),
-            ],
-            vec![3, 5],
-        );
-        let buf = Placeholder(1 << 20);
-        let store = Store::default();
-
-        let plan_against = |uniform: &[u32]| {
-            let d = declared(2, uniform);
-            plan_by_row(
-                &lowered,
-                &lowered.launches[0],
-                kernels_wgpu::KERNELS,
-                Built {
-                    module: Module {
-                        local: Local([256, 1, 1]),
-                        tile: None,
-                    },
-                    declared: &d,
-                    sig: Some(synthetic),
-                },
-                Sources {
-                    arena: Arena {
-                        buffer: &buf,
-                        bytes: 1 << 20,
-                    },
-                    resolver: &store,
-                    min_offset: 256,
-                },
-                fire(),
-            )
-            .map(|_| ())
-        };
-
-        // The premise: with room for both, this rectangle plans. Without it
-        // the refusal below could be about anything.
-        plan_against(&[0, 4]).expect("a module with room for both scalars");
-
-        let why = plan_against(&[0]).expect_err("a module with room for one");
-        assert!(
-            matches!(why, Undispatchable::Scalars { stated: 2, room: 1 }),
-            "a row of two scalars against a block of one came back as `{why}`, \
-             which does not say that the shader would have read a zero"
-        );
-    }
-
     fn arena_arg(at: usize) -> Arg {
         Arg::Arena {
             at,
@@ -1315,165 +730,8 @@ mod tests {
             rotary_dims: 128,
             n_experts: 64,
             experts_per_token: 8,
+            ..Default::default()
         }
-    }
-
-    /// A whole rectangle becomes a dispatch, in the ROW's binding order.
-    ///
-    /// `rms_single_row` is the case the reorder exists for: the shader is
-    /// `x, w, out, params`, the trace hands over `in, out, weight`, and binding
-    /// positionally makes the norm read its own output as the gain.
-    #[test]
-    fn a_rectangle_binds_in_the_rows_order_and_not_the_traces() {
-        // `rms_single_row` was the case this was written for and `norm` has
-        // retired; `combine_sorted` stood in after it -- its row was
-        // `In(0), In(1), Out(0), Param(0), In(2)` against a trace stating its
-        // three reads before its write -- and `moe` retired too.
-        //
-        // SYNTHESIZED, and now synthesized WHOLE: the invented operand list
-        // used to be spread over a real row's remaining columns (`..*base`),
-        // and there is no longer a row to take them from. The claim is that
-        // `reorder` binds in the ROW's order and not the trace's, and the
-        // shape that shows it is a row stating `In(0), Out(0), In(1)` against
-        // a trace that hands over its reads and then its write: positionally
-        // the shader would be given the second read where its output belongs
-        // and would write the answer into a buffer nobody reads. Both are
-        // storage buffers of the same length, so nothing downstream sees it.
-        let shuffled: &'static [kernels::Operand] = Box::leak(
-            vec![
-                kernels::Operand {
-                    name: "a",
-                    ty: kernels::Ty::Buf,
-                    source: kernels::Source::In(0),
-                    nullable: false,
-                },
-                kernels::Operand {
-                    name: "out",
-                    ty: kernels::Ty::BufMut,
-                    source: kernels::Source::Out(0),
-                    nullable: false,
-                },
-                kernels::Operand {
-                    name: "b",
-                    ty: kernels::Ty::Buf,
-                    source: kernels::Source::In(1),
-                    nullable: false,
-                },
-            ]
-            .into_boxed_slice(),
-        );
-        let sig: &'static KernelSig = Box::leak(Box::new(KernelSig {
-            // A symbol no stem in `lowering::arm::LIVE` claims, so `plan_one`
-            // takes the table path. An armed one would be answered by its
-            // routine and this row would never be read.
-            name: "row_order",
-            symbol: "row_order",
-            launch: Rule::Elementwise,
-            operands: shuffled,
-            ..BARE
-        }));
-        let symbol = sig
-            .entrypoints()
-            .into_iter()
-            .next()
-            .expect("the row has entrypoints");
-        // The trace's order: three reads, then the write.
-        let lowered = plan(
-            &symbol,
-            vec![
-                arena_arg(0),
-                arena_arg(1024),
-                arena_arg(2048),
-                arena_arg(4096),
-            ],
-            vec![7, 8, 9, 10, 11],
-        );
-        let buf = Placeholder(1 << 20);
-        let store = Store::default();
-
-        let d = declared(3, &[]);
-        let got = plan_one(
-            &lowered,
-            &lowered.launches[0],
-            kernels_wgpu::KERNELS,
-            Built {
-                module: Module {
-                    local: Local([256, 1, 1]),
-                    tile: None,
-                },
-                declared: &d,
-                sig: Some(sig),
-            },
-            Sources {
-                arena: Arena {
-                    buffer: &buf,
-                    bytes: 1 << 20,
-                },
-                resolver: &store,
-                min_offset: 256,
-            },
-            fire(),
-        )
-        .expect("the rectangle dispatches");
-
-        assert_eq!(got.op, 11, "the traced op travels with the dispatch");
-        // Three buffers for three slots: this row states no parameter operand,
-        // so nothing takes a `@group(0)` entry the plan did not name.
-        assert_eq!(got.buffers.len(), 3);
-        assert_eq!(
-            got.block_at, None,
-            "this synthetic row states no params struct"
-        );
-
-        // In(0), Out(0), In(1) -- the ROW's order. Positionally the trace
-        // would have given 0, 1024, 2048: its two reads and then its write.
-        assert_eq!(got.buffers[0].offset(), 0);
-        assert_eq!(got.buffers[1].offset(), 4096, "the OUTPUT, second");
-        assert_eq!(got.buffers[2].offset(), 1024, "and the second input, last");
-        assert!(got.groups.iter().all(|n| *n >= 1));
-    }
-
-    /// An UNSTATED row is launchable, from the plan's own order.
-    ///
-    /// The fallback `driver-metal` carries and the Vulkan notes insist on: 56
-    /// rows over 292 entrypoints state no operands, and they include
-    /// `affine_qmm_t`, `sdpa_paged_tiled`, `gdn_core` and `argmax_logits` --
-    /// most of what a model runs. Treating them as unlaunchable would be
-    /// treating the backend as unusable.
-    #[test]
-    fn an_unstated_row_dispatches_from_the_plans_own_argument_order() {
-        let lowered = plan("plan_order", vec![arena_arg(0), arena_arg(512)], Vec::new());
-        let buf = Placeholder(1 << 20);
-        let store = Store::default();
-
-        let d = declared(2, &[]);
-        let got = plan_one(
-            &lowered,
-            &lowered.launches[0],
-            PLAIN,
-            Built {
-                module: Module::new([256, 1, 1]),
-                declared: &d,
-                sig: None,
-            },
-            Sources {
-                arena: Arena {
-                    buffer: &buf,
-                    bytes: 1 << 20,
-                },
-                resolver: &store,
-                min_offset: 256,
-            },
-            fire(),
-        )
-        .expect("an unstated row is not an unbindable one");
-        assert_eq!(
-            got.buffers.iter().map(Bound::offset).collect::<Vec<_>>(),
-            [0, 512],
-            "the plan's order, which is the only order there is"
-        );
-        assert_eq!(got.params, Params::None);
-        assert_eq!(got.block_at, None);
     }
 
     // RETIRED: THE TABLE IS EMPTY, so the walk has nothing to walk.
@@ -1503,20 +761,22 @@ mod tests {
     // fires, against a count of zero. That refusal to go vacuous is what
     // retires it rather than leaving it green over an empty set.
     //
-    // The fallback itself is live and reachable, and two tests in this file
-    // hold it: `an_unstated_row_dispatches_from_the_plans_own_argument_order`
-    // binds a rectangle in the plan's own order through `PLAIN`, and
+    // The fallback was live and reachable when this was written, and two
+    // tests in this file held it:
+    // `an_unstated_row_dispatches_from_the_plans_own_argument_order` bound a
+    // rectangle in the plan's own order through `PLAIN`, and
     // `an_unstated_rows_operands_come_from_the_plan_and_its_grid_does_not`
-    // takes the same rectangle through `reorder` and then all the way to the
-    // `Ungeometric::Unstated` refusal. Both state their row now instead of
-    // picking one, which is the only thing the emptying really took.
+    // took the same rectangle through `reorder` and then all the way to the
+    // `Ungeometric::Unstated` refusal. Both have since gone with
+    // `plan_by_row`, and the block at the end of this module is where that is
+    // written down: nothing reaches `reorder` from here any more.
     //
     // What a REAL launch's operands come from is no longer a row at all:
-    // `crate::lowering::arm`'s `Handles::{input, output, weight}` mint them in
+    // `crate::lowering::hold`'s `Handles::{input, output, weight}` mint them in
     // the order the body asks and record each as an `Asked`, and
     // `crate::lowering::routine::bind` turns those handles into `Placed`
     // bind-group entries against the module's own `Declared`. Its per-symbol
-    // cover is `arm.rs`'s `handles_are_minted_in_the_order_the_body_asks` and
+    // cover is `hold.rs`'s `handles_are_minted_in_the_order_the_body_asks` and
     // `a_statement_the_arm_cannot_fill_is_refused`; its whole-corpus cover is
     // `crates/driver-wgpu/tests/arena.rs`'s
     // `every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal`,
@@ -1527,82 +787,6 @@ mod tests {
     // building a pipeline is not binding one. That much of the coverage this
     // walk gave is simply gone, and saying so is better than naming a
     // replacement that does less.
-
-    /// An unstated row binds, and is refused for its GRID.
-    ///
-    /// The precise version of the claim `.wiki/new-driver/vulkan.md` §13
-    /// makes. A row with no operands -- there were 56 of them here, spanning
-    /// `affine_qmm_t_bias`, `sdpa_paged_tiled`, `gdn_core` and
-    /// `argmax_logits`, which is most of what a model runs -- is NOT
-    /// unbindable: its operands come from the plan's own order and every one
-    /// of them resolves. Every one of those 56 also stated no launch rule, so
-    /// what stopped them was the grid, by name, at the last step. That is a
-    /// different sentence from "unstated rows are unlaunchable" and it points
-    /// at a different fix: fill in `launch`, not `operands`.
-    ///
-    /// SYNTHESIZED, because the table is empty and there is no unstated row
-    /// left to pick. The row it picked was replaced four times as each became
-    /// armable, and the last replacement is the one that says why picking was
-    /// never the point: the claim is about `reorder` reading an EMPTY operand
-    /// list and `groups` reading `Rule::Unstated`, and both of those are
-    /// columns, not kernels. `BARE` is exactly a row that has said neither, so
-    /// this states it rather than hunting for one.
-    #[test]
-    fn an_unstated_rows_operands_come_from_the_plan_and_its_grid_does_not() {
-        let sig: &'static KernelSig = Box::leak(Box::new(KernelSig {
-            name: "no_rule",
-            symbol: "no_rule",
-            ..BARE
-        }));
-        assert!(
-            sig.operands.is_empty() && sig.launch == Rule::Unstated,
-            "the row under test has to have said neither, or this checks \
-             something else"
-        );
-        let lowered = plan(sig.symbol, vec![arena_arg(0), arena_arg(512)], Vec::new());
-        let buf = Placeholder(1 << 20);
-        let store = Store::default();
-        let arena = Arena {
-            buffer: &buf,
-            bytes: 1 << 20,
-        };
-
-        // The operands, on their own: the fallback resolves both, in the
-        // plan's order, with nothing from the row.
-        let slots = reorder(sig, &lowered, &lowered.launches[0], arena, &store, 256)
-            .expect("the plan's order is an order");
-        assert_eq!(slots.len(), 2);
-        assert!(slots.iter().all(|s| matches!(s, Slot::Buffer(_))));
-
-        // And the whole dispatch, which gets past the binding and stops at the
-        // grid. The row is handed over rather than looked up, and the table
-        // passed in is empty to say so: a lookup would answer
-        // `Undispatchable::Unknown` and this test would never reach a grid to
-        // be refused for.
-        let d = declared(2, &[]);
-        assert_eq!(
-            plan_one(
-                &lowered,
-                &lowered.launches[0],
-                &[],
-                Built {
-                    module: Module::new([256, 1, 1]),
-                    declared: &d,
-                    sig: Some(sig),
-                },
-                Sources {
-                    arena,
-                    resolver: &store,
-                    min_offset: 256,
-                },
-                fire(),
-            )
-            .expect_err("no rule, no grid"),
-            Undispatchable::Ungeometric {
-                why: Ungeometric::Unstated
-            }
-        );
-    }
 
     // RETIRED: THE TABLE IS EMPTY, so the walk has nothing to walk.
     //
@@ -1658,7 +842,7 @@ mod tests {
     //
     // WHERE EACH HALF LIVES NOW.
     //
-    // * The operands and the bind group: `crate::lowering::arm`'s `Handles`
+    // * The operands and the bind group: `crate::lowering::hold`'s `Handles`
     //   mints them in the order the body asks and records each as an `Asked`,
     //   and `crate::lowering::routine::bind` lays them out as `Placed` against
     //   the module's own `Declared`, refusing by name through `Unplanned::`
@@ -1667,7 +851,7 @@ mod tests {
     //   `routine.rs`'s `scalars_wider_than_the_modules_block_are_refused_by_name`.
     // * The grid that must not be empty: `Unplanned::Refused` through the
     //   body's own extent, checked by `a_body_that_computed_a_zero_extent_is_refused`.
-    // * The contiguous-cache refusal: `crate::lowering::arm::contiguous_pool`,
+    // * The contiguous-cache refusal: `crate::lowering::hold::contiguous_pool`,
     //   which narrows the blanket table-path refusal by one notch -- a fire
     //   whose pool states a page size is refused, a fire whose pool has none is
     //   served -- and whose doc names the same three families this walk pinned.
@@ -1682,6 +866,10 @@ mod tests {
     //   building a pipeline is not planning a dispatch.
 
     /// A guarded rectangle is refused, not recorded.
+    ///
+    /// Before the arm is looked for, which is why the symbol below is one no
+    /// stem claims: a guard nothing has answered is refused on its own terms
+    /// rather than as a symbol the routine plane does not know.
     #[test]
     fn a_conditional_rectangle_is_refused_rather_than_run() {
         let mut lowered = plan("plan_order", vec![arena_arg(0)], Vec::new());
@@ -1693,11 +881,9 @@ mod tests {
             plan_one(
                 &lowered,
                 &lowered.launches[0],
-                PLAIN,
                 Built {
                     module: Module::new([256, 1, 1]),
                     declared: &d,
-                    sig: None,
                 },
                 Sources {
                     arena: Arena {
@@ -1717,7 +903,7 @@ mod tests {
         );
     }
 
-    /// A symbol no row covers is named rather than guessed at.
+    /// A symbol no arm claims is named rather than guessed at.
     #[test]
     fn a_symbol_no_row_states_is_refused_by_name() {
         let lowered = plan("no_such_kernel_bfloat16", vec![arena_arg(0)], Vec::new());
@@ -1728,11 +914,9 @@ mod tests {
             plan_one(
                 &lowered,
                 &lowered.launches[0],
-                kernels_wgpu::KERNELS,
                 Built {
                     module: Module::new([256, 1, 1]),
                     declared: &d,
-                    sig: None,
                 },
                 Sources {
                     arena: Arena {
@@ -1751,280 +935,146 @@ mod tests {
         );
     }
 
-    /// The row's own scalar overrides the fire's number.
-    ///
-    /// `grid_param` is the one that fires 1788 times over real texts, and a
-    /// driver that read only the fire would normalise over the wrong width
-    /// every one of them and produce numbers rather than an error.
-    #[test]
-    fn a_row_that_names_its_extent_takes_it_from_the_statement() {
-        // `rms_single_row` was this test's row until `norm` retired, then
-        // `qmv_routed` until `moe` did. SYNTHESIZED now, and it loses nothing:
-        // `dims_of` reads exactly two columns to answer this -- `grid_param`
-        // and the widths the LOWERING states -- so the row was never more than
-        // a carrier for `Some(1)`. This is `qmv_routed`'s shape transcribed:
-        // `Rule::RoutedQmv`, and its extent at param 1, which is
-        // `out_vec_size` -- the matvec's row axis, and NOT the output
-        // rectangle's width, because a routed projection writes a whole
-        // token's `k` results end to end.
-        let sig = KernelSig {
-            name: "stated_axis",
-            symbol: "stated_axis",
-            launch: Rule::RoutedQmv,
-            grid_param: Some(1),
-            ..BARE
-        };
-        // The statement's run: index 1 is 256 -- a head-wide axis under a
-        // 64-wide rectangle.
-        let lowered = plan(
-            sig.symbol,
-            vec![arena_arg(0), arena_arg(1024), Arg::Weight("gain".into())],
-            vec![0, 256, 0, 0, 0],
-        );
-        let dims = dims_of(&sig, &lowered, &lowered.launches[0], fire());
-        assert_eq!(dims.axis, 256, "the row's own scalar, not the row width");
-        assert_eq!(dims.width, 64, "the last widthed operand");
-
-        // And a statement that does not carry it falls back to the fire rather
-        // than to zero, because a zero extent is a grid of nothing.
-        let bare = plan(
-            sig.symbol,
-            vec![arena_arg(0), arena_arg(1024), Arg::Weight("gain".into())],
-            Vec::new(),
-        );
-        assert_eq!(dims_of(&sig, &bare, &bare.launches[0], fire()).axis, 64);
-    }
-
-    /// The head overrides come from the statement when it has them.
-    ///
-    /// The two that were counted and not checked for two commits, so they are
-    /// checked here against a fire that DISAGREES on purpose -- a geometry
-    /// equal to the stated value would pass with either line deleted.
-    #[test]
-    fn a_row_that_names_its_head_shape_takes_it_from_the_statement() {
-        // A row of this file's own, with the two head indices set. It was
-        // always synthesized in part -- no real row ever stated either index,
-        // and the point is to check that the LINES read them rather than to
-        // find a row that does -- and the columns it borrowed from
-        // `qmv_routed` were never read by `dims_of`. The table is empty, so
-        // the borrowing half goes and the stating half stays.
-        let sig = KernelSig {
-            name: "stated_heads",
-            symbol: "stated_heads",
-            launch: Rule::RoutedQmv,
-            head_param: Some(2),
-            heads_param: Some(3),
-            ..BARE
-        };
-        let lowered = plan(
-            sig.symbol,
-            vec![arena_arg(0)],
-            // index 2 is a 512-wide head, index 3 is four of them -- gemma-4's
-            // full-attention shape, against a fire stating 128 and 8.
-            vec![0, 0, 512, 4],
-        );
-        let dims = dims_of(&sig, &lowered, &lowered.launches[0], fire());
-        assert_eq!(dims.head_dim, 512, "the statement's, not the fire's 128");
-        assert_eq!(dims.kv_heads, 4, "the statement's, not the fire's 8");
-    }
-
-    /// A rule a caller needs before it has the operands.
-    ///
-    /// `engine`'s wgpu backend is that caller: `every_launch_fits` asks
-    /// [`rule_of`] for a symbol's rule so it can size the grid a prefill would
-    /// dispatch, long before anything binds an operand.
-    ///
-    /// SYNTHESIZED, and the qualification is worth stating plainly: THE
-    /// SHIPPED TABLE ANSWERS NOTHING NOW. `kernels_wgpu::KERNELS` is empty, so
-    /// `rule_of(KERNELS, ..)` is `Undispatchable::Unknown` for every symbol
-    /// this backend can dispatch, and the caller above skips every launch it
-    /// asks about. That is a fact about the TABLE, and the table's own tests
-    /// own it; what is checked here is the two things `rule_of` itself
-    /// promises, which are unchanged and which `table` is a parameter
-    /// precisely so a test can state.
-    ///
-    /// The row carries AXES on purpose. `rule_of` goes through
-    /// [`kernels::sig_in`] and not through an equality test, and that is the
-    /// half with a defect behind it: exact matching found a row for 432 of the
-    /// Vulkan port's 3992 launches and reported "no kernel row" for sixteen
-    /// symbols that all exist and all have modules. So the symbol asked about
-    /// below is a POINT of the row's axes and not the row's own name, which is
-    /// what a driver holds.
-    #[test]
-    fn a_symbols_rule_is_answerable_from_the_table_alone() {
-        // `kernels-wgpu`'s `BF16` and `GROUP_64`/`BITS_4` spelled out, because
-        // `crate::axes` is that crate's and this row is this file's.
-        const AXES: &[kernels::Axis] = &[
-            kernels::Axis {
-                what: "activation dtype",
-                points: &["_bfloat16"],
-            },
-            kernels::Axis {
-                what: "affine group and width",
-                points: &["_gs_64_b_4"],
-            },
-        ];
-        let table: &'static [KernelSig] = Box::leak(
-            vec![KernelSig {
-                name: "rule_lookup",
-                symbol: "rule_lookup",
-                launch: Rule::RoutedQmv,
-                axes: AXES,
-                ..BARE
-            }]
-            .into_boxed_slice(),
-        );
-        let symbol = table[0]
-            .entrypoints()
-            .into_iter()
-            .next()
-            .expect("the row names its points");
-        assert_eq!(
-            symbol, "rule_lookup_bfloat16_gs_64_b_4",
-            "the spelling a driver holds is the base plus every axis point"
-        );
-        assert_eq!(rule_of(table, &symbol).expect("stated"), Rule::RoutedQmv);
-        // And the base itself, which is what a model text states.
-        assert_eq!(
-            rule_of(table, "rule_lookup").expect("stated"),
-            Rule::RoutedQmv
-        );
-        // A symbol no row covers is named rather than rounded to the nearest
-        // row -- including a half-spelled one, which is the case `covers_point`
-        // peels its axes from the END to refuse.
-        assert!(rule_of(table, "no_such_kernel").is_err());
-        assert!(rule_of(table, "rule_lookup_bfloat16").is_err());
-    }
-
-    /// A launch whose module binds more than the plan states is refused.
-    #[test]
-    fn a_module_that_binds_more_than_the_plan_states_is_refused_by_arity() {
-        let lowered = plan("plan_order", vec![arena_arg(0)], Vec::new());
-        let buf = Placeholder(1 << 20);
-        let store = Store::default();
-        // The module wants three and the plan carries one.
-        let d = declared(3, &[]);
-        let err = plan_one(
-            &lowered,
-            &lowered.launches[0],
-            PLAIN,
-            Built {
-                module: Module::new([256, 1, 1]),
-                declared: &d,
-                sig: None,
-            },
-            Sources {
-                arena: Arena {
-                    buffer: &buf,
-                    bytes: 1 << 20,
-                },
-                resolver: &store,
-                min_offset: 256,
-            },
-            fire(),
-        )
-        .expect_err("short");
-        assert_eq!(
-            err,
-            Undispatchable::Arity {
-                symbol: "plan_order".into(),
-                stated: 1,
-                module: 3
-            }
-        );
-    }
-
-    /// An operand the resolver does not hold names the slot it would have gone
-    /// in.
-    #[test]
-    fn an_unresolvable_operand_is_refused_with_its_slot() {
-        let lowered = plan(
-            "plan_order",
-            vec![arena_arg(0), Arg::Weight("absent".into())],
-            Vec::new(),
-        );
-        let buf = Placeholder(1 << 20);
-        let store = Store::default();
-        let d = declared(2, &[]);
-        let err = plan_one(
-            &lowered,
-            &lowered.launches[0],
-            PLAIN,
-            Built {
-                module: Module::new([256, 1, 1]),
-                declared: &d,
-                sig: None,
-            },
-            Sources {
-                arena: Arena {
-                    buffer: &buf,
-                    bytes: 1 << 20,
-                },
-                resolver: &store,
-                min_offset: 256,
-            },
-            fire(),
-        )
-        .expect_err("absent");
-        assert_eq!(
-            err,
-            Undispatchable::Operand {
-                at: 1,
-                why: Unbindable::UnknownWeight("absent".into())
-            }
-        );
-    }
-
-    /// An empty grid never reaches a device.
-    ///
-    /// The refusal this crate makes hardest, because the alternative reports
-    /// success: `dispatch_workgroups(0, 1, 1)` is legal WebGPU, runs nothing,
-    /// and leaves the output holding whatever it was born with.
-    #[test]
-    fn a_grid_that_would_run_nothing_is_refused() {
-        // A zero-width operand: `Rule::Elementwise` is `width * rows`, so the
-        // grid is zero on x.
-        let lowered = plan(
-            "plan_order",
-            vec![Arg::Arena {
-                at: 0,
-                width: 0,
-                bytes: 2,
-            }],
-            Vec::new(),
-        );
-        let buf = Placeholder(1 << 20);
-        let store = Store::default();
-        let d = declared(1, &[]);
-        let err = plan_one(
-            &lowered,
-            &lowered.launches[0],
-            PLAIN,
-            Built {
-                module: Module::new([256, 1, 1]),
-                declared: &d,
-                sig: None,
-            },
-            Sources {
-                arena: Arena {
-                    buffer: &buf,
-                    bytes: 1 << 20,
-                },
-                resolver: &store,
-                min_offset: 256,
-            },
-            fire(),
-        )
-        .expect_err("empty");
-        // The operand is refused first, because a zero-width rectangle is also
-        // a zero-length binding -- and WebGPU has no such binding. Either
-        // refusal is a refusal; what matters is that nothing dispatches.
-        assert!(
-            matches!(
-                err,
-                Undispatchable::Empty { .. } | Undispatchable::Operand { .. }
-            ),
-            "a rectangle of nothing produced {err:?}"
-        );
-    }
+    // RETIRED: THE ROW PATH HAS NO CALLER. `plan_one` does not fork, so ten
+    // tests here were driving `plan_by_row`, `dims_of` and `rule_of` -- three
+    // functions nothing production-side can reach -- over a table with
+    // nothing in it.
+    //
+    // Two fixtures went with them. `static PLAIN` was a one-row table of an
+    // operand-less `Rule::Elementwise` row, invented so the plan-order
+    // fallback could be driven end to end; `const BARE` was sixteen
+    // `KernelSig` columns at rest, so a test could state the two its claim
+    // was about. Both were written when the shipped table stopped being able
+    // to supply an example, which is the same fact these deletions are, one
+    // layer up.
+    //
+    // THE PLAN-ORDER FALLBACK, which was `.wiki/new-driver/vulkan.md` §13's
+    // claim and carried 56 rows over 292 entrypoints.
+    // `an_unstated_row_dispatches_from_the_plans_own_argument_order` bound a
+    // rectangle whose row stated no operands and got the plan's own two
+    // offsets back in the plan's own order, with `Params::None` and no
+    // `block_at`.
+    // `an_unstated_rows_operands_come_from_the_plan_and_its_grid_does_not`
+    // took the same rectangle through `reorder` to two `Slot::Buffer`s and
+    // then the whole way to `Undispatchable::Ungeometric` carrying
+    // `Ungeometric::Unstated`. The pair separated "an unstated row is
+    // unlaunchable" from "an unstated row binds and then has no grid", which
+    // are two different repairs: `launch`, not `operands`.
+    //
+    // THE ROW'S ORDER AGAINST THE TRACE'S.
+    // `a_rectangle_binds_in_the_rows_order_and_not_the_traces` stated
+    // `In(0), Out(0), In(1)` against a trace handing over its reads and then
+    // its write, and required the OUTPUT second. Bound positionally the
+    // shader is given the second read where its output belongs and writes the
+    // answer into a buffer nobody reads -- both are storage buffers of the
+    // same length, so nothing downstream sees it.
+    //
+    // THE ROW'S SCALARS AGAINST THE MODULE'S BLOCK.
+    // `a_module_with_no_room_for_the_rows_scalars_says_how_many_of_each` put
+    // a row of two scalars against a uniform block of one member and required
+    // `Undispatchable::Scalars { stated: 2, room: 1 }` by name, having first
+    // planned the same rectangle against a block of two so the refusal could
+    // not be about something else. By name because the underlying defect is
+    // silent: WGSL bounds-checks every access, so a short block reads ZEROS
+    // and a missing pitch is a plausible number.
+    //
+    // THE STATEMENT'S OWN NUMBERS AGAINST THE FIRE'S -- `dims_of`'s three
+    // indices, each checked against a fire that DISAGREED on purpose.
+    // `a_row_that_names_its_extent_takes_it_from_the_statement` required
+    // `grid_param` to take the extent from the statement's param run (256)
+    // and not the rectangle's width (64), and a statement that does not carry
+    // it to fall back to the FIRE rather than to zero, because a zero extent
+    // is a grid that runs nothing and reports success.
+    // `a_row_that_names_its_head_shape_takes_it_from_the_statement` did the
+    // same for `head_param` and `heads_param` with gemma-4's full-attention
+    // shape -- a 512-wide head and four of them, against a fire stating 128
+    // and 8.
+    //
+    // THE RULE, ANSWERED BEFORE ANYTHING BINDS.
+    // `a_symbols_rule_is_answerable_from_the_table_alone` asked `rule_of` for
+    // a row's `LaunchRule` with no operands, no arena and no resolver, which
+    // is what `engine`'s `every_launch_fits` needs to size a prefill it has
+    // not planned. It went through `kernels::sig_in` rather than an equality
+    // test, and pinned the axis peeling that is the reason why: the fully
+    // spelled `rule_lookup_bfloat16_gs_64_b_4` and the base `rule_lookup`
+    // both answer, and a half-spelled `rule_lookup_bfloat16` is refused
+    // rather than rounded to the nearest row. Exact matching found a row for
+    // 432 of the Vulkan port's 3992 launches.
+    //
+    // THE THREE REFUSALS THE ROW PATH RAISED ON ITS WAY.
+    // `a_module_that_binds_more_than_the_plan_states_is_refused_by_arity`
+    // required `Undispatchable::Arity { stated: 1, module: 3 }`;
+    // `an_unresolvable_operand_is_refused_with_its_slot` required
+    // `Undispatchable::Operand` carrying `at: 1` and
+    // `Unbindable::UnknownWeight`, so a missing weight names the slot it
+    // would have gone in; and `a_grid_that_would_run_nothing_is_refused` sent
+    // a zero-width rectangle in and required `Empty` or `Operand` -- either
+    // refusal, so long as nothing dispatched.
+    //
+    // WHERE THE CLAIMS LIVE NOW.
+    //
+    // * The operand order and the bind group: `crate::lowering::hold`'s
+    //   `Handles::{input, output, weight}` mint one handle per thing the BODY
+    //   asks for, in the order it asks, recording each as an `Asked`, and
+    //   `crate::lowering::routine::bind` lays them out as `Placed` against
+    //   the module's own `Declared`. Held by `hold.rs`'s
+    //   `handles_are_minted_in_the_order_the_body_asks` and
+    //   `a_statement_the_arm_cannot_fill_is_refused`, and by `routine.rs`'s
+    //   `a_handle_past_what_the_arm_minted_is_refused_by_name` and
+    //   `an_operand_the_fire_does_not_hold_is_refused_by_name`.
+    // * The scalars against the block's room: `Unplanned::Scalars`, held by
+    //   `routine.rs`'s
+    //   `scalars_wider_than_the_modules_block_are_refused_by_name`.
+    // * The grid that must not be empty: the body states its own extent and
+    //   `routine.rs`'s `a_body_that_computed_a_zero_extent_is_refused` pins
+    //   the refusal; `crates/driver-wgpu/tests/arena.rs`'s
+    //   `every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal`
+    //   asserts no grid of any real rectangle contains a zero.
+    // * The statement's numbers beating the fire's:
+    //   `crate::lowering::hold::facts` builds `Facts` from the launch and the
+    //   fire, and `Handles::stated` is `dims_of`'s fallback transcribed --
+    //   the statement's scalar, zero treated as absent, the fire's number
+    //   otherwise. Its doc says so at the line.
+    // * The symbol lookup: `crate::lowering::routine::armed` over
+    //   `hold::crossed`, whose spelling rules are held by `hold.rs`'s
+    //   `the_armed_stems_are_the_ones_registered_and_nothing_else` and
+    //   `every_entrypoint_is_claimed_by_the_stem_that_owns_it`, and whose
+    //   join is held by `routine.rs`'s
+    //   `an_armed_symbol_is_reached_through_the_spelling_a_plan_uses` --
+    //   which pins the same two traps `sig_in`'s axis peeling was written
+    //   for, a quantization suffix no routine name carries and a stem that is
+    //   a strict prefix of another.
+    //
+    // WHAT IS LOST, and it is not small.
+    //
+    // `Undispatchable::{Arity, Operand, Scalars, Empty, Ungeometric}` were
+    // built and named ONLY here. Nothing constructs them now: every refusal
+    // the routine plane raises arrives as `Undispatchable::Routine` carrying
+    // a rendered string, so a caller that used to tell an arity mistake from
+    // an unresolvable weight from a block too small by MATCHING now gets one
+    // variant and prose. The conditions are still checked one layer down as
+    // `Unplanned::*`; what is gone is this enum's ability to say which.
+    // `tests/citations.rs`'s census counts variants that are declared, so
+    // those five have to be listed as unnamed there or deleted outright.
+    //
+    // The plan-order fallback has no successor at all. `Handles::input` is
+    // not the same claim -- a body asks for the statement's operands one at a
+    // time, by index, and no code anywhere now takes a whole argument list
+    // and binds it in the order it arrived. That was `binding::reorder`, and
+    // `reorder` is retiring with these tests.
+    //
+    // `rule_of`'s promise -- a grid rule for a symbol, with nothing bound --
+    // has no successor either, and it had a real caller: a routine states its
+    // lanes only when it is PLANNED, against a statement, so
+    // `engine`'s `every_launch_fits` cannot ask what it used to ask. That
+    // caller has to be rewritten around `plan_one` or dropped; it is not a
+    // gap a test on this side can close.
+    //
+    // The three-index override survives as `Handles::stated` and is used by
+    // the arms that need it, but no test in this crate now pins the RULE that
+    // a statement's number beats the fire's. `dims_of` had one line per index
+    // and two tests holding all three against a fire chosen to disagree.
+    // Gemma-4 is the case that motivated them -- four 512-wide KV heads
+    // against sixteen 256-wide ones in one checkpoint -- and it is now
+    // asserted per body or not at all.
 }

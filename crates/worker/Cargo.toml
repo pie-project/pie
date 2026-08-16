@@ -18,10 +18,11 @@ crate-type = ["rlib"]
 # Binary half — the `pie` CLI. Parses argv via clap and dispatches into
 # the lib.
 [features]
-# Default = no embedded backend feature. Enable `driver-cuda` (Linux/NVIDIA),
-# `driver-metal` (macOS), `driver-vulkan` (anywhere with a loader and an ICD)
-# or `driver-wgpu` (anywhere with an adapter) to reach a device; with none of
-# them, this crate builds and serves nothing locally.
+# Default = no embedded backend feature. Enable `driver-cuda-12` /
+# `driver-cuda-13` (Linux/NVIDIA -- the number is the CUDA runtime ABI this
+# binary will LOAD), `driver-metal` (macOS), `driver-vulkan` (anywhere with a
+# loader and an ICD) or `driver-wgpu` (anywhere with an adapter) to reach a
+# device; with none of them, this crate builds and serves nothing locally.
 #
 # There used to be a third: an always-linked `driver-dummy` selected at
 # runtime, plus a `driver-dummy = []` no-op kept for older build commands.
@@ -30,7 +31,13 @@ default = []
 # Each flavor turns on a DEPENDENCY, not a branch in this crate's build
 # script. Both drivers are Rust now, so what this crate needs from them is
 # that they be in the graph.
-driver-cuda = ["engine/driver-cuda"]
+#
+# CUDA carries its runtime ABI in the name, and `_driver-cuda` is the private
+# "the CUDA shell is linked" gate every `#[cfg]` here is written against. See
+# `engine`'s manifest for why there is no version-less `driver-cuda`.
+_driver-cuda = ["engine/_driver-cuda"]
+driver-cuda-12 = ["_driver-cuda", "engine/driver-cuda-12"]
+driver-cuda-13 = ["_driver-cuda", "engine/driver-cuda-13"]
 driver-metal = ["engine/driver-metal"]
 # The pure-Rust Vulkan driver. Portable rather than vendor-specific, so it is
 # a flavor a machine can have alongside either of the two above -- and without
@@ -50,8 +57,6 @@ nixl = ["dep:transport", "transport/nixl"]
 # corresponding flag. See `crates/engine/src/scheduler/probe.rs` for the
 # catalog of domains.
 profile-fire = ["engine/profile-fire"]
-profile-hot-path = ["engine/profile-hot-path"]
-profile-all = ["engine/profile-all"]
 
 [dependencies]
 # `pie` is the runtime crate. After Phase 8 deleted the legacy

@@ -1,18 +1,12 @@
 //! `qwen3_5`'s SHAPE: the numbers a checkpoint of the GDN hybrid has.
 //!
-//! Ungated, because a row is written in these words and a row is the
-//! crate's identity under every aspect -- `chat` asks which template
-//! speaks for it, `contract` asks how to author it, `forward` asks what
-//! to trace. `llama_like`'s `spec.rs` made the argument first; this
-//! family follows it, and has one more reason to: the hybrid's layer
-//! SCHEDULE (which layers are gated-delta-net and which are full
-//! attention) is what its manifest and its `Deployment` are both
-//! projections of, and neither of those belongs to the tracer.
-//!
-//! What stayed behind in `forward/facts.rs` is [`Qwen35CudaFacts`], the
-//! per-backend BINDING facts -- env gates, workspace ceilings, which
-//! joins the load materialized. Those name kernels, so they belong to
-//! the aspect that has them.
+//! Ungated, because a row is the crate's identity under every aspect — `chat`
+//! asks which template speaks for it, `contract` how to author it, `forward`
+//! what to trace. This family has one more reason than `llama_like`: the
+//! hybrid's layer SCHEDULE is what its manifest and its `Deployment` are both
+//! projections of, and neither belongs to the tracer. Per-backend BINDING facts
+//! stay in `forward/facts.rs` as [`Qwen35CudaFacts`] — env gates, workspace
+//! ceilings, which joins the load materialized — because those name kernels.
 //!
 //! [`Qwen35CudaFacts`]: super::forward::facts::Qwen35CudaFacts
 
@@ -22,16 +16,12 @@ use serde::{Deserialize, Serialize};
 /// Facts for one qwen3_5_moe-family MoE MLP block — a traced FRAGMENT, not
 /// a model.
 ///
-/// Deliberately narrower than a `Qwen35MoeFacts` would be: the qwen3.5
-/// family alternates GDN linear-attention layers with full-attention layers
-/// (the HYBRID part, `crates/driver-cuda/csrc/src/model/qwen3_5/qwen3_5_forward.cpp`),
-/// and declaring the MoE MLP inside the llama_like skeleton would trace a
-/// model that does not exist. So these facts describe exactly the unit the
-/// qwen3_5 hybrid composes per layer — `y += moe_mlp(rmsnorm(y))`, the
-/// [`Qwen35MlpKind::Moe`] arm of [`Qwen35HybridFacts`] — and
-/// `family::qwen3_5_moe_mlp_block` traces that unit standalone. The GDN
-/// attention half is [`Qwen35GdnFacts`] / `family::qwen3_5_gdn_block` —
-/// its own fragment, same reasoning.
+/// Deliberately narrower than a `Qwen35MoeFacts`: the family alternates GDN
+/// linear-attention with full-attention layers, so declaring the MoE MLP inside
+/// the llama_like skeleton would trace a model that does not exist. These facts
+/// describe exactly the unit the hybrid composes per layer —
+/// `y += moe_mlp(rmsnorm(y))`, the [`Qwen35MlpKind::Moe`] arm of
+/// [`Qwen35HybridFacts`] — which `family::qwen3_5_moe_mlp_block` traces alone.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Qwen35MoeMlpFacts {
     pub hidden: u32,
@@ -55,16 +45,12 @@ pub struct Qwen35MoeMlpFacts {
 impl Qwen35MoeMlpFacts {
     /// Qwen3.5-35B-A3B, the small qwen3_5_moe checkpoint.
     ///
-    /// No config.json is committed in this tree, so these dims are pinned
-    /// from the driver's own measured notes on this checkpoint
-    /// (`qwen3_5_moe_forward.cpp`): 256 routed experts ("with 256 experts
-    /// holding only a few routes each"); gate_up bytes per expert 4.2 MB at
-    /// tp=1 / 2.1 MB at tp=2 = `2 * moe_intermediate * hidden * 2B` with
-    /// `moe_intermediate = 512, hidden = 2048`; top-k 8 (the profiled
-    /// N=128 decode step's "352 blocks for ~252 active experts" matches
-    /// the aligned-decode block formula only at `routes = N * 8`); and a
-    /// shared expert with `Is == Im` (the precondition of the shared-fold
-    /// experiment, which rode it along "as one more expert").
+    /// No config.json is committed here, so these dims are pinned from
+    /// `qwen3_5_moe_forward.cpp`'s measured notes: 256 routed experts; gate_up
+    /// 4.2 MB/expert at tp=1 = `2 * moe_intermediate * hidden * 2B` with
+    /// `moe_intermediate = 512, hidden = 2048`; top-k 8 (the profiled N=128 step's
+    /// "352 blocks for ~252 active experts" matches the aligned-decode formula
+    /// only at `routes = N * 8`); a shared expert with `Is == Im`.
     pub fn qwen3_5_35b_a3b() -> Self {
         Self {
             hidden: 2048,
@@ -80,14 +66,10 @@ impl Qwen35MoeMlpFacts {
 /// Facts for one qwen3_5 GDN (gated-deltanet) linear-attention block — the
 /// second traced FRAGMENT, and the other layer kind of the qwen3.5 hybrid.
 ///
-/// Describes exactly the unit the qwen3_5 hybrid composes on a `Linear`
-/// layer — `y += gdn(l, rmsnorm(y, attn_norm))` (plan.md Part 1's
-/// `match layers[l] { ..., Linear => gdn(l, x, h) }`) — traced standalone by
+/// Exactly the unit the hybrid composes on a `Linear` layer —
+/// `y += gdn(l, rmsnorm(y, attn_norm))` — traced standalone by
 /// `family::qwen3_5_gdn_block`, mirroring
-/// `qwen3_5_forward.cpp::linear_attn_layer_body` launch for launch. The
-/// full-attention layer kind is [`Qwen35FullAttnFacts`] /
-/// `family::qwen3_5_full_attn_block` — its own fragment, same reasoning —
-/// and [`Qwen35HybridFacts`] composes both into the full model.
+/// `qwen3_5_forward.cpp::linear_attn_layer_body` launch for launch.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Qwen35GdnFacts {
     pub hidden: u32,
@@ -103,15 +85,10 @@ pub struct Qwen35GdnFacts {
     /// Depthwise conv window (HF `linear_conv_kernel_dim`).
     pub conv_kernel: u32,
     /// The deployment bound the fused `in_proj_qkvz` + `in_proj_ba` banks.
-    /// A *binding* fact, llama_like's `fused_qkv` precedent: the checkpoint
-    /// ships four raw projections (`in_proj_{qkv,z,b,a}`) and the CUDA
-    /// contract's `gdn_fused_in_proj_joins` re-joins them — but only behind
-    /// `PIE_QWEN35_FUSED_GDN_PROJ` (default OFF,
-    /// `qwen35_fused_gdn_projection_enabled()`), so the default deployment
-    /// binds four projections and the trace writes four matmuls; with the
-    /// join enabled it writes two matmuls + two `SplitGdn`s
-    /// (`qwen3_5_forward.cpp` branches on `la_in_proj_qkvz`/`la_in_proj_ba`
-    /// the same way).
+    /// A *binding* fact: the checkpoint ships four raw projections
+    /// (`in_proj_{qkv,z,b,a}`) and `gdn_fused_in_proj_joins` re-joins them only
+    /// behind `PIE_QWEN35_FUSED_GDN_PROJ` (default OFF), so the default trace
+    /// writes four matmuls and the joined one two matmuls + two `SplitGdn`s.
     pub fused_in_proj: bool,
     /// qwen3.5/3.6 use the Gemma `(1 + w)` fold for the block norms
     /// (`kernels::norm::rmsnorm_gemma_bf16` on the pre-attention norm). The GATED
@@ -141,26 +118,21 @@ impl Qwen35GdnFacts {
     /// (`crates/driver-cuda/csrc/tests/parity_qwen3_5_multireq.py` defaults to
     /// `Qwen/Qwen3.5-0.8B-Base`).
     ///
-    /// No config.json is committed in this tree, so every dimension is
-    /// pinned from the drivers' own statements of this checkpoint:
+    /// No config.json is committed here, so every dimension is pinned from the
+    /// drivers' own statements of this checkpoint:
     ///
-    /// * `crates/driver-metal/csrc/src/model/qwen3_5/geometry.hpp` (`DecodeGeometry`
-    ///   defaults, the Metal driver's 0.8B target): `hidden = 1024`,
-    ///   `gdn_k_heads = 16`, `gdn_v_heads = 16`, `gdn_k_dim = 128`,
-    ///   `gdn_v_dim = 128`, `gdn_conv_k = 4`, `gdn_conv_dim = 6144`,
-    ///   `gdn_v_total = 2048` — and `conv_dim()`/`value_width()` here
-    ///   reproduce those last two (2·2048 + 2048 = 6144, 16·128 = 2048).
-    /// * `crates/driver-metal/csrc/src/model/qwen3_5/decode_consts.cpp` corroborates
-    ///   the widths as launch geometry: in-proj 1024 → 6144, z 1024 →
-    ///   2048, out-proj 2048 → 1024, "in_proj_a / in_proj_b — DENSE bf16
-    ///   GEMV [16, 1024]" (= value_heads × hidden).
-    /// * `crates/driver-cuda/csrc/src/model/config.hpp:357` pins the conv window: 4.
-    /// * `fused_in_proj: false` is the live default binding
-    ///   (`PIE_QWEN35_FUSED_GDN_PROJ` unset — see the field doc).
+    /// * `driver-metal/csrc/src/model/qwen3_5/geometry.hpp` (`DecodeGeometry`
+    ///   defaults): `hidden = 1024`, `gdn_k_heads = 16`, `gdn_v_heads = 16`,
+    ///   `gdn_k_dim = 128`, `gdn_v_dim = 128`, `gdn_conv_k = 4`,
+    ///   `gdn_conv_dim = 6144`, `gdn_v_total = 2048` — `conv_dim()`/`value_width()`
+    ///   reproduce the last two (2·2048 + 2048 = 6144, 16·128 = 2048).
+    /// * `decode_consts.cpp` corroborates them as launch geometry: in-proj
+    ///   1024 → 6144, z 1024 → 2048, out-proj 2048 → 1024, in_proj_a/b a dense
+    ///   bf16 GEMV `[16, 1024]` (= value_heads × hidden).
+    /// * `driver-cuda/csrc/src/model/config.hpp:357` pins the conv window: 4.
+    /// * `fused_in_proj: false` is the live default binding (see the field doc).
     /// * `norm_variant: Gemma`: `qwen3_5_forward.cpp` launches
-    ///   `kernels::norm::rmsnorm_gemma_bf16` for every block norm, and the Metal
-    ///   port states "All RMSNorm gains use the Gemma (1+w) convention"
-    ///   (`crates/driver-metal/csrc/tests/mlx/model/qwen3_5.hpp`).
+    ///   `kernels::norm::rmsnorm_gemma_bf16` for every block norm.
     pub fn qwen3_5_0_8b() -> Self {
         Self {
             hidden: 1024,
@@ -178,18 +150,14 @@ impl Qwen35GdnFacts {
 /// Facts for one qwen3_5 FULL-attention block — the third traced FRAGMENT,
 /// and the last layer kind the qwen3.5 hybrid needed.
 ///
-/// This is NOT llama_like's attention, which is why it gets its own facts
-/// instead of a `LlamaLikeFacts` configuration: the q projection is 2× wide
-/// with an interleaved per-head `[query | gate]` split
-/// (`kernels::layout::split_q_gate_bf16`), the attention output is multiplied by
-/// `sigmoid(gate)` (`kernels::mlp::sigmoid_gate_inplace_bf16` — no residual, not
-/// the shared-expert `SigmoidGateAdd`), rope is PARTIAL
-/// (`partial_rotary_factor`, `kernels::rope::rope_partial_bf16`), and the per-head
-/// q/k norms fold Gemma-style (`kernels::norm::rmsnorm_gemma_bf16` over `N * heads`
-/// rows of `head_dim`). The qk-norm is not a tri-state here: the
-/// hand-written `full_attn_layer_body` launches the per-head pair
-/// unconditionally, so the declaration does too, and only the fold is a
-/// fact ([`Qwen35FullAttnFacts::norm_variant`]).
+/// NOT llama_like's attention, which is why it gets its own facts: the q
+/// projection is 2× wide with an interleaved per-head `[query | gate]` split
+/// (`kernels::layout::split_q_gate_bf16`), the output is multiplied by
+/// `sigmoid(gate)` (`sigmoid_gate_inplace_bf16` — no residual, not the
+/// shared-expert `SigmoidGateAdd`), rope is PARTIAL, and the per-head q/k norms
+/// fold Gemma-style over `N * heads` rows of `head_dim`. The qk-norm is not a
+/// tri-state: `full_attn_layer_body` launches the pair unconditionally, so only
+/// the fold is a fact.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Qwen35FullAttnFacts {
     pub hidden: u32,
@@ -204,15 +172,11 @@ pub struct Qwen35FullAttnFacts {
     /// result with provenance.
     pub rotary_dim: u32,
     /// The deployment bound one packed `[2q | k | v]` projection
-    /// (`fa_qgkv_proj_fused`). A *binding* fact, llama_like's `fused_qkv`
-    /// precedent: the join is env-gated default-OFF
-    /// (`PIE_QWEN35_FUSED_FULL_ATTN_QGKV`,
-    /// `qwen3_5.cpp::fused_full_attn_qgkv_weights_enabled`), so the default
-    /// deployment binds three projections and the trace writes three
-    /// matmuls; with the join enabled it writes Matmul(qgkv) + SplitQkv
+    /// (`fa_qgkv_proj_fused`). A *binding* fact: the join is env-gated
+    /// default-OFF (`PIE_QWEN35_FUSED_FULL_ATTN_QGKV`), so the default trace
+    /// writes three matmuls; with the join it writes Matmul(qgkv) + SplitQkv
     /// whose "q" leg is the 2×-wide `[query | gate]` bank
-    /// (`full_attn_layer_body`'s `use_fused_qgkv` branch:
-    /// `kernels::attn::split_qkv_bf16(packed, qg, k, v, N, 2*Hq, Hk)`).
+    /// (`split_qkv_bf16(packed, qg, k, v, N, 2*Hq, Hk)`).
     pub fused_qkv: bool,
     /// qwen3.5 folds `(1 + w)` on every norm of this block — the
     /// pre-attention norm AND the per-head q/k norms
@@ -230,29 +194,21 @@ impl Qwen35FullAttnFacts {
     }
 
     /// Qwen3.5-0.8B's full-attention geometry, pinned from the drivers'
-    /// own statements of this checkpoint (no config.json is committed;
-    /// same provenance discipline as [`Qwen35GdnFacts::qwen3_5_0_8b`]):
+    /// own statements of this checkpoint (no config.json is committed; same
+    /// provenance discipline as [`Qwen35GdnFacts::qwen3_5_0_8b`]):
     ///
-    /// * `crates/driver-metal/csrc/src/model/qwen3_5/geometry.hpp` (`DecodeGeometry`
-    ///   defaults, the Metal driver's 0.8B target): `hidden = 1024`,
-    ///   `n_q_heads = 8`, `n_kv_heads = 2`, `head_dim = 256`,
-    ///   `rotary_dims = 64` ("derived from partial_rotary_factor *
-    ///   head_dim").
-    /// * `crates/driver-metal/csrc/src/model/qwen3_5/decode_consts.cpp` corroborates
-    ///   the widths as launch geometry: "2×-wide gated q_proj (4096)" =
-    ///   2 · 8 · 256, k/v 1024 → 512 = 2 · 256, o_proj 2048 → 1024.
-    /// * `rotary_dim = 64`: `partial_rotary_factor = 0.25` (the family
-    ///   default `crates/driver-metal/csrc/src/batch/forward.hpp` states and
-    ///   `crates/driver-cuda/csrc/src/model/qwen3_5/qwen3_5.hpp` documents —
-    ///   "`partial_rotary_factor=0.25` — only the first 25% of head_dim is
-    ///   rotated"); the CUDA derivation `max(2, 2·int(0.5·0.25·256))`
-    ///   (`qwen3_5_forward.cpp`) and Metal's `rotary_dims` both land on 64.
-    /// * `fused_qkv: false` is the live default binding
-    ///   (`PIE_QWEN35_FUSED_FULL_ATTN_QGKV` unset — see the field doc).
+    /// * `driver-metal/csrc/src/model/qwen3_5/geometry.hpp` (`DecodeGeometry`
+    ///   defaults): `hidden = 1024`, `n_q_heads = 8`, `n_kv_heads = 2`,
+    ///   `head_dim = 256`, `rotary_dims = 64`.
+    /// * `decode_consts.cpp` corroborates the widths as launch geometry: the
+    ///   2×-wide gated q_proj 4096 = 2·8·256, k/v 1024 → 512 = 2·256,
+    ///   o_proj 2048 → 1024.
+    /// * `rotary_dim = 64` from `partial_rotary_factor = 0.25`: the CUDA
+    ///   derivation `max(2, 2·int(0.5·0.25·256))` and Metal's `rotary_dims`
+    ///   both land on 64.
+    /// * `fused_qkv: false` is the live default binding (see the field doc).
     /// * `norm_variant: Gemma`: `full_attn_layer_body` launches
-    ///   `kernels::norm::rmsnorm_gemma_bf16` for the block norm and both per-head
-    ///   q/k norms, and the Metal port states "All RMSNorm gains use the
-    ///   Gemma (1+w) convention" (`crates/driver-metal/csrc/tests/mlx/model/qwen3_5.hpp`).
+    ///   `rmsnorm_gemma_bf16` for the block norm and both per-head q/k norms.
     pub fn qwen3_5_0_8b() -> Self {
         Self {
             hidden: 1024,
@@ -269,43 +225,30 @@ impl Qwen35FullAttnFacts {
 /// Which MLP the qwen3_5 hybrid runs on every layer: the dense SwiGLU block
 /// (qwen3.5 dense checkpoints — `qwen35_dense_mlp_block`) or the MoE block
 /// (qwen3.5/3.6-MoE — `run_moe_mlp`, the [`Qwen35MoeMlpFacts`] fragment).
-/// One enum for the whole model because the family applies the same MLP
-/// kind to every layer (`qwen3_5_forward.cpp` has no per-layer MLP switch;
-/// the per-layer axis of this family is the ATTENTION kind).
-///
-/// WHICH ARM A CHECKPOINT TAKES IS A READING OF ITS CONFIG, not of its
-/// `model_type`. Qwen3.6-27B is `model_type: qwen3_5` and takes `Dense`
-/// (no `num_experts`, `intermediate_size` 17408); the MoE arm is the
-/// 35B-A3B-shaped checkpoints'. Worth stating because the opposite was
-/// once assumed here, and it aimed a stretch of work at a branch the
-/// checkpoint in question never reaches.
+/// One enum for the whole model: `qwen3_5_forward.cpp` has no per-layer MLP
+/// switch, and this family's per-layer axis is the ATTENTION kind. WHICH ARM A
+/// CHECKPOINT TAKES IS A READING OF ITS CONFIG, not of its `model_type`:
+/// Qwen3.6-27B is `model_type: qwen3_5` and takes `Dense` (no `num_experts`,
+/// `intermediate_size` 17408).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Qwen35MlpKind {
     Dense { intermediate: u32 },
     Moe(Qwen35MoeMlpFacts),
 }
 
-/// Facts for the full qwen3_5 HYBRID model — the declaration that composes
-/// the three fragments: plan.md Part 1's
-/// `match layers[l] { Full => full_attn(l, x), Linear => gdn(l, x) }`,
-/// a static match resolved at trace time.
+/// Facts for the full qwen3_5 HYBRID model, composing the three fragments as
+/// `match layers[l] { Full => full_attn(l, x), Linear => gdn(l, x) }`, a static
+/// match resolved at trace time.
 ///
 /// # How the layer kinds are known
 ///
-/// The checkpoint states them explicitly: `config.json` ships a
-/// `layer_types` array of `"linear_attention"` / `"full_attention"` with one
-/// entry per layer, which is the CUDA driver's sole source
-/// (`HfConfig::layer_types`, parsed in `crates/driver-cuda/csrc/src/model/config.cpp`;
-/// `qwen3_5.cpp` refuses a length mismatch). The qwen3.5 checkpoints ship a
-/// REGULAR pattern — one full-attention layer every
-/// `full_attention_interval`, the rest linear
-/// (`crates/driver-metal/csrc/tests/mlx/model/qwen3_5.hpp`) — and the Metal driver
-/// reduces the array to exactly that interval, refusing irregular arrays
-/// (`crates/driver-metal/csrc/src/batch/forward.hpp`: "-1: `layer_types` is irregular,
-/// refuse"; `crates/driver-metal/csrc/src/model/qwen3_5/geometry.hpp::is_full_attn`).
-/// These facts state the interval, mirroring that reduction: a hypothetical
-/// irregular checkpoint is outside this declaration's vocabulary, exactly
-/// as it is outside the Metal driver's.
+/// `config.json` ships a `layer_types` array of `"linear_attention"` /
+/// `"full_attention"`, one per layer, which is the CUDA driver's sole source
+/// (`HfConfig::layer_types`; `qwen3_5.cpp` refuses a length mismatch). Shipped
+/// checkpoints are REGULAR — one full-attention layer every
+/// `full_attention_interval` — and the Metal driver reduces the array to that
+/// interval, refusing irregular ones. These facts state the interval: an
+/// irregular checkpoint is outside this vocabulary as it is outside Metal's.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Qwen35HybridFacts {
     pub layers: u32,
@@ -344,19 +287,12 @@ impl Qwen35HybridFacts {
     /// Qwen3.5-0.8B, the workspace's hybrid parity checkpoint
     /// (`crates/driver-cuda/csrc/tests/parity_qwen3_5_multireq.py` defaults to
     /// `Qwen/Qwen3.5-0.8B-Base`). Sub-facts are the provenance-pinned 0.8B
-    /// fixtures ([`Qwen35FullAttnFacts::qwen3_5_0_8b`],
-    /// [`Qwen35GdnFacts::qwen3_5_0_8b`]); the model-level dims are pinned
-    /// from `crates/driver-metal/csrc/src/model/qwen3_5/geometry.hpp` (`DecodeGeometry`
-    /// defaults, the Metal driver's 0.8B target): `n_layers = 24`,
-    /// `full_attn_interval = 4` (layers 3, 7, 11, 15, 19, 23 full — the
-    /// family's 3:1 linear:full pattern), `vocab = 248320`
-    /// (`decode_consts.cpp` corroborates: lm_head 1024 → 248320),
-    /// `tied_embeddings = true`. The MLP is DENSE with `intermediate =
-    /// 3584` (geometry.hpp; `decode_consts.cpp`: gate/up 1024 → 3584,
-    /// down 3584 → 1024) — "Dense only on the 0.8B target (MoE deferred)"
-    /// (`crates/driver-metal/csrc/tests/mlx/model/qwen3_5.hpp`), and the CUDA dense
-    /// family (`model_type: qwen3_5`, `qwen3_5_forward.cpp`) runs
-    /// `qwen35_dense_mlp_block` on every layer.
+    /// fixtures; the model-level dims come from `geometry.hpp`'s
+    /// `DecodeGeometry` defaults: `n_layers = 24`, `full_attn_interval = 4`
+    /// (layers 3, 7, 11, 15, 19, 23 full — the family's 3:1 linear:full
+    /// pattern), `vocab = 248320` (lm_head 1024 → 248320),
+    /// `tied_embeddings = true`. The MLP is DENSE at `intermediate = 3584`
+    /// (gate/up 1024 → 3584, down 3584 → 1024).
     pub fn qwen3_5_0_8b() -> Self {
         Self {
             layers: 24,
@@ -373,25 +309,19 @@ impl Qwen35HybridFacts {
     /// Qwen3.6-27B — the DENSE hybrid, read from the checkpoint's own
     /// `config.json` (`text_config`), not inferred from the family name.
     ///
-    /// Every value here is a field of that file or the driver's stated
-    /// derivation from one: 64 layers, `full_attention_interval` 4,
-    /// `vocab_size` 248320, `tie_word_embeddings` false,
-    /// `intermediate_size` 17408 (no `num_experts` — this checkpoint
-    /// takes the `Dense` arm, see [`Qwen35MlpKind`]), hidden 5120,
-    /// 24 q heads over 4 kv heads at `head_dim` 256, and
-    /// `partial_rotary_factor` 0.25 → `rotary_dim` 64 by the driver's
-    /// `max(2, 2 * int(0.5 * f * head_dim))`. The GDN half is the
-    /// `linear_*` block: 16 key heads, 48 value heads (a GQA ratio of 3,
-    /// which `family.rs`'s gdn body already branches on), 128/128 head
-    /// dims, `linear_conv_kernel_dim` 4.
+    /// Every value is a field of that file or the driver's stated derivation
+    /// from one: 64 layers, `full_attention_interval` 4, `vocab_size` 248320,
+    /// `tie_word_embeddings` false, `intermediate_size` 17408 (no `num_experts`,
+    /// so the `Dense` arm), hidden 5120, 24 q heads over 4 kv heads at
+    /// `head_dim` 256, `partial_rotary_factor` 0.25 → `rotary_dim` 64 by
+    /// `max(2, 2 * int(0.5 * f * head_dim))`. The GDN half: 16 key heads, 48
+    /// value heads (GQA ratio 3, which `family.rs`'s gdn body branches on),
+    /// 128/128 head dims, `linear_conv_kernel_dim` 4. Both fusion joins are
+    /// env-gated default-off, as at 0.8B.
     ///
-    /// `fused_in_proj` / `fused_qkv` are false because both joins are
-    /// env-gated default-off, the same as 0.8B's.
-    ///
-    /// NOT reachable on an L40S at bf16 — 27B is ~55 GB against 46. An
-    /// FP8 checkpoint of the same geometry is what would boot here; the
-    /// traced form is identical either way, which is why the fixture is
-    /// worth having before the hardware is.
+    /// NOT reachable on an L40S at bf16 — 27B is ~55 GB against 46. An FP8
+    /// checkpoint of the same geometry would boot; the traced form is identical
+    /// either way, which is why the fixture predates the hardware.
     pub fn qwen3_6_27b() -> Self {
         Self {
             layers: 64,

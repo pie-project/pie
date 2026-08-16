@@ -62,7 +62,7 @@
 //! indifference and called it the driver's mask.
 //!
 //! ```text
-//! PIE_KERNELS_VULKAN_SPV_DIR=<abs>/out/spv PIE_VULKAN_ARTIFACT=/tmp/q4full.zt \
+//! PIE_VULKAN_ARTIFACT=/tmp/q4full.zt \
 //!   cargo test -p pie-gpu-tests --features driver-vulkan \
 //!   --test vulkan_padded_causal_mask -- --ignored --nocapture
 //! ```

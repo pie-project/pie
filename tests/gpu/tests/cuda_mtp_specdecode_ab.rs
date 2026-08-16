@@ -31,7 +31,7 @@
 //!
 //! `#[ignore]`, driver-cuda. Run:
 //!   PIE_MTP_DRAFT_TOKENS=4 cargo test -p pie-gpu-tests \
-//!     --features driver-cuda --test cuda_mtp_specdecode_ab -- --ignored --nocapture
+//!     --features driver-cuda-13 --test cuda_mtp_specdecode_ab -- --ignored --nocapture
 
 use std::path::Path;
 use std::process::Command;

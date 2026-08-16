@@ -14,6 +14,8 @@
 //! * [`kv_move`] — the page-major move plan a KV copy runs, one plan for
 //!   every buffer of every layer.
 //! * [`linear`] — the recurrent state slots' step/parity bookkeeping.
+//! * [`recurrent`] — the recurrent stack's slab SHAPE. `pools::recurrent`
+//!   allocates it.
 //! * [`region`] — the trait a device buffer implements so a planner can
 //!   name a sub-range of it without naming Metal.
 //! * [`shader`] — reading kernel text and stating what a batch of them is.
@@ -23,6 +25,7 @@ pub mod bump;
 pub mod kv;
 pub mod kv_move;
 pub mod linear;
+pub mod recurrent;
 pub mod region;
 pub mod shader;
 pub mod tuning;

@@ -1,6 +1,6 @@
 //! THE forward path: guest-programmed pipelines. The wire format (the IR
-//! itself) lives in the `tensor_ir` crate; this module is the runtime domain
-//! that binds/instantiates/fires it.
+//! itself) lives in `tensor_ir`; this module is the runtime domain that
+//! binds/instantiates/fires it.
 //!
 //! - [`program`]: container bytes -> bind -> price -> cache; absorbs
 //!   `model_profile()`.
@@ -14,15 +14,11 @@
 //! - [`fire`]: one fire: prepare -> run-ahead submit -> finalize/poison, plus
 //!   `geometry`/`kv`/`rs`/`lease`.
 //!
-//! Layering: this module imports only `scheduler`/`store`/`driver` (strictly
-//! below it) plus the `tensor_ir` IR crate and other external leaf crates
-//! (`wasmtime::component::ResourceTable`, `uuid`) — never `inferlet`/
-//! `server`. The WIT resource *types* (`Channel`, `ForwardPass`,
-//! `Pipeline`) live here because they hold domain state (cells, FIFO,
-//! working-set reps, cursor, failure, devgeo); `inferlet::host` (L4) owns
-//! only the thin `Host*` trait impls that push/get/delete them from the WASM
-//! component resource table, via the [`fire::FireContext`] trait it
-//! implements for `ProcessCtx` — see `fire`'s module doc.
+//! Layering: this module imports only `scheduler`/`store`/`driver` plus the
+//! `tensor_ir` IR crate and external leaf crates — never `inferlet`/`server`.
+//! The WIT resource *types* live here because they hold domain state;
+//! `inferlet::host` owns only the thin `Host*` trait impls that push/get/
+//! delete them from the WASM component resource table.
 
 pub mod channel;
 pub mod fire;
@@ -34,49 +30,30 @@ use std::sync::{Arc, Mutex};
 
 use fire::{PendingFireQueue, PendingFires, PipelineFailure};
 
-/// A run-ahead submission pipeline (overview §3): the ORDERING domain (W3.1)
-/// — the WIT `pie:inferlet/pipeline.pipeline` resource. Owns the in-flight
-/// fire FIFO — fires submitted here are issued in submission order, so fire
-/// t's epilogue channel puts happen-before fire t+1's descriptor reads,
-/// EXTENDED ACROSS PASSES (draft→verify chaining). `take`/`read` await this
-/// FIFO via each channel's recorded pipeline. Submission order rides the
-/// scheduler queue; completion order rides this FIFO.
+/// A run-ahead submission pipeline (overview §3): the ORDERING domain (W3.1,
+/// WIT `pie:inferlet/pipeline.pipeline`). Owns the in-flight fire FIFO;
+/// submission order rides the scheduler queue, completion order rides this
+/// FIFO.
 ///
-/// **FIFO INVARIANT (B3, mandatory).** Fires of one pipeline keep submission
-/// order through the scheduler onto one stream, and every pass binding a
-/// shared channel MUST submit on the SAME pipeline (enforced by
-/// [`fire::wire_channels_to_pipeline`]). This is the ENTIRE correctness
-/// argument for run-ahead + multi-pass chaining: because all interacting
-/// fires funnel onto one ordered FIFO, fire t's epilogue puts happen-before
-/// fire t+1's descriptor reads. `push_back` at submit + `pop_front` at
-/// finalize preserve that order; the same-pipeline check makes it an explicit
-/// invariant, not an accident.
-///
-/// Domain state (not WIT glue), so it lives here rather than in
-/// `inferlet::host::pipeline`, which only holds the `Host`/`HostPipeline`
+/// **FIFO INVARIANT (B3, mandatory).** Every pass binding a shared channel
+/// MUST submit on the SAME pipeline (enforced by
+/// [`fire::wire_channels_to_pipeline`]) — the entire correctness argument for
+/// run-ahead + multi-pass chaining, since fire t's epilogue channel puts
+/// happen-before fire t+1's descriptor reads. Domain state, not WIT glue:
+/// `inferlet::host::pipeline` only holds the thin `Host`/`HostPipeline`
 /// impls that push/get/delete it from the WASM component resource table.
 pub struct Pipeline {
+    /// This pipeline's in-flight fires, oldest first — the FIFO above.
     pub fires: PendingFires,
     pub(crate) failure: PipelineFailure,
     pub(crate) scope: crate::store::PipelineScope,
     /// Per-lane frame sequence for Vesuvius frame submission (k > 1): each
     /// `forward.submit` frame on this pipeline takes the next number.
     pub(crate) frame_seq: std::sync::atomic::AtomicU64,
-    // UPSTREAM'S `PIE_DEFER_ALLOC` HANDLE IS NOT CARRIED BY THIS MERGE.
-    //
-    // Upstream parks a frame's grant on an engine completion task
-    // (`fire::DeferredSubmission`) and takes it on the next frame in.
-    // That is the same concern this branch's kv-contention rewrite owns —
-    // one queue, one grant, a fire lease as the suspend seal — and the two
-    // designs meet inside `prepare_submission`, which the rewrite replaced
-    // wholesale. Merging them is a design question, not a conflict
-    // resolution, and this branch's rule is that runtime scheduling does
-    // not change under it.
-    //
-    // Dropping it changes NO default behaviour: upstream's path is gated
-    // behind `PIE_DEFER_ALLOC` and is off unless asked for. It is recorded
-    // here rather than deleted quietly so that reconciling the two designs
-    // stays a visible, named piece of work.
+    // This branch does not carry upstream's `PIE_DEFER_ALLOC` handle: its
+    // frame-grant queuing is superseded by this branch's kv-contention
+    // rewrite of `prepare_submission`. Default behaviour is unaffected
+    // (upstream's path is opt-in and off unless asked for).
 }
 
 impl Pipeline {

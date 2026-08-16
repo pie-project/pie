@@ -116,7 +116,7 @@ const ROLES: &[(&str, &[&str])] = &[
     ("q_proj", &["self_attn.q_proj"]),
     ("k_proj", &["self_attn.k_proj"]),
     ("v_proj", &["self_attn.v_proj"]),
-    ("o_proj", &["self_attn.o_proj"]),
+    ("o_proj", &["self_attn.o_proj", "linear_attn.out_proj"]),
     // The Qwen-2 family's projection biases. A bias hangs under the
     // PROJECTION rather than under a module of its own, so the path carries
     // the `.bias` and the empty `weight_suffix` closes it -- the same shape
@@ -139,6 +139,27 @@ const ROLES: &[(&str, &[&str])] = &[
     // and its own checkpoint test does not sweep this text.
     ("o_bias", &["self_attn.o_proj.bias"]),
     ("router_bias", &["mlp.gate.bias", "mlp.router.bias"]),
+    // THE GATED DELTANET's layer, read off a compiled `qwen3.5-0.8b-base`
+    // plan rather than guessed. Its projections and constants hang under
+    // `linear_attn.`, which is a module this table had never seen: 306 of the
+    // 712 names a qwen3.5 lowering binds had NO SPELLING here, which by the
+    // rule stated above is not a refusal anywhere -- the loader allocates what
+    // it could name and the rest stay bound to whatever the arena held. That
+    // is the gpt-oss defect at six times the scale.
+    //
+    // `out_proj` is listed under `o_proj` beside the attention spelling: a
+    // hybrid's linear layers publish `linear_attn.out_proj` and its full
+    // layers `self_attn.o_proj`, one text binds `layer.N.o_proj` for both, and
+    // the two paths cannot collide because no layer is both kinds.
+    ("conv_w", &["linear_attn.conv1d.weight"]),
+    ("conv_b", &["linear_attn.conv1d.bias"]),
+    ("a_log", &["linear_attn.A_log"]),
+    ("dt", &["linear_attn.dt_bias"]),
+    ("gate_norm", &["linear_attn.norm"]),
+    ("in_proj_qkv", &["linear_attn.in_proj_qkv"]),
+    ("in_proj_a", &["linear_attn.in_proj_a"]),
+    ("in_proj_b", &["linear_attn.in_proj_b"]),
+    ("in_proj_z", &["linear_attn.in_proj_z"]),
     ("q_norm", &["self_attn.q_norm"]),
     ("k_norm", &["self_attn.k_norm"]),
     // One learned logit per head, and the one role whose tensor hangs under

@@ -1,40 +1,118 @@
+//! The CUDA attention family: FlashInfer's FA2 lattice and scheduler, XQA's
+//! decode kernel, MLA's prefill and naive pair, the paged-KV writers, the DSV4
+//! compression path and the fused QKV projections.
+//!
+//! Parameters are typed by what a binder can answer for. `In<N, _>`/`Out<N, _>`
+//! promise a region's `rows` and `width`, so a launcher holding one divides for
+//! itself rather than taking the quotient as a parameter; `Unbound<T>` is the
+//! opposite — `T` plus a name for the absence of a source, promising no extent
+//! and consuming neither positional counter. The `#[source(..)]` marks record
+//! which driver-side query each parameter is read from, and the block below the
+//! imports says where they come from and what an unmarked parameter means.
+
 #![allow(clippy::too_many_arguments)]
 
 use core::ffi::c_void;
 
-use crate::jit::abi::{Elem, bf16, f16};
+use crate::jit::abi::{Inst, bf16, f16};
 use crate::jit::{Abi, Ctx, Family, Launch, Routine};
-// The YaRN quartet is `rope`'s, and attention names it because the fused
-// prepare rotates on the way in. One import across a family boundary, which
-// is the shape `x::cx` existed to avoid and was not worth a module for.
 use crate::rope::Yarn;
 use crate::{driver_bound, routine};
 use kernels::Refusal;
+use kernels::keys;
+use kernels::routine::{Bank, Env, In, Out, Param, Unbound};
 
-// `routine!` names a `fn` by IDENTIFIER, so the host programs that live
-// beside the root whose kernels they launch are brought into scope here to
-// be named in `ROUTINES`. The routine's name is the identifier and not the
-// path, which is what keeps it equal to its contract symbol's tail, and
-// `driver_bound!` names its `fn` the same way.
-//
-// Two come from further off than a submodule of this file: the score fold
-// from the root module that compiles it, and `split_qkv_bf16` from
-// `driver_internal`, whose header says why that body stays there while the
-// declaration is here.
 use attention_flashinfer::attn_score_fold_heads;
 use crate::driver_internal::split_qkv_bf16;
 use dsv4_compress::{dsv4_compress_gather_paged_bf16, dsv4_store_comp_entries_bf16};
 use kv_paged::{
     dequant_kv_cache_layer_to_bf16_active, write_kv_explicit_bf16, write_kv_explicit_bf16_devwin,
-    write_kv_to_pages,
+    write_kv_to_pages, write_kv_to_pages_bf16, write_kv_to_pages_quantised,
 };
 use qkv_fused::{
     qkv_decode_fused_dispatch, qkv_decode_qk_norm_rope_write_kv_bf16,
     qkv_packed_qk_norm_rope_vnorm_write_kv_bf16,
 };
 
+// ── WHERE THE `#[source(..)]` MARKS COME FROM ──────────────────────────
+//
+// Every mark below is read off the arm that binds that symbol in
+// `driver-cuda/src/bind/arms/attn.rs`. Where a launcher has no arm, the
+// evidence is its row's `unbound:` sentence, which names the query each
+// operand would come off.
+//
+// A parameter that carries no mark is one of two cases, and the sites below
+// cite them as (a) and (b):
+//
+//   (a) no `Source` variant names the fact at all — `cx.q_out()` and the
+//       `dsv4` compression `ratio`. THE LIST WAS SIX LONGER: `peel_window`,
+//       `first_token`, `final_logit_softcap` and `w_page_d`/`w_off_d` all
+//       have keys now, so the case they illustrated moved out from under
+//       them. What is left is a RESULT and a ratio, not facts nobody named;
+//
+//       THE ATTENTION WORKSPACE'S FOUR WERE ON THAT LINE AND ARE NOT ANY
+//       MORE, and no launcher in THIS file ever took them — `attn/xqa.rs`
+//       and `attn/fa2/` did. `keys::AttnWorkspaceFloat`, `...FloatBytes`,
+//       `...Int` and `...IntBytes` name what `Cx::attn_workspace` had been
+//       answering all along, which makes them the clearest case of the
+//       shape this list keeps mis-sorting: an UNNAMED answer reads exactly
+//       like an unreachable one from the parameter's end.
+//
+//       THREE NAMES LEFT THIS LIST IN KILIMANJARO III STAGE 3 AND ONE LEFT
+//       EARLIER. `plan()`'s `qo_indptr` and `row_valid` are
+//       `keys::QoIndptr` and `keys::RowValid` (`keys.rs` §1's last two),
+//       `kv_last_page_lens` is `keys::KvLastPageLens`, and `cx.sm_scale()`
+//       is `keys::SmScale` — all four answered by `operand()`, so every
+//       parameter in this file that reads one now SAYS which one. The list
+//       above is what is left, and it is `Cx` queries with no fact behind
+//       them rather than facts with no word: §1.1's *"`k_pages` is one line
+//       away from `page_size`"* has no remaining instance here;
+//   (b) a variant names it and `bind/table.rs`'s `operand()` cannot answer
+//       it — `KvLayer`'s aggregate fields and the KV page pointers. Statement
+//       params are NOT in this bucket any more: `Param<N, T>` and
+//       `ParamF32<N>` state their own slots, and `operand()` answers both.
+//       (b) is the worse row: the coverage test asserts the first unresolved
+//       parameter is `None | Aux | Param | ParamF32`, so a true mark
+//       outside that set turns a passing test into a failing one.
+//
+// TRAP, AND IT IS THE ONE TO READ TWICE: `Source::Named(keys::Rows)` is
+// `f.rows.count`, and a region's height is filled from the same field. It is
+// NOT `cx.rows().total`. The two differ on exactly the peeled fires the
+// `_devwin` launchers exist for, which is why `write_kv_explicit_bf16_devwin`
+// and `split_qkv_bf16_devwin` keep their `n_max` unmarked and unwrapped.
+//
+// `Unbound<T>` is a REFUSAL and not a mark: it is `T` plus a name for the
+// absence of a source, promises no extent, and consumes neither positional
+// counter. `In<N, _>`/`Out<N, _>` do promise extents — a region carries
+// `rows` and `width`, so a launcher holding one divides for itself rather
+// than taking the quotient as a parameter.
+//
+// A width that arrives through a region is `unwrap_or(0)`, where the deleted
+// `#[source(OutWidth(n))]` refused a zero. Any launcher that needs the zero
+// caught builds a VIEW — `x.all("out_width(0)")?`, which refuses in the word
+// the launcher passes it and hands back a `Region` whose `width` cannot be
+// zero and whose `stride` states the packing the body used to assume
+// (`kernels/src/routine.rs`). Two launchers deliberately build none; see
+// `head_dim_refusal` and the note where `width_of` used to stand.
+//
+// ── WHICH ROWS CARRY A COLUMN ──────────────────────────────────────────
+//
+// `routine!` rows do. `driver_bound!` rows do not: their bodies answer
+// `Refusal::Absent { what: "a statement-bound body" }` for every argument
+// list, so a column could never be honoured by the thing it feeds. Those six
+// launchers still carry their marks, because the mark is where the reading is
+// written down.
+//
+// Two rows cannot cross however complete their column gets, because a derived
+// arm is bindings and nothing else: `write_kv_to_pages_quantised`'s arm
+// refuses outright on a non-zero `cx.first_token()`, and
+// `dequant_kv_cache_layer_to_bf16_active`'s returns `Ok(())` without
+// launching when the layer is already bf16.
+
 /// The FlashInfer FA2 lattice, its host arithmetic and its param structs.
 pub mod fa2;
+/// FlashAttention-4 forward: the host launcher for `attn/fa4.cuh`.
+pub mod fa4;
 /// The scheduler: `flashinfer/attention/scheduler.cuh` as host Rust.
 pub mod plan;
 /// XQA's decode kernel and the five members its host program picks between.
@@ -54,6 +132,38 @@ impl kv_scheme {
     #[must_use]
     pub const fn of(scheme: crate::attn::KvScheme) -> Self {
         Self(scheme as i32 as u8)
+    }
+
+    /// The [`KvScheme`] this byte spells, or `None` for a byte no scheme mints.
+    ///
+    /// # Why the inverse exists, and what it is NOT for
+    ///
+    /// `.wiki/kilimanjaro.md` §5 D1 — *"a routine takes fields, never a
+    /// struct"* — makes the quantisation scheme an ARGUMENT of
+    /// [`kv_paged::write_kv_to_pages_quantised`] rather than a field the
+    /// routine reads off a `&KvLayer`. A `routine!` derives its table row
+    /// from the signature, so every parameter has to be a
+    /// [`kernels::routine::Arg`], and [`KvScheme`] is a host enum that no
+    /// `Arg` impl names — this newtype is the spelling that does.
+    ///
+    /// The routine then has to BRANCH on it, because the four schemes are
+    /// four kernels. That is what this answers, and answering it as an
+    /// `Option<KvScheme>` rather than as a chain of `==` against
+    /// [`Self::of`] is deliberate: the `match` at the branch stays
+    /// exhaustive, so a fifth scheme is a compile error at the routine
+    /// rather than a silent fall into the `Native` refusal.
+    #[must_use]
+    pub const fn scheme(self) -> Option<crate::attn::KvScheme> {
+        use crate::attn::KvScheme;
+
+        match self.0 {
+            0 => Some(KvScheme::Native),
+            1 => Some(KvScheme::Fp8PerTensor),
+            2 => Some(KvScheme::Int8PerTokenHead),
+            3 => Some(KvScheme::Fp8PerTokenHead),
+            4 => Some(KvScheme::Fp4Block),
+            _ => None,
+        }
     }
 }
 
@@ -102,6 +212,15 @@ impl crate::jit::Abi for kv_dtype {
 }
 
 crate::arg_via_abi!(kv_dtype);
+
+/// The byte a `keys::KvSchemeByte` / `keys::KvStorageDtype` `i32` spells.
+///
+/// `u8::MAX` for anything out of range, so a wrong number lands on the
+/// `None` refusal rather than aliasing onto a scheme `& 0xff` happens to hit.
+#[must_use]
+const fn scheme_byte(n: i32) -> u8 {
+    if n < 0 || n > u8::MAX as i32 { u8::MAX } else { n as u8 }
+}
 
 /// `attn`'s `#[repr(C)]` mirrors of C++ aggregates, and their measured
 pub mod params {
@@ -183,6 +302,8 @@ pub mod params {
 pub mod attention_flashinfer {
     use crate::jit::{Ctx, Launch};
     use crate::jit::Abi;
+    use kernels::keys;
+    use kernels::routine::{Env, Unbound};
     use kernels::Refusal;
 
     /// `attn::attn_score_fold_heads_dev` — the per-head rows of one request
@@ -205,15 +326,16 @@ pub mod attention_flashinfer {
     /// reach a launch, since a zero `grid.x` is itself a refusal — and
     /// whatever the compile, the load or the launch refuses.
     #[allow(clippy::too_many_arguments)]
+    #[kernels_macros::routine]
     pub fn attn_score_fold_heads(
         ctx: &Ctx,
         scores: *const f32,
-        score_indptr: *const i32,
-        kv_page_indptr: *const u32,
-        kv_last_page_lens: *const u32,
-        page_size: i32,
-        num_requests: i32,
-        num_q_heads: i32,
+        score_indptr: Unbound<*const i32>,
+        kv_page_indptr: Env<keys::KvPageIndptr>,
+        kv_last_page_lens: Unbound<*const u32>,
+        page_size: Env<keys::KvPageSize>,
+        num_requests: Env<keys::RequestCount>,
+        num_q_heads: Env<keys::NumQHeads>,
         folded: *mut f32,
     ) -> Result<(), Refusal> {
         /// The fold's block width: `attention_flashinfer.cu:829`'s `256`.
@@ -257,9 +379,9 @@ pub mod attention_flashinfer {
                 Launch::grid([num_requests.unsigned_abs(), FOLD_GRID_Y, 1], [FOLD_BLOCK, 1, 1]),
                 &[
                     scores.arg(),
-                    score_indptr.arg(),
+                    score_indptr.ptr.arg(),
                     kv_page_indptr.arg(),
-                    kv_last_page_lens.arg(),
+                    kv_last_page_lens.ptr.arg(),
                     page_size.arg(),
                     num_q_heads.arg(),
                     folded.arg(),
@@ -279,6 +401,7 @@ pub mod attention_flashinfer {
 /// than separate calls. The driver issues them at the point on its own stream
 /// where those dispatches used to.
 pub mod attention_score_post {
+    use kernels::routine::Env;
     use crate::jit::{Ctx, Launch};
     use crate::jit::Abi;
     use kernels::Refusal;
@@ -403,7 +526,7 @@ pub mod attention_score_post {
         ctx: &Ctx,
         scores: *mut f32,
         score_indptr: *const i32,
-        qo_indptr: *const u32,
+        qo_indptr: Env<*const u32>,
         kv_page_indptr: *const u32,
         kv_last_page_lens: *const u32,
         page_size: i32,
@@ -468,7 +591,7 @@ pub mod attention_score_post {
         scores: *const f32,
         folded: *mut f32,
         score_indptr: *const i32,
-        qo_indptr: *const u32,
+        qo_indptr: Env<*const u32>,
         kv_page_indptr: *const u32,
         kv_last_page_lens: *const u32,
         page_size: i32,
@@ -541,20 +664,28 @@ pub mod page_compact {
 /// What the caller must guarantee, as `call()` states it: every pointer is a
 /// device address live across BOTH launches — `scratch_counts` especially,
 /// which carries the dependency between them.
+///
+/// The row that declines this symbol (`arms/attn.rs:582`) says *"six of
+/// eleven ARE answered: `keep` is `arg_in(0)`, the three CSR inputs and
+/// `num_requests` come off `plan()`"*. Only two of the six are marks a
+/// `Source` can carry; the other four are the reason the row is declined.
+#[kernels_macros::routine]
 pub fn compact_page_csr(
     ctx: &Ctx,
-    page_indices_in: *const u32,
-    page_indptr_in: *const u32,
-    last_page_lens_in: *const u32,
-    keep: *const u8,
-    scratch_counts: *mut u32,
+    // WHICH IS A DESCRIPTION OF CONFUSION AND NOT A FINDING. Chased to the
+    // end, nothing was stopping them, and here is the whole check:
+    page_indices_in: Env<keys::KvPageIndices>,
+    page_indptr_in: Env<keys::KvPageIndptr>,
+    last_page_lens_in: Unbound<*const u32>,
+    keep: In<0, u8>,
+    scratch_counts: Unbound<*mut u32>,
     keep_stride: u32,
-    num_requests: i32,
-    page_indices_out: *mut u32,
-    page_indptr_out: *mut u32,
-    last_page_lens_out: *mut u32,
+    num_requests: Env<keys::RequestCount>,
+    page_indices_out: Unbound<*mut u32>,
+    page_indptr_out: Unbound<*mut u32>,
+    last_page_lens_out: Unbound<*mut u32>,
 ) -> Result<(), Refusal> {
-    if scratch_counts.is_null() {
+    if scratch_counts.ptr.is_null() {
         return Err(Refusal::Absent { what: "the compaction scratch buffer" });
     }
     let launch = Launch::per_row(num_requests.unsigned_abs(), page_compact::K_BLOCK);
@@ -568,10 +699,10 @@ pub fn compact_page_csr(
             launch,
             &[
                 page_indptr_in.arg(),
-                keep.arg(),
+                keep.ptr.arg(),
                 keep_stride.arg(),
                 num_requests.arg(),
-                scratch_counts.arg(),
+                scratch_counts.ptr.arg(),
             ],
         )?;
         ctx.launch(
@@ -581,14 +712,14 @@ pub fn compact_page_csr(
             &[
                 page_indices_in.arg(),
                 page_indptr_in.arg(),
-                last_page_lens_in.arg(),
-                keep.arg(),
-                scratch_counts.cast_const().arg(),
+                last_page_lens_in.ptr.arg(),
+                keep.ptr.arg(),
+                scratch_counts.ptr.cast_const().arg(),
                 keep_stride.arg(),
                 num_requests.arg(),
-                page_indptr_out.arg(),
-                last_page_lens_out.arg(),
-                page_indices_out.arg(),
+                page_indptr_out.ptr.arg(),
+                last_page_lens_out.ptr.arg(),
+                page_indices_out.ptr.arg(),
             ],
         )
     }
@@ -612,38 +743,49 @@ pub mod attention_naive {
 ///
 /// What the caller must guarantee, as `call()` states it: every pointer is a
 /// device address live across the launch.
+///
+/// The row (`arms/attn.rs:599`) declines over ONE operand and lists the rest:
+/// *"`target_hidden` and `pending_hidden` are `arg_in(0)` and `arg_in(1)` --
+/// the statement hands the pending slab over as an INPUT [...] `out` is
+/// `arg_out(0)`, `qo_indptr` and `num_requests` come off `plan()`,
+/// `total_tokens` is `rows()` and `hidden_size` is `out_width(0)`"*.
+#[kernels_macros::routine]
 pub fn mtp_shift_hidden<T>(
     ctx: &Ctx,
-    target_hidden: *const T,
-    pending_hidden: *const T,
-    qo_indptr: *const u32,
-    slot_ids: *const i32,
-    out: *mut T,
-    total_tokens: i32,
-    num_requests: i32,
-    hidden_size: i32,
+    target_hidden: In<0, T>,
+    pending_hidden: In<1, T>,
+    qo_indptr: Env<keys::QoIndptr>,
+    slot_ids: Unbound<*const i32>,
+    out: Out<0, T>,
+    num_requests: Env<keys::RequestCount>,
 ) -> Result<(), Refusal>
 where
-    T: Elem,
+    T: Inst + kernels::Elem,
     *const T: Abi,
     *mut T: Abi,
 {
-    if pending_hidden.is_null() {
+    if pending_hidden.ptr.is_null() {
         return Err(Refusal::Absent { what: "the MTP pending-hidden state" });
     }
+    // THE WIDTH AND NOT THE PITCH, though `attention_naive.cuh:314-317`
+    // strides all three buffers by this one number: `i < hidden_size` at
+    // `:318` is the copy's own bound, so the extent is the reading `out`
+    // states and the pitch is what a packed row makes of it.
+    let dst = out.all("out_width(0)")?;
+    let hidden_size = dst.width;
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
     unsafe {
         ctx.launch(
             "attn/attention_naive.cuh",
             &format!("::pie::attn::mtp_shift_hidden<{}>", T::CPP),
-            Launch::per_row(total_tokens.unsigned_abs(), attention_naive::BLOCK),
+            Launch::per_row(dst.rows.unsigned_abs(), attention_naive::BLOCK),
             &[
-                target_hidden.arg(),
-                pending_hidden.arg(),
+                target_hidden.ptr.arg(),
+                pending_hidden.ptr.arg(),
                 qo_indptr.arg(),
-                slot_ids.arg(),
-                out.arg(),
+                slot_ids.ptr.arg(),
+                out.ptr.arg(),
                 num_requests.arg(),
                 hidden_size.arg(),
             ],
@@ -654,23 +796,30 @@ where
 /// `attn::mtp_update_pending_hidden_bf16` — one block per REQUEST.
 ///
 /// [`mtp_shift_hidden`]'s obligation.
+#[kernels_macros::routine]
 pub fn mtp_update_pending_hidden<T>(
     ctx: &Ctx,
-    target_hidden: *const T,
-    pending_hidden: *mut T,
-    qo_indptr: *const u32,
-    slot_ids: *const i32,
-    num_requests: i32,
-    hidden_size: i32,
+    target_hidden: In<0, T>,
+    pending_hidden: Unbound<*mut T>,
+    // As its twin's, and it is a NAME now: `keys::QoIndptr` = "plan.qo_indptr",
+    // which `operand()` answers off `cx.plan()`. Reason (a) had this row for
+    // two stages and lost it.
+    qo_indptr: Env<keys::QoIndptr>,
+    slot_ids: Unbound<*const i32>,
+    num_requests: Env<keys::RequestCount>,
 ) -> Result<(), Refusal>
 where
-    T: Elem,
+    T: Inst + kernels::Elem,
     *const T: Abi,
     *mut T: Abi,
 {
-    if pending_hidden.is_null() {
+    if pending_hidden.ptr.is_null() {
         return Err(Refusal::Absent { what: "the MTP pending-hidden state" });
     }
+    // As its twin's, off the input this form reads instead of the output it
+    // does not take.
+    let src = target_hidden.all("in_width(0)")?;
+    let hidden_size = src.width;
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
     unsafe {
@@ -679,10 +828,10 @@ where
             &format!("::pie::attn::mtp_update_pending_hidden<{}>", T::CPP),
             Launch::per_row(num_requests.unsigned_abs(), attention_naive::BLOCK),
             &[
-                target_hidden.arg(),
-                pending_hidden.arg(),
+                target_hidden.ptr.arg(),
+                pending_hidden.ptr.arg(),
                 qo_indptr.arg(),
-                slot_ids.arg(),
+                slot_ids.ptr.arg(),
                 num_requests.arg(),
                 hidden_size.arg(),
             ],
@@ -696,31 +845,38 @@ where
 /// device address live across the launch, `layer`'s two page pointers
 /// included.
 #[allow(clippy::similar_names)]
+#[kernels_macros::routine]
 pub fn mla_prepare_bf16(
     ctx: &Ctx,
     layer: MlaLayer,
-    kv_a: *const bf16,
-    kv_a_norm_weight: *const bf16,
-    q_b: *const bf16,
-    kv_c: *mut bf16,
-    k_pe: *mut bf16,
-    q_nope: *mut bf16,
-    q_pe: *mut bf16,
-    positions: *const i32,
-    qo_indptr: *const u32,
-    kv_page_indices: *const u32,
-    kv_page_indptr: *const u32,
-    kv_last_page_lens: *const u32,
-    row_valid: *const u8,
-    total_tokens: i32,
-    num_requests: i32,
+    kv_a: In<0, bf16>,
+    #[source(Weight(0))] kv_a_norm_weight: *const bf16,
+    q_b: In<1, bf16>,
+    kv_c: Out<0, bf16>,
+    k_pe: Out<1, bf16>,
+    q_nope: Out<2, bf16>,
+    q_pe: Out<3, bf16>,
+    positions: Env<keys::Positions>,
+    // `keys::QoIndptr`. `row_valid` below keeps its own reason, which never
+    // depended on this one: it arrives `Unbound` because the MLA rows are
+    // blocked by `MlaLayer` whole, not because the fact wants a word.
+    qo_indptr: Env<keys::QoIndptr>,
+    kv_page_indices: Env<keys::KvPageIndices>,
+    kv_page_indptr: Env<keys::KvPageIndptr>,
+    kv_last_page_lens: Unbound<*const u32>,
+    row_valid: Unbound<*const u8>,
+    num_requests: Env<keys::RequestCount>,
     heads: i32,
     qk_nope_head_dim: i32,
-    eps: f32,
-    theta: f32,
+    eps: Env<keys::RmsEps>,
+    // `Source::Named(<keys::RopeTheta as keys::Fact>::KEY)`, NOT `Source::Named(<keys::Theta as keys::Fact>::KEY)`, and the distinction is the
+    // whole reason this parameter has a comment.
+    theta: Env<keys::RopeTheta>,
     interleaved: bool,
     kv_a_row_stride: i32,
-    yarn: Option<Yarn>,
+    // `cx.yarn()`, the YaRN scaling block, which `operand()` refuses as part
+    // of the documented boundary: reason (b).
+    yarn: Unbound<Option<Yarn>>,
 ) -> Result<(), Refusal> {
     /// `mla_paged.cu:65` — the grid's second axis, less its KV lane.
     #[must_use]
@@ -753,18 +909,18 @@ pub fn mla_prepare_bf16(
     let per_block = mla_heads_per_block(rope);
     let blocks = mla_q_blocks(heads, per_block);
 
-    let (low_dim, high_dim) = match yarn {
+    let (low_dim, high_dim) = match yarn.ptr {
         Some(y) => crate::rope::ramp_bounds(
             rope,
-            theta,
+            **theta,
             y.beta_fast,
             y.beta_slow,
             y.original_max_position,
         ),
         None => (0.0, 0.0),
     };
-    let yarn_factor = yarn.map_or(-1.0_f32, |y| y.factor);
-    let yarn_mscale = yarn.map_or(1.0_f32, |y| y.attention_factor);
+    let yarn_factor = yarn.ptr.map_or(-1.0_f32, |y| y.factor);
+    let yarn_mscale = yarn.ptr.map_or(1.0_f32, |y| y.attention_factor);
 
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
@@ -773,25 +929,25 @@ pub fn mla_prepare_bf16(
             "attn/mla_paged.cuh",
             "::pie::attn::mla_prepare<::pie::i32(256)>",
             Launch::grid(
-                [total_tokens.unsigned_abs(), blocks.saturating_add(1).max(1).unsigned_abs(), 1],
+                [kv_c.rows.unsigned_abs(), blocks.saturating_add(1).max(1).unsigned_abs(), 1],
                 [MLA_PREPARE_BLOCK.unsigned_abs(), 1, 1],
             ),
             &[
-                kv_a.arg(),
+                kv_a.ptr.arg(),
                 kv_a_norm_weight.arg(),
-                q_b.arg(),
-                kv_c.arg(),
-                k_pe.arg(),
-                q_nope.arg(),
-                q_pe.arg(),
+                q_b.ptr.arg(),
+                kv_c.ptr.arg(),
+                k_pe.ptr.arg(),
+                q_nope.ptr.arg(),
+                q_pe.ptr.arg(),
                 layer.ckv_pages.cast::<bf16>().arg(),
                 layer.kpe_pages.cast::<bf16>().arg(),
                 positions.arg(),
                 qo_indptr.arg(),
                 kv_page_indices.arg(),
                 kv_page_indptr.arg(),
-                kv_last_page_lens.arg(),
-                row_valid.arg(),
+                kv_last_page_lens.ptr.arg(),
+                row_valid.ptr.arg(),
                 num_requests.arg(),
                 layer.page_size.arg(),
                 heads.arg(),
@@ -815,18 +971,18 @@ pub fn mla_prepare_bf16(
 /// `attn::write_mla_to_pages` — appends one step's compressed latent and rope
 ///
 /// [`mla_prepare_bf16`]'s obligation.
+#[kernels_macros::routine]
 pub fn write_mla_to_pages(
     ctx: &Ctx,
     layer: MlaLayer,
-    ckv_curr: *const bf16,
-    kpe_curr: *const bf16,
-    qo_indptr: *const u32,
-    kv_page_indices: *const u32,
-    kv_page_indptr: *const u32,
-    kv_last_page_lens: *const u32,
-    row_valid: *const u8,
-    total_tokens: i32,
-    num_requests: i32,
+    ckv_curr: In<0, bf16>,
+    kpe_curr: In<1, bf16>,
+    qo_indptr: Env<keys::QoIndptr>,
+    kv_page_indices: Env<keys::KvPageIndices>,
+    kv_page_indptr: Env<keys::KvPageIndptr>,
+    kv_last_page_lens: Unbound<*const u32>,
+    row_valid: Unbound<*const u8>,
+    num_requests: Env<keys::RequestCount>,
 ) -> Result<(), Refusal> {
     /// `mla_paged.cu:105` — `write_mla`'s block, one per token row.
     pub const MLA_WRITE_BLOCK: u32 = 256;
@@ -837,17 +993,17 @@ pub fn write_mla_to_pages(
         ctx.launch(
             "attn/mla_paged.cuh",
             "::pie::attn::write_mla",
-            Launch::per_row(total_tokens.unsigned_abs(), MLA_WRITE_BLOCK),
+            Launch::per_row(ckv_curr.rows.unsigned_abs(), MLA_WRITE_BLOCK),
             &[
-                ckv_curr.arg(),
-                kpe_curr.arg(),
+                ckv_curr.ptr.arg(),
+                kpe_curr.ptr.arg(),
                 layer.ckv_pages.cast::<bf16>().arg(),
                 layer.kpe_pages.cast::<bf16>().arg(),
                 qo_indptr.arg(),
                 kv_page_indices.arg(),
                 kv_page_indptr.arg(),
-                kv_last_page_lens.arg(),
-                row_valid.arg(),
+                kv_last_page_lens.ptr.arg(),
+                row_valid.ptr.arg(),
                 num_requests.arg(),
                 layer.page_size.arg(),
                 layer.kv_lora_rank.arg(),
@@ -864,15 +1020,27 @@ const DSV4_META_BLOCK: u32 = 128;
 ///
 /// What the caller must guarantee, as `call()` states it: every pointer is a
 /// device address live across the launch.
+///
+/// The row (`arms/attn.rs:671`) declines over one integer and lists the rest:
+/// *"`positions` is `arg_in(0)`, the three outputs are `arg_out(0..2)`,
+/// `row_valid` and `requests` come off `plan()`, and `n` is `rows()`"*. Every
+/// one of those is a mark below except `row_valid`, which is a `plan()` array
+/// no variant names.
+#[kernels_macros::routine]
 pub fn dsv4_boundary_meta_decode(
     ctx: &Ctx,
-    positions: *const i32,
-    out_pos: *mut i32,
-    out_req: *mut i32,
-    out_rope: *mut i32,
-    n: i32,
+    // # NOT `Env<keys::Positions>`, AND THIS IS THE ONE `positions` IN THE
+    // # TREE A NAME SWEEP WOULD GET WRONG WITHOUT REFUSING
+    positions: In<0, i32>,
+    out_pos: Out<0, i32>,
+    out_req: Out<1, i32>,
+    out_rope: Out<2, i32>,
     ratio: i32,
-    row_valid: *const u8,
+    // `plan.row_valid` = `keys::RowValid`. The row's own sentence
+    // (`arms/attn.rs`) called this *"a `plan()` array no variant names"*;
+    // `keys.rs` §1 names it now, so the sentence is wrong and the type is
+    // right.
+    row_valid: Env<keys::RowValid>,
 ) -> Result<(), Refusal> {
     if ratio <= 0 {
         return Err(Refusal::Narrow { what: "ratio", at: i64::from(ratio) });
@@ -883,13 +1051,13 @@ pub fn dsv4_boundary_meta_decode(
         ctx.launch(
             "attn/dsv4_compress.cuh",
             "::pie::attn::dsv4_boundary_meta_decode<::pie::i32>",
-            Launch::flat(n.unsigned_abs(), DSV4_META_BLOCK),
+            Launch::flat(out_pos.rows.unsigned_abs(), DSV4_META_BLOCK),
             &[
-                positions.arg(),
-                out_pos.arg(),
-                out_req.arg(),
-                out_rope.arg(),
-                n.arg(),
+                positions.ptr.arg(),
+                out_pos.ptr.arg(),
+                out_req.ptr.arg(),
+                out_rope.ptr.arg(),
+                out_pos.rows.arg(),
                 ratio.arg(),
                 row_valid.arg(),
             ],
@@ -900,17 +1068,19 @@ pub fn dsv4_boundary_meta_decode(
 /// `attn::dsv4_boundary_meta_paged` — the prefill form of
 ///
 /// [`dsv4_boundary_meta_decode`]'s obligation.
+#[kernels_macros::routine]
 pub fn dsv4_boundary_meta_paged(
     ctx: &Ctx,
-    positions: *const i32,
-    qo_indptr: *const u32,
-    out_pos: *mut i32,
-    out_req: *mut i32,
-    out_rope: *mut i32,
-    n: i32,
-    num_requests: i32,
+    positions: In<0, i32>,
+    qo_indptr: Env<keys::QoIndptr>,
+    out_pos: Out<0, i32>,
+    out_req: Out<1, i32>,
+    out_rope: Out<2, i32>,
+    num_requests: Env<keys::RequestCount>,
+    // Its twin's: a number nothing in the driver holds. Reason (a).
     ratio: i32,
-    row_valid: *const u8,
+    // `plan.row_valid`, as on the decode twin above, and keyed with it.
+    row_valid: Env<keys::RowValid>,
 ) -> Result<(), Refusal> {
     if ratio <= 0 {
         return Err(Refusal::Narrow { what: "ratio", at: i64::from(ratio) });
@@ -921,14 +1091,14 @@ pub fn dsv4_boundary_meta_paged(
         ctx.launch(
             "attn/dsv4_compress.cuh",
             "::pie::attn::dsv4_boundary_meta_paged<::pie::i32>",
-            Launch::flat(n.unsigned_abs(), DSV4_META_BLOCK),
+            Launch::flat(out_pos.rows.unsigned_abs(), DSV4_META_BLOCK),
             &[
-                positions.arg(),
+                positions.ptr.arg(),
                 qo_indptr.arg(),
-                out_pos.arg(),
-                out_req.arg(),
-                out_rope.arg(),
-                n.arg(),
+                out_pos.ptr.arg(),
+                out_req.ptr.arg(),
+                out_rope.ptr.arg(),
+                out_pos.rows.arg(),
                 num_requests.arg(),
                 ratio.arg(),
                 row_valid.arg(),
@@ -940,22 +1110,91 @@ pub fn dsv4_boundary_meta_paged(
 /// `attn::attention_compressed_paged_bf16` — attention against the COMPRESSED
 ///
 /// [`dsv4_boundary_meta_decode`]'s obligation.
+///
+/// The row (`arms/attn.rs:698`) says *"`q`, `o`, `lse_out`, `positions`, the
+/// two page arrays, `total_tokens`, `num_q_heads`, `head_dim` and `page_size`
+/// are all answered today"*, and for the last two that claim wanted checking,
+/// because this kernel attends over a cache no pool allocates. It holds, and
+/// the device source is why: `compressed_attn_paged` addresses
+/// `comp_kv_pages` through `paged_slot(kv_page_indices, kv_page_indptr, req,
+/// pos, page_size)` (`dsv4_compress.cuh:700`, `:465`) -- the ORDINARY plan's
+/// page tables -- so `page_size` is the paged layer's granularity and not a
+/// compressed cache's own, which is exactly `Source::Named(<keys::KvPageSize as keys::Fact>::KEY)`. And
+/// `head_dim` strides the QUERY rows, `q + (qi * num_q_heads + q_head) *
+/// head_dim` (`:678-679`), so it is the fire's head dim and not the KV view's,
+/// which is exactly `Source::Named(<keys::HeadDim as keys::Fact>::KEY)`. Both are marked on that evidence
+/// rather than on the row's word.
+#[kernels_macros::routine]
 pub fn attention_compressed_paged_bf16(
     ctx: &Ctx,
-    q: *const bf16,
-    comp_kv_pages: *const bf16,
-    o: *mut bf16,
-    lse_out: *mut f32,
-    positions: *const i32,
-    kv_page_indices: *const u32,
-    kv_page_indptr: *const u32,
-    req_of_token: *const i32,
-    total_tokens: i32,
-    num_q_heads: i32,
-    head_dim: i32,
+    // `In(0)`: the statement's `inputs: [q]`
+    // (`model-dsl/src/cuda/deepseek_v4.rs:301`) has one entry.
+    q: In<0, bf16>,
+    comp_kv_pages: Env<*const bf16>,
+    // `Out(0)`, the first of the statement's two `outs`.
+    o: Out<0, bf16>,
+    // The log-sum-exp side channel, written only when a later merge wants it.
+    //
+    // D2 APPLIED AND DECLINED (`.wiki/kilimanjaro3.md` §3.8). The absence is
+    // read TWICE INSIDE THE KERNEL and never on this side:
+    // `dsv4_compress.cuh:692` writes `neg_inf()` on the empty-window return
+    // and `:750` writes the real log-sum-exp on the normal one, both guarded
+    // `if (lse_out != nullptr && tid == 0)`. `lse_out.ptr` is threaded into
+    // the argument list below beside `o.ptr` with no test between them, the
+    // instantiation `::pie::attn::compressed_attn_paged` is not templated on
+    // it, and `Launch::grid` reads `o.rows`, not this pointer. A split would
+    // produce two bodies that differ in nothing, which is one function under
+    // two names -- the rule asks for two FUNCTIONS.
+    //
+    // # AND THE `Or` STILL WENT, WHICH IS A DIFFERENT QUESTION FROM D2's
+    //
+    // Kilimanjaro III Stage 6 deletes `Or<T>` from operand position, and the
+    // question it asks is not *"are these two functions"* but *"does anything
+    // READ the `Provenance::Either` this plants"*. `Or` has exactly two
+    // readers on a `Binds::Writes` parameter and neither reaches this one:
+    //
+    // * `arity_problem` (`model-ir/src/kernels.rs:303`) counted it into
+    //   `opt_writes`, giving a band of `[1, 2]`. This symbol has ONE text --
+    //   `dsl::cuda::attention_compressed_paged`
+    //   (`model-dsl/src/cuda/deepseek_v4.rs:298`) -- whose `outs:` list is
+    //   unconditional and two long, and `deepseek_v4/forward/mod.rs:155` is
+    //   its only caller. `declared` is 2, always. The band is `[2, 2]` now
+    //   and 2 is in it.
+    // * `accepts_an_unstated_result` (`:227`) is consulted by
+    //   `model-compiler/src/lower/walk.rs:472` only when `op.outputs` is
+    //   EMPTY. It never is here, and deepseek-v4's forward opens no
+    //   `dsl::guarded_value` or `dsl::regions` at all -- so unlike fa2's `o`
+    //   and ssm's six prefill recurrences, no guard's value depends on this
+    //   flag.
+    //
+    // The third reader, `bind/table.rs:721`'s `d.nullable => Ptr(null)`, is
+    // not reachable either: this row is `arm: None, unbound: Some(..)`
+    // (`arms/attn.rs`), so nothing binds it at all.
+    //
+    // **THE `nullptr` GUARD IN THE KERNEL IS NOT EVIDENCE THAT THE HOST MAY
+    // PASS ONE.** It is device-side defensiveness on a `.cuh` shared with
+    // callers this file does not own, and it is what makes the D2 verdict
+    // above right. It says nothing about which arities a Rust signature must
+    // admit, and the two were being conflated by one spelling.
+    lse_out: Out<1, f32>,
+    // `Env<keys::Positions>` and not `Env<*const i32>`: the same
+    // `Source::Named(<keys::Positions as keys::Fact>::KEY)`, reached from the TYPE instead of from the name.
+    positions: Env<keys::Positions>,
+    kv_page_indices: Env<keys::KvPageIndices>,
+    kv_page_indptr: Env<keys::KvPageIndptr>,
+    // *"a per-token request map that nothing in `driver-cuda` builds"*.
+    req_of_token: Env<keys::RequestOfToken>,
+    num_q_heads: Env<keys::NumQHeads>,
+    head_dim: Env<keys::HeadDim>,
+    // The `dsv4` three's ratio, as on the boundary pair: a number no context
+    // holds. Reason (a).
     ratio: i32,
-    page_size: i32,
-    sm_scale: f32,
+    page_size: Env<keys::KvPageSize>,
+    // `cx.sm_scale()` = `keys::SmScale`, answered by `operand()`. The doc
+    // above cites this parameter as a producer *"with no query and no
+    // variant"*; the variant exists and the query is `Fire::sm_scale`, so the
+    // citation is retired here and at `dispatch_attention_mla_bf16`.
+    sm_scale: Env<keys::SmScale>,
 ) -> Result<(), Refusal> {
     /// `dsv4_compress.cu:37` — `constexpr int ATTN_BLOCK = 128;`.
     const DSV4_ATTN_BLOCK: u32 = 128;
@@ -972,15 +1211,15 @@ pub fn attention_compressed_paged_bf16(
             "attn/dsv4_compress.cuh",
             "::pie::attn::compressed_attn_paged",
             Launch::grid(
-                [total_tokens.unsigned_abs(), num_q_heads.unsigned_abs(), 1],
+                [o.rows.unsigned_abs(), num_q_heads.unsigned_abs(), 1],
                 [DSV4_ATTN_BLOCK, 1, 1],
             )
             .smem(smem),
             &[
-                q.arg(),
+                q.ptr.arg(),
                 comp_kv_pages.arg(),
-                o.arg(),
-                lse_out.arg(),
+                o.ptr.arg(),
+                lse_out.ptr.arg(),
                 positions.arg(),
                 kv_page_indices.arg(),
                 kv_page_indptr.arg(),
@@ -999,34 +1238,51 @@ pub fn attention_compressed_paged_bf16(
 ///
 /// What the caller must guarantee, as `call()` states it: every pointer is a
 /// device address live across the launch.
+///
+/// The row (`arms/attn.rs:555`) declines over two operands and one number:
+/// *"`dsl::cuda::dsa_index_knorm_rope` names NO weight bank, and the kernel
+/// reads a LayerNorm weight AND a bias -- two operands with nothing to come
+/// from, on top of the `rope_dim` its sibling also lacks. `head_dim` alone is
+/// statable, as `out_width(0)`"*.
+#[kernels_macros::routine]
 pub fn dsa_index_knorm_rope<T>(
     ctx: &Ctx,
-    idx_k: *mut T,
-    k_norm_weight: *const T,
-    k_norm_bias: *const T,
-    positions: *const i32,
-    tokens: i32,
-    head_dim: i32,
+    idx_k: Out<0, T>,
+    k_norm_weight: Unbound<*const T>,
+    // A LayerNorm bias, absent on a text that norms without one.
+    k_norm_bias: Unbound<*const T>,
+    // The fire's position array, as on every rope in the tree.
+    //
+    // `fact_of` maps `positions` to `Source::Named(<keys::Positions as keys::Fact>::KEY)` and `operand()`
+    // answers it, so this one resolves without a `#[source]`.
+    positions: Env<keys::Positions>,
+    // *"`rope_dim` appears in no statement, no shape and no context at all"*
+    // (`arms/attn.rs:542`, the sibling's row). Reason (a).
     rope_dim: i32,
-    theta: f32,
-    eps: f32,
+    theta: Env<keys::Theta>,
+    eps: Env<keys::RmsEps>,
 ) -> Result<(), Refusal>
 where
-    T: Elem,
+    T: Inst + kernels::Elem,
     *const T: Abi,
     *mut T: Abi,
 {
+    // A HEAD DIM AND NOT A PITCH: `dsa_indexer.cuh:111` strides `idx_k` by
+    // it and `:115` loops to it, so this operand's row IS one head and the
+    // width the row calls `out_width(0)` is `head_dim` itself.
+    let dst = idx_k.all("out_width(0)")?;
+    let head_dim = dst.width;
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
     unsafe {
         ctx.launch(
             "attn/dsa_indexer.cuh",
             &format!("::pie::attn::index_knorm_rope<{}>", T::CPP),
-            Launch::per_row(tokens.unsigned_abs(), dsa_indexer::K_BLOCK),
+            Launch::per_row(dst.rows.unsigned_abs(), dsa_indexer::K_BLOCK),
             &[
-                idx_k.arg(),
-                k_norm_weight.arg(),
-                k_norm_bias.arg(),
+                idx_k.ptr.arg(),
+                k_norm_weight.ptr.arg(),
+                k_norm_bias.ptr.arg(),
                 positions.arg(),
                 head_dim.arg(),
                 rope_dim.arg(),
@@ -1040,18 +1296,24 @@ where
 /// `attn::dsa_index_q_rope_bf16` — interleaved RoPE on the indexer's QUERY
 ///
 /// [`dsa_index_knorm_rope`]'s obligation.
+///
+/// **Read the `in_place` note in `ROUTINES` before crossing this one.** The
+/// kernel reads AND writes `idx_q` and the registration does not say so.
+#[kernels_macros::routine]
 pub fn dsa_index_q_rope<T>(
     ctx: &Ctx,
-    idx_q: *mut T,
-    positions: *const i32,
-    tokens: i32,
+    idx_q: Out<0, T>,
+    positions: Env<keys::Positions>,
     n_heads: i32,
     head_dim: i32,
+    // *"`rope_dim` appears in no statement, no shape and no context at all"*.
+    // Reason (a).
     rope_dim: i32,
-    theta: f32,
+    // As its sibling's, and on the same indirect evidence.
+    theta: Env<keys::Theta>,
 ) -> Result<(), Refusal>
 where
-    T: Elem,
+    T: Inst + kernels::Elem,
     *mut T: Abi,
 {
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
@@ -1060,9 +1322,9 @@ where
         ctx.launch(
             "attn/dsa_indexer.cuh",
             &format!("::pie::attn::index_q_rope<{}>", T::CPP),
-            Launch::per_row(tokens.unsigned_abs(), dsa_indexer::q_rope_block(n_heads)),
+            Launch::per_row(idx_q.rows.unsigned_abs(), dsa_indexer::q_rope_block(n_heads)),
             &[
-                idx_q.arg(),
+                idx_q.ptr.arg(),
                 positions.arg(),
                 n_heads.arg(),
                 head_dim.arg(),
@@ -1076,18 +1338,24 @@ where
 /// `attn::dsa_index_topk_mask` — score every causal (query, key) pair and
 ///
 /// [`dsa_index_knorm_rope`]'s obligation.
+///
+/// Unlike its two siblings this symbol's scalar sizes are statement params:
+/// the final three parameters name `Kind::Param(0..=2)` directly, matching the
+/// old arm's `cx.param` reads while leaving the input/output counters at the
+/// three score buffers and one mask.
+#[kernels_macros::routine]
 pub fn dsa_index_topk_mask(
     ctx: &Ctx,
-    idx_q: *const bf16,
-    idx_k: *const bf16,
-    idx_w: *const bf16,
-    mask: *mut u8,
-    tokens: i32,
-    n_heads: i32,
-    head_dim: i32,
-    topk: i32,
+    idx_q: In<0, bf16>,
+    idx_k: In<1, bf16>,
+    idx_w: In<2, bf16>,
+    mask: Out<0, u8>,
+    n_heads: Param<0, i32>,
+    head_dim: Param<1, i32>,
+    topk: Param<2, i32>,
 ) -> Result<(), Refusal> {
-    let smem = tokens
+    let smem = mask
+        .rows
         .unsigned_abs()
         .saturating_mul(u32::try_from(core::mem::size_of::<f32>()).unwrap_or(4));
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
@@ -1096,13 +1364,13 @@ pub fn dsa_index_topk_mask(
         ctx.launch(
             "attn/dsa_indexer.cuh",
             "::pie::attn::index_topk_mask<::pie::bf16>",
-            Launch::per_row(tokens.unsigned_abs(), dsa_indexer::K_BLOCK).smem(smem),
+            Launch::per_row(mask.rows.unsigned_abs(), dsa_indexer::K_BLOCK).smem(smem),
             &[
-                idx_q.arg(),
-                idx_k.arg(),
-                idx_w.arg(),
-                mask.arg(),
-                tokens.arg(),
+                idx_q.ptr.arg(),
+                idx_k.ptr.arg(),
+                idx_w.ptr.arg(),
+                mask.ptr.arg(),
+                mask.rows.arg(),
                 n_heads.arg(),
                 head_dim.arg(),
                 topk.arg(),
@@ -2199,8 +2467,8 @@ pub enum MlaDispatch {
 /// ONE trace symbol with TWO bodies. [`mla_fa2::fire`] is FlashInfer's
 /// persistent FA2 kernel and [`mla_naive::fire`] the Blackwell pair, and the
 /// choice between them is this device's compute-capability major: **`>= 10`
-/// picks naive.** `attention_mla.cu:334-340`'s note is the only account
-/// anywhere of why, so it is carried whole rather than summarised:
+/// picks naive.** `attention_mla.cu:334-340` is the only account anywhere of
+/// why, and it is a correctness claim rather than a performance one:
 ///
 /// > FlashInfer's FA2 BatchMLAPagedAttention (a cooperative kernel) produces
 /// > zero output on sm_100; the ecosystem (sglang/vllm) routes Blackwell MLA
@@ -2211,186 +2479,121 @@ pub enum MlaDispatch {
 /// > (latent_to_v, o_proj) is unchanged.
 ///
 /// **A zero output is a WRONG ANSWER and not a fault.** Nothing raises, the
-/// `o_proj` that follows reads zeros, and the model emits text. That is what
-/// makes this a dispatch rather than a fallback, and it is the premise every
-/// other decision below rests on.
-///
-/// This is [`kv_paged::write_kv_to_pages`]'s shape, further down this same
-/// file: an entry point whose whole body is a choice between two complete
-/// arms, with the arms' own docs carrying their kernels' arithmetic. That one
-/// picks on a field of the layer; this one picks on the device.
+/// `o_proj` that follows reads zeros, and the model emits text. That is the
+/// premise every decision below rests on.
 ///
 /// # Two device queries, and only one of them may fall back
 ///
-/// The capability is [`Ctx::compute_capability_major`], and a `None` REFUSES.
-/// The C++ wrote `int major = 0; cudaDeviceGetAttribute(&major, ...)` and
-/// tested `major >= 10`, so a device that would not answer silently got FA2 —
-/// **that default is not carried.** It is incidental rather than chosen (it
-/// is what the uninitialise-then-query shape leaves behind), and the thing it
-/// defaults to is the one arm that returns zeros on the one architecture the
-/// query exists to detect. [`xqa::attention_xqa_decode_bf16_prepared`] makes
-/// the same refusal in the same words when its own capability query comes
-/// back empty.
+/// The capability is [`Ctx::compute_capability_major`], and a `None` REFUSES
+/// rather than defaulting: the arm a default would pick is the one that
+/// returns zeros on the one architecture the query exists to detect.
 ///
-/// The FA2 arm needs a second number: `smem_limit_per_sm`, which is
-/// `cudaDevAttrMaxSharedMemoryPerMultiprocessor`. That is exactly what
-/// upstream's `BatchMLAPagedAttention` read before handing it to
-/// `DISPATCH_SMEM_CONFIG` — that launcher is the `// PIE: REMOVED` marker
-/// below the macro in `attn/flashinfer/attention/mla.cuh` (this crate plans
-/// and fires with `cuLaunchKernel`), and the macro's three thresholds survive
-/// beside it and as [`mla_fa2::ARMS`], so reading the same attribute here is
-/// what keeps the port's arm equal to upstream's. It comes through
-/// [`fa2::plan::fa_device`], the one place in this crate that asks: memoised,
-/// so two fires in one process cannot disagree, and with `Device::L40S` as a
-/// NAMED fallback rather than a guess.
-///
-/// **That fallback is admissible where the capability's would not be, and the
-/// difference is the failure mode.** A wrong shared-memory budget picks an arm
-/// whose `SharedStorage` the device cannot allocate, and the launch FAILS —
-/// loudly, with the kernel named. A wrong capability picks an arm that
-/// launches, succeeds, and writes zeros.
-///
-/// # The two C++ checks that are gone, and neither is a relaxation
-///
-/// `dispatch_attention_mla_bf16` opened with two `throw`s and this has
-/// neither, because both were artefacts of the cache struct rather than facts
-/// about the fire:
-///
-/// * `if (!cache.valid) throw "cache is empty; call plan first"`.
-///   `MlaPlanCache` was a mutable object a separate `plan` call filled, so it
-///   had a *"nobody called plan"* state to be in. [`MlaPlan`] is a value; a
-///   `&MlaPlan` is a plan that was built, and there is no state to test.
-/// * `if (layer.kv_lora_rank != cache.kv_lora_rank || ...) throw "layer/cache
-///   shape mismatch"`. `MlaPlanCache` carried its OWN copy of the latent
-///   rank, the rope width and the page size, and the check was that the two
-///   copies agreed. There is one copy here: both arms' shapes are built from
-///   `layer` below and from nothing else, so the disagreement is not
-///   detectable because it is not constructible.
-///
-/// What that second check was really guarding — that `plan` was scheduled for
-/// THIS layer's geometry — neither copy could ever have shown, since
-/// [`plan::MlaPlanInfo`] carries offsets and a grid and no shape at all. It is
-/// an obligation, and it is in `# Safety` where obligations go.
+/// The FA2 arm needs a second number, `cudaDevAttrMaxSharedMemoryPerMultiprocessor`,
+/// which upstream's `BatchMLAPagedAttention` read before handing it to
+/// `DISPATCH_SMEM_CONFIG`; its three thresholds survive as [`mla_fa2::ARMS`],
+/// so reading the same attribute keeps this port's arm equal to upstream's.
+/// It comes through [`fa2::plan::fa_device`], memoised so two fires in one
+/// process cannot disagree, and with `Device::L40S` as a NAMED fallback.
+/// **That fallback is admissible where the capability's would not be**, and
+/// the difference is the failure mode: a wrong shared-memory budget picks an
+/// arm the device cannot allocate and the launch FAILS loudly; a wrong
+/// capability picks an arm that launches, succeeds, and writes zeros.
 ///
 /// # `MlaNaive::Declined` is not an error and is not translated
 ///
 /// It is returned as [`MlaDispatch::Naive`] holding exactly what
-/// [`mla_naive::fire`] returned. Three reasons, and the first is the whole
-/// argument:
+/// [`mla_naive::fire`] returned. The arm has already classified it, and
+/// `Refusal` is a `Copy` value with no payload, so translating would flatten
+/// four distinguishable answers — an empty batch, a null indptr trio, a
+/// latent too wide for the register array, a rope tail too wide — into one.
+/// The return type has to say *"nothing was launched"* regardless, because
+/// [`mla_naive::NaiveDecline::NoTokens`] is a legal empty fire, and erasing
+/// that into `Ok(())` is how a caller comes to believe `o` was written.
 ///
-/// * **The arm has already classified it.** Three of the four declines were a
-///   `throw` in the C++ and one a bare `return`, and that arm's doc is explicit
-///   that neither is a device failure. Re-classifying here would make one fact
-///   answer differently depending on which door the caller came in.
-/// * `Refusal` is a `Copy` value with no payload, so translating would flatten
-///   four distinguishable answers — an empty batch, a null indptr trio, a
-///   latent too wide for the register array, a rope tail too wide — into one
-///   string or into four strings nothing could match on.
-/// * The return type has to be able to say *"nothing was launched"* anyway,
-///   because [`mla_naive::NaiveDecline::NoTokens`] is a legal empty fire.
-///   Erasing that into `Ok(())` is how a caller comes to believe `o` was
-///   written when it was not.
+/// The two `Refusal`s below are the contrast: a device that will not state
+/// its capability, and a device no [`mla_fa2::ARMS`] entry fits, are the
+/// DEVICE failing to answer rather than the SHAPE going unserved.
 ///
-/// The contrast is what the two refusals below are for: a device that will not
-/// state its capability and a device no [`mla_fa2::ARMS`] entry fits are the
-/// DEVICE failing to answer, not the SHAPE going unserved, and those are
-/// `Refusal`s. Keeping the two apart is the reason this does not return
-/// `Result<(), Refusal>`.
-///
-/// # It is NOT `whole`, and the contrast is the argument
+/// # It is NOT `whole`
 ///
 /// [`mla_prepare_bf16`] and [`write_mla_to_pages`] are `whole` because they
 /// WALK `qo_indptr` / `kv_page_indptr` / `kv_last_page_lens`, which are
 /// R-shaped, so a row window leaves that arithmetic pointing at another
 /// request's rows. This reads a plan built over the whole fire and still
-/// covers a row range, like the FlashInfer dispatches do — so a row window is
-/// legal here and the column stays `false`. It was `false` at `9e3936fb9^`
-/// and `tests/stated_columns.rs` pins it there.
+/// covers a row range, so a row window is legal and the column stays `false`.
+/// `tests/stated_columns.rs` pins it there.
 ///
 /// # Two things the arms do not agree on, recorded rather than unified
 ///
-/// Both are upstream's, both are load-bearing for a caller, and neither is
-/// repaired here — making the two arms agree would be inventing a behaviour
-/// rather than porting one, and nothing on this box could tell which
-/// invention was right.
+/// Both are upstream's and both are load-bearing for a caller. Making the
+/// arms agree would be inventing a behaviour rather than porting one.
 ///
 /// * **An empty fire.** `total_tokens <= 0` is
-///   [`mla_naive::NaiveDecline::NoTokens`] on the naive arm —
-///   `attention_mla_naive.cuh:211`'s bare `return` — and the FA2 arm has no
-///   such test: its grid is the plan's `num_blks_x`/`num_blks_y`, so an empty
-///   batch is the scheduler's business rather than the launcher's.
-/// * **`lse`.** Only the FA2 arm writes one. The naive pair has no LSE output
-///   at all — neither `__global__` takes the pointer — so on a `>= 10` device
-///   a caller that passed a non-null `lse` gets an untouched buffer and no
-///   word about it. The C++ dropped `lse_out` on that path in exactly the
-///   same silence. It is not turned into a refusal here because a refusal
-///   would make a Blackwell box reject a fire an sm_90 box serves, which is a
-///   larger claim than *"this arm has no LSE"* and is not one this `fn` is in
-///   a position to make.
+///   [`mla_naive::NaiveDecline::NoTokens`] on the naive arm; the FA2 arm has
+///   no such test, since its grid is the plan's `num_blks_x`/`num_blks_y` and
+///   an empty batch is the scheduler's business.
+/// * **`lse`.** Only the FA2 arm writes one — neither naive `__global__`
+///   takes the pointer — so on a `>= 10` device a caller that passed a
+///   non-null `lse` gets an untouched buffer and no word about it. Not a
+///   refusal here, because refusing would make a Blackwell box reject a fire
+///   an sm_90 box serves.
 ///
 /// # What is verified, and what is not
 ///
-/// **Nothing calls this.** What is verified is that it compiles, and that
-/// every template-id both arms name is one NVRTC lowers —
-/// `tests/every_instantiation_compiles`, which reads both roots and both
-/// `mod inst` blocks out of this source. That is the whole of the evidence,
-/// and note what it is not: that fixture needs `libnvrtc` and not a device,
-/// so it proves the strings compile and nothing about what they compute.
 /// **No fire reaches this function, so no numerical result backs a single
-/// line of it**, including the arm choice it exists to make.
-///
-/// Three things block MLA end to end and this is one of them:
-///
-/// * there was no dispatcher — the two arms sat beside each other with
-///   nothing choosing, which is what this `fn` is;
-/// * `driver-cuda`'s `fire/launch.rs`'s `kv_pools_for` refuses
-///   `KvStyle::Mla`, so no latent cache is ever allocated for a fire;
-/// * `serve/load.rs` refuses an MLA checkpoint at model load, so no fire with
-///   one is ever built.
-///
-/// The other two must move for this to run, and neither moves because this
-/// exists. `bind/arms/attn.rs` declines the symbol over `Cx::mla_layer` and
-/// `Cx::mla_plan` for exactly that reason; its sentence there — *"what is
-/// missing is a caller"* — is still true with this written.
+/// line of it**, including the arm choice it exists to make. What is verified
+/// is that it compiles and that every template-id both arms name is one NVRTC
+/// lowers (`tests/every_instantiation_compiles`, which needs `libnvrtc` and
+/// not a device). Two things still block MLA end to end and neither moves
+/// because this exists: `fire/launch.rs`'s `kv_pools_for` refuses
+/// `KvStyle::Mla`, so no latent cache is allocated; and `serve/load.rs`
+/// refuses an MLA checkpoint at model load.
 ///
 /// # Errors
 ///
 /// [`Refusal::Device`] if the device will not state its compute capability,
 /// and [`Refusal::Absent`] if no [`mla_fa2::ARMS`] entry fits its shared
-/// memory — which is `DISPATCH_SMEM_CONFIG`'s own final `else`, where
-/// upstream raised `cudaErrorNotSupported`. Otherwise whatever the chosen
-/// arm's compile, load or launch refuses. **A shape the naive pair cannot
-/// serve is not among these**; see above.
+/// memory — which is `DISPATCH_SMEM_CONFIG`'s own final `else`. Otherwise
+/// whatever the chosen arm's compile, load or launch refuses. **A shape the
+/// naive pair cannot serve is not among these**; see above.
 ///
 /// # Safety
 ///
 /// Every pointer must be a device address live across the launch — `layer`'s
-/// two page pointers and `plan`'s two arenas included — which is the
-/// obligation every `<<<>>>` made. Beyond it, [`mla_fa2::pack`]'s own, which
-/// this inherits and does not widen: `plan` must be the plan those arenas
-/// were uploaded from, because the FA2 arm reaches fourteen index arrays in
-/// the int arena and two partial buffers in the float one by adding that
-/// plan's offsets to those two base pointers. `plan` must also
-/// have been scheduled for `layer`'s geometry and for `num_heads`; the C++
-/// checked a copy of that and this has no copy to check.
+/// two page pointers and `plan`'s two arenas included. Beyond that,
+/// [`mla_fa2::pack`]'s own obligation, inherited and not widened: `plan` must
+/// be the plan those arenas were uploaded from, because the FA2 arm reaches
+/// fourteen index arrays in the int arena and two partial buffers in the
+/// float one by adding that plan's offsets to those two base pointers.
+/// `plan` must also have been scheduled for `layer`'s geometry and for
+/// `num_heads`; nothing here can check it.
+///
+/// Marked but NOT given a column, and it could not carry a useful one: a
+/// `driver_bound!` row, an `unsafe fn`, returning `MlaDispatch` rather than
+/// `()`.
+#[kernels_macros::routine]
 pub unsafe fn dispatch_attention_mla_bf16(
     ctx: &Ctx,
     plan: &MlaPlan,
-    q_nope: *const bf16,
-    q_pe: *const bf16,
+    q_nope: In<0, bf16>,
+    q_pe: In<1, bf16>,
+    // `Cx::mla_layer`, the same structural refusal `mla_prepare_bf16` blocks
+    // on. Reason (a).
     layer: MlaLayer,
-    o: *mut bf16,
-    kv_page_indices: *const u32,
-    lse: *mut f32,
-    qo_indptr: *const u32,
-    kv_page_indptr: *const u32,
-    kv_last_page_lens: *const u32,
-    index_mask: *const u8,
+    o: Out<0, bf16>,
+    kv_page_indices: Env<keys::KvPageIndices>,
+    lse: Unbound<*mut f32>,
+    qo_indptr: Env<keys::QoIndptr>,
+    kv_page_indptr: Env<keys::KvPageIndptr>,
+    kv_last_page_lens: Unbound<*const u32>,
+    index_mask: Unbound<*const u8>,
     index_mask_stride: i32,
-    total_tokens: i32,
-    num_requests: i32,
+    num_requests: Env<keys::RequestCount>,
     num_heads: i32,
-    sm_scale: f32,
+    // `AttnCtx::sm_scale` = `keys::SmScale`, which `operand()` answers off
+    // `f.sm_scale()`. It was *"a producer with no query and no variant"*
+    // when this comment was written and it is neither now.
+    sm_scale: Env<keys::SmScale>,
     causal: bool,
 ) -> Result<MlaDispatch, Refusal> {
     let Some(major) = ctx.compute_capability_major() else {
@@ -2406,33 +2609,31 @@ pub unsafe fn dispatch_attention_mla_bf16(
         // The arm reads NO workspace and NO plan: it walks the paged cache
         // directly, which is what makes it arch-agnostic.
         let ptrs = mla_naive::NaivePtrs {
-            q_nope,
-            q_pe,
+            q_nope: q_nope.ptr,
+            q_pe: q_pe.ptr,
             ckv_pages: layer.ckv_pages.cast::<bf16>().cast_const(),
             kpe_pages: layer.kpe_pages.cast::<bf16>().cast_const(),
-            qo_indptr,
-            kv_page_indices,
-            kv_page_indptr,
-            kv_last_page_lens,
-            o,
-            index_mask,
+            qo_indptr: **qo_indptr,
+            kv_page_indices: **kv_page_indices,
+            kv_page_indptr: **kv_page_indptr,
+            kv_last_page_lens: kv_last_page_lens.ptr,
+            o: o.ptr,
+            index_mask: index_mask.ptr,
         };
         let shape = mla_naive::NaiveShape {
             kv_lora_rank: layer.kv_lora_rank,
             qk_rope_head_dim: layer.qk_rope_head_dim,
             page_size: layer.page_size,
-            total_tokens,
-            num_requests,
+            total_tokens: o.rows,
+            num_requests: **num_requests,
             num_heads,
-            sm_scale,
+            sm_scale: **sm_scale,
             causal,
             index_mask_stride,
         };
         return mla_naive::fire(ctx, ptrs, shape).map(MlaDispatch::Naive);
     }
 
-    // `cudaDevAttrMaxSharedMemoryPerMultiprocessor`, which is what the
-    // deleted upstream launcher read, through the memo that already holds it.
     let Some(arm) = mla_fa2::arm_index(fa2::plan::fa_device().max_smem_per_sm) else {
         return Err(Refusal::Absent {
             what: "a `DISPATCH_SMEM_CONFIG` arm for this device's shared memory per SM",
@@ -2443,37 +2644,24 @@ pub unsafe fn dispatch_attention_mla_bf16(
         num_heads: num_heads.unsigned_abs(),
         kv_lora_rank: layer.kv_lora_rank.unsigned_abs(),
         qk_rope_head_dim: layer.qk_rope_head_dim.unsigned_abs(),
-        sm_scale,
+        sm_scale: **sm_scale,
     };
     let buffers = mla_fa2::Buffers {
         int_buffer: plan.int_arena.cast::<u8>(),
         float_buffer: plan.float_arena.cast::<u8>(),
-        // `attention_mla.cu:270-271` and `:292-293` — three `const_cast`s and
-        // a `reinterpret_cast`, transcribed rather than argued away.
-        // `MLAParams` declares the two query halves and the page-index array
-        // non-const; the C++ took all three as `const` from its caller and
-        // cast, which is defined only if nothing writes through the result.
-        // So the struct's spelling is the wider one and this signature's is
-        // the one that says what the kernel does.
-        q_nope: q_nope.cast_mut(),
-        q_pe: q_pe.cast_mut(),
+        q_nope: q_nope.ptr.cast_mut(),
+        q_pe: q_pe.ptr.cast_mut(),
         ckv_pages: layer.ckv_pages.cast::<bf16>(),
         kpe_pages: layer.kpe_pages.cast::<bf16>(),
-        out: o,
-        kv_page_indices: kv_page_indices.cast::<i32>().cast_mut(),
-        lse,
+        out: o.ptr,
+        kv_page_indices: (**kv_page_indices).cast::<i32>().cast_mut(),
+        lse: lse.ptr,
     };
-    // `want_lse` is DERIVED and is not a parameter: the C++ assigned
-    // `params.final_lse = lse_out` unconditionally, so the null pointer WAS
-    // the request, and a caller given both a pointer and a flag has two ways
-    // to say one thing and one way to disagree with itself. `mla_naive::fire`
-    // recovers `have_indptr` from its three pointers for the same reason.
-    //
     // SAFETY: the caller's obligation, forwarded -- every pointer here is a
     // device address live across the launch, and `plan` is the plan its two
     // arenas were uploaded from. Nothing is dereferenced on this side; the
     // offsets `pack` adds are the ones the upload used.
-    let params = unsafe { mla_fa2::pack(&plan.info, shape, buffers, !lse.is_null()) };
+    let params = unsafe { mla_fa2::pack(&plan.info, shape, buffers, !lse.ptr.is_null()) };
     // `attention_mla.cu:406-414` — the mask is a template parameter upstream
     // and an index here, which is why one call replaces the C++'s two.
     mla_fa2::fire(ctx, arm, causal, &params, mla_fa2::grid(&plan.info, mla_fa2::ARMS[arm]))?;
@@ -2482,8 +2670,10 @@ pub unsafe fn dispatch_attention_mla_bf16(
 
 /// The units `attn` compiles in fn-world.
 pub mod qkv_fused {
+    use kernels::keys;
     use super::bf16;
     use super::{Ctx, Launch, Refusal};
+    use kernels::routine::{Bank, Env, In, Out};
     
     use crate::jit::Abi;
 
@@ -2494,27 +2684,53 @@ pub mod qkv_fused {
     /// `num_rows` rows of `(num_q_heads + 2·num_kv_heads)·head_dim` elements,
     /// and the page arrays must describe the layer the cache pointers came
     /// from.
+    ///
+    /// The column is read off `qkv_packed_post_arm`, argument for argument —
+    /// and there is no longer an arm to read it off. **`arms/attn.rs`'s row
+    /// says `Bound::derived` as of Kilimanjaro III Stage 3**: the two things
+    /// the arm did that a column could not were `plan.row_valid`, which had
+    /// no key until `keys::RowValid` landed, and `out_width(0) /
+    /// layer.head_dim`, which is arithmetic and belongs to the launcher that
+    /// divides (F6). Both are below, and the pin at the end of this file
+    /// asserts the seventeen entries the column now derives.
+    #[kernels_macros::routine]
     pub fn qkv_packed_qk_norm_rope_vnorm_write_kv_bf16(
         ctx: &Ctx,
-        packed: *const bf16,
-        q_out: *mut bf16,
-        k_pages: *mut bf16,
-        v_pages: *mut bf16,
-        q_weight: *const bf16,
-        k_weight: *const bf16,
-        positions: *const i32,
-        kv_page_indices: *const u32,
-        kv_page_indptr: *const u32,
-        kv_last_page_lens: *const u32,
-        row_valid: *const u8,
-        num_rows: i32,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        page_size: i32,
-        hnd_layout: bool,
-        theta: f32,
-        eps: f32,
+        // `In(0)` -- the statement's one input, which is the whole of what
+        // position was guessing correctly.
+        packed: In<0, bf16>,
+        q_out: Out<0, bf16>,
+        k_pages: Env<keys::KvKeys>,
+        v_pages: Env<keys::KvValues>,
+        // `cx.weight(0)` and `cx.weight(1)` (`arms/attn.rs:413-414` -- the
+        // citation said `:227-228` and the arm has moved twice since), the
+        // POSITIONAL banks, so `Weight(n)` and not `WeightNamed`. Neither
+        // mark consumes the `In` counter, which is what leaves the positional
+        // pointers above them where the arm puts them.
+        q_weight: Bank<0, bf16>,
+        k_weight: Bank<1, bf16>,
+        positions: Env<keys::Positions>,
+        kv_page_indices: Env<keys::KvPageIndices>,
+        kv_page_indptr: Env<keys::KvPageIndptr>,
+        kv_last_page_lens: Env<keys::KvLastPageLens>,
+        // `plan.row_valid`, and it is `keys::RowValid` rather than a bare
+        // `Env<*const u8>` as of Kilimanjaro III Stage 3: the fact was read
+        // by hand at `arms/attn.rs` for as long as this signature existed and
+        // had no NAME, which is the whole of §1.5's *"reads an aggregate
+        // field with no key"*. `operand()` answers it off `cx.plan()`.
+        row_valid: Env<keys::RowValid>,
+        // `num_q_heads` STOOD HERE AND WAS THE ARM'S ARITHMETIC — F6.
+        // `qkv_packed_post_arm` read `cx.out_width(0)? / layer.head_dim`,
+        // which is `q_out`'s width over a fact this signature already takes,
+        // so the quotient is computed below and the parameter is gone. It was
+        // the LAST thing that arm did that this body could not, and the row
+        // reads `Bound::derived` now.
+        num_kv_heads: Env<keys::KvNumHeads>,
+        head_dim: Env<keys::KvHeadDim>,
+        page_size: Env<keys::KvPageSize>,
+        hnd_layout: Env<keys::KvHndLayout>,
+        theta: Env<keys::Theta>,
+        eps: Env<keys::RmsEps>,
     ) -> Result<(), Refusal> {
         /// `attn/qkv_fused.cuh` — the root these routines compile a symbol out of.
         /// The template-ids NVRTC is handed, spelled as it is handed them.
@@ -2526,6 +2742,23 @@ pub mod qkv_fused {
         /// `BLOCK` for the packed form, and it IS the block width.
         pub const PACKED_BLOCK: u32 = 256;
 
+        // THE ARM'S TWO LINES, IN THE LAUNCHER THAT DIVIDES. The guard is
+        // `qkv_packed_post_arm`'s, word for word -- `Refusal::Empty { what:
+        // "head_dim" }` -- and it comes first for the reason it did there: a
+        // zero head width is a division by zero, which panics rather than
+        // refusing. The numerator is the region's, so the operand that proves
+        // the launch has a result is the operand its width is read from.
+        //
+        // ONE REFUSAL WORD MOVED AND NO REFUSAL DID. The arm read
+        // `cx.out_width(0)?`, which is `Refusal::Absent { what: "an output's
+        // width" }` (`bind/table.rs:461`); `all()` refuses `Absent { what:
+        // "out_width(0)" }` on the same `width <= 0`
+        // (`kernels/src/routine.rs:1146`). Same kind, same shapes refused,
+        // and the new word names the operand a reader would go and look at.
+        if **head_dim <= 0 {
+            return Err(Refusal::Empty { what: "head_dim" });
+        }
+        let num_q_heads = q_out.all("out_width(0)")?.width / **head_dim;
         let heads = num_q_heads.unsigned_abs() + num_kv_heads.unsigned_abs();
         // SAFETY: `call()`'s contract -- every pointer bound here addresses
         // live device memory of the extent the kernel reads it as.
@@ -2533,14 +2766,14 @@ pub mod qkv_fused {
             ctx.launch(
                 "attn/qkv_fused.cuh",
                 "::pie::attn::qkv_packed_qk_norm_rope_vnorm_write_kv<::pie::i32(256)>",
-                Launch::grid([num_rows.unsigned_abs(), heads, 1], [PACKED_BLOCK, 1, 1]),
+                Launch::grid([packed.rows.unsigned_abs(), heads, 1], [PACKED_BLOCK, 1, 1]),
                 &[
-                    packed.arg(),
-                    q_out.arg(),
+                    packed.ptr.arg(),
+                    q_out.ptr.arg(),
                     k_pages.arg(),
                     v_pages.arg(),
-                    q_weight.arg(),
-                    k_weight.arg(),
+                    q_weight.ptr.arg(),
+                    k_weight.ptr.arg(),
                     positions.arg(),
                     kv_page_indices.arg(),
                     kv_page_indptr.arg(),
@@ -2627,9 +2860,6 @@ pub mod qkv_fused {
         let use_rope_table = !rope_table.is_null();
         let heads = num_q_heads.unsigned_abs() + num_kv_heads.unsigned_abs();
 
-        // The warp form takes `num_requests` where the block form takes
-        // `head_dim`: one warp walks a whole request's heads, so the kernel
-        // needs the request count and reads the width from its template.
         if let Some(instantiation) = warp_instantiation(head_dim, use_rope_table) {
             let units = num_requests.unsigned_abs().saturating_mul(heads);
             // SAFETY: `call()`'s contract -- every pointer bound here
@@ -2705,59 +2935,100 @@ pub mod qkv_fused {
     /// `attn/qkv_fused.cu:160` — `qkv_decode_qk_norm_rope_write_kv_bf16`.
     ///
     /// [`qkv_decode_fused_dispatch`]'s obligation.
+    ///
+    /// The column is read off `qkv_decode_fused_arm` and turns on one
+    /// property of the macro: `#[source(..)]` short-circuits ahead of both
+    /// counters (`kernels-macros/src/lib.rs:205`), so marking the two weights
+    /// leaves `rope_table` -- the only other bare `*const` -- at `In(1)`,
+    /// which is exactly the arm's `cx.arg_in(1)`. Had the weights been
+    /// wrapped `Weight<..>` instead, `stated_source` would have run and the
+    /// same thing would have happened; had they been left bare, the column
+    /// would have claimed `In(1)` and `In(2)` for two banks and pushed
+    /// `rope_table` to `In(3)`.
+    ///
+    /// **THAT ARM STAYS AND ITS PACKED TWIN'S DOES NOT**, over one parameter:
+    /// `q_out` is `Out<0, _>`: the region form states no result, so
+    /// `TraceBuilder::push` stamps the enclosing region's buffer onto
+    /// `Op::dest` and the lowerer pushes it into the operand run.
     #[allow(clippy::fn_params_excessive_bools)]
+    #[kernels_macros::routine]
     pub fn qkv_decode_qk_norm_rope_write_kv_bf16(
         ctx: &Ctx,
-        packed: *const bf16,
-        q_out: *mut bf16,
-        k_pages: *mut bf16,
-        v_pages: *mut bf16,
-        q_weight: *const bf16,
-        k_weight: *const bf16,
-        positions: *const i32,
-        rope_table: *const f32,
-        kv_page_indices: *const u32,
-        kv_page_indptr: *const u32,
-        kv_last_page_lens: *const u32,
-        w_page: *const u32,
-        w_off: *const u32,
-        row_valid: *const u8,
-        num_requests: i32,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        page_size: i32,
-        hnd_layout: bool,
-        theta: f32,
-        eps: f32,
+        // `In(0)` -- the statement's packed projection.
+        packed: In<0, bf16>,
+        q_out: Out<0, bf16>,
+        // `layer.k_pages` / `layer.v_pages`. `KvKeys` / `KvValues`, named and
+        // answered as of Stage 2: reason (b) no longer applies to these two.
+        k_pages: Env<keys::KvKeys>,
+        v_pages: Env<keys::KvValues>,
+        // `cx.weight(0)` / `cx.weight(1)`, the POSITIONAL banks.
+        q_weight: Bank<0, bf16>,
+        k_weight: Bank<1, bf16>,
+        positions: Env<keys::Positions>,
+        rope_table: In<1, f32>,
+        kv_page_indices: Env<keys::KvPageIndices>,
+        kv_page_indptr: Env<keys::KvPageIndptr>,
+        kv_last_page_lens: Env<keys::KvLastPageLens>,
+        // The `_or_null` pair: a fire that appends no KV carries a null and the
+        // kernel branches on it, so the refusing spelling would decline it.
+        w_page: Env<keys::KvWritePageOrNull>,
+        w_off: Env<keys::KvWriteOffsetOrNull>,
+        // `w_page`/`w_off` STAY BARE ON THIS ROW ALONE. `keys::KvWritePage`
+        // and `keys::KvWriteOffset` bind them on `write_kv_explicit_bf16`,
+        // where the arm reads `cx.w_page_d()?` and the key's null-check is the
+        // same refusal. Here the arm reads `unwrap_or(null)` and the kernel
+        // branches on the null itself, so the key would refuse a valid fire.
+        row_valid: Env<keys::RowValid>,
+        // `num_q_heads` STOOD HERE. `qkv_decode_fused_arm` computed
+        // `(cx.in_width(0)? - 2 * num_kv_heads * head_dim) / head_dim` and
+        // divided by a `head_dim` it never checked -- a panic rather than a
+        // refusal on a layer view stating none. F6 puts the arithmetic in the
+        // launcher that has all three numbers, and the guard with it.
+        num_kv_heads: Env<keys::KvNumHeads>,
+        head_dim: Env<keys::KvHeadDim>,
+        page_size: Env<keys::KvPageSize>,
+        hnd_layout: Env<keys::KvHndLayout>,
+        theta: Env<keys::Theta>,
+        eps: Env<keys::RmsEps>,
     ) -> Result<(), Refusal> {
-        // `win` is null here: this entry point is the host-window form, and
-        // the kernel reads a null window as "no window".
+        // The packed twin's guard, for the packed twin's reason, over the
+        // subtraction this form does first: the packed row's width is q's
+        // heads and both KV halves, so the query heads are what is left after
+        // the two KV runs are taken off it. `cx.in_width(0)?` became
+        // `packed.all("in_width(0)")?` -- `Refusal::Absent` either way, and
+        // the word now names the slot rather than "an input's width".
+        if **head_dim <= 0 {
+            return Err(Refusal::Empty { what: "head_dim" });
+        }
+        let packed_width = packed.all("in_width(0)")?.width;
+        let num_q_heads = (packed_width - 2 * **num_kv_heads * **head_dim) / **head_dim;
         qkv_decode_fused_dispatch(
             ctx,
-            packed,
-            q_out,
-            k_pages,
-            v_pages,
-            q_weight,
-            k_weight,
-            positions,
-            rope_table,
-            kv_page_indices,
-            kv_page_indptr,
-            kv_last_page_lens,
-            w_page,
-            w_off,
-            row_valid,
+            packed.ptr,
+            q_out.ptr,
+            k_pages.cast::<bf16>(),
+            v_pages.cast::<bf16>(),
+            q_weight.ptr,
+            k_weight.ptr,
+            **positions,
+            rope_table.ptr,
+            **kv_page_indices,
+            **kv_page_indptr,
+            **kv_last_page_lens,
+            **w_page,
+            **w_off,
+            **row_valid,
             core::ptr::null(),
-            num_requests,
+            // The misnamed parameter's value, from the region rather than
+            // from a `#[source(Rows)]` scalar. Same number, same slot.
+            packed.rows,
             num_q_heads,
-            num_kv_heads,
-            head_dim,
-            page_size,
-            hnd_layout,
-            theta,
-            eps,
+            **num_kv_heads,
+            **head_dim,
+            **page_size,
+            **hnd_layout,
+            **theta,
+            **eps,
         )
     }
 }
@@ -2765,6 +3036,8 @@ pub mod qkv_fused {
 /// `attn/dsv4_compress.cuh` — deepseek_v4's SECOND KV cache, and the eleven
 pub mod dsv4_compress {
     use super::bf16;
+    use kernels::keys;
+    use kernels::routine::{Env, In, Out};
     use super::{Ctx, Launch, Refusal};
     
     use crate::jit::Abi;
@@ -2788,22 +3061,31 @@ pub mod dsv4_compress {
     /// What the caller must guarantee, as `call()` states it: every pointer
     /// addresses a live allocation of the extent the kernel reads, and `ape`
     /// and nothing else may be null.
+    ///
+    /// The row (`arms/attn.rs:716`) declines the whole symbol: *"`state_kv`,
+    /// `state_score`, `ape`, `boundary_req`, `ratio` and `coff` have no
+    /// operand to come from"*. Six of thirteen, so the marks below are the
+    /// other seven and the reasons are the six.
+    #[kernels_macros::routine]
     pub fn dsv4_compress_gather_paged_bf16(
         ctx: &Ctx,
-        state_kv: *const bf16,
-        state_score: *const bf16,
-        ape: *const f32,
-        boundary_pos: *const i32,
-        boundary_req: *const i32,
-        kv_page_indices: *const u32,
-        kv_page_indptr: *const u32,
-        out: *mut bf16,
+        state_kv: Env<*const bf16>,
+        state_score: Env<*const bf16>,
+        // The absolute-position table, a load-time constant.
+        ape: Env<*const f32>,
+        boundary_pos: In<0, i32>,
+        boundary_req: In<1, i32>,
+        kv_page_indices: Env<keys::KvPageIndices>,
+        kv_page_indptr: Env<keys::KvPageIndptr>,
+        // `Out(0)`, the statement's single `out`, declared
+        // `[Dim::Tokens, Dim::Const(head_dim)] as BF16`.
+        out: Out<0, bf16>,
         num_entries: i32,
-        head_dim: i32,
         ratio: i32,
         coff: i32,
         page_size: i32,
     ) -> Result<(), Refusal> {
+        let head_dim = out.all("out_width(0)")?.width;
         // SAFETY: `call()`'s contract -- every pointer bound here addresses
         // live device memory of the extent the kernel reads it as.
         unsafe {
@@ -2815,11 +3097,11 @@ pub mod dsv4_compress {
                     state_kv.arg(),
                     state_score.arg(),
                     ape.arg(),
-                    boundary_pos.arg(),
-                    boundary_req.arg(),
+                    boundary_pos.ptr.arg(),
+                    boundary_req.ptr.arg(),
                     kv_page_indices.arg(),
                     kv_page_indptr.arg(),
-                    out.arg(),
+                    out.ptr.arg(),
                     head_dim.arg(),
                     ratio.arg(),
                     coff.arg(),
@@ -2832,18 +3114,28 @@ pub mod dsv4_compress {
     /// Commit those entries to the compressed cache.
     ///
     /// As above; no operand of this one is nullable.
+    ///
+    /// The row (`arms/attn.rs:730`): the statement *"names `entries` and
+    /// `boundary_pos`, and the kernel also reads `boundary_req` [...] and
+    /// needs `head_dim` and `page_size` besides"*. So `In(0)` and `In(1)` are
+    /// the two it names and everything else refuses.
+    #[kernels_macros::routine]
     pub fn dsv4_store_comp_entries_bf16(
         ctx: &Ctx,
-        entries: *const bf16,
-        comp_kv_pages: *mut bf16,
-        boundary_pos: *const i32,
-        boundary_req: *const i32,
-        kv_page_indices: *const u32,
-        kv_page_indptr: *const u32,
+        entries: In<0, bf16>,
+        comp_kv_pages: Env<*mut bf16>,
+        // `In(1)`, stated, and the statement does name it.
+        boundary_pos: In<1, i32>,
+        boundary_req: In<2, i32>,
+        kv_page_indices: Env<keys::KvPageIndices>,
+        kv_page_indptr: Env<keys::KvPageIndptr>,
         num_entries: i32,
-        head_dim: i32,
         page_size: i32,
     ) -> Result<(), Refusal> {
+        // The gather's guard, for the gather's reason -- `route_rows`'s
+        // `.max(1)` hides a zero width from the empty-grid check. A view is
+        // where that guard lives now, and it refuses in the same word.
+        let head_dim = entries.all("in_width(0)")?.width;
         // SAFETY: `call()`'s contract -- every pointer bound here addresses
         // live device memory of the extent the kernel reads it as.
         unsafe {
@@ -2852,10 +3144,10 @@ pub mod dsv4_compress {
                 "::pie::attn::dsv4_store_comp_entries<::pie::bf16>",
                 route_rows(num_entries, head_dim),
                 &[
-                    entries.arg(),
+                    entries.ptr.arg(),
                     comp_kv_pages.arg(),
-                    boundary_pos.arg(),
-                    boundary_req.arg(),
+                    boundary_pos.ptr.arg(),
+                    boundary_req.ptr.arg(),
                     kv_page_indices.arg(),
                     kv_page_indptr.arg(),
                     head_dim.arg(),
@@ -2868,14 +3160,19 @@ pub mod dsv4_compress {
 
 /// `attn/kv_paged.cuh` — the paged KV cache's appenders, its quantised
 pub mod kv_paged {
+    use kernels::keys;
+
+    use kernels::routine::{Env, In, Unbound};
     use super::bf16;
     use crate::jit::abi::MaybeConst;
     use crate::jit::fp8_kind;
 
-    use super::{Ctx, Launch};
+    use super::{Ctx, Launch, scheme_byte};
     
+    use core::ffi::c_void;
+
     use crate::jit::Abi;
-    use crate::attn::{KvDType, KvLayer, KvScheme};
+    use crate::attn::{KvDType, KvScheme, kv_dtype, kv_scheme};
     use kernels::Refusal;
 
     /// `attn/kv_paged.cuh` — the root these routines compile a symbol out of.
@@ -2888,19 +3185,26 @@ pub mod kv_paged {
         /// `kv_paged.cu`'s `constexpr int BLOCK = 256`, which every launch in
     const BLOCK: u32 = 256;
     /// The interpretation an fp8 page is written and read under.
-    fn fp8_kind_of(storage_dtype: KvDType) -> fp8_kind {
+    ///
+    /// Takes the DEVICE spelling, not [`KvDType`]: `.wiki/kilimanjaro.md` §5
+    /// D1 made the storage type an argument of
+    /// [`write_kv_to_pages_quantised`], and a `routine!` argument has to be
+    /// an `Arg`, which only [`kv_dtype`] is. The two dequant programs still
+    /// hold a `&KvLayer` and wrap at the call — see their headers for why
+    /// they were left behind.
+    fn fp8_kind_of(storage_dtype: kv_dtype) -> fp8_kind {
 
         const NV_E5M2: u32 = 1;
 
         /// `::__nv_fp8_interpretation_t`'s two values, by the names the header
         const NV_E4M3: u32 = 0;
 
-        fp8_kind(if matches!(storage_dtype, KvDType::Fp8E5M2) { NV_E5M2 } else { NV_E4M3 })
+        fp8_kind(if storage_dtype == kv_dtype::of(KvDType::Fp8E5M2) { NV_E5M2 } else { NV_E4M3 })
     }
 
     /// NVFP4's block, when the layer states none.
-    fn fp4_block_size(layer: &KvLayer) -> i32 {
-        if layer.block_size > 0 { layer.block_size } else { 16 }
+    fn fp4_block_size(block_size: i32) -> i32 {
+        if block_size > 0 { block_size } else { 16 }
     }
 
     /// An upper bound on the pages an append can touch.
@@ -2914,22 +3218,60 @@ pub mod kv_paged {
 
     /// `attn::write_kv_explicit_bf16` — write B rows to B explicit slots.
     ///
+    /// # The layer arrives as FIELDS
+    ///
+    /// A routine takes fields, never a struct: the only `ArgValue` a struct
+    /// could ride in is `Bytes`, whose layout agreement *"is not checked and
+    /// cannot be here"* (`kernels-cuda/src/jit/value.rs:32`). Sixteen
+    /// arguments buy that check back, which is why the signature is long.
+    ///
+    /// `is_native_bf16` is still taken, and still only asserted on: the
+    /// kernel this launches writes bf16 unconditionally, so the field is the
+    /// caller's claim that the pages can hold what it writes, not an operand.
+    ///
     /// What the caller must guarantee, as `call()` states it: every pointer
-    /// must be a device allocation of the stated extent.
+    /// must be a device allocation of the stated extent. The `Env` marks say
+    /// which of them the FIRE supplies rather than the trace statement —
+    /// §6.2's arity rule counts the unmarked ones against the two inputs
+    /// `write_kv_explicit` places.
+    ///
+    /// The column is read off `write_kv_explicit_arm` (`arms/attn.rs:324-348`)
+    /// and is nine tenths refusal: two `In`s, `Rows`, `KvPageSize`, and
+    /// thirteen facts the fire holds and the table has no word for.
+    #[kernels_macros::routine]
     pub fn write_kv_explicit_bf16(
         ctx: &Ctx,
-        layer: &KvLayer,
-        k_curr: *const bf16,
-        v_curr: *const bf16,
-        w_page: *const u32,
-        w_off: *const u32,
-        b: i32,
-        row_valid: *const u8,
+        k_curr: In<0, bf16>,
+        v_curr: In<1, bf16>,
+        k_pages: Env<keys::KvKeys>,
+        v_pages: Env<keys::KvValues>,
+        w_page: Env<keys::KvWritePage>,
+        w_off: Env<keys::KvWriteOffset>,
+        // `plan.row_valid` = `keys::RowValid` (`keys.rs` §1). This was
+        // reason (a) -- a fact with no word -- until Kilimanjaro III Stage 3
+        // minted one; `operand()` answers it off `cx.plan()`, so the arm
+        // stops reading it by hand.
+        row_valid: Env<keys::RowValid>,
+        // `layer.k_env_min` / `layer.k_env_max` -- the per-page bf16 envelope
+        // pair, two more `KvLayer` fields. Reason (b), `KvLayerField`, AND
+        // THE FIRST REFUSAL ON THIS ROW now that `row_valid` above it is
+        // answered: this is the pair `write_kv_to_pages_bf16_arm`'s doc names.
+        k_env_min: Env<keys::KvEnvMin>,
+        k_env_max: Env<keys::KvEnvMax>,
+        page_size: Env<keys::KvPageSize>,
+        num_kv_heads: Env<keys::KvNumHeads>,
+        head_dim: Env<keys::KvHeadDim>,
+        hnd: Env<keys::KvHndLayout>,
+        // `layer.has_envelopes` = `keys::KvHasEnvelopes`, `bool` because
+        // `operand()` mints an `ArgValue::Bool` for it (`table.rs:928`) and
+        // an `i32` key would refuse the day an arm is written.
+        has_envelopes: Env<keys::KvHasEnvelopes>,
+        is_native_bf16: Env<keys::KvNativeBf16>,
     ) -> Result<(), Refusal> {
-        assert!(layer.is_native_bf16, "attn::write_kv_explicit_bf16 requires native bf16 KV cache");
+        assert!(**is_native_bf16, "attn::write_kv_explicit_bf16 requires native bf16 KV cache");
 
         let instantiation =
-            if layer.hnd { "::pie::attn::write_kv_explicit<\
+            if **hnd { "::pie::attn::write_kv_explicit<\
                                 ::pie::true_type::value>" } else { "::pie::attn::write_kv_explicit<::pie::false_type::value>" };
         // SAFETY: `call()`'s contract -- every pointer bound here addresses
         // live device memory of the extent the kernel reads it as.
@@ -2937,35 +3279,37 @@ pub mod kv_paged {
             ctx.launch(
                 "attn/kv_paged.cuh",
                 instantiation,
-                Launch::per_row(b.unsigned_abs(), BLOCK),
+                Launch::per_row(k_curr.rows.unsigned_abs(), BLOCK),
                 &[
-                    k_curr.arg(),
-                    v_curr.arg(),
-                    layer.k_pages.cast::<bf16>().arg(),
-                    layer.v_pages.cast::<bf16>().arg(),
+                    k_curr.ptr.arg(),
+                    v_curr.ptr.arg(),
+                    k_pages.arg(),
+                    v_pages.arg(),
                     w_page.arg(),
                     w_off.arg(),
-                    MaybeConst::new(row_valid).arg(),
-                    b.arg(),
-                    layer.page_size.arg(),
-                    layer.num_kv_heads.arg(),
-                    layer.head_dim.arg(),
+                    MaybeConst::new(**row_valid).arg(),
+                    k_curr.rows.arg(),
+                    page_size.arg(),
+                    num_kv_heads.arg(),
+                    head_dim.arg(),
                 ],
             )?;
         }
 
-        if layer.has_envelopes && !layer.hnd {
+        if **has_envelopes && !**hnd {
             let _ = crate::layout::envelope_merge_written(
                 ctx,
-                k_curr,
-                w_page,
-                w_off,
-                MaybeConst::new(row_valid),
-                layer.k_env_min.cast(),
-                layer.k_env_max.cast(),
-                b,
-                layer.num_kv_heads,
-                layer.head_dim,
+                Unbound { ptr: k_curr.ptr },
+                Unbound { ptr: **w_page },
+                Unbound { ptr: **w_off },
+                Unbound { ptr: MaybeConst::new(**row_valid) },
+                Unbound { ptr: (**k_env_min).cast::<bf16>().cast_mut() },
+                Unbound { ptr: (**k_env_max).cast::<bf16>().cast_mut() },
+                k_curr.rows,
+                // `crate::layout` is not this family and its parameters are flat
+                // `i32`s, so the two facts are opened at the call.
+                **num_kv_heads,
+                **head_dim,
             );
         }
         Ok(())
@@ -2973,29 +3317,46 @@ pub mod kv_paged {
 
     /// `attn::write_kv_explicit_bf16_devwin` — the same write with a
     ///
-    /// As [`write_kv_explicit_bf16`].
+    /// As [`write_kv_explicit_bf16`], fields and all: §5 D1 unpacked this
+    /// signature at the same time and for the same reason.
+    ///
+    /// **No `Bound` row names this symbol.** The marks are read off
+    /// [`write_kv_explicit_bf16`]'s arm, which is the same write with a host
+    /// window, plus the one thing the `_devwin` form does differently: it
+    /// takes `cx.rows().total` where the host-window form takes `.count`. The
+    /// `split_qkv_bf16_devwin` arm (`arms/attn.rs:146`) is the evidence for
+    /// that, since it is the other `_devwin` in the family and does exactly
+    /// this.
+    #[kernels_macros::routine]
     pub fn write_kv_explicit_bf16_devwin(
         ctx: &Ctx,
-        layer: &KvLayer,
-        k_curr: *const bf16,
-        v_curr: *const bf16,
-        w_page: *const u32,
-        w_off: *const u32,
-        win_d: *const u32,
-        n_max: i32,
-        row_valid: *const u8,
+        k_curr: In<0, bf16>,
+        v_curr: In<1, bf16>,
+        k_pages: Env<keys::KvKeys>,
+        v_pages: Env<keys::KvValues>,
+        w_page: Env<keys::KvWritePage>,
+        w_off: Env<keys::KvWriteOffset>,
+        win_d: Env<keys::PeelWindow>,
+        row_valid: Env<keys::RowValid>,
+        n_max: Env<keys::RowsTotal>,
+        page_size: Env<keys::KvPageSize>,
+        num_kv_heads: Env<keys::KvNumHeads>,
+        head_dim: Env<keys::KvHeadDim>,
+        hnd: Env<keys::KvHndLayout>,
+        has_envelopes: Env<keys::KvHasEnvelopes>,
+        is_native_bf16: Env<keys::KvNativeBf16>,
     ) -> Result<(), Refusal> {
         assert!(
-            layer.is_native_bf16,
+            **is_native_bf16,
             "attn::write_kv_explicit_bf16_devwin requires native bf16 KV cache"
         );
         assert!(
-            !layer.has_envelopes,
+            !**has_envelopes,
             "attn::write_kv_explicit_bf16_devwin: envelope maintenance not yet \
              windowed — use the host-window form"
         );
 
-        let instantiation = if layer.hnd {
+        let instantiation = if **hnd {
             "::pie::attn::write_kv_explicit_devwin<::pie::true_type::value>"
         } else {
             "::pie::attn::write_kv_explicit_devwin<::pie::false_type::value>"
@@ -3006,46 +3367,77 @@ pub mod kv_paged {
             ctx.launch(
                 "attn/kv_paged.cuh",
                 instantiation,
-                Launch::per_row(n_max.unsigned_abs(), BLOCK),
+                Launch::per_row((**n_max).unsigned_abs(), BLOCK),
                 &[
-                    k_curr.arg(),
-                    v_curr.arg(),
-                    layer.k_pages.cast::<bf16>().arg(),
-                    layer.v_pages.cast::<bf16>().arg(),
+                    k_curr.ptr.arg(),
+                    v_curr.ptr.arg(),
+                    k_pages.arg(),
+                    v_pages.arg(),
                     w_page.arg(),
                     w_off.arg(),
-                    MaybeConst::new(row_valid).arg(),
+                    MaybeConst::new(**row_valid).arg(),
                     win_d.arg(),
                     n_max.arg(),
-                    layer.page_size.arg(),
-                    layer.num_kv_heads.arg(),
-                    layer.head_dim.arg(),
+                    page_size.arg(),
+                    num_kv_heads.arg(),
+                    head_dim.arg(),
                 ],
             )
         }
     }
 
-    /// The native-bf16 append, `kv_paged.cu:60-120`.
+    /// `attn::write_kv_to_pages_bf16` — the native-bf16 append,
+    /// `kv_paged.cu:60-120`.
+    ///
+    /// # A SYMBOL, not an arm
+    ///
+    /// `is_native_bf16` is a BOOT FACT — `[driver] kv_cache_dtype`, fixed
+    /// before the first token — so [`write_kv_to_pages`] is a MAP resolved
+    /// once at model load, and this is a symbol the driver binds directly.
+    ///
+    /// # And it takes FIELDS
+    ///
+    /// §5 D1 — *"a routine takes fields, never a struct"*. Nine of
+    /// `KvLayer`'s eighteen fields are read here; the other nine were
+    /// carried in for nothing by a `&KvLayer` that no `ArgValue` can hold
+    /// without falling back on `Bytes`, whose layout agreement
+    /// *"is not checked and cannot be here"* (`kernels-cuda/src/jit/value.rs:32`).
+    /// Nineteen arguments, exactly what the spec's table predicted.
     ///
     /// As [`write_kv_explicit_bf16`]; the four CSR arrays must describe
-    /// `num_requests` requests over `total_tokens` tokens.
+    /// `num_requests` requests over `total_tokens` tokens. `k_curr`/`v_curr`
+    /// are the two operands the trace statement places and so carry no mark;
+    /// everything else the FIRE supplies, which is what `Env` says.
+    ///
+    /// The column is read off `write_kv_to_pages_bf16_arm`
+    /// (`arms/attn.rs:246-273`).
+    #[kernels_macros::routine]
     pub fn write_kv_to_pages_bf16(
         ctx: &Ctx,
-        layer: &KvLayer,
-        k_curr: *const bf16,
-        v_curr: *const bf16,
-        qo_indptr: *const u32,
-        kv_page_indices: *const u32,
-        kv_page_indptr: *const u32,
-        kv_last_page_lens: *const u32,
-        total_tokens: i32,
-        num_requests: i32,
-        row_valid: *const u8,
-        first_token: i32,
+        k_curr: In<0, bf16>,
+        v_curr: In<1, bf16>,
+        k_pages: Env<keys::KvKeys>,
+        v_pages: Env<keys::KvValues>,
+        qo_indptr: Env<keys::QoIndptr>,
+        kv_page_indices: Env<keys::KvPageIndices>,
+        kv_page_indptr: Env<keys::KvPageIndptr>,
+        kv_last_page_lens: Env<keys::KvLastPageLens>,
+        row_valid: Env<keys::RowValid>,
+        // Two `KvLayer` fields: reason (b), and the FIRST refusal on this row
+        // now that the CSR above it is four keys deep.
+        k_env_min: Env<keys::KvEnvMin>,
+        k_env_max: Env<keys::KvEnvMax>,
+        num_requests: Env<keys::RequestCount>,
+        first_token: Env<keys::FirstToken>,
+        page_size: Env<keys::KvPageSize>,
+        num_kv_heads: Env<keys::KvNumHeads>,
+        head_dim: Env<keys::KvHeadDim>,
+        hnd: Env<keys::KvHndLayout>,
+        has_envelopes: Env<keys::KvHasEnvelopes>,
     ) -> Result<(), Refusal> {
-        let launch_tokens = total_tokens - first_token;
+        let launch_tokens = k_curr.rows - **first_token;
 
-        let instantiation = if layer.hnd { "::pie::attn::write_kv<\
+        let instantiation = if **hnd { "::pie::attn::write_kv<\
                                                 ::pie::true_type::value>" } else { "::pie::attn::write_kv<::pie::false_type::value>" };
         // SAFETY: `call()`'s contract -- every pointer bound here addresses
         // live device memory of the extent the kernel reads it as.
@@ -3055,81 +3447,139 @@ pub mod kv_paged {
                 instantiation,
                 Launch::per_row(launch_tokens.unsigned_abs(), BLOCK),
                 &[
-                    k_curr.arg(),
-                    v_curr.arg(),
-                    layer.k_pages.cast::<bf16>().arg(),
-                    layer.v_pages.cast::<bf16>().arg(),
+                    k_curr.ptr.arg(),
+                    v_curr.ptr.arg(),
+                    k_pages.arg(),
+                    v_pages.arg(),
                     qo_indptr.arg(),
                     kv_page_indices.arg(),
                     kv_page_indptr.arg(),
                     kv_last_page_lens.arg(),
-                    MaybeConst::new(row_valid).arg(),
+                    MaybeConst::new(**row_valid).arg(),
                     MaybeConst::<u32>::none().arg(),
                     num_requests.arg(),
-                    layer.page_size.arg(),
-                    layer.num_kv_heads.arg(),
-                    layer.head_dim.arg(),
+                    page_size.arg(),
+                    num_kv_heads.arg(),
+                    head_dim.arg(),
                     first_token.arg(),
                 ],
             )?;
         }
 
-        if layer.has_envelopes && !layer.hnd && total_tokens > 0 {
+        if **has_envelopes && !**hnd && k_curr.rows > 0 {
             let _ = crate::layout::envelope_update_appended(
                 ctx,
-                layer.k_pages.cast(),
-                qo_indptr,
-                kv_page_indices,
-                kv_page_indptr,
-                kv_last_page_lens,
-                layer.k_env_min.cast(),
-                layer.k_env_max.cast(),
-                num_requests,
-                max_touched_pages(total_tokens, num_requests, layer.page_size),
-                layer.page_size,
-                layer.num_kv_heads,
-                layer.head_dim,
+                Unbound { ptr: k_pages.cast::<bf16>().cast_const() },
+                Unbound { ptr: **qo_indptr },
+                Unbound { ptr: **kv_page_indices },
+                Unbound { ptr: **kv_page_indptr },
+                Unbound { ptr: **kv_last_page_lens },
+                Unbound { ptr: (**k_env_min).cast::<bf16>().cast_mut() },
+                Unbound { ptr: (**k_env_max).cast::<bf16>().cast_mut() },
+                **num_requests,
+                max_touched_pages(k_curr.rows, **num_requests, **page_size),
+                **page_size,
+                **num_kv_heads,
+                **head_dim,
             );
         }
         Ok(())
     }
 
-    /// The quantised append, `kv_paged.cu:130-190` — four schemes, three
+    /// `attn::write_kv_to_pages_quantised` — the quantised append,
+    /// `kv_paged.cu:130-190` — four schemes, three kernels.
+    ///
+    /// # The other half of the boot fact
+    ///
+    /// The sibling of [`write_kv_to_pages_bf16`], and a symbol for the same
+    /// reason: §5 D5 turned `is_native_bf16` from a per-fire branch into a
+    /// load-time map, and this is what the map answers when the boot chose a
+    /// quantised `[driver] kv_cache_dtype`. Read that header first — it
+    /// carries the argument, and [`write_kv_to_pages`] carries the epitaph.
+    ///
+    /// The scheme, in contrast, is NOT a boot fact this routine could shed:
+    /// four schemes over three kernels is a dispatch on an operand the layer
+    /// carries, so it stays inside, and §5 D1 makes it arrive as
+    /// [`kv_scheme`] — the device spelling, because a `routine!` derives its
+    /// row from the signature and only that spelling is an `Arg`.
+    /// [`kv_scheme::scheme`] decodes it back so the `match` stays exhaustive.
+    ///
+    /// TEN of `KvLayer`'s eighteen fields, eighteen arguments. The spec's D1
+    /// table predicted the argument count exactly and said *"uses 9 of 18"*
+    /// of the fields; the tenth is `storage_dtype`, which only the
+    /// fp8-per-tensor arm reads and only to pick between `E4M3` and `E5M2`.
+    /// The count that governs is the argument count — `impl_kernel_fn!` is
+    /// stamped through 36 (`kernels/src/routine.rs`) — and eighteen is what
+    /// this is.
     ///
     /// As [`write_kv_to_pages_bf16`]; the layer's scale planes must be
     /// sized for its scheme.
+    ///
+    /// `first_token` IS TAKEN AND NEVER LAUNCHED. None of the three kernels
+    /// below has a parameter for it, so all three write from row zero, and a
+    /// fire meaning to skip the first tokens would land its rows in the wrong
+    /// slots. That is a kernel limitation and the routine's own refusal, not
+    /// a caller's policy -- `write_kv_to_pages`'s doc had already located it
+    /// as *"`first_token != 0 && !is_native_bf16` must refuse"*, and it sat
+    /// in the driver arm only because this signature did not take the fact.
+    /// It does now. `is_native_bf16` on [`write_kv_explicit_bf16`] is the
+    /// same shape: taken, asserted on, never passed to a kernel.
+    #[kernels_macros::routine]
     pub fn write_kv_to_pages_quantised(
         ctx: &Ctx,
-        layer: &KvLayer,
-        k_curr: *const bf16,
-        v_curr: *const bf16,
-        qo_indptr: *const u32,
-        kv_page_indices: *const u32,
-        kv_page_indptr: *const u32,
-        kv_last_page_lens: *const u32,
-        total_tokens: i32,
-        num_requests: i32,
+        k_curr: In<0, bf16>,
+        v_curr: In<1, bf16>,
+        first_token: Env<keys::FirstToken>,
+        // `KvKeys` / `KvValues`, reason (b), witnessed at
+        // `arms/attn.rs:556-557`.
+        k_pages: Env<keys::KvKeys>,
+        v_pages: Env<keys::KvValues>,
+        // Same TYPE as a workspace buffer, a different fact, and that is why
+        // the sweep that named `attn/fa2/`'s stopped here until these two got
+        // their own keys.
+        k_scales: Env<keys::KvKeyScales>,
+        v_scales: Env<keys::KvValueScales>,
+        // Four `plan()` CSRs, ALL FOUR spelled from their keys now
+        // (`arms/attn.rs`'s bindings): `qo_indptr` was the odd one out under
+        // reason (a) and `keys::QoIndptr` ended that.
+        qo_indptr: Env<keys::QoIndptr>,
+        kv_page_indices: Env<keys::KvPageIndices>,
+        kv_page_indptr: Env<keys::KvPageIndptr>,
+        kv_last_page_lens: Env<keys::KvLastPageLens>,
+        num_requests: Env<keys::RequestCount>,
+        page_size: Env<keys::KvPageSize>,
+        num_kv_heads: Env<keys::KvNumHeads>,
+        head_dim: Env<keys::KvHeadDim>,
+        block_size: Env<keys::KvBlockSize>,
+        scheme: Env<keys::KvSchemeByte>,
+        storage_dtype: Env<keys::KvStorageDtype>,
     ) -> Result<(), Refusal> {
-        let page_size = layer.page_size;
-        let h_kv = layer.num_kv_heads;
-        let d = layer.head_dim;
-        let tokens = total_tokens.unsigned_abs();
+        if **first_token != 0 {
+            return Err(Refusal::Absent {
+                what: "a quantised appender that skips the first tokens",
+            });
+        }
+        let scheme = kv_scheme(scheme_byte(**scheme));
+        let storage_dtype = kv_dtype(scheme_byte(**storage_dtype));
+        let h_kv = num_kv_heads;
+        let d = head_dim;
+        let tokens = k_curr.rows.unsigned_abs();
         let heads = h_kv.unsigned_abs();
 
-        match layer.scheme {
+        match scheme.scheme() {
             // SAFETY, in all three arms: `call()`'s contract -- every pointer
             // bound here addresses live device memory of the extent the
             // kernel reads it as.
-            KvScheme::Fp8PerTensor => unsafe {
+            Some(KvScheme::Fp8PerTensor) => unsafe {
                 ctx.launch(
                     "attn/kv_paged.cuh",
                     "::pie::attn::write_kv_fp8_per_tensor",
                     Launch::per_row(tokens, BLOCK),
                     &[
-                        k_curr.arg(),
-                        v_curr.arg(),
-                        layer.k_pages.cast::<u8>().arg(),
-                        layer.v_pages.cast::<u8>().arg(),
+                        k_curr.ptr.arg(),
+                        v_curr.ptr.arg(),
+                        k_pages.arg(),
+                        v_pages.arg(),
                         qo_indptr.arg(),
                         kv_page_indices.arg(),
                         kv_page_indptr.arg(),
@@ -3138,13 +3588,13 @@ pub mod kv_paged {
                         page_size.arg(),
                         h_kv.arg(),
                         d.arg(),
-                        fp8_kind_of(layer.storage_dtype).arg(),
+                        fp8_kind_of(storage_dtype).arg(),
                     ],
                 )
             },
 
-            KvScheme::Int8PerTokenHead | KvScheme::Fp8PerTokenHead => {
-                let instantiation = if matches!(layer.scheme, KvScheme::Fp8PerTokenHead) {
+            Some(KvScheme::Int8PerTokenHead | KvScheme::Fp8PerTokenHead) => {
+                let instantiation = if scheme == kv_scheme::of(KvScheme::Fp8PerTokenHead) {
                     "::pie::attn::write_kv_per_token_head<::pie::true_type::value>"
                 } else {
                     "::pie::attn::write_kv_per_token_head<::pie::false_type::value>"
@@ -3158,12 +3608,12 @@ pub mod kv_paged {
                         instantiation,
                         Launch::grid([tokens, heads, 1], [BLOCK, 1, 1]).smem(smem),
                         &[
-                            k_curr.arg(),
-                            v_curr.arg(),
-                            layer.k_pages.arg(),
-                            layer.v_pages.arg(),
-                            layer.k_scales.cast::<f32>().arg(),
-                            layer.v_scales.cast::<f32>().arg(),
+                            k_curr.ptr.arg(),
+                            v_curr.ptr.arg(),
+                            k_pages.arg(),
+                            v_pages.arg(),
+                            k_scales.cast::<f32>().arg(),
+                            v_scales.cast::<f32>().arg(),
                             qo_indptr.arg(),
                             kv_page_indices.arg(),
                             kv_page_indptr.arg(),
@@ -3177,8 +3627,8 @@ pub mod kv_paged {
                 }
             }
 
-            KvScheme::Fp4Block => {
-                let block_size = fp4_block_size(layer);
+            Some(KvScheme::Fp4Block) => {
+                let block_size = fp4_block_size(**block_size);
                 let blocks = d.div_euclid(block_size) + i32::from(d.rem_euclid(block_size) != 0);
                 unsafe {
                     ctx.launch(
@@ -3186,12 +3636,12 @@ pub mod kv_paged {
                         "::pie::attn::write_kv_fp4_block",
                         Launch::grid([tokens, heads, blocks.unsigned_abs()], [32, 1, 1]),
                         &[
-                            k_curr.arg(),
-                            v_curr.arg(),
-                            layer.k_pages.cast::<u8>().arg(),
-                            layer.v_pages.cast::<u8>().arg(),
-                            layer.k_scales.cast::<f32>().arg(),
-                            layer.v_scales.cast::<f32>().arg(),
+                            k_curr.ptr.arg(),
+                            v_curr.ptr.arg(),
+                            k_pages.arg(),
+                            v_pages.arg(),
+                            k_scales.cast::<f32>().arg(),
+                            v_scales.cast::<f32>().arg(),
                             qo_indptr.arg(),
                             kv_page_indices.arg(),
                             kv_page_indptr.arg(),
@@ -3206,65 +3656,44 @@ pub mod kv_paged {
                 }
             }
 
-            KvScheme::Native => {
+            Some(KvScheme::Native) => {
                 Err(Refusal::Absent { what: "a quantised writer for Native storage" })
             }
+
+            None => Err(Refusal::Absent { what: "a KV scheme this byte names" }),
         }
     }
 
-    /// `attn::write_kv_to_pages` — the entry point, which chooses.
+    /// `attn::write_kv_to_pages` — the boot fact's MAP.
     ///
-    /// As [`write_kv_to_pages_bf16`].
-    pub fn write_kv_to_pages(
-        ctx: &Ctx,
-        layer: &KvLayer,
-        k_curr: *const bf16,
-        v_curr: *const bf16,
-        qo_indptr: *const u32,
-        kv_page_indices: *const u32,
-        kv_page_indptr: *const u32,
-        kv_last_page_lens: *const u32,
-        total_tokens: i32,
-        num_requests: i32,
-        row_valid: *const u8,
-        first_token: i32,
-    ) -> Result<(), Refusal> {
-        // A partial write addresses its destination by counting from
-        // `first_token`, and only the native appender takes that operand: the
-        // three quantised kernels have no parameter for it.
-        if first_token != 0 && !layer.is_native_bf16 {
-            return Err(Refusal::Absent {
-                what: "a quantised appender that skips the first tokens",
-            });
+    /// Not a launcher: it answers which SYMBOL serves a deployment, and the
+    /// driver asks once, at model load. `is_native_bf16` follows `[driver]
+    /// kv_cache_dtype`, fixed before the first token, so the choice is a map
+    /// rather than a per-fire branch — and a branch would hide two routines
+    /// behind one symbol, leaving the load-time arity check nothing to check
+    /// them against.
+    ///
+    /// The partial-write guard that belongs with this choice is NOT here:
+    /// `first_token != 0 && !is_native_bf16` must refuse, and only the native
+    /// appender takes `first_token`, so the guard lives in the driver arm that
+    /// has it in hand (`driver-cuda/src/bind/arms/attn.rs`,
+    /// `write_kv_to_pages_quantised_arm`).
+    ///
+    /// The stated symbol keeps its `driver_bound!` row: `kernels_cuda::sigs()`
+    /// is what `check_plan` measures a model text against, and every live text
+    /// states this name through `model-dsl/src/cuda/base.rs:696`.
+    #[must_use]
+    pub const fn write_kv_to_pages(is_native_bf16: bool) -> &'static str {
+        if is_native_bf16 {
+            concat!("attn::", stringify!(write_kv_to_pages_bf16))
+        } else {
+            concat!("attn::", stringify!(write_kv_to_pages_quantised))
         }
-        if layer.is_native_bf16 {
-            return write_kv_to_pages_bf16(
-                ctx,
-                layer,
-                k_curr,
-                v_curr,
-                qo_indptr,
-                kv_page_indices,
-                kv_page_indptr,
-                kv_last_page_lens,
-                total_tokens,
-                num_requests,
-                row_valid,
-                first_token,
-            );
-        }
-        write_kv_to_pages_quantised(
-            ctx,
-            layer,
-            k_curr,
-            v_curr,
-            qo_indptr,
-            kv_page_indices,
-            kv_page_indptr,
-            kv_last_page_lens,
-            total_tokens,
-            num_requests,
-        )
+    }
+
+    #[allow(dead_code)]
+    fn the_map_names_two_real_fns() {
+        let _ = (write_kv_to_pages_bf16, write_kv_to_pages_quantised);
     }
 
     /// The fp8-per-tensor arm, called by name from
@@ -3272,20 +3701,31 @@ pub mod kv_paged {
     /// What the caller must guarantee, as `call()` states it:
     /// `kv_page_indices` must list `num_pages_in_batch` valid page indices,
     /// and the layer's bf16 mirror planes must be sized for them.
+    #[allow(clippy::too_many_arguments)]
     pub fn dequant_fp8_per_tensor_pages_active(
         ctx: &Ctx,
-        layer: &KvLayer,
+        k_pages: *mut u8,
+        v_pages: *mut u8,
+        k_bf16_pages: *mut c_void,
+        v_bf16_pages: *mut c_void,
+        page_size: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        scheme: kv_scheme,
+        storage_dtype: kv_dtype,
+        is_native_bf16: bool,
         kv_page_indices: *const u32,
         num_pages_in_batch: i32,
     ) -> Result<(), Refusal> {
-        if layer.is_native_bf16 {
+        if is_native_bf16 {
             return Err(Refusal::Absent { what: "quantised pages on a bf16 layer" });
         }
-        if !matches!(layer.scheme, KvScheme::Fp8PerTensor) {
+        if scheme != kv_scheme::of(KvScheme::Fp8PerTensor) {
             return Err(Refusal::Absent { what: "an fp8-per-tensor layer" });
         }
 
-        let (logical_n, page_elems, launch) = active_geometry(layer, num_pages_in_batch);
+        let (logical_n, page_elems, launch) =
+            active_geometry(page_size, num_kv_heads, head_dim, num_pages_in_batch);
         // SAFETY: `call()`'s contract -- every pointer bound here addresses
         // live device memory of the extent the kernel reads it as.
         unsafe {
@@ -3294,22 +3734,27 @@ pub mod kv_paged {
                 "::pie::attn::dequant_fp8_pages_active",
                 launch,
                 &[
-                    layer.k_pages.cast::<u8>().cast_const().arg(),
-                    layer.v_pages.cast::<u8>().cast_const().arg(),
-                    layer.k_bf16_pages.cast::<bf16>().arg(),
-                    layer.v_bf16_pages.cast::<bf16>().arg(),
+                    k_pages.cast::<u8>().cast_const().arg(),
+                    v_pages.cast::<u8>().cast_const().arg(),
+                    k_bf16_pages.cast::<bf16>().arg(),
+                    v_bf16_pages.cast::<bf16>().arg(),
                     kv_page_indices.arg(),
                     logical_n.arg(),
                     page_elems.arg(),
-                    fp8_kind_of(layer.storage_dtype).arg(),
+                    fp8_kind_of(storage_dtype).arg(),
                 ],
             )
         }
     }
 
     /// The element count an active-page pass covers, and the grid that
-    fn active_geometry(layer: &KvLayer, num_pages_in_batch: i32) -> (i64, i32, Launch) {
-        let page_elems = layer.page_size * layer.num_kv_heads * layer.head_dim;
+    fn active_geometry(
+        page_size: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        num_pages_in_batch: i32,
+    ) -> (i64, i32, Launch) {
+        let page_elems = page_size * num_kv_heads * head_dim;
         let logical_n = i64::from(num_pages_in_batch) * i64::from(page_elems);
         let blocks = (logical_n + i64::from(BLOCK) - 1) / i64::from(BLOCK);
         (logical_n, page_elems, Launch::grid([blocks as u32, 1, 1], [BLOCK, 1, 1]))
@@ -3318,92 +3763,141 @@ pub mod kv_paged {
     /// `attn::dequant_kv_cache_layer_to_bf16_active` — dequantise the pages
     ///
     /// As [`dequant_fp8_per_tensor_pages_active`].
+    ///
+    /// A native-bf16 layer is `Ok(())` HERE and `Refusal::Absent` in the
+    /// per-scheme launchers below, and the difference is which question is
+    /// being asked. This is the dispatcher: "stage the cache" over a cache
+    /// that needs no staging is done, not declined. Both callers had already
+    /// written that answer around the old `Err` -- `arms/fa2.rs`'s
+    /// `dequant_prelude` with `let _ =`, `dequant_kv_active_arm` with an
+    /// `is_native_bf16` branch -- so no caller ever wanted the decline.
+    #[kernels_macros::routine]
+    #[allow(clippy::too_many_arguments)]
     pub fn dequant_kv_cache_layer_to_bf16_active(
         ctx: &Ctx,
-        layer: &KvLayer,
-        kv_page_indices: *const u32,
-        num_pages_in_batch: i32,
+        k_pages: Env<keys::KvKeys>,
+        v_pages: Env<keys::KvValues>,
+        k_scales: Env<keys::KvKeyScales>,
+        v_scales: Env<keys::KvValueScales>,
+        // The mirrors this pass WRITES. Bound as they stand, null included:
+        // `keys::KvNativeBf16` on the same row announces the layer that has
+        // none, so a refusal here would contradict a fact the row carries.
+        k_bf16_pages: Env<keys::KvBf16Keys>,
+        v_bf16_pages: Env<keys::KvBf16Values>,
+        page_size: Env<keys::KvPageSize>,
+        num_kv_heads: Env<keys::KvNumHeads>,
+        head_dim: Env<keys::KvHeadDim>,
+        block_size: Env<keys::KvBlockSize>,
+        scheme: Env<keys::KvSchemeByte>,
+        storage_dtype: Env<keys::KvStorageDtype>,
+        is_native_bf16: Env<keys::KvNativeBf16>,
+        kv_page_indices: Env<keys::KvPageIndices>,
+        // The fire-wide page BOUND, which is what this pass covers. Not
+        // `xqa`'s `max_pages_per_seq`, a per-request maximum the same table
+        // happens to be able to approximate.
+        num_pages_in_batch: Env<keys::KvPagesInBatch>,
     ) -> Result<(), Refusal> {
-        if layer.is_native_bf16 {
-            return Err(Refusal::Absent { what: "quantised pages on a bf16 layer" });
+        if **is_native_bf16 {
+            return Ok(());
         }
-        let (logical_n, _page_elems, launch) = active_geometry(layer, num_pages_in_batch);
+        let scheme = kv_scheme(scheme_byte(**scheme));
+        let storage_dtype = kv_dtype(scheme_byte(**storage_dtype));
+        let (logical_n, _page_elems, launch) = active_geometry(
+            **page_size,
+            **num_kv_heads,
+            **head_dim,
+            **num_pages_in_batch,
+        );
 
-        match layer.scheme {
-            KvScheme::Fp8PerTensor => {
-                dequant_fp8_per_tensor_pages_active(ctx, layer, kv_page_indices, num_pages_in_batch)
-            }
+        match scheme.scheme() {
+            Some(KvScheme::Fp8PerTensor) => dequant_fp8_per_tensor_pages_active(
+                ctx,
+                **k_pages,
+                **v_pages,
+                **k_bf16_pages,
+                **v_bf16_pages,
+                **page_size,
+                **num_kv_heads,
+                **head_dim,
+                scheme,
+                storage_dtype,
+                **is_native_bf16,
+                **kv_page_indices,
+                **num_pages_in_batch,
+            ),
 
             // SAFETY, in all three arms: `call()`'s contract -- every pointer
             // bound here addresses live device memory of the extent the
             // kernel reads it as.
-            KvScheme::Fp8PerTokenHead => unsafe {
+            Some(KvScheme::Fp8PerTokenHead) => unsafe {
                 ctx.launch(
                     "attn/kv_paged.cuh",
                     "::pie::attn::dequant_fp8_per_token_head_pages_active<::pie::bf16>",
                     launch,
                     &[
-                        layer.k_pages.cast::<u8>().cast_const().arg(),
-                        layer.v_pages.cast::<u8>().cast_const().arg(),
-                        layer.k_scales.cast::<f32>().cast_const().arg(),
-                        layer.v_scales.cast::<f32>().cast_const().arg(),
-                        layer.k_bf16_pages.cast::<bf16>().arg(),
-                        layer.v_bf16_pages.cast::<bf16>().arg(),
-                        kv_page_indices.arg(),
+                        (**k_pages).cast::<u8>().cast_const().arg(),
+                        (**v_pages).cast::<u8>().cast_const().arg(),
+                        (**k_scales).cast::<f32>().cast_const().arg(),
+                        (**v_scales).cast::<f32>().cast_const().arg(),
+                        (**k_bf16_pages).cast::<bf16>().arg(),
+                        (**v_bf16_pages).cast::<bf16>().arg(),
+                        (**kv_page_indices).arg(),
                         logical_n.arg(),
-                        layer.page_size.arg(),
-                        layer.num_kv_heads.arg(),
-                        layer.head_dim.arg(),
+                        page_size.arg(),
+                        num_kv_heads.arg(),
+                        head_dim.arg(),
                     ],
                 )
             },
 
-            KvScheme::Int8PerTokenHead => unsafe {
+            Some(KvScheme::Int8PerTokenHead) => unsafe {
                 ctx.launch(
                     "attn/kv_paged.cuh",
                     "::pie::attn::dequant_int8_per_token_head_pages_active<::pie::bf16>",
                     launch,
                     &[
-                        layer.k_pages.cast::<i8>().cast_const().arg(),
-                        layer.v_pages.cast::<i8>().cast_const().arg(),
-                        layer.k_scales.cast::<f32>().cast_const().arg(),
-                        layer.v_scales.cast::<f32>().cast_const().arg(),
-                        layer.k_bf16_pages.cast::<bf16>().arg(),
-                        layer.v_bf16_pages.cast::<bf16>().arg(),
-                        kv_page_indices.arg(),
+                        (**k_pages).cast::<i8>().cast_const().arg(),
+                        (**v_pages).cast::<i8>().cast_const().arg(),
+                        (**k_scales).cast::<f32>().cast_const().arg(),
+                        (**v_scales).cast::<f32>().cast_const().arg(),
+                        (**k_bf16_pages).cast::<bf16>().arg(),
+                        (**v_bf16_pages).cast::<bf16>().arg(),
+                        (**kv_page_indices).arg(),
                         logical_n.arg(),
-                        layer.page_size.arg(),
-                        layer.num_kv_heads.arg(),
-                        layer.head_dim.arg(),
+                        page_size.arg(),
+                        num_kv_heads.arg(),
+                        head_dim.arg(),
                     ],
                 )
             },
 
-            KvScheme::Fp4Block => unsafe {
+            Some(KvScheme::Fp4Block) => unsafe {
                 ctx.launch(
                     "attn/kv_paged.cuh",
                     "::pie::attn::dequant_fp4_pages_active<::pie::bf16>",
                     launch,
                     &[
-                        layer.k_pages.cast::<u8>().cast_const().arg(),
-                        layer.v_pages.cast::<u8>().cast_const().arg(),
-                        layer.k_scales.cast::<f32>().cast_const().arg(),
-                        layer.v_scales.cast::<f32>().cast_const().arg(),
-                        layer.k_bf16_pages.cast::<bf16>().arg(),
-                        layer.v_bf16_pages.cast::<bf16>().arg(),
-                        kv_page_indices.arg(),
+                        (**k_pages).cast::<u8>().cast_const().arg(),
+                        (**v_pages).cast::<u8>().cast_const().arg(),
+                        (**k_scales).cast::<f32>().cast_const().arg(),
+                        (**v_scales).cast::<f32>().cast_const().arg(),
+                        (**k_bf16_pages).cast::<bf16>().arg(),
+                        (**v_bf16_pages).cast::<bf16>().arg(),
+                        (**kv_page_indices).arg(),
                         logical_n.arg(),
-                        layer.page_size.arg(),
-                        layer.num_kv_heads.arg(),
-                        layer.head_dim.arg(),
-                        fp4_block_size(layer).arg(),
+                        page_size.arg(),
+                        num_kv_heads.arg(),
+                        head_dim.arg(),
+                        fp4_block_size(**block_size).arg(),
                     ],
                 )
             },
 
-            KvScheme::Native => {
+            Some(KvScheme::Native) => {
                 Err(Refusal::Absent { what: "a quantised dequant for Native storage" })
             }
+
+            None => Err(Refusal::Absent { what: "a KV scheme this byte names" }),
         }
     }
 }
@@ -3452,14 +3946,29 @@ const fn per_head(rows: u32, heads: u32) -> Launch {
 ///
 /// What the caller must guarantee, as `call()` states it: `lse` must address
 /// `n` live, writable `f32`s.
-pub fn lse_log2_to_ln(ctx: &Ctx, lse: *mut f32, n: usize) -> Result<(), Refusal> {
-    let Ok(elems) = u32::try_from(n) else {
-        return Err(Refusal::Wide {
-            what: "lse elements",
-            at: i64::from(i32::MAX),
-            max: i64::from(i32::MAX),
-        });
+///
+/// The derived column is `[Out(0), OutElements(0)]`, and **this row is
+/// crossed**: `arms/attn.rs`'s row names `table::derived_arm`.
+///
+/// `n: usize` against an `operand()` that mints `ArgValue::I32` is not a
+/// mismatch a signature has to fix: a `Source` says WHICH FACT, not how wide.
+/// `operands` runs `as_declared` over each value with this launcher's own
+/// `Routine::args` in hand (`bind/table.rs:1062`), converting the `I32` to a
+/// `Usize` and refusing rather than wrapping where that would lose
+/// information.
+#[kernels_macros::routine]
+pub fn lse_log2_to_ln(
+    ctx: &Ctx,
+    lse: Out<0, f32>,
+) -> Result<(), Refusal> {
+    // `Region::elements()` IS this product, and it is safe there for the
+    // reason it was guarded here: a view cannot have a zero width, so the
+    // multiply cannot collapse an unstated pitch into a stated zero.
+    let elems = lse.all("out_width(0)")?.elements();
+    let Ok(elems) = u32::try_from(elems) else {
+        return Err(Refusal::Empty { what: "lse elements" });
     };
+    let n = elems as usize;
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
     unsafe {
@@ -3467,7 +3976,7 @@ pub fn lse_log2_to_ln(ctx: &Ctx, lse: *mut f32, n: usize) -> Result<(), Refusal>
             "attn/attn_sink.cuh",
             "::pie::attn::lse_log2_to_ln<::pie::attn::f32>",
             elementwise(elems),
-            &[lse.arg(), n.arg()],
+            &[lse.ptr.arg(), n.arg()],
         )
     }
 }
@@ -3478,17 +3987,33 @@ pub fn lse_log2_to_ln(ctx: &Ctx, lse: *mut f32, n: usize) -> Result<(), Refusal>
 /// num_q_heads * head_dim` live, writable bf16 elements; `lse` addresses `n *
 /// num_q_heads` live `f32`s; `sinks` addresses `num_q_heads` live bf16
 /// elements.
+///
+/// The derived column is `[Out(0), In(0), Weight(0), Rows, NumQHeads,
+/// HeadDim]`, `alias()` shifts the `In(0)` to `In(1)` past the in-place pair,
+/// and every entry resolves. **This row is crossed**: the column reads, in
+/// order, `arg_out(0)`, `arg_in(1)`, `weight(0)`, `rows().count`,
+/// `num_q_heads()`, `head_dim()` -- which is what the deleted
+/// `attention_sink_rescale_arm` did, argument for argument.
+///
+/// The shift is the part worth stating, because it is the only thing here
+/// that is not a transcription. The row declares `in_place = &[(0, 0)]`, the
+/// column names ONE `In(_)` and the statement has two inputs, so `operands`
+/// finds `named < o.ins.len()` and applies `alias()` -- which is exactly the
+/// condition that guard was added for. Were the column ever to gain a second
+/// `In(_)`, the shift would stop and this binding would silently change; the
+/// `lse` parameter below says so at the parameter.
+#[kernels_macros::routine]
 pub fn attention_sink_rescale<T>(
     ctx: &Ctx,
-    o: *mut T,
-    lse: *const f32,
-    sinks: *const T,
-    n: i32,
-    num_q_heads: i32,
-    head_dim: i32,
+    // `Out(0)`.
+    o: Out<0, T>,
+    lse: In<1, f32>,
+    sinks: Bank<0, T>,
+    num_q_heads: Env<keys::NumQHeads>,
+    head_dim: Env<keys::HeadDim>,
 ) -> Result<(), Refusal>
 where
-    T: Elem,
+    T: Inst + kernels::Elem,
     *const T: Abi,
     *mut T: Abi,
 {
@@ -3499,11 +4024,18 @@ where
             "attn/attn_sink.cuh",
             &format!("::pie::attn::attn_sink_rescale<{}>", T::CPP),
             per_head_elementwise(
-                n.unsigned_abs(),
+                o.rows.unsigned_abs(),
                 num_q_heads.unsigned_abs(),
                 head_dim.unsigned_abs(),
             ),
-            &[o.arg(), lse.arg(), sinks.arg(), n.arg(), num_q_heads.arg(), head_dim.arg()],
+            &[
+                o.ptr.arg(),
+                lse.ptr.arg(),
+                sinks.ptr.arg(),
+                o.rows.arg(),
+                num_q_heads.arg(),
+                head_dim.arg(),
+            ],
         )
     }
 }
@@ -3515,20 +4047,25 @@ where
 /// buffer pointers must be BASE pointers — the kernel windows them itself
 /// from `win`, so a pre-windowed pointer is windowed twice. The binder
 /// guarantees it by the `_devwin` suffix; a hand caller must not.
+#[kernels_macros::routine]
 pub fn split_qkv_bf16_devwin(
     ctx: &Ctx,
-    packed: *const bf16,
-    q_out: *mut bf16,
-    k_out: *mut bf16,
-    v_out: *mut bf16,
-    win: *const u32,
-    n_max: i32,
-    q_dim: i32,
-    kv_dim: i32,
+    packed: In<0, bf16>,
+    q_out: Out<0, bf16>,
+    k_out: Out<1, bf16>,
+    v_out: Out<2, bf16>,
+    win: Env<keys::PeelWindow>,
+    n_max: Env<keys::RowsTotal>,
 ) -> Result<(), Refusal> {
     /// `split_packed.cu:30` — `constexpr int BLOCK = 256;`.
     pub const SPLIT_BLOCK: u32 = 256;
 
+    // Both are EXTENTS the kernel loops to (`split_packed.cuh:122`, `:126`)
+    // before it strides by them, so both are widths; the packed row's pitch
+    // -- `q_dim + 2 * kv_dim` at `:120` -- is the SOURCE's and belongs to no
+    // one operand, which is why it is still computed on the device.
+    let (q_dim, kv_dim) =
+        (q_out.all("out_width(0)")?.width, k_out.all("out_width(1)")?.width);
     let max_dim = if q_dim > kv_dim { q_dim } else { kv_dim };
     let xblocks = max_dim.unsigned_abs().div_ceil(SPLIT_BLOCK);
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
@@ -3537,12 +4074,12 @@ pub fn split_qkv_bf16_devwin(
         ctx.launch(
             "attn/split_packed.cuh",
             "::pie::attn::split_qkv_devwin<::pie::bf16>",
-            Launch::grid([xblocks.max(1), n_max.unsigned_abs(), 1], [SPLIT_BLOCK, 1, 1]),
+            Launch::grid([xblocks.max(1), (**n_max).unsigned_abs(), 1], [SPLIT_BLOCK, 1, 1]),
             &[
-                packed.arg(),
-                q_out.arg(),
-                k_out.arg(),
-                v_out.arg(),
+                packed.ptr.arg(),
+                q_out.ptr.arg(),
+                k_out.ptr.arg(),
+                v_out.ptr.arg(),
                 win.arg(),
                 q_dim.arg(),
                 kv_dim.arg(),
@@ -3555,22 +4092,41 @@ pub fn split_qkv_bf16_devwin(
 ///
 /// What the caller must guarantee, as `call()` states it: every pointer must
 /// address live device memory of the extent the kernel reads or writes.
+///
+/// A `routine!` row since the `&KvLayer` unfolded into its ten leaves. The
+/// aggregate was the only thing keeping it `driver_bound!`, since `Arg` is
+/// implemented for no host struct.
+#[kernels_macros::routine]
 pub fn attention_naive_paged(
     ctx: &Ctx,
-    layer: &crate::attn::KvLayer,
-    q: *const bf16,
-    o: *mut bf16,
-    qo_indptr: *const u32,
-    kv_page_indices: *const u32,
-    kv_page_indptr: *const u32,
-    kv_last_page_lens: *const u32,
-    total_tokens: i32,
-    num_requests: i32,
-    q_width: i32,
-    window_left: i32,
-    sm_scale: f32,
-    logits_soft_cap: f32,
-    lse_out: *mut f32,
+    k_pages: Env<keys::KvKeys>,
+    v_pages: Env<keys::KvValues>,
+    k_scales: Env<keys::KvKeyScales>,
+    v_scales: Env<keys::KvValueScales>,
+    page_size: Env<keys::KvPageSize>,
+    head_dim: Env<keys::KvHeadDim>,
+    num_kv_heads: Env<keys::KvNumHeads>,
+    scheme: Env<keys::KvSchemeByte>,
+    storage_dtype: Env<keys::KvStorageDtype>,
+    block_size: Env<keys::KvBlockSize>,
+    q: In<0, bf16>,
+    o: Out<0, bf16>,
+    // `plan.qo_indptr` = `keys::QoIndptr`. The note that stood here said
+    // *"`fact_of` has no key for `qo_indptr`, so it derives `None` unaided"*
+    // -- both halves are dead: `fact_of` is gone (the name table with it) and
+    // the key exists, so this derives `Some(Named("plan.qo_indptr"))`.
+    qo_indptr: Env<keys::QoIndptr>,
+    // WHAT OWNS THE THIRD: `Cx::plan`, the fire's page plan, same as the two
+    // above it.
+    kv_page_indices: Env<keys::KvPageIndices>,
+    kv_page_indptr: Env<keys::KvPageIndptr>,
+    kv_last_page_lens: Env<keys::KvLastPageLens>,
+    num_requests: Env<keys::RequestCount>,
+    window_left: Env<keys::WindowLeft>,
+    // `cx.sm_scale()`, and `keys::SmScale` is the word for it.
+    sm_scale: Env<keys::SmScale>,
+    logits_soft_cap: Env<keys::AttnLogitsSoftCap>,
+    lse_out: Env<keys::AttnLseOut>,
 ) -> Result<(), Refusal> {
     /// `attention_naive_paged.cuh:223` — `constexpr int kMaxHeadDim = 1024`.
     pub const PAGED_MAX_HEAD_DIM: i32 = 1024;
@@ -3578,15 +4134,16 @@ pub fn attention_naive_paged(
     /// `attention_naive_paged.cuh:33` — `constexpr int BLOCK = 128`.
     pub const PAGED_BLOCK: u32 = 128;
 
-    if layer.head_dim > PAGED_MAX_HEAD_DIM {
+    if **head_dim > PAGED_MAX_HEAD_DIM {
         return Err(Refusal::Wide {
             what: "head_dim",
-            at: i64::from(layer.head_dim),
+            at: i64::from(**head_dim),
             max: i64::from(PAGED_MAX_HEAD_DIM),
         });
     }
-    let num_q_heads = q_width / layer.head_dim;
-    let smem = (layer.head_dim.unsigned_abs() + PAGED_BLOCK) * 4;
+    let src = q.all("in_width(0)")?;
+    let num_q_heads = src.width.checked_div(**head_dim).unwrap_or(0);
+    let smem = ((**head_dim).unsigned_abs() + PAGED_BLOCK) * 4;
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
     unsafe {
@@ -3596,19 +4153,19 @@ pub fn attention_naive_paged(
             Launch::grid(
                 [
                     num_requests.unsigned_abs(),
-                    total_tokens.unsigned_abs(),
+                    src.rows.unsigned_abs(),
                     num_q_heads.unsigned_abs(),
                 ],
                 [PAGED_BLOCK, 1, 1],
             )
             .smem(smem),
             &[
-                q.arg(),
-                layer.k_pages.cast_const().arg(),
-                layer.v_pages.cast_const().arg(),
-                layer.k_scales.cast::<f32>().cast_const().arg(),
-                layer.v_scales.cast::<f32>().cast_const().arg(),
-                o.arg(),
+                q.ptr.arg(),
+                (**k_pages).cast_const().arg(),
+                (**v_pages).cast_const().arg(),
+                (*k_scales).cast::<f32>().cast_const().arg(),
+                (*v_scales).cast::<f32>().cast_const().arg(),
+                o.ptr.arg(),
                 qo_indptr.arg(),
                 kv_page_indices.arg(),
                 kv_page_indptr.arg(),
@@ -3616,12 +4173,12 @@ pub fn attention_naive_paged(
                 core::ptr::null::<u8>().arg(),
                 core::ptr::null::<i32>().arg(),
                 num_q_heads.arg(),
-                layer.num_kv_heads.arg(),
-                layer.head_dim.arg(),
-                layer.page_size.arg(),
-                kv_scheme::of(layer.scheme).arg(),
-                kv_dtype::of(layer.storage_dtype).arg(),
-                layer.block_size.arg(),
+                num_kv_heads.arg(),
+                head_dim.arg(),
+                page_size.arg(),
+                kv_scheme(scheme_byte(**scheme)).arg(),
+                kv_dtype(scheme_byte(**storage_dtype)).arg(),
+                block_size.arg(),
                 window_left.arg(),
                 sm_scale.arg(),
                 logits_soft_cap.arg(),
@@ -3636,40 +4193,50 @@ pub fn attention_naive_paged(
 /// What the caller must guarantee, as `call()` states it: `prefix` and `out`
 /// address `t * h` live bf16 elements, `blocks` addresses `t * b * h`, and
 /// `norm_weight` and `proj_weight` address `h` each, `out` writable.
+///
+/// The derived column is `[In(0), In(1), In(2), In(3), Out(0), RmsEps]`. The
+/// two weights are `arg_in(2)` and `arg_in(3)` here and NOT `weight(n)`, which
+/// is why they take a positional `In` and not a `Weight` mark.
+#[kernels_macros::routine]
 pub fn attn_res_blend<T>(
     ctx: &Ctx,
-    prefix: *const T,
-    blocks: *const T,
-    norm_weight: *const T,
-    proj_weight: *const T,
-    out: *mut T,
-    t: i32,
-    b: i32,
-    h: i32,
-    block_rows: i32,
-    eps: f32,
+    prefix: In<0, T>,
+    blocks: In<1, T>,
+    norm_weight: In<2, T>,
+    proj_weight: In<3, T>,
+    out: Out<0, T>,
+    // # AND NOW THE DIVISION IS HERE, WHICH IS THE THIRD PLACE IT HAS LIVED
+    eps: Env<keys::RmsEps>,
 ) -> Result<(), Refusal>
 where
-    T: Elem,
+    T: Inst + kernels::Elem,
     *const T: Abi,
     *mut T: Abi,
 {
+    let dst = out.all("out_width(0)")?;
+    let h = dst.width;
+    // AND THE REGION'S OWN STRIDE IS NOT `blocks`' PITCH. `attn_res.cuh:114`
+    // addresses it `(j * block_rows + t) * H` -- BLOCK-major -- so the
+    // view's `b * h` row is a flattening of a plane the kernel walks in two
+    // steps, and only the quotient `b` is a fact about it. `h > 0` here
+    // because `dst` was built, which is what makes the divide legal.
+    let b = blocks.all("in_width(1)")?.width / h;
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
     unsafe {
         ctx.launch(
             "attn/attn_res.cuh",
             &format!("::pie::attn::attn_res_blend<{}>", T::CPP),
-            Launch::per_row(t.unsigned_abs(), BLOCK),
+            Launch::per_row(dst.rows.unsigned_abs(), BLOCK),
             &[
-                prefix.arg(),
-                blocks.arg(),
-                norm_weight.arg(),
-                proj_weight.arg(),
-                out.arg(),
+                prefix.ptr.arg(),
+                blocks.ptr.arg(),
+                norm_weight.ptr.arg(),
+                proj_weight.ptr.arg(),
+                out.ptr.arg(),
                 b.arg(),
                 h.arg(),
-                block_rows.arg(),
+                dst.rows.arg(),
                 eps.arg(),
             ],
         )
@@ -3681,21 +4248,21 @@ where
 /// What the caller must guarantee, as `call()` states it: `packed` addresses
 /// `num_tokens * num_heads * head_dim` live bf16 elements and `padded`
 /// addresses `num_tokens * num_heads * head_dim_padded` writable ones.
+#[kernels_macros::routine]
 pub fn pad_head_dim<T>(
     ctx: &Ctx,
-    packed: *const T,
-    padded: *mut T,
-    num_tokens: i32,
-    num_heads: i32,
-    head_dim: i32,
-    head_dim_padded: i32,
+    packed: In<0, T>,
+    padded: Out<0, T>,
+    head_dim: Env<keys::HeadDim>,
 ) -> Result<(), Refusal>
 where
-    T: Elem,
+    T: Inst + kernels::Elem,
     *const T: Abi,
     *mut T: Abi,
 {
-    if let Some(why) = head_dim_refusal(num_tokens, num_heads, head_dim, head_dim_padded) {
+    let num_heads = packed.width.checked_div(**head_dim).unwrap_or(0);
+    let head_dim_padded = padded.width.checked_div(num_heads).unwrap_or(0);
+    if let Some(why) = head_dim_refusal(packed.rows, num_heads, **head_dim, head_dim_padded) {
         return Err(why);
     }
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
@@ -3704,8 +4271,14 @@ where
         ctx.launch(
             "attn/head_dim_pad.cuh",
             &format!("::pie::attn::pad_head_dim<{}>", T::CPP),
-            per_head(num_tokens.unsigned_abs(), num_heads.unsigned_abs()),
-            &[packed.arg(), padded.arg(), num_heads.arg(), head_dim.arg(), head_dim_padded.arg()],
+            per_head(packed.rows.unsigned_abs(), num_heads.unsigned_abs()),
+            &[
+                packed.ptr.arg(),
+                padded.ptr.arg(),
+                num_heads.arg(),
+                head_dim.arg(),
+                head_dim_padded.arg(),
+            ],
         )
     }
 }
@@ -3715,21 +4288,24 @@ where
 /// What the caller must guarantee, as `call()` states it: `padded` addresses
 /// `num_tokens * num_heads * head_dim_padded` live bf16 elements and `packed`
 /// addresses `num_tokens * num_heads * head_dim` writable ones.
+#[kernels_macros::routine]
 pub fn strip_head_dim<T>(
     ctx: &Ctx,
-    padded: *const T,
-    packed: *mut T,
-    num_tokens: i32,
-    num_heads: i32,
-    head_dim: i32,
-    head_dim_padded: i32,
+    padded: In<0, T>,
+    packed: Out<0, T>,
+    // Now `packed.width.checked_div(head_dim)`, in the body, for the reasons
+    // written out at `pad_head_dim`'s.
+    head_dim: Env<keys::HeadDim>,
+    // Now `padded.width.checked_div(num_heads)`.
 ) -> Result<(), Refusal>
 where
-    T: Elem,
+    T: Inst + kernels::Elem,
     *const T: Abi,
     *mut T: Abi,
 {
-    if let Some(why) = head_dim_refusal(num_tokens, num_heads, head_dim, head_dim_padded) {
+    let num_heads = packed.width.checked_div(**head_dim).unwrap_or(0);
+    let head_dim_padded = padded.width.checked_div(num_heads).unwrap_or(0);
+    if let Some(why) = head_dim_refusal(padded.rows, num_heads, **head_dim, head_dim_padded) {
         return Err(why);
     }
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
@@ -3738,13 +4314,87 @@ where
         ctx.launch(
             "attn/head_dim_pad.cuh",
             &format!("::pie::attn::strip_head_dim<{}>", T::CPP),
-            per_head(num_tokens.unsigned_abs(), num_heads.unsigned_abs()),
-            &[padded.arg(), packed.arg(), num_heads.arg(), head_dim.arg(), head_dim_padded.arg()],
+            per_head(padded.rows.unsigned_abs(), num_heads.unsigned_abs()),
+            &[
+                padded.ptr.arg(),
+                packed.ptr.arg(),
+                num_heads.arg(),
+                head_dim.arg(),
+                head_dim_padded.arg(),
+            ],
         )
     }
 }
 
+// ── WHERE `width_of` WENT ──────────────────────────────────────────────
+//
+// A private `fn width_of(width, what) -> Result<i32, Refusal>` stood here and
+// fifteen calls at twelve sites in this file went through it. It is now
+// [`kernels::routine::In::all`] / [`Out::all`], which makes the same `width
+// <= 0` test at the point a VIEW is built rather than at each reader
+// (`kernels/src/routine.rs` -- "THE VIEW API").
+//
+// The reason it existed is unchanged and worth keeping where the sites are: a
+// region's width is minted `out_width(n).unwrap_or(0)`
+// (`bind/table.rs:1233`) and deliberately does not refuse -- the region is an
+// operand, and an operand's shape is reported, not vetted. So a missing width
+// arrives as a ZERO, and a zero head dim launches a kernel that strides
+// nothing rather than declining to launch.
+//
+// `ctx.launch` catches only the subset that reaches a grid extent
+// (`jit/ctx.rs`'s `Refusal::Empty { what: "the grid" }`), which is the
+// wrong word in the wrong place: it names the grid for a fault in an operand,
+// and it does not fire at all where the width is only an ARGUMENT or where a
+// `.max(1)` stands between it and the grid (`dsv4_compress::route_rows` is
+// exactly that). `all()` takes the caller's word instead of inventing one, so
+// every site below still refuses in `width()`'s own -- `"out_width(0)"`,
+// `"in_width(1)"` -- and the messages did not merge.
+//
+// TWO LAUNCHERS STILL BUILD NO VIEW, and that is the paragraph on
+// [`head_dim_refusal`]: `pad_head_dim` and `strip_head_dim` never called
+// `width_of` either, because their width assertions survive transitively
+// through that guard in ITS words. Routing them through `all()` would be a
+// different refusal for the same fire.
+
 /// The four preconditions both head-dim launchers share, resolved BEFORE
+///
+/// # ITS PREMISE WAS RE-CHECKED UNDER `unwrap_or(0)` INPUTS AND IT HOLDS
+///
+/// This is the only guard in the family kept on the strength of text written
+/// against the OLD signature, so it is the only one that had to be re-derived
+/// rather than trusted. An existing guard is evidence about what the previous
+/// signature owed, not about what this one does.
+///
+/// The two launchers deleted `Div(&InWidth(0), &HeadDim)` and
+/// `Div(&OutWidth(0), &Div(..))` (`pad_head_dim`; `strip_head_dim` has the
+/// two indices the other way round, `padded` being its `In<0>` and `packed`
+/// its `Out<0>`). `operand()` walks a `Div`'s children through itself with
+/// `?`, so BOTH marks asserted `in_width(0) > 0` AND `out_width(0) > 0`.
+/// Those two assertions are what a region drops.
+///
+/// They survive here transitively, and each step matters:
+///
+/// * `head_dim <= 0` fires first, so `head_dim > 0` holds below it.
+/// * `num_heads` is `packed.width.checked_div(head_dim)`. A zero `packed`
+///   width makes it zero, and `num_heads <= 0` refuses. So the packed-side
+///   width assertion survives.
+/// * `head_dim_padded` is `padded.width.checked_div(num_heads)`, and
+///   `num_heads > 0` by the line above. A zero `padded` width makes it zero,
+///   and `0 < head_dim` -- head_dim being positive -- refuses `Narrow`. So
+///   the padded-side width assertion survives too.
+///
+/// Nothing here is a sum, a `.max`, or an `.unwrap_or` that a zero can walk
+/// through: each check is `<= 0` or `<` against a value already proved
+/// positive. That is why these two launchers build no view and the other
+/// eleven bodies do. Only the WORD differs from what `width()` would have
+/// said, and the note on `pad_head_dim`'s first `Div` already trades that
+/// away in `bind/table.rs:1370`'s terms.
+///
+/// SO THE FOUR `.width` READS IN THE TWO LAUNCHERS ABOVE STAY BARE, and they
+/// are the only reads of a WRAPPER's width field left in this file.
+/// `packed.all(..)` would refuse `Absent { what: .. }` where this refuses
+/// `Empty { what: "num_heads" }` for the same fire -- a re-wording of a live
+/// refusal, which is a change no `cargo check` sees.
 #[must_use]
 fn head_dim_refusal(
     num_tokens: i32,
@@ -3767,6 +4417,33 @@ fn head_dim_refusal(
     None
 }
 
+/// `Source::Slot(Kind::OutElements, 0)` over a region, for the two softcap launchers.
+///
+/// `bind/table.rs:1296` mints that variant as
+/// `f.rows.count.saturating_mul(out_width(n))`, and a region's two fields are
+/// those two factors read from the same places (`bind/table.rs:1233`) --
+/// which is exactly [`kernels::routine::Region::elements`], so the product is
+/// no longer written here at all. The `usize` is what `softcap.cuh` declares
+/// and what the launch list pushes.
+///
+/// Written once because BOTH softcap launchers need it and the f16 one has no
+/// arm to have inherited it from -- see the note on its `x`.
+///
+/// The view is built first, for `lse_log2_to_ln`'s reason and with its
+/// correction: `OutElements(n)` maps over `o.out_width(n)`, which is
+/// `width()` (`bind/table.rs:612`, `:640-643`), so the variant ASSERTED
+/// `out_width(0) > 0` and not merely that a width was present. A region's
+/// `unwrap_or(0)` drops that assertion whole. The zero would still be refused
+/// downstream -- as an empty grid, about the grid -- and `all()` refuses it
+/// here, about the width, in `width()`'s word. That ordering is also what
+/// makes `elements()` safe: it multiplies a width a view has already proved
+/// non-zero, so it cannot fold an unstated pitch into a stated zero.
+fn softcap_elems<T: kernels::Elem>(x: &Out<0, T>) -> Result<usize, Refusal> {
+    let elems = x.all("out_width(0)")?.elements();
+    usize::try_from(elems)
+        .map_err(|_| Refusal::Narrow { what: "logit elements", at: i64::from(elems) })
+}
+
 /// The guard `attn_softcap.cu`'s launcher opened with, as a refusal.
 fn softcap_launch(cap: f32, n: usize) -> Result<Launch, Refusal> {
     if cap.is_nan() || cap <= 0.0 {
@@ -3786,11 +4463,18 @@ fn softcap_launch(cap: f32, n: usize) -> Result<Launch, Refusal> {
 ///
 /// What the caller must guarantee, as `call()` states it: `x` must address
 /// `n` live, writable `bf16`s.
-pub fn logit_softcap<T>(ctx: &Ctx, x: *mut T, cap: f32, n: usize) -> Result<(), Refusal>
+#[kernels_macros::routine]
+pub fn logit_softcap<T>(
+    ctx: &Ctx,
+    x: Out<0, T>,
+    cap: Env<keys::FinalLogitSoftcap>,
+) -> Result<(), Refusal>
 where
-    T: Elem,
+    T: Inst + kernels::Elem,
     *mut T: Abi,
 {
+    let cap = **cap;
+    let n = softcap_elems(&x)?;
     let launch = softcap_launch(cap, n)?;
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
@@ -3799,7 +4483,7 @@ where
             "attn/softcap.cuh",
             &format!("::pie::attn::logit_softcap<{}>", T::CPP),
             launch,
-            &[x.arg(), cap.arg(), n.arg()],
+            &[x.ptr.arg(), cap.arg(), n.arg()],
         )
     }
 }
@@ -3807,7 +4491,18 @@ where
 /// `attn::logit_softcap_f16` — the same cap over an fp16 buffer.
 ///
 /// [`logit_softcap`]'s obligation, with `f16` for `bf16`.
-pub fn logit_softcap_f16(ctx: &Ctx, x: *mut f16, cap: f32, n: usize) -> Result<(), Refusal> {
+///
+/// **No `Bound` row names this symbol.** The column below is derived from the
+/// signature and from [`logit_softcap`]'s arm, which is the same launch over
+/// a different element type; nothing else was assumed.
+#[kernels_macros::routine]
+pub fn logit_softcap_f16(
+    ctx: &Ctx,
+    x: Out<0, f16>,
+    cap: Env<keys::FinalLogitSoftcap>,
+) -> Result<(), Refusal> {
+    let cap = **cap;
+    let n = softcap_elems(&x)?;
     let launch = softcap_launch(cap, n)?;
     // SAFETY: as [`logit_softcap`]'s.
     unsafe {
@@ -3815,33 +4510,36 @@ pub fn logit_softcap_f16(ctx: &Ctx, x: *mut f16, cap: f32, n: usize) -> Result<(
             "attn/softcap.cuh",
             "::pie::attn::logit_softcap<::pie::f16>",
             launch,
-            &[x.arg(), cap.arg(), n.arg()],
+            &[x.ptr.arg(), cap.arg(), n.arg()],
         )
     }
 }
 
 /// `attn::kimi_split_q_b_bf16` — split a fused query projection into its
+#[kernels_macros::routine]
 pub fn kimi_split_q_b<T>(
     ctx: &Ctx,
-    q_b: *const T,
-    q_nope: *mut T,
-    q_pe: *mut T,
-    tokens: i32,
-    heads: i32,
-    nope: i32,
-    rope: i32,
+    q_b: In<0, T>,
+    q_nope: Out<0, T>,
+    q_pe: Out<1, T>,
+    // The split sizes are statement params, not model facts: the wrapper
+    // states the exact `Kind::Param` slots the old arm read with
+    // `cx.param(0..=2)`, and must not consume an input or output counter.
+    heads: Param<0, i32>,
+    nope: Param<1, i32>,
+    rope: Param<2, i32>,
 ) -> Result<(), Refusal>
 where
-    T: Elem,
+    T: Inst + kernels::Elem,
     *const T: Abi,
     *mut T: Abi,
 {
-    let width = i64::from(heads) * (i64::from(nope) + i64::from(rope));
-    let total = i64::from(tokens) * width;
+    let width = i64::from(*heads) * (i64::from(*nope) + i64::from(*rope));
+    let total = i64::from(q_b.rows) * width;
     if total > i64::from(i32::MAX) {
         return Err(Refusal::Wide {
             what: "rows",
-            at: i64::from(tokens),
+            at: i64::from(q_b.rows),
             max: i64::from(i32::try_from(i64::from(i32::MAX) / width).unwrap_or(i32::MAX)),
         });
     }
@@ -3854,9 +4552,9 @@ where
             &format!("::pie::attn::split_q_b<{}>", T::CPP),
             elementwise(total.unsigned_abs()),
             &[
-                q_b.arg(),
-                q_nope.arg(),
-                q_pe.arg(),
+                q_b.ptr.arg(),
+                q_nope.ptr.arg(),
+                q_pe.ptr.arg(),
                 total.arg(),
                 heads.arg(),
                 nope.arg(),
@@ -3867,20 +4565,22 @@ where
 }
 
 /// `attn::kimi_split_kv_a_norm_bf16` — split `kv_a`, RMS-normalise the latent
+///
+/// The derived column is `[In(0), Weight(0), Out(0), Out(1), RmsEps]`, every
+/// entry resolving, and the row is crossed.
+#[kernels_macros::routine]
 pub fn kimi_split_kv_a_norm<T>(
     ctx: &Ctx,
-    kv_a: *const T,
-    norm_weight: *const T,
-    kv_c: *mut T,
-    k_pe: *mut T,
-    tokens: i32,
-    kv_lora: i32,
-    rope: i32,
-    src_row_stride: i32,
-    eps: f32,
+    kv_a: In<0, T>,
+    norm_weight: Bank<0, T>,
+    kv_c: Out<0, T>,
+    k_pe: Out<1, T>,
+    // The guard below therefore compares the same three numbers it always
+    // did, and refuses in the same word.
+    eps: Env<keys::RmsEps>,
 ) -> Result<(), Refusal>
 where
-    T: Elem,
+    T: Inst + kernels::Elem,
     *const T: Abi,
     *mut T: Abi,
 {
@@ -3890,8 +4590,23 @@ where
     Launch::per_row(rows, BLOCK).smem((BLOCK / 32) * 4)
     }
 
-    if src_row_stride < kv_lora + rope {
-        return Err(Refusal::Narrow { what: "src_row_stride", at: i64::from(src_row_stride) });
+    // THE ONE SITE IN THIS FAMILY WHERE A WIDTH WAS ALREADY CALLED A PITCH.
+    // `kimi_mla.cuh:110` addresses `kv_a + n * src_row_stride` and never
+    // loops to it -- `kv_lora` and `rope` are the extents -- so this is the
+    // ALLOCATION's number and `Stride` is what says so. It was `kv_a`'s own
+    // width read under an assumed packing (§3.1's "packed, ASSUMED"); a
+    // region carries the pitch as a field, so the assumption is now stated.
+    //
+    // Built in the tuple and in this order because the three refusals are
+    // ordered: a fire with two zero widths must still name `out_width(0)`.
+    let (kv_lora, rope, src) = (
+        kv_c.all("out_width(0)")?.width,
+        k_pe.all("out_width(1)")?.width,
+        kv_a.all("in_width(0)")?,
+    );
+    let src_row_stride = src.stride;
+    if *src_row_stride < kv_lora + rope {
+        return Err(Refusal::Narrow { what: "src_row_stride", at: i64::from(*src_row_stride) });
     }
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
@@ -3899,15 +4614,15 @@ where
         ctx.launch(
             "attn/kimi_mla.cuh",
             &format!("::pie::attn::split_kv_a_norm<{}, 256>", T::CPP),
-            rms(tokens.unsigned_abs()),
+            rms(src.rows.unsigned_abs()),
             &[
-                kv_a.arg(),
-                norm_weight.arg(),
-                kv_c.arg(),
-                k_pe.arg(),
+                kv_a.ptr.arg(),
+                norm_weight.ptr.arg(),
+                kv_c.ptr.arg(),
+                k_pe.ptr.arg(),
                 kv_lora.arg(),
                 rope.arg(),
-                src_row_stride.arg(),
+                src_row_stride.0.arg(),
                 eps.arg(),
             ],
         )
@@ -3917,21 +4632,24 @@ where
 /// `attn::combine_attn_outputs_bf16` — merge two attention halves and their
 ///
 /// What the caller must guarantee, as `call()` states it: every pointer must
-/// address the extents these three numbers describe.
+/// address the extents these regions and two params describe. `num_heads` and
+/// `head_dim` are NOT `keys::NumQHeads`/`keys::HeadDim`; they are the
+/// statement's param slots 0 and 1, made explicit so the derived column can
+/// bind the same scalars the driver arm used to read.
+#[kernels_macros::routine]
 pub fn combine_attn_outputs<T>(
     ctx: &Ctx,
-    o1: *const T,
-    lse1: *const f32,
-    o2: *const T,
-    lse2: *const f32,
-    o_out: *mut T,
-    lse_out: *mut f32,
-    n: i32,
-    num_heads: i32,
-    head_dim: i32,
+    o1: In<0, T>,
+    lse1: In<1, f32>,
+    o2: In<2, T>,
+    lse2: In<3, f32>,
+    o_out: Out<0, T>,
+    lse_out: Out<1, f32>,
+    num_heads: Param<0, i32>,
+    head_dim: Param<1, i32>,
 ) -> Result<(), Refusal>
 where
-    T: Elem,
+    T: Inst + kernels::Elem,
     *const T: Abi,
     *mut T: Abi,
 {
@@ -3965,28 +4683,24 @@ where
         ctx.launch(
             "attn/dsv4_compress.cuh",
             &format!("::pie::attn::combine_attn_outputs<{}>", T::CPP),
-            combine_attn(n.unsigned_abs(), num_heads.unsigned_abs(), head_dim.unsigned_abs()),
+            combine_attn(
+                o_out.rows.unsigned_abs(),
+                num_heads.unsigned_abs(),
+                head_dim.unsigned_abs(),
+            ),
             &[
-                o1.arg(),
-                lse1.arg(),
-                o2.arg(),
-                lse2.arg(),
-                o_out.arg(),
-                lse_out.arg(),
+                o1.ptr.arg(),
+                lse1.ptr.arg(),
+                o2.ptr.arg(),
+                lse2.ptr.arg(),
+                o_out.ptr.arg(),
+                lse_out.ptr.arg(),
                 num_heads.arg(),
                 head_dim.arg(),
             ],
         )
     }
 }
-
-// MLA'S ABSORB PAIR IS `x::gemm::absorb` — `mla_absorb_q_to_latent_bf16` and
-// `mla_absorb_latent_to_v_bf16`, with the `cublasGemmStridedBatchedEx` helper
-// and its two pinned constants. They sat here because their CALLER is MLA's
-// attention lane; they are `gemm`'s because a routine's symbol is its
-// family's namespace plus its name, a trace states them as `gemm::`, and no
-// `Family` resolved them while an `attn` module owned the host program. That
-// file's header is the whole argument.
 
 /// This family's routines, and what a trace may say about each.
 ///
@@ -3995,233 +4709,149 @@ where
 /// whether a statement consumes its whole operand, and which operands must be
 /// given the same address.
 ///
-/// **The layer-view host programs are DECLARED and are not `routine!`s**, and
-/// ONE reason covers every one of them: `write_kv_to_pages`, the two
-/// explicit-slot appends, `dequant_kv_cache_layer_to_bf16_active` and
-/// `attention_naive_paged` take a `&KvLayer`, and `mla_prepare_bf16` and
-/// `write_mla_to_pages` take an `MlaLayer`. Those are host aggregates rather
-/// than kernel arguments — a layer view is five to eighteen operands the fire
-/// resolves together — and `Arg` is implemented for no such type, so a
-/// `routine!` naming one does not compile. `driver_bound!` declares them off
-/// the same `fn`s with `args` left empty, which is the honest column: how a
-/// trace states a layer view is still an open question, and a declaration is
-/// not an answer to it.
+/// **Two layer-view host programs are DECLARED and are not `routine!`s.**
+/// `mla_prepare_bf16` and `write_mla_to_pages` take an `MlaLayer`. That is a
+/// host aggregate rather than a kernel argument and `Arg` is implemented for
+/// no such type, so a `routine!` naming one does not compile.
 ///
-/// **Three more of the paged-KV host programs are absent, and all three are
-/// inner arms rather than symbols.** `write_kv_to_pages_bf16` and
-/// `write_kv_to_pages_quantised` are what `write_kv_to_pages` chooses between
-/// on `KvLayer::is_native_bf16`, and `dequant_fp8_per_tensor_pages_active` is
-/// one scheme of the dequantiser's `match`. No trace names any of the three,
-/// because the choice is a property of the layer and not of the statement.
+/// **It was four, and no `KvLayer` is left.** `attention_naive_paged` read ten
+/// fields through the view and takes the ten as parameters now, at arity 21;
+/// `dequant_kv_cache_layer_to_bf16_active` read thirteen and takes fifteen
+/// leaves. Both left `driver_bound!` for `routine!` in the same move. That is
+/// the general shape: a `driver_bound!` row is held by an aggregate, and an
+/// aggregate whose leaves are each expressible unfolds. The ceiling is 36, so
+/// the arity was never what stood in the way -- the missing WORDS were, and
+/// `keys::KvBf16Keys`/`KvBf16Values`/`KvPagesInBatch` were the last three.
 ///
-/// **Three of the four score-capture launches are absent for a different
-/// reason, and it is not a gap.** [`attention_score_post`]'s three are fired
-/// by `driver-cuda`'s `fire::attn_score`, at the point on the fire's stream
-/// where the C++ capture dispatch used to issue them, and were never
-/// statements at all — a `routine!` for one would put a row in
-/// `crate::sigs()` that nothing could lower to. The fold is the exception and
-/// is declared below: `dsl::cuda::attn_score_fold_heads` states the CONTRACT
-/// symbol `attn::attn_score_fold_heads`, which is a different symbol from the
-/// device one this file's `_dev` suffix marks, so that row IS lowerable and
-/// had been carried by hand in `not_yet_crossed.rs` until this table could
-/// derive it.
+/// **Absent on purpose, so nobody goes looking for the gap:**
 ///
-/// **MLA's two DISPATCH arms are absent, and the symbol they answer is not.**
-/// [`mla_fa2::fire`] and [`mla_naive::fire`] are ARMS rather than symbols, in
-/// the sense `write_kv_to_pages_bf16` and `write_kv_to_pages_quantised` are:
-/// no trace names either, because which one runs is a property of the device
-/// and not of the statement. What a trace names is
-/// `attn::dispatch_attention_mla_bf16`, and that is
-/// [`dispatch_attention_mla_bf16`] — the `fn` that chooses — declared below.
+/// * `dequant_fp8_per_tensor_pages_active` is one arm of the dequantiser's
+///   `match`, and the fp8 kind is a property of the layer, not the statement.
+///   It takes leaves rather than the view for the same reason its caller does:
+///   there is no aggregate left to forward.
+/// * Three of [`attention_score_post`]'s four launches are fired by
+///   `driver-cuda`'s `fire::attn_score` on the fire's own stream and were
+///   never statements; a `routine!` for one would put a row in `crate::sigs()`
+///   that nothing could lower to. The fold is the exception, and is declared
+///   below because `dsl::cuda::attn_score_fold_heads` states the CONTRACT
+///   symbol, which is a different symbol from the `_dev` device one.
+/// * [`mla_fa2::fire`] and [`mla_naive::fire`] are ARMS, not symbols: which
+///   one runs is a property of the device. A trace names the `fn` that
+///   chooses, [`dispatch_attention_mla_bf16`], declared below.
+///
+/// # `derived =`, on every `routine!` row and no `driver_bound!` one
+///
+/// Each column reaches its row through `<FN as kernels::Derivation>::DERIVED`,
+/// the impl `#[kernels_macros::routine]` emits beside the launcher, read off
+/// that symbol's arm in
+/// `driver-cuda/src/bind/arms/attn.rs`. `driver_bound!` rows carry none:
+/// their bodies refuse every argument list, so `args: &[]` leaves the column
+/// nothing to be checked beside.
+///
+/// `qkv_decode_fused_dispatch` carries no attribute at all, and this is the
+/// one row where that is deliberate rather than pending. It is an inner LEG:
+/// one caller, [`qkv_decode_qk_norm_rope_write_kv_bf16`], which has already
+/// bound every operand through its own column. A derived column here would
+/// resolve end to end and claim a binding no statement made, and fourteen of
+/// its fifteen pointers would disagree with the caller's arm-witnessed
+/// indices -- the leg counts `rope_table` at `In(4)` where the caller states
+/// `In(1)`, because the caller's two `Bank` weights and its `positions` fact
+/// are not operands down here. Marking all fifteen `Unbound<_>` is the trap:
+/// `packed` and `rope_table` really ARE statement operands on the caller, so
+/// `Unbound` would deny an index the value genuinely has. There is no honest
+/// column for a leg; `NO_COLUMN_ON_PURPOSE` in `driver-cuda` is where the
+/// exemption lives.
 pub static ROUTINES: &[Routine] = &[
-    routine!(lse_log2_to_ln, in_place = &[(0, 0)]),
-    routine!(attention_sink_rescale_bf16 = attention_sink_rescale::<bf16>, in_place = &[(0, 0)]),
-    routine!(attn_res_blend_bf16 = attn_res_blend::<bf16>),
-    routine!(pad_head_dim_bf16 = pad_head_dim::<bf16>),
-    routine!(strip_head_dim_bf16 = strip_head_dim::<bf16>),
-    routine!(logit_softcap_bf16 = logit_softcap::<bf16>, in_place = &[(0, 0)]),
-    routine!(logit_softcap_f16, in_place = &[(0, 0)]),
-    routine!(kimi_split_q_b_bf16 = kimi_split_q_b::<bf16>),
-    routine!(kimi_split_kv_a_norm_bf16 = kimi_split_kv_a_norm::<bf16>),
-    routine!(combine_attn_outputs_bf16 = combine_attn_outputs::<bf16>),
-    routine!(split_qkv_bf16_devwin),
-    routine!(compact_page_csr, whole),
-    routine!(mtp_shift_hidden_bf16 = mtp_shift_hidden::<bf16>, whole),
-    routine!(mtp_update_pending_hidden_bf16 = mtp_update_pending_hidden::<bf16>, whole),
-    // THESE THREE LOST A `whole` THEY NEVER EARNED, and the loss is a
-    // restoration. All three were `whole: false` in `table/attn.rs` at
-    // `9e3936fb9^`; each acquired `whole` when its family crossed, no comment
-    // anywhere said why, and the check that would have caught it — §12c's
-    // contract-agreement twin — had died with `unit!`.
-    //
-    // The evidence is each one's own launch shape. `dsa_index_{knorm,q}_rope`
-    // are `Launch::per_row(tokens)` and `dsv4_boundary_meta_decode` is
-    // `Launch::flat(n)`; none of the three reads an R-shaped index, so a row
-    // window slices them exactly where the lowering says it may. The old
-    // table knew this and said so CONTRASTIVELY, in the note beside
-    // `dsa_index_topk_mask` two lines down: *"`whole`, and here the reason is
-    // the ALGEBRA rather than the addressing."* A topk over a mask is one
-    // answer computed from every row; a rope over the indexer's query rows is
-    // per-row by construction. `topk_mask` needed its own sentence and these
-    // did not, which is why it keeps its `whole` here.
-    //
-    // The direction matters. `false → true` can only ever REFUSE more —
-    // `model-compiler`'s `kernels.rs` turns a `whole` kernel inside a Peel
-    // region into a load-time refusal, and `lower.rs` raises
-    // `Uncovered::WholeKernelSplit` for one emitted over a row window — so
-    // the drift could not corrupt an answer and could refuse a model text
-    // that used to load. It is being corrected as a wrong claim, not as a
-    // bug: `glm_5` and `deepseek_v4` state all four, and neither builds a
-    // Peel region, so nothing observable changes today either way.
-    routine!(dsa_index_knorm_rope_bf16 = dsa_index_knorm_rope::<bf16>),
-    routine!(dsa_index_q_rope_bf16 = dsa_index_q_rope::<bf16>),
-    routine!(dsa_index_topk_mask, whole),
-    routine!(dsv4_boundary_meta_decode),
-    // AND THIS ONE KEEPS IT, which is why the four were not one decision.
-    // Its argument list is not its neighbours': it takes `qo_indptr` and
-    // `num_requests` and walks them, which is exactly the R-shaped addressing
-    // the old table used to JUSTIFY `whole` on the paged MLA statements —
-    // a row window leaves that arithmetic pointing at another request's
-    // rows. So the `false → true` here reads as a deliberate correction made
-    // during the crossing rather than a transcription slip, and reverting it
-    // would reintroduce the fault the other three never had.
-    routine!(dsv4_boundary_meta_paged, whole),
-    routine!(attention_compressed_paged_bf16, whole),
-    routine!(dsv4_compress_gather_paged_bf16),
-    routine!(dsv4_store_comp_entries_bf16, whole),
-    routine!(qkv_packed_qk_norm_rope_vnorm_write_kv_bf16),
-    routine!(qkv_decode_qk_norm_rope_write_kv_bf16),
-    routine!(qkv_decode_fused_dispatch),
+    routine!(lse_log2_to_ln, in_place = &[(0, 0)], ),
+    routine!(
+        attention_sink_rescale_bf16 = attention_sink_rescale::<bf16>,
+        in_place = &[(0, 0)]
+    ),
+    routine!(attn_res_blend_bf16 = attn_res_blend::<bf16>, ),
+    routine!(pad_head_dim_bf16 = pad_head_dim::<bf16>, ),
+    routine!(strip_head_dim_bf16 = strip_head_dim::<bf16>, ),
+    routine!(
+        logit_softcap_bf16 = logit_softcap::<bf16>,
+        in_place = &[(0, 0)]
+    ),
+    routine!(logit_softcap_f16, in_place = &[(0, 0)], ),
+    routine!(kimi_split_q_b_bf16 = kimi_split_q_b::<bf16>, ),
+    routine!(
+        kimi_split_kv_a_norm_bf16 = kimi_split_kv_a_norm::<bf16>
+    ),
+    routine!(
+        combine_attn_outputs_bf16 = combine_attn_outputs::<bf16>
+    ),
+    routine!(split_qkv_bf16_devwin, ),
+    routine!(compact_page_csr, whole, ),
+    routine!(
+        mtp_shift_hidden_bf16 = mtp_shift_hidden::<bf16>,
+        whole
+    ),
+    routine!(
+        mtp_update_pending_hidden_bf16 = mtp_update_pending_hidden::<bf16>,
+        whole
+    ),
+    routine!(
+        dsa_index_knorm_rope_bf16 = dsa_index_knorm_rope::<bf16>,
+        in_place = &[(0, 0)]
+    ),
+    // `index_q_rope` does exactly the same thing to `idx_q`:
+    // `dsa_indexer.cuh:156-158` reads `row[d]` into a register buffer,
+    // rotates it with `rope_interleave_inplace`, and writes `row[d]` back --
+    // one buffer read and written, and the launcher takes ONE pointer for
+    // both.
+    routine!(
+        dsa_index_q_rope_bf16 = dsa_index_q_rope::<bf16>,
+        in_place = &[(0, 0)]
+    ),
+    routine!(dsa_index_topk_mask, whole, ),
+    routine!(dsv4_boundary_meta_decode, ),
+    routine!(dsv4_boundary_meta_paged, whole, ),
+    routine!(
+        attention_compressed_paged_bf16,
+        whole
+    ),
+    routine!(
+        dsv4_compress_gather_paged_bf16
+    ),
+    routine!(
+        dsv4_store_comp_entries_bf16,
+        whole
+    ),
+    routine!(
+        qkv_packed_qk_norm_rope_vnorm_write_kv_bf16
+    ),
+    routine!(
+        qkv_decode_qk_norm_rope_write_kv_bf16
+    ),
+    routine!(qkv_decode_fused_dispatch, uncolumned),
+    // ── THE PAGED-KV APPENDERS, WHICH CROSSED THE LINE BELOW ────────────
+    routine!(write_kv_to_pages_bf16),
+    routine!(
+        write_kv_to_pages_quantised
+    ),
+    routine!(write_kv_explicit_bf16),
+    routine!(
+        write_kv_explicit_bf16_devwin,
+        whole
+    ),
     // ── what the DRIVER fires, by path ──────────────────────────────────
-    //
-    // Below this line, every symbol is `driver_bound!` rather than
-    // `routine!`, and for all but the last of them the difference is one
-    // fact: **no statement supplies its arguments.** A paged-KV write takes
-    // the layer's page geometry, an MLA prepare takes the latent cache's —
-    // each assembled by the driver from the fire, mentioned by no trace, and
-    // therefore not describable by the extractor that reads a `fn`'s
-    // parameters. The reason is written per symbol rather than once, because
-    // the last one's is a different reason.
-    //
-    // They were rows in `not_yet_crossed.rs`, hand-transcribing columns off
-    // a `fn` sitting three thousand lines up this same file. The body was
-    // never what was missing.
-    //
-    // THE FIVE PAGED-KV SYMBOLS each take a `&KvLayer` -- one layer's page
-    // geometry, five to eighteen operands the fire resolves together and no
-    // trace states as one. Four of the five are armed over exactly these
-    // `fn`s in `bind/arms/attn.rs`; the device-window twin has the host
-    // program and no arm on either side of the seam.
     driver_bound!(write_kv_to_pages),
-    driver_bound!(write_kv_explicit_bf16),
-    driver_bound!(write_kv_explicit_bf16_devwin, whole),
-    driver_bound!(dequant_kv_cache_layer_to_bf16_active),
-    // The head dims FlashInfer's prefill template rejects (gemma-4's 512)
-    // take this naive paged kernel instead: no plan at all, fire-shaped, and
-    // `attention_naive_paged_arm` is what fires it. It is all that is left of
-    // the dispatch lattice's row block -- the six FlashInfer dispatches are
-    // `attn::fa2::ROUTINES`' now, and this shares their arm file and none of
-    // their shape.
-    driver_bound!(attention_naive_paged, whole),
-    // The fold is DECLINED in `bind/arms/attn.rs` for one operand -- the
-    // score-capture CSR, which has a producer and no `Cx` query -- and fires
-    // out of band from `fire::attn_score`, at the point on the stream where
-    // the capture dispatch used to issue it. Its `&KvLayer` is absent from
-    // the argument list and the reason is not: `page_size` reaches it off
-    // `Cx::kv_layer`, so what a statement cannot supply here is the CSR
-    // rather than the view. **Declaring it is not arming it** -- the row is
-    // what a lowering resolves against, and the `unbound:` sentence beside
-    // its arm is what a fire still meets.
+    routine!(dequant_kv_cache_layer_to_bf16_active),
+    routine!(attention_naive_paged, whole, ),
     driver_bound!(attn_score_fold_heads, whole),
-    // The MLA pair take an `MlaLayer`, which is the same reason in the latent
-    // cache's shape. Both are `whole` for the ADDRESSING rather than the
-    // algebra: they walk `qo_indptr` / `kv_page_indptr` / `kv_last_page_lens`,
-    // which are R-shaped, so a row window would leave that arithmetic
-    // pointing at another request's rows. `bind/arms/attn.rs` declines both
-    // over `Cx::mla_layer`, whose producer -- `pools::mla_cache::
-    // MlaCachePool::layer_view` -- no `Fire` reaches; `fire/launch.rs`'s
-    // `kv_pools_for` refuses `KvStyle::Mla` and `serve/load.rs` refuses an
-    // MLA checkpoint at load. Three things must move together, and a
-    // declaration is none of them.
     driver_bound!(mla_prepare_bf16, whole),
     driver_bound!(write_mla_to_pages, whole),
-    // AND THE MLA DISPATCH, WHICH WAS THE LAST `attn` ROW IN
-    // `not_yet_crossed.rs` AND IS THE REASON THAT FILE HELD ONE. Its row's
-    // comment is preserved here because it is an argument and not a label,
-    // and because deleting it with the row would delete the only record of
-    // why the row outlived the eight above it.
-    //
-    // The row said: *"it is ONE trace symbol with TWO bodies ... A `Routine`
-    // is one body. `driver_bound!` names one `fn`, so it cannot declare this
-    // any more than `routine!` could, and the decision it is waiting on is
-    // which of the two the declaration should name -- or whether the pick
-    // belongs inside a third `fn` that takes the `Ctx` and forwards."*
-    //
-    // **It is the third `fn`**, and the row had already named it. What the
-    // row was really recording is that `mla_fa2::fire` and `mla_naive::fire`
-    // are ARMS -- the choice between them is `Ctx::compute_capability_major`
-    // (`>= 10` picks naive, because FA2 MLA writes ZERO OUTPUT on sm_100, a
-    // wrong answer rather than a fault) -- and an arm is not a symbol.
-    // `write_kv_to_pages` had settled the same question for the paged-KV
-    // writes in this same file, and the paragraph above says so in its own
-    // words: the entry point that chooses is the symbol, the two arms it
-    // chooses between are not, and neither arm is a weaker declaration of
-    // the other.
-    //
-    // NO `whole`, and the contrast with the two rows above is the argument,
-    // in the deleted row's own words: the prepare and the page write are
-    // `whole` because they walk `qo_indptr` / `kv_page_indptr` /
-    // `kv_last_page_lens`, which are R-shaped; *"the dispatch reads a plan
-    // built over the whole fire and still covers a row range, like the
-    // FlashInfer ones."* `tests/stated_columns.rs` pins it against
-    // `9e3936fb9^`, which stated it the same way.
-    //
-    // **Declaring it is not arming it, and here that is more than the usual
-    // caveat.** The refusal runs the other way round from the prepare's:
-    // `bind/arms/attn.rs` declines this over `Cx::mla_layer` and
-    // `Cx::mla_plan`, which have nothing to answer WITH, because
-    // `fire/launch.rs`'s `kv_pools_for` refuses `KvStyle::Mla` and
-    // `serve/load.rs` refuses an MLA checkpoint at model load. THREE things
-    // must move together; the one that moved here is the first, which is
-    // that there was no `fn` to arm at all. *"What is missing is a caller"*
-    // is still the sentence beside the arm, and it is still true.
     driver_bound!(dispatch_attention_mla_bf16),
     // ── and one whose body is `driver_internal`'s ───────────────────────
-    //
-    // gemma-4 and the llama-like anchor lower `OpKind::SplitQkv` outside a
-    // peel tail to this symbol (`model-compiler`'s `lower.rs`), so a live
-    // model text names it and nothing declared it. The host program is
-    // `driver_internal::split_qkv_bf16` and STAYS there; the declaration
-    // cannot follow it, because `Family::symbol` is the module path's first
-    // segment plus the routine's name and a `Family` in `driver_internal`
-    // would offer `driver_internal::split_qkv_bf16` -- a string no lowering
-    // emits. `driver_internal`'s header carries the whole argument, for this
-    // and for the three sibling symbols in `layout`, `mlp` and `ssm`.
-    //
-    // **This declares the symbol and does not arm it.** A fire naming it
-    // still refuses with `NoArm`: `bind/arms/attn.rs` binds the device-window
-    // twin `attn::split_qkv_bf16_devwin` and nothing else, and the two are
-    // different kernels rather than one with a fallback.
-    driver_bound!(split_qkv_bf16),
+    routine!(split_qkv_bf16, ),
 ];
 
 /// `attn`, as a trace names it.
 pub static FAMILY: Family = crate::family!(ROUTINES);
 
 // ── what a statement cannot supply, for this family ──────────────────
-//
-// From `x::cx`, which held eleven types whose only shared property was that
-// a statement cannot supply them. "Context" is not a classification: it
-// groups by how a value ARRIVES rather than by what it means, so the module
-// had to be named for the arrival and `driver-cuda` wrote `x::cx::KvLayer`
-// for a thing that is attention's and nothing else's. `Yarn` went to
-// `rope` and `Gdn`/`Slab` to `ssm`; these eight are here.
-//
-// **[`Plan`] below is not [`plan::Plan`](crate::attn::plan::Plan)**, and the
-// two now sit one path segment apart, so the difference is worth the line.
-// This one is the per-request INDEX ARRAYS a paged launch walks -- four
-// device pointers the fire already holds. `plan::Plan` is what the
-// scheduler PRODUCES: an offset table plus the upload that fills it.
 
 /// WHICH ROWS this fire is launching.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4355,3 +4985,372 @@ pub struct Plan {
     /// How many requests.
     pub requests: i32,
 }
+
+// OPERAND SLOTS DID NOT MOVE: making `kimi_split_q_b`'s three split sizes
+// `Param<N, i32>` must not advance the `In`/`Out` counters. This is rule F4;
+// a `Weight<1, _>` index bug of exactly this shape shipped once and was
+// reverted, so the check lives in `cargo check` rather than in a test binary.
+const _: () = {
+    let d = <kimi_split_q_b as kernels::Derivation>::DERIVED;
+    assert!(d.len() == 6);
+    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(d[2].source, Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
+    assert!(matches!(d[3].source, Some(kernels::Source::Slot(kernels::Kind::Param, 0))));
+    assert!(matches!(d[4].source, Some(kernels::Source::Slot(kernels::Kind::Param, 1))));
+    assert!(matches!(d[5].source, Some(kernels::Source::Slot(kernels::Kind::Param, 2))));
+};
+
+// OPERAND SLOTS DID NOT MOVE: making `dsa_index_topk_mask`'s three scalar
+// sizes `Param<N, i32>` must not consume an operand slot before the mask. This
+// pins rule F4 at the old arm's boundary, where params followed three inputs
+// and one output.
+const _: () = {
+    let d = <dsa_index_topk_mask as kernels::Derivation>::DERIVED;
+    assert!(d.len() == 7);
+    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    assert!(matches!(d[2].source, Some(kernels::Source::Slot(kernels::Kind::In, 2))));
+    assert!(matches!(d[3].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(d[4].source, Some(kernels::Source::Slot(kernels::Kind::Param, 0))));
+    assert!(matches!(d[5].source, Some(kernels::Source::Slot(kernels::Kind::Param, 1))));
+    assert!(matches!(d[6].source, Some(kernels::Source::Slot(kernels::Kind::Param, 2))));
+};
+
+// OPERAND SLOTS DID NOT MOVE: making `combine_attn_outputs`'s merge shape
+// `Param<N, i32>` must leave the four inputs and two outputs numbered as the
+// arm wrote them. The params state their slots without shifting the region
+// counters.
+const _: () = {
+    let d = <combine_attn_outputs as kernels::Derivation>::DERIVED;
+    assert!(d.len() == 8);
+    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    assert!(matches!(d[2].source, Some(kernels::Source::Slot(kernels::Kind::In, 2))));
+    assert!(matches!(d[3].source, Some(kernels::Source::Slot(kernels::Kind::In, 3))));
+    assert!(matches!(d[4].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(d[5].source, Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
+    assert!(matches!(d[6].source, Some(kernels::Source::Slot(kernels::Kind::Param, 0))));
+    assert!(matches!(d[7].source, Some(kernels::Source::Slot(kernels::Kind::Param, 1))));
+};
+
+// `Region::elements()` IS THE PRODUCT THE TWO ELEMENT-COUNT LAUNCHERS USED TO
+// WRITE, SATURATION INCLUDED. `lse_log2_to_ln` and `softcap_elems` both read
+// `width_of(x.width, ..)?.saturating_mul(x.rows)` and now read
+// `x.all(..)?.elements()`; `softcap_elems` then hands the result to
+// `usize::try_from`, so a product that WRAPPED where the old one saturated
+// would turn a `Refusal::Narrow` about too many logits into a negative that
+// converts to nothing and a launch over the wrong `n`. Neither factor is a
+// const at a call site, so the arithmetic is pinned here on a region built by
+// hand rather than at the readers.
+const _: () = {
+    let r = kernels::routine::Region {
+        ptr: core::ptr::null_mut::<f32>(),
+        rows: 7,
+        width: 6,
+        stride: kernels::routine::Stride(6),
+    };
+    assert!(r.elements() == 42);
+
+    let wide = kernels::routine::Region {
+        ptr: core::ptr::null_mut::<f32>(),
+        rows: i32::MAX,
+        width: 2,
+        stride: kernels::routine::Stride(2),
+    };
+    assert!(wide.elements() == i32::MAX);
+};
+// ── THE ROW THAT CROSSED IN KILIMANJARO III STAGE 3 ────────────────────
+//
+// `qkv_packed_post_arm` is deleted and
+// `attn::qkv_packed_qk_norm_rope_vnorm_write_kv_bf16` reads
+// `Bound::derived`, so this column is now the ONLY description of how a fire
+// reaches this kernel. Nothing checks it at run time before the launch: a
+// wrong entry binds a live pointer of the right type from the wrong place.
+//
+// SEVENTEEN, AND THE COUNT IS THE FIRST ASSERTION FOR A REASON. The arm
+// passed eighteen arguments; `num_q_heads` left because F6 puts the division
+// in the launcher, and `ctx: &Ctx` is not in the derived column. A parameter
+// added without a thought for the binder shows up here and nowhere else.
+//
+// THE TWO POSITIONAL RUNS ARE PINNED INDEPENDENTLY. `stated_source`
+// (`kernels-macros/src/lib.rs:271`) SETS a counter to `N + 1` rather than
+// bumping it, so a wrapper leaving the middle of a signature can renumber a
+// later one silently: `Bank<1, _>` at `d[5]` and `In<0, _>` at `d[0]` are the
+// two ends of that risk. The banks are the pair `qkv_fused.cu` uses as
+// q-norm and k-norm weights -- swapping them normalises Q by K's gains, which
+// is numerically plausible and wrong.
+//
+// `keys::RowValid` AT `d[10]` IS THE STAGE'S OWN ENTRY. It said `None` --
+// "no source names this" -- for as long as this signature existed, and that
+// `None` was the whole reason the arm could not go. `source_is_named`
+// compares the key's `&'static str`, so this fires if the key is renamed
+// without `operand()` being taught the new string.
+const _: () = {
+    let d = <qkv_packed_qk_norm_rope_vnorm_write_kv_bf16 as kernels::Derivation>::DERIVED;
+    assert!(d.len() == 17);
+    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(d[4].source, Some(kernels::Source::Slot(kernels::Kind::Weight, 0))));
+    assert!(matches!(d[5].source, Some(kernels::Source::Slot(kernels::Kind::Weight, 1))));
+    assert!(kernels::source_is_named(&d[2].source, <kernels::keys::KvKeys as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[3].source, <kernels::keys::KvValues as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[6].source, <kernels::keys::Positions as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[7].source, <kernels::keys::KvPageIndices as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[8].source, <kernels::keys::KvPageIndptr as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[9].source, <kernels::keys::KvLastPageLens as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[10].source, <kernels::keys::RowValid as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[11].source, <kernels::keys::KvNumHeads as kernels::keys::Fact>::KEY));
+    // `KvHeadDim` AND NOT `HeadDim`, which is the one substitution in this
+    // column that would type-check, bind, and be wrong on a two-kind family:
+    // the LAYER's width is `cx.kv_layer()?.head_dim` and the FIRE's is
+    // `cx.head_dim()`, and `bind/table.rs` names gemma-4 as where they part.
+    assert!(kernels::source_is_named(&d[12].source, <kernels::keys::KvHeadDim as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[13].source, <kernels::keys::KvPageSize as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[14].source, <kernels::keys::KvHndLayout as kernels::keys::Fact>::KEY));
+    // `Theta` AND NOT `RopeTheta`: the statement's layer with a fallback,
+    // where `mla_prepare_bf16` two hundred lines up takes the fire's field.
+    assert!(kernels::source_is_named(&d[15].source, <kernels::keys::Theta as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[16].source, <kernels::keys::RmsEps as kernels::keys::Fact>::KEY));
+};
+
+// ── THE DECODE TWIN, WHICH DID NOT CROSS, AND THE PARAMETER THAT HOLDS IT ──
+//
+// Same conversion, one parameter short of the same outcome: `q_out` is
+// `cx.q_out()`, the decode fire's scratch destination, which no key names and
+// no statement places. This pin says WHICH index is the refusal, so that a
+// later stage that gives `q_out` a home finds out here whether it moved
+// anything else.
+//
+// `d[7]` IS THE ONE TO WATCH. `rope_table` is the only bare region left in
+// the middle of a run of `Env`s, and it is `In(1)` because `stated_source`
+// short-circuits ahead of both counters for the two `Bank`s above it. Had
+// those been left bare, the column would have claimed `In(1)` and `In(2)` for
+// them and this would read `In(3)` -- binding the rope table to an operand
+// the statement never placed.
+const _: () = {
+    let d = <qkv_decode_qk_norm_rope_write_kv_bf16 as kernels::Derivation>::DERIVED;
+    assert!(d.len() == 20);
+    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    // The region form states no result, so `Op::dest` carries the destination
+    // and it lands in the operand run as `Out(0)`.
+    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(d[4].source, Some(kernels::Source::Slot(kernels::Kind::Weight, 0))));
+    assert!(matches!(d[5].source, Some(kernels::Source::Slot(kernels::Kind::Weight, 1))));
+    assert!(matches!(d[7].source, Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    // The `_or_null` pair, not `keys::KvWritePage`/`KvWriteOffset`: those
+    // null-check, which `write_kv_explicit_bf16` wants and this row does not.
+    assert!(kernels::source_is_named(
+        &d[11].source,
+        <kernels::keys::KvWritePageOrNull as kernels::keys::Fact>::KEY
+    ));
+    assert!(kernels::source_is_named(
+        &d[12].source,
+        <kernels::keys::KvWriteOffsetOrNull as kernels::keys::Fact>::KEY
+    ));
+
+    assert!(kernels::source_is_named(&d[13].source, <kernels::keys::RowValid as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[15].source, <kernels::keys::KvHeadDim as kernels::keys::Fact>::KEY));
+};
+
+// ── THE BF16 APPEND ──
+//
+// d[9]/d[10] BIND A NULL AND THAT IS THE POINT. `abi.rs:101` defines
+// `has_envelopes()` as exactly "neither plane is null", so `operand()`
+// refusing on a null would refuse precisely the layers d[17] -- on this same
+// row -- reports `false` for, and the only two reads of the planes
+// (`:3457` here, `:3285` in `write_kv_explicit_bf16`) are guarded on it.
+const _: () = {
+    let d = <write_kv_to_pages_bf16 as kernels::Derivation>::DERIVED;
+    assert!(d.len() == 18);
+    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    assert!(kernels::source_is_named(&d[8].source, <kernels::keys::RowValid as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[9].source, <kernels::keys::KvEnvMin as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[10].source, <kernels::keys::KvEnvMax as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[11].source, <kernels::keys::RequestCount as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[12].source, <kernels::keys::FirstToken as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[17].source, <kernels::keys::KvHasEnvelopes as kernels::keys::Fact>::KEY));
+    let mut i = 0;
+    while i < d.len() {
+        assert!(d[i].source.is_some());
+        i += 1;
+    }
+};
+
+// ── THE NAIVE PAGED FALLBACK ──
+//
+// THE `&KvLayer` AGGREGATE IS GONE and `driver_bound!` went with it: `Arg` is
+// implemented for no host struct, so the aggregate was the only reason the
+// row could not be a `routine!`. Ten leaves in its place, arity 21 against a
+// 36 ceiling.
+//
+// Ten leaves, ten keys, and the same five that finished
+// `write_kv_to_pages_quantised` finished this one -- the two rows were down
+// to the identical set.
+const _: () = {
+    let d = <attention_naive_paged as kernels::Derivation>::DERIVED;
+    assert!(d.len() == 21);
+    assert!(kernels::source_is_named(&d[0].source, <kernels::keys::KvKeys as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[1].source, <kernels::keys::KvValues as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[2].source, <kernels::keys::KvKeyScales as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[3].source, <kernels::keys::KvValueScales as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[4].source, <kernels::keys::KvPageSize as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[5].source, <kernels::keys::KvHeadDim as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[6].source, <kernels::keys::KvNumHeads as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[7].source, <kernels::keys::KvSchemeByte as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[8].source, <kernels::keys::KvStorageDtype as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[9].source, <kernels::keys::KvBlockSize as kernels::keys::Fact>::KEY));
+    // THE TWO SLOTS THE UNFOLD MOVED. Ten leaves went in ahead of them and
+    // neither slot shifted, because both are STATED -- `In<0>`/`Out<0>` --
+    // and `stated_source` short-circuits ahead of the positional counters.
+    assert!(matches!(d[10].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[11].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(kernels::source_is_named(&d[12].source, <kernels::keys::QoIndptr as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[15].source, <kernels::keys::KvLastPageLens as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[17].source, <kernels::keys::WindowLeft as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[18].source, <kernels::keys::SmScale as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[19].source, <kernels::keys::AttnLogitsSoftCap as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[20].source, <kernels::keys::AttnLseOut as kernels::keys::Fact>::KEY));
+    let mut i = 0;
+    while i < d.len() {
+        assert!(d[i].source.is_some());
+        i += 1;
+    }
+};
+
+// ── THE EXPLICIT WRITER, THE SAME PAIR AT 7/8 ──
+//
+// `keys::KvWritePage`/`KvWriteOffset` at 4/5 are RIGHT HERE and WRONG on
+// `qkv_decode_qk_norm_rope_write_kv_bf16`: `Fire::w_page_d` null-checks, this
+// arm reads it with `?`, and that arm reads it with `unwrap_or(null)`. One
+// key, two rows, opposite verdicts, decided by what a null means on each.
+const _: () = {
+    let d = <write_kv_explicit_bf16 as kernels::Derivation>::DERIVED;
+    assert!(d.len() == 15);
+    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    assert!(kernels::source_is_named(&d[4].source, <kernels::keys::KvWritePage as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[5].source, <kernels::keys::KvWriteOffset as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[14].source, <kernels::keys::KvNativeBf16 as kernels::keys::Fact>::KEY));
+    let mut i = 0;
+    while i < d.len() {
+        assert!(d[i].source.is_some());
+        i += 1;
+    }
+    assert!(kernels::source_is_named(&d[6].source, <kernels::keys::RowValid as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[7].source, <kernels::keys::KvEnvMin as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[8].source, <kernels::keys::KvEnvMax as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[13].source, <kernels::keys::KvHasEnvelopes as kernels::keys::Fact>::KEY));
+};
+
+// ── THE THREE VERDICTS THAT ARE NOT KEYS ──
+//
+// One pin per row that still carries an arm, asserting WHICH index stops the
+// column, so a later pass reads the reason off the assertion rather than
+// guessing from a `None`.
+
+// `split_qkv_bf16_devwin` CROSSED. `keys::PeelWindow` and `keys::RowsTotal`
+// answer the two the arm fetched, and `total` is the one to read twice: a
+// region carries `rows.count` and the `_devwin` forms exist for the fires
+// where the two differ.
+const _: () = {
+    let d = <split_qkv_bf16_devwin as kernels::Derivation>::DERIVED;
+    assert!(d.len() == 6);
+    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(d[2].source, Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
+    assert!(matches!(d[3].source, Some(kernels::Source::Slot(kernels::Kind::Out, 2))));
+    assert!(kernels::source_is_named(&d[4].source, <kernels::keys::PeelWindow as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[5].source, <kernels::keys::RowsTotal as kernels::keys::Fact>::KEY));
+    let mut i = 0;
+    while i < d.len() {
+        assert!(d[i].source.is_some());
+        i += 1;
+    }
+};
+
+// Both softcap forms, and `logit_softcap_f16` has no `Bound` row at all --
+// its column is the only thing that binds it.
+const _: () = {
+    let d = <logit_softcap as kernels::Derivation>::DERIVED;
+    assert!(d.len() == 2);
+    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(kernels::source_is_named(&d[1].source, <kernels::keys::FinalLogitSoftcap as kernels::keys::Fact>::KEY));
+};
+const _: () = {
+    let d = <logit_softcap_f16 as kernels::Derivation>::DERIVED;
+    assert!(d.len() == 2);
+    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(kernels::source_is_named(&d[1].source, <kernels::keys::FinalLogitSoftcap as kernels::keys::Fact>::KEY));
+};
+
+// The `_devwin` explicit writer has no `Bound` row either; `PeelWindow` and
+// `RowsTotal` are the pair `split_qkv_bf16_devwin` crossed on.
+const _: () = {
+    let d = <write_kv_explicit_bf16_devwin as kernels::Derivation>::DERIVED;
+    assert!(kernels::source_is_named(&d[6].source, <kernels::keys::PeelWindow as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[8].source, <kernels::keys::RowsTotal as kernels::keys::Fact>::KEY));
+    let mut i = 0;
+    while i < d.len() {
+        assert!(d[i].source.is_some());
+        i += 1;
+    }
+};
+
+// `first_token` at d[2] IS TAKEN AND NEVER LAUNCHED: the refusal it guards
+// is the routine's, not the arm's.
+//
+// d[16]/d[17] ARE BOTH `i32` AND ADJACENT, so swapping `scheme` and
+// `storage_dtype` type-checks. This pin is the only thing that does not.
+const _: () = {
+    let d = <write_kv_to_pages_quantised as kernels::Derivation>::DERIVED;
+    assert!(d.len() == 18);
+    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    assert!(kernels::source_is_named(&d[2].source, <kernels::keys::FirstToken as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[5].source, <kernels::keys::KvKeyScales as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[6].source, <kernels::keys::KvValueScales as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[7].source, <kernels::keys::QoIndptr as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[15].source, <kernels::keys::KvBlockSize as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[16].source, <kernels::keys::KvSchemeByte as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[17].source, <kernels::keys::KvStorageDtype as kernels::keys::Fact>::KEY));
+    let mut i = 0;
+    while i < d.len() {
+        assert!(d[i].source.is_some());
+        i += 1;
+    }
+};
+
+// d[14] IS `cx.num_pages_in_batch()` AND IT IS NOT `xqa`'s REFUSAL. There the
+// parameter means a per-request maximum and the arm passes a fire-wide bound,
+// so a key would freeze an approximation. Here the parameter IS the bound --
+// `active_geometry` multiplies it by the page's element count to get the whole
+// batch's extent -- so the fact and the query are the same thing.
+//
+// d[10]/d[11] ARE BOTH `i32` AND ADJACENT, as on the quantised writer: only
+// this pin distinguishes the scheme from the storage dtype.
+const _: () = {
+    let d = <dequant_kv_cache_layer_to_bf16_active as kernels::Derivation>::DERIVED;
+    assert!(d.len() == 15);
+    assert!(kernels::source_is_named(&d[0].source, <kernels::keys::KvKeys as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[1].source, <kernels::keys::KvValues as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[2].source, <kernels::keys::KvKeyScales as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[3].source, <kernels::keys::KvValueScales as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[4].source, <kernels::keys::KvBf16Keys as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[5].source, <kernels::keys::KvBf16Values as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[6].source, <kernels::keys::KvPageSize as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[7].source, <kernels::keys::KvNumHeads as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[8].source, <kernels::keys::KvHeadDim as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[9].source, <kernels::keys::KvBlockSize as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[10].source, <kernels::keys::KvSchemeByte as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[11].source, <kernels::keys::KvStorageDtype as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[12].source, <kernels::keys::KvNativeBf16 as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[13].source, <kernels::keys::KvPageIndices as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&d[14].source, <kernels::keys::KvPagesInBatch as kernels::keys::Fact>::KEY));
+    let mut i = 0;
+    while i < d.len() {
+        assert!(d[i].source.is_some());
+        i += 1;
+    }
+};

@@ -1,16 +1,8 @@
-//! The memory budget a plan states: what the forward may carry and
-//! what that costs.
-//!
-//! that reconciles one per rank into one for the group.
-//!
-//! Ported from the `CudaMemoryPlan` / `PlannedForwardLimits` structs in
-//! `store/memory_planner.hpp` and the `min_into` / `tp_min_plan` pair in
-//! `store/memory_planner.cpp`.
+//! The memory budget a plan states: what the forward may carry and what that
+//! costs, plus the fold that reconciles one plan per rank into one for the
+//! group.
 
-/// Upper bounds on per-fire shapes.
-///
-/// Sized once by the planner so persistent device buffers can be reserved
-/// ahead of time and shared across every call.
+/// Upper bounds on per-fire shapes, sized once by the planner.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PlannedForwardLimits {
     /// Most tokens one forward may carry.
@@ -57,18 +49,12 @@ pub struct CudaMemoryPlan {
 impl CudaMemoryPlan {
     /// Fold `src` into `self`, keeping whatever every rank can satisfy.
     ///
-    /// The direction is **not** uniform, and that is the whole content of this
-    /// function:
-    ///
-    ///   * *Shape* limits take the **minimum**. A bound only one rank can meet
-    ///     is not a bound the group can meet.
-    ///   * *Byte* sizes take the **maximum**. These are allocations, so the
-    ///     group must reserve enough for its hungriest rank.
-    ///
-    /// `kv_page_size` is neither: it is a discrete choice that has to agree
+    /// Shape limits take the minimum (a bound only one rank meets is not a
+    /// group bound); byte sizes take the maximum (allocations must fit the
+    /// hungriest rank). `kv_page_size` is a discrete choice that must agree
     /// across ranks, so the smaller page wins and drags its own
-    /// `kv_page_bytes` along with it. Taking the minimum page size and the
-    /// maximum page bytes independently would describe a layout no rank has.
+    /// `kv_page_bytes` with it — taking min page size and max page bytes
+    /// independently would describe a layout no rank has.
     pub fn min_into(&mut self, src: &Self) {
         if src.kv_page_size < self.kv_page_size {
             self.kv_page_size = src.kv_page_size;

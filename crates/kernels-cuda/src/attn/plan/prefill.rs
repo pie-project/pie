@@ -55,7 +55,7 @@ impl Request<'_> {
                 got: self.kv_indptr.len(),
             });
         }
-        if self.num_kv_heads == 0 || self.num_qo_heads % self.num_kv_heads != 0 {
+        if self.num_kv_heads == 0 || !self.num_qo_heads.is_multiple_of(self.num_kv_heads) {
             return Err(Error::HeadsNotDivisible {
                 num_qo_heads: self.num_qo_heads,
                 num_kv_heads: self.num_kv_heads,

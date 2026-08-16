@@ -339,7 +339,7 @@ impl<'a, B: Allocation> Bound<'a, B> {
 ///     type Buffer = device::Buffer;
 ///     fn weight(&self, name: &str) -> Option<&device::Buffer> { .. }
 ///     fn named(&self, value: ValueId) -> Option<&device::Buffer> { .. }
-///     // `kv`, `number` and `table` are defaulted; a resolver serving a text
+///     // `kv`, `slab`, `number` and `table` are defaulted; a resolver serving a text
 ///     // without paged attention need not state them.
 /// }
 /// ```
@@ -365,9 +365,30 @@ pub trait Resolve {
     ///
     /// Defaulted to `None` so that a resolver serving a text without paged
     /// attention does not have to state a method it will never be asked for.
-    /// The refusal that produces is [`Unbindable::NoDriverResource`], which
+    /// The refusal that produces is a named one, which
     /// names what was missing.
     fn kv(&self, _layer: u16, _values: bool) -> Option<&Self::Buffer> {
+        None
+    }
+
+    /// A per-layer RECURRENT slab -- a gated DeltaNet's convolution or
+    /// recurrent carry, by the name the kernel knows it as.
+    ///
+    /// STATE, like [`Resolve::kv`], and for the same reason: no traced value
+    /// stands for it, so no plan mentions it and no arena holds it.
+    ///
+    /// # Why the default is `None` and not a placeholder
+    ///
+    /// `driver-metal` states this in as many words and the rule is worth
+    /// copying exactly: a missing SCALE is a legitimate absence, so binding
+    /// nothing is the honest answer there. A recurrent carry is not. **A scan
+    /// handed a null carry reads zero, writes nothing back, and returns a
+    /// fluent result that is wrong in a way no output check catches.**
+    ///
+    /// Neither backend allocates one today, so every `ssm` arm declines here,
+    /// and that is what keeps the family's dispatch honestly DARK instead of
+    /// quietly broken. `tests/hybrid_probe.rs` is where the decline is read.
+    fn slab(&self, _layer: u16, _which: &'static str) -> Option<&Self::Buffer> {
         None
     }
 
@@ -375,7 +396,7 @@ pub trait Resolve {
     ///
     /// A pool's shape, not a statement's scalar. A text that stated its page
     /// size would be right for one deployment and silently wrong for the next,
-    /// so the row names the number and the driver answers it.
+    /// so the kernel names the number and the driver answers it.
     fn number(&self, _which: FireNumber) -> Option<u32> {
         None
     }
@@ -410,16 +431,17 @@ pub enum FireNumber {
     /// as the widest row of the fire that supplied it, and the next fire's is
     /// a different number.
     AttentionMaskStride,
-    /// How many rows the fire has.
-    ///
-    /// The FIRE's, like the mask pitch beside it and for the same reason: a
-    /// `Shape` outlives every fire it serves, so the pool answers this from
-    /// what it last staged.
-    ///
-    /// `LaunchRule::SdpaTiled` is why it exists. That grid rounds the rows UP
-    /// to whole tiles, so the threads of a partial last tile are past the end
-    /// and this scalar is what tells them -- see `geometry::grid`.
-    Rows,
+    // RETIRED: `FireNumber::Rows` -- nothing asks the fire for it.
+    //
+    // It was the row count a fire last staged, answered by the pool because a
+    // `Shape` outlives every fire it serves. `LaunchRule::SdpaTiled` is why it
+    // existed: that grid rounds the rows UP to whole tiles, so the threads of a
+    // partial last tile run past the end and this scalar was what told them.
+    //
+    // A routine does not need the fire to tell it: the tiled attention bodies
+    // take their row count as an ARGUMENT, and their arm reads it off the
+    // launch rectangle the same way the grid does, so the padded grid and the
+    // bound are derived from one number instead of two that could disagree.
 }
 
 /// The fire-wide tables a kernel row may name.
@@ -452,6 +474,18 @@ pub enum FireTable {
     RopeFrequencies,
     /// Which rows the readout samples.
     SamplingIndices,
+    /// Which recurrent SLOT each request's state lives in.
+    ///
+    /// The gated DeltaNet's `*_slotted` kernels read it to find their carry,
+    /// the way a paged attention reads a page table. `driver-metal` states it
+    /// as `FireTable::RecurrentSlots` and its `gdn_prep_slotted` inserts the
+    /// handle at position 13.
+    ///
+    /// **This driver holds no such table**, so a body asking for one is
+    /// refused by name -- which is the same posture as
+    /// [`Resolve::slab`] and for the same reason: a slot index the driver
+    /// invents points a scan at another request's carry.
+    RecurrentSlots,
 }
 
 /// The marker a constant rides the weight-name slot under.
@@ -509,26 +543,6 @@ pub enum Unbindable {
         /// The constant's name, with the `scale.` prefix removed.
         String,
     ),
-    /// The row names an operand of the statement that the statement does not
-    /// have.
-    ///
-    /// A row states the shape of every deployment its kernel serves, so a
-    /// statement reaching only part of that shape is ordinary -- but a slot
-    /// left holding nothing is an entry the shader reads, so it is a refusal
-    /// rather than a gap. `Source::Unbound` is how a row says "gap".
-    NoOperand,
-    /// The row names the KV cache and the resolver does not hold one.
-    NoKvCache {
-        /// Which layer was asked for.
-        layer: u16,
-        /// Values rather than keys.
-        values: bool,
-    },
-    /// The row names a fire table the resolver does not hold.
-    NoDriverResource(
-        /// Which table.
-        FireTable,
-    ),
     /// The device cannot address the offset or extent this operand needs.
     ///
     /// Carries what [`Bound::within`] said, so an alignment failure and a
@@ -561,13 +575,6 @@ impl std::fmt::Display for Unbindable {
                     "`{name}` is a dispatch constant riding a weight slot, not a buffer"
                 )
             }
-            Self::NoOperand => write!(f, "the row names an operand this statement does not state"),
-            Self::NoKvCache { layer, values } => write!(
-                f,
-                "no {} cache for layer {layer}",
-                if *values { "value" } else { "key" }
-            ),
-            Self::NoDriverResource(what) => write!(f, "the driver holds no {what:?} table"),
             Self::Unaddressable(why) => write!(f, "{why}"),
         }
     }
@@ -735,7 +742,7 @@ pub enum Slot<'a, B> {
     Params,
     /// A slot the row states and nothing fills.
     ///
-    /// `Source::Unbound`. `kv_append_paged` keeps several, so that the rest of
+    /// Source `None`. `kv_append_paged` keeps several, so that the rest of
     /// its row stays at the positions a shared ring ABI put them; the module
     /// declares no global for them and nothing reads them.
     Nothing,
@@ -759,313 +766,128 @@ impl<B: Allocation> PartialEq for Slot<'_, B> {
     }
 }
 
-/// The three runs `Launch::args` is laid out in, as indices into that slice.
-///
-/// `Launch::args` states inputs in operand order, then outputs, then the
-/// weights the statement names -- so the weights are the ones that ARE
-/// [`Arg::Weight`], and the split between inputs and outputs is by COUNT,
-/// which only the row knows.
-///
-/// A type rather than three lines inside [`reorder`], and the reason is
-/// `driver-vulkan`'s: [`scalars`] needs the identical split to answer
-/// [`kernels::Source::OutWidth`], and two copies of this arithmetic would be
-/// two chances to disagree about which arg is an output. A disagreement there
-/// is a kernel handed the wrong pointer or the wrong row pitch, and both of
-/// those compute rather than fail.
-struct Runs {
-    /// Indices of the inputs, in operand order.
-    ins: Vec<usize>,
-    /// Indices of the outputs, in operand order.
-    outs: Vec<usize>,
-    /// Indices of the named weights, in the order the trace states them.
-    weights: Vec<usize>,
-}
-
-fn runs(sig: &kernels::KernelSig, args: &[Arg]) -> Runs {
-    let widthed: Vec<usize> = args
-        .iter()
-        .enumerate()
-        .filter(|(_, a)| !matches!(a, Arg::Weight(_)))
-        .map(|(i, _)| i)
-        .collect();
-    let weights: Vec<usize> = args
-        .iter()
-        .enumerate()
-        .filter(|(_, a)| matches!(a, Arg::Weight(_)))
-        .map(|(i, _)| i)
-        .collect();
-    // How many of the widthed run are outputs: one past the highest `Out(i)`
-    // the row names. Clamped to what the trace actually handed over, because a
-    // row may state an output a given statement does not produce.
-    let results = sig
-        .operands
-        .iter()
-        .filter_map(|o| match o.source {
-            kernels::Source::Out(i) => Some(usize::from(i) + 1),
-            _ => None,
-        })
-        .max()
-        .unwrap_or(0)
-        .min(widthed.len());
-    let (ins, outs) = widthed.split_at(widthed.len() - results);
-    Runs {
-        ins: ins.to_vec(),
-        outs: outs.to_vec(),
-        weights,
-    }
-}
-
-/// Whether an operand crosses as a device allocation rather than as a value.
-///
-/// The same question `kernels_wgpu::bindings` asks, asked here because
-/// [`scalars`] has to know whether an operand it did not recognise owes the
-/// scalar run a word or nothing at all. Read off the KIND and not off a list
-/// of source names, so a row that grows a new buffer source cannot land in the
-/// uniform block by omission.
-fn is_buffer_kind(ty: kernels::Ty) -> bool {
-    use kernels::Ty;
-    matches!(
-        ty,
-        Ty::BufMut
-            | Ty::Buf
-            | Ty::I32s
-            | Ty::I64s
-            | Ty::U32s
-            | Ty::U8s
-            | Ty::F32sMut
-            | Ty::F32s
-            | Ty::I32sMut
-            | Ty::U32sMut
-            | Ty::U8sMut
-            | Ty::U16s
-            | Ty::U16sMut
-            | Ty::I8s
-            | Ty::BufArray
-            | Ty::BufArrayMut
-            | Ty::BufArrayOut
-            | Ty::BufArrayOutMut
-            | Ty::U8Array
-            | Ty::I32Array
-    )
-}
-
-/// One operand's row width, as the plan states it.
-///
-/// `None` for a weight, whose extent the plan does not carry -- the resolver's
-/// buffer is what knows how big a tensor is, and a scalar derived from it
-/// would be a number this layer invented.
-fn arg_width(arg: &Arg) -> Option<u32> {
-    match arg {
-        Arg::Arena { width, .. } | Arg::Named { width, .. } => Some(*width),
-        Arg::Weight(_) => None,
-    }
-}
-
-/// Where each of a launch's binding slots gets what it holds.
-///
-/// This is the step the first version of the Vulkan binder did not have, and
-/// its absence was silent: binding a plan's operands positionally agrees with
-/// the row for 1094 of the 3992 rectangles that tree had when it was measured
-/// and disagrees for **2898**, across twelve symbols. Every one of those
-/// dispatched, and every one bound a real buffer of a plausible size to the
-/// wrong slot.
-///
-/// It is if anything quieter here. Every operand in this table is a storage
-/// buffer, and a `wgpu` bind group is validated against its LAYOUT -- which
-/// says "storage buffer" at every one of those entries -- so a shuffled set is
-/// accepted by the strictest thing in the stack.
-///
-/// `rms_single_row` is the clearest case: the shader is `0=x, 1=w, 2=out`, the
-/// row says `In(0), Weight(0), Out(0)`, and the trace says `In(0), Out(0),
-/// Weight(0)`. Positionally the norm reads its own output as the weight and
-/// writes the weight buffer.
-///
-/// # The unstated rows are launchable, and this is where that is carried
-///
-/// A row that states no operands has never told anyone an order, so the
-/// trace's is the only one there is -- and `driver-metal` binds exactly that.
-/// The 56 unstated rows are 292 entrypoints including `affine_qmm_t`,
-/// `sdpa_paged_tiled`, `gdn_core` and `argmax_logits`, which is most of what a
-/// model runs, so treating them as unlaunchable would be treating the backend
-/// as unusable. The fallback below is not a convenience; it is the majority
-/// path.
-///
-/// # Errors
-///
-/// The first [`Unbindable`] any slot produces, with the SLOT's index -- not
-/// the plan operand's, since a refusal points at a bind-group entry.
-pub fn reorder<'a, R: Resolve>(
-    sig: &kernels::KernelSig,
-    lowered: &Lowered,
-    launch: &Launch,
-    arena: Arena<'a, R::Buffer>,
-    resolver: &'a R,
-    min_offset: u64,
-) -> Result<Vec<Slot<'a, R::Buffer>>, (usize, Unbindable)> {
-    if sig.operands.is_empty() {
-        return Ok(bind(lowered, launch, arena, resolver, min_offset)?
-            .into_iter()
-            .map(Slot::Buffer)
-            .collect());
-    }
-
-    let span = launch.args.start as usize..launch.args.end as usize;
-    let args = &lowered.args[span];
-    let Runs { ins, outs, weights } = runs(sig, args);
-    let (ins, outs, weights) = (&ins[..], &outs[..], &weights[..]);
-
-    let layer = launch.layers.start;
-    let mut slots = Vec::with_capacity(sig.operands.len());
-    for (slot, operand) in sig.operands.iter().enumerate() {
-        let one = |at: Option<&usize>| -> Result<Slot<'a, R::Buffer>, Unbindable> {
-            let at = at.ok_or(Unbindable::NoOperand)?;
-            resolve(&args[*at], launch, arena, resolver, min_offset).map(Slot::Buffer)
-        };
-        let held = |b: Option<&'a R::Buffer>,
-                    what: FireTable|
-         -> Result<Slot<'a, R::Buffer>, Unbindable> {
-            b.map(Bound::whole)
-                .map(Slot::Buffer)
-                .ok_or(Unbindable::NoDriverResource(what))
-        };
-        let got = match operand.source {
-            kernels::Source::In(i) => one(ins.get(i as usize)),
-            kernels::Source::Out(i) => one(outs.get(i as usize)),
-            kernels::Source::Weight(i) => one(weights.get(i as usize)),
-            // The KV cache is per-LAYER state. The layer span of a rectangle
-            // is always one wide, so its start is the layer.
-            kernels::Source::KvKeys => resolver
-                .kv(layer, false)
-                .map(Bound::whole)
-                .map(Slot::Buffer)
-                .ok_or(Unbindable::NoKvCache {
-                    layer,
-                    values: false,
-                }),
-            kernels::Source::KvValues => resolver
-                .kv(layer, true)
-                .map(Bound::whole)
-                .map(Slot::Buffer)
-                .ok_or(Unbindable::NoKvCache {
-                    layer,
-                    values: true,
-                }),
-            kernels::Source::TokenIds => {
-                held(resolver.table(FireTable::TokenIds), FireTable::TokenIds)
-            }
-            kernels::Source::Positions => {
-                held(resolver.table(FireTable::Positions), FireTable::Positions)
-            }
-            kernels::Source::RequestOfToken => held(
-                resolver.table(FireTable::RequestOfToken),
-                FireTable::RequestOfToken,
-            ),
-            kernels::Source::KvPageIndices => held(
-                resolver.table(FireTable::KvPageIndices),
-                FireTable::KvPageIndices,
-            ),
-            kernels::Source::KvPageIndptr => held(
-                resolver.table(FireTable::KvPageIndptr),
-                FireTable::KvPageIndptr,
-            ),
-            kernels::Source::AttentionMask => held(
-                resolver.table(FireTable::AttentionMask),
-                FireTable::AttentionMask,
-            ),
-            kernels::Source::AttentionMaskEnabled => held(
-                resolver.table(FireTable::AttentionMaskEnabled),
-                FireTable::AttentionMaskEnabled,
-            ),
-            kernels::Source::KvWritePage => held(
-                resolver.table(FireTable::KvWritePage),
-                FireTable::KvWritePage,
-            ),
-            kernels::Source::KvWriteOffset => held(
-                resolver.table(FireTable::KvWriteOffset),
-                FireTable::KvWriteOffset,
-            ),
-            kernels::Source::RopeFrequencies => held(
-                resolver.table(FireTable::RopeFrequencies),
-                FireTable::RopeFrequencies,
-            ),
-            kernels::Source::SamplingIndices => held(
-                resolver.table(FireTable::SamplingIndices),
-                FireTable::SamplingIndices,
-            ),
-            // Slots the row states and nothing binds. `Unbound` is a gap kept
-            // on purpose; everything else here is a SCALAR, which does not
-            // come out of the operand list at all -- it rides a parameter
-            // buffer at whatever slot the row placed it, and `scalars` decides
-            // where that is.
-            kernels::Source::Unbound => Ok(Slot::Nothing),
-            // EVERY remaining source, spelled out, and the reason is a defect
-            // this file has already made once. `_ => Ok(Slot::Params)` sent
-            // anything unrecognised to the parameter buffer -- a scalar the
-            // TEXT states -- and a source that means a fact about the FIRE
-            // then arrives as whatever the text happened to put there.
-            // `Source::OutWidth` did exactly that at the sister site in
-            // `scalars`, where a `_ => {}` produced a silent zero: a width of
-            // zero is a grid of nothing, and the dispatch returned success
-            // over untouched memory.
-            //
-            // The `LaunchRule` match in `geometry.rs` is enumerated for the
-            // same reason and says so; this one now is too, so a variant added
-            // to `Source` tomorrow stops this build instead of being read as a
-            // parameter. That property is NOT free elsewhere:
-            // `driver-vulkan/src/binding.rs:683` catches all and answers
-            // `None`, so a new source lands there silently.
-            kernels::Source::WeightNamed
-            | kernels::Source::WeightNamed2
-            | kernels::Source::WeightSuffix(_)
-            | kernels::Source::Param(_)
-            | kernels::Source::ParamF32(_)
-            | kernels::Source::KvHeadStride
-            | kernels::Source::KvSeqStride
-            | kernels::Source::KvPageSize
-            | kernels::Source::AttentionMaskStride
-            | kernels::Source::KvLayerView
-            | kernels::Source::KvLayerField(_)
-            | kernels::Source::RequestCount
-            | kernels::Source::Rows
-            | kernels::Source::ResultOrRegion(_)
-            | kernels::Source::Aux(_)
-            | kernels::Source::OutRows(_)
-            | kernels::Source::InRows(_)
-            | kernels::Source::OutWidth(_)
-            | kernels::Source::InWidth(_)
-            | kernels::Source::OutElements(_)
-            | kernels::Source::InElements(_)
-            | kernels::Source::InDim(_, _)
-            | kernels::Source::OutDim(_, _)
-            | kernels::Source::Attn(_)
-            | kernels::Source::AttnWindow
-            | kernels::Source::AttnPlan(_)
-            | kernels::Source::AttnNonZero(_)
-            | kernels::Source::Gdn(_)
-            | kernels::Source::GdnSlab(_)
-            | kernels::Source::CtxByLayer(_)
-            | kernels::Source::Ctx(_)
-            | kernels::Source::CtxNonZero(_)
-            | kernels::Source::RoutesOfParam(_)
-            | kernels::Source::Lit(_)
-            | kernels::Source::Width(_)
-            | kernels::Source::Mul(_, _)
-            | kernels::Source::Sub(_, _)
-            | kernels::Source::Div(_, _)
-            | kernels::Source::Isqrt(_)
-            | kernels::Source::Ne(_, _)
-            | kernels::Source::Or(_, _)
-            | kernels::Source::IfPresent(_, _, _)
-            | kernels::Source::PerHeadDim
-            | kernels::Source::NamedScale
-            | kernels::Source::RotaryWidth
-            | kernels::Source::LayerScale
-            | kernels::Source::Beta => Ok(Slot::Params),
-        };
-        slots.push(got.map_err(|e| (slot, e))?);
-    }
-    Ok(slots)
-}
+// RETIRED: THE ROW PATH, which had no production caller left once
+// `dispatch::plan_one` stopped forking.
+//
+// `plan_one` plans through the arm or answers `Undispatchable::Unknown`, and
+// `plan_by_row` -- the only thing in this crate that ever handed a
+// `kernels::KernelSig` to this module -- went with the fork. What stood here
+// was `Runs`, `runs`, `reorder`, `scalars`, `is_buffer_kind` and `arg_width`,
+// held up by nothing but their own unit tests. That is the dual maintenance
+// the crossing exists to end: row-shaped code cannot go WRONG once the table
+// is empty, only SILENT, and silent reads exactly like passing.
+//
+// WHAT THEY DID, since a reader who never saw them cannot audit what is gone.
+//
+// `runs` split a launch's `Arg` slice into three index runs -- inputs,
+// outputs, weights. `Launch::args` states the weights as the ones that ARE
+// `Arg::Weight`, and splits inputs from outputs by COUNT rather than by kind;
+// only the row knew that count, as one past the highest `Source::Out(i)` it
+// named, clamped to what the trace actually handed over. `Runs` was a type
+// rather than three lines inside `reorder` because `scalars` needed the
+// identical split to answer `Source::OutWidth`, and two copies of the
+// arithmetic would have been two chances to disagree about which arg is an
+// output -- a kernel handed the wrong pointer or the wrong row pitch, both of
+// which compute rather than fail.
+//
+// `reorder` bound a rectangle in the ROW's operand order rather than the
+// trace's. A plan states its operands as inputs, then outputs, then weights;
+// a shader binds them in the order its row states, and those are not the same
+// order -- `rms_single_row` was `x, w, out, params` against a trace's `In(0),
+// Out(0), Weight(0)`, so positionally the norm read its own output as the
+// weight and wrote the weight buffer. So `reorder` walked the row and filled
+// slot k from whatever that row's k-th `Source` named: the trace's n-th
+// input, the layer's KV keys or values, one of the fire tables,
+// `Slot::Nothing` for an `Unbound` gap the module declares and nothing
+// fills, and `Slot::Params` for a scalar, which takes a row slot whether or
+// not it takes a bind-group entry. A row that stated NO operands fell back to
+// the plan's own order, which was the majority path while it existed.
+//
+// `scalars` resolved each `kernels::Source` into a NUMBER and decided where
+// the number went. The statement's own run answered `Param(i)` and
+// `ParamF32(i)`; the resolver answered the pool's page size, the mask stride
+// and the fire's rows; the LAUNCH answered the derived family -- `OutWidth`,
+// `InWidth`, `OutElements`, `InElements` -- from its row span and its
+// operands' stated widths, which is what `arg_width` read. The run then went
+// either into the `@group(1)` uniform block at the offsets the shader
+// declares, or, where the row gave a `Param` operand a buffer kind and so
+// said "the rest of this run is a STRUCT", into the `@group(0)` entry
+// `kernels_wgpu::bindings` named for it. `is_buffer_kind` was how an operand
+// that owed the run nothing was told from one that owed it a word, read off
+// the operand's KIND rather than off a list of source names.
+//
+// WHERE THE SAME WORK HAPPENS NOW. `lowering::hold`'s `Handles` mints a handle
+// per ask -- `input`, `output`, `weight`, `table`, `kv`, `unbound`,
+// `params_block` -- and records each as an `Asked`, whose five variants
+// (`Operand`, `Params`, `Table`, `Unbound`, `Kv`) are the closed set that
+// replaced the row's open source vocabulary; the numbers an arm cannot read
+// off the statement with `stated`, `param` and `param_f32` it computes itself
+// and passes as `ArgValue`s. `lowering::routine::state` runs the body and
+// splits what it dispatched by VARIANT, buffers from scalars, so neither can
+// renumber the other. `lowering::routine::bind` is then what `reorder` and
+// `scalars` were together: the buffer list comes from the body's handles
+// against what the arm resolved, the scalar run is packed from its
+// `ArgValue`s at WGSL's alignment rather than concatenated, and the parameter
+// block lands at `ParamSlot::Storage` where the body asked for one and
+// `ParamSlot::Uniform` where the module declares one. Per-symbol cover is
+// `arm::tests::handles_are_minted_in_the_order_the_body_asks` and
+// `arm::tests::a_statement_the_arm_cannot_fill_is_refused`; the placement's
+// is `routine::tests::a_usize_scalar_is_eight_aligned_in_the_block`,
+// `two_parameter_blocks_in_one_dispatch_are_refused_by_name` and
+// `scalars_wider_than_the_modules_block_are_refused_by_name`; the corpus-wide
+// cover is `tests/arena.rs`'s
+// `every_launchs_scalars_land_where_its_module_reads_them`, re-anchored off
+// `scalars` onto `routine::state`, and
+// `every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal`.
+// The contiguous-cache refusal `scalars` made by name is now
+// `arm::contiguous_pool`, which narrows it rather than inheriting it: a fire
+// whose pool states a page size is refused, a fire whose pool has none is
+// served.
+//
+// WHAT IS LOST, AND NOT MERELY RELOCATED.
+//
+// * THE COMPILER NO LONGER GUARDS `kernels::Source`. `reorder`'s match named
+//   all SIXTY-FOUR variants individually, with a comment saying why it must
+//   never catch all, so a variant added to the shared vocabulary failed THIS
+//   build until this module said whether it was a buffer or a number. Nothing
+//   replaces that. `Asked` being closed is a weaker and different claim: it
+//   says an arm cannot ask for something unresolvable, not that a source
+//   added to `kernels` is noticed here. `driver-vulkan` never had the
+//   property -- it caught all and answered `None` -- and now neither does
+//   this backend.
+// * FIVE REFUSALS BECOME UNCONSTRUCTIBLE AND UNNAMED. `Unbindable::
+//   {NoOperand, NoDriverResource, NoKvCache}` and `Misplaced::{Unresolved,
+//   Contiguous}` were built here and nowhere else. The variants stay --
+//   `dispatch.rs` and `hold.rs` cite the last two by name for the refusals
+//   that took their place -- but nothing produces them and no test names
+//   them, so `tests/citations.rs`'s census is five short: its `UNNAMED` list
+//   and the totals its own doc quotes have to move, and that edit is a
+//   coverage LOSS being recorded, not progress.
+// * THE PARAMS-STRUCT ASSUMPTION WENT UNVERIFIED RATHER THAN BECOMING TRUE.
+//   `Params` carries one buffer, so a row naming both a `Buf`-kinded `Param`
+//   operand -- a struct that swallows the whole scalar tail -- and scalar
+//   operands of its own would have had its uniform fields silently dropped on
+//   the way to the device. A walk over the table pinned that no row did both;
+//   it retired blind when the table emptied. `routine::bind` does not inherit
+//   the hazard, because it appends the body's own scalars INSIDE the storage
+//   block and a body with both loses neither, but the claim about rows was
+//   never settled and there is no table left to settle it against.
+// * THE DERIVED FAMILY LOSES ITS WORKED EXAMPLE. `Misplaced::Unresolved`
+//   exists because `kernels-metal` grew `add_bias` for the Qwen-2 attention
+//   biases -- served as fluent wrong text until then, because no kernel added
+//   them -- and its `width` operand was `Source::OutWidth`, which a
+//   fallthrough here answered with a ZERO: a row pitch of nothing, which
+//   biases element 0 of every row or launches a grid of nothing and reports
+//   success over the unbiased projection. An arm computes its own widths from
+//   the statement and `Facts`, so the shape has no door on this path; what is
+//   gone is the example that showed what a plausible zero costs, and the two
+//   tests that held it.
+//
+// `driver-metal` and `driver-vulkan` deleted their equivalents first. Vulkan
+// took `binding::{reorder, scalars, descriptors, runs, is_buffer_kind, Runs}`
+// and the nine unit tests that only exercised them, leaving `extent`,
+// `resolve`, `bind`, `params` and `params_from` -- which, `descriptors` and
+// `Slot` aside, is exactly what remains here.
 
 /// Which bind-group slot a launch's parameter buffer goes in.
 ///
@@ -1148,71 +970,49 @@ pub enum Misplaced {
         /// in bytes.
         blocks: Vec<u32>,
     },
-    /// The row names a scalar this driver cannot work out.
-    ///
-    /// A NAMED refusal where there used to be a zero, and the change is the
-    /// point. [`kernels::Source`] has a family of DERIVED scalars -- the width
-    /// of a result, the row count of an operand, an element product -- that no
-    /// entry of `Lowered::params` holds: the driver computes them from the
-    /// launch. A `_ => 0` arm for those is the worst possible default, because
-    /// zero is a plausible number: a width of zero is a grid of nothing, which
-    /// dispatches nothing, reads back as the zeros the buffer was born with,
-    /// and completes successfully. `.wiki/new-driver/vulkan.md` §9 and §12 are
-    /// about exactly that failure.
-    ///
-    /// It was not hypothetical. `kernels-metal` grew a hundredth row --
-    /// `add_bias`, the Qwen-2 attention biases that were being served as
-    /// fluent wrong text because no kernel added them -- and its `width`
-    /// operand is [`kernels::Source::OutWidth`], which this module resolved as
-    /// zero. `dispatch.rs`'s stated-entrypoint sweep is what caught it, one
-    /// row after the row landed.
-    ///
-    /// Reachable only by a row naming a source outside
-    /// [`Self::Count`]'s handled set; the sweep in this module's own tests
-    /// pins that no row in `kernels-wgpu`'s table does today.
-    Unresolved {
-        /// Which operand of the row, counting from zero.
-        at: usize,
-        /// The operand's name, as the row spells it.
-        name: &'static str,
-        /// The [`kernels::Source`] variant, rendered -- `Source` is not `Eq`,
-        /// so it cannot be carried whole in a type that is.
-        source: String,
-    },
-    /// The row addresses the KV cache CONTIGUOUSLY, and this driver's pool is
-    /// paged.
-    ///
-    /// [`kernels::Source::KvHeadStride`] and [`kernels::Source::KvSeqStride`]
-    /// appear on exactly the rows that walk the cache with two strides and no
-    /// page table -- `kv_append`, `sdpa_vector_decode`, `sdpa_vector_decode_
-    /// swa`. `attn/kv_write.wgsl` shows the pair side by side: the paged
-    /// writer takes `page_size` and `n_kv_heads`, the contiguous one takes the
-    /// strides and computes `h * head_stride + pos * seq_stride + d`.
-    ///
-    /// `resources::Shape` allocates `[page, token, head, dim]` for every fire
-    /// this driver runs, so that expression is right only while the fire's
-    /// pages happen to be physically consecutive from zero -- true of one
-    /// freshly-allocated sequence and false of the second one. It reads real
-    /// memory at every step and attends to the WRONG TOKENS: nothing faults,
-    /// nothing is out of bounds, and the text stays fluent.
-    ///
-    /// `crates/model` reached the same conclusion from the other side and
-    /// stopped emitting these rows (*"no contiguous attention over a paged
-    /// pool"*). This is the same fact said where it is a fact -- the pool's
-    /// layout is the DRIVER's, and a text is not the last thing that can be
-    /// wrong about it.
-    ///
-    /// The refusal is blanket rather than conditional on the translation being
-    /// the identity. A driver that served these rows *sometimes* would be
-    /// correct on the first request of a fresh cache and wrong afterwards,
-    /// which is the worst way to be wrong.
-    Contiguous {
-        /// Which operand of the row, counting from zero.
-        at: usize,
-        /// The operand's name, as the row spells it.
-        name: &'static str,
-    },
 }
+
+// RETIRED: `Misplaced::{Unresolved, Contiguous}` -- nothing builds them.
+//
+// Both were raised by `scalars`, which read a row's `kernels::Source` column
+// and is deleted with the rest of the row path.
+//
+// `Unresolved` said: a row named a `Source` this driver cannot work out, and a
+// NAMED refusal is better than the zero it would otherwise place -- because
+// zero is a PLAUSIBLE number. A width of zero is a grid of nothing, which
+// dispatches nothing, reads back as the zeros the buffer was born with, and
+// completes successfully. It was not hypothetical: `kernels-metal` grew a
+// hundredth row, `add_bias` for the Qwen-2 attention biases that were being
+// served as fluent wrong text because no kernel added them, and its `width`
+// operand is `Source::OutWidth`, which this module resolved as zero.
+//
+// `Contiguous` said something worse. `Source::KvHeadStride` and
+// `Source::KvSeqStride` appear on exactly the rows that walk the cache with
+// two strides and no page table -- `kv_append`, `sdpa_vector_decode`,
+// `sdpa_vector_decode_swa`. `resources::Shape` allocates `[page, token, head,
+// dim]` for every fire this driver runs, so `h * head_stride + pos *
+// seq_stride + d` is right only while a fire's pages happen to be physically
+// consecutive from zero -- true of one freshly-allocated sequence and false of
+// the second. It reads real memory and attends to the WRONG TOKENS: nothing
+// faults, nothing is out of bounds, and the text stays fluent. The refusal was
+// blanket rather than conditional on the translation being the identity,
+// because a driver that served these SOMETIMES would be correct on the first
+// request of a fresh cache and wrong afterwards.
+//
+// THAT SECOND CLAIM IS NOT LOST. `lowering::hold::contiguous_pool` makes it on
+// the routine plane, for the same three kernels, by asking the FIRE rather
+// than the row: a non-zero `FireNumber::KvPageSize` means the pool is paged,
+// and a stride over it is `Refusal::Absent` with the reason in the message.
+// `crates/model` reached the same conclusion from the third side and stopped
+// emitting these kernels for a paged pool.
+//
+// THE FIRST CLAIM IS LOST, and there is no honest place to put it: a routine
+// takes its scalars as typed arguments, so "a source this driver cannot work
+// out" is not a state that can be reached -- the compiler refuses a body whose
+// argument no arm supplies. That is the refactor working rather than a gap,
+// but it means the `add_bias` class of defect is caught by the type checker
+// now and not by a named refusal, and a reader looking for that refusal will
+// not find one.
 
 impl core::fmt::Display for Misplaced {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -1226,17 +1026,6 @@ impl core::fmt::Display for Misplaced {
                 "{stated} scalars stated; the uniform block holds {uniform} and \
                  the sized storage blocks are {blocks:?}"
             ),
-            Self::Unresolved { at, name, source } => write!(
-                f,
-                "operand {at} (`{name}`) is sourced from {source}, which this \
-                 driver does not know how to work out"
-            ),
-            Self::Contiguous { at, name } => write!(
-                f,
-                "operand {at} (`{name}`) is a contiguous KV stride, and this \
-                 driver's pool is paged: the row would read real memory at \
-                 the wrong tokens"
-            ),
         }
     }
 }
@@ -1245,8 +1034,10 @@ impl core::error::Error for Misplaced {}
 
 /// Place one launch's scalars the way its module wants them.
 ///
-/// For a row that states no operands, which has no layout of its own to place
-/// them by. [`scalars`] is what a stated row goes through.
+/// The MODULE's reading of where the plan's own scalar run goes, and the only
+/// reading left: the row that used to place its own is retired above
+/// [`ParamSlot`], and a routine's scalars are packed and placed by
+/// [`crate::lowering::routine::bind`].
 ///
 /// # Errors
 ///
@@ -1259,193 +1050,6 @@ pub fn params(
 ) -> Result<Params, Misplaced> {
     let stated = &lowered.params[launch.params.start as usize..launch.params.end as usize];
     params_from(stated, declared)
-}
-
-/// The scalars one launch hands one module, in the order the ROW places them.
-///
-/// The statement's own run is a flat list the row indexes into, and a row may
-/// index into only part of it: `neox_mb` states `ParamF32(0), ParamF32(1),
-/// Param(2)` against a plan that carries four. Taking the run whole was
-/// refusing it as one scalar too many.
-///
-/// A row also interleaves numbers the DRIVER resolves. `kv_append_paged` is
-/// `Param(0), KvPageSize, Param(1)` -- the page size is a property of the pool,
-/// not of the statement, and it lands between the two scalars the statement did
-/// carry, not after them. Both paged decodes do the same, which is exactly the
-/// one word each was short of.
-///
-/// # Errors
-///
-/// [`Misplaced`], as [`params`] -- with the run this built, so the count in the
-/// refusal is the count the module would have been given.
-pub fn scalars<R: Resolve>(
-    sig: &kernels::KernelSig,
-    lowered: &Lowered,
-    launch: &Launch,
-    declared: &crate::reflect::Declared,
-    resolver: &R,
-) -> Result<Params, Misplaced> {
-    let stated = &lowered.params[launch.params.start as usize..launch.params.end as usize];
-    if sig.operands.is_empty() {
-        return params_from(stated, declared);
-    }
-    // Which `@group(0)` entry a `Param` operand of buffer kind takes, if the
-    // row has one. Read off `kernels_wgpu::bindings` rather than counted here,
-    // so the driver and a test asking the same question ask it of one place.
-    let bindings = kernels_wgpu::bindings(sig);
-    let span = launch.args.start as usize..launch.args.end as usize;
-    let args = &lowered.args[span];
-    let split = runs(sig, args);
-    // The derived scalars, in one place. Each is computed from the LAUNCH --
-    // its row span and its operands' stated widths -- because no entry of
-    // `Lowered::params` holds them: a bias vector's length is the projection's
-    // width, and the trace already said that when it sized the output, so a
-    // row that needs the pitch names where to READ it rather than which scalar
-    // slot holds it.
-    //
-    // `None` is a refusal below and never a zero. Which of these a row may name
-    // used to be settled by a walk over the table; with the table empty it is
-    // settled by the COMPILER, because `reorder`'s `Source` match is exhaustive
-    // and a variant added to `kernels::Source` fails to build until this
-    // module says what it resolves to.
-    let derived = |source: kernels::Source| -> Option<u32> {
-        let rows = launch.rows.end - launch.rows.start;
-        let width =
-            |run: &[usize], i: u8| run.get(usize::from(i)).and_then(|at| arg_width(&args[*at]));
-        match source {
-            kernels::Source::RequestCount => Some(lowered.n_requests),
-            // The trailing-dims product of one value -- what a row of it is
-            // worth in elements, which is exactly `Arg`'s stated width.
-            kernels::Source::OutWidth(i) => width(&split.outs, i),
-            kernels::Source::InWidth(i) => width(&split.ins, i),
-            // Rows times that width: the ELEMENT count a flat launcher takes
-            // where a row-shaped one takes both. Saturating, because a plan
-            // with an absurd width should reach the refusals below rather than
-            // wrap to a small number that binds.
-            kernels::Source::OutElements(i) => {
-                width(&split.outs, i).map(|w| w.saturating_mul(rows))
-            }
-            kernels::Source::InElements(i) => width(&split.ins, i).map(|w| w.saturating_mul(rows)),
-            // NOT the fire's row count, and that is why they are refused
-            // rather than answered with `rows`. `OutRows` is a value's LEADING
-            // extent: `Rows` for a token-shaped value, a load-time constant
-            // for a fixed one, and for the MoE aligned path the padded
-            // block-major count, which is neither. A driver that answered the
-            // fire's rows would be right for most values and silently wrong
-            // for the ones the source exists to distinguish -- and the plan
-            // does not carry the number, so the honest answer is that this
-            // layer cannot supply it.
-            //
-            // No row in `kernels-wgpu`'s table names one. If one does, this is
-            // the line that has to grow a real answer.
-            kernels::Source::OutRows(_) | kernels::Source::InRows(_) | kernels::Source::Rows => {
-                None
-            }
-            _ => None,
-        }
-    };
-
-    let mut struct_at = None;
-    let mut run: Vec<u32> = Vec::new();
-    for (at, operand) in sig.operands.iter().enumerate() {
-        // A field of the preceding packed struct: the driver's number, added
-        // to the run the struct covers. `row_gather` is the only one --
-        // `Param(0)` there is a `Buf`, which is how a row says "the rest of
-        // this run is a struct in a buffer".
-        if operand.ty == kernels::Ty::InPacked {
-            run.push(
-                derived(operand.source).ok_or_else(|| Misplaced::Unresolved {
-                    at,
-                    name: operand.name,
-                    source: format!("{:?}", operand.source),
-                })?,
-            );
-            continue;
-        }
-        // The two contiguous strides are refused rather than answered. The
-        // pool is `[page, token, head, dim]`, so `Shape::number` CAN produce a
-        // head stride and a sequence stride for it -- and handing them to a
-        // kernel that walks the cache without a page table is what makes the
-        // launch succeed against the wrong tokens. See `Misplaced::Contiguous`.
-        if matches!(
-            operand.source,
-            kernels::Source::KvHeadStride | kernels::Source::KvSeqStride
-        ) {
-            return Err(Misplaced::Contiguous {
-                at,
-                name: operand.name,
-            });
-        }
-        let number = match operand.source {
-            kernels::Source::KvPageSize => Some(FireNumber::KvPageSize),
-            kernels::Source::AttentionMaskStride => Some(FireNumber::AttentionMaskStride),
-            kernels::Source::Rows => Some(FireNumber::Rows),
-            _ => None,
-        };
-        if let Some(want) = number {
-            // Zero rather than a refusal, matching `driver-metal`: a pool that
-            // has not been built yet has no page size, and the caller that has
-            // not built one is not dispatching against it either. Unlike the
-            // derived family above, this one is a question the RESOLVER
-            // answers and a caller that has not built a pool is not
-            // dispatching against it.
-            run.push(resolver.number(want).unwrap_or(0));
-            continue;
-        }
-        match operand.source {
-            kernels::Source::Param(i) | kernels::Source::ParamF32(i) => {
-                // A buffer where a scalar could be is how a row says "the rest
-                // of this run is a struct, and it starts here". So it takes
-                // the whole tail, not one word: `rms_single_row`'s row is one
-                // `Param(0)` against five scalars, and picking the single word
-                // at index 0 refused it as four too many.
-                if matches!(operand.ty, kernels::Ty::Buf | kernels::Ty::BufMut) {
-                    if let Some(kernels_wgpu::Binding::Storage(n)) = bindings.get(at) {
-                        struct_at.get_or_insert(*n);
-                    }
-                    run.extend_from_slice(stated.get(usize::from(i)..).unwrap_or(&[]));
-                } else {
-                    // The `unwrap_or` is unreachable across every row and text
-                    // the Vulkan port measured. Kept because the alternative
-                    // is an index panic on a statement that carried fewer
-                    // scalars than its row indexes, which is a plan defect
-                    // this crate would rather report as a short run than as a
-                    // crash.
-                    run.push(stated.get(usize::from(i)).copied().unwrap_or(0));
-                }
-            }
-            // Every other source is either a BUFFER -- which `reorder` placed
-            // and which contributes no scalar -- or a derived number. The
-            // difference is decided by the operand's KIND rather than by a
-            // list of source names, so a row that grows a new buffer source
-            // does not land in the scalar run by omission and a row that grows
-            // a new derived one does not land in it as a zero.
-            other => {
-                if !is_buffer_kind(operand.ty) {
-                    run.push(derived(other).ok_or_else(|| Misplaced::Unresolved {
-                        at,
-                        name: operand.name,
-                        source: format!("{other:?}"),
-                    })?);
-                }
-            }
-        }
-    }
-
-    // The row's own answer, when it gave one, before the module's. A stated
-    // row that names a `Buf` param has told the driver exactly which entry the
-    // struct is, and the size-matching below is a fallback for the rows that
-    // did not.
-    if let Some(at) = struct_at {
-        if run.is_empty() {
-            return Ok(Params::None);
-        }
-        return Ok(Params::Block {
-            bytes: words(&run),
-            at: ParamSlot::Storage(at),
-        });
-    }
-    params_from(&run, declared)
 }
 
 /// A run of `u32` as little-endian bytes.
@@ -1525,7 +1129,7 @@ pub enum Unlayoutable {
     /// not all unbound.
     ///
     /// A row states every deployment its kernel serves, so a row longer than
-    /// one module is ordinary -- but only where the tail is `Unbound`. A buffer
+    /// one module is ordinary -- but only where the tail is `None`. A buffer
     /// past the end is a buffer nothing can hold.
     Overlong {
         /// How many slots the row states.
@@ -1576,16 +1180,16 @@ impl core::error::Error for Unlayoutable {}
 
 /// Cut a row's slots down to the module's `@group(0)` bindings.
 ///
-/// [`reorder`] answers "what does slot *k* of the ROW hold"; this answers "what
-/// does binding *k* of the module's storage group hold", and they differ in two
-/// measured ways.
+/// A slot list answers "what does slot *k* of the launch hold"; this answers
+/// "what does binding *k* of the module's storage group hold", and they differ
+/// in two measured ways.
 ///
 /// A scalar occupies a row slot whether or not it occupies a bind-group entry.
 /// A row whose scalars ride the uniform block takes NO `@group(0)` entry for
 /// them, so everything after them moves down; a row whose `Param` operand is a
 /// `Buf` does take one, and it is a binding the plan never mentions.
 ///
-/// And a row may be longer than a module: several rows end in `Unbound`, one
+/// And a row may be longer than a module: several rows end in `None`, one
 /// slot past a layout that does not declare it.
 ///
 /// # Errors
@@ -1643,7 +1247,7 @@ pub fn descriptors<'a, B: Allocation>(
     }
 
     // Every empty slot has to be one the module never reads. This is the check
-    // that pins the two readings together: the row's `Unbound` slots and the
+    // that pins the two readings together: the row's unsourced slots and the
     // module's unread bindings have to be the same slots.
     for (at, slot) in out.iter().enumerate() {
         // `false` is the right default for a slot the reflection did not
@@ -2164,76 +1768,6 @@ mod tests {
         l
     }
 
-    /// The rows the tests below use, stated here rather than looked up.
-    ///
-    /// `kernels_wgpu::KERNELS` is EMPTY: all hundred of this backend's kernels
-    /// and all 481 of its entrypoints are reached through a ROUTINE and an
-    /// ARM, and nothing in that crate describes a launch positionally any
-    /// more. A test that asks the table for a row is a test that goes quiet
-    /// the moment the refactor it guards succeeds — and these are not about
-    /// the table. They are about [`scalars`] and [`reorder`], which take a
-    /// `KernelSig` and are still live non-test code: `dispatch::plan_by_row`
-    /// calls both, and it is what serves any symbol `routine::armed` declines.
-    ///
-    /// So each row is written out at the shape it really had, taken from the
-    /// family's own source before it crossed, with the `kernel!` and
-    /// `operands!` spellings the table used. `driver-vulkan/src/binding.rs`
-    /// states the same two KV writers for the same reason and by the same
-    /// means. Scraping a live row only ever stood in for stating one.
-    ///
-    /// `attn/kv_write.wgsl`'s contiguous writer.
-    fn kv_append_sig() -> kernels::KernelSig {
-        kernels::kernel!(kv_append "kv_append",
-            file = Some("attn/kv_write.wgsl"), launch = kernels::LaunchRule::PerHead,
-            operands = kernels::operands![
-                k_new: Buf <- kernels::Source::In(0),
-                v_new: Buf <- kernels::Source::In(1),
-                k_cache: BufMut <- kernels::Source::KvKeys,
-                v_cache: BufMut <- kernels::Source::KvValues,
-                pos: I32s <- kernels::Source::Positions,
-                head_dim: I32 <- kernels::Source::Param(0),
-                // The POOL's, not the statement's, and the two operands
-                // `the_contiguous_kv_writer_is_refused_and_the_paged_one_is_not`
-                // is about.
-                k_head_stride: Usize <- kernels::Source::KvHeadStride,
-                k_seq_stride: Usize <- kernels::Source::KvSeqStride,
-            ],
-            head_param = Some(0),
-            axes = &[kernels_wgpu::axes::BF16])
-    }
-
-    /// `attn/kv_write.wgsl`'s paged writer.
-    ///
-    /// Sparse indices, and the gaps are stated: buffers 4, 6-9, 11 and 15
-    /// belong to a shared ring ABI this kernel does not read. A row is
-    /// POSITIONAL, so it lists them as `Unbound` rather than closing the gap
-    /// and shifting everything after.
-    fn kv_append_paged_sig() -> kernels::KernelSig {
-        kernels::kernel!(kv_append_paged "kv_append_paged",
-            file = Some("attn/kv_write.wgsl"), launch = kernels::LaunchRule::PerHead,
-            operands = kernels::operands![
-                k_new: Buf <- kernels::Source::In(0),
-                v_new: Buf <- kernels::Source::In(1),
-                k_pages: BufMut <- kernels::Source::KvKeys,
-                v_pages: BufMut <- kernels::Source::KvValues,
-                ring_4: Buf,
-                head_dim: I32 <- kernels::Source::Param(0),
-                ring_6: Buf,
-                ring_7: Buf,
-                ring_8: Buf,
-                ring_9: Buf,
-                page_size: I32 <- kernels::Source::KvPageSize,
-                ring_11: Buf,
-                n_kv_heads: I32 <- kernels::Source::Param(1),
-                w_page: U32s <- kernels::Source::KvWritePage,
-                w_off: U32s <- kernels::Source::KvWriteOffset,
-                ring_15: Buf,
-            ],
-            head_param = Some(0),
-            heads_param = Some(1),
-            axes = &[kernels_wgpu::axes::BF16])
-    }
-
     #[test]
     fn scalars_the_uniform_block_holds_go_at_the_offsets_the_shader_declares() {
         let low = with_params(vec![7, 9]);
@@ -2328,174 +1862,6 @@ mod tests {
         );
     }
 
-    /// A contiguous-cache row is refused; the paged one beside it is not.
-    ///
-    /// `attn/kv_write.wgsl` holds both writers. The paged entry point takes
-    /// `page_size` and `n_kv_heads` and walks a page table; the contiguous one
-    /// takes `k_head_stride`/`k_seq_stride` and computes `h * head_stride +
-    /// pos * seq_stride + d`. `resources::Shape` allocates `[page, token,
-    /// head, dim]` for every fire, so `Shape::number` CAN produce both strides
-    /// -- and a launch given them reads real memory at the wrong tokens the
-    /// moment a sequence's pages are not consecutive from zero. Nothing
-    /// faults, nothing is out of bounds, and the text stays fluent.
-    ///
-    /// `crates/model` stopped emitting these rows (*"no contiguous attention
-    /// over a paged pool"*), which guards the texts that exist. This is the
-    /// driver saying it too, because the pool's layout is the driver's fact.
-    ///
-    /// The paged writer is the control: it is the SAME shader file and the
-    /// same kind of row, so a refusal that fired on the file, on `Source::
-    /// KvPageSize`, or on scalars generally would fail here.
-    ///
-    /// Both rows are STATED — [`kv_append_sig`] and [`kv_append_paged_sig`] —
-    /// because `attn` has crossed and the table cannot be asked for either any
-    /// more. The refusal itself has not moved: `scalars` still returns
-    /// `Misplaced::Contiguous` for the two stride sources, and
-    /// `lowering::arm::contiguous_pool` is the routine plane's narrower
-    /// restatement of the same rule, refusing `arm::kv_append`,
-    /// `arm::sdpa_vector_decode` and its windowed sibling with
-    /// `Refusal::Absent` whenever the fire's pool answers a page size.
-    #[test]
-    fn the_contiguous_kv_writer_is_refused_and_the_paged_one_is_not() {
-        let store = Store::default();
-        let placed = |sig: &kernels::KernelSig| {
-            let fields = kernels_wgpu::uniform_layout(sig);
-            let offsets: Vec<u32> = fields.iter().map(|f| f.offset).collect();
-            let low = with_params((0..fields.len() as u32).map(|n| n + 1).collect());
-            scalars(
-                sig,
-                &low,
-                &scalar_launch(fields.len() as u32),
-                &declared(&offsets, &[None; 4]),
-                &store,
-            )
-        };
-        assert!(
-            placed(&kv_append_paged_sig()).is_ok(),
-            "the paged writer still places its scalars"
-        );
-        let why = placed(&kv_append_sig()).expect_err("the contiguous writer is refused");
-        assert!(
-            matches!(
-                why,
-                Misplaced::Contiguous {
-                    name: "k_head_stride",
-                    ..
-                }
-            ),
-            "the refusal names the operand: {why}"
-        );
-        assert!(format!("{why}").contains("paged"), "and says why: {why}");
-    }
-
-    /// `moe/route.wgsl`'s router, as `kernels-wgpu`'s `moe` family stated it.
-    ///
-    /// Five buffers, of which the FOURTH is the params struct — which is what
-    /// makes `Storage(3)` the ROW's answer and not a count the test did.
-    fn router_topk_sig() -> kernels::KernelSig {
-        kernels::kernel!(router_topk "router_topk", file = Some("moe/route.wgsl"),
-            launch = kernels::LaunchRule::RouterLane,
-            operands = kernels::operands![
-                logits: Buf <- kernels::Source::In(0),
-                expert_ids: BufMut <- kernels::Source::Out(0),
-                expert_weights: BufMut <- kernels::Source::Out(1),
-                params: Buf <- kernels::Source::Param(0),
-                // The unscaled variant reads it and does nothing with it; the
-                // slot is positional so it is listed, and `router_topk_scaled`
-                // is the symbol that means it.
-                per_expert_scale: Buf,
-            ],
-            axes = &[kernels_wgpu::axes::BF16])
-    }
-
-    /// A row that names a `Buf` param says where its struct goes; the module
-    /// is not consulted.
-    ///
-    /// The simplification the ABI buys. `driver-vulkan` has to find this by
-    /// scanning the reflection for a block of matching size, because a shader
-    /// is the only place that answer exists there. `kernels_wgpu::bindings`
-    /// states it, so a row that names its params buffer is answered from the
-    /// table and the reflection stays a check.
-    #[test]
-    fn a_row_that_names_its_params_buffer_places_it_from_the_row() {
-        // `rms_single_row` stood here, then `row_gather`, then
-        // `combine_sorted`, then `router_topk` — each until its family
-        // retired, and `moe` was the last of the four. `router_topk`'s arm HAS
-        // now landed, so the comment that stood here is spent: there is no
-        // stated row left in the table to pick, and its sentence about the
-        // claim moving to the routine plane's `bind` is only half true.
-        //
-        // `routine::bind` does stage a `@group(0)` storage block from the
-        // body's ask — `Placed::Params` takes a position and no entry, and the
-        // statement's own run goes in first — but it learns the POSITION from
-        // where the body put the handle, not from an operand list. The claim
-        // that `kernels_wgpu::bindings` answers this and the reflection is
-        // only a check belongs to `scalars`, which `dispatch::plan_by_row`
-        // still calls for every symbol `routine::armed` declines. So the row
-        // is STATED at its real shape rather than the claim being let go.
-        let sig = router_topk_sig();
-        let low = with_params(vec![1, 2, 3, 4, 5]);
-        let store = Store::default();
-        let got = scalars(
-            &sig,
-            &low,
-            &scalar_launch(5),
-            // Deliberately a module that declares NOTHING useful: no uniform
-            // block, no sized storage block. If the placement came from the
-            // reflection this would refuse.
-            &declared(&[], &[None, None, None, None]),
-            &store,
-        )
-        .expect("the row places it");
-        assert_eq!(
-            got,
-            Params::Block {
-                bytes: vec![1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 5, 0, 0, 0],
-                at: ParamSlot::Storage(3),
-            }
-        );
-    }
-
-    /// A row's scalar operands ride the uniform block, and take no entry.
-    ///
-    /// The specimen is `kv_append_paged` and used to be `kv_append`, which is
-    /// now refused outright: its scalars are the contiguous strides, and this
-    /// driver's pool is paged. The paged writer has three scalars of its own
-    /// (`head_dim`, `page_size`, `n_kv_heads`), so it asks the same question
-    /// about a row this driver can actually serve.
-    ///
-    /// STATED at that row's real shape — [`kv_append_paged_sig`] — since
-    /// `attn` has crossed. The placement is still `scalars`'s to make, and the
-    /// two facts asserted are the ones a uniform block exists for: the scalars
-    /// land at `ParamSlot::Uniform` rather than at a `@group(0)` entry, and
-    /// the block is sized to a multiple of 16, which is what `wgpu` refuses a
-    /// uniform binding for not being.
-    #[test]
-    fn a_rows_scalar_operands_are_placed_in_the_uniform_block() {
-        let sig = kv_append_paged_sig();
-        let fields = kernels_wgpu::uniform_layout(&sig);
-        assert!(
-            !fields.is_empty(),
-            "this row was chosen for having scalars; it now has none"
-        );
-        let offsets: Vec<u32> = fields.iter().map(|f| f.offset).collect();
-        let low = with_params((0..fields.len() as u32).map(|n| n + 1).collect());
-        let store = Store::default();
-        let got = scalars(
-            &sig,
-            &low,
-            &scalar_launch(fields.len() as u32),
-            &declared(&offsets, &[None; 4]),
-            &store,
-        )
-        .expect("placed");
-        let Params::Block { bytes, at } = got else {
-            panic!("a row with scalars places them somewhere");
-        };
-        assert_eq!(at, ParamSlot::Uniform);
-        assert_eq!(bytes.len() % 16, 0);
-    }
-
     /// A uniform block takes no `@group(0)` entry, and a struct does.
     #[test]
     fn a_uniform_block_is_not_a_storage_binding_and_a_struct_is() {
@@ -2574,7 +1940,7 @@ mod tests {
                 module: 1
             })
         );
-        // And an `Unbound` tail past the same module is dropped, not refused.
+        // And an unsourced tail past the same module is dropped, not refused.
         let laid = descriptors(
             vec![Slot::Buffer(Bound::whole(&buf)), Slot::Nothing],
             &Params::None,
@@ -2611,397 +1977,6 @@ mod tests {
         );
     }
 
-    // RETIRED: THE TABLE IS EMPTY, so the walk has no row to read.
-    //
-    // It asserted the assumption `scalars` rests on: that NO stated row names
-    // both a `Buf`-kinded `Param`/`ParamF32` operand — a params STRUCT, which
-    // takes a `@group(0)` entry and swallows the statement's whole scalar tail
-    // — and scalar operands of its own, which ride the `@group(1)` uniform
-    // block. `Params` carries ONE buffer, so a row with both would have had
-    // its uniform fields silently dropped on the way to the device; the honest
-    // fix would have been a second field, not a guess about which of the two
-    // the shader really reads. It was pinned as a walk rather than argued,
-    // because the shape is not hypothetical: `norm/rms.wgsl` declares a
-    // `RmsParams` STORAGE struct and a `Strided` UNIFORM block in the same
-    // file, and it was only that the variant stating operands
-    // (`rms_single_row`) was not the variant with both.
-    //
-    // It BECAME BLIND, not true. Nothing established that no row wants both;
-    // there are no rows. The walk's own floor is what made that audible rather
-    // than letting it pass over an empty iterator — `assert!(stated >= 10)`,
-    // written as "a FLOOR, and it falls as Stage 3 empties the table; it
-    // exists so that a walk reading nothing cannot pass" — so this retires by
-    // failing, which is the outcome the floor was for.
-    //
-    // The routine plane does not inherit the assumption, which is why it is
-    // not restated as a synthetic row. `lowering::routine::bind` takes the
-    // storage-block branch when the body asks for one and appends the body's
-    // own packed scalars to the statement's run INSIDE that block, so a body
-    // that has both does not lose either — the drop this walk was watching for
-    // is unrepresentable there rather than unobserved. What is left refusable
-    // is refused by name: `Unplanned::Blocks` for a body binding two parameter
-    // blocks in one dispatch (`routine::tests::
-    // two_parameter_blocks_in_one_dispatch_are_refused_by_name`) and
-    // `Unplanned::Scalars` for a run wider than the module's uniform block
-    // (`routine::tests::scalars_wider_than_the_modules_block_are_refused_by_
-    // name`).
-
-    /// The `add_bias` row, written out rather than scraped.
-    ///
-    /// `norm/add_bias.wgsl` is Qwen-2's attention biases, ported operand for
-    /// operand from `kernels-metal`'s row, which is `kernels-cuda`'s and
-    /// `kernels-vulkan`'s: IN PLACE over the value it biases, the bias off the
-    /// statement's named weight, and the row width DERIVED rather than stated
-    /// — an `AddBias` carries no scalars, because a bias vector's length is
-    /// the projection's width and the trace knew it when it sized the output.
-    ///
-    /// `norm` has crossed and the row is gone, but what the two tests below
-    /// are about is `binding`'s arm for `Source::OutWidth`, which is still
-    /// reachable: a row anywhere in the fleet may name it, and the catch-all
-    /// this file used to have answered zero. `driver-vulkan/src/binding.rs`
-    /// keeps the same `add_bias_sig` for the same pair of tests.
-    fn add_bias_sig() -> kernels::KernelSig {
-        kernels::kernel!(add_bias "add_bias", file = Some("norm/add_bias.wgsl"),
-            launch = kernels::LaunchRule::RouteRows,
-            in_place = &[(0, 0)],
-            operands = kernels::operands![
-                out: BufMut <- kernels::Source::Out(0),
-                bias: Buf <- kernels::Source::Weight(0),
-                width: I32 <- kernels::Source::OutWidth(0),
-            ],
-            axes = &[kernels_wgpu::axes::BF16])
-    }
-
-    /// A derived scalar is the launch's own number, not a zero and not a guess.
-    ///
-    /// `add_bias` is the row this is written for, and it arrived as a defect
-    /// rather than as a feature: `kernels-metal` grew a hundredth row for the
-    /// Qwen-2 attention biases -- which had been served as fluent WRONG TEXT,
-    /// because no kernel added them -- and its `width` operand is
-    /// [`kernels::Source::OutWidth`], a source this module used to fall
-    /// through to zero.
-    ///
-    /// A zero is the worst possible answer here and not a neutral one. The
-    /// width is a row pitch: at zero the shader adds the bias to element 0 of
-    /// every row, or launches a grid of nothing, and either way it returns
-    /// success over a buffer that still holds the projection it was supposed
-    /// to bias. Nothing reports it.
-    ///
-    /// So the assertion is on the VALUE. `add_bias`'s output is 4096 wide, and
-    /// 4096 is what the uniform block has to carry.
-    #[test]
-    fn a_derived_width_is_the_launchs_own_width() {
-        // `add_bias`'s row stood here, and it was the last in the table to
-        // name a derived width — `norm` retired and `Source::OutWidth` went
-        // with it. The DERIVATION is still `scalars`'s to make, and a table
-        // with no row exercising it is exactly how a source falls back to
-        // zero unnoticed, so the row is STATED rather than the test deleted.
-        // See [`add_bias_sig`].
-        let sig = add_bias_sig();
-
-        // The trace hands over the output and then the weight.
-        let lowered = {
-            let mut low = lowered(vec![
-                Arg::Arena {
-                    at: 0,
-                    width: 4096,
-                    bytes: 2,
-                },
-                Arg::Weight("bias".into()),
-            ]);
-            low.params = Vec::new();
-            low
-        };
-        let mut launch = launch(8, 2);
-        launch.params = 0..0;
-
-        let d = declared(&[0], &[None, None]);
-        let got = scalars(&sig, &lowered, &launch, &d, &Store::default()).expect("resolves");
-        let Params::Block { bytes, at } = got else {
-            panic!("a row with a scalar places it somewhere");
-        };
-        assert_eq!(at, ParamSlot::Uniform);
-        assert_eq!(
-            &bytes[0..4],
-            &4096u32.to_le_bytes(),
-            "the width the plan gave the output, not a zero and not the fire's"
-        );
-    }
-
-    // RETIRED: THE TABLE IS EMPTY, so the sweep has no stated row to ask
-    // about.
-    //
-    // It walked every row of `kernels_wgpu::KERNELS` that stated operands,
-    // built a plan shaped from the ROW — one arena operand per input and
-    // output, one weight per weight, because the derived sources are answered
-    // from the launch's args and a plan that did not match would have made the
-    // sweep pass for the wrong reason — and asked `scalars` for each. The
-    // claim was that NO source a row names reaches `scalars`'s fallthrough:
-    // every one either resolves or comes back as `Misplaced::Unresolved`
-    // naming itself. It was written after the fact it would have caught.
-    // `kernels-metal` grew a hundredth row for the Qwen-2 attention biases,
-    // `add_bias`, whose `width` operand is `Source::OutWidth`; this module
-    // answered that source with a ZERO, which is a row pitch of nothing — the
-    // shader biases element 0 of every row, or launches a grid of nothing, and
-    // returns success over the unbiased projection either way.
-    //
-    // It BECAME BLIND. Zero rows named zero sources, so nothing was
-    // established about any of them; the walk stopped looking rather than
-    // started agreeing. Its `assert_eq!(checked, 12)` is what said so out loud
-    // instead of letting an empty iterator pass — the same floor
-    // `no_stated_row_wants_a_params_struct_and_a_uniform_block_at_once` had,
-    // and it worked the same way.
-    //
-    // Its own doc named what it could NOT catch, and that half survives
-    // unchanged: a variant added to `kernels::Source` that no row uses is
-    // invisible to any walk over rows, and the guard for it is the COMPILER —
-    // `reorder` enumerates every variant of `Source` individually rather than
-    // catching all, so a new one stops this build. That is not free elsewhere;
-    // `driver-vulkan/src/binding.rs` catches all and answers `None`, so a new
-    // source lands there silently.
-    //
-    // The half that was about ROWS has no counterpart on the routine plane
-    // and does not need one, because the plane has no source vocabulary to
-    // fall through. An arm computes each number itself and hands it over as an
-    // `ArgValue`: `lowering::arm::Handles` mints a handle per ask and
-    // `arm::Asked::{Operand, Params, Unbound, Kv, Table}` is the closed set of
-    // what a body can want, so there is no lookup that can return a plausible
-    // zero. A value an arm cannot produce is a `Refusal` (`arm::tests::
-    // a_statement_the_arm_cannot_fill_is_refused`), which `lowering::routine::
-    // plan` turns into a named `Unplanned::{Operand, NoCache, Absent}`. The
-    // census that succeeded this one is `arm::tests::
-    // every_entrypoint_is_claimed_by_the_stem_that_owns_it`, which walks all
-    // 481 entrypoints and refuses one no stem claims — an orphan there cannot
-    // be planned by ANY path, which is a stronger floor than this had.
-    //
-    // The control below outlives it. `a_source_this_driver_cannot_work_out_is
-    // _refused_rather_than_zeroed` asserts the refusal itself against a
-    // synthesized row, so `scalars`'s `Misplaced::Unresolved` is still pinned
-    // by name; what is gone is the claim that no REAL row needs it.
-
-    /// And a source it cannot work out is REFUSED, by name.
-    ///
-    /// The control for the sweep above, which would pass just as well if
-    /// `scalars` had gone back to answering zero. `OutRows` is the case with
-    /// teeth: it is a real variant of the fleet's vocabulary, no row here names
-    /// it, and it is deliberately NOT derived -- a value's leading extent is
-    /// the fire's rows only for a token-shaped value, and answering `rows` for
-    /// the MoE aligned path would be a plausible number in place of a padded
-    /// block-major count.
-    #[test]
-    fn a_source_this_driver_cannot_work_out_is_refused_rather_than_zeroed() {
-        // Stated for the reason `a_derived_width_is_the_launchs_own_width`
-        // above says: `add_bias` was the last row naming `OutWidth` and its
-        // family has retired. `OutRows` is a source no row names either, which
-        // is what makes it the right one to ask about — the question is what
-        // `scalars` does with a source it cannot work out.
-        //
-        // Built by SWAPPING the one source on `add_bias`'s real row, so the
-        // only thing that differs between this and
-        // `a_derived_width_is_the_launchs_own_width`'s subject is the source
-        // under test. `driver-vulkan/src/binding.rs` states its control the
-        // same way and for the same reason.
-        let base = add_bias_sig();
-        let operands: Vec<kernels::Operand> = base
-            .operands
-            .iter()
-            .map(|o| kernels::Operand {
-                source: match o.source {
-                    kernels::Source::OutWidth(i) => kernels::Source::OutRows(i),
-                    other => other,
-                },
-                ..*o
-            })
-            .collect();
-        let sig = kernels::KernelSig {
-            operands: Box::leak(operands.into_boxed_slice()),
-            ..base
-        };
-
-        let lowered = lowered(vec![
-            Arg::Arena {
-                at: 0,
-                width: 4096,
-                bytes: 2,
-            },
-            Arg::Weight("bias".into()),
-        ]);
-        let d = declared(&[0], &[None, None]);
-        assert_eq!(
-            scalars(&sig, &lowered, &launch(8, 2), &d, &Store::default()),
-            Err(Misplaced::Unresolved {
-                at: 2,
-                name: "width",
-                source: "OutRows(0)".into(),
-            }),
-            "an underivable source names itself instead of contributing a zero"
-        );
-    }
-
-    /// `rope/neox.wgsl`'s decode rotation, as `kernels-wgpu`'s `rope` family
-    /// stated it.
-    ///
-    /// An IN-PLACE result, then a fire table, then three scalars. `reorder`
-    /// never reaches the scalars — it stops at the first slot it cannot bind —
-    /// but they are stated because a row is POSITIONAL and a truncated one is
-    /// a different row.
-    fn neox_decode_sig() -> kernels::KernelSig {
-        kernels::kernel!(neox_decode "neox_decode", file = Some("rope/neox.wgsl"),
-            launch = kernels::LaunchRule::Rope,
-            operands = kernels::operands![
-                x: BufMut <- kernels::Source::Out(0),
-                position: I32s <- kernels::Source::Positions,
-                scale: F32 <- kernels::Source::ParamF32(0),
-                base: F32 <- kernels::Source::ParamF32(1),
-                head_dim: I32 <- kernels::Source::Param(2),
-            ],
-            grid_param = Some(3),
-            head_param = Some(2),
-            axes = &[kernels_wgpu::axes::BF16])
-    }
-
-    /// `attn/sdpa_paged.wgsl`'s vector decode, as `kernels-wgpu`'s `attn`
-    /// family stated it.
-    ///
-    /// Eleven storage buffers, which is why this was the row
-    /// `over_downlevel_storage_limit` used to name. What matters here is only
-    /// that its SECOND operand is the cache's KEY plane: a resolver holding no
-    /// cache is refused one slot in, before the values are ever asked for, and
-    /// that ordering is what makes `values: false` in the refusal mean
-    /// something.
-    fn sdpa_paged_decode_sig() -> kernels::KernelSig {
-        kernels::kernel!(sdpa_paged_decode "sdpa_paged_decode",
-        file = Some("attn/sdpa_paged.wgsl"),
-        launch = kernels::LaunchRule::SdpaVector,
-        operands = kernels::operands![
-            queries: Buf <- kernels::Source::In(0),
-            k_pages: Buf <- kernels::Source::KvKeys,
-            v_pages: Buf <- kernels::Source::KvValues,
-            out: BufMut <- kernels::Source::Out(0),
-            gqa_factor: I32 <- kernels::Source::Param(0),
-            position_ids: I32s <- kernels::Source::Positions,
-            req_of_token: I32s <- kernels::Source::RequestOfToken,
-            kv_page_indices: U32s <- kernels::Source::KvPageIndices,
-            kv_page_indptr: U32s <- kernels::Source::KvPageIndptr,
-            page_size: I32 <- kernels::Source::KvPageSize,
-            n_kv_heads: I32 <- kernels::Source::Param(1),
-            scale: F32 <- kernels::Source::ParamF32(2),
-            attention_mask: U8s <- kernels::Source::AttentionMask,
-            attention_mask_stride: U32 <- kernels::Source::AttentionMaskStride,
-            attention_mask_enabled: U8s <- kernels::Source::AttentionMaskEnabled,
-            window: I32 <- kernels::Source::Param(4),
-            sinks: Buf,
-        ],
-        lacks = &[kernels::Cap::Scores, kernels::Cap::PageMaskSink],
-        axes = &[kernels::Axis {
-            what: "head dim and page shape",
-            points: &["_bfloat16_d_64", "_bfloat16_d_128", "_bfloat16_d_256",
-                      "_bfloat16_d_512", "_bfloat16_d_64_p32",
-                      "_bfloat16_d_128_p32", "_bfloat16_d_64_p32_sg8"],
-        }])
-    }
-
-    /// Three refusals `reorder` builds that no test named.
-    ///
-    /// From the census in `tests/citations.rs`: sixty of ninety-seven refusal
-    /// variants are asserted by name and thirty-seven are not, of which the
-    /// `Unbindable` three are in the group it calls "reachable and untested".
-    /// They are also the cheapest to reach — `reorder` is in the portable half,
-    /// so none of this needs an adapter.
-    ///
-    /// Each asks a DIFFERENT question, which is why one test per refusal
-    /// rather than one that takes what it gets:
-    ///
-    /// * `NoOperand` is the statement being shorter than the row;
-    /// * `NoKvCache` is a resolver with no cache, and it must name the LAYER
-    ///   and which half, because a fire binds one layer's keys and values as
-    ///   two separate slots;
-    /// * `NoDriverResource` is a fire table the driver never staged, and it
-    ///   must name WHICH — `Positions` and `TokenIds` are staged by the same
-    ///   call and a refusal that said only "a table" would not say which of
-    ///   the six went missing.
-    ///
-    /// The test `Store` leaves `kv`, `number` and `table` defaulted, which is
-    /// exactly the shape of a resolver serving a text that needs none — so the
-    /// last two need no fixture at all beyond choosing a row that reads one.
-    #[test]
-    fn the_three_ways_a_row_outruns_what_the_driver_can_hand_it() {
-        let buf = buffer(1 << 20);
-        let arena = Arena {
-            buffer: &buf,
-            bytes: 1 << 20,
-        };
-        let store = Store::default();
-        let arg = || Arg::Arena {
-            at: 0,
-            width: 8,
-            bytes: 2,
-        };
-
-        // `neox_decode`'s row stood here — `x: Out(0)` then
-        // `position: Positions` — until `rope` retired, and the first two
-        // refusals were then SYNTHESIZED from that pair by spreading `..*base`
-        // over whatever row still stated operands. THE TABLE IS EMPTY now, so
-        // there is no base to spread either; both rows are STATED whole
-        // instead. See [`neox_decode_sig`] and [`sdpa_paged_decode_sig`]. The
-        // claim is about `reorder`'s refusals and not about which family shows
-        // them, but the shapes are the real ones, so the ORDER the refusals
-        // arrive in is the real one too.
-        let rope = neox_decode_sig();
-        let (slot, why) = reorder(
-            &rope,
-            &lowered(Vec::new()),
-            &launch(1, 0),
-            arena,
-            &store,
-            256,
-        )
-        .expect_err("a row cannot bind an operand the statement never stated");
-        assert_eq!(slot, 0, "the refusal names the slot it stopped at");
-        assert_eq!(why, Unbindable::NoOperand);
-
-        // The same row's SECOND operand is `Source::Positions`, a fire table.
-        // One arg satisfies `Out(0)`; nothing satisfies the table, because
-        // this resolver stages none.
-        let (slot, why) = reorder(
-            &rope,
-            &lowered(vec![arg()]),
-            &launch(1, 1),
-            arena,
-            &store,
-            256,
-        )
-        .expect_err("a table the driver never staged is not bindable");
-        assert_eq!(slot, 1);
-        assert_eq!(why, Unbindable::NoDriverResource(FireTable::Positions));
-        assert!(
-            why.to_string().contains("Positions"),
-            "the refusal must name which table: {why}"
-        );
-
-        // `sdpa_paged_decode` reads the cache. Two args satisfy `In(0)` and
-        // `Out(0)`; the keys have nowhere to come from.
-        let attn = sdpa_paged_decode_sig();
-        let (_, why) = reorder(
-            &attn,
-            &lowered(vec![arg(), arg()]),
-            &launch(1, 2),
-            arena,
-            &store,
-            256,
-        )
-        .expect_err("a paged attention cannot bind a cache the resolver has not got");
-        assert_eq!(
-            why,
-            Unbindable::NoKvCache {
-                layer: 0,
-                values: false
-            },
-            "the KEYS are asked for before the values, and the refusal says \
-             which half as well as which layer"
-        );
-    }
-
     /// A `Lowered` holding nothing but the operands under test.
     fn lowered(args: Vec<Arg>) -> Lowered {
         Lowered {
@@ -3021,5 +1996,53 @@ mod tests {
             conds: Vec::new(),
             readout: None,
         }
+    }
+}
+
+/// A [`Resolve`] that answers a size for anything and holds no memory.
+///
+/// The device-free half of this module already has [`Placeholder`] for the
+/// BUFFER; this is the other half of the same idea for the RESOLVER, so a
+/// caller can plan a rectangle without an adapter, a checkpoint or a KV pool.
+///
+/// It exists for one production question. `engine`'s `widest_fire` measures
+/// `max_forward_tokens` by lowering a text and asking whether every launch
+/// fits the device's workgroup limit -- a search over a boundary, run before
+/// any weights are loaded. That question needs the GRID, which is a fact about
+/// the plan, and nothing about the bytes.
+///
+/// It answers `Some` to everything on purpose: a resolver that refused would
+/// make a launch look unplannable for the wrong reason, and the caller would
+/// read that as "does not fit".
+#[derive(Debug, Clone, Copy)]
+pub struct Unbacked(
+    /// The size every answer reports.
+    pub Placeholder,
+);
+
+impl Resolve for Unbacked {
+    type Buffer = Placeholder;
+
+    fn weight(&self, _name: &str) -> Option<&Self::Buffer> {
+        Some(&self.0)
+    }
+
+    fn named(&self, _value: ValueId) -> Option<&Self::Buffer> {
+        Some(&self.0)
+    }
+
+    fn kv(&self, _layer: u16, _values: bool) -> Option<&Self::Buffer> {
+        Some(&self.0)
+    }
+
+    fn table(&self, _which: FireTable) -> Option<&Self::Buffer> {
+        Some(&self.0)
+    }
+
+    fn number(&self, _which: FireNumber) -> Option<u32> {
+        // ONE, not zero. Zero is a plausible number that a body may divide by
+        // or size a grid with, and this resolver exists to answer "could this
+        // be planned", not "what would it compute".
+        Some(1)
     }
 }

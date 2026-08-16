@@ -77,7 +77,7 @@ pub struct Schedule {
 
 /// Build the SM90 schedule without laying it out in a workspace.
 pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
-    if req.num_kv_heads == 0 || req.num_qo_heads % req.num_kv_heads != 0 {
+    if req.num_kv_heads == 0 || !req.num_qo_heads.is_multiple_of(req.num_kv_heads) {
         return Err(Error::HeadsNotDivisible {
             num_qo_heads: req.num_qo_heads,
             num_kv_heads: req.num_kv_heads,

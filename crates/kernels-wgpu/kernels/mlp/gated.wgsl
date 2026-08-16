@@ -90,9 +90,9 @@ struct GptOssSwiGluParams {
 
 //#if defined(PIE_SILU_STRIDED)
 // Vulkan sends this to a push block; WebGPU has none, so it is the one field of
-// the uniform block. The row is UNSTATED, so the placement follows
-// `norm/residual_add.wgsl`, which is the same kernel shape with the same
-// scalar.
+// the uniform block. The placement follows `norm/residual_add.wgsl`, which is
+// the same kernel shape with the same scalar, and `mlp::silu_mul_strided`'s
+// signature is what states it.
 struct Strided { row_pitch: i32 }
 @group(1) @binding(0) var<uniform> strided: Strided;
 //#endif

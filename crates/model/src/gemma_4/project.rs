@@ -90,7 +90,7 @@ pub fn manifest(f: &Gemma4Facts, mixture: Option<Gemma4Mixture>) -> Manifest {
         // A tie is an ABSENCE: gemma-4 ships no `lm_head`, and the MLX
         // author renames `embed_tokens` into the head's place rather
         // than binding a second table.
-        .either(!f.tied_embeddings, "lm_head", [vocab, hidden])
+        .tie(f.tied_embeddings, "lm_head", [vocab, hidden])
         // THE PER-LAYER EMBEDDING TABLE, whose second axis multiplies
         // the layer count — the one tensor shape that says "gemma-3n or
         // gemma-4" and nothing else. The A4B mixture drops it
@@ -367,6 +367,7 @@ fn layer_attention(f: &Gemma4Facts, sliding_window: i32, l: u32) -> LayerAttenti
         } else {
             f.head_dim
         },
+        q_gate: false,
     }
 }
 
@@ -511,6 +512,7 @@ pub fn metal_facts(
         paged_multi_batch: bind.paged_multi_batch,
         qmm_multi_batch: bind.qmm_multi_batch,
         add_bias: bind.add_bias,
+        fused_qk_rope: bind.fused_qk_rope,
         proj_repr: WeightRepr::Scaled {
             layout: ScaleLayout::PerGroup,
             group: bind.quant_group,
@@ -534,6 +536,12 @@ pub fn metal_facts(
         moe_repr: bind.moe_mxfp4.then_some(WeightRepr::Mxfp4Marlin),
         moe_bits: 4,
         qmm_tile: crate::shared::llama_like::project::QMM_TILE,
+        qmm_fp16_precast: crate::shared::llama_like::project::qmm_fp16_precast(bind.quant_group, bind.quant_bits),
+        routed_qmm_fp16: crate::shared::llama_like::project::qmm_fp16_precast(
+            bind.quant_group,
+            bind.quant_bits,
+        ),
+        moe_tile: Some(crate::shared::llama_like::project::ROUTED_QMM_TILE),
         // No Metal deployment publishes a fused bank; `compile_load_plan`
         // authors with `Projections::InPlace`.
         gate_up_fused: false,
@@ -1292,6 +1300,7 @@ mod tests {
             paged_multi_batch: true,
             qmm_multi_batch: true,
             add_bias: false,
+            fused_qk_rope: false,
         };
         for k_eq_v in [false, true] {
             assert_eq!(
@@ -1353,6 +1362,7 @@ mod tests {
             paged_multi_batch: true,
             qmm_multi_batch: true,
             add_bias: false,
+            fused_qk_rope: false,
         };
         let row = RowScalars {
             mixture: None,
@@ -1452,6 +1462,7 @@ mod tests {
                 paged_multi_batch: true,
                 qmm_multi_batch: true,
                 add_bias: false,
+                fused_qk_rope: false,
             },
         );
         let full = (0..f.layers)

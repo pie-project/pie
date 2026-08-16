@@ -1,112 +1,12 @@
-//! Grammar-guided LLM token generation.
+//! Grammar-guided LLM token generation: constrains model output to a formal
+//! grammar (EBNF, JSON Schema, regex) so structured generation is
+//! syntactically correct by construction. A Rust rewrite derived in part from
+//! the [XGrammar](https://github.com/mlc-ai/xgrammar) project.
 //!
-//! This constrains language model output to follow formal grammars
-//! (EBNF, JSON Schema, regex), enabling structured generation with guaranteed
-//! syntactic correctness.
-//!
-//! This implementation is a Rust rewrite derived in part from the
-//! [XGrammar](https://github.com/mlc-ai/xgrammar) project.
-//!
-//! # Usage
-//!
-//! The typical flow is:
-//!
-//! 1. **Create a grammar** from EBNF, JSON Schema, or regex
-//! 2. **Build a tokenizer** from your LLM's vocabulary
-//! 3. **Create a matcher** (compiles grammar into per-rule DFAs + token masks)
-//! 4. **Loop**: `fill_next_token_bitmask` → mask logits → sample → `accept_token`
-//!
-//! ```rust
-//! use std::sync::Arc;
-//! use ::grammar::bitmask;
-//! use ::grammar::grammar::Grammar;
-//! use ::grammar::matcher::GrammarMatcher;
-//! use tokenizer::Tokenizer;
-//!
-//! // Create grammar from EBNF
-//! let grammar = Arc::new(
-//!     Grammar::from_ebnf(r#"root ::= "yes" | "no""#, "root").unwrap()
-//! );
-//!
-//! // Build tokenizer from vocabulary
-//! let vocab: Vec<String> = vec!["yes".into(), "no".into(), "maybe".into()];
-//! let tokenizer = Arc::new(Tokenizer::from_vocab(&vocab));
-//!
-//! // Create matcher (compiles grammar for this tokenizer)
-//! let mut matcher = GrammarMatcher::new(grammar, tokenizer, vec![], 10);
-//!
-//! // Generate next-token bitmask
-//! let mut bm = vec![0u32; bitmask::bitmask_size(3)];
-//! matcher.fill_next_token_bitmask(&mut bm);
-//!
-//! assert!(bitmask::get_bit(&bm, 0));  // "yes" allowed
-//! assert!(bitmask::get_bit(&bm, 1));  // "no" allowed
-//! assert!(!bitmask::get_bit(&bm, 2)); // "maybe" blocked
-//!
-//! // Accept a token
-//! assert!(matcher.accept_token(0));
-//! assert!(matcher.can_terminate());
-//! ```
-//!
-//! # JSON Schema
-//!
-//! ```rust
-//! use ::grammar::json_schema::{json_schema_to_grammar, JsonSchemaOptions};
-//!
-//! let grammar = json_schema_to_grammar(r#"{
-//!     "type": "object",
-//!     "properties": {
-//!         "name": {"type": "string"},
-//!         "age": {"type": "integer"}
-//!     },
-//!     "required": ["name", "age"],
-//!     "additionalProperties": false
-//! }"#, &JsonSchemaOptions::default()).unwrap();
-//! ```
-//!
-//! # Regex
-//!
-//! ```rust
-//! use ::grammar::regex::regex_to_grammar;
-//!
-//! let grammar = regex_to_grammar(r"[a-z]+@[a-z]+\.[a-z]{2,4}").unwrap();
-//! ```
-//!
-//! # Sharing compiled grammars
-//!
-//! For batch inference, compile once and share across matchers:
-//!
-//! ```rust
-//! use std::sync::Arc;
-//! use ::grammar::compiled_grammar::CompiledGrammar;
-//! use ::grammar::grammar::Grammar;
-//! use ::grammar::matcher::GrammarMatcher;
-//! use tokenizer::Tokenizer;
-//!
-//! let grammar = Arc::new(Grammar::from_ebnf(r#"root ::= [a-z]+"#, "root").unwrap());
-//! let vocab: Vec<String> = (0..128u16).map(|b| String::from(b as u8 as char)).collect();
-//! let tokenizer = Arc::new(Tokenizer::from_vocab(&vocab));
-//!
-//! // Compile once (builds DFAs + token masks)
-//! let compiled = Arc::new(CompiledGrammar::new(&grammar, &tokenizer));
-//!
-//! // Create multiple matchers cheaply
-//! let mut m1 = GrammarMatcher::with_compiled(compiled.clone(), vec![], 10);
-//! let mut m2 = GrammarMatcher::with_compiled(compiled.clone(), vec![], 10);
-//!
-//! m1.accept_string("hello");
-//! m2.accept_string("world");
-//! ```
-//!
-//! # Modules
-//!
-//! - [`grammar`] -- Core grammar types and construction (EBNF, builder)
-//! - [`json_schema`] -- JSON Schema to grammar conversion
-//! - [`regex`] -- Regex to grammar conversion
-//! - [`compiler`] -- Tokenizer-bound compilation and typed caching
-//! - [`compiled_grammar`] -- Pre-compiled grammar with DFAs and token masks
-//! - [`matcher`] -- Runtime matcher (accept tokens, generate bitmasks, rollback)
-//! - [`bitmask`] -- Token bitmask utilities
+//! Flow: build a [`grammar::Grammar`], bind it to a tokenizer through
+//! [`compiled_grammar::CompiledGrammar`] — compile once and share it across
+//! matchers for batch inference — then loop `fill_next_token_bitmask` → mask
+//! logits → sample → `accept_token` on a [`matcher::GrammarMatcher`].
 
 pub mod bitmask;
 pub mod brle;
@@ -114,6 +14,7 @@ pub mod compiled_grammar;
 pub mod compiler;
 mod frontend;
 pub(crate) mod fsm;
+/// The grammar itself: EBNF front end, rule set, and normalisation.
 pub mod grammar;
 pub mod json_schema;
 pub mod matcher;

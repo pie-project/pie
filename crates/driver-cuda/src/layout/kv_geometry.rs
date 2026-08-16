@@ -1,33 +1,22 @@
 //! How many device bytes a KV page costs, for a stack of layers that may not
 //! all be the same shape.
 //!
-//! Port of the three free functions at the bottom of
-//! `driver-cuda/csrc/src/store/kv_cache.cpp`. They sit directly on top of
-//! [`KvCacheFormat`], take a handful of `HfConfig` integers, and touch no
-//! device state at all -- which is why they can be lifted well ahead of the
-//! `KvCache` class that lives above them.
-//!
-//! This arithmetic is what the memory planner searches against: every
-//! candidate layout in the lattice is scored by multiplying a page count by
-//! the number these functions return. An error here does not corrupt anything
-//! at runtime -- it makes the planner refuse to boot a model that would have
-//! fit, or admit one that will later run out of arena. Both have happened; see
-//! [`kv_page_bytes_per_layer`].
+//! These sit on top of [`KvCacheFormat`], take only `HfConfig` integers, and
+//! touch no device state. The memory planner scores every candidate layout by
+//! multiplying a page count by the number these return; an error here makes it
+//! refuse a model that would have fit, or admit one that later runs out of
+//! arena.
 
 use super::KvCacheFormat;
 use crate::dtype::DType;
 
-/// Device bytes for one KV page in this format, including the dequantisation
-/// scratch tier.
+/// Device bytes for one KV page in this format, including dequant scratch.
 ///
-/// A quantised cache is not read directly by the attention kernels: they take
-/// BF16, so a non-native format has to land its dequantised K and V somewhere.
-/// That scratch is charged here rather than at the call site, which is what
-/// keeps it from being forgotten by one caller and counted twice by another --
-/// the entire reason this is a function and not an expression.
-///
-/// The `2 *` is K and V. The scratch is sized on the *logical* `head_dim`,
-/// not the format's packed `storage_head_dim`: it holds the unpacked values.
+/// Quantised caches aren't read by the attention kernels (they take BF16), so a
+/// non-native format lands its dequantised K and V in scratch, charged here so
+/// no caller forgets it or double-counts it. The `2 *` is K and V. The scratch
+/// is sized on the *logical* `head_dim`, not the format's packed
+/// `storage_head_dim`: it holds the unpacked values.
 #[must_use]
 pub fn device_bytes_per_page(
     format: &KvCacheFormat,
@@ -48,10 +37,9 @@ pub fn device_bytes_per_page(
 
 /// Per-page bytes for a stack where every layer has the same shape.
 ///
-/// Tensor parallelism shards the KV heads, so each rank holds
-/// `num_key_value_heads / tp_size` of them. Note this is truncating integer
-/// division, matching the C++: a head count not divisible by the rank count
-/// loses the remainder rather than rounding up.
+/// Tensor parallelism shards the KV heads: each rank holds
+/// `num_key_value_heads / tp_size`, truncating — a count not divisible by the
+/// rank count loses the remainder rather than rounding up.
 #[must_use]
 pub fn page_bytes_homogeneous(
     num_hidden_layers: u32,
@@ -66,50 +54,33 @@ pub fn page_bytes_homogeneous(
 
 /// Per-layer shape overrides for a heterogeneous stack.
 ///
-/// Each field is independently optional, and an absent one falls back to the
-/// uniform value. They are grouped into a struct rather than passed as three
-/// positional vectors because the C++ signature takes
-/// `(per_layer_head_dim, per_layer_num_kv_heads, kv_source_layer, tp_size, format)`
-/// -- five arguments, three of them same-typed vectors, in an order nothing
-/// enforces. Swapping the first two compiles and silently produces a wrong
-/// budget.
+/// Each field is independently optional; an absent one falls back to the
+/// uniform value.
 #[derive(Debug, Default, Clone)]
 pub struct LayerShapes<'a> {
     /// Per-layer `head_dim`. Empty means every layer uses `head_dim_kernel`.
     pub head_dim: &'a [u32],
-    /// Per-layer KV head count, **unsharded** -- this is divided by `tp_size`
-    /// here. Empty means every layer uses `num_key_value_heads / tp_size`.
+    /// Per-layer KV head count, unsharded — divided by `tp_size` here. Empty
+    /// means every layer uses `num_key_value_heads / tp_size`.
     pub num_kv_heads: &'a [u32],
-    /// Which layer physically owns each layer's pages. `kv_source_layer[i] ==
-    /// i` means layer `i` owns its own; anything else means it aliases another
-    /// layer's and must not be charged. Empty means no sharing.
+    /// Which layer owns each layer's pages: `source_layer[i] == i` owns its
+    /// own, anything else aliases another layer's and is not charged. Empty
+    /// means no sharing.
     pub source_layer: &'a [u32],
 }
 
 /// Per-page bytes for a stack where layers may differ in shape or share pages.
 ///
-/// Three ways a layer can deviate, all of which have to be handled together:
-///
-/// * **It aliases another layer's pages.** Cross-layer KV sharing means only
-///   the owning layer is charged; a layer whose `source_layer[i] != i`
-///   contributes nothing.
-/// * **It has a different `head_dim`.**
-/// * **It has a different KV head count.** This one carried a real bug. Gemma-4's
-///   `attention_k_eq_v` mode puts the full-attention layers on
-///   `num_global_key_value_heads` rather than `num_key_value_heads`, and that
-///   is what the allocator actually reserves. Charging those layers the flat
-///   config number instead billed them up to **4x** their real width, which
-///   pushed the planner's KV estimate past the point where no lattice
-///   candidate could clear `min_kv_tokens`; the model then failed to load with
-///   "no viable forward/KV layout fits budget". The fix is the
-///   `per_layer_num_kv_heads` path, and the `PERLAYER` rows of the parity
-///   sweep exist to keep it.
+/// Three ways a layer can deviate: it aliases another layer's pages (only the
+/// owner is charged; `source_layer[i] != i` contributes nothing), it has a
+/// different `head_dim`, or it has a different KV head count. The last takes
+/// the `num_kv_heads` override path, which must bill the width the allocator
+/// actually reserves rather than the flat config number.
 ///
 /// # Panics
 ///
-/// If a non-empty override slice is shorter than `num_hidden_layers`. The C++
-/// indexes these unguarded and reads out of bounds; this is the same
-/// precondition, stated.
+/// If a non-empty override slice is shorter than `num_hidden_layers`; the C++
+/// indexes these unguarded.
 #[must_use]
 pub fn page_bytes_per_layer(
     num_hidden_layers: u32,
@@ -164,7 +135,6 @@ mod tests {
     }
 
     // Exhaustive agreement with the C++ lives in `tests/kv_geometry_parity.rs`.
-    // These pin the behaviour a reader would otherwise have to derive.
 
     #[test]
     fn a_native_format_is_charged_no_dequant_scratch() {
@@ -191,10 +161,8 @@ mod tests {
 
     #[test]
     fn dequant_scratch_is_sized_on_logical_head_dim_not_the_packed_one() {
-        // FP4 packs two values per byte, so `storage_head_dim` is half. The
-        // scratch holds unpacked BF16 and must not inherit that halving --
-        // getting this wrong under-reserves by 2x on exactly the formats
-        // chosen to save memory.
+        // FP4 packs two values per byte, so `storage_head_dim` is half; the
+        // scratch holds unpacked BF16 and must not inherit that halving.
         let f = fmt("nvfp4");
         assert_eq!(f.storage_head_dim(128), 64, "storage is packed");
         let scratch = device_bytes_per_page(&f, 16, 8, 128) - f.total_bytes_per_page(16, 8, 128);
@@ -212,8 +180,7 @@ mod tests {
     #[test]
     fn tensor_parallelism_shards_kv_heads_by_truncating_division() {
         let f = fmt("bf16");
-        // 3 heads across 2 ranks is 1 per rank, not 2. Truncation matches the
-        // C++; a `div_ceil` here would over-reserve on every ragged model.
+        // 3 heads across 2 ranks is 1 per rank, not 2 (truncating).
         assert_eq!(
             page_bytes_homogeneous(1, 3, 128, 2, &f),
             device_bytes_per_page(&f, 1, 1, 128)
@@ -245,8 +212,8 @@ mod tests {
     #[test]
     fn an_aliasing_layer_is_not_charged() {
         let f = fmt("bf16");
-        // Every odd layer points at its even predecessor, so half the stack
-        // pays nothing.
+        // Odd layers alias their even predecessor, so half the stack pays
+        // nothing.
         let src: Vec<u32> = (0..32u32)
             .map(|i| if i % 2 == 1 { i - 1 } else { i })
             .collect();
@@ -272,11 +239,8 @@ mod tests {
 
     #[test]
     fn the_gemma4_wide_layers_are_charged_their_real_width() {
-        // The regression this function's per-layer path exists for. A stack
-        // whose every 4th layer is 4x wider must cost more than the flat
-        // config number suggests -- and, crucially, exactly as much as the
-        // allocator will actually reserve, not the 4x-everything figure that
-        // made the planner give up.
+        // Every 4th layer 4x wider must cost more than the flat config number,
+        // but exactly what the allocator reserves — not 4x every layer.
         let f = fmt("bf16");
         let kv: Vec<u32> = (0..32u32)
             .map(|i| if i % 4 == 0 { 32 } else { 8 })
@@ -352,8 +316,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "has 2 entries for 32 layers")]
     fn a_short_override_slice_is_rejected_rather_than_read_past_the_end() {
-        // The C++ indexes these unguarded; this is that precondition made
-        // audible instead of silently reading whatever follows the vector.
+        // The C++ indexes these unguarded; here the precondition is checked.
         let f = fmt("bf16");
         let hd = vec![64u32, 128];
         let shapes = LayerShapes {

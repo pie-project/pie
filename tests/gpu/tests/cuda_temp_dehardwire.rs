@@ -19,7 +19,7 @@
 //! `#[ignore]`, driver-cuda. Run:
 //!   PIE_COMPILER_LAUNCHER=env CUDACXX=/usr/local/cuda/bin/nvcc \
 //!   CPM_SOURCE_CACHE=$HOME/.cache/pie-cpm CARGO_BUILD_JOBS=2 \
-//!   cargo test -j2 -p pie-gpu-tests --features driver-cuda \
+//!   cargo test -j2 -p pie-gpu-tests --features driver-cuda-13 \
 //!     --test cuda_temp_dehardwire -- --ignored --nocapture
 
 mod common;

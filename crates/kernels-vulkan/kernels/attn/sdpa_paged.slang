@@ -17,6 +17,25 @@
 #define PIE_NUMTHREADS [numthreads(PIE_HEAD_DIM, 1, 1)]
 #endif
 
+#if defined(PIE_COMBINE)
+// The fold pass of a flash decode reads NOTHING the split pass read. It does
+// not touch the queries, the pages, the page table, the positions or the
+// mask -- all of that was consumed by the splits -- so it declares its own
+// three bindings rather than inheriting eleven of which nine would be holes.
+// The partials are `float` and not `PIE_ACT`: a partial is an unnormalised
+// weighted sum whose scale is `exp(score - split_max)`, and rounding that to
+// bfloat16 between the two passes would throw away eight bits of mantissa the
+// single-pass path never loses.
+// Numbered to match the ORDER `attn::sdpa_paged_decode` takes them in, not
+// the order the fold reads them: `tests/routines.rs` holds every body to
+// passing a subsequence of its signature, and the signature's output comes
+// before its sinks which come before its partials. A sinkless fold never
+// reads binding 1, slangc drops it, and the descriptor set carries a hole
+// there -- the same shape the split pass has at `out_`.
+PIE_BUFFER_RW(0, out_);
+PIE_BUFFER_RO(1, sinks);
+[[vk::binding(2)]] StructuredBuffer<float> partials;
+#else
 PIE_BUFFER_RO(0, queries);
 PIE_BUFFER_RO(1, k_pages);
 PIE_BUFFER_RO(2, v_pages);
@@ -28,6 +47,14 @@ PIE_BUFFER_RW(3, out_);
 [[vk::binding(8)]] StructuredBuffer<uint8_t> attention_mask;
 [[vk::binding(9)]] StructuredBuffer<uint8_t> attention_mask_enabled;
 PIE_BUFFER_RO(10, sinks);
+#if defined(PIE_SPLIT)
+// Where a split leaves its `(sum over its keys of exp(s - max) * v)`, its
+// `max` and its `sum_exp`. `out_` at binding 3 is declared above and never
+// written by a split, so slangc drops it and the descriptor set carries a
+// hole there -- which is what `Declared::holes` is for.
+[[vk::binding(11)]] RWStructuredBuffer<float> partials;
+#endif
+#endif
 
 #if defined(PIE_TILED)
 struct Push {
@@ -42,6 +69,14 @@ struct Push {
     int q_row_pitch;
     int o_row_pitch;
 #endif
+};
+[[vk::push_constant]] ConstantBuffer<Push> pc;
+#elif defined(PIE_COMBINE)
+// One number, and it is the one the grid cannot carry: the fold's grid is
+// `(head, row)` with no third axis, so how many splits there were to fold has
+// to be pushed.
+struct Push {
+    int n_splits;
 };
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 #else
@@ -68,6 +103,7 @@ struct Push {
 #define PIE_PAGE_SIZE 0
 #endif
 
+#if !defined(PIE_COMBINE)
 uint page_slot(int req, int kp) {
 #if PIE_PAGE_SIZE == 32
     uint page_ix = uint(kp) >> 5;
@@ -90,6 +126,7 @@ bool keeps(uint row, int kp, int q_pos, int start) {
     }
     return true;
 }
+#endif
 
 uint q_base_for(uint row, uint q_head, uint n_q_heads) {
 #if defined(PIE_TILED) && defined(PIE_STRIDED)
@@ -211,29 +248,67 @@ void tiled_tile(uint q_head, uint n_q_heads, uint3 group, uint3 local, uint grou
 }
 #endif
 
-#if !defined(PIE_TILED)
-// The decode path, with the score computed ONCE per key instead of once per
-// thread.
+#if !defined(PIE_TILED) && !defined(PIE_COMBINE)
+// The decode path, with each SUBGROUP walking its own keys.
 //
-// The obvious shape of this kernel -- every thread owns one output dimension
-// and works out the whole score for itself -- is what this path and the tiled
-// one above both used to do. For decode it is a
-// hundred and twenty-eight times too much arithmetic: the workgroup has one
-// thread per head dimension, and every one of them was walking the entire
-// query and key vectors to reach the same scalar. The dot product is the
-// whole cost of decode attention, so the whole cost was being paid
-// `PIE_HEAD_DIM` times over.
+// Two rewrites have happened here and the second undoes the cost of the
+// first. The original shape -- every thread owns one output dimension and
+// works out the whole score for itself -- paid the dot product `PIE_HEAD_DIM`
+// times over. Replacing it with a cooperative score removed that arithmetic
+// and replaced it with SYNCHRONISATION: one shared-memory tree fold per key,
+// which at `PIE_HEAD_DIM == 128` is `log2(128) = 7` barriered rounds plus one
+// barrier to publish the partial and one to protect the scratch from the next
+// key. Nine whole-workgroup barriers per key, ~3,456 of them per (head,
+// layer) at a 384-key history, with four warps resident to hide them.
 //
-// Here each thread contributes its own term and the workgroup adds them up
-// in a tree, which is both less work and -- pairwise rather than sequential
-// -- a slightly better-conditioned sum. The output accumulation stays exactly
-// where it was, one dimension per thread, because that part was never
-// redundant.
+// The measurement said what that costs. At 384 keys, 8 KV heads and a 128-wide
+// head, one dispatch moves 1.5 MiB and took 288 us on a card independently
+// measured at ~1000 GB/s -- 5.5 GB/s, a factor of 180 off. The rows sweep in
+// `tests/sdpa_bench.rs` settled the cause: one decode row and EIGHT cost the
+// same 265 us, so the card was not busy and the time was latency, not work.
 //
-// Every thread of the workgroup shares one row and one key position, so the
-// mask test and the loop bound are uniform and the barriers below are
-// reached by all threads or by none.
-groupshared float pie_sdpa_part[PIE_HEAD_DIM];
+// So the workgroup stops cooperating on one key. Subgroup `s` of
+// `gl_NumSubgroups` walks keys `start + s, start + s + n, ...`; within it a
+// lane owns dimensions `WaveGetLaneIndex(), + width, ...` across the head; and
+// the score is one `WaveActiveSum`, which is internally synchronised, needs no
+// `GroupMemoryBarrierWithGroupSync` and lands already broadcast to every lane
+// that will use it. Each subgroup keeps its OWN online-softmax state and its
+// own output accumulator, and the `gl_NumSubgroups` states are merged ONCE at
+// the end. The inner loop contains no group barrier at all: the whole kernel
+// has two, one after the query is staged and one before the merge reads what
+// the other subgroups accumulated.
+//
+// The merge is the standard online-softmax combine and is exact:
+// `pie_sdpa_acc[s][d]` holds `sum over s's keys of exp(score - max_s) * v`, so
+// rescaling it by `exp(max_s - max_global)` restores a common base. Only the
+// ASSOCIATION of the sum changes against the sequential fold, not the value it
+// approximates.
+//
+// ## Why the accumulator is shared and bounded by a constant
+//
+// A lane's dimension count is `PIE_HEAD_DIM / gl_SubgroupSize`, which is not a
+// compile-time constant -- the width is 32 here, 64 on AMD and as little as 8
+// on Intel -- so it cannot size a register array. The accumulator therefore
+// lives in groupshared, indexed `[subgroup][dimension]`, and each lane touches
+// only entries no other invocation touches, which is why the loop needs no
+// barrier despite writing shared memory every key.
+//
+// That array must be bounded at compile time too, and `gl_NumSubgroups` can be
+// as large as `PIE_HEAD_DIM` on a hypothetical one-lane subgroup. The bound
+// below is a shared-memory budget of 16 KiB; a device that reports more
+// subgroups than fit simply leaves the extra ones idle through the key loop
+// (they still reach both barriers and still write their own output
+// dimensions), which is slower than it could be and never wrong.
+#if PIE_HEAD_DIM >= 512
+#define PIE_SDPA_MAX_SUBGROUPS 8
+#else
+#define PIE_SDPA_MAX_SUBGROUPS 16
+#endif
+
+groupshared float pie_sdpa_q[PIE_HEAD_DIM];
+groupshared float pie_sdpa_acc[PIE_SDPA_MAX_SUBGROUPS][PIE_HEAD_DIM];
+groupshared float pie_sdpa_max[PIE_SDPA_MAX_SUBGROUPS];
+groupshared float pie_sdpa_sum[PIE_SDPA_MAX_SUBGROUPS];
 
 void decode_one(uint row, uint q_head, uint d, uint n_q_heads) {
     int req = req_of_token[row];
@@ -247,33 +322,259 @@ void decode_one(uint row, uint q_head, uint d, uint n_q_heads) {
     uint o_base = o_base_for(row, q_head, n_q_heads);
     int kv_head = int(q_head) / pc.gqa_factor;
 
-    float q_d = PIE_LOAD(queries[q_base + d]);
+    uint sg = gl_SubgroupID;
+    uint lane = WaveGetLaneIndex();
+    uint width = WaveGetLaneCount();
+    uint subgroups = min(gl_NumSubgroups, uint(PIE_SDPA_MAX_SUBGROUPS));
+    bool walks = sg < subgroups;
+
+    // The query is read once per workgroup rather than once per key, scaled
+    // on the way in so the inner product is a bare FMA. One thread per
+    // dimension, because the workgroup is exactly `PIE_HEAD_DIM` wide.
+    pie_sdpa_q[d] = pc.scale * PIE_LOAD(queries[q_base + d]);
+    if (walks) {
+        for (uint i = lane; i < uint(PIE_HEAD_DIM); i += width) pie_sdpa_acc[sg][i] = 0.0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
     float max_score = PIE_SDPA_NEG_INF;
     float sum_exp = 0.0;
-    float out_acc = 0.0;
-    for (int kp = start; kp <= q_pos; kp++) {
-        if (!keeps(row, kp, q_pos, start)) continue;
-        uint slot = page_slot(req, kp);
-        uint base = (slot * uint(pc.n_kv_heads) + uint(kv_head)) * uint(PIE_HEAD_DIM);
-        pie_sdpa_part[d] = pc.scale * q_d * PIE_LOAD(k_pages[base + d]);
-        GroupMemoryBarrierWithGroupSync();
-        for (uint half_ = uint(PIE_HEAD_DIM) >> 1; half_ > 0u; half_ >>= 1) {
-            if (d < half_) pie_sdpa_part[d] += pie_sdpa_part[d + half_];
-            GroupMemoryBarrierWithGroupSync();
+    if (walks) {
+        // `keeps` and `page_slot` depend only on the row and the key, both of
+        // which are uniform across the subgroup, so every lane reaches the
+        // `WaveActiveSum` below on exactly the same iterations.
+        //
+        // One key per iteration, which is not obviously right and was
+        // measured. What is left after the barriers are gone is ~700 ns per
+        // key per subgroup at a 128-wide head and ~690 ns at a 64-wide one --
+        // a figure that barely moves with the arithmetic, so it is one memory
+        // round trip per iteration that a 16-workgroup launch has nothing to
+        // hide behind. Two attempts to shorten it failed and are recorded so
+        // they are not retried: hoisting `page_slot`'s two dependent loads out
+        // of the loop (the CSR base is invariant and the physical page changes
+        // only every `page_size` keys) measured 68.5 us against 67.8, because
+        // those arrays are small and stay in L1; and taking FOUR keys per
+        // iteration, to put four independent key loads in flight, measured
+        // 134 us -- twice as slow, the per-key `float`/`uint` arrays it needs
+        // spilling to scratch memory because the dimension walk inside them
+        // is not a compile-time trip count. The latency is real and the fix
+        // for it is more workgroups, not a longer loop body.
+        for (int kp = start + int(sg); kp <= q_pos; kp += int(subgroups)) {
+            if (!keeps(row, kp, q_pos, start)) continue;
+            uint slot = page_slot(req, kp);
+            uint base = (slot * uint(pc.n_kv_heads) + uint(kv_head)) * uint(PIE_HEAD_DIM);
+            float partial = 0.0;
+            for (uint i = lane; i < uint(PIE_HEAD_DIM); i += width) {
+                partial += pie_sdpa_q[i] * PIE_LOAD(k_pages[base + i]);
+            }
+            float score = WaveActiveSum(partial);
+            float hist, prob;
+            sdpa_online_update(score, max_score, sum_exp, hist, prob);
+            for (uint i = lane; i < uint(PIE_HEAD_DIM); i += width) {
+                pie_sdpa_acc[sg][i] = pie_sdpa_acc[sg][i] * hist + prob * PIE_LOAD(v_pages[base + i]);
+            }
         }
-        float score = pie_sdpa_part[0];
-        float hist, prob;
-        sdpa_online_update(score, max_score, sum_exp, hist, prob);
-        out_acc = out_acc * hist + prob * PIE_LOAD(v_pages[base + d]);
-        // The next key overwrites the scratch, so no thread may run ahead of
-        // the slowest reader of `pie_sdpa_part[0]`.
-        GroupMemoryBarrierWithGroupSync();
+        if (WaveIsFirstLane()) {
+            pie_sdpa_max[sg] = max_score;
+            pie_sdpa_sum[sg] = sum_exp;
+        }
     }
+    // Both the accumulators and the two state arrays are read below by
+    // invocations that did not write them, and this is the barrier that
+    // orders that. There is no second one -- `common/reduce.slang` needs its
+    // because its scratch is reused on the next call, and nothing here writes
+    // the scratch again.
+    GroupMemoryBarrierWithGroupSync();
+
+    // The merge. A subgroup that drew no key at all keeps `PIE_SDPA_NEG_INF`
+    // and a zero sum; its weight is `exp(-3e38 - max)`, which is zero for any
+    // real maximum and exactly one when EVERY subgroup was empty -- and in
+    // that case the sum is still zero, so the guarded division below returns
+    // the zero accumulator rather than a NaN.
+    float merged_max = PIE_SDPA_NEG_INF;
+    for (uint s = 0u; s < subgroups; s++) merged_max = max(merged_max, pie_sdpa_max[s]);
+    float merged_sum = 0.0;
+    float out_acc = 0.0;
+    for (uint s = 0u; s < subgroups; s++) {
+        float w = exp(pie_sdpa_max[s] - merged_max);
+        merged_sum += pie_sdpa_sum[s] * w;
+        out_acc += pie_sdpa_acc[s][d] * w;
+    }
+
 #if defined(PIE_WITH_SINK)
-    float orescale = sdpa_merge_sink(PIE_LOAD(sinks[q_head]), max_score, sum_exp);
+    float orescale = sdpa_merge_sink(PIE_LOAD(sinks[q_head]), merged_max, merged_sum);
     out_acc *= orescale;
 #endif
-    out_[o_base + d] = PIE_STORE(sum_exp == 0.0 ? out_acc : out_acc / sum_exp);
+    out_[o_base + d] = PIE_STORE(merged_sum == 0.0 ? out_acc : out_acc / merged_sum);
+}
+#endif
+
+#if defined(PIE_SPLIT)
+// The first pass of a FLASH DECODE: the same body as `decode_one`, over one
+// contiguous slice of the key range, leaving a partial nobody has normalised.
+//
+// ## Why this exists
+//
+// `decode_one` is occupancy-bound and the sweep in `tests/sdpa_bench.rs` is
+// what says so: at a 384-key history one decode row costs 67.65 us and
+// THIRTY-TWO rows cost 76.03 -- thirty-two times the work for twelve percent
+// more time, and 662 GB/s against a card measured at 996. A single row of
+// qwen3-0.6b launches `q_heads * rows` = 16 workgroups on a 128-SM card, so
+// fifteen sixteenths of the machine is idle and the ~700 ns per key per
+// subgroup that is left is one memory round trip with nothing to hide behind.
+// Two attempts to shorten that round trip were measured and rejected (see
+// `decode_one`); the fix is more workgroups, and the only axis left to make
+// them out of is the key range itself.
+//
+// ## The decomposition
+//
+// Split `[start, q_pos]` into `gl_NumWorkGroups.z` CONTIGUOUS chunks, one per
+// workgroup, and give the split its own online-softmax state. Contiguous and
+// not strided: a strided assignment at `S = 8` and four subgroups walks with
+// a stride of 32, which is exactly a page, so every workgroup would touch
+// every page. A chunk of 48 keys touches two.
+//
+// What a split leaves behind is `(max_s, sum_s, acc_s)` where
+// `acc_s = sum over its keys of exp(score - max_s) * v` -- unnormalised, and
+// in `float` rather than bfloat16, because the fold has to rescale it by
+// `exp(max_s - max)` before it means anything.
+//
+// ## What is deliberately NOT done here
+//
+// The sink. `sdpa_merge_sink` adds one more term to the softmax, and adding
+// it once per split would add it `S` times. It belongs in the fold, which is
+// why there is no `PIE_WITH_SINK` in this body and why the sink and non-sink
+// decodes share ONE split module.
+void decode_split(uint row, uint q_head, uint d, uint n_q_heads, uint n_rows,
+                  uint split, uint n_splits) {
+    int req = req_of_token[row];
+    int q_pos = position_ids[row];
+#if defined(PIE_FAST_FULL)
+    int start = 0;
+#else
+    int start = (pc.window > 0 && q_pos >= pc.window) ? (q_pos - pc.window + 1) : 0;
+#endif
+    uint q_base = q_base_for(row, q_head, n_q_heads);
+    int kv_head = int(q_head) / pc.gqa_factor;
+
+    // The slice. `keys` can be zero or negative for a row whose window has
+    // not opened, and `chunk` is then zero and every split's `lo > hi`, so
+    // the loop below never runs and the whole grid writes the empty partial
+    // the fold reads as "contributed nothing".
+    int keys = q_pos - start + 1;
+    int chunk = keys > 0 ? (keys + int(n_splits) - 1) / int(n_splits) : 0;
+    int lo = start + int(split) * chunk;
+    int hi = min(q_pos, lo + chunk - 1);
+
+    uint sg = gl_SubgroupID;
+    uint lane = WaveGetLaneIndex();
+    uint width = WaveGetLaneCount();
+    uint subgroups = min(gl_NumSubgroups, uint(PIE_SDPA_MAX_SUBGROUPS));
+    bool walks = sg < subgroups;
+
+    pie_sdpa_q[d] = pc.scale * PIE_LOAD(queries[q_base + d]);
+    if (walks) {
+        for (uint i = lane; i < uint(PIE_HEAD_DIM); i += width) pie_sdpa_acc[sg][i] = 0.0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    float max_score = PIE_SDPA_NEG_INF;
+    float sum_exp = 0.0;
+    if (walks) {
+        for (int kp = lo + int(sg); kp <= hi; kp += int(subgroups)) {
+            if (!keeps(row, kp, q_pos, start)) continue;
+            uint slot = page_slot(req, kp);
+            uint base = (slot * uint(pc.n_kv_heads) + uint(kv_head)) * uint(PIE_HEAD_DIM);
+            float partial = 0.0;
+            for (uint i = lane; i < uint(PIE_HEAD_DIM); i += width) {
+                partial += pie_sdpa_q[i] * PIE_LOAD(k_pages[base + i]);
+            }
+            float score = WaveActiveSum(partial);
+            float hist, prob;
+            sdpa_online_update(score, max_score, sum_exp, hist, prob);
+            for (uint i = lane; i < uint(PIE_HEAD_DIM); i += width) {
+                pie_sdpa_acc[sg][i] = pie_sdpa_acc[sg][i] * hist + prob * PIE_LOAD(v_pages[base + i]);
+            }
+        }
+        if (WaveIsFirstLane()) {
+            pie_sdpa_max[sg] = max_score;
+            pie_sdpa_sum[sg] = sum_exp;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // The within-workgroup merge is `decode_one`'s, unchanged and for the
+    // same reason: `subgroups` states are folded once, and a subgroup that
+    // drew no key weighs `exp(-3e38 - max)`, which is zero against any real
+    // maximum and one when every state is empty -- in which case the sum is
+    // zero too and the fold's guard is what answers.
+    float merged_max = PIE_SDPA_NEG_INF;
+    for (uint s = 0u; s < subgroups; s++) merged_max = max(merged_max, pie_sdpa_max[s]);
+    float merged_sum = 0.0;
+    float out_acc = 0.0;
+    for (uint s = 0u; s < subgroups; s++) {
+        float w = exp(pie_sdpa_max[s] - merged_max);
+        merged_sum += pie_sdpa_sum[s] * w;
+        out_acc += pie_sdpa_acc[s][d] * w;
+    }
+
+    // Written UNCONDITIONALLY, by every workgroup of the grid, including one
+    // whose slice was empty. The fold reads all `S` entries and nothing
+    // zeroes this buffer between fires, so a split that skipped its write
+    // would hand the fold the previous token's numbers.
+    uint at = (split * n_rows + row) * n_q_heads + q_head;
+    partials[at * uint(PIE_HEAD_DIM) + d] = out_acc;
+    if (d == 0u) {
+        uint stats = n_splits * n_rows * n_q_heads * uint(PIE_HEAD_DIM) + at * 2u;
+        partials[stats] = merged_max;
+        partials[stats + 1u] = merged_sum;
+    }
+}
+#endif
+
+#if defined(PIE_COMBINE)
+// The second pass of a flash decode: fold `S` partials into one row.
+//
+// One workgroup per `(query head, row)` and one lane per dimension, which is
+// the grid `decode_one` had -- so this pass launches exactly the workgroups
+// the single-pass kernel did and reads `S * (PIE_HEAD_DIM + 2)` floats each.
+// At qwen3-0.6b's shape with `S = 8` that is 8 * 130 * 4 = 4 KiB a workgroup
+// and 66 KiB a dispatch, against the 1.5 MiB the split pass moves.
+//
+// The merge is the standard online-softmax combine and is exact: `acc_s` is
+// `sum over s's keys of exp(score - max_s) * v`, so `exp(max_s - max)` puts
+// every split on one base. Only the ASSOCIATION of the sum differs from the
+// sequential fold.
+void decode_combine(uint row, uint q_head, uint d, uint n_q_heads, uint n_rows) {
+    uint n_splits = uint(pc.n_splits);
+    uint stats0 = n_splits * n_rows * n_q_heads * uint(PIE_HEAD_DIM);
+
+    float merged_max = PIE_SDPA_NEG_INF;
+    for (uint s = 0u; s < n_splits; s++) {
+        uint at = (s * n_rows + row) * n_q_heads + q_head;
+        merged_max = max(merged_max, partials[stats0 + at * 2u]);
+    }
+    float merged_sum = 0.0;
+    float out_acc = 0.0;
+    for (uint s = 0u; s < n_splits; s++) {
+        uint at = (s * n_rows + row) * n_q_heads + q_head;
+        // `exp(-3e38 - merged_max)` is zero for any real maximum, so an empty
+        // split contributes nothing without an `if`; when EVERY split was
+        // empty the weight is `exp(0) == 1` and the sums are all zero, so the
+        // guarded division below returns the zero accumulator and not a NaN.
+        float w = exp(partials[stats0 + at * 2u] - merged_max);
+        merged_sum += partials[stats0 + at * 2u + 1u] * w;
+        out_acc += partials[at * uint(PIE_HEAD_DIM) + d] * w;
+    }
+
+#if defined(PIE_WITH_SINK)
+    // ONCE, over the whole key range, which is the reason the sink is not in
+    // the split pass: a per-split sink would join the softmax `S` times.
+    float orescale = sdpa_merge_sink(PIE_LOAD(sinks[q_head]), merged_max, merged_sum);
+    out_acc *= orescale;
+#endif
+    uint o_base = o_base_for(row, q_head, n_q_heads);
+    out_[o_base + d] = PIE_STORE(merged_sum == 0.0 ? out_acc : out_acc / merged_sum);
 }
 #endif
 
@@ -281,6 +582,11 @@ PIE_NUMTHREADS
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID, uint group_index : SV_GroupIndex) {
 #if defined(PIE_TILED)
     tiled_tile(group.x, gl_NumWorkGroups.x, group, local, group_index);
+#elif defined(PIE_COMBINE)
+    decode_combine(group.y, group.x, local.x, gl_NumWorkGroups.x, gl_NumWorkGroups.y);
+#elif defined(PIE_SPLIT)
+    decode_split(group.y, group.x, local.x, gl_NumWorkGroups.x, gl_NumWorkGroups.y,
+                 group.z, gl_NumWorkGroups.z);
 #else
     decode_one(group.y, group.x, local.x, gl_NumWorkGroups.x);
 #endif
@@ -294,6 +600,17 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID, uint group_i
 // pie:instantiate sdpa_paged_decode_bfloat16_d_128_p32 PIE_HEAD_DIM=128 PIE_PAGE_SIZE=32 PIE_FAST_FULL=1
 // pie:instantiate sdpa_paged_decode_bfloat16_d_64_p32_sg8 PIE_HEAD_DIM=64 PIE_PAGE_SIZE=32 PIE_FAST_FULL=1 PIE_SHORT_GROUP=8
 // pie:instantiate sdpa_paged_decode_sink_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_WITH_SINK=1
+// The flash-decode pair. One split module serves the sink and non-sink forms
+// both, because the sink is merged in the fold and not per split.
+// pie:instantiate sdpa_paged_decode_split_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_SPLIT=1
+// pie:instantiate sdpa_paged_decode_split_bfloat16_d_128 PIE_HEAD_DIM=128 PIE_SPLIT=1
+// pie:instantiate sdpa_paged_decode_split_bfloat16_d_256 PIE_HEAD_DIM=256 PIE_SPLIT=1
+// pie:instantiate sdpa_paged_decode_split_bfloat16_d_512 PIE_HEAD_DIM=512 PIE_SPLIT=1
+// pie:instantiate sdpa_paged_decode_combine_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_COMBINE=1
+// pie:instantiate sdpa_paged_decode_combine_bfloat16_d_128 PIE_HEAD_DIM=128 PIE_COMBINE=1
+// pie:instantiate sdpa_paged_decode_combine_bfloat16_d_256 PIE_HEAD_DIM=256 PIE_COMBINE=1
+// pie:instantiate sdpa_paged_decode_combine_bfloat16_d_512 PIE_HEAD_DIM=512 PIE_COMBINE=1
+// pie:instantiate sdpa_paged_decode_combine_sink_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_COMBINE=1 PIE_WITH_SINK=1
 // pie:instantiate sdpa_paged_tiled_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1
 // pie:instantiate sdpa_paged_tiled_bfloat16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1
 // pie:instantiate sdpa_paged_tiled_bfloat16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1

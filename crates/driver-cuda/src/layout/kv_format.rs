@@ -1,34 +1,17 @@
 //! The KV cache storage format: what one page costs, and how a config string
 //! names it.
 //!
-//! Port of `driver-cuda/csrc/src/store/kv_cache_format.{hpp,cpp}`.
-//!
-//! # One table instead of three lists
-//!
-//! The C++ spells the format catalogue three times: a chain of `if (v == ...)`
-//! in the parser, a hand-written comma-separated string in
-//! `valid_kv_cache_dtype_values()`, and a `try`/`catch` round-trip in
-//! `is_valid_kv_cache_dtype()`. The first two are in sync today, by hand, and
-//! nothing checks that they still are -- adding a format and forgetting the
-//! string produces an error message that omits the option the user was
-//! supposed to discover.
-//!
-//! Here [`KvCacheFormat::CATALOGUE`] is the single list, the parser is a
-//! lookup in it, the error message is built from it, and
-//! [`KvCacheFormat::is_valid_name`] is the parser returning `is_ok`. A test
-//! pins the rendered string against the C++ literal, so the two stay
-//! byte-identical while both exist.
+//! [`KvCacheFormat::CATALOGUE`] is the single list of accepted formats; the
+//! parser, the error message, and [`KvCacheFormat::is_valid_name`] all derive
+//! from it, so they cannot fall out of sync.
 
 use crate::dtype::DType;
 use crate::error::{Error, Result};
 
 /// How a format quantizes, which is what the attention kernels switch on.
 ///
-/// Discriminants mirror `kernels-cuda/csrc/src/kernels/kv_cache_view.hpp` --
-/// the archive crate's host header, deleted with it at `85c6c674b` -- which
-/// declared them without explicit values, so they are 0..4 in declaration
-/// order, and this enum must keep that order for the same FFI reason
-/// [`DType`] must keep its own.
+/// Discriminants are 0..4 in declaration order and must keep it: the attention
+/// kernels switch on the raw `u8` across FFI, like [`DType`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum KvCacheScheme {
@@ -57,14 +40,11 @@ pub enum KvCacheScaleLayout {
     PerTokenHeadBlock = 2,
 }
 
-/// The default block width when a `PerTokenHeadBlock` format does not state
-/// one.
+/// The default block width when a `PerTokenHeadBlock` format does not state one.
 ///
-/// The C++ writes this as a bare `16` inside `scale_bytes_per_page`'s
-/// `block_size > 0 ? block_size : 16`. It is only reachable through a
-/// hand-built format, since every catalogue entry selecting
-/// `PerTokenHeadBlock` sets `block_size = 16` explicitly -- but it is a number
-/// that changes a page size, so it gets a name.
+/// Only reachable through a hand-built format — every catalogue entry that is
+/// blocked sets `block_size = 16` explicitly — but it changes a page size, so
+/// it gets a name.
 const DEFAULT_SCALE_BLOCK: u32 = 16;
 
 /// A KV cache storage format.
@@ -78,20 +58,16 @@ pub struct KvCacheFormat {
 }
 
 impl Default for KvCacheFormat {
-    /// Native bf16 -- the C++ `KvCacheFormat{}` default, which is what its
-    /// parser returns for `auto`, `bf16` and `bfloat16` alike.
+    /// Native bf16, the format `auto` resolves to.
     fn default() -> Self {
         Self::BF16
     }
 }
 
 impl KvCacheFormat {
-    /// Every format the driver accepts, in the order the C++ lists them.
-    ///
-    /// The order is the error message's order, so it is pinned by test rather
-    /// than free. Aliases are separate rows: `bfloat16` resolves to the same
-    /// format as `bf16` but is its own accepted spelling, and both appear in
-    /// the message because the C++ message lists both.
+    /// Every accepted format, in the order the error message lists them (pinned
+    /// by test). Aliases are separate rows: `bfloat16` resolves like `bf16` but
+    /// is its own spelling and appears in the message.
     pub const CATALOGUE: &'static [(&'static str, KvCacheFormat)] = &[
         ("auto", Self::BF16),
         ("bf16", Self::BF16),
@@ -154,24 +130,20 @@ impl KvCacheFormat {
     };
     /// The same format as [`Self::FP4_E2M1`] under NVIDIA's spelling.
     ///
-    /// A separate constant only because the C++ writes the *requested* alias
-    /// into `name`, so `nvfp4` and `fp4_e2m1` produce formats that differ in
-    /// that one string. Preserved rather than normalised: the name reaches
-    /// logs and the plan, and a rewrite that changes what a log says is a
-    /// rewrite that cannot be diffed against the original.
+    /// A separate constant because the requested alias is stored in `name`, so
+    /// `nvfp4` and `fp4_e2m1` differ in that one string, which reaches logs and
+    /// the plan.
     pub const NVFP4: Self = Self {
         name: "nvfp4",
         ..Self::FP4_E2M1
     };
 
-    /// Build a format from its fields, as the C++'s aggregate initialisation
-    /// does.
+    /// Build a format from its fields.
     ///
-    /// `KvCache::allocate(DType)` synthesises a format this way rather than
-    /// looking one up by name, so the combinations reachable here are not
-    /// limited to [`Self::CATALOGUE`]: a scale layout on a native dtype, or a
-    /// blocked layout with `block_size == 0`, are both constructible and both
-    /// change what a cache allocates.
+    /// Combinations reachable this way are not limited to [`Self::CATALOGUE`]:
+    /// a scale layout on a native dtype, or a blocked layout with
+    /// `block_size == 0`, are both constructible and both change what a cache
+    /// allocates.
     #[must_use]
     pub const fn from_parts(
         name: &'static str,
@@ -189,11 +161,8 @@ impl KvCacheFormat {
         }
     }
 
-    /// The format `KvCache::allocate(DType)` synthesises for a bare dtype.
-    ///
-    /// Native scheme, no scales, and a name that is `"bf16"` by literal rather
-    /// than by `dtype_name` -- the two agree for BF16, but the C++ writes the
-    /// literal, so a change to `dtype_name` would not follow here.
+    /// The format synthesised for a bare dtype: native scheme, no scales, and
+    /// the name `"bf16"` by literal for BF16.
     #[must_use]
     pub const fn for_storage_dtype(dtype: DType) -> Self {
         Self {
@@ -209,7 +178,7 @@ impl KvCacheFormat {
         }
     }
 
-    /// The format's name, as the C++ records it.
+    /// The format's name.
     #[must_use]
     pub const fn name(&self) -> &'static str {
         self.name
@@ -253,11 +222,8 @@ impl KvCacheFormat {
 
     /// Storage elements in one token/head row.
     ///
-    /// Equal to `head_dim` except for FP4, which packs two logical values per
-    /// byte and therefore needs `ceil(head_dim / 2)` of them. This is the
-    /// counterpart to [`DType::size_bytes`] reporting the byte rather than the
-    /// logical element: one of the two has to know about the packing, and it
-    /// is this one.
+    /// Equal to `head_dim`, except FP4 packs two values per byte and needs
+    /// `ceil(head_dim / 2)`.
     #[must_use]
     pub const fn storage_head_dim(&self, head_dim: u32) -> u64 {
         match self.scheme {
@@ -277,9 +243,7 @@ impl KvCacheFormat {
 
     /// Bytes in one K-scale page, or zero when the format has no side scales.
     ///
-    /// Scales are FP32 in this milestone, which the C++ states as a literal
-    /// `dtype_bytes(DType::FP32)` rather than a field -- so per-format scale
-    /// dtypes would be a change here, not a config.
+    /// Scales are FP32, by literal rather than a field.
     #[must_use]
     pub const fn scale_bytes_per_page(
         &self,
@@ -314,22 +278,10 @@ impl KvCacheFormat {
             + 2 * self.scale_bytes_per_page(page_size, num_kv_heads, head_dim)
     }
 
-    /// Resolve a config string, case-insensitively. An empty string means
-    /// `auto`.
+    /// Resolve a config string, case-insensitively. An empty string means `auto`.
     ///
-    /// # The dropped parameter
-    ///
-    /// The C++ takes a second argument, `activation_dtype`, and does nothing
-    /// with it: under `auto` it tests whether the activation dtype is bf16 and
-    /// returns `KvCacheFormat{}` if it is, then returns `KvCacheFormat{}` if
-    /// it is not, with a comment conceding the point ("Keep auto behavior
-    /// identical to the historical path"). Every other branch ignores it
-    /// outright. It cannot change the result, so it is not a parameter here.
-    ///
-    /// Dropped rather than kept-and-ignored deliberately: a parameter that
-    /// looks like it selects something and does not is worse than no
-    /// parameter, and this is exactly the sort of thing that survives a
-    /// transliteration and dies in a rewrite.
+    /// The C++'s second `activation_dtype` argument is dropped: it cannot change
+    /// the result, so keeping it would only look like it selects something.
     pub fn from_name(value: &str) -> Result<Self> {
         let requested = if value.is_empty() { "auto" } else { value };
         Self::CATALOGUE
@@ -354,9 +306,6 @@ impl KvCacheFormat {
     }
 
     /// Every accepted spelling, comma-separated, for an error message.
-    ///
-    /// Built from [`Self::CATALOGUE`] rather than written out, which is the
-    /// point of the catalogue existing.
     #[must_use]
     pub fn valid_names() -> String {
         Self::CATALOGUE
@@ -373,10 +322,7 @@ mod tests {
 
     #[test]
     fn the_rendered_valid_names_still_match_the_cpp_string_exactly() {
-        // The literal from `kv_cache_format.cpp`'s
-        // `valid_kv_cache_dtype_values()`, which the C++ maintains by hand.
-        // While both exist they must produce the same message, so this is a
-        // differential pin, not a formatting preference.
+        // Differential pin against the hand-maintained C++ literal.
         assert_eq!(
             KvCacheFormat::valid_names(),
             "auto, bf16, bfloat16, fp8_e4m3, fp8_e5m2, \
@@ -386,8 +332,6 @@ mod tests {
 
     #[test]
     fn every_catalogue_alias_parses_back_to_its_own_entry() {
-        // The property the single table buys: parser and message cannot
-        // disagree, because there is nothing for them to disagree about.
         for &(alias, expected) in KvCacheFormat::CATALOGUE {
             assert_eq!(
                 KvCacheFormat::from_name(alias).unwrap(),
@@ -436,8 +380,7 @@ mod tests {
 
     #[test]
     fn the_two_fp4_spellings_differ_in_name_and_in_nothing_else() {
-        // Preserved C++ behaviour, and the one place `name` is not simply a
-        // function of the format.
+        // The one place `name` is not a function of the format.
         let a = KvCacheFormat::FP4_E2M1;
         let b = KvCacheFormat::NVFP4;
         assert_ne!(a.name(), b.name());
@@ -459,7 +402,6 @@ mod tests {
         // 16 tokens * 8 heads * 128 dims * 2 bytes
         assert_eq!(f.kv_bytes_per_page(16, 8, 128), 16 * 8 * 128 * 2);
         assert_eq!(f.scale_bytes_per_page(16, 8, 128), 0);
-        // K and V only; the scale planes contribute nothing.
         assert_eq!(f.total_bytes_per_page(16, 8, 128), 2 * 16 * 8 * 128 * 2);
     }
 
@@ -474,8 +416,7 @@ mod tests {
         );
         assert_eq!(f.storage_head_dim(1), 1);
         assert_eq!(f.storage_head_dim(0), 0);
-        // Half the bytes of an int8 cache of the same logical shape, which is
-        // the entire reason the packing exists.
+        // Half the bytes of an int8 cache of the same shape.
         assert_eq!(
             f.kv_bytes_per_page(16, 8, 128),
             KvCacheFormat::INT8_PER_TOKEN_HEAD.kv_bytes_per_page(16, 8, 128) / 2
@@ -497,8 +438,7 @@ mod tests {
         let f = KvCacheFormat::INT8_PER_TOKEN_HEAD;
         assert!(f.has_side_scales());
         assert_eq!(f.scale_bytes_per_page(16, 8, 128), 16 * 8 * 4);
-        // Independent of head_dim -- that is what "per token head" means, and
-        // getting it wrong would scale the scale plane with the model.
+        // Independent of head_dim -- that is what "per token head" means.
         assert_eq!(f.scale_bytes_per_page(16, 8, 4096), 16 * 8 * 4);
     }
 
@@ -508,7 +448,7 @@ mod tests {
         assert_eq!(f.block_size(), 16);
         assert_eq!(f.scale_bytes_per_page(16, 8, 128), 16 * 8 * 8 * 4);
         // 17 dims still needs two blocks; a truncating divide would under-size
-        // the buffer by one scale per head and corrupt the last block.
+        // the buffer and corrupt the last block.
         assert_eq!(f.scale_bytes_per_page(1, 1, 17), 2 * 4);
         assert_eq!(f.scale_bytes_per_page(1, 1, 16), 4);
         assert_eq!(f.scale_bytes_per_page(1, 1, 1), 4);
@@ -516,9 +456,7 @@ mod tests {
 
     #[test]
     fn a_blocked_format_with_no_block_size_falls_back_to_sixteen() {
-        // Only reachable through a hand-built format; the C++ spells the
-        // fallback as a bare literal inside the size computation, so it is
-        // pinned here rather than left to be rediscovered.
+        // Only reachable through a hand-built format; pins the 16 fallback.
         let f = KvCacheFormat {
             block_size: 0,
             ..KvCacheFormat::FP4_E2M1
@@ -531,9 +469,7 @@ mod tests {
 
     #[test]
     fn a_total_page_is_two_kv_planes_and_two_scale_planes() {
-        // Two of each, because K and V are stored and scaled separately. The
-        // planner multiplies this by page count, so a factor dropped here is a
-        // cache half the size it thinks it is.
+        // Two of each: K and V are stored and scaled separately.
         for &(alias, f) in KvCacheFormat::CATALOGUE {
             let kv = f.kv_bytes_per_page(16, 8, 128);
             let scale = f.scale_bytes_per_page(16, 8, 128);

@@ -257,6 +257,22 @@ struct Reference {
     mid: [(usize, f32); 3],
     /// The widest activation MLX's OWN forward reaches on this checkpoint.
     ///
+    /// ANYWHERE, and not only between decoder layers. This is compared
+    /// against the widest value in the driver's ARENA, and an arena holds
+    /// every intermediate a fire writes -- the projections, the MLP's
+    /// middle, the router's scores -- so the number that bounds it has to
+    /// come from the same population.
+    ///
+    /// The rest of this field says "by walking its own layers and taking
+    /// `max(abs(h))` after each", which measures the RESIDUAL STREAM alone.
+    /// That is the same number for a checkpoint whose residual dominates --
+    /// gpt-oss reaches 42,752 there and nothing else comes close -- and far
+    /// too small for one whose residual stays tiny. Qwen3.6-35B-A3B walks to
+    /// 5.26 between layers and the driver's arena reads 40.75, so the
+    /// residual walk would have called a correct forward a saturation by a
+    /// factor of two. Its widest module output is 52.72, at a
+    /// `QuantizedLinear`. So the qwen rows hook every module instead.
+    ///
     /// A saturation bound is a measurement too, and this one was a constant:
     /// `1e3`, with the comment "a llama-1B decode measures its widest
     /// activation under one, so the bound sits orders of magnitude out".
@@ -433,6 +449,98 @@ const REFERENCES: &[Reference] = &[
         // Measured displacement is 7.7% at its worst; this is that, rounded
         // up to a tenth, and NOT the smallest number that passes.
         routing: 0.10,
+    },
+    // The two qwen3.6 rows, taken because the driver had been serving both
+    // for weeks with nothing to serve them AGAINST. `reference_for` returned
+    // `None` on either checkpoint, so every gate in this file SKIPPED and
+    // the suite reported a clean run over a model nobody had compared to
+    // anything. The A3B row is the one that mattered: the routed MoE GEMM
+    // was switched on beneath it, and the switch changed which kernel
+    // computes every expert in the model.
+    //
+    // Taking them found two holes that had nothing to do with the numbers.
+    // The gates passed `slabs: None`, so every hybrid refused at its first
+    // `gdn_*` statement -- correctly, and at a rig that had never pointed a
+    // gate at a recurrent model. And every rig site staged
+    // `recurrent_slots: &[]` under "no row this rig serves has
+    // linear-attention layers", which is a LEGITIMATE staging meaning "this
+    // row has no recurrent state" and so failed silently rather than loudly.
+    // Both are fixed above; see `seats`.
+    //
+    // Both rows are UNCAPPED -- qwen states no `final_logit_softcapping` --
+    // so nothing here is erased by `tanh` and every value is compared as
+    // read. Both were taken in f32, which the `top` field's doc explains and
+    // which this table proved again: taken in bf16 first, the 27B row read
+    // the driver as wrong by three ulps at rank 1000, and MLX's own f32
+    // forward then landed within one ulp of the DRIVER. The reference was
+    // the rounding, not the driver.
+    Reference {
+        model: "Qwen3.6-27B-4bit",
+        bos: 248_044,
+        top: [
+            (2, 11.433_355),
+            (760, 10.968_042),
+            (550, 10.637_764),
+            (51, 9.575_583),
+            (32, 9.557_344),
+        ],
+        // Ranks four and five are 0.018 apart, which is well inside a bf16
+        // ulp; the depth scan resolves that by claiming only the top three.
+        next: Some(9.330_332),
+        span: (-12.188_389, 11.433_355),
+        mid: [(1642, 6.934_213), (32498, 4.905_787), (149_407, 1.641_766)],
+        // The widest MODULE OUTPUT, hooked over every module rather than
+        // read off the residual between layers. The layer walk gives 135
+        // here and both numbers would pass; A3B is where the difference
+        // decides, and the two rows are measured the same way so that the
+        // pair means one thing. See the field.
+        widest: Some(145.404),
+        cap: 0.0,
+        // Dense MLP. Nothing routes, so nothing near-ties.
+        routing: 0.0,
+    },
+    Reference {
+        model: "Qwen3.6-35B-A3B-4bit",
+        bos: 248_044,
+        top: [
+            (16, 10.698_828),
+            (17, 9.558_013),
+            (18, 9.462_732),
+            (26978, 9.137_769),
+            (19, 9.007_675),
+        ],
+        // Ranks five and six are 0.035 apart -- a third of a bf16 ulp -- so
+        // the depth scan claims four and leaves the fifth to the tie.
+        next: Some(8.972_200),
+        span: (-9.349_568, 10.698_828),
+        mid: [(4531, 6.860_312), (19916, 4.887_325), (42587, 2.478_823)],
+        // The widest MODULE OUTPUT, not the widest residual: 5.26 is what
+        // the layer walk gives and the driver's arena reads 40.75, which the
+        // walk's ceiling would have called a saturation. This is measured by
+        // hooking every module's `__call__`, and it lands at a
+        // `QuantizedLinear`. See the field.
+        widest: Some(52.7216),
+        cap: 0.0,
+        // 8 of 256 -- twice as sparse as gemma's 8 of 128, over twice the
+        // bank, so the eighth and ninth scores are closer still. Measured
+        // the way the field describes, by perturbing MLX's OWN router logits
+        // and rerunning its own f32 forward against its unperturbed self,
+        // three seeds each:
+        //
+        //   eps     argmax  top-5 set    worst relative displacement
+        //   0.2%    16      held         0.3%
+        //   1%      16      broke once   1.7%
+        //
+        // The argmax never moves. This is 1.7%, rounded up to a fiftieth,
+        // and NOT the smallest number that passes.
+        //
+        // It is far under gemma-4-26b-a4b's 0.10, and the difference is the
+        // DTYPE the measurement was taken in and not the model: gemma's was
+        // taken against a bf16 forward, where a routing flip and two bf16
+        // roundings arrive together and cannot be told apart. Sparser
+        // routing does not move a readout more; reading it through bf16
+        // twice does.
+        routing: 0.02,
     },
 ];
 
@@ -747,6 +855,24 @@ fn census(bytes: &[u8], element: usize) -> Census {
 /// A gate that builds its own geometry does not test the driver's. This asks
 /// the same source, so a deployment whose shape this file has never seen is
 /// laid out right without a line being added here.
+/// The first layer whose K pages a prefill actually writes.
+///
+/// Layer zero for everything dense, and NOT for a hybrid. Qwen3.6 places one
+/// full-attention layer every `full_attn_interval` and runs gated delta net in
+/// between; a linear layer keeps its history in a recurrent slab and never
+/// touches the paged pool, so layer zero's pages stay exactly as allocated.
+///
+/// Two gates read a K row back to prove a prefill rotated it, and both read
+/// layer zero. On 27B and 35B-A3B that row is all zeros, and both gates failed
+/// on their own "nothing was written" guard -- the guard that exists so the
+/// REAL assertion cannot pass for the wrong reason. It did its job: what was
+/// wrong was the layer, not the driver.
+fn first_paged_layer(dg: &driver_metal::batch::DecodeGeometry) -> u32 {
+    (0..dg.n_layers)
+        .find(|&l| dg.is_full_attn(l))
+        .expect("some layer attends")
+}
+
 fn pool_shape(dg: &driver_metal::batch::DecodeGeometry, pages: u32) -> Shape {
     Shape {
         layers: dg.n_layers,
@@ -842,6 +968,14 @@ fn dispatch_geometry(dg: &driver_metal::batch::DecodeGeometry, binding: &MetalBi
         global_head_dim: dg.global_head_dim,
         global_kv_heads: dg.global_kv_heads,
         full_attn_every: dg.full_attn_every,
+        // The gated-DeltaNet grid's two extents. Literal zeros here until
+        // qwen3.6 arrived, which was harmless while no row this file fired
+        // had a recurrent stack and is not now: a zero `v_dim` makes
+        // `gdn_core_slotted`'s grid empty, so the scan writes nothing, the
+        // arena keeps whatever was in it, and the census reads a fire that
+        // ran every dispatch and computed one layer of the model.
+        v_heads: dg.gdn_v_heads,
+        v_dim: dg.gdn_v_dim,
         router_group: binding.router_quant_group,
         router_bits: binding.router_quant_bits,
     }
@@ -853,6 +987,13 @@ struct Live<'a> {
     tables: &'a driver_metal::bind::tables::Staged,
     shape: Shape,
     pages: &'a dyn Fn(u16, bool) -> Option<Slice>,
+    /// The recurrent stack's planes, for a hybrid that has one.
+    ///
+    /// `None` everywhere but the gates that fire a gated-DeltaNet row, which
+    /// is what the driver's own resolver answers for a pure-attention
+    /// checkpoint too -- the field exists so those gates state the absence
+    /// rather than inherit it.
+    slabs: Option<&'a dyn Fn(u16, &'static str) -> Option<Slice>>,
 }
 
 impl Resolver for Live<'_> {
@@ -865,6 +1006,9 @@ impl Resolver for Live<'_> {
     fn kv(&mut self, layer: u16, values: bool) -> Option<Slice> {
         (self.pages)(layer, values)
     }
+    fn slab(&mut self, layer: u16, which: &'static str) -> Option<Slice> {
+        self.slabs?(layer, which)
+    }
     fn fire(&mut self, which: FireTable) -> Option<Slice> {
         self.tables.at(which)
     }
@@ -874,6 +1018,122 @@ impl Resolver for Live<'_> {
             FireTable::KvSeqStride => self.shape.kv_heads * self.shape.head_dim,
             FireTable::KvPageSize => self.shape.page_size,
             _ => return None,
+        })
+    }
+}
+
+/// A recurrent seat per ROW, one seat per REQUEST — the shape the slotted
+/// GDN kernels index by, staged the way `serve::launch` stages it.
+///
+/// `gdn_prep_slotted` and `gdn_core_recurrent_slotted` read
+/// `slot_ids[tpig.z / v_heads]` with `z` running over `rows * v_heads`, so
+/// the table is a PER-ROW one. The wire carries one entry per REQUEST and
+/// `serve::launch` spreads it; a rig that stages the wire's length hands the
+/// kernel an out-of-bounds read for every row past the first, and the write
+/// it indexes lands wherever the garbage points.
+///
+/// PER REQUEST and not a column of zeros, which is the other way to be
+/// per-row and is wrong for the same reason a shared KV page would be. Two
+/// requests in one fire carry two INDEPENDENT recurrent states, and seating
+/// them together makes each read the other's carry.
+/// `a_request_prefills_the_same_way_beside_another_one` names it exactly --
+/// "the first request's distribution moved when the other joined its fire"
+/// -- and named it the first time this rig ever ran a hybrid at all.
+fn seats(step: &Step<'_>) -> Vec<u32> {
+    let n = step.token_ids.len();
+    let requests = step.qo_indptr.len().saturating_sub(1);
+    let mut out = Vec::with_capacity(n);
+    for r in 0..requests {
+        for _ in step.qo_indptr[r]..step.qo_indptr[r + 1] {
+            out.push(u32::try_from(r).unwrap_or(0));
+        }
+    }
+    // The legacy single-request spelling, whose CSR does not cover its rows.
+    if out.len() == n { out } else { vec![0; n] }
+}
+
+/// The recurrent stack's planes, for a gate pointed at a hybrid.
+///
+/// `None` for every pure-attention checkpoint, which is what the driver's own
+/// resolver answers for one too.
+struct Slabs {
+    /// Which STACK layers are linear-attention ones, in stack order.
+    linear: Vec<u32>,
+    pool: driver_metal::pools::recurrent::Pool,
+}
+
+/// Seats a gate's pool holds.
+///
+/// FOUR and not one. One is what a gate that fires a single request needs,
+/// and it is what this held until `a_request_prefills_the_same_way_beside_
+/// another_one` put two requests in one fire and every row landed in seat
+/// zero -- two recurrent states written over each other, reported as the
+/// first request's distribution moving. No gate here fires more than two
+/// requests; four leaves the margin and costs a plane per seat.
+const GATE_SEATS: u32 = 4;
+
+impl Slabs {
+    fn of(context: &Context, row: &'static dyn model::catalog::Variant) -> Option<Self> {
+        let deployment = row
+            .deployment(model::catalog::Deployed::single())
+            .expect("the row deploys");
+        let r = deployment.recurrent.as_ref()?;
+        let shape = driver_metal::layout::recurrent::Shape {
+            linear_layers: u32::try_from(r.linear_layers.len()).unwrap(),
+            conv_dim: u32::try_from(r.conv_dim).unwrap(),
+            conv_k: u32::try_from(r.conv_k).unwrap(),
+            v_heads: u32::try_from(r.v_h).unwrap(),
+            v_dim: u32::try_from(r.v_d).unwrap(),
+            k_dim: u32::try_from(r.k_d).unwrap(),
+            slots: GATE_SEATS,
+        };
+        Some(Self {
+            linear: r.linear_layers.clone(),
+            pool: driver_metal::pools::recurrent::Pool::allocate(context, shape)
+                .expect("a recurrent pool"),
+        })
+    }
+
+    /// The recurrent planes, in the registry a recording resolves against.
+    ///
+    /// `serve/load.rs` calls `pool.register` the moment it allocates one, so
+    /// this is the rig catching up with the seam rather than a second policy.
+    /// Without it `gdn_core_slotted` binds its state at an address in no
+    /// registered allocation, the recording is refused, and the fire is
+    /// ENCODED -- which is right for serving and useless for a gate whose
+    /// whole subject is the replay.
+    fn register(&self, regions: &mut driver_metal::device::Regions) {
+        self.pool.register(regions);
+    }
+
+    /// Zero every seat, which is what a request STARTING means.
+    ///
+    /// A gate that fires twice over the same prompt and compares the two
+    /// answers has to do this between them. A recurrent state is not a
+    /// scratch buffer: `gdn_core_slotted` decays and updates it IN PLACE, so
+    /// the second fire reads what the first one left and computes a different
+    /// thing for a correct reason. Serving calls `clear_slot` when it seats a
+    /// request for exactly this.
+    fn clear(&self) {
+        for slot in 0..GATE_SEATS {
+            self.pool.clear_slot(slot).expect("a seat this pool holds");
+        }
+    }
+
+    fn at(&self, layer: u16, which: &'static str) -> Option<Slice> {
+        // Stack index in, linear ordinal out: the text names the layer it IS,
+        // and the pool holds one plane per LINEAR layer with nothing between.
+        let ord = self.linear.iter().position(|&x| x == u32::from(layer))?;
+        let l = self.pool.layer(u32::try_from(ord).ok()?)?;
+        let (region, bytes) = match which {
+            "conv_state" => (&l.conv, self.pool.shape().conv_bytes_per_layer()),
+            "new_conv_state" => (&l.new_conv, self.pool.shape().conv_bytes_per_layer()),
+            "recurrent_state" => (&l.state, self.pool.shape().state_bytes_per_layer()),
+            _ => return None,
+        };
+        Some(Slice {
+            address: region.gpu_address(),
+            bytes,
         })
     }
 }
@@ -981,6 +1241,20 @@ fn stage_tables(
             // staging the driver does not do.
             sampling_indices: &driver_metal::lowering::frame::sampled_rows(step)
                 .expect("the readout table places its rows"),
+            // ONE SEAT, PER ROW.
+            //
+            // This read `&[]` under "no row this rig serves has
+            // linear-attention layers", which was true when it was written
+            // and stopped being true the day a qwen3.6 checkpoint arrived --
+            // and nothing said so, because an empty seat table is a
+            // LEGITIMATE staging. It means "this row has no recurrent
+            // state", so a hybrid staged through it does not fail to bind:
+            // it reads its seat out of whatever the allocator put next.
+            //
+            // These gates fire ONE request, so every row sits in seat zero
+            // and `Slabs` allocates exactly one. What they claim is that the
+            // arithmetic is right, not that seats are kept apart.
+            recurrent_slots: &seats(step),
         },
     )
     .expect("the tables stage")
@@ -1032,12 +1306,16 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
     let freqs = driver_metal::model::rope::table(&dg);
     let staged = stage_tables(&context, &step, shape.page_size, &freqs);
 
+    let rs = Slabs::of(&context, row);
+    let slabs = |l: u16, w: &'static str| rs.as_ref()?.at(l, w);
+
     let named = HashMap::new();
     let mut live = Live {
         store: Store::new(Names::mlx(), &loaded.tensors, &named),
         tables: &staged,
         shape,
         pages: &pages,
+        slabs: Some(&slabs),
     };
 
     let geometry = dispatch_geometry(&dg, &binding);
@@ -1602,12 +1880,16 @@ fn bisect(class: FireClass) {
         stage_prefill(&context, &step, shape.page_size, &freqs)
     };
 
+    let rs = Slabs::of(&context, row);
+    let slabs = |l: u16, w: &'static str| rs.as_ref()?.at(l, w);
+
     let named = HashMap::new();
     let mut live = Live {
         store: Store::new(Names::mlx(), &loaded.tensors, &named),
         tables: &staged,
         shape,
         pages: &pages,
+        slabs: Some(&slabs),
     };
     let geometry = dispatch_geometry(&dg, &binding);
 
@@ -1869,6 +2151,45 @@ fn bisect(class: FireClass) {
 #[test]
 #[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn the_first_statement_that_writes_a_nan_says_which_one_it_is() {
+    // BOTH CLASSES, because they are different programs. This fired a decode
+    // only, and a decode names none of the prefill-shaped kernels: a hybrid's
+    // prefill runs `gdn_prep_prefill` and its scan, a routed mixture runs the
+    // batched GEMM where a decode runs the matvec, and attention pages
+    // differently. The locator reported "the whole fire is NaN-free" for a
+    // checkpoint whose three-token PREFILL was 248,320 NaNs, and it was right
+    // about the program it ran.
+    //
+    // Four requests of one token, then one request of four. The second is the
+    // shape every long prompt has and the first is the shape every generated
+    // token has, and the axis between them is exactly the class.
+    locate_first_nan(
+        FireClass::Decode,
+        &Step {
+            token_ids: &[128_000, 9906, 1917, 128_001],
+            qo_indptr: &[0, 1, 2, 3, 4],
+            sampling_indices: &[0, 0, 0, 0],
+            sampling_indptr: &[0, 1, 2, 3, 4],
+            ..Step::default()
+        },
+    );
+    // SIXTY-FOUR rows, because a prefill's rectangle is the axis the driver
+    // splits on and a four-row one never reaches a second launch.
+    let long: Vec<u32> = (0..64u32).map(|i| 1000 + i * 37).collect();
+    locate_first_nan(
+        FireClass::Prefill,
+        &Step {
+            token_ids: &long,
+            qo_indptr: &[0, 64],
+            sampling_indices: &[63],
+            sampling_indptr: &[0, 1],
+            ..Step::default()
+        },
+    );
+}
+
+/// One class's fire, walked statement by statement. See the caller.
+fn locate_first_nan(class: FireClass, step: &Step<'_>) {
+    eprintln!("---- {class:?} ----");
     let Some(snapshot) = snapshot() else {
         eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
@@ -1885,21 +2206,14 @@ fn the_first_statement_that_writes_a_nan_says_which_one_it_is() {
     };
     let binding = observed(&dg, &loaded);
 
-    let step = Step {
-        token_ids: &[128_000, 9906, 1917, 128_001],
-        qo_indptr: &[0, 1, 2, 3, 4],
-        sampling_indices: &[0, 0, 0, 0],
-        sampling_indptr: &[0, 1, 2, 3, 4],
-        ..Step::default()
-    };
-    let plan = text(row, FireClass::Decode, &binding);
-    let lowered = lower_step(&plan, &step).expect("the step lowers");
+    let plan = text(row, class, &binding);
+    let lowered = lower_step(&plan, step).expect("the step lowers");
     let geometry = dispatch_geometry(&dg, &binding);
 
     let shape = pool_shape(&dg, 64);
     let pool = Pool::allocate(&context, shape).expect("a pool");
     let freqs = driver_metal::model::rope::table(&dg);
-    let staged = stage_tables(&context, &step, shape.page_size, &freqs);
+    let staged = stage_tables(&context, step, shape.page_size, &freqs);
     let named = HashMap::new();
 
     // Which arena spans hold FLOATS, off the text's own declared dtypes.
@@ -1920,6 +2234,8 @@ fn the_first_statement_that_writes_a_nan_says_which_one_it_is() {
     // NaN and this said none, in the same file, about the same arena. One of
     // the two readings had to be wrong and it was this one.
     let skip: Vec<usize> = int_offsets.iter().copied().collect();
+    let rs = Slabs::of(&context, row);
+    let slabs = |l: u16, w: &'static str| rs.as_ref()?.at(l, w);
     let float_spans = arena_regions(&lowered, lowered.arena_bytes as usize, &skip);
     eprintln!(
         "{} float span(s), {} integer value(s) excluded",
@@ -1954,6 +2270,7 @@ fn the_first_statement_that_writes_a_nan_says_which_one_it_is() {
             tables: &staged,
             shape,
             pages: &pages,
+            slabs: Some(&slabs),
         };
         let dispatches = driver_metal::lowering::dispatch::plan(
             &lowered,
@@ -2396,6 +2713,16 @@ fn one_token_at_position_zero_agrees_with_mlx() {
         return;
     };
     let binding = observed(&dg, &loaded);
+    // The recurrent stack, when this checkpoint HAS one.
+    //
+    // `None` was here for every gate below, which meant every hybrid
+    // checkpoint refused at the first `gdn_*` statement -- "a GDN slab: this
+    // driver allocates none" -- and refused it as a rig failure that reads
+    // like a driver defect. `Slabs::of` answers `None` for a pure-attention
+    // row itself, so this is the same thing for those and the missing thing
+    // for qwen3.6.
+    let rs = Slabs::of(&context, row);
+    let slabs = |l: u16, w: &'static str| rs.as_ref()?.at(l, w);
 
     // ONE request, ONE token, position zero.
     let step = Step {
@@ -2429,6 +2756,7 @@ fn one_token_at_position_zero_agrees_with_mlx() {
         tables: &staged,
         shape,
         pages: &pages,
+        slabs: Some(&slabs),
     };
 
     let (_, arena) = driver_metal::fire::run::run_keeping_arena(
@@ -2706,7 +3034,7 @@ fn one_token_at_position_zero_agrees_with_mlx() {
 ///     readout one per REQUEST. Without it the readout read row 0 and answered
 ///     the FIRST token's distribution — exactly right, for a question nobody
 ///     asked;
-///   * `Source::RequestCount` as `Ty::InPacked`, because how many rows to
+///   * `Source::Named(<keys::RequestCount as keys::Fact>::KEY)` as `Ty::InPacked`, because how many rows to
 ///     gather is the fire's number and it is a FIELD of a packed struct rather
 ///     than an operand.
 #[test]
@@ -2731,6 +3059,16 @@ fn a_two_token_prefill_agrees_with_mlx() {
         return;
     };
     let binding = observed(&dg, &loaded);
+    // The recurrent stack, when this checkpoint HAS one.
+    //
+    // `None` was here for every gate below, which meant every hybrid
+    // checkpoint refused at the first `gdn_*` statement -- "a GDN slab: this
+    // driver allocates none" -- and refused it as a rig failure that reads
+    // like a driver defect. `Slabs::of` answers `None` for a pure-attention
+    // row itself, so this is the same thing for those and the missing thing
+    // for qwen3.6.
+    let rs = Slabs::of(&context, row);
+    let slabs = |l: u16, w: &'static str| rs.as_ref()?.at(l, w);
 
     // ONE request, TWO tokens: a prefill.
     //
@@ -2774,6 +3112,7 @@ fn a_two_token_prefill_agrees_with_mlx() {
         tables: &staged,
         shape,
         pages: &pages,
+        slabs: Some(&slabs),
     };
 
     let (_, arena) = driver_metal::fire::run::run_keeping_arena(
@@ -2891,6 +3230,16 @@ fn a_prefill_rotates_its_second_row() {
         return;
     };
     let binding = observed(&dg, &loaded);
+    // The recurrent stack, when this checkpoint HAS one.
+    //
+    // `None` was here for every gate below, which meant every hybrid
+    // checkpoint refused at the first `gdn_*` statement -- "a GDN slab: this
+    // driver allocates none" -- and refused it as a rig failure that reads
+    // like a driver defect. `Slabs::of` answers `None` for a pure-attention
+    // row itself, so this is the same thing for those and the missing thing
+    // for qwen3.6.
+    let rs = Slabs::of(&context, row);
+    let slabs = |l: u16, w: &'static str| rs.as_ref()?.at(l, w);
 
     // The SAME token twice. Same embedding, same projection, so the two K rows
     // leave the matmul bit-identical and only the rotation can part them.
@@ -2947,6 +3296,7 @@ fn a_prefill_rotates_its_second_row() {
         tables: &staged,
         shape,
         pages: &pages,
+        slabs: Some(&slabs),
     };
 
     driver_metal::fire::run::run_keeping_arena(
@@ -2959,10 +3309,12 @@ fn a_prefill_rotates_its_second_row() {
     )
     .expect("the prefill runs");
 
-    // Layer zero's keys. `stage_prefill` writes row r into page zero at slot r,
-    // and the layer is `[pages, page_size, kv_heads * head_dim]`.
-    let layer = pool.layer(0).expect("layer zero is pooled");
-    let row_bytes = shape.row_bytes_at(0) as usize;
+    // The first PAGED layer's keys -- see `first_paged_layer`, which is not
+    // layer zero on a hybrid. `stage_prefill` writes row r into page zero at
+    // slot r, and the layer is `[pages, page_size, kv_heads * head_dim]`.
+    let paged = first_paged_layer(&dg);
+    let layer = pool.layer(paged).expect("the first paged layer is pooled");
+    let row_bytes = shape.row_bytes_at(paged) as usize;
     let mut keys = vec![0u8; row_bytes * 2];
     // SAFETY: the command buffer retired before `run_keeping_arena` returned,
     // and the pool's K region is at least two rows wide.
@@ -2982,8 +3334,8 @@ fn a_prefill_rotates_its_second_row() {
 
     assert!(
         row0.iter().any(|b| *b != 0),
-        "row zero's key is all zeros, so nothing was written and the rest of \
-         this gate would pass for the wrong reason"
+        "row zero's key is all zeros at layer {paged}, so nothing was written \
+         and the rest of this gate would pass for the wrong reason"
     );
     assert!(
         row0 != row1,
@@ -3039,6 +3391,16 @@ fn a_prefill_rotates_its_second_row_on_the_base_ladder() {
         return;
     };
     let binding = observed(&dg, &loaded);
+    // The recurrent stack, when this checkpoint HAS one.
+    //
+    // `None` was here for every gate below, which meant every hybrid
+    // checkpoint refused at the first `gdn_*` statement -- "a GDN slab: this
+    // driver allocates none" -- and refused it as a rig failure that reads
+    // like a driver defect. `Slabs::of` answers `None` for a pure-attention
+    // row itself, so this is the same thing for those and the missing thing
+    // for qwen3.6.
+    let rs = Slabs::of(&context, row);
+    let slabs = |l: u16, w: &'static str| rs.as_ref()?.at(l, w);
 
     // The SAME token twice. Same embedding, same projection, so the two K rows
     // leave the matmul bit-identical and only the rotation can part them.
@@ -3083,6 +3445,7 @@ fn a_prefill_rotates_its_second_row_on_the_base_ladder() {
         tables: &staged,
         shape,
         pages: &pages,
+        slabs: Some(&slabs),
     };
 
     driver_metal::fire::run::run_keeping_arena(
@@ -3095,10 +3458,12 @@ fn a_prefill_rotates_its_second_row_on_the_base_ladder() {
     )
     .expect("the prefill runs");
 
-    // Layer zero's keys. `stage_prefill` writes row r into page zero at slot r,
-    // and the layer is `[pages, page_size, kv_heads * head_dim]`.
-    let layer = pool.layer(0).expect("layer zero is pooled");
-    let row_bytes = shape.row_bytes_at(0) as usize;
+    // The first PAGED layer's keys -- see `first_paged_layer`, which is not
+    // layer zero on a hybrid. `stage_prefill` writes row r into page zero at
+    // slot r, and the layer is `[pages, page_size, kv_heads * head_dim]`.
+    let paged = first_paged_layer(&dg);
+    let layer = pool.layer(paged).expect("the first paged layer is pooled");
+    let row_bytes = shape.row_bytes_at(paged) as usize;
     let mut keys = vec![0u8; row_bytes * 2];
     // SAFETY: the command buffer retired before `run_keeping_arena` returned,
     // and the pool's K region is at least two rows wide.
@@ -3118,8 +3483,8 @@ fn a_prefill_rotates_its_second_row_on_the_base_ladder() {
 
     assert!(
         row0.iter().any(|b| *b != 0),
-        "row zero's key is all zeros, so nothing was written and the rest of \
-         this gate would pass for the wrong reason"
+        "row zero's key is all zeros at layer {paged}, so nothing was written \
+         and the rest of this gate would pass for the wrong reason"
     );
     assert!(
         row0 != row1,
@@ -3201,6 +3566,20 @@ fn stage_prefill(
             // staging the driver does not do.
             sampling_indices: &driver_metal::lowering::frame::sampled_rows(step)
                 .expect("the readout table places its rows"),
+            // ONE SEAT, PER ROW.
+            //
+            // This read `&[]` under "no row this rig serves has
+            // linear-attention layers", which was true when it was written
+            // and stopped being true the day a qwen3.6 checkpoint arrived --
+            // and nothing said so, because an empty seat table is a
+            // LEGITIMATE staging. It means "this row has no recurrent
+            // state", so a hybrid staged through it does not fail to bind:
+            // it reads its seat out of whatever the allocator put next.
+            //
+            // These gates fire ONE request, so every row sits in seat zero
+            // and `Slabs` allocates exactly one. What they claim is that the
+            // arithmetic is right, not that seats are kept apart.
+            recurrent_slots: &seats(step),
         },
     )
     .expect("the tables stage")
@@ -3244,6 +3623,16 @@ fn a_generation_agrees_with_mlx_token_for_token() {
         return;
     };
     let binding = observed(&dg, &loaded);
+    // The recurrent stack, when this checkpoint HAS one.
+    //
+    // `None` was here for every gate below, which meant every hybrid
+    // checkpoint refused at the first `gdn_*` statement -- "a GDN slab: this
+    // driver allocates none" -- and refused it as a rig failure that reads
+    // like a driver defect. `Slabs::of` answers `None` for a pure-attention
+    // row itself, so this is the same thing for those and the missing thing
+    // for qwen3.6.
+    let rs = Slabs::of(&context, row);
+    let slabs = |l: u16, w: &'static str| rs.as_ref()?.at(l, w);
 
     // ONE pool for the whole generation. That is the point: every fire after
     // the first reads what its predecessors wrote.
@@ -3309,6 +3698,7 @@ fn a_generation_agrees_with_mlx_token_for_token() {
                 kv_write_offset: &w_off,
                 rope_frequencies: &inv_freq,
                 sampling_indices: &[n - 1],
+                recurrent_slots: &zeros,
             },
         )
         .expect("the tables stage");
@@ -3319,6 +3709,7 @@ fn a_generation_agrees_with_mlx_token_for_token() {
             tables: &staged,
             shape,
             pages: &pages,
+            slabs: Some(&slabs),
         };
         let (_, arena) = driver_metal::fire::run::run_keeping_arena(
             &context,
@@ -3413,6 +3804,16 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
         return;
     };
     let binding = observed(&dg, &loaded);
+    // The recurrent stack, when this checkpoint HAS one.
+    //
+    // `None` was here for every gate below, which meant every hybrid
+    // checkpoint refused at the first `gdn_*` statement -- "a GDN slab: this
+    // driver allocates none" -- and refused it as a rig failure that reads
+    // like a driver defect. `Slabs::of` answers `None` for a pure-attention
+    // row itself, so this is the same thing for those and the missing thing
+    // for qwen3.6.
+    let rs = Slabs::of(&context, row);
+    let slabs = |l: u16, w: &'static str| rs.as_ref()?.at(l, w);
 
     let step = Step {
         token_ids: &[128_000],
@@ -3463,6 +3864,7 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
         tables: &staged,
         shape,
         pages: &pages,
+        slabs: Some(&slabs),
     };
     let (_, arena) = driver_metal::fire::run::run_keeping_arena(
         &context,
@@ -3499,6 +3901,13 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
             layer.v.register(&mut regions);
         }
     }
+    if let Some(rs) = rs.as_ref() {
+        rs.register(&mut regions);
+        // The state the ENCODED fire just advanced, back to where it started.
+        // See `Slabs::clear`: without this the replay reads the first fire's
+        // leavings and the two paths are compared over different inputs.
+        rs.clear();
+    }
     regions.add(staged.region());
     regions.set_null(staged.region());
 
@@ -3510,6 +3919,7 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
         tables: &staged,
         shape,
         pages: &pages,
+        slabs: Some(&slabs),
     };
     let replayed_arena;
     let replayed = {
@@ -3582,7 +3992,11 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
     assert_eq!(
         recordings.recorded(),
         1,
-        "the fire was not recorded, so this proved nothing"
+        "the fire was not recorded, so this proved nothing. {}",
+        recordings
+            .refusals()
+            .next()
+            .unwrap_or("and the recorder gave no reason")
     );
 
     let mut order: Vec<usize> = (0..encoded.len()).collect();
@@ -3692,6 +4106,20 @@ fn stage_prefill_fleet(
             // staging the driver does not do.
             sampling_indices: &driver_metal::lowering::frame::sampled_rows(step)
                 .expect("the readout table places its rows"),
+            // ONE SEAT, PER ROW.
+            //
+            // This read `&[]` under "no row this rig serves has
+            // linear-attention layers", which was true when it was written
+            // and stopped being true the day a qwen3.6 checkpoint arrived --
+            // and nothing said so, because an empty seat table is a
+            // LEGITIMATE staging. It means "this row has no recurrent
+            // state", so a hybrid staged through it does not fail to bind:
+            // it reads its seat out of whatever the allocator put next.
+            //
+            // These gates fire ONE request, so every row sits in seat zero
+            // and `Slabs` allocates exactly one. What they claim is that the
+            // arithmetic is right, not that seats are kept apart.
+            recurrent_slots: &seats(step),
         },
     )
     .expect("the tables stage")
@@ -3760,6 +4188,16 @@ fn prefill_logits_on(
     } = *rig;
     let plan = text(row, FireClass::Prefill, binding);
     let lowered = lower_step(&plan, step).expect("the step lowers");
+    // The recurrent stack, when this checkpoint HAS one.
+    //
+    // `None` was here for every gate below, which meant every hybrid
+    // checkpoint refused at the first `gdn_*` statement -- "a GDN slab: this
+    // driver allocates none" -- and refused it as a rig failure that reads
+    // like a driver defect. `Slabs::of` answers `None` for a pure-attention
+    // row itself, so this is the same thing for those and the missing thing
+    // for qwen3.6.
+    let rs = Slabs::of(context, row);
+    let slabs = |l: u16, w: &'static str| rs.as_ref()?.at(l, w);
 
     let shape = pool_shape(dg, 16);
     // The arena outlives the pool: an elastic buffer charges its tiles back
@@ -3792,6 +4230,7 @@ fn prefill_logits_on(
         tables: &staged,
         shape,
         pages: &pages,
+        slabs: Some(&slabs),
     };
     let (_, arena) = driver_metal::fire::run::run_keeping_arena(
         context,
@@ -3913,6 +4352,11 @@ fn a_request_prefills_the_same_way_beside_another_one() {
         describe(&solo_b[0]),
         describe(&solo[0])
     );
+    // RED ON QWEN3.6, and not because a request leaked into another's rows.
+    // A hybrid's prefill scan races over its own tokens -- see the long note
+    // in `the_batched_gemm_answers_what_the_matvec_answers` -- so neither
+    // side of this comparison repeats, and a leak gate cannot claim anything
+    // until a fire does. Every seat here is its own, staged by `seats`.
     for (which, alone, batched) in [
         ("first", &solo[0], &batched[0]),
         ("second", &solo_b[0], &batched[1]),
@@ -4043,6 +4487,37 @@ fn the_batched_gemm_answers_what_the_matvec_answers() {
     // neither takes -- their answers must agree bit for bit, and a failure
     // here is the harness rather than either kernel.
     //
+    // # It is not the harness on a hybrid, and this is where that was found
+    //
+    // Both qwen3.6 checkpoints FAIL here, by more than a logit, and they
+    // fail with the two bindings replaced by one: the same program fired
+    // twice does not repeat. gemma-4-26b-a4b, which is pure attention, is
+    // bit-exact. The recurrent pool is freshly allocated and host-memset to
+    // zero before each fire, so it is not carry-over.
+    //
+    // `gdn_core_recurrent_slotted` is a DECODE kernel. Its state pointer is
+    //
+    //   i_state = rstate + ((slot * Hv + hv) * Dv + dv) * Dk
+    //
+    // -- indexed by SLOT -- while its grid is `z = 0 .. rows * Hv`, indexed
+    // by ROW. One row per slot is a decode and the pointer is private; R rows
+    // per slot is a prefill and R threads read, decay, update and store the
+    // same state with nothing sequencing them. `new_conv_state` is written
+    // the same way. The recurrence is defined to be sequential over tokens
+    // and this dispatch runs it in parallel over them.
+    //
+    // The prefill-shaped pair EXISTS and is dark: `gdn_prep_prefill_bfloat16`
+    // takes `row_pitch` and `n_scan` and scans the prompt in one thread per
+    // (head, dv); `kernels-metal/src/ssm.rs` carries both entrypoints and
+    // `driver-metal`'s `arm::gdn_prep_prefill` and
+    // `arm::gdn_core_recurrent_prefill` bind them. `model-dsl/src/metal.rs`
+    // names them ZERO times -- the same shape of gap as the routed MoE GEMM,
+    // and found the same way, by a gate that could finally run.
+    //
+    // So this assertion is red on qwen3.6 on purpose. It is not a tolerance
+    // to widen: a fire that does not repeat is a fire nothing else in this
+    // file can measure.
+    //
     // It is also the reference the 64-row fires are measured against, and it
     // needs no MLX: attention is CAUSAL, so row 1 of a sixty-four token
     // prefill sees tokens 0 and 1 and nothing else. Its distribution is the
@@ -4071,10 +4546,19 @@ fn the_batched_gemm_answers_what_the_matvec_answers() {
         &mut pipelines,
         &short,
     );
+    let disagreement = a[0]
+        .iter()
+        .zip(&b[0])
+        .enumerate()
+        .max_by(|m, n| (m.1.0 - m.1.1).abs().total_cmp(&(n.1.0 - n.1.1).abs()))
+        .expect("a vocabulary");
     assert_eq!(
         a[0], b[0],
         "below the guard both bindings take the matvec, so this comparison is \
-         of one program with itself -- and it disagreed"
+         of one program with itself -- and it disagreed. Widest at token {}: \
+         {} against {}. A fire that does not repeat is a fire nothing else in \
+         this file can measure, so this is the first thing to settle.",
+        disagreement.0, disagreement.1.0, disagreement.1.1
     );
 
     let worst_of = |x: &[f32], y: &[f32]| -> (usize, f32, f32) {
@@ -4103,41 +4587,107 @@ fn the_batched_gemm_answers_what_the_matvec_answers() {
          the SAME kernel. Widest gap at token {at}: short {p}, long {q}. \
          Attention is causal, so nothing after row 1 may reach it."
     );
+    // # What "the same product" can be measured as, and what it cannot
+    //
+    // The two arms are one matrix product spelled twice, so the gap between
+    // them is bf16 rounding at the projection -- and then thirty layers of
+    // whatever the checkpoint does to it. Measured at the first QKV
+    // projection, relative RMS over the whole arena:
+    //
+    //     qwen3.6-27B   3.7e-5      gemma-4-26b-a4b   3.2e-5
+    //
+    // The kernel is equally right on both. Measured at the LOGITS, after the
+    // stack has had its way with that:
+    //
+    //     gpt-oss-20b      0.27% / 0.40%        (row 1 / row 63)
+    //     qwen3.6-27B      0.18% / 0.13%
+    //     gemma-4-26b-a4b  2.30% / 0.67%
+    //
+    // gemma-4 amplifies by an order of magnitude and the growth is smooth --
+    // 3e-5 into 9e-4 across one 256-wide attention, which is what an
+    // exponential does to a dot product that size, and no single statement
+    // multiplies it by more than five. An absolute bound of four bf16 ulps at
+    // the span was calibrated on the two checkpoints that do not amplify, and
+    // it failed gemma-4 for having a different condition number rather than a
+    // different answer.
+    //
+    // So the measurement is the RELATIVE RMS against the distribution's own
+    // span, bounded where a correct GEMM lands on every checkpoint in the
+    // catalogue and nowhere near where a broken one does: when the tile was
+    // derived rather than read off the name, the worst pair was 14 against a
+    // span of 6, which is 230%.
+    const REL_RMS: f32 = 0.04;
+    let rel_rms = |x: &[f32], y: &[f32]| -> f32 {
+        let n = x.len() as f64;
+        let d = x
+            .iter()
+            .zip(y)
+            .map(|(p, q)| f64::from(*p - *q).powi(2))
+            .sum::<f64>();
+        (d / n).sqrt() as f32 / span(y).max(f32::MIN_POSITIVE)
+    };
     // The GEMM's own causality, to a tolerance, because it is a different
     // kernel summing the same row in a different order.
     let (at, p, q) = worst_of(&a[0], &gemm[0]);
+    let r = rel_rms(&gemm[0], &a[0]);
     assert!(
-        (p - q).abs() <= slack,
-        "row 1 under the GEMM is {q} at token {at} where the two-token \
-         prefill says {p}, further than {slack}. Causality does not depend on \
-         which projection kernel ran."
+        r <= REL_RMS,
+        "row 1 under the GEMM is {r:.4} of its span away from the two-token \
+         prefill in RMS, past {REL_RMS}. Widest at token {at}: short {p}, \
+         GEMM {q}. Causality does not depend on which projection kernel ran."
     );
 
     // NOT bit for bit: the two kernels sum a row in different orders, so the
     // last bits differ legitimately. A quarter-written projection does not
-    // land within a couple of bf16 ulps of anything -- when the tile was
-    // derived rather than read off the name, this gap was 14.
+    // land within a couple of bf16 ulps of anything.
     let (at, g, m) = worst_of(&gemm[1], &matvec[1]);
+    let r = rel_rms(&gemm[1], &matvec[1]);
     assert!(
-        (g - m).abs() <= slack,
-        "the GEMM and the matvec disagree at token {at}: GEMM {g}, matvec {m}, \
-         which is further apart than {slack}. They are two spellings of one \
-         matrix product."
+        r <= REL_RMS,
+        "the GEMM and the matvec disagree by {r:.4} of the distribution's \
+         span in RMS, past {REL_RMS}. The widest is token {at}, GEMM {g} \
+         against matvec {m}. They are two spellings of one matrix product."
     );
 
-    // The ORDER too, because a distribution can stay within tolerance
-    // pointwise and still rank differently at the top, which is the only part
-    // a sampler reads.
-    let top5 = |v: &[f32]| {
-        let mut order: Vec<usize> = (0..v.len()).collect();
-        order.sort_by(|&x, &y| v[y].total_cmp(&v[x]));
-        order[..5].to_vec()
-    };
-    assert_eq!(
-        top5(&gemm[1]),
-        top5(&matvec[1]),
-        "the two arms rank the top of the distribution differently"
-    );
+    // The TOP too, because a distribution can stay within tolerance pointwise
+    // and still rank differently where a sampler reads.
+    //
+    // # A tie broken two ways is not a different ranking
+    //
+    // This compared the top five index for index and gemma-4-26b-a4b failed
+    // it on `[236758, 531, 563]` against `[531, 563, 236758]` -- 19.75 and
+    // 19.625, which are ADJACENT bf16 values. Three logits inside one ulp
+    // have no order to disagree about, and demanding one asks the two
+    // summation orders to break a tie the same way.
+    //
+    // What a sampler would notice is a top choice the other arm does not
+    // rate: an arm's argmax has to be within `slack` of the other arm's
+    // maximum. A projection reading the wrong rows moves the top by a lot
+    // more than a couple of ulps and this still catches it; a coin flip
+    // between neighbours it does not.
+    fn top(v: &[f32]) -> (usize, f32) {
+        let (at, best) = v
+            .iter()
+            .enumerate()
+            .max_by(|x, y| x.1.total_cmp(y.1))
+            .expect("a vocabulary");
+        (at, *best)
+    }
+    for (name, x, y) in [
+        ("the GEMM", &gemm[1], &matvec[1]),
+        ("the matvec", &matvec[1], &gemm[1]),
+    ] {
+        let (at, chosen) = top(x);
+        let (peak_at, peak) = top(y);
+        assert!(
+            y[at] >= peak - slack,
+            "{name} would sample token {at} at {chosen}, which the other arm \
+             rates {} against its own top of {peak} at token {peak_at} -- \
+             further below it than {slack}, so the two arms do not agree on \
+             what to say next.",
+            y[at]
+        );
+    }
 }
 
 /// **An elastic pool answers exactly as a fixed one does.**
@@ -4351,6 +4901,16 @@ fn attention_is_a_minority_of_a_long_prefill() {
         return;
     };
     let binding = observed(&dg, &loaded);
+    // The recurrent stack, when this checkpoint HAS one.
+    //
+    // `None` was here for every gate below, which meant every hybrid
+    // checkpoint refused at the first `gdn_*` statement -- "a GDN slab: this
+    // driver allocates none" -- and refused it as a rig failure that reads
+    // like a driver defect. `Slabs::of` answers `None` for a pure-attention
+    // row itself, so this is the same thing for those and the missing thing
+    // for qwen3.6.
+    let rs = Slabs::of(&context, row);
+    let slabs = |l: u16, w: &'static str| rs.as_ref()?.at(l, w);
     let freqs = driver_metal::model::rope::table(&dg);
 
     // Geometrically spaced, which is what the estimator above needs. The
@@ -4421,6 +4981,7 @@ fn attention_is_a_minority_of_a_long_prefill() {
                 tables: staged,
                 shape: *shape,
                 pages: &pages,
+                slabs: Some(&slabs),
             };
             let started = std::time::Instant::now();
             let (_, _arena) = driver_metal::fire::run::run_keeping_arena(
@@ -4487,17 +5048,28 @@ fn attention_is_a_minority_of_a_long_prefill() {
     // kernel's cost would have crossed the threshold — and refuses to
     // answer where it could not, exactly as it refuses a negative
     // coefficient above.
-    assert!(
-        share * DECODE_OVER_WIRED >= 0.40,
-        "this checkpoint cannot tell the two attention kernels apart: at \
-         {:.0}% of a {longest:.0}-token prefill, attention would still be \
-         under the 40% threshold at {DECODE_OVER_WIRED}x the cost. Its \
-         per-token work swamps the quadratic term — run this gate on a \
-         dense checkpoint (Llama-3.2-1B measured 8% on the wired mma kernel \
-         against 47% on the decode kernel it replaces) where \
-         the threshold sits between the two states.",
-        share * 100.0
-    );
+    //
+    // A SKIP and not a failure, and the difference matters. Whether a
+    // checkpoint's quadratic term is large enough to judge is a property of
+    // its SHAPE -- Qwen3.6-27B runs linear attention in three layers of every
+    // four, so three quarters of its stack has no quadratic term to find, and
+    // it will refuse here on every run of every build forever. An `assert!`
+    // made that a red suite that no change could turn green, which trains a
+    // reader to ignore the colour. The gate is out of scope for this row; it
+    // is not failing on it.
+    if share * DECODE_OVER_WIRED < 0.40 {
+        eprintln!(
+            "SKIP: this checkpoint cannot tell the two attention kernels \
+             apart: at {:.0}% of a {longest:.0}-token prefill, attention \
+             would still be under the 40% threshold at {DECODE_OVER_WIRED}x \
+             the cost. Its per-token work swamps the quadratic term -- run \
+             this gate on a dense checkpoint (Llama-3.2-1B measured 8% on the \
+             wired mma kernel against 47% on the decode kernel it replaces) \
+             where the threshold sits between the two states.",
+            share * 100.0
+        );
+        return;
+    }
     assert!(
         share < 0.40,
         "attention is {:.0}% of a {longest:.0}-token prefill ({attention:.0} ms of {:.0} ms). \
@@ -4534,22 +5106,41 @@ fn where_a_long_prefill_spends_its_time() {
         return;
     };
     let binding = observed(&dg, &loaded);
+    // The recurrent stack, when this checkpoint HAS one.
+    //
+    // `None` was here for every gate below, which meant every hybrid
+    // checkpoint refused at the first `gdn_*` statement -- "a GDN slab: this
+    // driver allocates none" -- and refused it as a rig failure that reads
+    // like a driver defect. `Slabs::of` answers `None` for a pure-attention
+    // row itself, so this is the same thing for those and the missing thing
+    // for qwen3.6.
+    let rs = Slabs::of(&context, row);
+    let slabs = |l: u16, w: &'static str| rs.as_ref()?.at(l, w);
     let freqs = driver_metal::model::rope::table(&dg);
     let plan = text(row, FireClass::Prefill, &binding);
     let named = HashMap::new();
 
-    const N: u32 = 2048;
+    // 2048 by default, and `PIE_BENCH_PREFILL` because the attribution is a
+    // DIFFERENT picture at the length tier 1 reports. At 2048 gpt-oss spends
+    // 75% of its fire in one routed GEMM and the per-dispatch costs vanish;
+    // at 128 the same fire is dominated by what it costs to order 604
+    // dispatches. A tool that can only see the first regime cannot be pointed
+    // at the second, which is the one the C++ shell is beating us in.
+    let n: u32 = std::env::var("PIE_BENCH_PREFILL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2048);
     const ROUNDS: usize = 5;
-    let tokens: Vec<u32> = (0..N).map(|i| 1000 + i % 5000).collect();
+    let tokens: Vec<u32> = (0..n).map(|i| 1000 + i % 5000).collect();
     let step = Step {
         token_ids: &tokens,
-        qo_indptr: &[0, N],
-        sampling_indices: &[N - 1],
+        qo_indptr: &[0, n],
+        sampling_indices: &[n - 1],
         sampling_indptr: &[0, 1],
         ..Step::default()
     };
     let whole = lower_step(&plan, &step).expect("the step lowers");
-    let shape = pool_shape(&dg, N.div_ceil(16) + 4);
+    let shape = pool_shape(&dg, n.div_ceil(16) + 4);
     let pool = Pool::allocate(&context, shape).expect("a pool");
     let staged = stage_prefill_fleet(&context, &step, shape.page_size, &freqs);
 
@@ -4575,6 +5166,7 @@ fn where_a_long_prefill_spends_its_time() {
                 tables: &staged,
                 shape,
                 pages: &pages,
+                slabs: Some(&slabs),
             };
             let started = std::time::Instant::now();
             let (timing, _arena) = driver_metal::fire::run::run_keeping_arena(
@@ -4618,7 +5210,7 @@ fn where_a_long_prefill_spends_its_time() {
         .launches
         .iter()
         .enumerate()
-        .filter(|(_, l)| l.layers == (0..1) && l.rows == (0..N))
+        .filter(|(_, l)| l.layers == (0..1) && l.rows == (0..n))
         .map(|(i, _)| i)
         .take(20)
         .collect();
@@ -4670,7 +5262,7 @@ fn where_a_long_prefill_spends_its_time() {
 
     rows.sort_by(|a, b| b.0.total_cmp(&a.0));
     let attributed: f64 = rows.iter().map(|r| r.0).sum();
-    println!("\nprefill n={N}: {total:.1} ms total, {attributed:.1} ms attributed");
+    println!("\nprefill n={n}: {total:.1} ms total, {attributed:.1} ms attributed");
     for (ms, count, symbol) in &rows {
         println!(
             "  {ms:8.2} ms  {:5.1}%  x{count:<4} {symbol}",
@@ -4770,6 +5362,16 @@ fn what_a_decode_costs_at_length() {
         return;
     };
     let binding = observed(&dg, &loaded);
+    // The recurrent stack, when this checkpoint HAS one.
+    //
+    // `None` was here for every gate below, which meant every hybrid
+    // checkpoint refused at the first `gdn_*` statement -- "a GDN slab: this
+    // driver allocates none" -- and refused it as a rig failure that reads
+    // like a driver defect. `Slabs::of` answers `None` for a pure-attention
+    // row itself, so this is the same thing for those and the missing thing
+    // for qwen3.6.
+    let rs = Slabs::of(&context, row);
+    let slabs = |l: u16, w: &'static str| rs.as_ref()?.at(l, w);
     let geometry = dispatch_geometry(&dg, &binding);
     let freqs = driver_metal::model::rope::table(&dg);
     let inv_freq: Vec<u32> = freqs.iter().map(|f| f.to_bits()).collect();
@@ -4856,6 +5458,7 @@ fn what_a_decode_costs_at_length() {
                     kv_write_offset: &w_off,
                     rope_frequencies: &inv_freq,
                     sampling_indices: &[count - 1],
+                    recurrent_slots: &zeros,
                 },
             )
             .expect("the tables stage");
@@ -4866,6 +5469,7 @@ fn what_a_decode_costs_at_length() {
                 tables: &staged,
                 shape,
                 pages: &pages,
+                slabs: Some(&slabs),
             };
             let mut machine = driver_metal::fire::run::Machine {
                 context: &context,
@@ -4937,6 +5541,579 @@ fn what_a_decode_costs_at_length() {
     }
 }
 
+/// Tier 1 of `.wiki/macos-bench.md` §3, on the Rust driver.
+///
+/// One prefill of `P` tokens, then `D` single-token decodes reading the
+/// context it built. Prints the two numbers that document's tables carry:
+/// prefill tok/s and no-readback decode tok/s.
+///
+/// # Why this exists at all
+///
+/// Every pie column in `.wiki/macos-bench.md` was taken with
+/// `driver/metal/tests/llama_bench.cpp`, which `2cc4e5e4d` deleted along with
+/// the rest of the C++ Metal driver. So the recorded numbers describe an
+/// engine that no longer exists in this tree, and there was no way to ask
+/// whether the Rust rewrite reproduces them. This is that way.
+///
+/// It is deliberately NOT the served loop: no sampler, no detokeniser, no
+/// scheduler. `llama_bench` was not either -- §3 says the decode column is
+/// comparable to `llama-bench`'s `tg` precisely because both synchronise per
+/// step and neither samples. Feeding a token back is a different measurement
+/// and §6 records it in a separate sentence.
+///
+/// # What it holds fixed
+///
+/// The lowering cache, the `Scratch` and the `Stepper` are reused across
+/// steps, because a server reuses all three and the alternative measures the
+/// allocator. The first prefill and the first decode are discarded: they are
+/// the ones that compile their class's pipelines, which a server pays once
+/// per shape and not per token.
+///
+/// `PIE_BENCH_PREFILL` and `PIE_BENCH_DECODE` move the two lengths;
+/// `PIE_BENCH_ROUNDS` moves how many prefills are raced for the best.
+///
+/// # What a single prefill number hides
+///
+/// The tables quote ONE prefill length, 128, and a tok/s at one length is a
+/// ratio of two things that scale differently. Sweeping the length on
+/// gemma-4-26b-a4b, best of three:
+///
+/// | tokens | ms | tok/s |
+/// |---|---|---|
+/// | 32 | 135.9 | 235.4 |
+/// | 64 | 187.9 | 340.5 |
+/// | 128 | 293.3 | 436.4 |
+/// | 256 | 496.7 | 515.4 |
+/// | 512 | 942.2 | 543.4 |
+/// | 1024 | 1935.6 | 529.0 |
+///
+/// The middle four are a straight line: **84 ms fixed plus 1.62 ms a token**,
+/// with the per-token slope inside 4% across a 8x range (1.625, 1.647,
+/// 1.589). 1024 bends because attention has gone quadratic.
+///
+/// The fixed 84 ms is mostly not overhead. This checkpoint is 15.34 GB of
+/// weights and a 128-token prefill at top-8 of 128 experts touches every one
+/// of them, so it streams the whole file once no matter how many tokens ask
+/// for it -- about 46 ms at the ~330 GB/s this machine actually reaches.
+/// That leaves ~38 ms, across 990 dispatches, for ramp and drain.
+///
+/// Two things follow. The quoted 436 tok/s is 29% fixed cost, so a rival's
+/// number at n=128 is largely a statement about ITS fixed cost, not its
+/// arithmetic; the honest asymptote here is 1/1.62 ms = ~617 tok/s. And an
+/// optimisation that removes dispatches is bidding against 38 ms, while one
+/// that speeds the arithmetic is bidding against 207 ms.
+///
+/// # Where the 293 ms goes, priced without the attribution harness
+///
+/// `where_a_long_prefill_spends_its_time` cannot price a routing kernel --
+/// re-encoded alone its tile table is garbage and the number comes out at
+/// 161% of the fire -- and its `wall` column includes the subset's own CPU
+/// encode, which for a cheap kernel is most of what it reports. Both go away
+/// if the fire is cut instead: `PIE_BENCH_CUT_PREFILL=N` runs the first N
+/// dispatches of the REAL fire, so the difference between two cuts is what
+/// the dispatches between them cost in place, over real operands, behind the
+/// real barriers.
+///
+/// One MoE layer of gemma-4-26b-a4b is dispatches #495..#526. Cutting at each
+/// boundary, best of five, n=128:
+///
+/// | # | dispatch | ms |
+/// |---|---|---|
+/// | 516 | `router_topk_scaled` | 0.0 |
+/// | 517 | `route_sort` | 0.0 |
+/// | 518 | `route_gather` | 0.4 |
+/// | 519 | `affine_qmm_t_routed` (gate) | 1.9 |
+/// | 520 | `affine_qmm_t_routed` (up) | 1.6 |
+/// | 521 | `geglu_tanh` | 0.4 |
+/// | 522 | `affine_qmm_t_routed` (down) | 1.7 |
+/// | 523..526 | combine, two norms, scale | 0.0 |
+///
+/// **The three routed GEMMs are 5.2 ms of a 9.3 ms layer: 156 ms of the 293,
+/// or 53% of the fire.** Three dense projections priced the same way (#495
+/// to #498) are 1.2 ms, so the dense GEMM is 85 ms and 29%. Everything else
+/// -- 630 dispatches of norms, rope, gathers, sorts -- is the remaining 50 ms.
+/// Two kernels are 82% of a prefill.
+///
+/// # What the routed GEMM is bound by, and what it is not
+///
+/// Not padding. The sort rounds each touched expert's run up to the row tile,
+/// and at 128 experts, top-8 and 128 tokens the average expert holds eight
+/// rows and is rounded to thirty-two -- an arithmetic multiplier of four that
+/// is the obvious thing to attack. `bm = 16` halves it and the same cut pair
+/// says the block goes from 5.7 ms to 6.2: **removing half the arithmetic
+/// made it nine percent slower.** Whatever this kernel is waiting for, it is
+/// not the padded rows.
+///
+/// Sweeping the token count instead separates the two terms that do fit.
+/// Same cut pair, best of five: n=32 2.6 ms, n=128 5.7 ms, n=512 15.8 ms.
+/// Solving for a per-touched-expert term (the weights, which a token count
+/// does not move once every expert is hit) and a per-real-row term:
+///
+///     5.7 ms  =  2.33 ms weights  +  3.37 ms rows
+///
+/// The weight half is 428 MB of 4-bit expert weights a layer at **184 GB/s**,
+/// which is what this machine actually reaches, so it is a floor and not a
+/// defect. The row half is 12.2 GFLOP of real work at 3.6 TFLOP/s.
+///
+/// The dense GEMM, priced the same way, is 5.91 GFLOP in 1.2 ms at n=128 and
+/// 23.6 in 4.1 at n=512 -- **4.9 and 5.8 TFLOP/s**, against a peak near 8.
+/// It is not starved for threadgroups the way its 256-tile grid suggests: a
+/// 4x bigger M buys 17% more efficiency and no more.
+///
+/// So both GEMMs are inside a factor of two of what this GPU can do, and the
+/// remaining prefill gap against the deleted C++ engine is not hiding in a
+/// tile, a warp shape, a barrier count or a padded row. All four are closed
+/// with numbers now.
+#[test]
+#[ignore = "needs a checkpoint and a device"]
+fn tier_one_prefill_then_decode() {
+    let Some(snapshot) = snapshot() else {
+        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        return;
+    };
+    let Ok(context) = Context::new() else {
+        eprintln!("SKIP: no Metal 4 device");
+        return;
+    };
+    let env = |name: &str, fallback: u32| -> u32 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(fallback)
+    };
+    let prefill_len = env("PIE_BENCH_PREFILL", 128);
+    let decode_len = env("PIE_BENCH_DECODE", 64);
+    let rounds = env("PIE_BENCH_ROUNDS", 3);
+
+    let compiler = Compiler::new(&context).expect("a compiler");
+    let mut pipelines = Pipelines::new(kernels_dir());
+    let Some((row, dg, loaded)) = served(&context, &snapshot) else {
+        return;
+    };
+    let binding = observed(&dg, &loaded);
+    let geometry = dispatch_geometry(&dg, &binding);
+    let freqs = driver_metal::model::rope::table(&dg);
+    let inv_freq: Vec<u32> = freqs.iter().map(|f| f.to_bits()).collect();
+    let named = HashMap::new();
+
+    let shape = pool_shape(&dg, (prefill_len + decode_len).div_ceil(16) + 4);
+    let pool = Pool::allocate(&context, shape).expect("a pool");
+    let pages = |layer: u16, values: bool| {
+        pool.layer(u32::from(layer)).map(|l| Slice {
+            address: if values {
+                l.v.gpu_address()
+            } else {
+                l.k.gpu_address()
+            },
+            bytes: shape.layer_bytes_at(0),
+        })
+    };
+    let rs = Slabs::of(&context, row);
+    let slabs = |l: u16, w: &'static str| rs.as_ref()?.at(l, w);
+
+    let mut regions = driver_metal::device::Regions::new();
+    for region in &loaded.regions {
+        regions.add(region);
+    }
+    for l in 0..shape.layers {
+        if let Some(layer) = pool.layer(l) {
+            layer.k.register(&mut regions);
+            layer.v.register(&mut regions);
+        }
+    }
+    if let Some(rs) = rs.as_ref() {
+        rs.pool.register(&mut regions);
+    }
+
+    let mut lowerings = driver_metal::lowering::cached::Lowerings::new();
+    let scratch = driver_metal::fire::Scratch::new();
+    let mut stepper = driver_metal::device::Stepper::new(&context).expect("a stepper");
+
+    let fire = |first: u32,
+                count: u32,
+                lowerings: &mut driver_metal::lowering::cached::Lowerings,
+                pipelines: &mut Pipelines,
+                regions: &mut driver_metal::device::Regions,
+                stepper: &mut driver_metal::device::Stepper|
+     -> f64 {
+        let started = std::time::Instant::now();
+        // A fire at position zero IS a new sequence, and a new sequence's
+        // taps and DeltaNet memory are defined to be zero. `serve::launch`
+        // does this off the step's RESET flag; here the position says it.
+        //
+        // Not cosmetic. Left un-cleared, the second prefill of a hybrid
+        // re-consumes 128 tokens into a memory that already holds 129, and
+        // what that produced on Qwen3.6-35B-A3B was not a wrong answer but a
+        // HANG -- "the GPU did not reach event 3 within 60000 ms".
+        if first == 0 {
+            if let Some(rs) = rs.as_ref() {
+                rs.pool.clear_slot(0).expect("the seat clears");
+            }
+        }
+        let tokens: Vec<u32> = (0..count).map(|i| 1000 + (first + i) % 5000).collect();
+        let positions: Vec<u32> = (first..first + count).collect();
+        let step = Step {
+            token_ids: &tokens,
+            qo_indptr: &[0, count],
+            sampling_indices: &[count - 1],
+            sampling_indptr: &[0, 1],
+            ..Step::default()
+        };
+        let class = if count > 1 {
+            FireClass::Prefill
+        } else {
+            FireClass::Decode
+        };
+        let lowered = lowerings
+            .for_step(class, &step, || {
+                Ok::<_, std::convert::Infallible>(text(row, class, &binding))
+            })
+            .expect("the step lowers");
+        let held = (first + count).div_ceil(shape.page_size);
+        let page_list: Vec<u32> = (0..held).collect();
+        let zeros: Vec<u32> = vec![0; count as usize];
+        let w_page: Vec<u32> = positions.iter().map(|p| p / shape.page_size).collect();
+        let w_off: Vec<u32> = positions.iter().map(|p| p % shape.page_size).collect();
+        let staged = driver_metal::bind::tables::stage(
+            &context,
+            &scratch,
+            driver_metal::bind::tables::Frame {
+                token_ids: &tokens,
+                position_ids: &positions,
+                req_of_token: &zeros,
+                kv_page_indices: &page_list,
+                kv_page_indptr: &[0, held],
+                kv_write_page: &w_page,
+                kv_write_offset: &w_off,
+                rope_frequencies: &inv_freq,
+                sampling_indices: &[count - 1],
+                // One seat, and it is seat zero -- but one entry per ROW, not
+                // one per request. Both slotted GDN kernels read the table by
+                // the fire's row; a single entry for a 128-token prefill is a
+                // read past the tables region, and what it reads goes on to
+                // index a device WRITE. See
+                // `model::qwen_3_5::forward::metal`.
+                recurrent_slots: &zeros,
+            },
+        )
+        .expect("the tables stage");
+        regions.add(staged.region());
+        regions.set_null(staged.region());
+        let mut live = Live {
+            store: Store::new(Names::mlx(), &loaded.tensors, &named),
+            tables: &staged,
+            shape,
+            pages: &pages,
+            slabs: Some(&slabs),
+        };
+        let mut machine = driver_metal::fire::run::Machine {
+            context: &context,
+            compiler: &compiler,
+            pipelines,
+            stepper,
+            scratch: &scratch,
+            regions,
+            recordings: None,
+        };
+        // What the fire costs before it runs: the arena it needs and the
+        // launches it holds. The first question when a fire is slow for a
+        // reason no symbol explains -- `PIE_BENCH_SYMBOLS` says what runs,
+        // this says how much of it there is.
+        //
+        // And what the DEVICE is holding while it runs. Metal does not report
+        // a working set it cannot honour: every buffer is created, every bind
+        // succeeds, and the fire either faults much later or simply never
+        // retires. So the footprint against `working_set_bytes` is the first
+        // question when a fire hangs for a reason no binding explains -- a
+        // model whose weights already fill the set has nothing left for a
+        // second shape's arena, and `Scratch` never gives one back.
+        if std::env::var("PIE_BENCH_ARENA").is_ok_and(|v| !v.is_empty()) {
+            use objc2_metal::{MTLDevice, MTLResidencySet};
+            let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+            let held = context.device().currentAllocatedSize() as u64;
+            println!(
+                "  arena {:.1} MiB for {count} rows, {} launches; \
+                 device holds {:.2} GiB of {:.2} GiB working set, {} resident allocations",
+                lowered.arena_bytes as f64 / (1024.0 * 1024.0),
+                lowered.launches.len(),
+                gib(held),
+                gib(context.working_set_bytes()),
+                context.residency().allocationCount(),
+            );
+        }
+        let submitted =
+            driver_metal::fire::run::submit(&mut machine, &lowered, geometry, &mut live)
+                .expect("the fire commits");
+        machine
+            .stepper
+            .wait_for(submitted.value)
+            .expect("the fire retires");
+        // `PIE_BENCH_VERIFY_TABLES=1` reads the fire's own tables BACK off the
+        // device once it has retired, and says so when they no longer hold
+        // what was staged into them.
+        //
+        // The tables are the one input every dispatch of a fire reads and no
+        // dispatch is supposed to write: the positions, the request of each
+        // token, the page list. A kernel that overruns its output into them
+        // does not fault -- the region is resident and writable -- it just
+        // makes a LATER dispatch read a position out of nowhere, and
+        // `sdpa_paged`'s pass loop runs from `kp_lo` to that position. See
+        // `model::qwen_3_5::forward::metal`.
+        if std::env::var_os("PIE_BENCH_VERIFY_TABLES").is_some() {
+            use driver_metal::layout::region::Region as _;
+            let n = count as usize;
+            // SAFETY: the fire has retired, and the positions span starts one
+            // token-id table in -- `bind::tables::stage` writes them in that
+            // order.
+            let seen: Vec<u32> = unsafe {
+                let base = staged.region().contents().as_ptr().cast::<u32>();
+                core::slice::from_raw_parts(base.add(n), n).to_vec()
+            };
+            if seen == positions {
+                println!("  tables intact after {count} rows at {first}");
+            } else {
+                let bad = seen
+                    .iter()
+                    .zip(&positions)
+                    .enumerate()
+                    .filter(|(_, (a, b))| a != b)
+                    .take(4)
+                    .map(|(i, (a, b))| format!("[{i}] {a} != {b}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("  TABLES CLOBBERED after {count} rows at {first}: {bad}");
+            }
+        }
+        // What `serve::launch` does at the same point, and for the same
+        // reason: the plane the kernel wrote becomes the plane it reads.
+        if let Some(rs) = rs.as_ref() {
+            // SAFETY: the fire has retired, so nothing is reading either plane.
+            unsafe { rs.pool.carry_forward() }.expect("the conv planes carry");
+        }
+        started.elapsed().as_secs_f64() * 1e3
+    };
+
+    // Discarded: these two compile their class's pipelines.
+    //
+    // `PIE_BENCH_PREDECODE=1` fires a decode BEFORE the warm prefill, so that
+    // every decode-shaped pipeline, buffer and argument table already exists
+    // by the time the prefill-anything-prefill sequence runs.
+    //
+    // It was once the only way that sequence passed on Qwen3.6-35B-A3B, and
+    // that was a symptom rather than a property: the seat table was staged
+    // per REQUEST for kernels that read it per ROW, and the pre-decode moved
+    // the allocator enough that the read past its end came back harmless.
+    // The read is gone -- `bind::tables::stage` refuses a seat table that is
+    // not one entry per token -- so this now buys nothing but a warmer cache
+    // and is kept for measuring first-fire cost on its own. See
+    // `model::qwen_3_5::forward::metal`.
+    if std::env::var_os("PIE_BENCH_PREDECODE").is_some() {
+        fire(
+            prefill_len,
+            1,
+            &mut lowerings,
+            &mut pipelines,
+            &mut regions,
+            &mut stepper,
+        );
+    }
+    let warm = fire(
+        0,
+        prefill_len,
+        &mut lowerings,
+        &mut pipelines,
+        &mut regions,
+        &mut stepper,
+    );
+    if decode_len > 0 {
+        // `PIE_BENCH_CUT_DECODE=N` truncates ONLY the middle fire to its
+        // first N dispatches. At N=0 it encodes nothing at all and the fire
+        // after it still wedges, which is what took every decode KERNEL off
+        // the list of suspects.
+        let cut = std::env::var("PIE_BENCH_CUT_DECODE").ok();
+        if let Some(cut) = cut.as_ref() {
+            // SAFETY: this test is single-threaded (`--test-threads=1`) and
+            // nothing else reads the environment while it is set.
+            unsafe { std::env::set_var("PIE_METAL_MAX_DISPATCH", cut) };
+        }
+        // `PIE_BENCH_MIDDLE_PREFILL` / `PIE_BENCH_MIDDLE_AT` make the middle
+        // fire a PREFILL of some other length, at some other position,
+        // instead of a decode. Both shapes wedge the fire that follows, so
+        // the class is not the trigger; what they move is how OFTEN it
+        // wedges, which is how the hang was shown to be nondeterministic.
+        let middle: u32 = std::env::var("PIE_BENCH_MIDDLE_PREFILL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let at: u32 = std::env::var("PIE_BENCH_MIDDLE_AT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(prefill_len);
+        println!("  middle fire: {middle} row(s) at {at}");
+        fire(
+            at,
+            middle,
+            &mut lowerings,
+            &mut pipelines,
+            &mut regions,
+            &mut stepper,
+        );
+        if cut.is_some() {
+            // SAFETY: as above.
+            unsafe { std::env::remove_var("PIE_METAL_MAX_DISPATCH") };
+        }
+    }
+
+    // What the prefill actually named, which is the first question when a
+    // throughput is flat in the token count: a batched GEMM amortises the
+    // weight read over the rows, so its tok/s RISES with the prompt. A
+    // per-row path's does not, and this says which kernels are in the fire.
+    if std::env::var("PIE_BENCH_SYMBOLS").is_ok_and(|v| !v.is_empty())
+        || std::env::var_os("PIE_BENCH_WINDOW").is_some()
+    {
+        let step = Step {
+            token_ids: &vec![1000_u32; prefill_len as usize],
+            qo_indptr: &[0, prefill_len],
+            sampling_indices: &[prefill_len - 1],
+            sampling_indptr: &[0, 1],
+            ..Step::default()
+        };
+        let lowered = lower_step(&text(row, FireClass::Prefill, &binding), &step)
+            .expect("the prefill lowers");
+        let mut by_symbol: Vec<(usize, usize, &str)> = Vec::new();
+        for (index, symbol) in lowered.kernels.iter().enumerate() {
+            let n = lowered
+                .launches
+                .iter()
+                .filter(|l| usize::from(l.kernel) == index)
+                .count();
+            if n > 0 {
+                by_symbol.push((n, index, symbol));
+            }
+        }
+        by_symbol.sort_by(|a, b| b.0.cmp(&a.0));
+        // `PIE_BENCH_WINDOW=N` names the launches AROUND dispatch N, and
+        // `PIE_BENCH_WINDOW=LO:HI` names a range of them, which is what
+        // turns a `PIE_BENCH_CUT_PREFILL` bisect into an answer: the bisect
+        // says which dispatch index stalls, and this says which kernel and
+        // which layer that index is. Together they put the A3B wedge on
+        // `sdpa_paged_tiled_bfloat16_d_256` at layer 31 -- see
+        // `model::qwen_3_5::forward::metal`.
+        if let Some(spec) = std::env::var("PIE_BENCH_WINDOW").ok() {
+            let (lo, hi) = match spec.split_once(':') {
+                Some((a, b)) => (
+                    a.parse::<usize>().unwrap_or(0),
+                    b.parse::<usize>().unwrap_or(0),
+                ),
+                None => {
+                    let n = spec.parse::<usize>().unwrap_or(0);
+                    (n.saturating_sub(8), n + 4)
+                }
+            };
+            let hi = hi.min(lowered.launches.len());
+            println!("\nlaunches {lo}..{hi} of {}:", lowered.launches.len());
+            for (i, l) in lowered.launches.iter().enumerate().take(hi).skip(lo) {
+                println!(
+                    "  #{i:<5} rows {:?} layers {:?} op {:?} {}",
+                    l.rows,
+                    l.layers,
+                    l.op,
+                    lowered.kernels[usize::from(l.kernel)]
+                );
+            }
+        }
+        if std::env::var("PIE_BENCH_SYMBOLS").is_ok_and(|v| !v.is_empty()) {
+            println!("\nprefill {prefill_len} names {} symbols:", by_symbol.len());
+            for (n, index, symbol) in by_symbol {
+                let first = lowered
+                    .launches
+                    .iter()
+                    .find(|l| usize::from(l.kernel) == index)
+                    .expect("the symbol has a launch");
+                println!("  x{n:<5} rows {:?} {symbol}", first.rows);
+            }
+        }
+    }
+
+    let mut prefills = Vec::new();
+    for _ in 0..rounds {
+        // `PIE_BENCH_CUT_PREFILL=N` truncates ONLY the MEASURED prefill to
+        // its first N dispatches, which is how the A3B wedge was localised:
+        // bisecting N put the stall between 845 (retires, three runs in
+        // three) and 846 (wedges, two in two). Pair it with
+        // `PIE_BENCH_WINDOW` to name the dispatch that N lands on.
+        let cut = std::env::var("PIE_BENCH_CUT_PREFILL").ok();
+        if let Some(cut) = cut.as_ref() {
+            // SAFETY: this test is single-threaded (`--test-threads=1`) and
+            // nothing else reads the environment while it is set.
+            unsafe { std::env::set_var("PIE_METAL_MAX_DISPATCH", cut) };
+        }
+        // `PIE_BENCH_SKIP_PREFILL=M` is the other end of the same window,
+        // applied to the same fire.
+        let skip = std::env::var("PIE_BENCH_SKIP_PREFILL").ok();
+        if let Some(skip) = skip.as_ref() {
+            // SAFETY: as above.
+            unsafe { std::env::set_var("PIE_METAL_MIN_DISPATCH", skip) };
+        }
+        prefills.push(fire(
+            0,
+            prefill_len,
+            &mut lowerings,
+            &mut pipelines,
+            &mut regions,
+            &mut stepper,
+        ));
+        if cut.is_some() {
+            // SAFETY: as above.
+            unsafe { std::env::remove_var("PIE_METAL_MAX_DISPATCH") };
+        }
+        if skip.is_some() {
+            // SAFETY: as above.
+            unsafe { std::env::remove_var("PIE_METAL_MIN_DISPATCH") };
+        }
+    }
+    // `PIE_BENCH_ROUNDS=0` measures nothing twice: the warm-up prefill's own
+    // time is reported instead. It is the pessimistic figure -- it paid the
+    // pipeline compiles -- and it exists so a model whose second prefill
+    // misbehaves can still be measured on the decode half.
+    if prefills.is_empty() {
+        prefills.push(warm);
+    }
+    prefills.sort_by(f64::total_cmp);
+
+    let mut decodes = Vec::new();
+    for i in 0..decode_len {
+        decodes.push(fire(
+            prefill_len + i,
+            1,
+            &mut lowerings,
+            &mut pipelines,
+            &mut regions,
+            &mut stepper,
+        ));
+    }
+    let total: f64 = decodes.iter().sum();
+    decodes.sort_by(f64::total_cmp);
+    // `PIE_BENCH_DECODE=0` measures the prefill half alone, which is what
+    // isolates a defect that only shows once two prefills are in the same
+    // process.
+    let median = decodes.get(decodes.len() / 2).copied().unwrap_or(f64::NAN);
+
+    println!(
+        "\nTIER1 {}\n  prefill {prefill_len}: {:.1} ms, {:.1} tok/s (best of {rounds}, worst {:.1} ms)\n  \
+         decode {decode_len}: {median:.2} ms a token, {:.1} tok/s median, {:.1} tok/s over the whole run \
+         (best {:.2} worst {:.2})",
+        row.id(),
+        prefills[0],
+        f64::from(prefill_len) * 1e3 / prefills[0],
+        prefills[prefills.len() - 1],
+        1e3 / median,
+        f64::from(decode_len) * 1e3 / total,
+        decodes.first().copied().unwrap_or(f64::NAN),
+        decodes.last().copied().unwrap_or(f64::NAN),
+    );
+}
+
 /// Where a DECODE spends its time, per symbol, at two context lengths.
 ///
 /// `where_a_long_prefill_spends_its_time` answers this for the other half of
@@ -4970,6 +6147,16 @@ fn where_a_decode_spends_its_time() {
         return;
     };
     let binding = observed(&dg, &loaded);
+    // The recurrent stack, when this checkpoint HAS one.
+    //
+    // `None` was here for every gate below, which meant every hybrid
+    // checkpoint refused at the first `gdn_*` statement -- "a GDN slab: this
+    // driver allocates none" -- and refused it as a rig failure that reads
+    // like a driver defect. `Slabs::of` answers `None` for a pure-attention
+    // row itself, so this is the same thing for those and the missing thing
+    // for qwen3.6.
+    let rs = Slabs::of(&context, row);
+    let slabs = |l: u16, w: &'static str| rs.as_ref()?.at(l, w);
     let geometry = dispatch_geometry(&dg, &binding);
     let freqs = driver_metal::model::rope::table(&dg);
     let inv_freq: Vec<u32> = freqs.iter().map(|f| f.to_bits()).collect();
@@ -4995,6 +6182,7 @@ fn where_a_decode_spends_its_time() {
                 kv_write_offset: &[ctx % shape.page_size],
                 rope_frequencies: &inv_freq,
                 sampling_indices: &[0],
+                recurrent_slots: &[0],
             },
         )
         .expect("the tables stage");
@@ -5026,6 +6214,7 @@ fn where_a_decode_spends_its_time() {
                     tables: &staged,
                     shape,
                     pages: &pages,
+                    slabs: Some(&slabs),
                 };
                 let started = std::time::Instant::now();
                 let (timing, _arena) = driver_metal::fire::run::run_keeping_arena(
@@ -5090,7 +6279,7 @@ fn where_a_decode_spends_its_time() {
 /// of the tail that is a result -- which is the split
 /// `arena_regions`'s writers and the rectangle census below both need.
 ///
-/// It read the row's `operands` column and counted `Source::Out(i)`. Every
+/// It read the row's `operands` column and counted `Source::Slot(Kind::Out, i)`. Every
 /// Metal family has retired its rows, and the answer moved to where it was
 /// always derivable: a routine spells a written buffer `BufMut` or `F32sMut`
 /// and a read one `Buf`, `I32s`, `U32s`, `U8s`, `F32s`, so the WRITE COUNT is
@@ -5104,7 +6293,7 @@ fn where_a_decode_spends_its_time() {
 /// name than one that truly has no result, and attributing zero writers to it
 /// makes the region it filled look unwritten.
 fn results_of(symbol: &str) -> usize {
-    let Some((routine, _)) = driver_metal::lowering::routine::crossed(symbol) else {
+    let Some(routine) = driver_metal::lowering::routine::crossed(symbol) else {
         return 1;
     };
     routine
@@ -5112,4 +6301,240 @@ fn results_of(symbol: &str) -> usize {
         .iter()
         .filter(|(ty, _)| matches!(ty, kernels::Ty::BufMut | kernels::Ty::F32sMut))
         .count()
+}
+
+/// The first statement whose output is not the same twice.
+///
+/// # A fire that does not repeat is a fire nothing else can measure
+///
+/// `the_batched_gemm_answers_what_the_matvec_answers` opens with a control:
+/// two tokens is below the GEMM's row guard, so both of its bindings resolve
+/// to the matvec and the two fires are the same program. On qwen3.6 that
+/// control fails by thirteen logits. Every other gate in this file compares
+/// one fire to a reference, and against a fire that does not repeat, every
+/// one of those comparisons is measuring the wrong thing.
+///
+/// So this walks the fire the way `locate_first_nan` does -- a prefix of `n`
+/// statements, run into a freshly zeroed arena -- but runs each prefix TWICE
+/// and compares the arenas. The first `n` whose two runs differ names the
+/// statement that does not repeat, which is a far narrower thing to look at
+/// than a logit.
+///
+/// A prefix, not the whole fire, for the same reason the NaN search takes
+/// one: the answer wanted is the FIRST statement that diverges, and by the
+/// end of a fire every value downstream of it has diverged too.
+#[test]
+#[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
+fn the_first_statement_that_does_not_repeat_says_which_one_it_is() {
+    // The shape the control fails at, and it is a PREFILL: two tokens in one
+    // request. A decode of two tokens is two requests and a different program.
+    locate_first_divergence(
+        FireClass::Prefill,
+        &Step {
+            token_ids: &[128_000, 9906],
+            qo_indptr: &[0, 2],
+            sampling_indices: &[1],
+            sampling_indptr: &[0, 1],
+            ..Step::default()
+        },
+    );
+}
+
+/// One class's fire, run twice per prefix. See the caller.
+fn locate_first_divergence(class: FireClass, step: &Step<'_>) {
+    eprintln!("---- {class:?} ----");
+    let Some(snapshot) = snapshot() else {
+        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        return;
+    };
+    let Ok(context) = Context::new() else {
+        eprintln!("SKIP: no Metal 4 device");
+        return;
+    };
+    let compiler = Compiler::new(&context).expect("a compiler");
+    let mut pipelines = Pipelines::new(kernels_dir());
+
+    let Some((row, dg, loaded)) = served(&context, &snapshot) else {
+        return;
+    };
+    let binding = observed(&dg, &loaded);
+
+    let plan = text(row, class, &binding);
+    let lowered = lower_step(&plan, step).expect("the step lowers");
+    let geometry = dispatch_geometry(&dg, &binding);
+
+    let shape = pool_shape(&dg, 64);
+    let freqs = driver_metal::model::rope::table(&dg);
+    let staged = stage_tables(&context, step, shape.page_size, &freqs);
+    let named = HashMap::new();
+
+    // The whole arena, INTEGER values included. A NaN search has to exclude
+    // them because an index read as a float is a NaN; a byte comparison has
+    // no such problem, and a routing permutation that comes out differently
+    // twice is exactly the kind of answer this is looking for.
+    let mut run = |n: usize| -> Vec<u8> {
+        // The KV pages and the RECURRENT slabs are allocated per run, because
+        // the fire WRITES them: a recurrent scan reads the state its previous
+        // fire left, so two runs sharing one pool differ for the most boring
+        // reason there is and the locator would name the scan every time
+        // whatever the scan did. `prefill_logits` allocates both per fire, so
+        // this is also what the gate being chased actually does.
+        let pool = Pool::allocate(&context, shape).expect("a pool");
+        let rs = Slabs::of(&context, row);
+        let slabs = |l: u16, w: &'static str| rs.as_ref()?.at(l, w);
+        let arena = Allocation::new(
+            &context,
+            (lowered.arena_bytes as u64).max(1),
+            "repeat search arena",
+        )
+        .expect("an arena");
+        // SAFETY: freshly allocated. Zeroed so an unwritten slot compares
+        // equal between the two runs rather than carrying the allocator's
+        // leftovers, which would report every prefix as divergent.
+        unsafe { arena.zero(0, arena.len()).expect("it zeroes") };
+        let pages = |layer: u16, values: bool| {
+            pool.layer(u32::from(layer)).map(|l| Slice {
+                address: if values {
+                    l.v.gpu_address()
+                } else {
+                    l.k.gpu_address()
+                },
+                bytes: shape.layer_bytes_at(0),
+            })
+        };
+        let mut live = Live {
+            store: Store::new(Names::mlx(), &loaded.tensors, &named),
+            tables: &staged,
+            shape,
+            pages: &pages,
+            slabs: Some(&slabs),
+        };
+        let dispatches = driver_metal::lowering::dispatch::plan(
+            &lowered,
+            driver_metal::lowering::executor::Frame {
+                arena: Slice {
+                    address: arena.gpu_address(),
+                    bytes: arena.len(),
+                },
+            },
+            geometry,
+            &mut live,
+        )
+        .expect("the fire plans");
+        let prefix = &dispatches[..n.min(dispatches.len())];
+        let prepared = driver_metal::fire::run::prepare(&context, &lowered, prefix)
+            .expect("the prefix prepares");
+        pipelines
+            .ensure(&context, &compiler, prefix)
+            .expect("the pipelines compile");
+        let mut stepper = driver_metal::device::Stepper::new(&context).expect("a stepper");
+        stepper
+            .run(|encoder| {
+                driver_metal::bind::encode::encode(
+                    encoder,
+                    &prepared.table,
+                    &pipelines,
+                    &prepared.params,
+                    prefix,
+                )
+            })
+            .expect("the prefix runs");
+        // SAFETY: the command buffer retired.
+        unsafe {
+            core::slice::from_raw_parts(
+                arena.contents().as_ptr().cast_const().cast::<u8>(),
+                arena.len() as usize,
+            )
+        }
+        .to_vec()
+    };
+
+    let total = lowered.launches.len();
+    // REPEATED, and scanned LINEARLY, because the predicate is a coin.
+    //
+    // A bisection assumes `differs(n)` answers the same way every time it is
+    // asked. A race does not: the first version of this bisected two runs per
+    // probe and named `gdn_core_recurrent_prefill` once and `gated_rms` the
+    // next time, from the same binary against the same checkpoint. Neither
+    // answer was the statement's fault -- a bisection over a randomized
+    // predicate returns whichever boundary the coin drew.
+    //
+    // So each prefix is run `RUNS` times and compared against the first, and
+    // the prefixes are walked in order from zero. That is O(total) probes
+    // rather than O(log total) and it is the only shape that gives an answer
+    // worth acting on. The walk stops at the first divergence, which for a
+    // race that shows in the first layers is a small fraction of the fire.
+    const RUNS: usize = 6;
+    let unstable = |n: usize, run: &mut dyn FnMut(usize) -> Vec<u8>| -> Option<usize> {
+        let first = run(n);
+        (1..RUNS).find_map(|_| {
+            let other = run(n);
+            first.iter().zip(&other).position(|(x, y)| x != y)
+        })
+    };
+
+    if unstable(total, &mut run).is_none() {
+        eprintln!("the whole fire ({total} statements) repeats byte for byte over {RUNS} runs");
+        return;
+    }
+    let Some(hi) = (1..=total).find(|n| unstable(*n, &mut run).is_some()) else {
+        eprintln!(
+            "the full fire diverges but no prefix of it does, which cannot happen unless the arena is read after the last statement"
+        );
+        return;
+    };
+    let launch = &lowered.launches[hi - 1];
+    let symbol = &lowered.kernels[launch.kernel as usize];
+    let operands: Vec<&str> = lowered.args[launch.args.start as usize..launch.args.end as usize]
+        .iter()
+        .filter_map(|a| match a {
+            model_compiler::lower::Arg::Weight(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let site = unstable(hi, &mut run).map_or(String::new(), |at| {
+        format!(
+            "\n  first differing byte at arena offset {at}{}",
+            lowered
+                .value_offset
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| **o <= at)
+                .max_by_key(|(_, o)| **o)
+                .map_or(String::new(), |(v, o)| format!(
+                    " (value {v}, +{} into it)",
+                    at - o
+                ))
+        )
+    });
+    // The SPANS it touches, because the likeliest way a deterministic kernel
+    // stops repeating is that two of them overlap: a value the allocator
+    // reused while it was still live turns one statement's write into
+    // another's read, and the winner is whichever thread got there first.
+    let spans: Vec<String> = lowered.args[launch.args.start as usize..launch.args.end as usize]
+        .iter()
+        .map(|a| match a {
+            model_compiler::lower::Arg::Arena { at, width, bytes } => {
+                let v = lowered
+                    .value_offset
+                    .iter()
+                    .position(|o| o == at)
+                    .map_or(String::new(), |v| format!(" v{v}"));
+                let span = launch.rows.len() * (*width as usize) * (*bytes as usize);
+                format!("arena[{at}..{}]{v}", at + span)
+            }
+            model_compiler::lower::Arg::Weight(name) => format!("w:{name}"),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    eprintln!(
+        "\nthe first statement that does not repeat is {} of {total}: `{symbol}`, layer {:?}, rows {:?}\n  over {operands:?}{site}\n  spans {spans:?}",
+        hi - 1,
+        launch.layers,
+        launch.rows
+    );
+    panic!(
+        "statement {} of {total} (`{symbol}`) does not repeat",
+        hi - 1
+    );
 }

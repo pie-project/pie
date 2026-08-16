@@ -1,43 +1,21 @@
 //! What a paged KV cache actually allocates, layer by layer.
+//! [`KvCacheLayout::plan`] returns the whole manifest as a value, checkable
+//! without a GPU. Three hazards:
 //!
-//! Port of `driver-cuda/csrc/src/store/kv_cache.cpp`'s two `allocate`
-//! overloads, its `resolve_`/`head_dim_at`/`num_kv_heads_at` accessors, and
-//! its envelope tier.
-//!
-//! The C++ decides and allocates in the same expression: a shape is written
-//! inline as an argument to `DeviceTensor::allocate`, so the only trace it
-//! leaves is a device pointer. That is why this file exists as a separate
-//! layer. [`KvCacheLayout::plan`] returns the whole manifest as a value --
-//! every tensor the cache will own, in slot order, with its dtype and extents
-//! -- and [`KvCacheLayout::allocate`] then walks it. The decision becomes
-//! comparable, and the layout of a fifty-layer heterogeneous cache under a
-//! quantised format can be checked against the C++ without a GPU.
-//!
-//! # The three things this layer gets wrong if it is careless
-//!
-//! * **Aliasing.** A layer whose `kv_source_layer[i] != i` allocates *nothing*
-//!   and reads through to its source. The C++ still pushes an empty
-//!   placeholder so that slot index equals layer index; drop the placeholder
-//!   and every layer after the first alias is off by one.
-//! * **Tiers.** A non-native-BF16 format allocates a dequantisation mirror per
-//!   layer, and a scaled format allocates a scale pair whose trailing extent
-//!   depends on `block_size`. Both are easy to size against the wrong
-//!   `head_dim` in a per-layer stack.
-//! * **Envelopes.** They are allocated with the pool or not at all, and only
-//!   for native BF16 in NHD order. The comment in the C++ explains why at
-//!   length: switching them on later leaves every already-written page at the
-//!   empty seed, which scores `+inf` -- "always keep" -- forever.
+//! * Aliasing: `kv_source_layer[i] != i` allocates nothing and reads through,
+//!   but keeps a placeholder so slot index == layer index (else off by one).
+//! * Tiers: a non-native-BF16 format adds a dequant mirror per layer, a scaled
+//!   one a scale pair sized on `block_size` — easy to size on the wrong `head_dim`.
+//! * Envelopes: allocated with the pool or never, only native BF16 in NHD order;
+//!   enabling them later leaves written pages at the empty seed, scoring `+inf`.
 
 use crate::dtype::DType;
 use crate::error::{Error, Result};
 use crate::layout::{KvCacheFormat, KvCacheScaleLayout};
 use crate::tensor::{DeviceTensor, TensorSpec};
 
-/// Everything one layer slot owns.
-///
-/// `None` is the port of the C++'s default-constructed `DeviceTensor`: a
-/// placeholder that keeps the slot index aligned with the layer index and is
-/// never read through.
+/// Everything one layer slot owns. A `None` field is the C++'s default
+/// `DeviceTensor` placeholder — keeps slot index == layer index, never read.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LayerSlot {
     /// Key pages, or `None` for a slot that aliases another layer.
@@ -65,14 +43,11 @@ impl LayerSlot {
         self.k.is_none()
     }
 
-    /// Whether this slot's key tensor would have a device pointer.
-    ///
-    /// Distinct from [`Self::is_alias`], and the distinction is load-bearing:
-    /// the C++ tests `DeviceTensor::empty()`, which is `ptr_ == nullptr`, and
-    /// a *zero-byte* allocation also has a null pointer. A cache planned with
-    /// `num_pages == 0` therefore looks aliased at every layer, and the
-    /// envelope pass skips all of it. Testing `is_alias` there would allocate
-    /// a zero-byte envelope pair per layer that the C++ never creates.
+    /// Whether this slot's key tensor would have a device pointer. Distinct from
+    /// [`Self::is_alias`]: `empty()` is also true for a zero-byte allocation, so
+    /// a `num_pages == 0` cache looks aliased everywhere and the envelope pass
+    /// skips it — using `is_alias` would allocate zero-byte envelopes the C++
+    /// never makes.
     #[must_use]
     pub fn has_key_pointer(&self) -> bool {
         self.k.as_ref().is_some_and(|t| !t.is_empty())
@@ -97,50 +72,26 @@ impl LayerSlot {
     }
 }
 
-/// How a stack of layers varies, if it does.
-///
-/// The C++ takes three parallel `std::vector<int>` that are each either empty
-/// (meaning "use the scalar") or exactly `num_layers` long, and validates the
-/// lengths at the top of `allocate_per_layer` with three near-identical
-/// `throw`s. Grouping them makes the "all three agree on a length, or are
-/// absent" rule a property of one value.
+/// How a stack of layers varies, if it does. Three parallel `vector<int>`, each
+/// empty ("use the scalar") or exactly `num_layers` long; grouped so the
+/// agree-on-length invariant belongs to one value.
 #[derive(Debug, Clone, Default)]
 pub struct PerLayer {
     /// Head dimension per layer.
     pub head_dim: Vec<i32>,
-    /// Which layer each layer's KV physically lives in.
-    ///
-    /// `kv_source_layer[i] == i` means layer `i` owns its pages. Anything else
-    /// means it reads through, and allocates nothing.
+    /// Which layer each layer's KV physically lives in. `[i] == i` owns its
+    /// pages; anything else reads through and allocates nothing.
     pub kv_source_layer: Vec<i32>,
     /// KV head count per layer.
     pub num_kv_heads: Vec<i32>,
 }
 
 impl PerLayer {
-    /// Refuse a table where a sharer's geometry differs from its source's.
-    ///
-    /// One set of pages has ONE shape — `page_size x kv_heads x
-    /// head_dim` — so a layer that reads through another's pages must
-    /// have that layer's dims. gemma-4 gets this right without trying:
-    /// `kv_source` searches for an earlier layer with the same
-    /// `is_full_attn`, which is the same predicate `head_dim_of` keys
-    /// on. That is one invariant spread across two functions in another
-    /// crate, and nothing was checking it.
-    ///
-    /// # Why this is not inside [`KvCacheLayout::plan_per_layer`]
-    ///
-    /// Because the C++ `plan_per_layer` accepts the inconsistent table,
-    /// and `tests/kv_cache_live_parity.rs` pins the port to the C++
-    /// oracle's own transcript hash — including a case built precisely
-    /// to disagree, as the probe that distinguishes a `layer_view`
-    /// reading the source's dims from one reading the layer's. Refusing
-    /// it there would break the parity the port rests on to fix a defect
-    /// the port cannot produce.
-    ///
-    /// So this is the SHELL's check: whoever builds a `PerLayer` from a
-    /// model's facts calls it, and the ported constructor stays
-    /// byte-identical to the thing it was ported from.
+    /// Refuse a table where a sharer's geometry differs from its source's: one
+    /// set of pages has one shape, so a reader-through must share its source's
+    /// dims. Separate from [`KvCacheLayout::plan_per_layer`] because parity pins
+    /// the port to the C++ oracle, which accepts the inconsistent table — so the
+    /// shell checks; whoever builds a `PerLayer` calls it.
     pub fn check_sharing(&self) -> Result<()> {
         for (i, &src) in self.kv_source_layer.iter().enumerate() {
             let s = usize::try_from(src).unwrap_or(usize::MAX);
@@ -184,16 +135,9 @@ pub struct KvCacheLayout {
     slots: Vec<LayerSlot>,
 }
 
-/// Whether the operator asked for Quest key envelopes.
-///
-/// Port of `env_requests_kv_envelopes`. Only `1`, `true` and `on` enable them,
-/// lowercase and exact -- `yes`, `TRUE` and `On` all leave the tier off.
-///
-/// It is an environment switch rather than a capability because the KV pool is
-/// sized to consume the device: the envelope bytes cannot be found after the
-/// fact, so they have to come out of the page count, which means the memory
-/// planner has to know before it picks one. `memory_planner.rs` reads the same
-/// switch, and the two MUST agree.
+/// Whether the operator asked for Quest key envelopes. Only `1`, `true`, `on`
+/// (exact, lowercase). An env switch because envelope bytes come from the page
+/// count, so `memory_planner.rs` must read the same switch before sizing.
 #[must_use]
 pub fn envelopes_requested() -> bool {
     match std::env::var("PIE_CUDA_KV_ENVELOPES") {
@@ -202,16 +146,9 @@ pub fn envelopes_requested() -> bool {
     }
 }
 
-/// The error `KvCache::enable_envelopes` always returns.
-///
-/// The C++ method has no success path at all: envelopes are allocated with the
-/// pages, at construction, because the page count itself was chosen to leave
-/// room for them. Reaching here means a program asked for envelopes on a cache
-/// that was sized without them, so there is no memory to grow into.
-///
-/// Kept as a function rather than a method because there is nothing to enable:
-/// it exists to say why, at the call site, instead of failing later inside an
-/// allocation under an unrelated stack.
+/// The error `KvCache::enable_envelopes` always returns. Envelopes are allocated
+/// with the pages at construction, so a cache sized without them has no room to
+/// grow into — said here at the call site rather than failing in an allocation.
 #[must_use]
 pub fn enable_envelopes_late_error() -> Error {
     Error::invalid(
@@ -222,14 +159,10 @@ pub fn enable_envelopes_late_error() -> Error {
     )
 }
 
-/// Physical order of the two middle extents of a KV page tensor.
-///
-/// FlashInfer's HND kernels want the head extent outermost; everything else
-/// wants the token extent there. The C++ keeps this as a `bool hnd_layout_`
-/// that is assigned `false` at both allocation sites and never set anywhere
-/// else, so the HND branch of `kv_storage_shape` is currently unreachable --
-/// but the accessors, the layer view and the envelope guard all still read it.
-/// Named rather than boolean here so that the dead arm is visibly dead.
+/// Physical order of the two middle extents of a KV page tensor. HND kernels
+/// want the head extent outermost, everything else the token extent.
+/// `hnd_layout_` is never set, so the HND arm is dead — named, not boolean, so
+/// the dead arm is visibly dead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PageOrder {
     /// `[pages, page_size, kv_heads, head_dim]`.
@@ -241,8 +174,6 @@ pub enum PageOrder {
 
 impl KvCacheLayout {
     /// Plan a stack where every layer has the same shape.
-    ///
-    /// The port of the homogeneous `KvCache::allocate`.
     pub fn plan(
         num_layers: i32,
         num_pages: i32,
@@ -265,12 +196,9 @@ impl KvCacheLayout {
     }
 
     /// Plan a stack whose layers may differ in head dimension, head count, or
-    /// which layer physically holds their pages.
-    ///
-    /// The port of `KvCache::allocate_per_layer`. Note the scalar `head_dim`
-    /// the C++ records is `per_layer_head_dim[0]`, not an argument -- and it
-    /// is `0` when the vector is empty, which is what `head_dim_at` then
-    /// returns for every layer.
+    /// which layer holds their pages. The scalar `head_dim` is
+    /// `per_layer_head_dim[0]` (0 when empty), which `head_dim_at` returns for
+    /// every layer.
     pub fn plan_per_layer(
         num_layers: i32,
         num_pages: i32,
@@ -337,9 +265,7 @@ impl KvCacheLayout {
     }
 
     fn plan_slot(&self, layer: i32) -> Result<LayerSlot> {
-        // A slot that aliases another layer allocates nothing at all -- but it
-        // still occupies an index, which is the only reason this returns a
-        // default rather than being skipped.
+        // An aliasing slot allocates nothing but keeps its index — default, not skip.
         if !self.owns_pages(layer) {
             return Ok(LayerSlot::default());
         }
@@ -366,10 +292,8 @@ impl KvCacheLayout {
             ..LayerSlot::default()
         };
 
-        // The scale tier's trailing extent is the only place `block_size` is
-        // read at allocation time, and the C++ substitutes 16 for a
-        // non-positive value here rather than at parse time -- so a format
-        // that reports `block_size == 0` still allocates a real scale tier.
+        // The scale tier's trailing extent is the only reader of `block_size`,
+        // and substitutes 16 when it is non-positive (so 0 still allocates one).
         match self.format.scale_layout() {
             KvCacheScaleLayout::PerTokenHead => {
                 let s = TensorSpec::new(DType::Fp32, vec![pages, psz, heads])?;
@@ -390,9 +314,8 @@ impl KvCacheLayout {
             KvCacheScaleLayout::None => {}
         }
 
-        // A native BF16 cache IS its own attention input; anything else needs
-        // a dequantised mirror, sized on the LOGICAL head_dim rather than the
-        // format's packed one.
+        // A native BF16 cache is its own attention input; anything else needs a
+        // dequantised mirror, sized on the logical head_dim, not the packed one.
         if !self.format.is_native_bf16() {
             let m = TensorSpec::new(DType::Bf16, vec![pages, psz, heads, logical_hd])?;
             slot.k_bf16 = Some(m.clone());
@@ -402,10 +325,7 @@ impl KvCacheLayout {
     }
 
     fn plan_envelopes(&mut self) -> Result<()> {
-        // Envelopes describe BF16 keys. A quantised format keeps its
-        // dequantised mirror elsewhere, but the append path writes the storage
-        // tier, so enveloping anything but native BF16 would envelope stale
-        // values.
+        // Envelopes describe BF16 keys; on a quantised format they'd cover stale values.
         if !self.format.is_native_bf16() || self.page_order() == PageOrder::Hnd {
             return Ok(());
         }
@@ -420,14 +340,8 @@ impl KvCacheLayout {
                 * u64::from(self.page_size.unsigned_abs())
                 * u64::from(kvh.unsigned_abs())
                 * u64::from(hd.unsigned_abs());
-            // Believed unreachable, and kept anyway. The guard can only fire
-            // if the key layer's numel disagrees with the shape this very
-            // function would compute -- but we are already inside the
-            // native-BF16, NHD arm, where `storage_head_dim(hd) == hd`, so
-            // `plan_slot` allocated exactly `[pages, page_size, kvh, hd]`.
-            // No sweep case reaches it. It stays because it is the C++'s
-            // guard and because it is the assertion that would catch a future
-            // storage layout being added without revisiting this tier.
+            // Believed unreachable (native-BF16 NHD has `storage_head_dim(hd) ==
+            // hd`), but kept as the C++'s guard against a future storage layout.
             let actual = self.slots[idx].k.as_ref().map_or(0, TensorSpec::numel);
             if actual != expected {
                 return Err(Error::invalid(
@@ -496,13 +410,9 @@ impl KvCacheLayout {
         &self.slots
     }
 
-    /// The same stack with a different page count.
-    ///
-    /// A resize changes how many pages there are and nothing else, so
-    /// re-deriving the per-layer geometry from a config would be a second
-    /// chance to get it wrong — and the config cannot state it: the
-    /// families with two head dims and a shared tail encode that in their
-    /// facts, not in `hf.json`.
+    /// The same stack with a different page count. Re-deriving per-layer geometry
+    /// from a config would be a second chance to get it wrong, and the config
+    /// cannot state it (two-head-dim families encode it in facts, not `hf.json`).
     pub fn with_num_pages(&self, num_pages: i32) -> Result<Self> {
         Self::build(
             self.num_layers,
@@ -552,10 +462,8 @@ impl KvCacheLayout {
         self.slots.iter().map(LayerSlot::nbytes).sum()
     }
 
-    /// The buffers the swap path copies for `layer`, in the C++'s order.
-    ///
-    /// Port of `KvCache::page_buffers`. It resolves through an alias, so a
-    /// shared layer reports its source's buffers rather than nothing.
+    /// The buffers the swap path copies for `layer`, in the C++'s order. Resolves
+    /// through an alias, so a shared layer reports its source's buffers.
     #[must_use]
     pub fn page_buffers(&self, layer: i32) -> Vec<(&'static str, u64)> {
         let src = self.resolve(layer);
@@ -572,10 +480,8 @@ impl KvCacheLayout {
         out
     }
 
-    /// Allocate every tensor in the manifest.
-    ///
-    /// Walks the plan in slot order, which is the same order the C++ allocates
-    /// in -- worth preserving because a suballocator's addresses depend on it.
+    /// Allocate every tensor in the manifest, in slot order — a suballocator's
+    /// addresses depend on it.
     #[cfg(feature = "_cuda")]
     pub fn allocate(&self, alloc: &crate::device::Allocator) -> Result<Vec<AllocatedSlot>> {
         let mut out = Vec::with_capacity(self.slots.len());

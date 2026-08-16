@@ -1,37 +1,24 @@
 //! Geometry for the DeepSeek-V4 compressor caches.
 //!
-//! Port of the sizing logic in
-//! `driver-cuda/csrc/src/store/dsv4_compress_cache.cpp`.
-//!
-//! A V4 layer with `compress_ratio > 0` runs a second attention over
-//! *compressed* KV entries: one entry per `ratio` tokens, each a per-dimension
-//! softmax pool over the `coff * ratio` tokens ending at a boundary position.
-//! Three per-token tensors have to survive across forward passes:
-//!
-//! * `state_kv` and `state_score` -- the compressor's `wkv` / `wgate`
-//!   projections, `coff * head_dim` wide. A boundary token pools projections
-//!   written during *earlier* forward passes, which is why they are cache and
-//!   not scratch.
-//! * `comp_kv` -- the finished entry, `head_dim` wide.
-//!
-//! Only the widths are here. Everything else in that file is allocation and a
-//! best-effort `cudaMemset`.
+//! A V4 layer with `compress_ratio > 0` pools KV into one compressed entry per
+//! `ratio` tokens, over the `coff * ratio` tokens ending at a boundary. Three
+//! per-token tensors survive across forward passes (so they are cache, not
+//! scratch): `state_kv` and `state_score` (the `wkv`/`wgate` projections,
+//! `coff * head_dim` wide) and `comp_kv` (the finished entry, `head_dim`
+//! wide). Only the widths live here.
 
 /// The compressor's window coefficient for a given ratio.
 ///
-/// A ratio-4 layer pools over a window of `2 * 4` tokens rather than `4`;
-/// every other ratio pools over exactly its own span. This single special case
-/// is the whole function, and it is why `state_kv` is not simply `head_dim`
-/// wide: at ratio 4 it is **twice** as wide as the naive reading suggests.
+/// A ratio-4 layer pools over `2 * 4` tokens, not `4`; every other ratio pools
+/// over its own span. So at ratio 4 `state_kv` is twice `head_dim` wide.
 #[must_use]
 pub const fn compressor_coff(ratio: i32) -> u32 {
     if ratio == 4 { 2 } else { 1 }
 }
 
-/// The width in elements of one layer's `state_kv` / `state_score` rows.
+/// Width in elements of one layer's `state_kv` / `state_score` rows.
 ///
-/// Returns `None` for a layer that does not compress, which is the same thing
-/// the C++ expresses by leaving that layer's tensors empty.
+/// `None` for a layer that does not compress.
 #[must_use]
 pub const fn state_width(ratio: i32, head_dim: u32) -> Option<u32> {
     if ratio <= 0 {
@@ -44,11 +31,8 @@ pub const fn state_width(ratio: i32, head_dim: u32) -> Option<u32> {
 /// Bytes of compressor state per token, summed over every compressing layer.
 ///
 /// The `2 *` is `state_kv` and `state_score`; the trailing `head_dim` is
-/// `comp_kv`. Everything is BF16, so the element size is fixed at 2 rather
-/// than read from a dtype -- matching the C++, which hardcodes
-/// `sizeof(std::uint16_t)` and allocates `DType::BF16`.
-///
-/// This is what the memory planner adds on top of the KV cache for a V4 model.
+/// `comp_kv`. Everything is BF16, so the element size is fixed at 2. The
+/// planner adds this on top of the KV cache for a V4 model.
 #[must_use]
 pub fn compress_bytes_per_token(ratios: &[i32], head_dim: u32) -> u64 {
     ratios
@@ -61,13 +45,8 @@ pub fn compress_bytes_per_token(ratios: &[i32], head_dim: u32) -> u64 {
 /// Device bytes for the whole compressor cache at a given page geometry.
 ///
 /// Zero when nothing compresses, when there are no pages, or when the page
-/// size is zero -- the C++ returns a default-constructed (empty) cache in all
-/// three cases, and an empty cache costs nothing.
-///
-/// A ratios list shorter than `num_hidden_layers` leaves the trailing layers
-/// uncompressed. That is the C++'s explicit `li < ratios.size() ? ... : 0`,
-/// not an accident of iteration, so a short list is a supported input rather
-/// than a caller error.
+/// size is zero. A ratios list shorter than `num_hidden_layers` is supported:
+/// the trailing layers are left uncompressed.
 #[must_use]
 pub fn compress_cache_bytes(
     ratios: &[i32],
@@ -89,10 +68,8 @@ pub fn compress_cache_bytes(
 
 /// Which layers compress, as a per-layer width table.
 ///
-/// Index `i` is `Some(width)` when layer `i` compresses. Length is always
-/// `num_hidden_layers`, mirroring the C++'s `layers_.resize(L)` -- every
-/// layer gets a slot whether or not it compresses, so `has_layer` is an index
-/// rather than a search.
+/// Index `i` is `Some(width)` when layer `i` compresses; length is always
+/// `num_hidden_layers`, so lookup is an index rather than a search.
 #[must_use]
 pub fn layer_widths(ratios: &[i32], num_hidden_layers: u32, head_dim: u32) -> Vec<Option<u32>> {
     if ratios.is_empty() {
@@ -158,9 +135,8 @@ mod tests {
 
     #[test]
     fn an_empty_ratios_list_produces_no_cache_at_all() {
-        // The C++ returns early with an empty `layers_`, so there is no
-        // per-layer table to index -- distinct from "L layers, none of which
-        // compress", even though both cost zero bytes.
+        // Empty `layers_` (early return) is distinct from "L layers, none
+        // compressing", though both cost zero bytes.
         assert!(layer_widths(&[], 8, 128).is_empty());
         assert_eq!(layer_widths(&[0; 8], 8, 128).len(), 8);
         assert_eq!(compress_cache_bytes(&[], 8, 128, 16, 64), 0);
@@ -184,10 +160,9 @@ mod tests {
 
     #[test]
     fn cache_bytes_only_count_the_first_num_hidden_layers_ratios() {
-        // A ratios list LONGER than the layer count is truncated by
-        // `compress_cache_bytes` (which walks layers) but not by
-        // `compress_bytes_per_token` (which walks ratios). That asymmetry is
-        // in the C++ and is worth knowing before trusting either number.
+        // A ratios list longer than the layer count is truncated by
+        // `compress_cache_bytes` (walks layers) but not by
+        // `compress_bytes_per_token` (walks ratios) — the two disagree.
         let ratios = [2, 2, 2, 2];
         assert_eq!(
             compress_cache_bytes(&ratios, 2, 128, 1, 1),

@@ -1,25 +1,9 @@
 //! The MLA (multi-head latent attention) page cache.
 //!
-//! Port of `driver-cuda/csrc/src/store/mla_cache.{cpp,hpp}`.
-//!
-//! MLA does not store K and V. It stores one compressed latent per token plus
-//! a small rotary-position tail, so a layer holds two tensors of *different*
-//! widths:
-//!
-//! | tensor | shape | what it is |
-//! |---|---|---|
-//! | `ckv` | `[pages, page_size, kv_lora_rank]` | the compressed KV latent |
-//! | `kpe` | `[pages, page_size, qk_rope_head_dim]` | the RoPE'd key tail |
-//!
-//! Both are decompressed on the fly by the attention kernel. That is the whole
-//! point of the format: `kv_lora_rank` (512 on DeepSeek-V3) is far smaller
-//! than `num_kv_heads * head_dim` would be, so the cache holds many more
-//! tokens for the same bytes.
-//!
-//! Unlike [`crate::pools::kv_cache`] this cache has no aliasing, no scale
-//! tier, no dequantisation mirror and no per-layer overrides -- every layer is
-//! identical. What it does have is a real validation front door, which the KV
-//! cache does not, so the errors are the part worth pinning.
+//! MLA stores no K/V: per layer two tensors of different widths — `ckv`
+//! `[pages, page_size, kv_lora_rank]` (compressed latent) and `kpe`
+//! `[pages, page_size, qk_rope_head_dim]` (RoPE'd key tail). Every layer is
+//! identical — no aliasing, tiers or overrides — but validation is pinned.
 
 use crate::dtype::DType;
 use crate::error::{Error, Result};
@@ -38,11 +22,8 @@ pub struct MlaCacheLayout {
     kpe: TensorSpec,
 }
 
-/// The dimensions one layer hands to the MLA attention kernel.
-///
-/// Port of `attn/mla_cache_view.hpp` from the archive crate's `csrc/src`,
-/// minus the two device pointers -- a layout has no memory yet, and the
-/// pointers come from whatever allocated it.
+/// The dimensions one layer hands to the MLA attention kernel — no device
+/// pointers, a layout has no memory yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MlaCacheLayerView {
     /// Which layer this describes.
@@ -71,10 +52,8 @@ impl MlaCacheLayout {
     ///
     /// # Errors
     ///
-    /// [`Error::Invalid`] when any dimension is non-positive, or when `dtype`
-    /// is neither `bf16` nor `fp16`. The dtype restriction is real rather than
-    /// defensive: the MLA attention kernel reads the latent directly with no
-    /// dequantisation step, so there is nowhere to put a scale.
+    /// [`Error::Invalid`] when any dimension is non-positive, or `dtype` is not
+    /// `bf16`/`fp16` — the MLA kernel reads the latent directly, no scale.
     pub fn plan(
         num_layers: i32,
         num_pages: i32,
@@ -151,8 +130,7 @@ impl MlaCacheLayout {
         self.dtype
     }
 
-    /// The compressed-latent tensor. Every layer has the same shape, so one
-    /// spec describes all of them.
+    /// The compressed-latent tensor; one spec describes every (identical) layer.
     #[must_use]
     pub const fn ckv(&self) -> &TensorSpec {
         &self.ckv
@@ -164,12 +142,9 @@ impl MlaCacheLayout {
         &self.kpe
     }
 
-    /// The two page buffers of any layer.
-    ///
-    /// The widths differ, which is why [`crate::layout::swap_plan::PoolGeometry`]
-    /// is ragged: an MLA layer's second buffer is `qk_rope_head_dim/kv_lora_rank`
-    /// of the first, and a rectangular table would let a swap copy the wrong
-    /// span.
+    /// The two page buffers of any layer. The widths differ, which is why
+    /// [`crate::layout::swap_plan::PoolGeometry`] is ragged — a rectangular
+    /// table would let a swap copy the wrong span.
     #[must_use]
     pub fn page_buffers(&self) -> [PageBuffer; 2] {
         let elem = self.dtype.size_bytes() as u64;
@@ -186,15 +161,8 @@ impl MlaCacheLayout {
         ]
     }
 
-    /// The per-layer descriptor the MLA attention kernel consumes.
-    ///
-    /// Reads its dimensions from the cache's own fields rather than from the
-    /// caller, which is why it is worth having: a plan that stored a
-    /// dimension in the wrong field would still allocate correctly and only
-    /// go wrong once a kernel read the view.
-    ///
-    /// The C++ indexes `ckv_layers_[layer]` with no bounds check, so an
-    /// out-of-range layer there is undefined; here it is `None`.
+    /// The per-layer descriptor the MLA attention kernel consumes; an
+    /// out-of-range layer is `None` (the C++ indexes unchecked).
     #[must_use]
     pub fn layer_view(&self, layer: u32) -> Option<MlaCacheLayerView> {
         if layer >= self.num_layers {
@@ -209,11 +177,8 @@ impl MlaCacheLayout {
         })
     }
 
-    /// Allocation order: `ckv` then `kpe`, layer by layer.
-    ///
-    /// Interleaved rather than grouped, matching the C++'s single loop. Worth
-    /// preserving: a suballocator's addresses depend on the order, so grouping
-    /// them would change every pointer in the cache.
+    /// Allocation order: `ckv` then `kpe`, layer by layer — interleaved, since a
+    /// suballocator's addresses depend on the order.
     #[must_use]
     pub fn allocation_order(&self) -> Vec<(u32, &'static str, &TensorSpec)> {
         (0..self.num_layers)

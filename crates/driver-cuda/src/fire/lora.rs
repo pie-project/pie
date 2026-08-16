@@ -1,58 +1,25 @@
 //! The `lora` sink's vocabulary and the fire-scoped staging — gate-lora,
-//! slice A.
-//!
-//! Ports `model/lora.hpp` (the site vocabulary and the lane/table views)
-//! and the staging half of `llama_like.cpp`'s lora machinery:
-//! [`LoraStageArena`], [`LoraFireState`]'s construction — validation,
-//! bf16 casts, same-shape grouping, the grouped xA^T layout, the pointer
-//! slab — and [`stage_qkv_adapters`] with its splitmix fingerprint.
-//! `apply()`, the body-time launches, is slice B and lands with the
-//! emitter work that generates its call sites.
-//!
-//! # Grouping, the short version
-//!
-//! Same-shape lanes (equal `(rank, d_in, d_out)`) share one grouped-GEMM
-//! launch per correction GEMM — measured at up to 24.75× over separate
-//! launches when shapes share (stage0-l40s §3.1). The precondition is
-//! pairwise-disjoint token spans (one grouped call runs its beta=1
-//! accumulations concurrently); overlap falls back to per-lane pairs,
-//! which stay correct. Groups of one are pruned — nothing to share.
+//! slice A: [`LoraStageArena`], [`LoraFireState`]'s construction, and
+//! [`stage_qkv_adapters`]. Same-shape lanes share one grouped-GEMM launch,
+//! valid only for pairwise-disjoint token spans; overlap falls back to
+//! per-lane pairs. `apply()` is slice B.
 
 use std::ffi::c_void;
 
 use super::sideband_arena::DeviceMemory;
 
-// ── THE LAUNCH HALF OF THIS FILE IS `kernels_cuda::gemm::lora` ────────
-//
-// `LoraFireState::apply` -- the three passes, the slot arithmetic and the
-// four kinds of matmul in them -- descended under
-// `.wiki/kernel-x/refactor-plan.md` §6.3, and `Lane`, `Group`, `bf16_row`
-// and the site vocabulary went with it. The symbol went too:
-// `pie_lora_qkv_correction` is `gemm::lora_qkv_correction`, so that its row
-// can derive from a `fn` in a family instead of being hand-written in
-// `not_yet_crossed.rs` -- a bare symbol has no namespace, and a namespace is
-// what `Family::symbol` is half made of.
-//
-// **What stayed is what could not go**: `stage` reaches
-// `sideband_arena::DeviceMemory`, a trait with five implementors in this
-// crate, and lays its casts down in a per-FIRE bump arena with
-// retire-on-grow. `kernels_cuda`'s two device-memory shapes are per-CALL
-// (`Ctx`) and per-PROCESS (`jit::device`'s scratch); neither is a fire. So
-// the arithmetic went and the lifetime stayed, which is the line FA2's
-// descent drew as well.
-//
-// The vocabulary is re-exported rather than re-spelled: `fire::launch` and
-// `tests/lora_stage_parity.rs` name these through this module, and a
-// re-export makes every one of them keep resolving to the one definition.
+// `apply` and the matmul passes live in `kernels_cuda::gemm::lora`; the
+// types below are re-exported so callers keep one definition.
+
 use kernels_cuda::gemm::lora::{Group, Lane, Staged, bf16_row};
+
 pub use kernels_cuda::gemm::lora::{
     LORA_SITE_DOWN, LORA_SITE_GATE_UP, LORA_SITE_K, LORA_SITE_O, LORA_SITE_Q, LORA_SITE_V,
     LORA_SITES_CONSUMED, LORA_SITES_KNOWN, LoraForm, LoraLaneView,
 };
 use kernels_cuda::jit::abi::bf16;
 
-/// The launch's resolved lora configuration — a borrowed view, valid for
-/// the fire. Ports `LoraTable`.
+/// The launch's resolved lora configuration: a borrowed view valid for the fire.
 #[derive(Debug, Clone, Copy)]
 pub struct LoraTable<'a> {
     /// One entry per lane whose program carries the sink.
@@ -67,10 +34,9 @@ impl LoraTable<'_> {
     }
 }
 
-/// The per-fire bump arena the staging draws from. Ports
-/// `LoraStageArena` (`model/workspace.hpp`): 256-aligned allocs, a
-/// doubling growth with a 1 MiB floor, retire-on-grow (the old block may
-/// still be read by an in-flight fire), reset per fire.
+/// The per-fire bump arena the staging draws from: 256-aligned allocs,
+/// doubling growth with a 1 MiB floor. Retire-on-grow, not free-on-grow —
+/// the old block may still be read by an in-flight fire — reset per fire.
 #[derive(Debug, Default)]
 pub struct LoraStageArena {
     buf: *mut c_void,
@@ -112,8 +78,7 @@ impl LoraStageArena {
         unsafe { self.buf.cast::<u8>().add(at).cast() }
     }
 
-    /// Free every block through the seam — the C++ leaves this to
-    /// `DeviceBuffer` RAII; the port's usual explicit release.
+    /// Free every block through the seam — explicit, since there is no RAII here.
     pub fn release<M: DeviceMemory>(&mut self, mem: &mut M) {
         if !self.buf.is_null() {
             mem.free(self.buf);
@@ -132,17 +97,12 @@ impl LoraStageArena {
 pub trait LoraOps {
     /// `kernels::quant::cast_fp32_to_bf16`.
     fn cast_fp32_to_bf16(&mut self, src: *const c_void, dst: *mut c_void, elems: usize);
-    /// The pointer-slab upload (`cudaMemcpyAsync`, host to device) — the
-    /// slab must be device-resident because `cublasGemmGroupedBatchedEx`
-    /// does not consume its pointer arrays synchronously.
+    /// The pointer-slab upload, host to device — must be device-resident,
+    /// since `cublasGemmGroupedBatchedEx` doesn't consume it synchronously.
     fn upload_slab(&mut self, dst: *mut c_void, slots: &[*const c_void]);
 }
 
-/// The live [`LoraOps`] (retirement plan phase B), behind `_cuda` for the
-/// cast launch. The slab upload is `cudaMemcpyAsync` of the host pointer
-/// array — device-resident because `cublasGemmGroupedBatchedEx` does not
-/// consume its pointer arrays synchronously, which is the trait doc's own
-/// sentence and the reason this is an upload rather than an argument.
+/// The live [`LoraOps`], behind `_cuda` for the cast launch.
 #[cfg(feature = "_cuda")]
 #[derive(Debug, Clone, Copy)]
 pub struct LiveLoraOps {
@@ -158,12 +118,7 @@ impl LiveLoraOps {
     }
 }
 
-/// The staging arena's allocator, which is the same three CUDA calls
-/// the sideband arena makes.
-///
-/// `LiveLoraOps` implements BOTH traits because the staging needs both
-/// — memory to lay the slab in and kernels to cast with — and splitting
-/// them would mean two handles onto one stream.
+/// Implements both `DeviceMemory` and `LoraOps`: one handle for memory and casts alike.
 #[cfg(feature = "_cuda")]
 impl crate::fire::sideband_arena::DeviceMemory for LiveLoraOps {
     fn alloc(&mut self, bytes: usize) -> Option<*mut c_void> {
@@ -187,15 +142,13 @@ impl crate::fire::sideband_arena::DeviceMemory for LiveLoraOps {
 impl LoraOps for LiveLoraOps {
     #[allow(clippy::not_unsafe_ptr_arg_deref)] // seam method; recorders share it
     fn cast_fp32_to_bf16(&mut self, src: *const c_void, dst: *mut c_void, elems: usize) {
-        // SAFETY: the caller holds `self.stream` live across the launch —
-        // the same assertion this method made when it handed the stream to
-        // `ffi::pie_k_quant_cast_fp32_to_bf16`, which put it in a `<<<>>>`.
+        // SAFETY: the caller holds `self.stream` live across the launch.
         let fired = unsafe {
             let ctx = kernels_cuda::jit::Ctx::on(self.stream);
             kernels_cuda::quant::cast_fp32_to::<bf16>(
                 &ctx,
-                src.cast::<f32>(),
-                dst.cast::<kernels_cuda::jit::abi::bf16>(),
+                kernels::routine::In { ptr: src.cast::<f32>(), rows: 0, width: 0 },
+                kernels::routine::Out { ptr: dst.cast::<kernels_cuda::jit::abi::bf16>(), rows: 0, width: 0 },
                 elems,
             )
         };
@@ -218,8 +171,7 @@ impl LoraOps for LiveLoraOps {
     }
 }
 
-/// Why staging refused a lane table. Every message is the C++'s
-/// `runtime_error` text — the refusals are part of the surface.
+/// Why staging refused a lane table; each message is part of the surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoraStageError(pub String);
 
@@ -231,8 +183,7 @@ impl std::fmt::Display for LoraStageError {
 
 impl std::error::Error for LoraStageError {}
 
-/// `PIE_LORA_GROUPED` as a pure function — unset or first byte not `'0'`
-/// means the grouped lowering is armed.
+/// `PIE_LORA_GROUPED` as a pure function: unset, or first byte not `'0'`, arms grouping.
 #[must_use]
 pub fn lora_grouped_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
     match value {
@@ -244,34 +195,10 @@ pub fn lora_grouped_enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
     }
 }
 
-/// The rows the stage phase reads off the fire's workspace — the C++
-/// passes `Workspace&` and picks five buffers; the port names them.
 #[derive(Debug, Clone, Copy)]
-/// The fire buffers a staging pass reads.
-///
-/// # The one thing still missing, stated precisely
-///
-/// Every other piece of the adapter path exists: [`read_lora_sink`]
-/// resolves the plan, [`lane_for_instance`] resolves the addresses,
-/// [`stage_qkv_adapters`] builds the state, and the executor's
-/// `gemm::lora_qkv_correction` arm applies it. What is not decided is
-/// WHICH of the fire's named values these five pointers are.
-///
-/// It is not plumbing. The staging reads `rows.q` and `rows.v` to build
-/// its pointer slab, and those are the q and v PROJECTION OUTPUTS —
-/// which the lowering names, differently per family text. `rows.gate`
-/// is scratch the driver can supply from its own arena; `rows.norm_x`
-/// and `rows.y` are the projection input under pre- and post-norm
-/// placement, and which of the two applies is
-/// `LlamaLikeFacts::norm_placement`.
-///
-/// So the resolution is: find the launch that states
-/// `gemm::lora_qkv_correction`, read its operand join the way
-/// [`crate::fire::launch::attention_pins`] reads attention's, and
-/// take q and v from there. That is the same shape as the fix that
-/// replaced attention's positional read, and for the same reason — a
-/// value found by counting launches is a fact derived from where a
-/// statement SITS, which is false under `GuardMode::Union`.
+/// The fire buffers a staging pass reads. Which named values these five
+/// pointers are is resolved from the launch's operand join, not launch
+/// position — which is false under `GuardMode::Union`.
 pub struct LoraStageRows {
     /// `ws.y` — the projection input under POST-norm placement.
     pub y: *const c_void,
@@ -286,11 +213,8 @@ pub struct LoraStageRows {
 }
 
 /// The fire-scoped staging — `LoraFireState`, construction half.
-///
-/// `Lane` and `Group` are `kernels_cuda::gemm::lora`'s now, because every
-/// field of both exists to be read by the launch this state was staged for.
-/// This type writes them and hands them over as a [`Staged`]; see
-/// [`Self::staged`].
+/// `Lane`/`Group` live in `kernels_cuda::gemm::lora`, since the launch
+/// reads every field; this type writes them and hands them over as [`Staged`].
 #[derive(Debug)]
 pub struct LoraFireState {
     lanes: Vec<Lane>,
@@ -298,20 +222,8 @@ pub struct LoraFireState {
     ptr_slab: *mut c_void,
     slab_stride: usize,
     grouped_enabled: bool,
-    /// EVERYTHING A CAPTURED LORA BODY BAKES, mixed into one number.
-    ///
-    /// `stage_qkv_adapters` computed this and RETURNED it, and the call
-    /// site wrote `let _ = fingerprint`. Carried on the state instead, so
-    /// the value and the thing it describes cannot be separated — the
-    /// bucket key needs it, and a key that has to be given a number
-    /// separately is a key that will one day be given the wrong one.
-    ///
-    /// Its readers — `recordings::capture_digest` and the bucket key in
-    /// `fire::launch` — are both `feature = "abi"`, and this file is not, so
-    /// a build that cannot fire computes the fingerprint and has nothing to
-    /// key on. That is the honest shape rather than a defect: staging an
-    /// adapter is a host job the portable half still does, and gating the
-    /// FIELD would mean gating every line that fills it.
+    /// Everything a captured lora body bakes, mixed into one number for the
+    /// bucket key. Unused unless `feature = "abi"`, which this file isn't.
     #[cfg_attr(
         not(feature = "abi"),
         expect(dead_code, reason = "both readers are behind `abi`")
@@ -319,19 +231,11 @@ pub struct LoraFireState {
     pub(crate) capture_fingerprint: u64,
 }
 
-// `bf16_row` STOOD HERE and is `kernels_cuda::gemm::lora::bf16_row`. It
-// was the one function this file's two halves BOTH used -- the staging
-// addresses a row to put it in the slab, the launch addresses the same row to
-// accumulate into it -- so leaving a copy behind would have been the same row
-// stride computed on two sides of a crate boundary. That is the shape §6.3
-// exists to find, and finding it in the file being split is the cheapest
-// place it can be found.
+// `bf16_row` (shared with the launch half) computes the row stride both use.
 
 impl LoraFireState {
-    /// The constructor: validate every lane, stage the bf16 casts, group
-    /// same-shape lanes, lay out the grouped scratch and the pointer
-    /// slab. Ports `LoraFireState::LoraFireState` line for line;
-    /// `grouped_enabled` carries the env gate as a value.
+    /// The constructor: validates lanes, stages bf16 casts, groups same-shape
+    /// lanes, and lays out the grouped scratch/pointer slab.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_lines)]
     pub fn stage<O: DeviceMemory + LoraOps>(
@@ -355,8 +259,7 @@ impl LoraFireState {
             ));
         }
         let mut me = Self {
-            // Filled by `stage_qkv_adapters`, which is the only thing
-            // that knows what the capture will bake.
+            // Filled by `stage_qkv_adapters`, the only thing that knows the bake.
             capture_fingerprint: 0,
             lanes: Vec::with_capacity(table.lanes.len()),
             groups: Vec::new(),
@@ -510,8 +413,8 @@ impl LoraFireState {
                      exceeds the {n}x{i_width} ws.gate alias bound"
                 )));
             }
-            // Pointer-slab layout: per layer, per group, [x a xa](n each)
-            // [q_act q_w q_y](nq each) [v_act v_w v_y](nv each).
+            // Pointer-slab layout, per layer/group: [x a xa](n) [q_act q_w q_y](nq)
+            // [v_act v_w v_y](nv).
             for gi in 0..me.groups.len() {
                 let members: Vec<usize> = me.groups[gi].members.clone();
                 for &idx in &members {
@@ -615,8 +518,7 @@ impl LoraFireState {
         Ok(me)
     }
 
-    /// True iff no two lanes' token spans overlap. Ports
-    /// `lane_spans_disjoint`.
+    /// True iff no two lanes' token spans overlap.
     fn lane_spans_disjoint(&self) -> bool {
         let mut by_start: Vec<&LoraLaneView> = self.lanes.iter().map(|l| &l.view).collect();
         by_start.sort_by_key(|v| v.token_start);
@@ -630,34 +532,15 @@ impl LoraFireState {
 
     /// Whether this staged state may be recorded into a union capture.
     ///
-    /// Only the GROUPED path may. `apply`'s solo path is a host-side loop
-    /// over lanes whose launch count and shapes follow the fire's adapter
-    /// set — its rank, its token spans, which sites each lane touches — so
-    /// a capture bakes the lanes it happened to see and a later fire with
-    /// a different set needs a different launch sequence. That is not a
-    /// pointer to hand in; the arm is a PROGRAM whose shape is a variant
-    /// axis with unbounded cardinality, and no conditional node folds one.
-    ///
-    /// The grouped path is slot arithmetic over `ptr_slab` and a fixed
-    /// launch per group — which is what `apply` says where it does it,
-    /// "the slab was fully staged at fire setup … what a captured body
-    /// requires". It was written for this.
-    ///
-    /// So a fire joins a union only if EVERY lane grouped. This is an
-    /// eligibility rule of the same shape the C++ arc used for mixed
-    /// peels: what cannot be replayed stays eager.
-    ///
-    /// Note the group SHAPE is still baked by a capture (the member count
-    /// and the `m` vector reach the launcher as arguments), so a bucket
-    /// key that admits LoRA has to carry it. `true` here means "may be
-    /// captured", not "may share any exec".
+    /// Only if every lane grouped: the solo path's launch shape follows the
+    /// fire's adapter set, so a different adapter set needs a different capture.
+    /// `true` means "may be captured", not "may share any exec".
     #[must_use]
     pub fn union_capture_safe(&self) -> bool {
         self.grouped_enabled && self.lanes.iter().all(|l| l.grouped)
     }
 
-    /// The one-line grouping summary `PIE_LORA_FIRE_TRACE` prints. Ports
-    /// `grouping_desc`.
+    /// The one-line grouping summary `PIE_LORA_FIRE_TRACE` prints.
     #[must_use]
     pub fn grouping_desc(&self) -> String {
         if !self.grouped_enabled {
@@ -680,18 +563,8 @@ impl LoraFireState {
         s
     }
 
-    /// What the launch half needs, as one borrow.
-    ///
-    /// The whole of this type's output. `apply` used to be a method here and
-    /// is `kernels_cuda::gemm::lora_qkv_correction` now; this is the seam
-    /// between the two, and it is a BORROW rather than a copy because the two
-    /// vectors are the fire's and outlive every launch made from them.
-    ///
-    /// It is also the reason the fields stay private. A `Staged` is what any
-    /// reader outside this file may have, and it is exactly what the launcher
-    /// reads -- so nothing can reach `capture_fingerprint` or `grouped_\
-    /// enabled` through it, and those two have their own readers for their own
-    /// reasons.
+    /// What the launch half needs, as a borrow (not a copy — the vectors
+    /// outlive every launch made from them). Excludes the private fields.
     #[must_use]
     pub fn staged(&self) -> Staged<'_> {
         Staged {
@@ -703,41 +576,9 @@ impl LoraFireState {
     }
 }
 
-// `LoraFireState::apply` STOOD HERE, and `grouped_or_panic` under it. Both
-// are `kernels_cuda::gemm::lora`'s -- see the note at the top of this
-// file for what moved and what could not.
-//
-// `grouped_or_panic` did not survive the move, and its own doc is why: it
-// existed because *"a staged LoRA apply has nowhere to put a `Declined`"*,
-// `apply` having returned `()`. `gemm::lora_qkv_correction` returns
-// `Result<(), Refusal>`, so the three call sites propagate with `?` and the
-// abort is a value the dispatch arm reports like any other decline. The
-// unreachability argument that doc made still holds and now lives beside the
-// guards that establish it, in `stage` above.
-
-/// An empty extent is a no-op; every other decline is a bug.
-///
-/// `fire::dtype_cast` stood between this file and the two `quant` casts and
-/// returned `()`, because a `bind::jit::fire` returns `()` and swallows its
-/// own refusals. `x::quant::{cast_fp32_to_bf16, scale_rows_bf16}` return
-/// `#[must_use] Fired` instead, and the two outcomes they can produce are not
-/// the same outcome:
-///
-///   * `Declined(Empty)` is `dtype_cast.cu:50`'s `if (n == 0) return;` and
-///     `:65`'s `if (rows == 0 || width == 0) return;`, moved from the C++ into
-///     the host program unchanged. Callers relied on it — a LoRA lane with no
-///     tokens reaches here — so it must stay a no-op HERE, on the caller's
-///     side, which is where the loader's no-op lived all along.
-///   * Anything else means the host program refused an argument this file
-///     built, which the C++ had no way to say and this file has no way to
-///     handle.
-///
-/// So the arm is named and the second case aborts with the symbol, for the
-/// reason its one remaining caller cannot escape: `let _ =` would spell
-/// "it declined" like "it ran", and `LoraOps::cast_fp32_to_bf16` returns
-/// `()` because the trait's other implementor is a recorder with no device
-/// to be refused by. The launch half had the same problem and no longer
-/// does -- see the note where `apply` stood.
+/// An empty extent is a no-op (a LoRA lane with no tokens reaches here);
+/// every other decline means this file built an argument the host program
+/// refused, which it cannot handle — abort.
 fn empty_or_panic(symbol: &str, fired: Result<(), kernels_cuda::Refusal>) {
     if let Err(why) = fired
         && !matches!(why, kernels_cuda::Refusal::Empty { .. })
@@ -755,19 +596,8 @@ fn mix(mut x: u64) -> u64 {
 }
 
 /// Stage the fire's lora state and answer a fingerprint of everything a
-/// captured lora body bakes: the lane structure, the adapter device
-/// pointers, the grouping mode, and the post-staging arena base (a growth
-/// changes addresses and must recapture). `0` means no lora. Ports
-/// `llama_like_lora_stage` (the C++'s name); the staged state and the
-/// table it was staged from go to the caller — the `lora_staged` slot in
-/// C++ — rather than being written here, because the plan state's `L`
-/// parameter is exactly this type.
-///
-/// NAMED FOR WHAT IT DOES, not for where it came from. The C++ spells
-/// it `llama_like_lora_stage`, and provenance belongs in a doc line:
-/// nothing about staging q/k/v adapters is llama's, and a function
-/// named after a family teaches the next reader that there is a family
-/// axis here. `tests/no_family_names.rs` is what noticed.
+/// captured lora body bakes (lane structure, adapter pointers, grouping mode,
+/// arena base — a growth changes addresses and must recapture). `0` means no lora.
 #[allow(clippy::too_many_arguments)]
 pub fn stage_qkv_adapters<O: DeviceMemory + LoraOps>(
     ops: &mut O,
@@ -824,9 +654,7 @@ pub fn stage_qkv_adapters<O: DeviceMemory + LoraOps>(
         h64 ^= mix(v.b as u64);
     }
     let h64 = if h64 == 0 { 1 } else { h64 };
-    // CARRIED, not merely returned. The bucket key needs it and the call
-    // site used to drop it; a value that travels beside the thing it
-    // describes cannot be dropped without dropping both.
+    // Carried on the state so the bucket key can't be handed it separately.
     let staged = LoraFireState {
         capture_fingerprint: h64,
         ..staged
@@ -838,18 +666,13 @@ pub fn stage_qkv_adapters<O: DeviceMemory + LoraOps>(
 
 /// The `lora` sink's operand layout, read out of a prologue stage plan.
 ///
-/// `fwd.adapter(site, |x, y| expr)` recognises LoRA `y + mm(b, mm(a, x))`,
-/// IA3 `scale(y, l)` and the DoRA composite, and lowers all of them to ONE
-/// pass-wide sink in the program's PROLOGUE: `SinkCall { name: "lora" }`
-/// with three args for the low-rank form (`a`, `b`, `sites`) or two for
-/// the scale form (`l`, `sites`). The ARITY selects the form — see
-/// `tensor-compiler/src/codegen/cuda/validate.rs`, which refuses any other
-/// count and any stage but the prologue.
+/// `fwd.adapter` lowers LoRA, IA3 and DoRA to one `SinkCall { name: "lora" }`:
+/// three args for the low-rank form (`a`, `b`, `sites`), two for scale
+/// (`l`, `sites`) — arity selects the form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoraSink {
-    /// The channel the `a` (or, on a scale sink, the `l`) tensor arrives on
-    /// — a PROGRAM-GLOBAL dense channel index, which is what
-    /// `LaunchStagePlan::channel_bindings` resolves a stage-local slot to.
+    /// The channel the `a` (or, on a scale sink, `l`) tensor arrives on — a
+    /// program-global dense index, resolved from the stage-local slot.
     pub a_channel: u32,
     /// The `b` channel, absent on a scale sink.
     pub b_channel: Option<u32>,
@@ -881,30 +704,9 @@ const SINK_CALL: u16 = 0xA2;
 
 /// Find and resolve the `lora` sink in one stage plan.
 ///
-/// # Why this reads three tables rather than one
-///
-/// A sink's operands are stage-local VALUE ids, and the ops that produce
-/// them are not in `plan.ops` at all: `codegen/launch.rs::lower_stages`
-/// turns `chan_take`, `chan_read`, `const` and `intrinsic_val` into stage
-/// EFFECTS, so the op list has no producer to walk back to. What survives
-/// is `channel_rules` — one `{ value, local }` per channel-touching op —
-/// which is exactly the value→channel map, and `value_types`, which is
-/// indexed by the same value ids and carries the dims.
-///
-/// So: `ops` says which values the sink consumes, `channel_rules` says
-/// which channel each of them came off, `channel_bindings` widens a
-/// stage-local slot to the program's dense numbering, and `value_types`
-/// says what shape it is. A caller then turns a dense index into an
-/// address, which is the one thing this cannot do — see
-/// [`LoraSink::a_channel`].
-///
-/// # Errors
-///
-/// [`SinkRefusal::Absent`] when the stage states no sink, which is the
-/// ordinary case. [`SinkRefusal::Malformed`] when it states one that does
-/// not resolve — and that is worth distinguishing, because a program that
-/// asked for an adapter and silently ran without it returns an answer
-/// indistinguishable from a correct one.
+/// [`SinkRefusal::Absent`] is the ordinary case (no sink). `Malformed` is
+/// distinguished because silently running without a requested adapter
+/// would return an answer indistinguishable from a correct one.
 pub fn read_lora_sink(
     plan: &driver::driver_api::plan::LaunchStagePlan,
 ) -> Result<LoraSink, SinkRefusal> {
@@ -929,10 +731,8 @@ pub fn read_lora_sink(
             ));
         }
     };
-    // The SITES literal is the last arg either way, and it is a constant
-    // the trace knew: `lit_bits` on the op that defined it. That op is a
-    // `const`, which does reach `plan.ops`, so unlike the channel operands
-    // it can be found by walking.
+    // The SITES arg is a `const` op, which (unlike the channel operands) does
+    // reach `plan.ops`, so it can be found by walking to `lit_bits`.
     let sites_value = *op.args.last().expect("checked arity");
     let sites_bits = plan
         .ops
@@ -984,11 +784,8 @@ pub fn read_lora_sink(
             let &[b_layers, d_out, b_rank] = b_dims else {
                 return Err(SinkRefusal::Malformed("a low-rank B is [layers, d_out, R]"));
             };
-            // CHECKED RATHER THAN ASSUMED, because the two tensors arrive
-            // on separate channels and nothing upstream pairs them: a
-            // caller that re-seeded one and not the other would otherwise
-            // get a GEMM over mismatched inner dimensions, which is a
-            // wrong answer and not a fault.
+            // A and B arrive on separate channels with nothing to pair them; a
+            // mismatched pair silently produces a wrong GEMM, not a fault.
             if b_layers != layers || b_rank != rank {
                 return Err(SinkRefusal::Malformed(
                     "the adapter's A and B disagree on layers or rank",
@@ -1025,13 +822,8 @@ pub fn read_lora_sink(
 }
 
 impl LoraSink {
-    /// This sink as one lane's view, given the addresses the caller
-    /// resolved and the token span the lane owns.
-    ///
-    /// The split is deliberate: everything above is a pure read of the
-    /// plan and is testable without a device, while an ADDRESS is a fact
-    /// about a live session's rings. Keeping the two apart is what lets
-    /// the resolution be proved and the binding be simple.
+    /// This sink as one lane's view, given the resolved addresses and the
+    /// lane's token span. The plan read above is device-free.
     #[must_use]
     pub const fn lane(
         &self,
@@ -1060,8 +852,7 @@ mod sink_tests {
     use super::*;
     use driver::driver_api::plan::{LaunchChannelRule, LaunchOp, LaunchPlanValue, LaunchStagePlan};
 
-    /// Value ids are op INDICES here, which is what the plan's stage-local
-    /// numbering makes them for a straight-line stage.
+    /// Value ids are op INDICES here, per the plan's stage-local numbering.
     fn value(dims: &[u32]) -> LaunchPlanValue {
         LaunchPlanValue {
             dtype: 0,
@@ -1087,8 +878,7 @@ mod sink_tests {
         }
     }
 
-    /// A prologue whose sink is the low-rank form: A on channel slot 0,
-    /// B on slot 1, and a sites literal.
+    /// A prologue whose sink is the low-rank form: A on slot 0, B on slot 1.
     fn low_rank_plan() -> LaunchStagePlan {
         LaunchStagePlan {
             names: vec!["lora".to_owned()],
@@ -1136,9 +926,7 @@ mod sink_tests {
         );
     }
 
-    /// Two args is IA3, and it has no rank and no input width. Reading it
-    /// as a low-rank sink would give a GEMM two dimensions it does not
-    /// have.
+    /// Two args is IA3: no rank, no input width.
     #[test]
     fn a_two_arg_sink_is_the_scale_form() {
         let mut plan = low_rank_plan();
@@ -1155,8 +943,7 @@ mod sink_tests {
         assert_eq!(read.d_out, 128);
     }
 
-    /// The ordinary case. Most stages state no sink and must not be read
-    /// as stating a broken one.
+    /// Most stages state no sink and must read as Absent, not Malformed.
     #[test]
     fn a_stage_with_no_sink_is_absent_rather_than_malformed() {
         let plan = LaunchStagePlan {
@@ -1166,9 +953,7 @@ mod sink_tests {
         assert_eq!(read_lora_sink(&plan), Err(SinkRefusal::Absent));
     }
 
-    /// A and B arrive on SEPARATE channels and nothing upstream pairs
-    /// them, so a caller that re-seeded one and not the other would hand
-    /// the GEMM mismatched inner dimensions — a wrong answer, not a fault.
+    /// A and B on separate channels with mismatched rank must be refused.
     #[test]
     fn an_a_and_b_that_disagree_are_refused() {
         let mut plan = low_rank_plan();
@@ -1179,9 +964,7 @@ mod sink_tests {
         );
     }
 
-    /// A site this driver has no arm for is refused rather than dropped.
-    /// A program that asked for an adapter and silently ran without it
-    /// returns an answer indistinguishable from a correct one.
+    /// An unknown site is refused, not silently masked off.
     #[test]
     fn an_unknown_site_is_refused_rather_than_masked_off() {
         let mut plan = low_rank_plan();
@@ -1192,9 +975,7 @@ mod sink_tests {
         ));
     }
 
-    /// An operand that is not a channel cannot be an adapter tensor: the
-    /// whole point of the channel form is that swapping an adapter is
-    /// re-seeding rather than re-tracing.
+    /// A non-channel operand cannot be an adapter tensor.
     #[test]
     fn an_operand_off_no_channel_is_refused() {
         let mut plan = low_rank_plan();
@@ -1208,38 +989,11 @@ mod sink_tests {
 
 // ── The address half: a plan says WHICH channel, a session says WHERE ──
 
-/// Resolve one instance's `lora` sink into a lane view.
-///
-/// [`read_lora_sink`] answers *which* channels the adapter arrives on
-/// and what shape it is; this answers *where*, which is a fact about a
-/// live session's rings rather than about a plan. The two are separate
-/// functions because the first is testable without a device and the
-/// second is not.
-///
-/// # Why this could not exist until sessions were hoisted
-///
-/// A cell's address comes from `Rings`, and the driver built one lazily
-/// inside `run_program` — the sampler, which runs AFTER the forward.
-/// The `lora` sink lives in the program's PROLOGUE, which is before. The
-/// blocker was never a missing function; it was the order two things
-/// happened in. `launch::ensure_sessions` fixed the order.
-///
-/// # Errors
-///
-/// `None` when the instance has no program, its program states no
-/// prologue, the prologue states no `lora` sink, or the sink's channels
-/// are not ones this session rings. Each of those is an ordinary
-/// adapter-free fire rather than a failure — a program without an
-/// adapter is the common case.
-// Same seam as `fire::launch`: it reads the shell's instance table,
-// which is the door's own state.
-// `pub(crate)` rather than `pub`, because its `instances` parameter is a map
-// of `serve::state::InstanceEntry` and that type is the shell's own — an entry
-// in the instance table, meaningless outside the door that keeps it. Exported
-// at `pub` the signature named a type nobody outside could spell, which rustc
-// reports as "more private than the item" and which is really the visibility
-// having been chosen for the function alone rather than for its arguments.
-// `fire::launch` is the only caller and is in this crate.
+/// Resolve one instance's `lora` sink into a lane view — the *where*
+/// [`read_lora_sink`]'s *which* leaves open. `None` covers every ordinary
+/// adapter-free fire (no program, no prologue, no sink, unringed channel).
+// `pub(crate)`: `instances` is the shell's own `InstanceEntry`, and
+// `fire::launch` is the only caller.
 #[cfg(feature = "abi")]
 #[must_use]
 pub(crate) fn lane_for_instance(
@@ -1254,24 +1008,18 @@ pub(crate) fn lane_for_instance(
 ) -> Option<LoraLaneView> {
     let instance = instances.get(&instance_id)?;
     let compiled = programs.get(instance.program_id)?;
-    // THE PROLOGUE'S plan, by KIND. `plans.first()` would be the
-    // epilogue on every program in the tree today, which is the same
-    // accident `run_program` was fixed for.
+    // By KIND, not `plans.first()`, which would be the epilogue today.
     let stage = compiled.stage_of_kind(crate::program::runtime::stage_kind::PROLOGUE)?;
     let plan = compiled.plans.get(stage)?;
     let sink = read_lora_sink(plan).ok()?;
 
     let session = sessions.get(&instance_id)?;
     let cursors = rings.cursors(stream).ok()?;
-    // THE COMMITTED CELL, not the pending one. An adapter is SEEDED —
-    // the host publishes it once and the fire reads it — so what a fire
-    // wants is the last value that was committed, which is what `head`
-    // names. Reading `tail` would be reading a cell nobody filled.
+    // `head` (committed), not `tail` (pending): an adapter is seeded once and
+    // read by the fire.
     //
-    // THROUGH THE SESSION'S SLOT MAP, because the rings are the driver's now
-    // and `dense` is this instance's own numbering. Indexing the registry with
-    // a dense number would hand the adapter whichever channel happened to be
-    // registered at that position — a real cell, and somebody else's.
+    // `dense` is this instance's own numbering; indexing the rings with it
+    // directly would hand the adapter somebody else's channel.
     let address = |dense: u32| -> Option<*const std::ffi::c_void> {
         let c = session.slot(dense as usize)? as usize;
         let cursor = cursors.get(c)?;
@@ -1281,9 +1029,7 @@ pub(crate) fn lane_for_instance(
 
     let a = address(sink.a_channel)?;
     let b = match sink.b_channel {
-        // A SCALE SINK HAS NO B, and null is the form `LoraFireState`
-        // expects for it — see `LoraForm::Scale`, whose `b` is null and
-        // whose rank and `d_in` are zero.
+        // A scale sink has no B; null is the form `LoraFireState` expects.
         None => core::ptr::null(),
         Some(dense) => address(dense)?,
     };

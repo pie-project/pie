@@ -676,3 +676,86 @@ fn the_fixture_actually_writes_across_a_cut() {
          differential is comparing arithmetic that never ran"
     );
 }
+
+/// A plan whose arena is NOT all persistent.
+///
+/// Everything above reads `Expr::out(..)`, so every operand is already a
+/// published tensor and the staging region is empty -- which is why
+/// `persistent_bytes` and `arena_bytes()` are the same number for the fixture
+/// and why nothing here could tell them apart. A tensor cast straight off the
+/// FILE has to stage the source first, and that is the region the two
+/// disagree about.
+fn scratch_plan() -> LoadPlan {
+    // Per-channel (group_size 0) rather than the shared `fp8()`, whose
+    // group of 32 does not divide this fixture's 8-wide axis. The 64 source
+    // bytes are read as BF16, which is 32 elements: [4, 8].
+    let quant = Encoding::Quant(QuantSpec {
+        group_size: 0,
+        ..fp8()
+    });
+    let contract = ModelContract {
+        alignment: 256,
+        tensors: vec![TensorContract::new(
+            "w_q",
+            Expr::src("w")
+                .transmute(TensorType {
+                    shape: vec![4, 8],
+                    encoding: Encoding::Raw(DType::BF16),
+                })
+                .cast(quant.clone()),
+            vec![4, 8],
+            quant,
+        )],
+        groups: Vec::new(),
+    };
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        tile_map_mask: CUDA_TILE_MAP_MASK,
+        ..StorageTarget::default()
+    };
+    compile_load_plan(&metadata(), &contract, target).expect("the fixture must compile")
+}
+
+/// The executor's own arena is big enough for the plan it is executing.
+///
+/// `Execution::run` with no `.arena(..)` allocates the backing itself, and
+/// allocated `persistent_bytes` while `walk::run` requires `arena_bytes()` --
+/// persistent PLUS staging, which the plan's offsets are all measured from
+/// the same base as. So the default, no-argument way to execute a plan
+/// refused any plan that staged anything, before reading a byte:
+///
+/// ```text
+/// Contract("arena is 4352 bytes and the plan needs 20736")
+/// ```
+///
+/// 206 lib tests and this file did not catch it because every one of them
+/// either passes its own arena or executes a plan with no staging region.
+/// It surfaced from `driver-cuda`'s `gpu_load_transforms`, two crates away,
+/// where it read as a CUDA failure.
+#[test]
+fn the_executor_allocates_an_arena_its_own_plan_fits_in() {
+    let plan = scratch_plan();
+
+    // Without this the test is vacuous: a plan with no staging region cannot
+    // tell the two sizes apart, and would pass against the bug.
+    assert!(
+        plan.memory.scratch_bytes > 0,
+        "the fixture stages nothing, so it does not distinguish \
+         persistent_bytes from arena_bytes() and proves nothing"
+    );
+    assert_eq!(
+        plan.memory.arena_bytes(),
+        plan.memory.persistent_bytes + plan.memory.scratch_bytes
+    );
+
+    let dir = checkpoint();
+    let storage = Execution::new(&plan, &dir).run();
+    std::fs::remove_dir_all(&dir).ok();
+    let storage = storage.expect("the executor's own arena must fit its own plan");
+
+    assert_eq!(
+        storage.arena.len() as u64,
+        plan.memory.arena_bytes(),
+        "the returned arena is the whole allocation, staging included"
+    );
+}

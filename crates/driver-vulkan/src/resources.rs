@@ -43,7 +43,7 @@ pub struct Shape {
     pub head_dim: u32,
     /// Rows per page.
     ///
-    /// The number `Source::KvPageSize` asks for, and the one a statement
+    /// The number `Source::Named(<keys::KvPageSize as keys::Fact>::KEY)` asks for, and the one a statement
     /// cannot carry.
     pub page_size: u32,
     /// How many pages the pool holds, across all requests.
@@ -117,7 +117,7 @@ impl Shape {
             // Not a fact about the cache. A shape cannot know the pitch of a
             // rectangle built from one fire's requests, and answering zero
             // here would be a shape claiming a fire states no mask.
-            FireNumber::AttentionMaskStride => None,
+            FireNumber::AttentionMaskStride | FireNumber::KvHistoryBucket => None,
         }
     }
 }
@@ -766,9 +766,17 @@ pub struct Pool {
     /// On the POOL and not on [`Shape`], because it is a fact about one fire
     /// rather than about the cache: two fires of the same pool mask against
     /// different pool lengths. Zero means the last fire stated no mask, which
-    /// is what a row reading `Source::AttentionMaskStride` needs to see so the
+    /// is what a row reading `Source::Named(<keys::AttentionMaskStride as keys::Fact>::KEY)` needs to see so the
     /// shader takes its causal path.
     mask_stride: u32,
+    /// One past the largest position the last staged fire attends from,
+    /// rounded up to a power of two.
+    ///
+    /// On the pool for the same reason `mask_stride` is: a fact about one
+    /// fire, not about the cache. Zero until a fire is staged, and zero reads
+    /// as "one split", which is the single-pass decode this backend has
+    /// always fired.
+    history_bucket: u32,
 }
 
 impl Pool {
@@ -840,6 +848,7 @@ impl Pool {
             named: None,
             restaged: 0,
             mask_stride: 0,
+            history_bucket: 0,
         })
     }
 
@@ -1177,6 +1186,44 @@ impl Pool {
             )?;
         }
         self.mask_stride = frame.attention_mask_stride;
+        // Rounded UP to a power of two, and that is not a detail: this number
+        // decides a grid, the grid is recorded, and `crate::replay`
+        // re-submits the recording across decode steps. An exact history
+        // would change every token and re-plan every token. See
+        // `FireNumber::KvHistoryBucket`.
+        let longest = frame.positions.iter().copied().max().unwrap_or(0);
+        self.history_bucket = longest.saturating_add(1).next_power_of_two();
+        Ok(())
+    }
+
+    /// Give the pool the flash decode's scratch, sized for `floats`.
+    ///
+    /// Reallocated only when the size CHANGES, which for a steady decode is
+    /// never: the split count moves at a power-of-two history boundary and
+    /// the row and head counts do not move at all. That matters beyond the
+    /// allocation cost, because `crate::replay::Key` carries the device's
+    /// allocation and free counts -- a pool that reallocated this every step
+    /// would invalidate the recorded command buffer every step.
+    ///
+    /// Not zeroed. Every workgroup of the split pass writes its own whole
+    /// entry before the fold reads any of them, so there is nothing in here
+    /// a fire can observe from the fire before it.
+    ///
+    /// # Errors
+    ///
+    /// [`Failed`] if the allocation does not fit.
+    pub fn partials(&mut self, device: &Device, floats: u64) -> Result<(), Failed> {
+        let bytes = floats.max(1) * 4;
+        if let Some(old) = self.tables.get(&FireTable::AttnPartials)
+            && old.size() >= bytes
+        {
+            return Ok(());
+        }
+        self.restaged += 1;
+        let buffer = device.empty(bytes)?;
+        if let Some(old) = self.tables.insert(FireTable::AttnPartials, buffer) {
+            device.free(old);
+        }
         Ok(())
     }
 
@@ -1468,6 +1515,7 @@ impl Resolve for Pool {
             // The one number that is a fact about the FIRE and not about the
             // cache, so it is answered here rather than delegated.
             FireNumber::AttentionMaskStride => Some(self.mask_stride),
+            FireNumber::KvHistoryBucket => Some(self.history_bucket),
             which => self.shape.number(which),
         }
     }
@@ -2243,7 +2291,7 @@ mod tests {
     /// A pool wider than four billion elements per layer cannot state its own
     /// sequence stride, and says so rather than wrapping.
     ///
-    /// `Source::KvSeqStride` reaches the shader through a 32-bit channel --
+    /// `Source::Named(<keys::KvSeqStride as keys::Fact>::KEY)` reaches the shader through a 32-bit channel --
     /// `PIE_STRIDE` is a `uvec2` whose low half is all the shaders read -- so
     /// a `row()` past `u32::MAX` has nowhere to go. Truncating it would put
     /// every position after the first at a wrong address, on a card, with no
@@ -2462,9 +2510,24 @@ mod tests {
 /// Separate from [`Pool`] because the two have opposite lifetimes. A pool
 /// belongs to a deployment and its tables belong to a fire; weights belong to
 /// a MODEL and outlive both.
+/// # Why a `HashMap` and not a `BTreeMap`
+///
+/// It was a `BTreeMap`, and nothing about this store is ordered: the only
+/// question ever asked of it is [`Weights::weight`], by exact name, once per
+/// weight operand of every rectangle a fire plans.
+///
+/// A `BTreeMap` answers that in about ten string comparisons, and these are
+/// the worst strings to compare: `model.layers.13.self_attn.q_proj.weight`
+/// and `model.layers.13.self_attn.k_proj.weight` agree for their first
+/// twenty-eight bytes, over nodes the allocator scattered. Measured GPU-free
+/// by `tests/planbench.rs`, planning a qwen3-0.6b decode's 452 rectangles
+/// against a store of the same 704 names: `bind` is **68 ns a rectangle
+/// ordered and 35 ns hashed**, against 15 ns with a store that answers
+/// without looking anything up. So more than half of what binding an operand
+/// cost was the tree.
 #[derive(Default)]
 pub struct Weights {
-    held: BTreeMap<String, Buffer>,
+    held: std::collections::HashMap<String, Buffer>,
     seam: Option<Buffer>,
 }
 

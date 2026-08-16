@@ -1,26 +1,11 @@
-//! The live KV cache — gate-kvcache-live.
+//! The live KV cache: object wiring over [`super::kv_cache::KvCacheLayout`]'s
+//! tensor plan — pointer wiring, alias-resolving accessors, swap buffers,
+//! envelope seeding, elastic clamp-and-ratio. Shape arithmetic stays in the
+//! layout; [`KvCache::materialize`] only walks the planned slots.
 //!
-//! [`super::kv_cache::KvCacheLayout`] is the port of WHAT the C++ `KvCache`
-//! allocates, proven tensor-for-tensor. This is the port of the OBJECT: the
-//! pointer wiring of `layer_view` (2,966 calls in the generated forward
-//! bodies), the accessors that resolve through `kv_source_layer`, the
-//! buffers the swap path copies, the envelope seeding, and the
-//! clamp-and-ratio the elastic forwarding applies.
-//!
-//! The layout stays stated ONCE: [`KvCache::materialize`] walks the planned
-//! slots and allocates them in the C++'s order, so there is no second copy
-//! of the shape arithmetic here to drift — the `workspace_bytes` lesson,
-//! applied preemptively.
-//!
-//! # Seams
-//!
-//! Device work goes through [`KvCacheDeviceOps`] (allocation, the envelope
-//! seed launch, the arena escape) and the elastic pool through
-//! [`ElasticPool`] — the recorder pattern every gate uses. The arena escape
-//! deserves its sentence: envelopes are seeded at construction, and the KV
-//! arena is elastic (`commit_on_allocate = false`), so seeding through it
-//! would fault on uncommitted VA. The C++ unbinds the custom allocator
-//! around the tier; the real ops implementation must do the same.
+//! Arena escape is the load-bearing seam: envelopes seed at construction but the
+//! KV arena is elastic (`commit_on_allocate = false`), so seeding through it
+//! faults — a real [`KvCacheDeviceOps`] unbinds the allocator around the tier.
 
 use std::ffi::c_void;
 
@@ -32,9 +17,8 @@ use crate::layout::KvCacheFormat;
 
 /// What the live cache asks of the device.
 pub trait KvCacheDeviceOps {
-    /// `DeviceTensor::allocate` — returns the data pointer, null for a
-    /// zero-byte request (the C++ allocator's own convention, and the
-    /// convention `empty()` tests).
+    /// `DeviceTensor::allocate` — the data pointer, null for a zero-byte request
+    /// (the allocator's convention, and what `empty()` tests).
     fn alloc_tensor(&mut self, dtype: DType, shape: &[i64]) -> *mut c_void;
     /// Unbind the elastic arena before the envelope tier.
     fn escape_arena(&mut self);
@@ -53,35 +37,16 @@ pub trait KvCacheDeviceOps {
     fn stream_synchronize(&mut self);
 }
 
-/// The live [`KvCacheDeviceOps`] (retirement plan phase B), behind `_cuda`
-/// because [`Self::envelope_seed`] is a LAUNCH. It was `bridge` when that
-/// launch was a generated shim entry off the second table's first
-/// driver-internal row; the row is gone, the `.cu` is gone, and the launch
-/// is `kernels_cuda::layout::envelope_seed_empty`. The gate outlived
-/// its reason by exactly that much (BRIDGE_RETIREMENT.md §2.2's specimen).
+/// The live [`KvCacheDeviceOps`], behind `_cuda` because
+/// [`Self::envelope_seed`] is a launch.
 ///
-/// `escape_arena`/`restore_arena` are no-ops here, and that is a statement
-/// about THIS impl rather than a shortcut: the C++ escapes because a global
-/// arena allocator is installed and envelope storage must not live in
-/// elastic (uncommitted) VA. This impl allocates through the driver's own
-/// [`Allocator`](crate::device::Allocator), which is already outside the
-/// arena. The moment an arena-backed `alloc_tensor` exists, the escape
-/// stops being a no-op — the pair stays on the trait so that impl has
-/// somewhere to put it.
-///
-/// # It owns what it allocates
-///
-/// [`KvCache`] holds raw `*mut c_void` and has no `Drop`, because it is a
-/// port of a C++ type whose tiers were freed by an arena that outlived it.
-/// In Rust that shape leaks: `serve`'s `kv_pools_for` REPLACES its
-/// pools on every growth, and a replaced tier with no owner is simply
-/// gone. So the ops object keeps the [`DeviceBuffer`](crate::device::DeviceBuffer)s
-/// — each one holds an `Arc` on the allocator and frees itself — and the
-/// caller keeps the ops object alongside the cache it materialised.
-///
-/// Which is why this is no longer `Copy`: a copy would have been a second
-/// owner of the same tiers, and dropping either would have freed them
-/// under the other.
+/// `escape_arena`/`restore_arena` are no-ops: this impl allocates through the
+/// driver's own [`Allocator`](crate::device::Allocator), already outside the
+/// arena. It owns what it allocates — [`KvCache`] holds raw pointers with no
+/// `Drop` and `serve` replaces its pools on every growth, so this object keeps
+/// the [`DeviceBuffer`](crate::device::DeviceBuffer)s and the caller keeps it
+/// alongside the cache. Not `Copy`: a second owner would free the tiers under
+/// the other.
 #[cfg(feature = "_cuda")]
 #[derive(Debug)]
 pub struct LiveKvCacheOps<'a> {
@@ -92,17 +57,10 @@ pub struct LiveKvCacheOps<'a> {
 
 #[cfg(feature = "_cuda")]
 impl<'a> LiveKvCacheOps<'a> {
-    /// Ops ordered on `stream`, allocating from `alloc`.
-    ///
-    /// `alloc` is borrowed, not held: [`Allocator`](crate::device::Allocator)
-    /// is deliberately not `Clone`, because a second handle would be a
-    /// second way to call `alloc` that `begin_capture`'s `&mut self`
-    /// borrow does not cover. So this object is transient — build it,
-    /// materialise a cache with it, and take the buffers out with
-    /// [`Self::into_held`].
-    ///
-    /// The stream is the materialize-time one, which the C++ takes from
-    /// the engine's context.
+    /// Ops ordered on `stream`, allocating from `alloc`. `alloc` is borrowed,
+    /// not held: [`Allocator`](crate::device::Allocator) is not `Clone`, since a
+    /// second handle would bypass `begin_capture`'s `&mut self` borrow. Build,
+    /// materialise, take buffers with [`Self::into_held`].
     #[must_use]
     pub const fn new(
         stream: crate::device::StreamRef<'a>,
@@ -121,16 +79,8 @@ impl<'a> LiveKvCacheOps<'a> {
         self.held.iter().map(crate::device::DeviceBuffer::len).sum()
     }
 
-    /// The buffers backing the cache this materialised, for the caller
-    /// to keep alongside it.
-    ///
-    /// [`KvCache`] holds raw `*mut c_void` and has no `Drop`, because it
-    /// is a port of a C++ type whose tiers were freed by an arena that
-    /// outlived it. In Rust that shape leaks — `serve`'s
-    /// `kv_pools_for` REPLACES its pools on every growth, and a replaced
-    /// tier with no owner is simply gone. Keeping these beside the cache
-    /// makes the cache's lifetime the buffers', which is what the shell's
-    /// hand-built pools already got right.
+    /// The buffers backing the cache this materialised, for the caller to keep
+    /// alongside it — see the type's own note on why the cache cannot own them.
     #[must_use]
     pub fn into_held(self) -> Vec<crate::device::DeviceBuffer> {
         self.held
@@ -143,12 +93,10 @@ impl KvCacheDeviceOps for LiveKvCacheOps<'_> {
         let elems: i64 = shape.iter().product();
         let bytes = usize::try_from(elems).unwrap_or(0) * dtype.size_bytes();
         if bytes == 0 {
-            // The C++ allocator's own convention, and what `empty()` tests.
             return std::ptr::null_mut();
         }
         let Ok(buf) = self.alloc.alloc(bytes) else {
-            // The C++ returns null on failure and `materialize` checks it,
-            // so exhaustion stays a refusal rather than a panic.
+            // Null on failure; `materialize` checks it, so exhaustion refuses.
             return std::ptr::null_mut();
         };
         let p = buf.as_ptr();
@@ -159,9 +107,8 @@ impl KvCacheDeviceOps for LiveKvCacheOps<'_> {
     fn escape_arena(&mut self) {}
     fn restore_arena(&mut self) {}
 
-    // The seam's method is safe by design — the recorders that share the
-    // trait never touch the pointers, and the cache passes back only planes
-    // its own `alloc_tensor` produced.
+    // Safe by design: nothing dereferences these pointers here, and the cache
+    // passes back only planes its own `alloc_tensor` produced.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn envelope_seed(
         &mut self,
@@ -182,8 +129,7 @@ impl KvCacheDeviceOps for LiveKvCacheOps<'_> {
     }
 
     fn stream_synchronize(&mut self) {
-        // `CUDA_CHECK` in the C++ — a seed that silently failed would hand
-        // out an envelope tier full of garbage as "empty".
+        // `CUDA_CHECK`: a silent seed failure would hand out garbage as "empty".
         self.stream.synchronize().expect("cudaStreamSynchronize");
     }
 }
@@ -198,17 +144,10 @@ pub trait ElasticPool {
     fn committed_bytes(&self) -> usize;
 }
 
-/// A cache whose pages are all resident.
-///
-/// [`ElasticPool`] has no other implementor: [`Arena`](crate::device::vmm::Arena)
-/// is the driver's elastic allocator and speaks `ensure_committed(bytes)`
-/// rather than `ensure_fraction(used, capacity)`, so nothing yet bridges
-/// the two. Until something does, every cache the driver builds is this
-/// one, and a caller still has to name a type parameter — so it is named
-/// here rather than re-declared at each call site.
-///
-/// `materialize` leaves `elastic` as `None` regardless, so this affects
-/// only what the type reads as, not what it does.
+/// A cache whose pages are all resident. The only [`ElasticPool`] so far:
+/// [`Arena`](crate::device::vmm::Arena) speaks `ensure_committed(bytes)`, not
+/// `ensure_fraction`, so nothing bridges them and `materialize` leaves `elastic`
+/// `None` regardless.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AllResident;
 
@@ -251,8 +190,6 @@ pub struct KvCache<E> {
 }
 
 /// A buffer the swap path copies, with its per-page stride.
-///
-/// Port of `KvCache::PageBuffer`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageBuffer {
     /// The tier's device base.
@@ -262,10 +199,9 @@ pub struct PageBuffer {
 }
 
 impl<E: ElasticPool> KvCache<E> {
-    /// Allocate every tensor the layout plans, in the C++'s order: per slot
-    /// the storage pair, the scale pair, the mirror pair; then the envelope
-    /// tier behind the arena escape, seeding each owning slot as its pair
-    /// lands, then one stream sync for all of them.
+    /// Allocate every planned tensor in the C++'s order: per slot the storage,
+    /// scale and mirror pairs; then the envelope tier behind the arena escape,
+    /// seeding each owning slot as its pair lands, then one stream sync.
     pub fn materialize<O: KvCacheDeviceOps>(layout: KvCacheLayout, ops: &mut O) -> Result<Self> {
         let n = layout.slots().len();
         let mut k = Tier::with_capacity(n);
@@ -332,10 +268,8 @@ impl<E: ElasticPool> KvCache<E> {
         usize::try_from(self.layout.resolve(layer)).unwrap_or(usize::MAX)
     }
 
-    /// What a kernel is handed for `layer` — the C++ `layer_view`, field
-    /// for field, including that the dims are the SOURCE's (an aliased
-    /// layer reports what its physical pages look like, not its own
-    /// table entries).
+    /// What a kernel is handed for `layer` (the C++ `layer_view`). Dims are the
+    /// source's: an aliased layer reports its physical pages, not its own.
     #[must_use]
     pub fn layer_view(&self, layer: i32) -> crate::bind::abi::KvCacheLayerView {
         let src = self.layout.resolve(layer);
@@ -405,8 +339,7 @@ impl<E: ElasticPool> KvCache<E> {
         self.v_scale.at(self.src(layer))
     }
 
-    /// The BF16 pages attention reads — the storage itself when native,
-    /// the dequantisation mirror otherwise.
+    /// The BF16 pages attention reads: storage when native, else the dequant mirror.
     #[must_use]
     pub fn k_for_attention(&self, layer: i32) -> *mut c_void {
         let s = self.src(layer);
@@ -468,9 +401,8 @@ impl<E: ElasticPool> KvCache<E> {
         self.elastic = allocator;
     }
 
-    /// Commit backing for `pages` of the pool — clamped to `[0, num_pages]`
-    /// and forwarded as a fraction. A cache with no pool, or no pages, does
-    /// nothing.
+    /// Commit backing for `pages`, clamped to `[0, num_pages]` and forwarded as
+    /// a fraction. No pool or no pages does nothing.
     pub fn ensure_pages(&mut self, pages: i32) {
         let total = self.layout.num_pages();
         if total <= 0 {
@@ -508,10 +440,9 @@ impl<E: ElasticPool> KvCache<E> {
         self.layout.envelopes_enabled()
     }
 
-    /// The C++ `enable_envelopes`: an early `Ok` when they are already on,
-    /// a refusal otherwise — they cannot be added late, because pages
-    /// written before they existed would keep the empty seed and score
-    /// `+inf` forever.
+    /// `enable_envelopes`: `Ok` when already on, else a refusal — they cannot be
+    /// added late, since pages written before they existed keep the empty seed
+    /// and score `+inf` forever.
     pub fn enable_envelopes(&self) -> Result<()> {
         if self.layout.envelopes_enabled() {
             return Ok(());
@@ -532,11 +463,9 @@ impl<E: ElasticPool> KvCache<E> {
     }
 }
 
-/// The store scheme, respelled as the one-byte launch mirror.
-///
-/// Two enums with the same discriminants rather than one shared type,
-/// because they answer to different masters: the launch one must match the
-/// C++ header byte-for-byte, the store one must match the format catalogue.
+/// The store scheme, respelled as the one-byte launch mirror. Two enums with the
+/// same discriminants: the launch one matches the C++ header byte-for-byte, the
+/// store one the format catalogue.
 fn scheme_for_launch(f: &KvCacheFormat) -> crate::bind::abi::KvCacheScheme {
     use crate::layout::KvCacheScheme as S;
     match f.scheme() {

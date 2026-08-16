@@ -39,7 +39,7 @@
 //! of those it catches by finishing at all.
 //!
 //! ```text
-//! PIE_KERNELS_VULKAN_SPV_DIR=<abs>/out/spv PIE_VULKAN_ARTIFACT=/tmp/q4full.zt \
+//! PIE_VULKAN_ARTIFACT=/tmp/q4full.zt \
 //!   cargo test -p pie-gpu-tests --features driver-vulkan \
 //!   --test vulkan_sampled_completion -- --ignored --nocapture
 //! ```

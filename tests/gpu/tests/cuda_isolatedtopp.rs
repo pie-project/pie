@@ -8,7 +8,7 @@
 //! token-identity vs the slot-surface baseline captured off `70e8082d`:
 //!
 //!   PIE_FIXED_SAMPLING_SEED=12345 PIE_SAMPLING_IR_TRACE=1 \
-//!     cargo test -p pie-gpu-tests --features driver-cuda --test cuda_isolatedtopp \
+//!     cargo test -p pie-gpu-tests --features driver-cuda-13 --test cuda_isolatedtopp \
 //!     -- --ignored --nocapture --test-threads=1
 //!
 //! Asserts 4 tokens (no crash / fallback). Token-identity vs the baseline is a

@@ -9,10 +9,10 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use kernels::KernelSig;
 use kernels::routine::Refusal;
 
-use crate::routine::{Bind, Buf, BufMut, Ctx, Env, Fire, I32s, Routine, U8s, U32s, Usize};
+use crate::routine::{Reckoned, Say, Times, keys, Ask, Bind, Block, Buf, BufMut, Ctx, Env, F32sMut, Fire, Held, I32s, Null, Param, ParamF32, ParamOr, ParamOrLit, Routine, U32s, U8s, Usize};
+use crate::routine::{InSlot, OutSlot, Weight};
 
 /// The entrypoints this family's crossed routines spell, now that their
 /// rows are gone. See [`crate::RETIRED`].
@@ -31,6 +31,15 @@ pub static ENTRYPOINTS: &[&str] = &[
     "sdpa_paged_decode_bfloat16_d_128_p32",
     "sdpa_paged_decode_bfloat16_d_64_p32_sg8",
     "sdpa_paged_decode_sink_bfloat16_d_64",
+    "sdpa_paged_decode_split_bfloat16_d_64",
+    "sdpa_paged_decode_split_bfloat16_d_128",
+    "sdpa_paged_decode_split_bfloat16_d_256",
+    "sdpa_paged_decode_split_bfloat16_d_512",
+    "sdpa_paged_decode_combine_bfloat16_d_64",
+    "sdpa_paged_decode_combine_bfloat16_d_128",
+    "sdpa_paged_decode_combine_bfloat16_d_256",
+    "sdpa_paged_decode_combine_bfloat16_d_512",
+    "sdpa_paged_decode_combine_sink_bfloat16_d_64",
     "sdpa_paged_mma_bfloat16_d_64",
     "sdpa_paged_mma_sink_bfloat16_d_64",
     "sdpa_paged_tiled_bfloat16_d_64",
@@ -46,8 +55,6 @@ pub static ENTRYPOINTS: &[&str] = &[
     "sdpa_vector_decode_swa_bfloat16_d_256",
     "sdpa_vector_decode_swa_bfloat16_d_512",
 ];
-
-pub static KERNELS: &[KernelSig] = &[];
 
 /// The four head widths this tree compiles attention for.
 ///
@@ -84,6 +91,28 @@ const PAGED_DECODE: [&str; 4] = [
     "sdpa_paged_decode_bfloat16_d_128",
     "sdpa_paged_decode_bfloat16_d_256",
     "sdpa_paged_decode_bfloat16_d_512",
+];
+
+/// The split pass of the flash decode, by head width.
+///
+/// One table and not two: the sink and the sinkless forms share these
+/// modules, because a sink joins the softmax ONCE over the whole key range
+/// and the split pass sees only a slice of it. See [`PAGED_COMBINE`].
+const PAGED_SPLIT: [&str; 4] = [
+    "sdpa_paged_decode_split_bfloat16_d_64",
+    "sdpa_paged_decode_split_bfloat16_d_128",
+    "sdpa_paged_decode_split_bfloat16_d_256",
+    "sdpa_paged_decode_split_bfloat16_d_512",
+];
+
+/// The fold pass, by head width. The sink form is a fifth module at 64 and is
+/// named where it is used, the same way `sdpa_paged_decode_sink` names its
+/// one point.
+const PAGED_COMBINE: [&str; 4] = [
+    "sdpa_paged_decode_combine_bfloat16_d_64",
+    "sdpa_paged_decode_combine_bfloat16_d_128",
+    "sdpa_paged_decode_combine_bfloat16_d_256",
+    "sdpa_paged_decode_combine_bfloat16_d_512",
 ];
 
 /// `sdpa_paged_tiled`, by head width. All four are real and all four are
@@ -168,6 +197,101 @@ fn vector_grid(head_dim: i32, q_heads: i32, rows: i32) -> Result<[u32; 3], Refus
     Ok([x, rows.unsigned_abs(), 1])
 }
 
+/// How many ways a decode splits its key range, given the history and the
+/// shape.
+///
+/// # Why there is a rule at all
+///
+/// A decode's grid is `(query head, row)` and nothing else, so qwen3-0.6b at
+/// one row is SIXTEEN workgroups on a 128-SM card. `tests/sdpa_bench.rs`
+/// priced what that costs: at a 384-key history one row and thirty-two rows
+/// both take about 68 us -- thirty-two times the work for twelve percent more
+/// time -- so the kernel was never bandwidth-bound, it was waiting, and the
+/// only axis left to make workgroups out of is the key range.
+///
+/// Splitting it `S` ways multiplies the grid by `S` and costs a second,
+/// cheap dispatch that folds the `S` partials. Measured, one row of
+/// qwen3-0.6b, microseconds for the WHOLE attention (both dispatches):
+///
+/// | history | S=1 | 2 | 4 | 8 | 16 | 32 | 64 |
+/// |---|---|---|---|---|---|---|---|
+/// | 24 | 6.14 | 5.79 | 5.09 | **4.80** | 5.12 | 6.88 | 9.28 |
+/// | 128 | 24.13 | 14.34 | 9.22 | 6.75 | **6.18** | 7.01 | 9.66 |
+/// | 384 | 67.58 | 36.51 | 20.19 | 12.29 | 9.09 | **8.42** | 10.78 |
+/// | 1024 | 178.59 | 91.81 | 48.26 | 26.27 | 16.32 | **12.35** | 13.31 |
+///
+/// Three things are read off that table and they are the whole rule:
+///
+///   - the best `S` GROWS with the history, because what a split has to hide
+///     is its own slice's latency and a slice too short has nothing to hide;
+///   - it stops growing at 32, because past that the fold's `S` reads per
+///     output dimension start costing more than the split saves;
+///   - and it must fall with the row count, because rows multiply the grid
+///     too: at 32 rows the single-pass kernel is already 4,096-workgroup
+///     work and `S = 4` (55.1 us against 76.0) is as much as it wants.
+///
+/// So: aim for about 2,048 workgroups, allow one split per 8 keys of
+/// history, cap at 32, and round DOWN to a power of two.
+///
+/// # Why the history is bucketed by the caller
+///
+/// `S` decides a grid, a grid is recorded into a command buffer, and
+/// `driver-vulkan::replay` re-submits a recorded decode across tokens. A
+/// rule reading the exact history would change the grid every token and the
+/// replay would have to notice every time. The caller therefore hands a
+/// history ROUNDED UP TO A POWER OF TWO, which for the life of a sequence
+/// changes a handful of times, and folds that same bucketed number into the
+/// replay key. See `driver-vulkan::replay::Key::state`.
+///
+/// Returns 1 when the split is not worth its fold, and the caller then fires
+/// the single-pass [`sdpa_paged_decode`] path unchanged.
+#[must_use]
+pub fn decode_splits(history_bucket: i32, q_heads: i32, rows: i32) -> i32 {
+    /// Workgroups the split pass aims at, across every head and row.
+    const TARGET_GROUPS: i64 = 2048;
+    /// Keys a split must have to be worth being a split.
+    const KEYS_PER_SPLIT: i64 = 8;
+    /// Past this the fold costs more than the split saves.
+    const MOST: i64 = 32;
+
+    if history_bucket <= 0 || q_heads <= 0 || rows <= 0 {
+        return 1;
+    }
+    // The A/B switch the numbers in this doc-comment were taken with, read
+    // ONCE: this is called per layer per step, and `var_os` allocates.
+    // Setting it puts every decode back on the single-pass path, which is how
+    // "4.07 ms/token" and "1.66 ms/token" were measured against each other on
+    // one machine on one afternoon rather than across two commits.
+    static UNSPLIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *UNSPLIT.get_or_init(|| std::env::var_os("PIE_NO_FLASH_DECODE").is_some()) {
+        return 1;
+    }
+    let base = i64::from(q_heads) * i64::from(rows);
+    let want = (TARGET_GROUPS / base)
+        .min(i64::from(history_bucket) / KEYS_PER_SPLIT)
+        .min(MOST);
+    if want < 2 {
+        return 1;
+    }
+    // Down to a power of two, which is what keeps the breakpoints few: `S`
+    // then changes only where the bucketed history does.
+    1 << (63 - want.leading_zeros() as i64).min(30)
+}
+
+/// The split pass's shape: [`vector_grid`] with a third axis of splits.
+///
+/// # Errors
+///
+/// Whatever [`vector_grid`] refuses, and [`Refusal::Empty`] for a split count
+/// that is not positive.
+fn split_grid(head_dim: i32, q_heads: i32, rows: i32, splits: i32) -> Result<[u32; 3], Refusal> {
+    if splits <= 0 {
+        return Err(Refusal::Empty { what: "splits" });
+    }
+    let [x, y, _] = vector_grid(head_dim, q_heads, rows)?;
+    Ok([x, y, splits.unsigned_abs()])
+}
+
 /// The tiled shape: one 32 x 32 workgroup per (query head, block of 32 rows).
 ///
 /// The row count is rounded UP to whole tiles, which is what the `n_rows`
@@ -245,13 +369,13 @@ fn head_grid(head_dim: i32, heads: i32, depth: i32) -> Result<[u32; 3], Refusal>
 /// [`Refusal::Empty`] for an empty row or an empty rectangle.
 pub fn split_qkv_bf16(
     ctx: &Ctx<'_>,
-    packed: Buf,
-    q: BufMut,
-    k: BufMut,
-    v: BufMut,
-    params: Buf,
-    packed_width: Env<i32>,
-    rows: Env<i32>,
+    packed: InSlot<0, Buf>,
+    q: OutSlot<0, BufMut>,
+    k: OutSlot<1, BufMut>,
+    v: OutSlot<2, BufMut>,
+    params: Block<Buf>,
+    packed_width: Ask<keys::InWidth, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -279,11 +403,11 @@ pub fn split_qkv_bf16(
 /// [`Refusal::Empty`] for an empty rectangle.
 pub fn gate(
     ctx: &Ctx<'_>,
-    attn: BufMut,
-    gate: Buf,
-    row_stride: i32,
-    width: Env<i32>,
-    rows: Env<i32>,
+    attn: OutSlot<0, BufMut>,
+    gate: InSlot<1, Buf>,
+    row_stride: Param<0, i32>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -307,19 +431,19 @@ pub fn gate(
 /// than a token depth.
 pub fn q_gate_split(
     ctx: &Ctx<'_>,
-    qg: Buf,
-    q_out: BufMut,
-    gate_out: BufMut,
-    head_dim: i32,
-    qg_row_stride: i32,
-    out_row_stride: i32,
-    q_heads: Env<i32>,
-    rows: Env<i32>,
+    qg: InSlot<0, Buf>,
+    q_out: OutSlot<0, BufMut>,
+    gate_out: OutSlot<1, BufMut>,
+    head_dim: ParamOr<0, keys::HeadDim, i32>,
+    qg_row_stride: Param<1, i32>,
+    out_row_stride: Param<2, i32>,
+    q_heads: Ask<keys::NumQHeads, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: "q_gate_split_bfloat16",
-            lanes: head_grid(head_dim, *q_heads, *rows)?,
+            lanes: head_grid(*head_dim, *q_heads, *rows)?,
         },
         &[
             qg.v(),
@@ -350,20 +474,20 @@ pub fn q_gate_split(
 /// See [`head_grid`].
 pub fn kv_append(
     ctx: &Ctx<'_>,
-    k_new: Buf,
-    v_new: Buf,
-    k_cache: BufMut,
-    v_cache: BufMut,
-    pos: I32s,
-    head_dim: i32,
-    k_head_stride: Usize,
-    k_seq_stride: Usize,
-    heads: Env<i32>,
+    k_new: InSlot<0, Buf>,
+    v_new: InSlot<1, Buf>,
+    k_cache: Held<keys::KvKeys, BufMut>,
+    v_cache: Held<keys::KvValues, BufMut>,
+    pos: Held<keys::Positions, I32s>,
+    head_dim: ParamOr<0, keys::HeadDim, i32>,
+    k_head_stride: Held<keys::KvHeadStride, Usize>,
+    k_seq_stride: Held<keys::KvSeqStride, Usize>,
+    heads: Ask<keys::NumKvHeads, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: "kv_append_bfloat16",
-            lanes: head_grid(head_dim, *heads, 1)?,
+            lanes: head_grid(*head_dim, *heads, 1)?,
         },
         &[
             k_new.v(),
@@ -408,28 +532,28 @@ pub fn kv_append(
 /// See [`head_grid`].
 pub fn kv_append_paged(
     ctx: &Ctx<'_>,
-    k_new: Buf,
-    v_new: Buf,
-    k_pages: BufMut,
-    v_pages: BufMut,
-    _ring_4: Buf,
-    head_dim: i32,
-    _ring_6: Buf,
-    _ring_7: Buf,
-    _ring_8: Buf,
-    _ring_9: Buf,
-    page_size: i32,
-    _ring_11: Buf,
-    n_kv_heads: i32,
-    w_page: U32s,
-    w_off: U32s,
-    _ring_15: Buf,
-    tokens: Env<i32>,
+    k_new: InSlot<0, Buf>,
+    v_new: InSlot<1, Buf>,
+    k_pages: Ask<keys::KvKeys, BufMut>,
+    v_pages: Ask<keys::KvValues, BufMut>,
+    _ring_4: Null<Env<Buf>>,
+    head_dim: ParamOr<0, keys::HeadDim, i32>,
+    _ring_6: Null<Env<Buf>>,
+    _ring_7: Null<Env<Buf>>,
+    _ring_8: Null<Env<Buf>>,
+    _ring_9: Null<Env<Buf>>,
+    page_size: Held<keys::KvPageSize, i32>,
+    _ring_11: Null<Env<Buf>>,
+    n_kv_heads: ParamOr<1, keys::NumKvHeads, i32>,
+    w_page: Ask<keys::KvWritePage, U32s>,
+    w_off: Ask<keys::KvWriteOffset, U32s>,
+    _ring_15: Null<Env<Buf>>,
+    tokens: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: "kv_append_paged_bfloat16",
-            lanes: head_grid(head_dim, n_kv_heads, *tokens)?,
+            lanes: head_grid(*head_dim, *n_kv_heads, *tokens)?,
         },
         &[
             k_new.v(),
@@ -455,15 +579,15 @@ pub fn kv_append_paged(
 /// [`Refusal::Empty`] for an empty readout.
 pub fn logit_softcap(
     ctx: &Ctx<'_>,
-    logits: Buf,
-    out: BufMut,
-    params: Buf,
-    n: Env<i32>,
+    logits: InSlot<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    n: Reckoned<Times<Say<keys::Width>, Say<keys::Rows>>, Env<i32>>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: "logit_softcap_bfloat16",
-            lanes: crate::routine::elementwise(*n, 1)?,
+            lanes: crate::routine::elementwise(**n, 1)?,
         },
         &[logits.v(), out.v(), params.v()],
     )
@@ -487,6 +611,123 @@ pub fn logit_softcap(
 /// [`vector_grid`] refuses.
 pub fn sdpa_paged_decode(
     ctx: &Ctx<'_>,
+    queries: InSlot<0, Buf>,
+    k_pages: Ask<keys::KvKeys, Buf>,
+    v_pages: Ask<keys::KvValues, Buf>,
+    out: OutSlot<0, BufMut>,
+    gqa_factor: Param<0, i32>,
+    position_ids: Ask<keys::Positions, I32s>,
+    req_of_token: Ask<keys::RequestOfToken, I32s>,
+    kv_page_indices: Ask<keys::KvPageIndices, U32s>,
+    kv_page_indptr: Ask<keys::KvPageIndptr, U32s>,
+    page_size: Held<keys::KvPageSize, i32>,
+    n_kv_heads: Param<1, i32>,
+    scale: ParamF32<2>,
+    attention_mask: Ask<keys::AttentionMask, U8s>,
+    attention_mask_stride: Ask<keys::AttentionMaskStride, u32>,
+    attention_mask_enabled: Ask<keys::AttentionMaskEnabled, U8s>,
+    window: ParamOrLit<4, -1, i32>,
+    _sinks: Null<Buf>,
+    partials: Ask<keys::AttnPartials, F32sMut>,
+    head_dim: Ask<keys::HeadDim, i32>,
+    q_heads: Ask<keys::NumQHeads, i32>,
+    rows: Ask<keys::Rows, i32>,
+    splits: Ask<keys::AttnSplits, i32>,
+) -> Result<(), Refusal> {
+    let at = head_point(*head_dim, &PAGED_DIMS)?;
+    if *splits <= 1 {
+        return ctx.dispatch(
+            Fire {
+                entrypoint: PAGED_DECODE[at],
+                lanes: vector_grid(*head_dim, *q_heads, *rows)?,
+            },
+            &[
+                queries.v(),
+                k_pages.v(),
+                v_pages.v(),
+                out.v(),
+                gqa_factor.v(),
+                position_ids.v(),
+                req_of_token.v(),
+                kv_page_indices.v(),
+                kv_page_indptr.v(),
+                page_size.v(),
+                n_kv_heads.v(),
+                scale.v(),
+                attention_mask.v(),
+                attention_mask_stride.v(),
+                attention_mask_enabled.v(),
+                window.v(),
+            ],
+        );
+    }
+    flash_decode(
+        ctx,
+        Flash {
+            split: PAGED_SPLIT[at],
+            combine: PAGED_COMBINE[at],
+            sinks: None,
+        },
+        *queries,
+        *k_pages,
+        *v_pages,
+        *out,
+        *gqa_factor,
+        *position_ids,
+        *req_of_token,
+        *kv_page_indices,
+        *kv_page_indptr,
+        *page_size,
+        *n_kv_heads,
+        *scale,
+        *attention_mask,
+        *attention_mask_stride,
+        *attention_mask_enabled,
+        *window,
+        *partials,
+        *head_dim,
+        *q_heads,
+        *rows,
+        *splits,
+    )
+}
+
+/// Which two modules a flash decode fires, and whether the fold merges a
+/// sink.
+///
+/// A struct because [`flash_decode`] would otherwise take twenty-two
+/// positional arguments of which three are strings, and the three that say
+/// WHICH ARITHMETIC belong together.
+struct Flash<'a> {
+    /// The pass that walks a slice of the keys.
+    split: &'a str,
+    /// The pass that folds the slices.
+    combine: &'a str,
+    /// The per-head sink logit, and the fold module that reads it. `None` is
+    /// the ordinary decode.
+    sinks: Option<(Buf, &'a str)>,
+}
+
+/// The two dispatches of a flash decode.
+///
+/// Shared by the sink and sinkless forms, which differ in the fold module and
+/// in one binding -- the split pass is byte-identical between them, because
+/// the sink is merged once in the fold.
+///
+/// # The split pass binds no output
+///
+/// `sdpa_paged.slang` declares `out_` at binding 3 for every decode variant,
+/// and the split body never writes it, so slangc drops it and the module's
+/// descriptor set carries a HOLE there. The argument list below therefore
+/// goes `queries, k, v, positions, ...` with no `out` -- which is what
+/// `Declared::holes` and `encode`'s arity check are counting.
+///
+/// # Errors
+///
+/// Whatever [`split_grid`] or [`vector_grid`] refuses.
+fn flash_decode(
+    ctx: &Ctx<'_>,
+    which: Flash<'_>,
     queries: Buf,
     k_pages: Buf,
     v_pages: Buf,
@@ -503,21 +744,25 @@ pub fn sdpa_paged_decode(
     attention_mask_stride: u32,
     attention_mask_enabled: U8s,
     window: i32,
-    _sinks: Buf,
-    head_dim: Env<i32>,
-    q_heads: Env<i32>,
-    rows: Env<i32>,
+    partials: F32sMut,
+    head_dim: i32,
+    q_heads: i32,
+    rows: i32,
+    splits: i32,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
-            entrypoint: PAGED_DECODE[head_point(*head_dim, &PAGED_DIMS)?],
-            lanes: vector_grid(*head_dim, *q_heads, *rows)?,
+            entrypoint: which.split,
+            lanes: split_grid(head_dim, q_heads, rows, splits)?,
         },
+        // In the order the SIGNATURE takes them, minus the two the split
+        // pass does not touch. `encode` splits buffers from scalars on its
+        // own; what has to hold here is that neither list is reordered
+        // relative to the signature -- see `tests/routines.rs`.
         &[
             queries.v(),
             k_pages.v(),
             v_pages.v(),
-            out.v(),
             gqa_factor.v(),
             position_ids.v(),
             req_of_token.v(),
@@ -530,7 +775,32 @@ pub fn sdpa_paged_decode(
             attention_mask_stride.v(),
             attention_mask_enabled.v(),
             window.v(),
+            partials.v(),
         ],
+    )?;
+    // The fold reads what the split wrote, which the driver turns into one
+    // barrier between the two: they share `partials` and the first writes it.
+    // `partials` is handed over WRITABLE here although the fold only reads
+    // it. The flag is not documentation: `driver-vulkan` decides its barriers
+    // from it, and a conservative "writes" between two dispatches that share
+    // the buffer costs one execution barrier it was going to need anyway --
+    // where narrowing it to a read and getting the direction wrong is a race.
+    let mut args = vec![out.v()];
+    let entrypoint = match which.sinks {
+        Some((sinks, module)) => {
+            args.push(sinks.v());
+            module
+        }
+        None => which.combine,
+    };
+    args.push(partials.v());
+    args.push(splits.v());
+    ctx.dispatch(
+        Fire {
+            entrypoint,
+            lanes: vector_grid(head_dim, q_heads, rows)?,
+        },
+        &args,
     )
 }
 
@@ -547,28 +817,61 @@ pub fn sdpa_paged_decode(
 /// [`vector_grid`] refuses.
 pub fn sdpa_paged_decode_sink(
     ctx: &Ctx<'_>,
-    queries: Buf,
-    k_pages: Buf,
-    v_pages: Buf,
-    out: BufMut,
-    gqa_factor: i32,
-    position_ids: I32s,
-    req_of_token: I32s,
-    kv_page_indices: U32s,
-    kv_page_indptr: U32s,
-    page_size: i32,
-    n_kv_heads: i32,
-    scale: f32,
-    attention_mask: U8s,
-    attention_mask_stride: u32,
-    attention_mask_enabled: U8s,
-    window: i32,
-    sinks: Buf,
-    head_dim: Env<i32>,
-    q_heads: Env<i32>,
-    rows: Env<i32>,
+    queries: InSlot<0, Buf>,
+    k_pages: Ask<keys::KvKeys, Buf>,
+    v_pages: Ask<keys::KvValues, Buf>,
+    out: OutSlot<0, BufMut>,
+    gqa_factor: Param<0, i32>,
+    position_ids: Ask<keys::Positions, I32s>,
+    req_of_token: Ask<keys::RequestOfToken, I32s>,
+    kv_page_indices: Ask<keys::KvPageIndices, U32s>,
+    kv_page_indptr: Ask<keys::KvPageIndptr, U32s>,
+    page_size: Held<keys::KvPageSize, i32>,
+    n_kv_heads: Param<1, i32>,
+    scale: ParamF32<2>,
+    attention_mask: Ask<keys::AttentionMask, U8s>,
+    attention_mask_stride: Ask<keys::AttentionMaskStride, u32>,
+    attention_mask_enabled: Ask<keys::AttentionMaskEnabled, U8s>,
+    window: ParamOrLit<4, -1, i32>,
+    sinks: Weight<0, Buf>,
+    partials: Ask<keys::AttnPartials, F32sMut>,
+    head_dim: Ask<keys::HeadDim, i32>,
+    q_heads: Ask<keys::NumQHeads, i32>,
+    rows: Ask<keys::Rows, i32>,
+    splits: Ask<keys::AttnSplits, i32>,
 ) -> Result<(), Refusal> {
     head_point(*head_dim, &[64])?;
+    if *splits > 1 {
+        return flash_decode(
+            ctx,
+            Flash {
+                split: PAGED_SPLIT[0],
+                combine: PAGED_COMBINE[0],
+                sinks: Some((*sinks, "sdpa_paged_decode_combine_sink_bfloat16_d_64")),
+            },
+            *queries,
+            *k_pages,
+            *v_pages,
+            *out,
+            *gqa_factor,
+            *position_ids,
+            *req_of_token,
+            *kv_page_indices,
+            *kv_page_indptr,
+            *page_size,
+            *n_kv_heads,
+            *scale,
+            *attention_mask,
+            *attention_mask_stride,
+            *attention_mask_enabled,
+            *window,
+            *partials,
+            *head_dim,
+            *q_heads,
+            *rows,
+            *splits,
+        );
+    }
     ctx.dispatch(
         Fire {
             entrypoint: "sdpa_paged_decode_sink_bfloat16_d_64",
@@ -612,31 +915,31 @@ pub fn sdpa_paged_decode_sink(
 /// [`tiled_grid`] refuses.
 pub fn sdpa_paged_tiled(
     ctx: &Ctx<'_>,
-    queries: Buf,
-    k_pages: Buf,
-    v_pages: Buf,
-    out: BufMut,
-    gqa_factor: i32,
-    position_ids: I32s,
-    req_of_token: I32s,
-    kv_page_indices: U32s,
-    kv_page_indptr: U32s,
-    page_size: i32,
-    n_kv_heads: i32,
-    scale: f32,
-    attention_mask: U8s,
-    attention_mask_stride: u32,
-    attention_mask_enabled: U8s,
-    window: i32,
-    _sinks: Buf,
-    n_rows: i32,
-    head_dim: Env<i32>,
-    q_heads: Env<i32>,
+    queries: InSlot<0, Buf>,
+    k_pages: Ask<keys::KvKeys, Buf>,
+    v_pages: Ask<keys::KvValues, Buf>,
+    out: OutSlot<0, BufMut>,
+    gqa_factor: Param<0, i32>,
+    position_ids: Ask<keys::Positions, I32s>,
+    req_of_token: Ask<keys::RequestOfToken, I32s>,
+    kv_page_indices: Ask<keys::KvPageIndices, U32s>,
+    kv_page_indptr: Ask<keys::KvPageIndptr, U32s>,
+    page_size: Held<keys::KvPageSize, i32>,
+    n_kv_heads: Param<1, i32>,
+    scale: ParamF32<2>,
+    attention_mask: Ask<keys::AttentionMask, U8s>,
+    attention_mask_stride: Ask<keys::AttentionMaskStride, u32>,
+    attention_mask_enabled: Ask<keys::AttentionMaskEnabled, U8s>,
+    window: ParamOrLit<4, -1, i32>,
+    _sinks: Null<Env<Buf>>,
+    n_rows: Ask<keys::Rows, i32>,
+    head_dim: Ask<keys::HeadDim, i32>,
+    q_heads: Ask<keys::NumQHeads, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: PAGED_TILED[head_point(*head_dim, &PAGED_DIMS)?],
-            lanes: tiled_grid(*q_heads, n_rows)?,
+            lanes: tiled_grid(*q_heads, *n_rows)?,
         },
         &[
             queries.v(),
@@ -668,32 +971,32 @@ pub fn sdpa_paged_tiled(
 /// refuses.
 pub fn sdpa_paged_tiled_sink(
     ctx: &Ctx<'_>,
-    queries: Buf,
-    k_pages: Buf,
-    v_pages: Buf,
-    out: BufMut,
-    gqa_factor: i32,
-    position_ids: I32s,
-    req_of_token: I32s,
-    kv_page_indices: U32s,
-    kv_page_indptr: U32s,
-    page_size: i32,
-    n_kv_heads: i32,
-    scale: f32,
-    attention_mask: U8s,
-    attention_mask_stride: u32,
-    attention_mask_enabled: U8s,
-    window: i32,
-    sinks: Buf,
-    n_rows: i32,
-    head_dim: Env<i32>,
-    q_heads: Env<i32>,
+    queries: InSlot<0, Buf>,
+    k_pages: Ask<keys::KvKeys, Buf>,
+    v_pages: Ask<keys::KvValues, Buf>,
+    out: OutSlot<0, BufMut>,
+    gqa_factor: Param<0, i32>,
+    position_ids: Ask<keys::Positions, I32s>,
+    req_of_token: Ask<keys::RequestOfToken, I32s>,
+    kv_page_indices: Ask<keys::KvPageIndices, U32s>,
+    kv_page_indptr: Ask<keys::KvPageIndptr, U32s>,
+    page_size: Held<keys::KvPageSize, i32>,
+    n_kv_heads: Param<1, i32>,
+    scale: ParamF32<2>,
+    attention_mask: Ask<keys::AttentionMask, U8s>,
+    attention_mask_stride: Ask<keys::AttentionMaskStride, u32>,
+    attention_mask_enabled: Ask<keys::AttentionMaskEnabled, U8s>,
+    window: ParamOrLit<4, -1, i32>,
+    sinks: Weight<0, Buf>,
+    n_rows: Ask<keys::Rows, i32>,
+    head_dim: Ask<keys::HeadDim, i32>,
+    q_heads: Ask<keys::NumQHeads, i32>,
 ) -> Result<(), Refusal> {
     head_point(*head_dim, &[64])?;
     ctx.dispatch(
         Fire {
             entrypoint: "sdpa_paged_tiled_sink_bfloat16_d_64",
-            lanes: tiled_grid(*q_heads, n_rows)?,
+            lanes: tiled_grid(*q_heads, *n_rows)?,
         },
         &[
             queries.v(),
@@ -732,34 +1035,34 @@ pub fn sdpa_paged_tiled_sink(
 /// [`tiled_grid`] refuses.
 pub fn sdpa_paged_tiled_strided(
     ctx: &Ctx<'_>,
-    queries: Buf,
-    k_pages: Buf,
-    v_pages: Buf,
-    out: BufMut,
-    gqa_factor: i32,
-    position_ids: I32s,
-    req_of_token: I32s,
-    kv_page_indices: U32s,
-    kv_page_indptr: U32s,
-    page_size: i32,
-    n_kv_heads: i32,
-    scale: f32,
-    attention_mask: U8s,
-    attention_mask_stride: u32,
-    attention_mask_enabled: U8s,
-    window: i32,
-    _sinks: Buf,
-    n_rows: i32,
-    q_row_pitch: i32,
-    o_row_pitch: i32,
-    head_dim: Env<i32>,
-    q_heads: Env<i32>,
+    queries: InSlot<0, Buf>,
+    k_pages: Ask<keys::KvKeys, Buf>,
+    v_pages: Ask<keys::KvValues, Buf>,
+    out: OutSlot<0, BufMut>,
+    gqa_factor: Param<0, i32>,
+    position_ids: Ask<keys::Positions, I32s>,
+    req_of_token: Ask<keys::RequestOfToken, I32s>,
+    kv_page_indices: Ask<keys::KvPageIndices, U32s>,
+    kv_page_indptr: Ask<keys::KvPageIndptr, U32s>,
+    page_size: Held<keys::KvPageSize, i32>,
+    n_kv_heads: Param<1, i32>,
+    scale: ParamF32<2>,
+    attention_mask: Ask<keys::AttentionMask, U8s>,
+    attention_mask_stride: Ask<keys::AttentionMaskStride, u32>,
+    attention_mask_enabled: Ask<keys::AttentionMaskEnabled, U8s>,
+    window: ParamOrLit<4, -1, i32>,
+    _sinks: Null<Env<Buf>>,
+    n_rows: Ask<keys::Rows, i32>,
+    q_row_pitch: Param<5, i32>,
+    o_row_pitch: Param<6, i32>,
+    head_dim: Ask<keys::HeadDim, i32>,
+    q_heads: Ask<keys::NumQHeads, i32>,
 ) -> Result<(), Refusal> {
     head_point(*head_dim, &[256])?;
     ctx.dispatch(
         Fire {
             entrypoint: "sdpa_paged_tiled_strided_bfloat16_d_256",
-            lanes: tiled_grid(*q_heads, n_rows)?,
+            lanes: tiled_grid(*q_heads, *n_rows)?,
         },
         &[
             queries.v(),
@@ -804,32 +1107,32 @@ pub fn sdpa_paged_tiled_strided(
 /// refuses.
 pub fn sdpa_paged_mma(
     ctx: &Ctx<'_>,
-    queries: Buf,
-    k_pages: Buf,
-    v_pages: Buf,
-    out: BufMut,
-    gqa_factor: i32,
-    position_ids: I32s,
-    req_of_token: I32s,
-    kv_page_indices: U32s,
-    kv_page_indptr: U32s,
-    page_size: i32,
-    n_kv_heads: i32,
-    scale: f32,
-    attention_mask: U8s,
-    attention_mask_stride: u32,
-    attention_mask_enabled: U8s,
-    window: i32,
-    _sinks: Buf,
-    n_rows: i32,
-    head_dim: Env<i32>,
-    q_heads: Env<i32>,
+    queries: InSlot<0, Buf>,
+    k_pages: Ask<keys::KvKeys, Buf>,
+    v_pages: Ask<keys::KvValues, Buf>,
+    out: OutSlot<0, BufMut>,
+    gqa_factor: Param<0, i32>,
+    position_ids: Ask<keys::Positions, I32s>,
+    req_of_token: Ask<keys::RequestOfToken, I32s>,
+    kv_page_indices: Ask<keys::KvPageIndices, U32s>,
+    kv_page_indptr: Ask<keys::KvPageIndptr, U32s>,
+    page_size: Held<keys::KvPageSize, i32>,
+    n_kv_heads: Param<1, i32>,
+    scale: ParamF32<2>,
+    attention_mask: Ask<keys::AttentionMask, U8s>,
+    attention_mask_stride: Ask<keys::AttentionMaskStride, u32>,
+    attention_mask_enabled: Ask<keys::AttentionMaskEnabled, U8s>,
+    window: ParamOrLit<4, -1, i32>,
+    _sinks: Null<Env<Buf>>,
+    n_rows: Ask<keys::Rows, i32>,
+    head_dim: Ask<keys::HeadDim, i32>,
+    q_heads: Ask<keys::NumQHeads, i32>,
 ) -> Result<(), Refusal> {
     head_point(*head_dim, &[64])?;
     ctx.dispatch(
         Fire {
             entrypoint: "sdpa_paged_mma_bfloat16_d_64",
-            lanes: tiled_grid(*q_heads, n_rows)?,
+            lanes: tiled_grid(*q_heads, *n_rows)?,
         },
         &[
             queries.v(),
@@ -861,32 +1164,32 @@ pub fn sdpa_paged_mma(
 /// refuses.
 pub fn sdpa_paged_mma_sink(
     ctx: &Ctx<'_>,
-    queries: Buf,
-    k_pages: Buf,
-    v_pages: Buf,
-    out: BufMut,
-    gqa_factor: i32,
-    position_ids: I32s,
-    req_of_token: I32s,
-    kv_page_indices: U32s,
-    kv_page_indptr: U32s,
-    page_size: i32,
-    n_kv_heads: i32,
-    scale: f32,
-    attention_mask: U8s,
-    attention_mask_stride: u32,
-    attention_mask_enabled: U8s,
-    window: i32,
-    sinks: Buf,
-    n_rows: i32,
-    head_dim: Env<i32>,
-    q_heads: Env<i32>,
+    queries: InSlot<0, Buf>,
+    k_pages: Ask<keys::KvKeys, Buf>,
+    v_pages: Ask<keys::KvValues, Buf>,
+    out: OutSlot<0, BufMut>,
+    gqa_factor: Param<0, i32>,
+    position_ids: Ask<keys::Positions, I32s>,
+    req_of_token: Ask<keys::RequestOfToken, I32s>,
+    kv_page_indices: Ask<keys::KvPageIndices, U32s>,
+    kv_page_indptr: Ask<keys::KvPageIndptr, U32s>,
+    page_size: Held<keys::KvPageSize, i32>,
+    n_kv_heads: Param<1, i32>,
+    scale: ParamF32<2>,
+    attention_mask: Ask<keys::AttentionMask, U8s>,
+    attention_mask_stride: Ask<keys::AttentionMaskStride, u32>,
+    attention_mask_enabled: Ask<keys::AttentionMaskEnabled, U8s>,
+    window: ParamOrLit<4, -1, i32>,
+    sinks: Weight<0, Buf>,
+    n_rows: Ask<keys::Rows, i32>,
+    head_dim: Ask<keys::HeadDim, i32>,
+    q_heads: Ask<keys::NumQHeads, i32>,
 ) -> Result<(), Refusal> {
     head_point(*head_dim, &[64])?;
     ctx.dispatch(
         Fire {
             entrypoint: "sdpa_paged_mma_sink_bfloat16_d_64",
-            lanes: tiled_grid(*q_heads, n_rows)?,
+            lanes: tiled_grid(*q_heads, *n_rows)?,
         },
         &[
             queries.v(),
@@ -924,20 +1227,20 @@ pub fn sdpa_paged_mma_sink(
 /// [`vector_grid`] refuses.
 pub fn sdpa_vector_decode(
     ctx: &Ctx<'_>,
-    queries: Buf,
-    keys: Buf,
-    values: Buf,
-    out: BufMut,
-    gqa_factor: i32,
-    n: i32,
-    k_head_stride: Usize,
-    k_seq_stride: Usize,
-    v_head_stride: Usize,
-    v_seq_stride: Usize,
-    scale: f32,
-    head_dim: Env<i32>,
-    q_heads: Env<i32>,
-    rows: Env<i32>,
+    queries: InSlot<0, Buf>,
+    keys: Held<keys::KvKeys, Buf>,
+    values: Held<keys::KvValues, Buf>,
+    out: OutSlot<0, BufMut>,
+    gqa_factor: Param<0, i32>,
+    n: Param<1, i32>,
+    k_head_stride: Held<keys::KvHeadStride, Usize>,
+    k_seq_stride: Held<keys::KvSeqStride, Usize>,
+    v_head_stride: Held<keys::KvHeadStride, Usize>,
+    v_seq_stride: Held<keys::KvSeqStride, Usize>,
+    scale: ParamF32<2>,
+    head_dim: Ask<keys::HeadDim, i32>,
+    q_heads: Ask<keys::NumQHeads, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -973,23 +1276,23 @@ pub fn sdpa_vector_decode(
 /// [`vector_grid`] refuses.
 pub fn sdpa_vector_decode_swa(
     ctx: &Ctx<'_>,
-    queries: Buf,
-    keys: Buf,
-    values: Buf,
-    out: BufMut,
-    gqa_factor: i32,
-    n: i32,
-    k_head_stride: Usize,
-    k_seq_stride: Usize,
-    v_head_stride: Usize,
-    v_seq_stride: Usize,
-    scale: f32,
-    window: i32,
-    q_row_stride: i32,
-    o_row_stride: i32,
-    head_dim: Env<i32>,
-    q_heads: Env<i32>,
-    rows: Env<i32>,
+    queries: InSlot<0, Buf>,
+    keys: Held<keys::KvKeys, Buf>,
+    values: Held<keys::KvValues, Buf>,
+    out: OutSlot<0, BufMut>,
+    gqa_factor: Param<0, i32>,
+    n: Param<1, i32>,
+    k_head_stride: Held<keys::KvHeadStride, Usize>,
+    k_seq_stride: Held<keys::KvSeqStride, Usize>,
+    v_head_stride: Held<keys::KvHeadStride, Usize>,
+    v_seq_stride: Held<keys::KvSeqStride, Usize>,
+    scale: ParamF32<2>,
+    window: Param<3, i32>,
+    q_row_stride: Param<4, i32>,
+    o_row_stride: Param<5, i32>,
+    head_dim: Ask<keys::HeadDim, i32>,
+    q_heads: Ask<keys::NumQHeads, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -1030,24 +1333,24 @@ pub fn sdpa_vector_decode_swa(
 /// [`vector_grid`] refuses.
 pub fn sdpa_vector_decode_sink(
     ctx: &Ctx<'_>,
-    queries: Buf,
-    keys: Buf,
-    values: Buf,
-    out: BufMut,
-    sinks: Buf,
-    gqa_factor: i32,
-    n: i32,
-    k_head_stride: Usize,
-    k_seq_stride: Usize,
-    v_head_stride: Usize,
-    v_seq_stride: Usize,
-    scale: f32,
-    window: i32,
-    q_row_stride: i32,
-    o_row_stride: i32,
-    head_dim: Env<i32>,
-    q_heads: Env<i32>,
-    rows: Env<i32>,
+    queries: InSlot<0, Buf>,
+    keys: Held<keys::KvKeys, Buf>,
+    values: Held<keys::KvValues, Buf>,
+    out: OutSlot<0, BufMut>,
+    sinks: Weight<0, Buf>,
+    gqa_factor: Param<0, i32>,
+    n: Param<1, i32>,
+    k_head_stride: Held<keys::KvHeadStride, Usize>,
+    k_seq_stride: Held<keys::KvSeqStride, Usize>,
+    v_head_stride: Held<keys::KvHeadStride, Usize>,
+    v_seq_stride: Held<keys::KvSeqStride, Usize>,
+    scale: ParamF32<2>,
+    window: Param<3, i32>,
+    q_row_stride: Param<4, i32>,
+    o_row_stride: Param<5, i32>,
+    head_dim: Ask<keys::HeadDim, i32>,
+    q_heads: Ask<keys::NumQHeads, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     head_point(*head_dim, &[64])?;
     ctx.dispatch(
@@ -1135,29 +1438,99 @@ mod tests {
     /// One dispatch of the paged decode, with everything but the swept
     /// arguments held still.
     fn decode(seen: &Seen, head_dim: i32, q_heads: i32, rows: i32) -> Result<(), Refusal> {
+        splitting(seen, head_dim, q_heads, rows, Ask::new(1))
+    }
+
+    /// The same dispatch, at a stated split count.
+    fn splitting(
+        seen: &Seen,
+        head_dim: i32,
+        q_heads: i32,
+        rows: i32,
+        splits: Ask<keys::AttnSplits, i32>,
+    ) -> Result<(), Refusal> {
         sdpa_paged_decode(
             seen,
-            Buf(0),
-            Buf(1),
-            Buf(2),
-            BufMut(3),
-            4,
-            I32s(4),
-            I32s(5),
-            U32s(6),
-            U32s(7),
-            32,
-            2,
-            0.125,
-            U8s(8),
-            0,
-            U8s(9),
-            0,
-            Buf(10),
-            Env(head_dim),
-            Env(q_heads),
-            Env(rows),
+            InSlot::new(Buf(0)),
+            Ask::new(Buf(1)),
+            Ask::new(Buf(2)),
+            OutSlot::new(BufMut(3)),
+            Param::new(4),
+            Ask::new(I32s(4)),
+            Ask::new(I32s(5)),
+            Ask::new(U32s(6)),
+            Ask::new(U32s(7)),
+            Held::new(32),
+            Param::new(2),
+            ParamF32::new(0.125),
+            Ask::new(U8s(8)),
+            Ask::new(0),
+            Ask::new(U8s(9)),
+            ParamOrLit::new(0),
+            Null::new(Buf(10)),
+            Ask::new(F32sMut(11)),
+            Ask::new(head_dim),
+            Ask::new(q_heads),
+            Ask::new(rows),
+            splits,
         )
+    }
+
+    /// Above one split the decode becomes TWO dispatches, and the second one
+    /// is not shaped like the first.
+    ///
+    /// The split pass carries the split count on z, so `gl_NumWorkGroups.z`
+    /// reads back as it; the fold has no z at all and is told the count
+    /// through a push instead. Getting that backwards costs nothing static --
+    /// both are legal grids -- and folds a fraction of the partials.
+    #[test]
+    fn a_split_decode_fires_the_split_grid_then_a_flat_fold() {
+        let seen = Seen::default();
+        splitting(&seen, 128, 16, 1, Ask::new(8)).expect("a legal split decode");
+        let calls = seen.0.borrow().clone();
+        assert_eq!(calls.len(), 2, "a split pass and a fold pass");
+        assert_eq!(calls[0].0, "sdpa_paged_decode_split_bfloat16_d_128");
+        assert_eq!(calls[0].1, [16 * 128, 1, 8], "heads * width, rows, splits");
+        assert_eq!(calls[1].0, "sdpa_paged_decode_combine_bfloat16_d_128");
+        assert_eq!(calls[1].1, [16 * 128, 1, 1], "the fold has no split axis");
+    }
+
+    /// One split is the single-pass path, untouched.
+    ///
+    /// The rule answers 1 for a short history, and 1 has to mean the shader
+    /// this backend has always fired -- not a one-way split plus a fold that
+    /// merges nothing at the cost of a dispatch and a barrier.
+    #[test]
+    fn one_split_is_the_original_single_dispatch() {
+        let seen = Seen::default();
+        splitting(&seen, 128, 16, 1, Ask::new(1)).expect("a legal decode");
+        let call = one(&seen);
+        assert_eq!(call.0, "sdpa_paged_decode_bfloat16_d_128");
+    }
+
+    /// What the split rule answers, and why each answer is the one measured.
+    ///
+    /// The numbers are from `tests/sdpa_bench.rs` on an RTX 4090: at 384 keys
+    /// and one row the whole attention costs 67.6 us unsplit, 12.3 us at 8 and
+    /// 8.4 us at 32, and at 24 keys it costs 6.1 us unsplit against 4.8 at 8 --
+    /// a short history has almost nothing to win and a fold to pay for. The
+    /// rule is a floor, not a fit: it targets workgroups, refuses a split
+    /// thinner than eight keys, and stops at 32 because past that the fold's
+    /// own reads dominate.
+    #[test]
+    fn the_split_rule_grows_with_the_history_and_falls_with_the_rows() {
+        // qwen3-0.6b decode: 16 query heads, one row.
+        assert_eq!(decode_splits(0, 16, 1), 1, "no history stated");
+        assert_eq!(decode_splits(32, 16, 1), 4, "32 keys, four ways");
+        assert_eq!(decode_splits(128, 16, 1), 16);
+        assert_eq!(decode_splits(512, 16, 1), 32, "capped");
+        assert_eq!(decode_splits(8192, 16, 1), 32, "still capped");
+        // Rows already multiply the grid, so they must divide the splits.
+        assert_eq!(decode_splits(1024, 16, 8), 16);
+        assert_eq!(decode_splits(1024, 16, 32), 4);
+        assert_eq!(decode_splits(1024, 16, 512), 1, "a prefill needs no help");
+        // Below two the answer is one, and one is the single-pass path.
+        assert_eq!(decode_splits(8, 16, 1), 1, "a split would hold one key");
     }
 
     /// The vector shape multiplies the head width INTO the x extent, and the
@@ -1176,20 +1549,20 @@ mod tests {
         let seen = Seen::default();
         sdpa_vector_decode(
             &seen,
-            Buf(0),
-            Buf(1),
-            Buf(2),
-            BufMut(3),
-            4,
-            17,
-            Usize(1),
-            Usize(2),
-            Usize(3),
-            Usize(4),
-            0.125,
-            Env(128),
-            Env(5),
-            Env(3),
+            InSlot::new(Buf(0)),
+            Held::new(Buf(1)),
+            Held::new(Buf(2)),
+            OutSlot::new(BufMut(3)),
+            Param::new(4),
+            Param::new(17),
+            Held::new(Usize(1)),
+            Held::new(Usize(2)),
+            Held::new(Usize(3)),
+            Held::new(Usize(4)),
+            ParamF32::new(0.125),
+            Ask::new(128),
+            Ask::new(5),
+            Ask::new(3),
         )
         .unwrap();
         let call = one(&seen);
@@ -1199,26 +1572,26 @@ mod tests {
         let seen = Seen::default();
         sdpa_paged_tiled(
             &seen,
-            Buf(0),
-            Buf(1),
-            Buf(2),
-            BufMut(3),
-            4,
-            I32s(4),
-            I32s(5),
-            U32s(6),
-            U32s(7),
-            32,
-            2,
-            0.125,
-            U8s(8),
-            0,
-            U8s(9),
-            0,
-            Buf(10),
-            33,
-            Env(64),
-            Env(5),
+            InSlot::new(Buf(0)),
+            Ask::new(Buf(1)),
+            Ask::new(Buf(2)),
+            OutSlot::new(BufMut(3)),
+            Param::new(4),
+            Ask::new(I32s(4)),
+            Ask::new(I32s(5)),
+            Ask::new(U32s(6)),
+            Ask::new(U32s(7)),
+            Held::new(32),
+            Param::new(2),
+            ParamF32::new(0.125),
+            Ask::new(U8s(8)),
+            Ask::new(0),
+            Ask::new(U8s(9)),
+            ParamOrLit::new(0),
+            Null::new(Env(Buf(10))),
+            Ask::new(33),
+            Ask::new(64),
+            Ask::new(5),
         )
         .unwrap();
         let call = one(&seen);
@@ -1250,23 +1623,23 @@ mod tests {
         let seen = Seen::default();
         kv_append_paged(
             &seen,
-            Buf(0),
-            Buf(1),
-            BufMut(2),
-            BufMut(3),
-            Buf(4),
-            64,
-            Buf(5),
-            Buf(6),
-            Buf(7),
-            Buf(8),
-            32,
-            Buf(9),
-            4,
-            U32s(10),
-            U32s(11),
-            Buf(12),
-            Env(5),
+            InSlot::new(Buf(0)),
+            InSlot::new(Buf(1)),
+            Ask::new(BufMut(2)),
+            Ask::new(BufMut(3)),
+            Null::new(Env(Buf(4))),
+            ParamOr::new(64),
+            Null::new(Env(Buf(5))),
+            Null::new(Env(Buf(6))),
+            Null::new(Env(Buf(7))),
+            Null::new(Env(Buf(8))),
+            Held::new(32),
+            Null::new(Env(Buf(9))),
+            ParamOr::new(4),
+            Ask::new(U32s(10)),
+            Ask::new(U32s(11)),
+            Null::new(Env(Buf(12))),
+            Ask::new(5),
         )
         .unwrap();
         let call = one(&seen);
@@ -1303,15 +1676,15 @@ mod tests {
         let seen = Seen::default();
         kv_append(
             &seen,
-            Buf(0),
-            Buf(1),
-            BufMut(2),
-            BufMut(3),
-            I32s(4),
-            128,
-            Usize(4096),
-            Usize(128),
-            Env(8),
+            InSlot::new(Buf(0)),
+            InSlot::new(Buf(1)),
+            Held::new(BufMut(2)),
+            Held::new(BufMut(3)),
+            Held::new(I32s(4)),
+            ParamOr::new(128),
+            Held::new(Usize(4096)),
+            Held::new(Usize(128)),
+            Ask::new(8),
         )
         .unwrap();
         let call = one(&seen);
@@ -1342,24 +1715,24 @@ mod tests {
         let seen = Seen::default();
         sdpa_vector_decode_sink(
             &seen,
-            Buf(0),
-            Buf(1),
-            Buf(2),
-            BufMut(3),
-            Buf(4),
-            4,
-            17,
-            Usize(1),
-            Usize(2),
-            Usize(3),
-            Usize(4),
-            0.125,
-            512,
-            256,
-            256,
-            Env(64),
-            Env(5),
-            Env(3),
+            InSlot::new(Buf(0)),
+            Held::new(Buf(1)),
+            Held::new(Buf(2)),
+            OutSlot::new(BufMut(3)),
+            Weight::new(Buf(4)),
+            Param::new(4),
+            Param::new(17),
+            Held::new(Usize(1)),
+            Held::new(Usize(2)),
+            Held::new(Usize(3)),
+            Held::new(Usize(4)),
+            ParamF32::new(0.125),
+            Param::new(512),
+            Param::new(256),
+            Param::new(256),
+            Ask::new(64),
+            Ask::new(5),
+            Ask::new(3),
         )
         .unwrap();
         let call = one(&seen);
@@ -1373,23 +1746,23 @@ mod tests {
         let seen = Seen::default();
         sdpa_vector_decode_swa(
             &seen,
-            Buf(0),
-            Buf(1),
-            Buf(2),
-            BufMut(3),
-            4,
-            17,
-            Usize(1),
-            Usize(2),
-            Usize(3),
-            Usize(4),
-            0.125,
-            512,
-            256,
-            256,
-            Env(256),
-            Env(5),
-            Env(3),
+            InSlot::new(Buf(0)),
+            Held::new(Buf(1)),
+            Held::new(Buf(2)),
+            OutSlot::new(BufMut(3)),
+            Param::new(4),
+            Param::new(17),
+            Held::new(Usize(1)),
+            Held::new(Usize(2)),
+            Held::new(Usize(3)),
+            Held::new(Usize(4)),
+            ParamF32::new(0.125),
+            Param::new(512),
+            Param::new(256),
+            Param::new(256),
+            Ask::new(256),
+            Ask::new(5),
+            Ask::new(3),
         )
         .unwrap();
         let swa = one(&seen);
@@ -1430,20 +1803,20 @@ mod tests {
         assert_eq!(
             sdpa_vector_decode(
                 &seen,
-                Buf(0),
-                Buf(1),
-                Buf(2),
-                BufMut(3),
-                4,
-                17,
-                Usize(1),
-                Usize(2),
-                Usize(3),
-                Usize(4),
-                0.125,
-                Env(512),
-                Env(5),
-                Env(3),
+                InSlot::new(Buf(0)),
+                Held::new(Buf(1)),
+                Held::new(Buf(2)),
+                OutSlot::new(BufMut(3)),
+                Param::new(4),
+                Param::new(17),
+                Held::new(Usize(1)),
+                Held::new(Usize(2)),
+                Held::new(Usize(3)),
+                Held::new(Usize(4)),
+                ParamF32::new(0.125),
+                Ask::new(512),
+                Ask::new(5),
+                Ask::new(3),
             ),
             Err(Refusal::Narrow {
                 what: "the head width",

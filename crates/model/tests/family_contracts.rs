@@ -1579,7 +1579,34 @@ fn qwen3_5_mlx_checkpoint() -> CheckpointMetadata {
     for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
         mlx_triplet(&mut ck, &format!("{p}self_attn.{proj}"), hidden, hidden);
     }
-    ck.push(&format!("{p}linear_attn.A_log"), &[8], f32enc());
+    // A WHOLE gated-DeltaNet block, not just its decay log. The two
+    // passes `author_qwen3_5_mlx` runs beyond the direct loop are both
+    // about this block -- `A_log` republished as f32 and a zero
+    // convolution bias synthesised -- and neither was reachable while
+    // the fixture published one tensor of it.
+    //
+    // `A_log` is BF16 here because that is what
+    // `mlx-community/Qwen3.6-35B-A3B-4bit` ships, which makes the CAST
+    // the case under test rather than the passthrough.
+    // Four key heads of eight and four value heads of sixteen, so the
+    // convolution plane is `2*32 + 64 = 128` — the same `[K | K | V]`
+    // stacking the real block has, at a width `mlx_triplet` can group.
+    ck.push(&format!("{p}linear_attn.A_log"), &[4], bf16());
+    ck.push(&format!("{p}linear_attn.dt_bias"), &[4], bf16());
+    ck.push(&format!("{p}linear_attn.norm.weight"), &[16], bf16());
+    // `[conv_dim, K, 1]` and NO bias beside it, which is the checkpoint's
+    // shape and the checkpoint's omission.
+    ck.push(
+        &format!("{p}linear_attn.conv1d.weight"),
+        &[128, 4, 1],
+        bf16(),
+    );
+    mlx_triplet(&mut ck, &format!("{p}linear_attn.in_proj_qkv"), 128, hidden);
+    mlx_triplet(&mut ck, &format!("{p}linear_attn.in_proj_z"), 64, hidden);
+    for gate in ["in_proj_a", "in_proj_b"] {
+        mlx_triplet(&mut ck, &format!("{p}linear_attn.{gate}"), 4, hidden);
+    }
+    mlx_triplet(&mut ck, &format!("{p}linear_attn.out_proj"), hidden, 64);
     ck.push("language_model.model.norm.weight", &[hidden], bf16());
     ck.finish("qwen3_5_mlx")
 }

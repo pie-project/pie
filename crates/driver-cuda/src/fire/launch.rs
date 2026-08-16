@@ -18,65 +18,12 @@ use driver_api::local::{
 };
 use driver_api::submission::FrameSubmission;
 
-// `SCORE_PIN` STOOD HERE — `ValueId::MAX`, the `Scratch::named` key the score
-// pin was pooled under — and it had lost its readers along with the pool that
-// used them. Its doc had been GLUED to the tail of a deleted item's ("the
-// loaded model's facts, family-dispatched"), which is the shape a doc comment
-// takes when the thing between two items goes and the comment does not: rustc
-// re-attaches it to the next item and says nothing.
-//
-// `runahead_env` AND `supergraph_enabled` STOOD HERE TOO, and they are the
-// more interesting deletion. Each was a private `getenv` for a knob that
-// `boot::Boot` already parses — `PIE_CUDA_RUNAHEAD` and `PIE_CUDA_SUPERGRAPH`
-// — which is precisely the defect `ef0f4e1fd` ("the boot knobs are parsed
-// once, and two of them disagreed") set out to end, surviving in a third
-// place because nothing called it. And they did not merely duplicate the
-// parse: `Boot` lets THE TOML OUTRANK THE ENVIRONMENT, and these two read
-// only the environment, so a caller of either would have silently overruled
-// `[driver] runahead = false`. The live readings are `state.runahead` and
-// `state.boot.supergraph`, both set from `serve::load`. Their substantive
-// prose — why each default is what it is — moved to the fields in `boot.rs`
-// that answer for them now.
-
-/// The arena offset the attention dispatch at `fi` WRITES.
+/// The arena offset the attention dispatch at `fi` writes.
 ///
-/// Two readings, and only the first is right under a union lowering.
-///
-/// 1. **The dispatch's own op join.** The attention statement carries its
-///    output placement, which is exactly the slot the o_proj goes on to read.
-/// 2. **The next launch's first operand** — "the launch after the dispatch is
-///    the o_proj". True under `Resolve`, where the guard has already deleted
-///    every arm the fire did not take. False under `Union`, where every arm is
-///    present and the next launch belongs to some other body, which is why a
-///    union that has to fall back here declines instead.
-///
-/// # And why every DECODE declines
-///
-/// `dsl::seam::attn_at` records an output only when the statement is NOT
-/// inside a value-producing region:
-///
-/// ```ignore
-/// let out = q.t.inner.borrow().inside_value_region();
-/// let shape = (!out).then(|| …);   // None inside a region
-/// ```
-///
-/// The decode arm states its attention inside one and the prefill arm does
-/// not. So reading 1 is empty for every decode, the union is declined, and a
-/// one-token fire walks all 396 launches — ~9 ms on a 0.6B model, which is
-/// most of what `.wiki/new-driver/next.md`'s table measures.
-///
-/// **Recovering it from the enclosing region here does not work, and the
-/// failure is quiet.** Two attempts, both green on 20 of 21 ABI tests and
-/// both wrong on `multi_step_resize_and_copy_preserve_the_kv`: the nearest
-/// preceding region is as often a closed guard from an earlier layer as the
-/// enclosing one; requiring coverage and matching the output's shape to q's
-/// still picks the wrong construct for some fires, because several covering
-/// regions can carry a q-shaped value. A wrong offset here is not a refusal —
-/// it binds the attention plan over another activation.
-///
-/// The fix belongs at the STATEMENT, not here: `attn_at` should record its
-/// landing in the join even inside a region, so the value has one stated
-/// producer instead of being reverse-engineered from op adjacency.
+/// Two readings; only the op join (reading 1) is right under a union
+/// lowering. The next launch's first operand is the o_proj only under
+/// `Resolve`, where the guard has deleted every arm the fire did not take;
+/// under `Union` every arm is present and the neighbour is some other body.
 fn attention_landing(
     lowered: &model_compiler::lower::Lowered,
     dplan: &crate::bind::DispatchPlan,
@@ -94,32 +41,15 @@ fn attention_landing(
 
 /// `PIE_CUDA_TRACE_SUPERGRAPH=1`: say what each fire did with the graph.
 ///
-/// The one instrument that answers the question the measurements raise —
-/// whether a fire REPLAYED or walked its launches, and if it walked, which
-/// clause of the servability test turned it away. Lazy, so an unset variable
-/// costs a `getenv` and no formatting.
+/// Lazy: an unset variable costs a `getenv` and no formatting.
 pub(crate) fn sg_trace(what: impl FnOnce() -> String) {
     if std::env::var_os("PIE_CUDA_TRACE_SUPERGRAPH").is_some() {
         eprintln!("[sg] {}", what());
     }
 }
 
-/// The fire's CLASS, read off its SHAPE — one row per request is a
-/// decode, anything else is prefill-shaped.
-///
-/// It used to read the recurrent-state flags too, and derive three MTP
-/// service classes from them (`CommitAdvance` where every row replayed
-/// buffered tokens, `FrozenVerify` where any row wrote buffered slabs,
-/// `StateOnly` where a recurrent fire had no readout rows). Those classes
-/// are gone — `.wiki/driver/graph.md` §4.2: a speculative decode buffers
-/// its tokens and folds only the accepted prefix, so a rejected token is
-/// never folded and there is nothing to repair. The driver executes the
-/// flags now (see the fold in `gdn_context`) instead of classifying on
-/// them.
-///
-/// What remains is a shape question, and it is on its way out too: the
-/// window class is `GuardPred::WindowOne` now, so the two surviving
-/// values pick nothing the trace does not already guard. See §4.1.
+/// The fire's class, read off its shape: one row per request is a decode,
+/// anything else is prefill-shaped.
 pub fn fire_class_of(
     _step: &driver_api::StepSubmission,
     rows: usize,
@@ -131,27 +61,11 @@ pub fn fire_class_of(
 
 /// Replay this fire's bucket if it is captured, and capture it if not.
 ///
-/// The whole supergraph arc, at its one live call site. What it does, in
-/// the order the pieces were built:
-///
-/// 1. **Eligibility.** A fire whose staged LoRA did not group cannot be
-///    recorded at all — `apply`'s solo path is a host loop whose launch
-///    count follows the adapter set. Ineligible means eager, which is the
-///    C++ arc's own device for what cannot be replayed.
-/// 2. **The bucket.** `(R, N, fire class, model)` plus the lora group
-///    shape. Every `GuardPred` axis is deliberately absent: those are what
-///    the conditionals fold.
-/// 3. **The epoch.** `Scratch` bumps it whenever a pool grew, because
-///    growth moves a base address out from under a recorded launch. A
-///    stale exec is dropped and recaptured rather than replayed.
-/// 4. **Dual-prepare.** A capture must be taken warm — a launcher that
-///    allocates on first use cannot do so inside a capture — and a warm-up
-///    must walk a VALID program, so warm once per variant with its own
-///    resolved lowering. A union records arms no single valid program
-///    takes, which is why one warm fire is not enough.
-/// 5. **The predicates**, uploaded before every launch: this is the fire's
-///    own shape, and the only thing that differs between two replays of
-///    one exec.
+/// A capture must be taken warm: a launcher that allocates on first use
+/// cannot allocate inside a capture, and the warm-up must walk a valid
+/// program, so each variant warms once with its own resolved lowering. The
+/// epoch is bumped whenever a pool grew — growth moves a base address out
+/// from under a recorded launch, so a stale exec is recaptured, not replayed.
 #[allow(clippy::too_many_arguments)]
 fn capture_or_replay<R: crate::bind::Resolver>(
     cache: &mut crate::fire::recordings::Recordings,
@@ -176,19 +90,9 @@ fn capture_or_replay<R: crate::bind::Resolver>(
     use crate::bind::{DispatchPlan, run};
     use crate::fire::recordings::{BucketKey, fire_predicates, union_eligibility};
 
-    // THE FIRE'S OWN LORA, and this read `None`.
-    //
-    // `union_eligibility` is "deliberately a function over the fire's
-    // staged state rather than a flag someone sets", and it was handed a
-    // literal `None` — so it answered `None` unconditionally and the
-    // `UngroupedLora` refusal never fired. An ungrouped adapter set is a
-    // host-side loop whose launch COUNT follows the adapters, so a
-    // capture of one cannot serve another; that is the whole reason the
-    // variant exists.
-    //
-    // SAFETY: the pointer is the `LoraFireState` `lora_phase` staged for
-    // this fire, alive for the whole call — `step_impl` holds it in
-    // `lora_state` past `capture_or_replay`.
+    // SAFETY: the pointer is the `LoraFireState` `lora_phase` staged for this
+    // fire, alive for the whole call — `step_impl` holds it in `lora_state`
+    // past `capture_or_replay`.
     let lora = ctx.lora.map(|(s, _)| unsafe { &*s });
     let eligibility = union_eligibility(lora);
     let key = BucketKey::new(
@@ -197,28 +101,19 @@ fn capture_or_replay<R: crate::bind::Resolver>(
         class,
         model_id,
     )
-    // AND THE ADAPTER SHAPE, which `BucketKey::lora_shape` argues for at
-    // length and which nothing set. A capture bakes the adapter device
-    // pointers, the lane count and the ranks; two fires with the same
-    // requests and tokens but different adapters shared a bucket, so the
-    // second replayed the first's pointers.
-    //
-    // `stage_qkv_adapters` already computes the fingerprint — "the lane
-    // structure, the adapter device pointers, the grouping mode, and the
-    // post-staging arena base" — and the call site discarded it with
-    // `let _ = fingerprint`.
+    // The bucket must carry the adapter shape: a capture bakes the adapter
+    // device pointers, lane count and ranks, so two fires with the same
+    // requests and tokens but different adapters must not share a bucket.
     .with_lora(lora.map_or(0, |l| l.capture_fingerprint));
 
-    // The fire's own bits, and the only thing that differs between two
-    // replays of one exec. NOT synchronized after: the upload and the replay
-    // are ordered on the same stream, so waiting here only made the call
-    // block on work it had just enqueued.
+    // The fire's own bits, the only thing that differs between two replays of
+    // one exec. Not synchronized after: upload and replay are ordered on the
+    // same stream.
     if fire_predicates(rows_desc, &lowered.conds, preds).is_err() || preds.upload(stream).is_err() {
         return run(lowered, dplan, frame, resolver, ctx, regions, gdn);
     }
 
-    // WHAT THIS FIRE WOULD HAND THE GRAPH, against what the graph
-    // recorded. See `recordings::capture_digest`.
+    // What this fire would hand the graph, against what the graph recorded.
     let digest = crate::fire::recordings::capture_digest(ctx, regions, gdn);
     if cache.replay(key, epoch, digest, stream).unwrap_or(false) {
         sg_trace(|| format!("replay {key:?}"));
@@ -226,13 +121,9 @@ fn capture_or_replay<R: crate::bind::Resolver>(
     }
     sg_trace(|| format!("miss {key:?} launches={}", lowered.launches.len()));
 
-    // DUAL-PREPARE: one warm fire per variant, each a resolved program.
-    // Only variants this fire can PREPARE. A `wants_scores` warm-up would
-    // lower the score-capturing dispatch, which refuses without a score
-    // sink — and warming is not the place to discover that. It is also
-    // why scores are not a union axis: the north star's list is "hook
-    // attachment, mask kind, correction arm, depth, LoRA rank", and every
-    // one of those is a branch rather than a different prepared state.
+    // One warm fire per variant, each a resolved program — only variants this
+    // fire can prepare: a `wants_scores` warm-up would lower the score-
+    // capturing dispatch, which refuses without a score sink.
     for marks in [
         model_compiler::lower::Row { samples: true, ..Default::default() },
         model_compiler::lower::Row { samples: true, write_desc: true, ..Default::default() },
@@ -246,66 +137,42 @@ fn capture_or_replay<R: crate::bind::Resolver>(
         ) else {
             return run(lowered, dplan, frame, resolver, ctx, regions, gdn);
         };
-        let warm_dplan = DispatchPlan::new(plan, &warm);
+        // Resolve against the fire's own boot, not a default: a
+        // `Boot::default()` states no KV dtype, so the warm-up would exercise
+        // a different program from the one captured.
+        let warm_dplan = DispatchPlan::with_boot(plan, &warm, dplan.boot());
         run(&warm, &warm_dplan, frame, resolver, ctx, regions, gdn)?;
         let _ = stream.synchronize();
     }
 
     let captured = {
-        // THE CAPTURE OPENS ON THE FIRE'S OWN ALLOCATOR, and it used to open
-        // on a throwaway one made right here. That looked harmless — nothing
-        // allocates during a capture — but the flag it raises is what makes a
-        // `cudaFree` DEFER, and the deferral has to happen on the allocator
-        // that OWNS the buffer. A temporary dropped inside `run_captured`
-        // therefore freed immediately, in the middle of an open stream
-        // capture, and the graph that came out faulted when it was destroyed.
-        //
-        // Phi-3's decode found it, because no decode had ever been captured.
+        // Open on the fire's own allocator: a `cudaFree` defers only on the
+        // allocator that owns the buffer, so a throwaway allocator would free
+        // immediately inside the open capture and the graph would fault on
+        // destroy.
         let Ok(scope) = alloc.begin_capture(stream) else {
             return run(lowered, dplan, frame, resolver, ctx, regions, gdn);
         };
         let mut b = crate::device::SupergraphBuilder::new(scope.stream(), preds);
         let ran =
             crate::bind::run_captured(lowered, dplan, frame, resolver, ctx, regions, gdn, &mut b);
-        // The nodes the capture retained, taken BEFORE the builder is
-        // dropped: one per launch, and what lets a later fire of a
-        // different row count retune this exec's rectangles instead of
-        // recapturing (`.wiki/driver/graph.md` §6.2).
+        // The retained nodes, taken before the builder is dropped: one per
+        // launch, letting a later fire of a different row count retune this
+        // exec's rectangles instead of recapturing.
         let nodes = b.nodes().to_vec();
         drop(b);
-        // A REFUSED CAPTURE IS NOT A REFUSED FIRE.
-        //
-        // Some arms cannot be recorded at all, and the reason is always
-        // the same shape: their prepared state is something the fire
-        // declined to build. The score-capturing prefill dispatch wants a
-        // plan raised for the full-attention variant, buffers laid out for
-        // an observation window, and a positive window — none of which a
-        // fire that wants no scores has any reason to prepare.
-        //
-        // So the capture is abandoned and the fire runs eagerly. That is
-        // the same answer ungrouped LoRA gets from `union_eligibility`,
-        // and the same one the C++ arc gives mixed peels: what cannot be
-        // replayed stays eager. The alternative — failing the fire — would
-        // make an optimisation into a correctness requirement.
+        // A refused capture is not a refused fire: some arms cannot be
+        // recorded because their prepared state is something the fire declined
+        // to build, so the capture is abandoned and the fire runs eager.
         let ended = scope.end();
         sg_trace(|| format!("capture ran={ran:?} ended_ok={}", ended.is_ok()));
         match (ran, ended) {
             (Ok(n), Ok(g)) => Some((n, g, nodes)),
             (Err(_), Ok(g)) => {
-                // AN ABANDONED CAPTURE IS NOT DESTROYED, it is forgotten.
-                //
-                // A run that refused part-way leaves a recording whose nodes
-                // the builder has already dropped, and `cudaGraphDestroy` on
-                // that faults inside the CUDA driver — no device error, a
-                // host segfault. Found through phi-3, where an unservable
-                // arm made every decode capture abandon.
-                //
-                // Leaking one graph template per abandoned capture is the
-                // cheaper wrong answer: captures are per (bucket, epoch) and
-                // a refusal is meant to be rare. The refusals that are NOT
-                // rare belong in the servability test above, which is where
-                // phi-3's went. `ManuallyDrop` rather than `mem::forget`
-                // because the leak is the POINT and should read as one.
+                // An abandoned capture must not be destroyed: its nodes are
+                // already dropped and `cudaGraphDestroy` would fault inside
+                // the driver (host segfault), so the template is leaked.
+                // `ManuallyDrop`, not `mem::forget`, so the leak reads as one.
                 let _leaked = std::mem::ManuallyDrop::new(g);
                 None
             }
@@ -325,8 +192,7 @@ fn capture_or_replay<R: crate::bind::Resolver>(
     Ok(ran)
 }
 
-/// The fire itself. Everything here is the proven smoke assembly, run
-/// against the shell's own state.
+/// The fire itself, run against the shell's own state.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn launch_impl(
     state: &mut Shell,
@@ -342,22 +208,10 @@ pub(crate) fn launch_impl(
     for step in &steps[..steps.len() - 1] {
         step_impl(state, frame, step, None)?;
     }
-    // The LAST step carries the frame's debt: EVERY step's terminal cells and
-    // the completion the runtime waits on. Only it enqueues an asynchronous
-    // retire, because a frame completes once.
-    //
-    // Every step's, and it used to be only the last one's. A cell is per
-    // MEMBER — `StepSubmission::validate` demands one per `roster_rows` entry,
-    // and the reason it does is that "a frame that states no cells is a frame
-    // whose members cannot be told apart on completion" — so a two-slot frame
-    // states two sets and publishing one leaves the other Pending forever.
-    // The runtime reports that as `work item completion terminal outcome is
-    // still Pending` and poisons the guest's channel, which is where a frame
-    // whose slots are two different instances died.
-    //
-    // Publishing the earlier steps' cells HERE rather than as each step ends
-    // is right for the same reason the debt is the last step's: by the time
-    // this callback runs every step has run, and a frame completes once.
+    // The last step carries the frame's debt: every step's terminal cells and
+    // the completion the runtime waits on, enqueuing one async retire because
+    // a frame completes once. Every step's cells, not just the last's — a cell
+    // is per member, and an unpublished one leaves that member Pending forever.
     let step = steps.last().expect("nonempty");
     let cells: Vec<*mut driver_api::local::TerminalCell> = steps
         .iter()
@@ -369,37 +223,25 @@ pub(crate) fn launch_impl(
 /// Trace a family's forward for one fire shape, lower it, and join the ops
 /// back onto the launches.
 ///
-/// Split out of `step_impl` so its result can be CACHED — see
-/// [`Shell::lowerings`]. Nothing here reads the fire's data; it reads the
-/// shape, which is what makes the answer reusable.
+/// Split out of `step_impl` so its result can be cached — nothing here reads
+/// the fire's data, only its shape, which is what makes the answer reusable.
 fn build_lowering(
     row: &'static dyn model::catalog::Variant,
     deployed: model::catalog::Deployed<'_>,
     class: model_ir::trace::FireClass,
     fire_rows: &[model_compiler::lower::Row],
     union_asked: bool,
+    boot: crate::bind::Boot,
 ) -> Result<LoweredFire, i32> {
     use crate::bind::DispatchPlan;
     use model_compiler::lower::{Fire, GuardMode, lower_with};
 
     let plan = row.trace(class, deployed).map_err(|e| i32::from(crate::Error::from(e)))?;
-    // `captures_across_splits` FOLLOWS THE GUARD MODE, and it did not.
-    //
-    // `lower.rs` states the consequence of getting this wrong, at the
-    // site that reads the flag: with it clear, "the host's counts are
-    // the truth and an empty region emits nothing" — so a capture bakes
-    // THIS fire's split into the graph, which is "a wrong answer no
-    // byte-parity run can see, because it is only wrong on the REPLAY."
-    //
-    // `BucketKey` carries requests, tokens, model and the LoRA shape. It
-    // does NOT carry the split, and it should not have to: under `Union`
-    // both regions lower with `rows_device` launches and each early-outs
-    // on the `PeelWindowWord`, so one exec serves every split. That is
-    // what makes the split a runtime word instead of a key axis — and it
-    // only holds if the flag is set when the mode is `Union`.
-    //
-    // Passing `false` under `Union` was the two halves disagreeing: the
-    // key said "the split does not matter" and the lowering froze it.
+    // `captures_across_splits` must follow the guard mode: with it clear the
+    // host's counts are the truth, so a capture would bake this fire's split
+    // into the graph — wrong only on replay. Under `Union` both regions lower
+    // with `rows_device` launches and early-out on the `PeelWindowWord`, so
+    // one exec serves every split and the split need not be a `BucketKey` axis.
     let lower_as = |g: GuardMode| {
         let captures_across_splits = g == GuardMode::Union;
         lower_with(&plan, fire_rows, Fire { captures_across_splits }, g).map_err(|e| {
@@ -413,65 +255,13 @@ fn build_lowering(
     }
     let lowered = lower_as(if union { GuardMode::Union } else { GuardMode::Resolve })?;
 
-    // NOTHING DECLINES THE UNION ANY MORE, and the two clauses that used
-    // to are worth naming because their removal is the point of §5 (1)
-    // and (2) in `.wiki/driver/graph.md`.
-    //
-    // The first refused any lowering mentioning `_capture` or `_custom` --
-    // the exact case a folded `WantsAttnScore` / `HasCustomMask` predicate
-    // exists for. Its cause was PER-ARM PREPARED STATE: under `Union`
-    // every arm is recorded whether this fire takes it or not, so the
-    // capture walked the arm whose state the fire declined to build and
-    // abandoned the whole recording. Prepared state belongs to the BUCKET
-    // now -- the score sink is published every fire, every plan the
-    // geometry permits is raised, a causal element mask stays resident.
-    //
-    // The second refused a fire whose attention output slot the op JOIN
-    // could not name. The old fallback -- "the launch after the dispatch
-    // is the o_proj, so its input is the slot" -- is a fact read off where
-    // a statement SITS, true under `Resolve` (the guard has deleted every
-    // arm the fire did not take) and false under `Union` (every arm is
-    // present and the neighbour belongs to some other body). But declining
-    // was never the only answer: `AttnCtx::o_out` is a DRIVER-owned
-    // pointer, so a fire whose join names no slot gets a driver-owned
-    // buffer instead of losing its graph. See `o_off` at the fire site.
-
-    let dplan = DispatchPlan::new(&plan, &lowered);
-    // ── THE LOAD-TIME REFUSAL ────────────────────────────────────────
-    //
-    // `.wiki/kernel-x/northstar.md` §5 step 4: *"unknown symbols now refuse
-    // at load"*, and §0's rule that this serves — *"every refusal the system
-    // can make is made at model load; a fire is a straight line."*
-    //
-    // Two classes reach `unfireable`, both knowable from the symbol table
-    // before a single operand is bound:
-    //
-    // * `Refusal::Undeclared` — no contract and no row declares the symbol.
-    // * `Refusal::Unstated` — fn-world declares it and NO bind can fire it,
-    //   ever. The sentence is the one its row carried as prose beside an
-    //   unsourced operand; here it is the diagnostic.
-    //
-    // # Why this refuses in BOTH guard modes, which is not obvious
-    //
-    // The tempting caution is to refuse under `Resolve` and merely report
-    // under `Union`, on the grounds that a union lowering carries arms this
-    // fire will not take. It does not hold, and the reason is in the LoRA
-    // arm's own comment below: *"under `Union` every arm lowers and the
-    // conditional decides at replay, so the arm has to be ISSUABLE with its
-    // predicate false"*. Issuable means dispatched during capture. So an
-    // unfireable symbol fails under `Union` at capture exactly as it fails
-    // under `Resolve` at the fire — there is no mode in which one loads and
-    // runs today.
-    //
-    // Moving the failure here therefore costs no working model. What it buys
-    // is the difference between a token-time `NoArm` naming a kernel and a
-    // load-time refusal naming the kernel, the reason and the family.
-    //
-    // # What this does NOT catch
-    //
-    // A `Route::Rows` symbol whose generated arm does not exist — see
-    // `DispatchPlan::unfireable`. That gap is the row world's and closes
-    // with it.
+    let dplan = DispatchPlan::with_boot(&plan, &lowered, boot);
+    // The load-time refusal: unfireable symbols refuse here, before any
+    // operand is bound, so a fire stays a straight line. Two classes reach
+    // `unfireable` — `Undeclared` (no contract or row declares the symbol)
+    // and `Unstated` (fn-world declares it but no bind can ever fire it). It
+    // refuses in both guard modes: under `Union` every arm is issued during
+    // capture, so an unfireable symbol fails there exactly as under `Resolve`.
     let unfireable = dplan.unfireable();
     if !unfireable.is_empty() {
         for u in unfireable {
@@ -486,31 +276,18 @@ fn build_lowering(
         });
         return Err(PIE_STATUS_UNSUPPORTED);
     }
-    // How much of this model still fires through the row world — §5 step 5's
-    // progress, counted over what a real deployment actually states rather
-    // than over a census of files.
+    // How much of this model still fires through the row world.
     let (rows_left, total) = dplan.sweep_progress();
     sg_trace(|| format!("routes: {rows_left}/{total} still row-world"));
     sg_trace(|| format!("built: launches={} union={union}", lowered.launches.len()));
     Ok(LoweredFire { plan, lowered, dplan, union })
 }
 
-/// One step's fire — the former single-step body.
+/// The admit phase's result.
 #[allow(clippy::too_many_lines)]
-/// What a step must satisfy before anything is traced, lowered or
-/// allocated for it — and the handful of facts that survive the asking.
-///
-/// The FIRST of `step_impl`'s phases, promoted out of it. Its boundary is
-/// the one place in the fire path where "this driver cannot serve this"
-/// is still a cheap answer: nothing has been built, nothing has been
-/// bound, and no device memory has moved. Every refusal below is
-/// therefore an early return and not a rollback, which is the north
-/// star's third rule read forwards — decide, then move.
-///
-/// The borrow shape is why this returns indices into `step` rather than
-/// the slices themselves: `state` is `&mut` for the rest of the fire, so
-/// a phase that handed back `&[u32]` borrowed from `state.model` would
-/// pin it. The caller re-slices from `step`, which it owns.
+/// What a step must satisfy before anything is traced, lowered or allocated,
+/// and the facts that survive the asking. Returns owned values, not slices
+/// borrowed from `state`, which is `&mut` for the rest of the fire.
 struct Admitted {
     /// The service class the row/request ratio implies.
     pub(crate) class: model_ir::trace::FireClass,
@@ -518,15 +295,8 @@ struct Admitted {
     pub(crate) rows: usize,
     /// Requests the step's CSR partitions those rows into.
     pub(crate) requests: usize,
-    /// The rows the lowering will resolve its guards against, read from
-    /// the step's REGION TABLE.
-    ///
-    /// This shell used to build `vec![Row { samples: true, ..default() };
-    /// rows]` and never look at `region_sig` — zero reads in the whole
-    /// file. So `HasLora`, `HasCustomMask`, `HasStageHooks` and the depth
-    /// truncation could not hold no matter what the engine sent, and
-    /// every fire claimed to sample every row. LoRA looked like a missing
-    /// feature; the wire had been carrying it the whole time.
+    /// The rows the lowering resolves its guards against, read from the step's
+    /// region table.
     pub(crate) fire_rows: Vec<model_compiler::lower::Row>,
 }
 
@@ -538,25 +308,6 @@ fn admit(
 ) -> Result<(Admitted, &'static dyn model::catalog::Variant), i32> {
     use model_ir::trace::FireClass;
 
-    // A USER MASK IS SERVED NOW, and it used to be refused.
-    //
-    // The refusal was right for its time and said so: this shell read
-    // neither `step.masks` nor the region bit, launched no custom-mask
-    // kernel, and would have attended CAUSALLY over a mask the caller
-    // supplied -- a wrong answer that looks like a right one.
-    //
-    // Three things landed since. `.wiki/driver/graph.md` §5 (1) made the
-    // mask BUCKET state, so a resident element mask is published on every
-    // fire and the `_custom` dispatch has an arm; the region table's
-    // `PIE_REGION_SIG_MASK` bit reaches `Row::custom_mask`, so the
-    // `HasCustomMask` guard can hold; and `brle` turns out never to have
-    // needed porting -- the engine decodes its own runs host-side and
-    // ships a packed bitset (`MaskWordsStorage::from_plan`).
-    //
-    // So what is left is a widen and a relayout, which is
-    // `element_mask::from_words`. It REFUSES a table that does not
-    // describe this fire rather than falling back, for the same reason
-    // the whole entry used to refuse.
     let sub_batches = step.sub_batch_indptr.as_slice();
     if sub_batches.len() > 2 {
         eprintln!("[driver-cuda] launch: one sub-batch per step today");
@@ -565,18 +316,10 @@ fn admit(
     let Some(model) = state.model.as_ref() else {
         return Err(PIE_STATUS_INVALID_ARGUMENT);
     };
-    // THE VALUE, not a fresh `Box<dyn PlannedFamily>`. Derived at load
-    // (`LoadedModel::deployment`); this is the read.
+    // The value derived at load (`LoadedModel::deployment`), not re-derived.
     let dep = &model.deployment;
-    // `trace()` is the one question a `Deployment` does not answer,
-    // because a `ForwardPlan` is `model-compiler`'s and the family text
-    // is what produces it. So the ROW comes along — a `&'static` borrow
-    // of a const table, which is the whole cost.
-    //
-    // It used to re-derive a `Box<dyn PlannedFamily>` here, ON EVERY
-    // FIRE: eleven `*_facts_from_hf` functions over a parsed
-    // `config.json`, allocating and cloning per-layer `Vec`s, to feed a
-    // lowering that is cached precisely because it costs 3.3 ms.
+    // `trace()` is the one question a `Deployment` does not answer, so the row
+    // comes along — a `&'static` borrow of a const table.
     let Some(row) = model::catalog::find(model.id) else {
         eprintln!(
             "[driver-cuda] launch: this build has no catalog row named \
@@ -602,44 +345,19 @@ fn admit(
     let rows = token_ids.len();
     let requests = kv_lens.len();
     let class = fire_class_of(step, rows, requests)?;
-    // THE REGION TABLE, which is the seriation's output stated once. An
-    // empty one is the legacy discipline — no seriation ran, so the fire
-    // is one region of the default point — and not a refusal.
-    //
-    // AND IT ARRIVES IN A DIFFERENT ROW SPACE THAN THE ONE IT IS READ IN.
-    //
-    // "Row" means two things across this seam, and they agree on exactly the
-    // shape that is easiest to test. The ENGINE counts WIRE rows: a
-    // `PendingRequest` contributes `qo_indptr.len() - 1` of them, `worker`'s
-    // `validate_launch` asserts `program_row_indptr.last() == rows` against
-    // that same count, and the region table partitions those. The LOWERING
-    // counts TOKEN rows -- `lower()` takes one `Row` per token, which is why
-    // a prefill of seven tokens lowers over seven rows and `fire_class_of`
-    // can call "one row per request" a decode at all.
-    //
-    // A decode has one token per request, so the two counts are equal and
-    // every decode fixture passes. A prefill of 34 tokens arrives as ONE wire
-    // row and 34 token rows, and the table then describes row 0 and nothing
-    // else: `RegionDrift::DoNotTile { at: 1 }`, on every prefill, which is
-    // every request's first step.
-    //
-    // `qo_indptr` is the map between them -- wire row `i` owns token rows
-    // `qo_indptr[i] .. qo_indptr[i + 1]` -- so the table is translated here
-    // rather than reinterpreted. Translating in the DRIVER and not on the
-    // wire is deliberate: the engine's counting is right for the engine (its
-    // `program_row_indptr` partitions INSTANCES, one per wire row), and the
-    // lowering's is right for the lowering. What was missing was the
-    // conversion between them, not a decision about which is correct.
+    // The region table (the seriation's output); an empty one is the legacy
+    // discipline, not a refusal. It arrives in wire-row space but is read in
+    // token-row space: the engine counts one wire row per request, the
+    // lowering one row per token. `qo_indptr` maps between them — wire row `i`
+    // owns token rows `qo_indptr[i]..qo_indptr[i + 1]` — so the table is
+    // translated here, not reinterpreted.
     let region_row_indptr: Vec<u32> = step
         .region_row_indptr
         .as_slice()
         .iter()
         .map(|&wire_row| {
-            // Out of range cannot be repaired here, and must not be silently
-            // clamped: a clamp would turn a table that describes rows the
-            // fire does not have into one that describes the wrong rows.
-            // Passing it through unchanged lets `rows_from_regions` refuse it
-            // by name, which is what it is for.
+            // Out of range must not be clamped — a clamp would describe the
+            // wrong rows; pass it through so `rows_from_regions` refuses it.
             qo_indptr.get(wire_row as usize).copied().unwrap_or(u32::MAX)
         })
         .collect();
@@ -655,12 +373,8 @@ fn admit(
         step.region_k.as_slice(),
     )
     .map_err(|drift| {
-        // THE SHAPES, because the variant alone does not locate the fault.
-        // `DoNotTile { at: 7 }` says row 7 is claimed twice or not at all,
-        // and which of those it is -- and whose fault it is -- is a question
-        // about the three arrays the ENGINE sent, none of which this message
-        // used to name. A refusal that reports a structural disagreement
-        // without reporting either structure sends its reader to the wrong
+        // Report the shapes: the variant alone does not locate the fault, and
+        // a refusal that names neither structure sends its reader to the wrong
         // crate.
         eprintln!(
             "[driver-cuda] launch: the step's region table does not describe \
@@ -677,56 +391,13 @@ fn admit(
         );
         PIE_STATUS_INVALID_ARGUMENT
     })?;
-    // THE READOUT ROWS ARE THE WIRE'S NOW, and this used to be an
-    // override that forced `samples: true` on every row.
-    //
-    // The reason it did is gone. `lower::epilogue` states a gather when
-    // the fire samples fewer rows than it computes -- a prefill reads one
-    // distribution per request out of a stream of one row per token --
-    // but it used to emit the gather over the `LmHead` op's own operands,
-    // whose output IS the logits buffer. The gather therefore wrote
-    // `[sampled, hidden]` into a `[sampled, vocab]` allocation and the
-    // head read what it had overwritten: all-zero logits on gemma-4 and
-    // the hybrid. Claiming every row was the way around it, at the cost
-    // of a prefill running the head over every token.
-    //
-    // The epilogue names its temp now (`Buffers::epilogue_gather`, sized
-    // from the statement and carried on `Lowered` all along), so the
-    // compaction is real and the wire's answer stands.
-    //
-    // A fire that names NO readout rows is the legacy discipline rather
-    // than a service pass, and the answer is one row per REQUEST: the
-    // last row a request contributes, `qo_indptr[r + 1] - 1`. Not the
-    // fire's last row, which is what a shape that knows no request
-    // boundaries can say and is only right at one request.
-    //
-    // That correction used to be made HERE, over the shared helper's
-    // answer, and it fixed only the empty half. The non-empty half went
-    // on reading `sampling_indices` as rows of the fire when they are
-    // numbered inside the request that named them -- the same defect one
-    // branch over, and the one this override could not see because it
-    // only ran when the table was empty. Both halves now live in
-    // `Readouts::samples`, which takes the CSR that makes the numbering
-    // readable, so this override is gone rather than half-right.
-
-    // AND `multi_token` IS DERIVED FROM THE CSR, not taken on trust.
-    //
-    // `GuardPred::WindowOne` reads it (`.wiki/driver/graph.md` §4.1: the
-    // window class is a row property now, not a class), so a row that
-    // under-claims it puts a RAGGED fire on the decode arm — the wrong
-    // attention kernel, and wrong logits rather than a refusal.
-    //
-    // `PIE_REGION_SIG_MULTI_TOKEN` is the engine's statement of the same
-    // fact, but an EMPTY region table is legal — it is the legacy
-    // discipline, "one region of the default point" — and the default
-    // point is `multi_token: false`. So every prefill fired by a caller
-    // that sends no table would answer WindowOne, which is exactly the
-    // disagreement `fire_class_of` would not have had.
-    //
-    // `qo_indptr` cannot be silent: it is how the fire says which rows
-    // belong to which request. A request contributing more than one token
-    // row IS multi-token, whatever else was said, so the two are ORed
-    // rather than one replacing the other.
+    // `multi_token` is derived from the CSR, not taken on trust:
+    // `GuardPred::WindowOne` reads it, so a row that under-claims it puts a
+    // ragged fire on the decode arm — the wrong kernel and wrong logits, not a
+    // refusal. The region bit states the same fact, but an empty table is
+    // legal (default point is `multi_token: false`), and `qo_indptr` cannot be
+    // silent: a request with more than one token row is multi-token, so the
+    // two are ORed rather than one replacing the other.
     for r in 0..requests {
         let (lo, hi) = (qo_indptr[r] as usize, qo_indptr[r + 1] as usize);
         if hi.saturating_sub(lo) > 1 {
@@ -735,43 +406,12 @@ fn admit(
             }
         }
     }
-    // AN ADAPTER THIS DRIVER CANNOT APPLY IS REFUSED.
-    //
-    // Now that the region bit is read, a marked row reaches the
-    // `HasLora` guard and the trace states `gemm::lora_qkv_correction`.
-    // The executor's arm for it returns `Ok(())` when `ctx.lora` is
-    // `None` — which it always is, because nothing stages the table
-    // yet — and that no-op is LOAD-BEARING for union captures: under
-    // `GuardMode::Union` every arm lowers and the predicate is decided
-    // at replay, so the arm has to be issuable with nothing to correct.
-    //
-    // So the refusal cannot live in the arm. It lives here, where the
-    // question is whether this FIRE asked for something the driver
-    // cannot do. Running it would apply no correction and return tokens
-    // that look like a slightly worse model, which is the one failure
-    // mode worth refusing over.
-    //
-    // THE ADAPTER IS APPLIED NOW, so there is nothing to refuse here.
-    //
-    // This used to turn away any fire whose region table carried
-    // `PIE_REGION_SIG_LORA`, because the correction's executor arm
-    // returns `Ok(())` when `ctx.lora` is `None` — and that no-op is
-    // load-bearing for union captures, so the refusal could not live in
-    // the arm. It lived here instead, where the question is whether
-    // this FIRE asked for something the driver cannot do.
-    //
-    // It can now. `lane_for_instance` resolves each request's adapter
-    // to an address, `lora_pins` names the q, v and x the correction
-    // binds, and `llama_like_lora_stage` builds the state `ctx.lora`
-    // carries. A fire whose lanes do not resolve still gets `None`,
-    // which is the same correct no-op an adapter-free fire gets — the
-    // difference being that it is now a fallback rather than the only
-    // outcome.
+    // No LoRA refusal here: the adapter is applied now, and a fire whose lanes
+    // do not resolve gets the same correct no-op an adapter-free fire gets.
 
-    // A family that does not DECLARE a service class must be turned away
-    // rather than traced: its text answers the three with `unreachable!`,
-    // and a panic crossing the entry point is caught but costs the whole
-    // request. Only the MTP family composes those passes.
+    // A family that does not declare a service class must be refused, not
+    // traced: its text answers with `unreachable!`, and a panic across the
+    // entry point costs the whole request. Only MTP composes these passes.
     if !matches!(class, FireClass::Decode | FireClass::Prefill) && dep.recurrent.is_none() {
         eprintln!(
             "[driver-cuda] launch: {class:?} is an MTP service pass and \
@@ -782,33 +422,21 @@ fn admit(
     Ok((Admitted { class, rows, requests, fire_rows }, row))
 }
 
-/// Run the instance's registered program over the fire's logits.
+/// Run the instance's registered program over the fire's logits — the
+/// sampling phase (top-p, top-k, temperature and argmax are PTIR ops a
+/// caller's program states, not driver flags).
 ///
-/// `step_impl`'s SAMPLING phase, and the reason `ptir_programs` had a
-/// writer and no reader until now. Sampling is a PTIR stage and not a
-/// driver flag — top-p, top-k, temperature and argmax are ops a caller's
-/// program states — so a fire that skipped this returned raw logits and
-/// ignored every sampling parameter the request carried.
-///
-/// Returns `Ok(false)` when there is nothing to run, which is the common
-/// case and not a failure: an instance with no program, a program that
-/// compiled to nothing, or an instance whose channels this shell does not
-/// hold. The caller then delivers logits the old way.
-///
-/// # Why a refusal here is not a failed request
-///
-/// A program that DECLINES a fire has said so deliberately, and one whose
-/// inputs are not ready is waiting on the engine rather than broken.
-/// Neither is a reason to fail the step: the cursors are left where they
-/// were, so the next fire sees the same inputs and the same decision.
-/// Only a device error propagates.
+/// Returns `Ok(false)` when there is nothing to run: no program, a program
+/// that compiled to nothing, or channels this shell does not hold. A program
+/// that declines or is not ready is not a failed step — the cursors are left
+/// where they were, so the next fire sees the same decision. Only a device
+/// error propagates.
 #[cfg(feature = "abi")]
 #[allow(clippy::too_many_arguments)]
 fn run_program(
-    // THE FIVE FIELDS THIS PHASE TOUCHES, not `&mut Shell` — the caller
-    // has already borrowed `model`, `named_bufs`, `stream` and `alloc` out
-    // of the shell, so a whole-shell borrow here is a conflict. Same wall
-    // `deliver_logits` and `gdn_context` hit, same answer.
+    // The disjoint `Shell` fields this phase touches, not `&mut Shell`: the
+    // caller has borrowed `model`, `named_bufs`, `stream` and `alloc` out of
+    // the shell, so a whole-shell borrow here would conflict.
     instances: &std::collections::BTreeMap<u64, InstanceEntry>,
     channels: &std::collections::BTreeMap<u64, ChannelState>,
     programs: &crate::program::Programs,
@@ -834,17 +462,10 @@ fn run_program(
     let Some(compiled) = programs.get(instance.program_id) else {
         return Ok(false);
     };
-    // THE EPILOGUE'S plan, not the first one.
-    //
-    // Sampling is an epilogue stage. `plans.first()` was the epilogue
-    // only by the accident that no program in the tree has a prologue —
-    // and `fwd.adapter` puts its `lora` sink in one, so the first program
-    // that carries an adapter would have had its ADAPTER fired here and
-    // its sampler never run, with the fire reporting a successful publish
-    // either way.
-    //
-    // Falling back to the first stage keeps a package that states no
-    // kinds working, which is what every fixture in the tree is.
+    // The epilogue's plan, not the first: `plans.first()` is the epilogue only
+    // by accident, and a package carrying an adapter puts its sink in a
+    // prologue, so first would fire the adapter and never sample. Fall back to
+    // the first stage for a package that states no kinds.
     let stage = compiled.stage_of_kind(crate::program::runtime::stage_kind::EPILOGUE).unwrap_or(0);
     let Some(plan) = compiled.plans.get(stage).cloned() else {
         return Ok(false);
@@ -859,9 +480,9 @@ fn run_program(
     let channel_ids = instance.channel_ids.clone();
     let compiled = compiled.clone();
 
-    // THE CONTROL KERNELS, ONCE. Same disk as the program runtime's on
-    // purpose: the two share a key scheme, so a second cache directory
-    // would recompile both every boot and neither would ever hit.
+    // The control kernels, once. Same disk as the program runtime: they share
+    // a key scheme, so a second cache directory would recompile both every
+    // boot and never hit.
     if control.is_none() {
         let target = ptir_target(device_ordinal)?;
         let architecture = crate::program::compile::arch_flag(target.major, target.minor);
@@ -878,13 +499,10 @@ fn run_program(
         }
     }
 
-    // `ensure_sessions` runs before the forward and rings every instance the
-    // frame names, so a missing session here is an instance whose channels
-    // this shell does not hold — the same decline `instance_ring_shapes`
-    // gives. Ringing one HERE is no longer possible: a session is a map into
-    // the driver's registry, and building one means registering channels,
-    // which is `ensure_sessions`'s job precisely so a prologue can have an
-    // address before the forward.
+    // `ensure_sessions` rings every instance the frame names before the
+    // forward, so a missing session here is an instance whose channels this
+    // shell does not hold — ringing one here would mean registering channels,
+    // which is `ensure_sessions`'s job.
     if !sessions.contains_key(&instance_id) {
         eprintln!(
             "[driver-cuda] launch: instance {instance_id} was not ringed before the \
@@ -894,8 +512,8 @@ fn run_program(
     }
     let _ = shapes;
 
-    // The host planes, in the instance's channel ORDER — which is the
-    // order a program indexes them by, and not the map's.
+    // The host planes, in the instance's channel order — the order a program
+    // indexes them by, not the map's.
     let mut host: Vec<crate::program::channel::HostChannel> = Vec::with_capacity(channel_ids.len());
     for id in &channel_ids {
         let Some(channel) = channels.get(id) else {
@@ -919,11 +537,9 @@ fn run_program(
         control,
         &mut host,
         logits,
-        // ONE LANE per fire, and one ROW per lane. The fire itself is no
-        // longer single-lane — `Prepared::build` takes one `Extents` per
-        // lane and writes a record, a descriptor row and a channel-slot
-        // row for each — so what is left is a caller that groups. When
-        // one exists, this slice grows and the closure indexes it.
+        // One lane per fire, one row per lane: the fire is no longer
+        // single-lane, but nothing groups yet, so this slice holds one and
+        // the closure ignores the lane.
         |_lane| u32::try_from(row).unwrap_or(0),
         std::slice::from_ref(&extents),
         alloc,
@@ -945,35 +561,22 @@ fn run_program(
     }
 }
 
-/// Publish the fire's readout: the LAST row's logits, out through the
-/// instance's reader channel.
+/// Publish the fire's readout — the last row's logits — through the
+/// instance's reader channel. Convention until the channel table is parsed:
+/// the roster's first instance, its first `READER` channel whose cell is
+/// `[vocab]` f32. Device bf16 widens to the f32 wire on the host.
 ///
-/// `step_impl`'s DELIVERY phase, promoted out of it. The convention until
-/// the launch package's channel table is parsed: the roster's first
-/// instance, its first registered channel with `host_role == READER`
-/// whose cell is `[vocab]` f32. Device bf16 widens to the f32 wire on the
-/// host.
-///
-/// Takes `debt` by `&mut Option` rather than returning a copy because the
-/// two paths through here differ in WHO waits, not in what is produced: a
-/// step that owes a completion hands the D2H's destination to the debt
-/// and returns with the copy still queued, and a step that owes nothing
-/// has already synchronized and can widen on this stack. Splitting those
-/// into two functions would duplicate the channel search, which is the
-/// part that is actually shared.
+/// Takes `debt` by `&mut Option` because the paths differ in who waits: a step
+/// owing a completion queues the D2H and hands its destination to the debt;
+/// one owing nothing has synchronized and widens here.
 #[cfg(feature = "abi")]
 #[allow(clippy::too_many_arguments)]
 /// Where request `r`'s logits sit in the fire's logits buffer.
 ///
-/// Its ROW is `qo_indptr[r + 1] - 1` — the last row of its token span.
-/// Its OFFSET is that row's ORDINAL among the rows the fire read out,
-/// because `lower::epilogue` states a gather whenever the fire samples
-/// fewer rows than it computes and the buffer is then `[sampled, vocab]`
-/// in gather order.
-///
-/// The two coincide when every row samples, which is the decode case and
-/// was the only case while the shell forced `samples: true`. A fire whose
-/// readout rows are the wire's makes them differ on every prefill.
+/// Its row is `qo_indptr[r + 1] - 1` (the last row of its token span); its
+/// offset is that row's ordinal among the rows the fire read out, because the
+/// gather packs the buffer as `[sampled, vocab]` in gather order. The two
+/// coincide only when every row samples (the decode case).
 fn logits_row_of(span_end: usize, rows: usize, sampled_rows: &[u32]) -> usize {
     let row = span_end.saturating_sub(1).min(rows.saturating_sub(1));
     if sampled_rows.len() == rows {
@@ -983,13 +586,9 @@ fn logits_row_of(span_end: usize, rows: usize, sampled_rows: &[u32]) -> usize {
 }
 
 fn deliver_logits(
-    // THE THREE FIELDS OF `Shell` THIS PHASE TOUCHES, and not `&mut
-    // Shell`. Not a style choice: `model` and `named_bufs` below are
-    // borrowed OUT of the shell by the caller, so a `&mut Shell` here is
-    // a borrow conflict, and the fix that keeps working is to name the
-    // disjoint fields rather than to widen the borrow. It also documents
-    // the phase — delivery reads the roster and the channel table and
-    // writes exactly one buffer.
+    // The disjoint `Shell` fields this phase touches, not `&mut Shell`:
+    // `model` and `named_bufs` are borrowed out of the shell by the caller,
+    // so a whole-shell borrow here would conflict.
     instances: &std::collections::BTreeMap<u64, InstanceEntry>,
     channels: &std::collections::BTreeMap<u64, ChannelState>,
     logits_staging: &mut Option<crate::device::PinnedBuf>,
@@ -1007,49 +606,31 @@ fn deliver_logits(
     // Where each request's token span ends, so its answer row can be
     // found. `qo_indptr[r + 1] - 1` is request `r`'s last row.
     qo_indptr: &[u32],
-    // The rows the fire read out, in the order the epilogue's gather
-    // compacted them. A request's logits live at its ORDINAL here, not at
-    // its row: the buffer holds `[sampled, vocab]` once a gather runs.
+    // The rows the fire read out, in gather order: a request's logits live at
+    // its ordinal here, not its row, once a gather packs `[sampled, vocab]`.
     sampled_rows: &[u32],
-    // The requests this fallback is for — the ones whose PTIR program did
-    // not publish. A frame can be mixed, and a request that already has a
-    // sampled answer must not also get a vocabulary.
+    // The requests this fallback is for — those whose PTIR program did not
+    // publish; a request with a sampled answer must not also get a vocabulary.
     serve: &[usize],
     debt: &mut Option<FireDebt>,
 ) -> Result<(), i32> {
     use model_compiler::lower::Arg;
-    // ── Delivery: the LAST row's logits, out through the instance's
-    // reader channel. The convention until the launch package's channel
-    // table is parsed: the roster's first instance, its first registered
-    // channel with `host_role == READER` whose cell is `[vocab]` f32.
-    // Device bf16 widens to the f32 wire on the host.
+    // The last launch output that names a value — the logits buffer.
     let logits_value = (0..lowered.launches.len()).rev().find_map(|i| {
         dplan.spec(i).outs.first().and_then(|a| match a {
             Arg::Named { value, .. } => Some(*value),
             Arg::Arena { .. } | Arg::Weight(_) => None,
         })
     });
-    // THE STEP'S instances, one per wire request. See `request_instances`:
-    // the frame's roster is not the step's, and reading it directly gave every
-    // step of a multi-slot frame the FIRST slot's reader channel.
+    // The step's instances, one per wire request (`request_instances`): the
+    // frame's roster is not the step's.
     let instance_ids = request_instances;
     let vocab = model.deployment.shape.vocab as usize;
 
-    // EVERY REQUEST, each its OWN reader channel and its OWN row.
-    //
-    // This used to take `instance_ids.first()` and `rows - 1`, so a frame
-    // with a roster of two published request 0's vocabulary and returned
-    // request 1 nothing at all. The row is not the index: request `r` owns
-    // `qo_indptr[r]..qo_indptr[r + 1]`, so its answer is at
-    // `qo_indptr[r + 1] - 1` — equal to `r` on a decode, and not on a
-    // prefill.
-    //
-    // And the row is not the OFFSET either, once the epilogue compacts. A
-    // fire that reads fewer rows than it computes states a gather, so the
-    // logits buffer holds `[sampled, vocab]` in gather order and a
-    // request's answer sits at its ORDINAL among the sampled rows. Those
-    // coincide exactly when every row samples — which is what the shell
-    // used to force, and why the distinction could be ignored.
+    // Every request, each its own reader channel and its own row: request `r`
+    // owns `qo_indptr[r]..qo_indptr[r + 1]`, so its answer is at
+    // `qo_indptr[r + 1] - 1` (equal to `r` only on a decode), and once the
+    // epilogue compacts, at its ordinal among the sampled rows.
     let readouts: Vec<(ChannelState, usize)> = serve
         .iter()
         .filter_map(|&r| {
@@ -1067,26 +648,20 @@ fn deliver_logits(
         })
         .collect();
 
-    // THE D2H IS ENQUEUED, NOT AWAITED. Its destination belongs to
-    // the debt rather than to this stack frame — a `Vec` here would
-    // be freed the moment this call returns, which with an
-    // asynchronous completion is before the copy lands.
-    //
-    // ONE copy carries every row, so N requests cost one D2H and N
-    // widenings rather than N copies.
+    // The D2H is enqueued, not awaited: its destination belongs to the debt,
+    // not this stack frame — a `Vec` here would be freed before an async copy
+    // lands. One copy carries every row: N requests cost one D2H, N widenings.
     if let (Some(lv), false) = (logits_value, readouts.is_empty())
         && let Some(buf) = named_bufs.get(&lv)
     {
         match debt.as_mut() {
             Some(d) => {
-                // The shell's buffer, grown to fit and reused. Not the
-                // debt's: see `FireDebt::staging`.
+                // The shell's buffer, grown to fit and reused (not the debt's).
                 if logits_staging.as_ref().is_none_or(|p| p.len() < buf.len()) {
-                    // PARKED, not dropped. `PinnedBuf::drop` is a
-                    // `cudaFreeHost` on this thread and is not stream-ordered,
-                    // so freeing here would pull the memory out from under an
-                    // earlier fire's queued D2H and under its debt's
-                    // `(ptr, len)`. See `Shell::retired_staging`.
+                    // Parked, not dropped: `PinnedBuf::drop` is a
+                    // `cudaFreeHost` that is not stream-ordered, so freeing
+                    // here would pull memory out from under an earlier fire's
+                    // queued D2H.
                     retired_staging
                         .extend(logits_staging.replace(crate::device::PinnedBuf::new(buf.len())?));
                 }
@@ -1097,8 +672,7 @@ fn deliver_logits(
                 d.readouts = readouts;
             }
             None => {
-                // A step that owes nothing has already synchronized,
-                // so the old shape is still correct for it.
+                // A step that owes nothing has already synchronized.
                 let mut bf16 = vec![0u8; buf.len()];
                 buf.copy_to_host(&mut bf16, stream)?;
                 stream.synchronize()?;
@@ -1128,39 +702,15 @@ fn deliver_logits(
 /// Make the shell's persistent device state ready, and reclaim what the
 /// last fires finished with.
 ///
-/// `step_impl`'s DEVICE STATE phase, promoted out of it — and the reason
-/// it could be is that it is the only phase before the launch that takes
-/// `&mut Shell` and borrows nothing else. Extracting it is what lets
-/// every shared borrow below it (`model`, the lowering, the stream, the
-/// allocator) be taken AFTER the mutation rather than across it, which is
-/// the borrow conflict that stopped `deliver_logits` from taking a
-/// `&mut Shell` and would have stopped each of these too.
+/// The stream and allocator are the shell's, not per-fire: a pooling allocator
+/// rebuilt every fire has no pool, and run-ahead needs a stream that outlives
+/// the call so a second fire can queue behind the first.
 ///
-/// The stream and the allocator used to be built per fire. The stream
-/// because nothing needed it to outlive the call, and the allocator
-/// because it was convenient — but an allocator that POOLS and is rebuilt
-/// every fire has no pool, so every buffer a fire wanted was a fresh
-/// `cudaMalloc`. Both are the shell's now, which is a saving on its own
-/// and is the precondition for run-ahead: a second fire cannot queue
-/// behind the first onto a stream that dies with the first call.
-///
-/// # Reclaim, and when it waits
-///
-/// A fire's scratch cannot be freed while it runs and cannot be freed
-/// from the callback — CUDA forbids calling the runtime from a host
-/// function, and `cudaFree` is the runtime — so it is freed here. What
-/// matters is WHEN.
-///
-/// This used to hold exactly one holder and `synchronize()` on it, which
-/// is a run-ahead that never runs ahead: the call that would queue fire
-/// n+1 blocked until fire n had finished. It cost nothing to notice while
-/// issuing a fire took longer than running one, and it is the whole game
-/// now that issue is 0.81 ms against 2.9 ms of work.
-///
-/// So: drop everything already retired without asking the driver to wait,
-/// and wait only when the queue is at depth. `RUNAHEAD_DEPTH` is the
-/// backpressure — the driver runs at most that many fires ahead of the
-/// GPU, which bounds the SCRATCH it is holding rather than the time.
+/// Reclaim: a fire's scratch cannot be freed while it runs or from the
+/// callback (CUDA forbids calling the runtime from a host function), so it is
+/// freed here. Drop everything already retired without waiting, and wait only
+/// when the queue is at `RUNAHEAD_DEPTH` — the backpressure that bounds how
+/// much scratch the driver holds.
 #[cfg(feature = "abi")]
 fn ready_device_state(state: &mut Shell) -> Result<(), i32> {
     if state.fire_stream.is_none() {
@@ -1173,21 +723,11 @@ fn ready_device_state(state: &mut Shell) -> Result<(), i32> {
         let done = state.in_flight.pop_front().expect("just checked");
         retire(done);
     }
-    // NOTHING IN FLIGHT IS THE ONLY MOMENT a replaced staging buffer is
-    // certainly unreferenced, and what makes that true is an ORDERING
-    // worth stating because nothing else does:
-    //
-    //   `host_fn(retire_fire, ..)` is enqueued FIRST, then the event
-    //   `InFlight::done` is recorded. Both are stream-ordered, so the
-    //   event cannot complete until the callback has returned.
-    //
-    // So an entry leaving `in_flight` proves its debt is already paid and
-    // dropped, and an EMPTY `in_flight` proves it of every fire. A debt
-    // cannot outlive the entry it belongs to, which is the only thing
-    // this clear needs.
-    //
-    // The two non-runahead paths pay synchronously and never push an
-    // entry at all, so they are covered by the same statement.
+    // An empty `in_flight` is the only moment a replaced staging buffer is
+    // certainly unreferenced: `retire_fire`'s host_fn is enqueued before the
+    // `InFlight::done` event is recorded, both stream-ordered, so an entry
+    // leaving `in_flight` proves its debt is already paid. The non-runahead
+    // paths pay synchronously and never push an entry.
     if state.in_flight.is_empty() {
         state.retired_staging.clear();
     }
@@ -1201,35 +741,13 @@ fn ready_device_state(state: &mut Shell) -> Result<(), i32> {
 
 /// The hybrids' recurrent context: driver-owned slabs, instance slots.
 ///
-/// `step_impl`'s GDN phase, promoted out of it — and the LARGEST of its
-/// phases at a hundred lines, which is why it is worth the six
-/// parameters. It also settles the design question the cut left open.
+/// Takes the disjoint `Shell` fields it touches (`gdn` mutable, `alloc`/
+/// `stream` shared) rather than `&mut Shell`, which would conflict with the
+/// borrows the caller holds.
 ///
-/// # Named fields, not a carrier
-///
-/// The middle phases each read the shell one way and write it another,
-/// so `&mut Shell` is a borrow conflict against the `model`, `stream`
-/// and `alloc` the caller already holds — the same wall `deliver_logits`
-/// hit. Two answers were on the table: a `Fire<'a>` struct holding the
-/// borrowed halves, or naming the fields each phase touches.
-///
-/// Naming them wins, and doing it three times is what says so. This
-/// phase touches exactly ONE field of the shell (`gdn`) and reads four
-/// things the caller has already resolved; a carrier would have handed
-/// it the whole fire so it could reach one `Option`. The parameter list
-/// IS the phase's contract, and a reader who wants to know whether the
-/// recurrent slabs can affect the attention plan can answer it from the
-/// signature.
-///
-/// The `alloc`/`stream` pair is shared and `gdn` is mutable, which the
-/// compiler accepts at the call site because they are disjoint fields —
-/// and that is the property a carrier would have hidden rather than
-/// removed.
-///
-/// Returns the context the dispatch reads, and the slot-id buffer it
-/// points into: the buffer is returned rather than dropped because the
-/// context holds a raw pointer to it, and a fire that let it go would
-/// bind a freed address.
+/// Returns the context and the slot-id buffer it points into: the buffer is
+/// returned, not dropped, because the context holds a raw pointer into it — a
+/// fire that let it go would bind a freed address.
 #[cfg(feature = "abi")]
 fn gdn_context(
     gdn: &mut Option<GdnState>,
@@ -1250,10 +768,8 @@ fn gdn_context(
         let (conv_stride, state_stride) = (shape.conv_stride, shape.state_stride);
         const GDN_SLOTS: u32 = 8;
         if (*gdn).is_none() {
-            // THE PORTED CACHE OWNS THE LAYOUT. This used to allocate a
-            // `(conv, recurrent)` pair per linear layer and derive every
-            // stride here; `RecurrentStateCache` pools them and answers
-            // both, which is what its 1,467 tested lines were ported for.
+            // The ported cache owns the layout: it pools the `(conv,
+            // recurrent)` pairs and answers both strides.
             let is_linear: Vec<bool> =
                 (0..dep.layers).map(|l| shape.linear_layers.contains(&l)).collect();
             let cache =
@@ -1284,42 +800,26 @@ fn gdn_context(
             });
         }
         let gdn_state = (*gdn).as_mut().expect("just ensured");
-        // The ENGINE assigns slots: `rs_slot_ids`, one per request. RESET
-        // zeroes a slot before the fire; BUFFER_WRITE routes the pass's
-        // state into a buffer slot instead of the live one; FOLD copies
-        // the accepted prefix back afterwards. See the fold below.
+        // The engine assigns slots (`rs_slot_ids`, one per request): RESET
+        // zeroes a slot before the fire; BUFFER_WRITE routes the pass's state
+        // into a buffer slot instead of the live one; FOLD copies the accepted
+        // prefix back afterwards.
         let rs_slot_ids = step.plan.rs_slot_ids.as_slice();
         let rs_flags = step.plan.rs_slot_flags.as_slice();
         if rs_slot_ids.len() != requests {
             eprintln!("[driver-cuda] launch: hybrid fire without rs_slot_ids");
             return Err(PIE_STATUS_INVALID_ARGUMENT);
         }
-        // THE BUFFER/FOLD FLAGS ARE ACCEPTED NOW, and that is directive
-        // 4.2 of `.wiki/driver/graph.md`.
-        //
-        // They used to be refused wholesale — "rs fold/buffer flags await
-        // spec-decode" — which left the tree carrying TWO mechanisms for
-        // one job: this one, complete on the ABI side since v23/v24, and
-        // the repair fire classes (`CommitAdvance`, `StateOnly`,
-        // `FrozenVerify`) that existed only because this one was off.
-        //
-        // The mechanism is the whole argument for deleting them. A
-        // speculative decode writes its tokens into a BUFFER slot and
-        // folds only the accepted prefix into the live slot; a rejected
-        // token is simply never folded, so there is nothing to repair.
-        // `FrozenVerify` is "prefill plus a verify-stash store" — the
-        // buffer IS the stash. `CommitAdvance` is "replay the confirmed
-        // prefix" — the fold length IS that prefix.
+        // Buffer/fold flags: a speculative decode writes its tokens into a
+        // buffer slot and folds only the accepted prefix into the live slot,
+        // so a rejected token is never folded and there is nothing to repair.
         let rs_fold_lens = step.plan.rs_fold_lens.as_slice();
         let rs_buffer_slot_ids = step.plan.rs_buffer_slot_ids.as_slice();
         let rs_buffer_indptr = step.plan.rs_buffer_slot_indptr.as_slice();
         let need_slots = rs_slot_ids.iter().copied().max().map_or(1, |m| m + 1);
         gdn_state.ensure_slots(need_slots, epoch, &alloc, &stream)?;
-        // RESET, asked of the cache rather than written out. `reset_slot`
-        // emits one strided fill per buffer -- a `Memset2D` whose rows are
-        // the linear layers -- where this walked layers and issued a
-        // contiguous fill each. Same bytes, one call, and the semantics
-        // now live where they are tested.
+        // RESET, asked of the cache: `reset_slot` emits one strided fill per
+        // buffer (a `Memset2D` whose rows are the linear layers).
         for (r, &slot) in rs_slot_ids.iter().enumerate() {
             if rs_flags.get(r).copied().unwrap_or(0) & driver_api::local::PIE_RS_FLAG_RESET == 0 {
                 continue;
@@ -1334,11 +834,9 @@ fn gdn_context(
             .iter()
             .enumerate()
             .map(|(r, &live)| {
-                // A BUFFER_WRITE row's pass writes the BUFFER slot, not
-                // the live one — that is the whole of "the pass scatters
-                // its own tokens". The buffer CSR names one slot per
-                // buffered token; the pass writes the row's head, which
-                // is its first entry.
+                // A BUFFER_WRITE row's pass writes the buffer slot, not the
+                // live one: the buffer CSR names one slot per buffered token
+                // and the pass writes the row's head (its first entry).
                 let f = rs_flags.get(r).copied().unwrap_or(0);
                 let slot = if f & driver_api::local::PIE_RS_FLAG_BUFFER_WRITE != 0 {
                     rs_buffer_indptr
@@ -1355,12 +853,11 @@ fn gdn_context(
         // Every slot the fire names has to exist, buffer slots included.
         let need_buffer = rs_buffer_slot_ids.iter().copied().max().map_or(0, |m| m + 1);
         gdn_state.ensure_slots(need_buffer.max(need_slots), epoch, &alloc, &stream)?;
-        // THE FOLD, recorded on the fire's stream so it lands after the
-        // pass that filled the buffer. Copying the accepted prefix's LAST
-        // state into the live slot is the whole operation: a linear
-        // state is a running summary, so the state after token `k` is the
-        // state the next fire continues from, and the tokens past `k`
-        // were rejected and are simply never folded.
+        // The fold, recorded on the fire's stream so it lands after the pass
+        // that filled the buffer: copy the accepted prefix's last state into
+        // the live slot. A linear state is a running summary, so the state
+        // after the accepted token is where the next fire continues; the
+        // rejected tokens past it are never folded.
         for (r, &live) in rs_slot_ids.iter().enumerate() {
             let f = rs_flags.get(r).copied().unwrap_or(0);
             if f & driver_api::local::PIE_RS_FLAG_FOLD == 0 {
@@ -1370,11 +867,9 @@ fn gdn_context(
                 (Some(&lo), Some(&hi)) => (lo as usize, hi as usize),
                 _ => continue,
             };
-            // A device-resolved length is CLAMPED to the row's replay
-            // length, which the ABI names as the bound. The port itself
-            // is not read yet, so a device row folds its whole replay —
-            // the conservative answer, and the one a non-speculative
-            // fire produces anyway.
+            // A device-resolved length is clamped to the row's replay length
+            // (the ABI bound). The port is not read yet, so a device row folds
+            // its whole replay — the conservative answer.
             let span = hi.saturating_sub(lo);
             let want = if f & driver_api::local::PIE_RS_FLAG_FOLD_LEN_DEVICE != 0 {
                 span
@@ -1388,12 +883,10 @@ fn gdn_context(
             let Some(&src_slot) = rs_buffer_slot_ids.get(lo + take - 1) else {
                 continue;
             };
-            // The LINEAR halves only, which is the cache's own asymmetry
-            // and worth taking from it rather than reinventing: a fold
-            // restores recurrent state to the accepted prefix, but the MTP
-            // pending-hidden row was already rebuilt from exactly those
-            // accepted tokens, so copying it would overwrite the newer
-            // value with an older one.
+            // Linear halves only: a fold restores recurrent state to the
+            // accepted prefix, but the MTP pending-hidden row was already
+            // rebuilt from those accepted tokens, so copying it would
+            // overwrite the newer value with an older one.
             let Ok(ops) = gdn_state.cache.copy_linear_state_slot_d2d(
                 i32::try_from(src_slot).unwrap_or(-1),
                 i32::try_from(live).unwrap_or(-1),
@@ -1413,14 +906,10 @@ fn gdn_context(
             v_d: shape.v_d,
             conv_dim: shape.conv_dim,
             conv_k: shape.conv_k,
-            // mamba's B/C group count, off the statement. This was the
-            // literal `0` while `RecurrentShape::k_h` carried the real
-            // eight — so `selective_scan_update` scanned at zero groups
-            // and the grouped gated norm divided by it.
+            // mamba's B/C group count, off the statement.
             n_groups: shape.n_groups,
-            // Still one base per MODEL layer, so nothing downstream moved:
-            // the pooling changed where a base comes FROM, not what a
-            // launch is handed.
+            // Still one base per model layer: pooling changed where a base
+            // comes from, not what a launch is handed.
             conv_state: (0..gdn_state.is_linear.len()).map(|l| gdn_state.conv_base(l)).collect(),
             conv_stride_elems: gdn_state.conv_stride_elems,
             recurrent_state: (0..gdn_state.is_linear.len())
@@ -1437,25 +926,16 @@ fn gdn_context(
 
 /// Size the KV pools for this fire and describe them per layer.
 ///
-/// `step_impl`'s KV phase. It touches ONE field of the shell — `kv` — and
-/// bumps the array epoch when it grows, which is the second reason it is
-/// worth being a function: growth MOVES base addresses, so every capture
-/// that recorded one is stale, and the bump is what says so. Keeping that
-/// pair in one place is what keeps a reader from having to notice it.
+/// Bumps the array epoch when it grows: growth moves base addresses, so every
+/// capture that recorded one is stale.
 ///
-/// # Per-layer geometry, and the layers that own no pool
+/// A family may share one layer's cache with another (gemma-4's trailing
+/// layers project no KV), so `kv_source(l)` says whose pool a layer reads and
+/// only the sources get an allocation; the returned vector is as long as the
+/// layer count, the pool vector is not.
 ///
-/// A family may share one layer's cache with another — gemma-4's trailing
-/// layers project no KV of their own — so `kv_source(l)` says whose pool a
-/// layer reads and only the SOURCES get an allocation. The views then
-/// point every layer at its source's pages, which is why the returned
-/// vector is as long as the layer count and the pool vector is not.
-///
-/// # What growth does not do
-///
-/// It REPLACES the pools without migrating pages. Decode continuity holds
-/// while page demand is stable, which is the single-frame world; page
-/// migration rides with `resize_pool`.
+/// Growth replaces the pools without migrating pages, so decode continuity
+/// holds only while page demand is stable; migration rides with `resize_pool`.
 #[cfg(feature = "abi")]
 #[allow(clippy::too_many_arguments)]
 fn kv_pools_for(
@@ -1469,19 +949,9 @@ fn kv_pools_for(
     stream: &crate::device::OwnedStream,
     format: crate::layout::KvCacheFormat,
 ) -> Result<Vec<crate::bind::abi::KvCacheLayerView>, i32> {
-    // THE PROVISIONER ASKS WHICH STORE, and that is §3.1's whole point:
-    // "if a family can differ in WHICH subsystem serves it, that
-    // difference is an enum the provisioner matches on — never a
-    // predicate the caller may forget to ask." This function built a
-    // paged cache for EVERY family and there was no MLA branch — not a
-    // `todo!()`, not a refusal, just an absence, which is how the MLA
-    // lineage loaded, reported itself healthy and would have died at its
-    // first fire.
-    //
-    // `load_model` refuses the two unbuilt styles at the door, which is
-    // the right place to answer a user. This match is the other half: a
-    // FOURTH `KvStyle` would be a compile error here rather than a
-    // family quietly served the wrong store.
+    // The provisioner asks which store, so a new `KvStyle` is a compile error
+    // here rather than a family quietly served the wrong store. `load_model`
+    // refuses the unbuilt styles at the door; this match is the other half.
     match dep.kv {
         model::deployment::KvStyle::Paged => {}
         model::deployment::KvStyle::Mla { .. }
@@ -1491,22 +961,19 @@ fn kv_pools_for(
     }
     let kv_heads_i = i32::try_from(model.deployment.shape.kv_heads).unwrap_or(0);
     let n = dep.layers;
-    // Per-layer geometry, family-decided: gemma-4's two layer kinds
-    // disagree on head dim, and its trailing layers own NO pages (they
-    // attend through their source's — the load-time decision).
+    // Per-layer geometry, family-decided: gemma-4's two layer kinds disagree
+    // on head dim, and its trailing layers own no pages (they attend through
+    // their source's).
     let per_layer = crate::pools::kv_cache::PerLayer {
         head_dim: dep.attention.iter().map(|a| a.head_dim as i32).collect(),
         kv_source_layer: dep.attention.iter().map(|a| a.kv_source as i32).collect(),
         num_kv_heads: vec![kv_heads_i; n as usize],
     };
-    // One set of pages has ONE shape, so a layer that reads through
-    // another's must have that layer's dims. gemma-4 holds this without
-    // trying — `kv_source` searches by the same predicate `head_dim_of`
-    // keys on — but that is an invariant spread across two functions in
-    // another crate. A violation would not crash: every shared layer
+    // One set of pages has one shape, so a layer that reads through another's
+    // must share its dims. A violation would not crash — each shared layer
     // would read its source's pages at its own stride and emit plausible
-    // tokens. It matters HERE because `layer_view` reports an aliased
-    // layer's dims as its SOURCE's.
+    // tokens — which is why it is checked here, where `layer_view` reports an
+    // aliased layer's dims as its source's.
     per_layer.check_sharing()?;
 
     let grow = !matches!(&(*kv), Some(kv) if kv.num_pages >= need_pages);
@@ -1524,21 +991,16 @@ fn kv_pools_for(
         let mut ops = crate::pools::kv_cache_live::LiveKvCacheOps::new(stream.as_ref(), alloc);
         let cache = crate::pools::kv_cache_live::KvCache::materialize(layout, &mut ops)?;
         let mut held = ops.into_held();
-        // `materialize` does not zero, and the C++ did not either — but
-        // the shell's hand-built pools did, and a page read before its
-        // first write is otherwise whatever the allocator last had.
+        // `materialize` does not zero, and a page read before its first write
+        // is otherwise whatever the allocator last had.
         for b in &mut held {
             b.memset(0, stream.as_ref())?;
         }
 
-        // NOTE: growth REPLACES the pages without migrating them — decode
-        // continuity holds while the page demand is stable, which is the
-        // single-frame smoke's world. Page migration rides with resize_pool.
-        //
-        // AND IT MOVES BASE ADDRESSES, so every capture that recorded one is
-        // stale. Same rule as `Scratch`'s own growth, and the same
-        // relocation: `install_kv` owns the bump so neither this path nor
-        // `resize_pool` can install a moved pool without one.
+        // Growth replaces the pages without migrating them (decode continuity
+        // holds while page demand is stable) and moves base addresses, so
+        // every capture that recorded one is stale. `install_kv` owns the
+        // epoch bump so no moved pool installs without one.
         crate::serve::state::install_kv(
             kv,
             epoch,
@@ -1574,10 +1036,9 @@ struct FireInputs {
     head_dim_i: i32,
     /// Per-layer views of the KV pool, in layer order.
     layers: Vec<crate::bind::abi::KvCacheLayerView>,
-    /// Which rows carry a sampled logit, by fire-row index.
-    ///
-    /// Returned as well as uploaded because delivery indexes by SAMPLED
-    /// ORDINAL — `logits_row_of` needs the host copy after the fire.
+    /// Which rows carry a sampled logit, by fire-row index. Returned as well
+    /// as uploaded because delivery indexes by sampled ordinal —
+    /// `logits_row_of` needs the host copy after the fire.
     sampled_rows: Vec<u32>,
     d_ids: *const u32,
     d_pos: *const u32,
@@ -1593,16 +1054,12 @@ struct FireInputs {
     d_valid: *mut core::ffi::c_void,
 }
 
-/// Grow the KV pool to fit the step and upload every descriptor array it
-/// needs. The fire's first phase, `lap("kv+arrays")`.
+/// Grow the KV pool to fit the step and upload every descriptor array it needs
+/// — the fire's first phase.
 ///
-/// TAKES ITS FIELDS, NOT THE SHELL, and that is not a style choice. The
-/// phase writes `kv` and `fire_arrays` while reading `fire_alloc` and
-/// `fire_stream`, which the borrow checker permits only because they are
-/// distinct fields of one struct. A `&mut Shell` parameter collapses that
-/// distinction and the body stops compiling. The parameter list is
-/// therefore an accurate statement of what the phase touches — which is
-/// the property that makes the cut worth making.
+/// Takes the disjoint `Shell` fields it writes (`kv`, `fire_arrays`) and reads
+/// (`fire_alloc`, `fire_stream`) rather than `&mut Shell`, which would not
+/// compile.
 #[allow(clippy::too_many_arguments)]
 fn kv_and_arrays(
     kv: &mut Option<KvState>,
@@ -1628,10 +1085,8 @@ fn kv_and_arrays(
     } = step;
     let need_pages = required_kv_pages.max(kv_indices.iter().copied().max().map_or(1, |m| m + 1));
     let page_size: i32 = 16;
-    // Re-derived here as well as inside `kv_pools_for`, because the
-    // attention plans below want the same two numbers and returning them
-    // would make the phase's result a tuple whose second half is a
-    // restatement of its arguments.
+    // Re-derived here as well as in `kv_pools_for`: the attention plans below
+    // want the same two numbers.
     let (kv_heads_i, head_dim_i) = (
         i32::try_from(model.deployment.shape.kv_heads).unwrap_or(0),
         i32::try_from(model.deployment.shape.head_dim_alloc()).unwrap_or(0),
@@ -1648,10 +1103,9 @@ fn kv_and_arrays(
         format,
     )?;
 
-    // The fire's descriptor arrays, POOLED like the arena and for the same
-    // reason: a capture bakes an address, so the buffer has to be the same
-    // one next fire with only its contents refreshed. Slots are positional
-    // and this is the whole list of them.
+    // The fire's descriptor arrays, pooled like the arena: a capture bakes an
+    // address, so the buffer must be the same one next fire with only its
+    // contents refreshed. Slots are positional.
     let d_ids = fire_arrays.upload_u32(alloc, slot::IDS, token_ids, stream.as_ref())?;
     let d_pos = fire_arrays.upload_u32(alloc, slot::POS, position_ids, stream.as_ref())?;
     let d_kv_indices =
@@ -1659,27 +1113,23 @@ fn kv_and_arrays(
     let d_kv_indptr = fire_arrays.upload_u32(alloc, slot::KV_INDPTR, kv_indptr, stream.as_ref())?;
     let d_kv_lens = fire_arrays.upload_u32(alloc, slot::KV_LENS, kv_lens, stream.as_ref())?;
     let d_qo = fire_arrays.upload_u32(alloc, slot::QO, qo_indptr, stream.as_ref())?;
-    // WHICH ROWS the epilogue gathers, from the rows the step described.
-    // Derived here rather than taken from `sampling_indices` directly, so
-    // the pointer and the guard that produced it cannot disagree: the
-    // lowering states a gather exactly when `sampled < window.len()`, and
-    // it counts the same `Row::samples` this reads.
+    // Which rows the epilogue gathers, derived here rather than from
+    // `sampling_indices` so the pointer and the guard that produced it cannot
+    // disagree: both count the same `Row::samples`.
     let sampled_rows: Vec<u32> = fire_rows
         .iter()
         .enumerate()
         .filter_map(|(i, r)| r.samples.then_some(u32::try_from(i).unwrap_or(0)))
         .collect();
     let d_sampled = if sampled_rows.len() == rows {
-        // Every row sampled means no gather is stated, and a pointer for
-        // a launch nobody makes is one more thing to keep in step.
+        // Every row sampled means no gather is stated.
         core::ptr::null()
     } else {
         fire_arrays.upload_u32(alloc, slot::SAMPLED, &sampled_rows, stream.as_ref())?
     };
 
-    // Write targets: each request appends its NEW tokens at the CSR tail.
-    // Decode appends one token at `len - 1`; prefill appends its whole
-    // window ending there.
+    // Write targets: each request appends its new tokens at the CSR tail —
+    // decode one token at `len - 1`, prefill its whole window ending there.
     let mut w_page = Vec::with_capacity(rows);
     let mut w_off = Vec::with_capacity(rows);
     for r in 0..requests {
@@ -1694,8 +1144,7 @@ fn kv_and_arrays(
     }
     let d_w_page = fire_arrays.upload_u32(alloc, slot::W_PAGE, &w_page, stream.as_ref())?;
     let d_w_off = fire_arrays.upload_u32(alloc, slot::W_OFF, &w_off, stream.as_ref())?;
-    // POOLED, because a capture bakes `row_valid_d`. See
-    // `Scratch::row_valid`.
+    // Pooled, because a capture bakes `row_valid_d`.
     let d_valid = fire_arrays.row_valid(alloc, rows, stream.as_ref())?;
 
     Ok(FireInputs {
@@ -1729,34 +1178,35 @@ struct PlanGeometry<'a> {
 
 /// The attention plans and workspaces a fire binds against.
 ///
-/// RAW POINTERS AND COPIES, deliberately: the plans live in `FireScratch`
-/// for the driver's lifetime, and returning borrows of them would keep
-/// `state.scratch` mutably borrowed across the whole rest of the fire.
+/// Raw pointers and copies, deliberately: the plans live in `FireScratch` for
+/// the driver's lifetime, and returning borrows would keep `state.scratch`
+/// mutably borrowed across the rest of the fire.
 struct AttnPlans {
     decode_plan: *mut std::ffi::c_void,
     decode_plan_full: *mut std::ffi::c_void,
     prefill_plan: *mut std::ffi::c_void,
     workspace: crate::bind::abi::AttentionWorkspaceView,
-    /// The workspace the prefill arm binds — which is the DECODE one for
-    /// the planless family, because it never raised a prefill plan and a
-    /// view of an unplanned workspace is not one a kernel may read.
+    /// The workspace the prefill arm binds — the decode one for the planless
+    /// family, because it never raised a prefill plan and a view of an
+    /// unplanned workspace is not one a kernel may read.
     prefill_workspace: crate::bind::abi::AttentionWorkspaceView,
     /// Does the lowered text state the flashinfer DECODE dispatch? Read by
     /// the score sink, which sizes a one-wide window for it.
     states_decode_dispatch: bool,
+    /// Does it plan its prefill INSIDE the fire? True when no arm states a
+    /// prefill schedule, which is the claim `PrefillStyle::Planless` used to
+    /// make one layer up.
+    planless_prefill: bool,
+    /// Does the stack keep a second decode schedule, one per layer kind?
+    two_decode_kinds: bool,
 }
 
-/// Allocate the workspaces on first fire, then raise EVERY plan the
-/// geometry permits. The fire's `lap("attn-plan")` phase.
-///
-/// Every plan, not just the one this fire's text states: under
-/// `GuardMode::Union` both arms of an attention guard are recorded, and a
-/// capture that walks an arm whose plan was never raised is abandoned.
-/// Prepared state belongs to the BUCKET rather than to the arm
-/// (`.wiki/driver/graph.md` §5 ①).
+/// Allocate the workspaces on first fire, then raise every plan the geometry
+/// permits — not just the one this fire's text states: under `GuardMode::Union`
+/// both arms of an attention guard are recorded, and a capture that walks an
+/// arm whose plan was never raised is abandoned.
 fn raise_attn_plans(
     scratch_slot: &mut Option<FireScratch>,
-    dep: &model::deployment::Deployment,
     model: &LoadedModel,
     lowered: &model_compiler::lower::Lowered,
     geom: PlanGeometry<'_>,
@@ -1770,10 +1220,9 @@ fn raise_attn_plans(
     if scratch_slot.is_none() {
         let ws = AttentionWorkspace::allocate(&mut sops, 32 << 20, 16 << 20, 2)?;
         let prefill_ws = AttentionWorkspace::allocate(&mut sops, 32 << 20, 16 << 20, 2)?;
-        // A THIRD workspace, for the peel tail, and the reason is
-        // `prefill_ws`'s: a plan writes into the workspace it was raised
-        // against, and a peel launches BOTH regions, so the tail cannot
-        // plan into the prefix's.
+        // A third workspace for the peel tail: a plan writes into the
+        // workspace it was raised against, and a peel launches both regions,
+        // so the tail cannot plan into the prefix's.
         let tail_ws = AttentionWorkspace::allocate(&mut sops, 32 << 20, 16 << 20, 2)?;
         *scratch_slot = Some(FireScratch {
             ws,
@@ -1793,95 +1242,76 @@ fn raise_attn_plans(
         &mut scratch.decode_plan_full,
         &mut scratch.prefill_plan,
     );
-    // Plan for the dispatch the LOWERED text actually states — not the
-    // fire class: the hybrid's `prefill_decode` fact routes a
-    // single-request decode through the PREFILL flashinfer path
-    // (`TokensLE(1)` resolves at lower time).
-    let states_decode_dispatch =
-        lowered.kernels.iter().any(|k| k == "attn::dispatch_attention_flashinfer_decode");
+    // What the text stated, not what its symbols imply and not the fire class:
+    // a union trace carries both classes as guard arms, so a capture stands on
+    // the schedules its arms state.
+    use model_ir::trace::PrepKind;
+    let mut decode_wanted: Vec<(u32, bool)> = Vec::new();
+    let mut prefill_head_dim: Option<u32> = None;
+    for p in &lowered.preps {
+        match p.kind {
+            PrepKind::DecodeAttention { head_dim, full_attention } => {
+                if !decode_wanted.contains(&(head_dim, full_attention)) {
+                    decode_wanted.push((head_dim, full_attention));
+                }
+            }
+            // The widest stated, so a stack whose layers disagree plans the
+            // schedule that addresses the most: one prefill plan is raised.
+            PrepKind::PrefillAttention { head_dim } => {
+                prefill_head_dim =
+                    Some(prefill_head_dim.map_or(head_dim, |d: u32| d.max(head_dim)));
+            }
+        }
+    }
+    let states_decode_dispatch = !decode_wanted.is_empty();
     ws.begin_plan_update(&mut sops)?;
-    // EVERY PLAN THE GEOMETRY PERMITS, not just the one this fire's text
-    // states. Under `GuardMode::Union` both arms of an attention guard are
-    // recorded, and a capture that walks an arm whose plan was never
-    // raised is abandoned — so prepared state belongs to the bucket rather
-    // than to the arm (`.wiki/driver/graph.md` §5 ①). It is also the
-    // precondition for §4.1: a merged Decode/Prefill graph needs BOTH
-    // classes' plans standing whenever either is captured.
-    //
-    // The cost is plan-raise time. It is not runtime waste — the arm a
-    // fire does not take is skipped by the conditional, not executed.
-    let planless_prefill = dep.prefill == model::deployment::PrefillStyle::Planless;
-    // The four FlashInfer plan raises below all want the same number in
-    // the same width. Bound once so a plan and the buffer it schedules
-    // over cannot come from different readings.
     let q_heads_i = i32::try_from(model.deployment.shape.q_heads).unwrap_or(0);
-    let decode_plan_full_ptr = if let Some((d_sliding, d_full)) = dep.decode_head_dims() {
-        // TWO decode plans, one per layer kind — the C++'s
-        // `decode_plan_sliding` / `decode_plan_full` pair, because
-        // the kinds disagree on head dim and the planner bakes it in.
-        decode_plan.plan_decode_variant(
-            kv_indptr,
-            q_heads_i,
-            kv_heads,
-            d_sliding as i32,
-            page_size,
-            ws.view(),
-            raw_stream,
-            false,
-            false,
-            -1,
-        );
-        decode_plan_full.plan_decode_variant(
-            kv_indptr,
-            q_heads_i,
-            kv_heads,
-            d_full as i32,
-            page_size,
-            ws.view(),
-            raw_stream,
-            false,
-            true,
-            -1,
-        );
-        decode_plan_full.as_ptr()
-    } else {
-        decode_plan.plan_decode(
-            kv_indptr,
-            q_heads_i,
-            kv_heads,
-            head_dim,
-            page_size,
-            ws.view(),
-            raw_stream,
-            false,
-            -1,
-        );
-        core::ptr::null_mut()
+    // `enable_cuda_graph = true` on every raise: the deployment always
+    // captures, so the padded batch size stays constant between fires.
+    //
+    // The PAIR is what a stack with two head dims states: the windowed arm and
+    // the full-attention arm. `attn_plan` picks the full one on an unbounded
+    // window, so the full-attention entry is the one that fills `_full`.
+    let full = decode_wanted.iter().find(|(_, f)| *f).copied();
+    let windowed = decode_wanted.iter().find(|(_, f)| !*f).copied();
+    let decode_plan_full_ptr = match (windowed, full) {
+        // Two schedules that differ in WIDTH -- the planner bakes the head dim,
+        // so a stack running two needs two. Two that differ only in window are
+        // one schedule: the width is what the plan is.
+        (Some((d_win, _)), Some((d_full, _))) if d_win != d_full => {
+            decode_plan.plan_decode_variant(
+                kv_indptr, q_heads_i, kv_heads, d_win as i32, page_size,
+                ws.view(), raw_stream, true, false, -1,
+            );
+            decode_plan_full.plan_decode_variant(
+                kv_indptr, q_heads_i, kv_heads, d_full as i32, page_size,
+                ws.view(), raw_stream, true, true, -1,
+            );
+            decode_plan_full.as_ptr()
+        }
+        // One schedule, whichever arm stated it. A text that states none is a
+        // pure-prefill trace: `head_dim` keeps the geometry's answer so the
+        // plan still stands for a capture whose other arm is a decode.
+        _ => {
+            let d = windowed.or(full).map_or(head_dim, |(d, _)| d as i32);
+            decode_plan.plan_decode(
+                kv_indptr, q_heads_i, kv_heads, d, page_size,
+                ws.view(), raw_stream, true, -1,
+            );
+            core::ptr::null_mut()
+        }
     };
-    // gemma-4's prefill is PLANLESS (it plans internally per fire, off the
-    // host CSR mirrors) and its 512-wide layers take the naive kernel —
-    // there is nothing to pre-plan, so it is the one plan that stays
-    // unraised.
-    if !planless_prefill {
+    // A text whose prefill plans inside the fire states no prep.
+    let planless_prefill = prefill_head_dim.is_none();
+    if let Some(d) = prefill_head_dim {
         prefill_ws.begin_plan_update(&mut sops)?;
         prefill_plan.plan_prefill(
-            qo_indptr,
-            kv_indptr,
-            kv_lens,
-            q_heads_i,
-            kv_heads,
-            head_dim,
-            page_size,
-            prefill_ws.view(),
-            raw_stream,
-            false,
-            -1,
+            qo_indptr, kv_indptr, kv_lens, q_heads_i, kv_heads, d as i32, page_size,
+            prefill_ws.view(), raw_stream, true, -1,
         );
-        // THE FENCE IS THE POINT, so dropping its result is dropping the
-        // guarantee. A FlashInfer plan writes its schedule into the
-        // workspace it was raised against and `end_plan_update` records
-        // the event that says the upload landed; a failure here means a
-        // launch reads a schedule that is not there yet.
+        // The fence is the point: `end_plan_update` records the event that
+        // says the schedule upload landed, so a launch cannot read a schedule
+        // that is not there yet.
         prefill_ws.end_plan_update(&mut sops, raw_stream)?;
     }
     ws.end_plan_update(&mut sops, raw_stream)?;
@@ -1893,6 +1323,8 @@ fn raise_attn_plans(
         workspace: ws.view(),
         prefill_workspace: if planless_prefill { ws.view() } else { prefill_ws.view() },
         states_decode_dispatch,
+        planless_prefill,
+        two_decode_kinds: !decode_plan_full_ptr.is_null(),
     })
 }
 
@@ -1909,16 +1341,11 @@ struct SeamPins {
     d_attn_out: *mut std::ffi::c_void,
 }
 
-/// Size and publish the resident seam buffers this fire's arms may read.
-///
-/// UNCONDITIONALLY, and that is the point. `WantsAttnScore` and
-/// `HasCustomMask` are FOLDED predicates: one exec serves the fire that
-/// wants scores and the fire that does not, and under `GuardMode::Union`
-/// both arms are recorded whether or not this fire takes either. So the
-/// question is not "what does this fire need" but "what could any arm
-/// need". A capture that walks an arm whose pin was never published is
-/// abandoned. The cost is resident memory, not runtime: the arm a fire
-/// does not take is skipped by the conditional rather than executed.
+/// Size and publish the resident seam buffers this fire's arms may read,
+/// unconditionally: `WantsAttnScore` and `HasCustomMask` are folded predicates,
+/// so one exec serves the fire that wants a buffer and the fire that does not,
+/// and a capture that walks an arm whose pin was never published is abandoned.
+/// The cost is resident memory, not runtime — the untaken arm is skipped.
 #[allow(clippy::too_many_arguments)]
 fn publish_seam_pins(
     fire_arrays: &mut crate::fire::scratch::Scratch,
@@ -1931,8 +1358,8 @@ fn publish_seam_pins(
     geom: PlanGeometry<'_>,
     rows: usize,
     states_decode_dispatch: bool,
-    // How many score rows the sink keeps — `crate::boot`'s, so the one
-    // parse of the knob reaches here rather than a second read of it.
+    // How many score rows the sink keeps — `crate::boot`'s, so the one parse of
+    // the knob reaches here.
     attn_score_window: u32,
 ) -> Result<SeamPins, i32> {
     let PlanGeometry { kv_indptr, kv_lens, qo_indptr, page_size, .. } = geom;
@@ -1941,23 +1368,9 @@ fn publish_seam_pins(
         // simply leave half the pin unread.
         fire_arrays.named(alloc, v, rows * w as usize * 4, stream.as_ref())?;
     }
-    // THE SCORE SINK IS UNCONDITIONAL, and that is a reversal.
-    //
-    // It used to be null on purpose: a fire that wants no scores prepares
-    // no score path, the capturing dispatch refuses without one, and
-    // refusing before the launcher is reached beats an exception crossing
-    // the C ABI with nowhere to go. Sound — but it makes the union decline
-    // every lowering that so much as MENTIONS `_capture`, which is the one
-    // case the union was built for. `WantsAttnScore` is a FOLDED
-    // predicate: one exec is supposed to serve the fire that wants scores
-    // and the fire that does not, and under `GuardMode::Union` both arms
-    // are recorded whether or not this fire takes either.
-    //
-    // So the question is not "what does this fire need" but "what could
-    // any arm need", and the answer is published every time. The cost is
-    // resident memory and plan-raise time; it is NOT runtime waste,
-    // because the arm a fire does not take is skipped by the conditional
-    // rather than executed. `.wiki/driver/graph.md` §5 ①.
+    // The score sink is published unconditionally: `WantsAttnScore` is a folded
+    // predicate, so the capturing arm must be recordable whether this fire
+    // wants scores or not.
     let score_window = if states_decode_dispatch { 1 } else { attn_score_window };
     let sink = crate::fire::attn_score::plan_score_sink(
         kv_indptr,
@@ -1967,9 +1380,8 @@ fn publish_seam_pins(
         score_window,
     );
     let (d_scores, d_folded, d_score_indptr) = match sink {
-        // A sink too large to publish (the prefill window grows with the
-        // context) keeps the old answer: null, and the capturing arm
-        // declines exactly as it did.
+        // A sink too large to publish (the prefill window grows with context)
+        // keeps the old answer: null, and the capturing arm declines.
         None => (core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null()),
         Some(p) => {
             let base = fire_arrays.score(alloc, &p, stream.as_ref())?;
@@ -1981,17 +1393,11 @@ fn publish_seam_pins(
         }
     };
 
-    // THE CUSTOM MASK, likewise unconditional. `HasCustomMask` is folded
-    // too, so the `_custom` arm has to be recordable whether or not this
-    // fire stages a mask. With nothing staged the resident form is plain
-    // causal — the same answer the unmasked arm computes — so taking the
-    // arm then is correct rather than merely safe. The addresses do not
-    // move either way.
-    // THE CALLER'S MASK WHEN THERE IS ONE, causal otherwise -- and the
-    // caller's is REFUSED rather than replaced when it does not describe
-    // this fire, because a fire asked to attend over a supplied mask and
-    // served causally returns an answer that looks exactly like a correct
-    // one. That was the whole reason `admit` used to turn the frame away.
+    // The custom mask, likewise unconditional (`HasCustomMask` is folded): with
+    // nothing staged the resident form is plain causal, so taking the `_custom`
+    // arm is correct, not merely safe. The caller's mask is used when there is
+    // one, but refused — not replaced — when it does not describe this fire,
+    // because attending causally over a supplied mask looks like a right answer.
     let staged = step.plan.has_user_mask.then(|| {
         let masks = step.plan.bitmask_words();
         crate::fire::page_mask::element_mask::from_words(
@@ -2030,10 +1436,10 @@ fn publish_seam_pins(
         }
     };
 
-    // The driver-owned attention landing, resolved BEFORE `named_bufs`
-    // borrows the map: a fire whose op join names no output slot lands
-    // here instead of losing its graph. Null when the family states its
-    // attention output as an SSA arg (gemma-4 does).
+    // The driver-owned attention landing, resolved before `named_bufs` borrows
+    // the map: a fire whose op join names no output slot lands here instead of
+    // losing its graph. Null when the family states its attention output as an
+    // SSA arg (gemma-4 does).
     let d_attn_out = if dep.attn_output == model::deployment::AttnOutput::DriverPinned {
         fire_arrays.attn_out(
             alloc,
@@ -2048,46 +1454,23 @@ fn publish_seam_pins(
     Ok(SeamPins { d_scores, d_folded, d_score_indptr, d_mask, d_mask_indptr, d_attn_out })
 }
 
-/// Which SSA value holds the attention QUERY, and where its output lands.
+/// Which SSA value holds the attention query, and where its output lands.
+/// Both are read off the lowering's join, not counted off launch positions,
+/// which is false under `Union`. `(None, None)` for a family that states
+/// [q, o] as SSA args (gemma-4).
 ///
-/// Both are read off the lowering's own join rather than counted off
-/// launch positions. A value found by counting is a fact derived from
-/// where a statement SITS, and that is false under `GuardMode::Union`,
-/// where every guard arm is present and the launch after the dispatch
-/// belongs to some other body.
-///
-/// `(None, None)` for a family that states [q, o] as SSA args — gemma-4
-/// does — because then there is no pin to find.
-/// Which SSA values the adapter correction reads and writes.
-///
-/// The same read [`attention_pins`] makes, for the same reason: a value
-/// found by COUNTING launches is a fact derived from where a statement
-/// sits, and that is false under `GuardMode::Union`, where every guard
-/// arm is present and the neighbour belongs to some other body. So this
-/// finds the launch by NAME and reads its own operands.
-///
-/// `(q, v, x)` — the two projection outputs the correction adds into,
-/// and the projection INPUT it reads. The first two are the launch's
-/// own args, which is what the executor's arm binds as `bound.args[0]`
-/// and `[1]`; the third is its FOREIGN operand (`LaunchSpec::aux[0]`),
-/// which is what the arm binds as `aux_slot(0)`.
-///
-/// The input being an aux is what makes this resolvable at all. It is
-/// not one of the correction's args — the statement does not carry it —
-/// and finding it any other way would mean knowing which named value
-/// the family's norm placement produces. The lowering already wrote it
-/// down.
-///
-/// `None` when the lowering states no correction, which is every
-/// adapter-free fire.
+/// Which SSA values the adapter correction reads and writes. `(q, v, x)`: the
+/// two projection outputs the correction adds into (bound as `args[0]`/`[1]`)
+/// and the projection input it reads — a foreign aux operand (`aux[0]`, bound
+/// as `aux_slot(0)`), which is what makes it resolvable. `None` when the
+/// lowering states no correction.
 struct LoraPins {
     /// The q-site output rows.
     q: model_ir::trace::ValueId,
     /// The v-site output rows.
     v: model_ir::trace::ValueId,
-    /// The projection input — normed value under `Pre`, residual stream
-    /// under `Post`, and the lowering knows which because the family
-    /// text stated it.
+    /// The projection input — normed value under `Pre`, residual stream under
+    /// `Post`; the lowering knows which.
     x: model_ir::trace::ValueId,
 }
 
@@ -2119,74 +1502,49 @@ fn attention_pins(
     states_decode_dispatch: bool,
 ) -> Result<(Option<model_ir::trace::ValueId>, Option<usize>), i32> {
     use model_compiler::lower::Arg;
-    // The guard-owned attention values, discovered from the lowering as
-    // the smokes discovered them. gemma-4 has NONE: both its attention
-    // forms state [q, o] as SSA args, so the pins stay null.
+    // The guard-owned attention values, discovered from the lowering. gemma-4
+    // has none: both its attention forms state [q, o] as SSA args, so the pins
+    // stay null.
     if dep.attn_output != model::deployment::AttnOutput::DriverPinned {
         return Ok((None, None));
     }
-    let dispatch_name = if states_decode_dispatch {
-        "attn::dispatch_attention_flashinfer_decode"
+    // Both decode spellings, as `states_decode_dispatch` above: a single-name
+    // lookup would refuse a `_lse`-stating family outright, since the `else`
+    // arm below is `PIE_STATUS_UNSUPPORTED`.
+    let dispatch_names: &[&str] = if states_decode_dispatch {
+        &[
+            "attn::dispatch_attention_flashinfer_decode",
+            "attn::dispatch_attention_flashinfer_decode_lse",
+        ]
     } else {
-        "attn::dispatch_attention_flashinfer_prefill_bf16"
+        &["attn::dispatch_attention_flashinfer_prefill_bf16"]
     };
-    let Some(fi) =
-        lowered.launches.iter().position(|x| lowered.kernels[x.kernel as usize] == dispatch_name)
+    let Some(fi) = lowered
+        .launches
+        .iter()
+        .position(|x| dispatch_names.contains(&lowered.kernels[x.kernel as usize].as_str()))
     else {
-        eprintln!("[driver-cuda] launch: the lowering states no {dispatch_name}");
+        eprintln!("[driver-cuda] launch: the lowering states no {}", dispatch_names[0]);
         return Err(PIE_STATUS_UNSUPPORTED);
     };
     let q_pin = lowered.launches[fi].args.clone().find_map(|ai| match &lowered.args[ai as usize] {
         Arg::Named { value, .. } => Some(*value),
         _ => None,
     });
-    // The dispatch's OUTPUT, read off its own op join.
-    //
-    // This used to be `launches[fi + 1]`'s first operand — "the launch
-    // after the dispatch is the o_proj, and its input is the slot the
-    // dispatch wrote". True under `Resolve`, where the guard has
-    // already deleted every arm the fire did not take, and false under
-    // `Union`, where every arm is present and the next launch belongs
-    // to some other guard's body.
-    //
-    // A value found by counting launches is a fact derived from where
-    // a statement SITS. The join says it: the attention statement
-    // carries one arg (q) and its output placement, which is exactly
-    // the slot wanted. Same read the executor's arms make.
-    // Prefer the join, fall back to the neighbour.
-    //
-    // The join is the STATED read: the attention statement carries its
-    // output placement, which is the slot the o_proj goes on to read.
-    // Where a deployment spells the attention with [q, o] as SSA args
-    // the join records no output of its own, and there the old
-    // positional read is still the only answer available.
-    //
-    // Positional is what breaks under `Union` — every guard arm is
-    // present, so the launch after the dispatch belongs to some other
-    // body — which is why the join is tried first rather than second.
-    // A JOIN THAT NAMES NO SLOT IS NOT A REFUSAL any more.
-    //
-    // This used to return `PIE_STATUS_UNSUPPORTED`, and before the
-    // union it also fell back to the neighbour read -- "the launch
-    // after the dispatch is the o_proj, so its input is the slot the
-    // dispatch wrote". That is a fact read off where a statement SITS,
-    // and it is false under `GuardMode::Union`, where every arm is
-    // present and the neighbour belongs to some other body.
-    //
-    // But `AttnCtx::o_out` is a DRIVER-owned pointer -- the whole
-    // reason it exists is that the region's launches record no SSA
-    // output of their own. So a fire whose join names no slot gets a
-    // driver-owned landing buffer, and keeps its graph
-    // (`.wiki/driver/graph.md` §5 (2)).
+    // The dispatch's output, read off its op join — the stated read: the
+    // attention statement carries its output placement, the slot the o_proj
+    // reads. Preferred over the neighbour launch (the old positional read)
+    // because positional breaks under `Union`, where every arm is present and
+    // the next launch belongs to some other body. A join that names no slot is
+    // not a refusal: `AttnCtx::o_out` is driver-owned, so the fire gets a
+    // driver-owned landing and keeps its graph.
     Ok((q_pin, attention_landing(lowered, dplan, fi)))
 }
 
 /// Where a sampling program reaches into the shell.
 ///
-/// A STRUCT OF FIELDS, not the shell: the phase writes `ptir_control` and
-/// `ptir_sessions` while reading `model` and the lowering, both of which
-/// are themselves borrows of the shell. Naming the fields is what keeps
-/// those disjoint.
+/// A struct of disjoint `Shell` fields, not `&mut Shell`: the phase writes
+/// `ptir_control` and `ptir_sessions` while reading `model` and the lowering.
 struct SamplingSites<'a> {
     instances: &'a std::collections::BTreeMap<u64, InstanceEntry>,
     channels: &'a std::collections::BTreeMap<u64, ChannelState>,
@@ -2200,21 +1558,12 @@ struct SamplingSites<'a> {
         &'a std::collections::BTreeMap<model_ir::trace::ValueId, crate::device::DeviceBuffer>,
 }
 
-/// Run each request's sampling PROGRAM, and report which requests still
-/// need raw logits.
+/// Run each request's sampling program over its own row, and report which
+/// requests still need raw logits.
 ///
-/// EVERY REQUEST, each over its OWN row. This used to fire only
-/// `instance_ids.first()` and then let a successful publish suppress
-/// `deliver_logits` for the whole frame — so a two-request batch sampled
-/// request 0 and returned request 1 NOTHING AT ALL: no sample, because
-/// its program never ran, and no logits, because request 0's had.
-///
-/// A frame can be MIXED — one request bound to a sampling program and
-/// another not — which is why the result is a set rather than a flag.
-///
-/// Everything about this degrades to the old behaviour: no program, a
-/// program that declines, inputs not ready, or channels this shell does
-/// not hold all fall through to the raw logits.
+/// A frame can be mixed — one request bound to a program, another not — so the
+/// result is a set, not a flag. No program, a decline, inputs not ready, or
+/// channels this shell does not hold all fall through to raw logits.
 #[allow(clippy::too_many_arguments)]
 fn run_sampling_programs(
     sites: SamplingSites<'_>,
@@ -2248,39 +1597,21 @@ fn run_sampling_programs(
         })
     });
     let logits_base = readout.and_then(|v| named_bufs.get(&v)).map_or(0, |b| b.as_ptr() as u64);
-    // EVERY REQUEST, each over its OWN row.
-    //
-    // This used to fire only `instance_ids.first()`, and then let a
-    // successful publish suppress `deliver_logits` for the whole frame —
-    // so a two-request batch sampled request 0 and returned request 1
-    // NOTHING AT ALL: no sample, because its program never ran, and no
-    // logits, because request 0's had.
-    //
-    // A request's logits row is the last row of its token span, which is
-    // what `qo_indptr` states: request `r` owns `qo_indptr[r]
-    // ..qo_indptr[r + 1]`, so its row is `qo_indptr[r + 1] - 1`. On a
-    // decode that is `r`; on a prefill it is not, and the difference is
-    // the whole reason to read the indptr rather than count.
-    //
-    // Still one lane per fire — `program::run`'s grouping is unbuilt — so
-    // this is N single-lane fires rather than one N-lane fire. Slower and
-    // correct, which is the right order.
-    // THE STEP'S instances, one per wire request — see `request_instances`.
-    // This read `frame.instance_ids[r]`, which is the FRAME's roster: in a
-    // `[prefill, decode]` frame both steps have one request, so both fired the
-    // prefill's program and the decode's channels never advanced.
+    // Every request over its own row: request `r`'s logits row is the last of
+    // its token span, `qo_indptr[r + 1] - 1` (`r` only on a decode). Still one
+    // lane per fire, so this is N single-lane fires, not one N-lane fire.
+    // The step's instances, one per wire request (`request_instances`), not
+    // the frame's roster.
     let instance_ids = request_instances;
-    // Which requests still need raw logits: the ones whose program did
-    // not publish. A frame can be MIXED — one request bound to a sampling
-    // program and another not — and each half has to be served, which is
-    // why this is a set rather than a flag.
+    // Which requests still need raw logits: those whose program did not
+    // publish. A mixed frame serves each half, so this is a set.
     let mut unsampled: Vec<usize> = Vec::new();
     for (r, &iid) in instance_ids.iter().enumerate() {
         let Some(&end) = qo_indptr.get(r + 1) else {
             break;
         };
-        // The ORDINAL, not the row — see `logits_row_of`. A sampling
-        // program reads the same compacted buffer the raw readback does.
+        // The ordinal, not the row (see `logits_row_of`): a sampling program
+        // reads the same compacted buffer the raw readback does.
         let row = logits_row_of(end as usize, rows, &sampled_rows);
         if run_program(
             instances,
@@ -2305,23 +1636,14 @@ fn run_sampling_programs(
     Ok(unsampled)
 }
 
-/// Which INSTANCE owns each of the step's wire requests.
+/// Which instance owns each of the step's wire requests.
 ///
-/// `frame.instance_ids` is the FRAME's roster and a step's `roster_rows` are
+/// `frame.instance_ids` is the frame's roster and a step's `roster_rows` are
 /// indices into it, so request `r`'s instance is not `instance_ids[r]` unless
-/// the step happens to use the whole roster in order — which is exactly what a
-/// single-slot frame does, and why reading the frame's roster directly was
-/// invisible until a frame carried two slots.
-///
-/// It is not invisible then. A `[prefill, decode]` frame has one instance per
-/// slot and both steps have one request, so BOTH steps read `instance_ids[0]`:
-/// the decode would fire the PREFILL's sampling program, publish the prefill's
-/// token again, and never advance its own channels.
-///
-/// `program_row_indptr` is the attribution the wire states. Absent, a roster
-/// the length of the request list is one request per member, in order; absent
-/// AND a different length, this falls back to the frame's roster, which is
-/// what the driver read before and is right for the single-member frame.
+/// the step uses the whole roster in order (a single-slot frame does).
+/// `program_row_indptr` is the attribution the wire states; absent, a roster
+/// the length of the request list is one request per member in order, and a
+/// differently-sized one falls back to the frame's roster.
 #[cfg(feature = "abi")]
 fn request_instances(
     frame: &FrameSubmission,
@@ -2360,20 +1682,13 @@ fn request_instances(
 /// Read the step's device-resolved descriptors and translate its pages.
 ///
 /// `None` when the step's own tables are already the fire — every member is
-/// host class and the frame states no page translation — which is the shape
-/// every prefill-only frame has and costs one pass over the roster.
+/// host class and the frame states no page translation.
 ///
-/// # Why an empty descriptor channel is a refusal here
-///
-/// `driver-vulkan` answers `Filled::Early` and lets the scheduler re-post,
-/// because its `launch` converts one step at a time and a chained slot's
-/// producer may genuinely not have run. This driver's `launch_impl` fires the
-/// frame's steps IN ORDER and synchronizes every one that does not carry the
-/// frame's completion, and `Session::fire` synchronizes again after its own
-/// regions — so by the time slot 1 is composed, slot 0's epilogue has
-/// committed and pushed. An empty cell here therefore is not "not yet": it is
-/// a chain the guest built that the driver did not walk, and reporting it as a
-/// retry would spin.
+/// An empty descriptor channel is a refusal here, not a retry: `launch_impl`
+/// fires the frame's steps in order and synchronizes each one that does not
+/// carry the completion, and `Session::fire` synchronizes after its regions, so
+/// by the time a slot is composed every earlier slot's epilogue has committed.
+/// An empty cell is a chain the guest built that the driver did not walk.
 #[cfg(feature = "abi")]
 fn compose_step(
     state: &mut Shell,
@@ -2387,9 +1702,9 @@ fn compose_step(
     };
     let page = state.facts.page_size;
     // A shell with no registry has ringed no instance, so it has no
-    // device-class member to resolve. The translation half still applies, and
-    // `compose` is what applies it — but it needs a registry to borrow, and
-    // building one here would allocate for a frame that names no program.
+    // device-class member to resolve. `compose` applies the translation half
+    // but needs a registry to borrow, and building one here would allocate for
+    // a frame that names no program.
     let Some(rings) = state.ptir_rings.as_mut() else {
         return Ok(None);
     };
@@ -2424,32 +1739,18 @@ fn compose_step(
     }
 }
 
-/// Ring every instance the frame names, BEFORE the forward runs.
+/// Ring every instance the frame names, before the forward runs.
 ///
-/// # Why this is not lazy any more
+/// Not lazy: a channel cell's address comes from a session's `Rings`, and
+/// `fwd.adapter` puts its `lora` sink in the program's prologue, which runs
+/// before the forward and so needs the address up front.
 ///
-/// `run_program` used to create a session on first use, and `run_program`
-/// runs AFTER the forward — it is the sampler. That is fine for a
-/// sampler and wrong for anything else, because a channel cell's ADDRESS
-/// comes from a session's `Rings`, and the one thing that needs an
-/// address before the forward is the thing the forward is supposed to
-/// apply: `fwd.adapter` puts its `lora` sink in the program's PROLOGUE,
-/// and a prologue is by definition before.
-///
-/// So the ordering was the whole of LoRA's remaining blocker — not a
-/// missing function. `model::lora::read_lora_sink` already resolves
-/// which channels an adapter arrives on; what it could not do was turn
-/// a channel index into a pointer, because the ring did not exist yet.
-///
-/// FAILURES ARE NOTED AND SWALLOWED, deliberately. A frame whose
-/// instance cannot be ringed still has a forward to run and raw logits
-/// to deliver; refusing here would turn a missing sampler into a dead
-/// request. `run_program` finds no session and declines, which is the
-/// path it already had.
+/// Failures are noted and swallowed: a frame whose instance cannot be ringed
+/// still has a forward to run and raw logits to deliver, and `run_program`
+/// declines when it finds no session.
 fn ensure_sessions(state: &mut Shell, frame: &FrameSubmission) {
-    // The stream and the allocator are separate FIELDS on purpose — see
-    // the north star §7: grouping them into one struct collapses a
-    // disjoint borrow the fire path depends on.
+    // The stream and allocator are separate fields on purpose: grouping them
+    // collapses a disjoint borrow the fire path depends on.
     let (Some(alloc), Some(stream)) = (state.fire_alloc.as_ref(), state.fire_stream.as_ref())
     else {
         return;
@@ -2466,10 +1767,9 @@ fn ensure_sessions(state: &mut Shell, frame: &FrameSubmission) {
             continue;
         };
         let channel_ids = instance.channel_ids.clone();
-        // THE REGISTRY FIRST, and a channel two instances name is registered
-        // ONCE. That is the whole point of the slot map: the prefill's
-        // `tok_in` and the decode's `EmbedTokens` channel are one id, so they
-        // get one ring and the decode reads what the prefill published.
+        // The registry first: a channel two instances name is registered once,
+        // so the prefill's `tok_in` and the decode's `EmbedTokens` share one
+        // ring and the decode reads what the prefill published.
         let rings = state.ptir_rings.get_or_insert_with(|| {
             crate::program::channel::Rings::new(alloc, &[], stream.as_ref())
                 .expect("an empty registry allocates nothing that can fail")
@@ -2483,15 +1783,10 @@ fn ensure_sessions(state: &mut Shell, frame: &FrameSubmission) {
             }
             match rings.register(alloc, shapes[dense], stream.as_ref()) {
                 Ok(slot) => {
-                    // THE SEED, at the one moment the ring is known empty.
-                    //
-                    // `driver::registry::bind_instance` pushes a seed into the
-                    // ring at bind and refuses one whose ring already holds a
-                    // cell; here the ring does not exist until now, so "at
-                    // registration" is the same moment. A channel a previous
-                    // instance registered keeps its cells, which is the
-                    // `continue` above — re-seeding it would overwrite what
-                    // that instance published.
+                    // The seed, at the one moment the ring is known empty: a
+                    // channel a previous instance registered keeps its cells
+                    // (the `continue` above), so re-seeding would overwrite
+                    // what that instance published.
                     if let Some((_, wire)) =
                         instance.seeds.iter().find(|(id, _)| id == channel)
                     {
@@ -2543,17 +1838,9 @@ fn ensure_sessions(state: &mut Shell, frame: &FrameSubmission) {
 
 /// The adapter phase: one lane per instance, and the state it stages.
 ///
-/// EXTRACTED, and the reason is the one `north-star.md`'s move 3 gives:
-/// a phase that stays inline stops being a phase. This one went in whole
-/// when LoRA landed and took `step_impl` from 536 lines back to 673 --
-/// which is the same regression the move was made to prevent, so it gets
-/// the same answer.
-///
-/// It takes its FIELDS and not the shell, which is that move's other
-/// finding: `named_bufs` is a shared borrow of `state.fire_arrays` and
-/// growing the pool is a unique one, so the two cannot be live together
-/// and a closure capturing `state` makes them so. The scratch is
-/// resolved before the closure for exactly that reason.
+/// Takes its fields, not the shell: `named_bufs` is a shared borrow of
+/// `state.fire_arrays` and growing the pool is a unique one, so they cannot be
+/// live together (the scratch is resolved before the closure for that reason).
 #[allow(clippy::too_many_arguments)]
 fn lora_phase(
     programs: &crate::program::Programs,
@@ -2574,16 +1861,9 @@ fn lora_phase(
     dplan: &crate::bind::DispatchPlan,
     rows: usize,
 ) -> Option<(crate::fire::lora::LoraFireState, *mut core::ffi::c_void)> {
-    // ── The adapter, if any request carries one ──
-    //
-    // Every piece is in place now: `read_lora_sink` resolves the plan,
-    // `lane_for_instance` resolves the addresses (which needed
-    // `ensure_sessions` to have run), `lora_pins` names the q and v the
-    // correction writes, and `llama_like_lora_stage` builds the state.
-    //
-    // ONE LANE PER INSTANCE, and the token span is the request's own —
-    // `qo_indptr[r]..qo_indptr[r+1]`, which is what makes an adapter
-    // apply to the rows that asked for it and no others.
+    // One lane per instance, and the token span is the request's own —
+    // `qo_indptr[r]..qo_indptr[r+1]`, which is what makes an adapter apply to
+    // the rows that asked for it and no others.
     let lora_lanes: Vec<crate::fire::lora::LoraLaneView> = frame
         .instance_ids
         .as_slice()
@@ -2604,21 +1884,9 @@ fn lora_phase(
             )
         })
         .collect();
-    // THE ROWS THE STAGING READS, from the correction's own operand
-    // join — the same read `attention_pins` makes, and false under
-    // `Union` if it were positional.
-    //
-    // `q` and `v` are the launch's own args; `x` is its FOREIGN operand
-    // (`LaunchSpec::aux[0]`), which is what makes the projection input
-    // resolvable at all. The statement does not carry it, so finding it
-    // any other way would have meant knowing which named value the
-    // family's norm placement produces — and the lowering already wrote
-    // it down.
-    // THE SCRATCH IS RESOLVED FIRST, outside the closure. Same wall the
-    // phase extraction hit: `named_bufs` is a shared borrow of
-    // `state.fire_arrays` and growing the pool is a unique one, so the
-    // two cannot be live together — and a closure capturing `state`
-    // makes them so.
+    // The scratch is resolved first, outside the closure: `named_bufs` is a
+    // shared borrow of `state.fire_arrays` and growing the pool is a unique
+    // one, so the two cannot be live together.
     let lora_gate = if lora_lanes.is_empty() {
         core::ptr::null_mut()
     } else {
@@ -2633,9 +1901,9 @@ fn lora_phase(
                 named_bufs.get(&v).map(crate::device::DeviceBuffer::as_ptr)
             };
             let (q, v, x) = (ptr(pins.q)?, ptr(pins.v)?, ptr(pins.x)?);
-            // The xAᵀ scratch, from the driver's own pool — it is not a
-            // value any text states, and it is sized by the widest
-            // adapter in the batch rather than by the fire.
+            // The xAᵀ scratch, from the driver's own pool: it is not a value
+            // any text states, and it is sized by the widest adapter in the
+            // batch rather than by the fire.
             let gate = lora_gate;
             if gate.is_null() {
                 return None;
@@ -2644,11 +1912,10 @@ fn lora_phase(
             let mut ops = crate::fire::lora::LiveLoraOps::new(raw_stream);
             let post = dep.norm == model::deployment::NormPlacement::Post;
             let stage_rows = crate::fire::lora::LoraStageRows {
-                // UNDER POST-NORM the projection input is the residual
-                // stream and under PRE it is the normed value; the
-                // staging picks with `post_norm`, and both slots name
-                // the same buffer here because the lowering resolved
-                // whichever one this text states.
+                // Under post-norm the projection input is the residual stream,
+                // under pre it is the normed value; both slots name the same
+                // buffer here because the lowering resolved whichever one this
+                // text states.
                 y: x.cast_const(),
                 norm_x: x.cast_const(),
                 q,
@@ -2677,26 +1944,13 @@ fn lora_phase(
     lora_state
 }
 
-/// A peel TAIL's attention state: its own plan, its own rebased CSRs.
+/// A peel tail's attention state: its own plan, its own rebased CSRs.
 ///
-/// `Launch::peel`'s doc says a prepared plan "is found by the
-/// rectangle's ROW COUNT", and this is where that stops being a
-/// sentence. A peel's tail serves rows `[split, N)` — a different
-/// request count, so FlashInfer's planner produces a different schedule,
-/// and handing it the fire's is handing it a plan that does not describe
-/// the launch. `bridge_smoke`'s hooked leg (deleted with the archive's
-/// door) built this by hand to prove
-/// the HANDING-OVER worked; the driver never built one, so the peel
-/// worked in a test harness and nowhere else.
-///
-/// THE CSRs ARE REBASED, not sliced. FlashInfer reads a prefix sum that
-/// starts at zero, so a sub-batch cannot borrow the fire's — the tail's
-/// `kv_page_indptr` is the fire's suffix minus its own first entry, and
-/// its page indices start where that entry points.
-///
-/// Everything else the tail inherits, because everything else is a fact
-/// about the FIRE rather than about the rectangle: the layers, the
-/// workspace, the landing buffers, the window table.
+/// A peel's tail serves rows `[split, N)` — a different request count, so
+/// FlashInfer's planner produces a different schedule and the fire's plan would
+/// not describe the launch. The CSRs are rebased, not sliced: FlashInfer reads
+/// a prefix sum starting at zero, so the tail's `kv_page_indptr` is the fire's
+/// suffix minus its own first entry. Everything else the tail inherits.
 #[allow(clippy::too_many_arguments)]
 /// A peel tail's rebased CSRs — the part that needs no device.
 #[derive(Debug, PartialEq, Eq)]
@@ -2709,37 +1963,17 @@ struct TailCsrs {
     qo: Vec<u32>,
 }
 
-/// REBASED, not sliced.
+/// Rebased, not sliced: `indptr[i]` counts the pages before request `split + i`
+/// within the tail (the fire's suffix entry minus its entry at `split`).
+/// Extracted from `peel_tail_ctx` because it is the half that can be silently
+/// wrong — an off-by-one plans for the wrong requests rather than faulting.
 ///
-/// FlashInfer reads a prefix sum that starts at zero, so a sub-batch
-/// cannot borrow the fire's: `indptr[i]` must be the count of pages
-/// BEFORE request `split + i` within the tail, which is the fire's entry
-/// minus the fire's entry at `split`.
-///
-/// Extracted from [`peel_tail_ctx`] because it is the half that can be
-/// silently wrong — every value here is a plausible number, and an
-/// off-by-one produces a plan for the wrong requests rather than a
-/// fault. The rest of that function needs an allocator, a stream and a
-/// planner; this needs nothing, so it is the half a test can hold.
-/// The `[start, count]` a `_devwin` launch reads — the only statement of
-/// where a peel splits.
-///
-/// TWO KERNEL FORMS READ IT and they read it differently, which is why
-/// getting it wrong is silent in both directions:
-///
-/// * the PREFIX form (`qkv_fused.cu:42`) runs rows `[0, start)` —
-///   `if (win != nullptr && r >= win[0]) return;`
-/// * the TAIL form (`split_packed.cu:61`, `kv_paged.cu:57`,
-///   `rope.cu:507`) runs rows `[start, start + count)` —
-///   `if (n < w0 || n >= w0 + w1) return;`
-///
-/// So an UNPEELED fire wants `(rows, 0)`: the prefix runs everything and
-/// the tail runs nothing. It used to answer `(0, rows)`, which is the
-/// exact opposite — the hook-free prefix computed NOTHING and the hooked
-/// tail ran over every row. That was harmless while an unpeeled fire
-/// lowered no `_devwin` launches at all, and stopped being harmless when
-/// `captures_across_splits` began following the guard mode, because
-/// under `Union` both regions lower whether this fire marks a row or not.
+/// The `[start, count]` a `_devwin` launch reads — the only statement of where
+/// a peel splits. Two kernel forms read it differently: the prefix form runs
+/// rows `[0, start)`, the tail form runs `[start, start + count)`. So an
+/// unpeeled fire wants `(rows, 0)` — the prefix runs everything, the tail
+/// nothing — which matters under `Union`, where both regions lower whether
+/// this fire marks a row or not.
 fn peel_word(
     fire_rows: &[model_compiler::lower::Row],
     axis: Option<model_ir::trace::PeelWindow>,
@@ -2749,10 +1983,8 @@ fn peel_word(
         // No peel in the lowering at all: one region, every row.
         return (u32::try_from(rows).unwrap_or(0), 0);
     };
-    // THE SAME PREDICATE `lower::split_at` USES, because two derivations
-    // of one split is how they drift — and under `Union` the rectangle
-    // cannot be that second derivation, since both regions carry the
-    // whole window by design.
+    // The same predicate `lower::split_at` uses — two derivations of one split
+    // is how they drift, and under `Union` both regions carry the whole window.
     let marked: fn(&model_compiler::lower::Row) -> bool = match axis {
         model_ir::trace::PeelWindow::HookFreePrefix => |r| r.hooked,
         model_ir::trace::PeelWindow::UnmaskedPrefix => |r| r.custom_mask,
@@ -2764,66 +1996,31 @@ fn peel_word(
     )
 }
 
-/// The fire's ROUTED-EXPERT FANOUT, read out of the lowered plan.
+/// The fire's routed-expert fanout, read out of the lowered plan.
 ///
-/// [`crate::bind::DispatchCtx::experts_per_token`] is a GEOMETRY axis — a
-/// routed decode opens `dim3 grid(num_tokens * top_k, ..)`
-/// (`quant/dequant_fp4.cuh:232`, `quant/dequant_wna16.cuh:295` — the host
-/// launchers that used to spell it were deleted as unreached in §43) — and a
-/// grid is sized before
-/// an operand is read, so it cannot arrive as an operand. It is also not in
-/// `model::deployment::Geometry`, which states hidden, heads, head width,
-/// intermediates and vocab and stops.
+/// The fanout sizes a grid before any operand is read, so it cannot arrive as
+/// an operand. It is read from the mixture statements' wire params, keyed on
+/// the symbol — never by blind `params[k]`, because index `k` is `window_left`
+/// on an attention dispatch, `w.width` on an unrouted `qmv`, a row pitch on a
+/// strided copy. A statement whose layout is not in `ROUTED_FANOUT_AT` is
+/// invisible here, which reads as a refusal downstream.
 ///
-/// What the fire does hold is its own lowered launches, and the mixture
-/// statements state the fanout as a wire param at a position `dsl` fixes per
-/// statement kind. This reads it from there.
+/// It must agree: a fire's mixture layers all route to the same fanout, so
+/// disagreement is a misread plan, and the answer to it is `0` — absence,
+/// which every reading rule refuses. A fire with no routed statement gets `0`
+/// too, true for a dense model.
 ///
-/// # Keyed on the SYMBOL, and that is the whole design
-///
-/// §21.14's test is *"does the new spelling make a wrong predicate
-/// well-formed?"*, and a field filled by a derivation is a spelling like any
-/// other. The wrong reading available here is *"take `params[k]` of whatever
-/// launch is in front of you"* — and `params[1]` is `window_left` on an
-/// attention dispatch, `params[1]` is `w.width` on an unrouted `qmv`, and
-/// `params[2]` is the ROW PITCH on a strided copy. Any of those would type
-/// as a `u32` and none of them is a fanout.
-///
-/// So there is no index in this function's interface. The only way to ask is
-/// to name a symbol, and a symbol's parameter layout is stated by the one
-/// `dsl` constructor that emits it — which is a fact under version control on
-/// the side that owns it, not a convention this driver remembers. A statement
-/// whose layout is not in [`ROUTED_FANOUT_AT`] is invisible here, which is
-/// absence and which reads as a refusal downstream.
-///
-/// # And it must AGREE
-///
-/// A fire's mixture layers all route to the same fanout — the router picks
-/// `k` and every downstream statement consumes the same `k` — so
-/// disagreement is not a fire with two mixtures, it is a plan this driver has
-/// misread. The answer to disagreement is `0`, which is absence, which every
-/// reading rule refuses. That is the difference between a derivation and a
-/// guess: a guess resolves a conflict, this one reports it.
-///
-/// A fire with NO routed statement gets `0` too, and for a dense model that
-/// is simply true.
+/// The seven symbols are metal's; no `kernels-cuda` fire matches one, so this
+/// returns `0` for every CUDA fire. The construction site therefore reads
+/// `model.deployment.shape.experts_per_token` first and calls this only as a
+/// fallback when the deployment states nothing.
 fn fire_experts_per_token(lowered: &model_compiler::lower::Lowered) -> i32 {
-    /// Where a routed statement states its fanout, by symbol.
-    ///
-    /// Each entry is `(symbol, index into that launch's params)` and each is
-    /// transcribed from the `dsl` constructor that emits it — the citation
-    /// is in the entry, because a table like this is only as good as its
-    /// provenance:
-    ///
-    ///  * `dsl.rs:2887` `router_topk` — `vec![n_experts, experts_per_token]`
-    ///  * `dsl.rs:2920` `route_sort` and `:2951` `route_gather` —
-    ///    `vec![padded, n_experts, experts_per_token, tile_rows, ..]`,
-    ///    deliberately one shared layout so the sort's padding and the
-    ///    gather's bounds cannot disagree
-    ///  * `dsl.rs:3038` `combine_sorted` — `vec![width, experts_per_token]`
-    ///
-    /// The routed GEMV is handled below rather than here, because `dsl`
-    /// builds its symbol by `format!` from the weight repr.
+    /// Where a routed statement states its fanout, by symbol. Each entry is
+    /// `(symbol, index into that launch's params)`, transcribed from the `dsl`
+    /// constructor that emits it. `route_sort` and `route_gather` share one
+    /// layout so the sort's padding and the gather's bounds cannot disagree;
+    /// the routed GEMV is handled below because `dsl` builds its symbol by
+    /// `format!` from the weight repr.
     const ROUTED_FANOUT_AT: &[(&str, usize)] = &[
         ("router_topk_bfloat16", 1),
         ("router_topk_scaled_bfloat16", 1),
@@ -2831,17 +2028,11 @@ fn fire_experts_per_token(lowered: &model_compiler::lower::Lowered) -> i32 {
         ("route_gather", 2),
         ("combine_sorted", 1),
     ];
-    /// The routed GEMV's family — `dsl.rs:2997-3004` builds
-    /// `mxfp4_qmv_routed_bias`, `affine_qmv_routed{point}` and
-    /// `affine_qmv_routed_bias{point}`, where `{point}` is the affine point
-    /// suffix. All three take `dsl.rs:3015`'s
-    /// `vec![in_w, w.width, 0, in_w, experts_per_token]`, so the index is
-    /// one and the match is on the stem.
-    ///
-    /// A PREFIX and not a `contains`: `affine_qmv_routed` is the start of
-    /// every routed GEMV symbol and the start of nothing else, whereas a
-    /// substring test would also match a hypothetical
-    /// `dequant_affine_qmv_routed_epilogue` with a different layout.
+    /// The routed GEMV's family: all three variants take the same params, so
+    /// the index is one and the match is on the stem. A prefix, not a
+    /// `contains`: `affine_qmv_routed` starts every routed GEMV symbol and
+    /// nothing else, where a substring test could match a differently-laid-out
+    /// symbol.
     const ROUTED_QMV_STEMS: &[&str] = &["mxfp4_qmv_routed", "affine_qmv_routed"];
     const ROUTED_QMV_FANOUT_AT: usize = 4;
 
@@ -2873,8 +2064,8 @@ fn fire_experts_per_token(lowered: &model_compiler::lower::Lowered) -> i32 {
         }
         match seen {
             None => seen = Some(v),
-            // DISAGREEMENT IS ABSENCE. See the doc: the answer to a plan this
-            // driver has misread is a refusal, not the first reading.
+            // Disagreement is absence: the answer to a plan this driver has
+            // misread is a refusal, not the first reading.
             Some(prev) if prev != v => return 0,
             Some(_) => {}
         }
@@ -2917,9 +2108,9 @@ fn peel_tail_ctx(
     rows: usize,
     // Whether the family keeps a second decode plan per layer kind.
     two_kind: bool,
-    // Bytes per row of the guard-owned attention landing, and of the
-    // log-sum-exp beside it. Both are pinned by the DRIVER, so both are
-    // addressed from a base the tail has to advance past the prefix.
+    // Bytes per row of the guard-owned attention landing, and of the log-sum-
+    // exp beside it. Both are pinned by the driver, so both are addressed from
+    // a base the tail must advance past the prefix.
     o_row_bytes: usize,
     lse_row_bytes: usize,
     q_heads: i32,
@@ -2931,30 +2122,17 @@ fn peel_tail_ctx(
     if split == 0 {
         return Ok(None);
     }
-    // ONE ROW PER REQUEST, or this function cannot do its arithmetic.
-    //
-    // `split` is a ROW index — `Launch::rows.start` — and everything it
-    // indexes below (`kv_indptr`, `kv_lens`, `qo_indptr`) is per REQUEST.
-    // In a decode fire those coincide and the peel is a decode-shaped
-    // thing. In a prefill they do not, and a silent mis-index would
-    // produce a plan for the wrong requests: real pointers, plausible
-    // numbers, wrong answer.
-    //
-    // So it is a REFUSAL rather than an assumption. A peeled prefill is
-    // not lowered today; when it is, this needs the qo_indptr search that
-    // turns a row into its request, and it should be written then rather
-    // than guessed now.
+    // One row per request, or this function cannot do its arithmetic: `split`
+    // is a row index but `kv_indptr`/`kv_lens`/`qo_indptr` are per request. In
+    // a decode they coincide; a prefill would mis-index silently, so it is a
+    // refusal, not an assumption (a peeled prefill is not lowered today).
     if rows != kv_lens.len() || split >= kv_lens.len() {
         return Err(PIE_STATUS_UNSUPPORTED);
     }
-    // A TWO-KIND FAMILY NEEDS TWO TAIL PLANS, and this builds one.
-    //
-    // gemma-4 keeps `decode_plan_full` beside the sliding one because its
-    // layer kinds disagree on head dim, and `attn_plan` picks between
-    // them per layer. A tail with only the sliding plan would serve its
-    // full layers from a plan built for a different head dim — so the
-    // peel refuses the family rather than half-serving it, and the second
-    // plan is the work to do when a peeled gemma-4 exists.
+    // A two-kind family needs two tail plans and this builds one: gemma-4's
+    // layer kinds disagree on head dim, so a tail with only the sliding plan
+    // would serve its full layers from the wrong plan. Refuse rather than
+    // half-serve.
     if two_kind {
         return Err(PIE_STATUS_UNSUPPORTED);
     }
@@ -2981,40 +2159,28 @@ fn peel_tail_ctx(
         page_size,
         ws.view(),
         raw_stream,
-        false,
-        // `-1`, MATCHING the fire's own `plan_decode`, not
-        // `fire.window_left`. The two are equal today and that is a
-        // coincidence: the window a row uses is per LAYER
-        // (`Source::AttnWindow` reads `window_left_by_layer`), and the
-        // plan is raised unbounded for every layer kind. A tail planned
-        // against a different bound than the prefix is two regions of one
-        // fire disagreeing about the cache.
+        // `true`, with `raise_attn_plans`' four: a tail is planned against the
+        // same workspace the prefix's capture replays over, so a tail raised as
+        // if there were no graph would disagree with the capture digest.
+        true,
+        // `-1`, matching the fire's own `plan_decode`, not `fire.window_left`:
+        // the window is per layer and the plan is raised unbounded, so a tail
+        // planned against a different bound than the prefix is two regions of
+        // one fire disagreeing about the cache.
         -1,
     );
     ws.end_plan_update(&mut sops, raw_stream)?;
 
     Ok(Some(crate::bind::AttnCtx {
         decode_plan: plan.as_ptr(),
-        // THE WORKSPACE ITS OWN PLAN WAS RAISED IN, which is the whole
-        // reason `tail_ws` exists and which inheriting `..fire.clone()`
-        // silently undid. A FlashInfer launcher reads the schedule out of
-        // the workspace it is HANDED, so a tail carrying the tail plan's
-        // handle beside the PREFIX's workspace executes the prefix's
-        // schedule — built for all N requests against the fire's CSRs —
-        // while its own sits unread. Every pointer valid, every number
-        // plausible, the wrong answer.
-        //
-        // `AttnCtx::prefill_workspace`'s doc states the rule: "a launcher
-        // must take the workspace its own plan was raised in."
+        // The workspace its own plan was raised in — the reason `tail_ws`
+        // exists: a FlashInfer launcher reads the schedule out of the
+        // workspace it is handed, so a tail beside the prefix's workspace would
+        // run the prefix's schedule while its own sits unread.
         workspace: ws.view(),
-        // NULL, so a tail that reaches for either DECLINES.
-        //
-        // `attn_plan` picks `decode_plan_full` on a full-attention layer
-        // of a two-kind family, and `prefill_plan` for a prefill row.
-        // Neither was replanned for this sub-batch, so inheriting them
-        // means the fire's schedule against the tail's rebased CSRs and
-        // request count. The guard `!attn_plan(..).is_null()` turns each
-        // into a refusal instead.
+        // Null, so a tail that reaches for either declines: `decode_plan_full`
+        // and `prefill_plan` were not replanned for this sub-batch, and the
+        // `!attn_plan(..).is_null()` guard turns each into a refusal.
         decode_plan_full: core::ptr::null_mut(),
         prefill_plan: core::ptr::null_mut(),
         kv_page_indptr_d: d_indptr,
@@ -3023,21 +2189,25 @@ fn peel_tail_ctx(
         qo_indptr_d: d_qo,
         num_requests: i32::try_from(kv_lens.len() - split).unwrap_or(0),
         num_pages_in_batch: i32::try_from(kv_indices.len().saturating_sub(base)).unwrap_or(0),
+        max_pages_per_request: i32::try_from(
+            kv_indptr
+                .windows(2)
+                .map(|w| w[1].saturating_sub(w[0]))
+                .max()
+                .unwrap_or(0),
+        )
+        .unwrap_or(0),
         first_token: i32::try_from(split).unwrap_or(0),
-        // THE DRIVER-PINNED OUTPUTS ADVANCE PAST THE PREFIX. These two
-        // are the guard-owned landings — the ones a row reaches through
-        // `Or(&Out(0), &Attn("o_out"))` when the trace states no slot —
-        // so nothing windows them and the tail would otherwise write its
-        // rows over the prefix's. A stated output IS windowed, by
-        // `resolve_arg_windowed`, which is why only these two move.
+        // The driver-pinned outputs advance past the prefix: these guard-owned
+        // landings are not windowed (a stated output is, by
+        // `resolve_arg_windowed`), so the tail would otherwise write its rows
+        // over the prefix's.
         o_out: fire.o_out.wrapping_byte_add(split * o_row_bytes),
         lse_out_d: fire.lse_out_d.wrapping_byte_add(split * lse_row_bytes),
-        // NULL, so a tail that wants them DECLINES rather than writing
-        // through the fire's. The score CSR and the mask indptr are
-        // indexed by the FIRE's rows; a tail addressing them at
-        // tail-relative indices reads someone else's rows and the answer
-        // is wrong rather than absent. `AttnNonZero` turns each of these
-        // into a per-row guard, so the refusal names the operand.
+        // Null, so a tail that wants them declines rather than writing through
+        // the fire's: the score CSR and mask indptr are indexed by the fire's
+        // rows, so a tail addressing them tail-relative reads someone else's
+        // rows. `Facts`' accessors return `Option` and test for null.
         score_out: core::ptr::null_mut(),
         score_indptr_d: core::ptr::null(),
         folded_out: core::ptr::null_mut(),
@@ -3051,13 +2221,10 @@ pub(crate) fn step_impl(
     state: &mut Shell,
     frame: &FrameSubmission,
     step: &driver_api::StepSubmission,
-    // `owes` is the debt this step carries when it is the frame's LAST:
-    // `None` for the earlier steps, which owe nothing because a frame
-    // completes once. A step handed one enqueues an asynchronous
-    // completion and does NOT synchronize; a step handed `None`
-    // synchronizes, because the next step's work depends on it and the
-    // producer→consumer ordering inside a frame is what makes steps
-    // sequential in the first place.
+    // `owes` is the debt the frame's last step carries; `None` for earlier
+    // steps, which owe nothing because a frame completes once. A step handed
+    // one enqueues an async completion and does not synchronize; a step handed
+    // `None` synchronizes, because the next step depends on it.
     owes: Option<(
         driver_api::completion::CompletionTarget,
         Vec<*mut driver_api::local::TerminalCell>,
@@ -3068,33 +2235,21 @@ pub(crate) fn step_impl(
     use model_ir::trace::ValueId;
 
     let t_head = std::time::Instant::now();
-    // THE MUTATION FIRST, AND THEN THE BORROWS. `ready_device_state` takes
-    // `&mut Shell`, so every shared borrow this function goes on to hold —
-    // `model`, the lowering, the stream, the allocator — has to be taken
-    // after it. This is the REFUSAL and nothing more: a fire with no model
-    // loaded stops here rather than inside `ready_device_state`, and no
-    // value is carried across, so no borrow is either.
-    //
-    // It used to read `hf.num_hidden_layers` out as a number here, and
-    // that number was shadowed forty lines later by `FireInputs.layers`
-    // without ever being read — a dead binding that was nonetheless the
-    // last thing in this file holding a parsed `config.json` open.
+    // The mutation first, then the borrows: `ready_device_state` takes
+    // `&mut Shell`, so every shared borrow below (`model`, the lowering, the
+    // stream, the allocator) must be taken after it. This is only the refusal —
+    // a fire with no model loaded stops here, carrying no value across.
     if state.model.is_none() {
         return Err(PIE_STATUS_INVALID_ARGUMENT);
     }
     ready_device_state(state)?;
-    // BEFORE the forward, so a prologue's channel cells have addresses.
-    // See `ensure_sessions`.
+    // Before the forward, so a prologue's channel cells have addresses.
     ensure_sessions(state, frame);
-    // AND BEFORE `admit`, which is the ordering this step exists for.
-    //
-    // A `DecodeEnvelope` member's wire plan carries one zero token, one zero
-    // position and NO KV tables at all — the engine's `DecodeEnvelope::template`
-    // fills the shape and leaves the values, because there is no host answer to
-    // put there. `admit` refuses that by name (`kv_indptr.len() < 2`), which is
-    // right: it is not a fire until its descriptors are read off the channel
-    // rings. `fire::envelope::compose` reads them, and translates every
-    // member's working-set pages to physical ones on the way past.
+    // And before `admit`, the ordering this step exists for: a `DecodeEnvelope`
+    // member's wire plan carries a zero token, a zero position and no KV tables
+    // — `admit` refuses that (`kv_indptr.len() < 2`) because it is not a fire
+    // until its descriptors are read off the channel rings. `compose` reads
+    // them and translates each member's working-set pages to physical ones.
     let composed = compose_step(state, frame, step)?;
     let step = composed.as_deref().unwrap_or(step);
     let (Admitted { class, rows, requests, fire_rows }, row) = admit(state, step)?;
@@ -3110,10 +2265,9 @@ pub(crate) fn step_impl(
 
     sg_trace(|| format!("  head {:?}", t_head.elapsed()));
     let t_low = std::time::Instant::now();
-    // ── The lowering, or the one this shape already has. ──
-    //
-    // Everything between here and `DispatchPlan` is a pure function of the
-    // key, and it costs ~3.3 ms on a 0.6B decode. See `Shell::lowerings`.
+    // The lowering, or the one this shape already has: everything to
+    // `DispatchPlan` is a pure function of the key, cached because it costs
+    // ~3.3 ms on a 0.6B decode.
     let key = LoweringKey {
         model_id: state.load_generation,
         class,
@@ -3125,10 +2279,8 @@ pub(crate) fn step_impl(
         let built = build_lowering(
             row,
             model::catalog::Deployed {
-                // CUDA, stated rather than defaulted. The row answers for
-                // either backend now, and a caller that let the default
-                // choose would be the same silent assumption the deleted
-                // `LLAMA_LIKE` string table made from the Metal side.
+                // CUDA, stated rather than defaulted: the row answers for
+                // either backend, so a default would be a silent assumption.
                 backend: model::catalog::Backend::Cuda,
                 tp_size: model.tp_size,
                 layer_scalars: &model.layer_scalars,
@@ -3136,6 +2288,9 @@ pub(crate) fn step_impl(
             class,
             &fire_rows,
             key.union_asked,
+            // The boot's KV scheme, read once here rather than branched on at
+            // every append — the same value the layer view is built from.
+            crate::bind::Boot { kv_native_bf16: Some(state.kv_format.is_native_bf16()) },
         )?;
         state.lowerings.insert(key, built);
     }
@@ -3192,7 +2347,7 @@ pub(crate) fn step_impl(
     )?;
 
     lap("kv+arrays");
-    // ── Workspace + plan caches: DRIVER-lifetime, first-launch built. ──
+    // Workspace + plan caches: driver-lifetime, first-launch built.
     let AttnPlans {
         decode_plan,
         decode_plan_full,
@@ -3200,9 +2355,10 @@ pub(crate) fn step_impl(
         workspace,
         prefill_workspace,
         states_decode_dispatch,
+        planless_prefill,
+        two_decode_kinds,
     } = raise_attn_plans(
         &mut state.scratch,
-        dep,
         model,
         lowered,
         PlanGeometry {
@@ -3224,8 +2380,8 @@ pub(crate) fn step_impl(
         std::collections::BTreeMap::new();
     for a in &lowered.args {
         if let Arg::Named { value, width, .. } = a {
-            // MAX, not last: several values can now share one id (they
-            // alias in place), and the buffer has to fit the widest read.
+            // Max, not last: several values can share one id (they alias in
+            // place), so the buffer must fit the widest read.
             let slot = named_widths.entry(*value).or_insert(*width);
             *slot = (*slot).max(*width);
         }
@@ -3261,7 +2417,7 @@ pub(crate) fn step_impl(
         )?;
 
     lap("attn-plan");
-    // ── The hybrid's GDN context: driver-owned slabs, instance slots. ──
+    // The hybrid's GDN context: driver-owned slabs, instance slots.
     let (gdn_ctx, _slot_ids_buf) = gdn_context(
         &mut state.gdn,
         &mut state.fire_arrays.epoch,
@@ -3272,11 +2428,10 @@ pub(crate) fn step_impl(
         stream,
     )?;
 
-    // POOLED, because a capture bakes `lse_out_d`. See `Scratch::lse`.
+    // Pooled, because a capture bakes `lse_out_d`.
     let lse = state.fire_arrays.lse(alloc, rows * model.deployment.shape.q_heads as usize * 4)?;
 
-    // The guard-owned attention values, discovered from the lowering as
-    // the smokes discovered them.
+    // The guard-owned attention values, discovered from the lowering.
     let (q_pin, o_off) = attention_pins(dep, lowered, dplan, states_decode_dispatch)?;
 
     struct LiveResolver<'a> {
@@ -3292,32 +2447,14 @@ pub(crate) fn step_impl(
         }
     }
 
-    // The family's attention scalars: gemma-4 runs sm_scale 1.0 (the
-    // q/k norms carry the scaling), per-layer windows (sliding at
-    // `sliding_window`, full unbounded), and needs the HOST CSR mirrors
-    // for its planless prefill.
-    // PER LAYER in the value; the binder wants one scalar, and every
-    // family that varies it varies it by layer KIND rather than by
-    // layer, so the first is the stack's.
+    // The family's attention scalars. `sm_scale` varies by layer kind, not
+    // layer, so the first is the stack's (gemma-4 runs 1.0 — its q/k norms
+    // carry the scaling — with per-layer windows and host CSR mirrors for its
+    // planless prefill).
     let sm_scale = dep.attention.first().map_or(1.0, |a| a.sm_scale);
     let window_by_layer = dep.windows();
-    // THE LINE THE NORTH STAR QUOTES, twice over.
-    //
-    // It was `let is_gemma4 = family.planless_prefill();` — wrapping a
-    // family name in a virtual predicate and then recovering the name
-    // at the call site, which means the axis was the family all along.
-    //
-    // The value fixed the read and the NAME still said gemma, which
-    // `tests/no_family_names.rs` caught. That is the guard doing its
-    // job on something a compiler cannot see: the code was correct and
-    // the word was wrong, and a wrong word is how the next reader
-    // learns to branch on a family again.
-    let planless = dep.prefill == model::deployment::PrefillStyle::Planless;
-    // ── The attention state a rectangle executes against. ──
-    //
-    // A struct literal and deliberately left as one: every field is a
-    // fact the phases above already computed, so a function would take
-    // twenty arguments to save naming twenty fields.
+    // The attention state a rectangle executes against — a struct literal because every
+    // field is already computed above.
     let attn = AttnCtx {
         decode_plan,
         decode_plan_full,
@@ -3325,9 +2462,8 @@ pub(crate) fn step_impl(
         workspace,
         prefill_workspace,
         layers,
-        // A TEMPORARY borrow, not the long-lived `named_bufs`: the
-        // adapter phase below grows the scratch, and a shared borrow
-        // held across it would forbid the growth.
+        // A temporary borrow, not the long-lived `named_bufs`: the adapter
+        // phase below grows the scratch, which a borrow held across forbids.
         q_out: q_pin
             .and_then(|v| state.fire_arrays.named.get(&v).map(|b| b.as_ptr()))
             .unwrap_or(core::ptr::null_mut()),
@@ -3338,8 +2474,7 @@ pub(crate) fn step_impl(
         mask_indptr_d: d_mask_indptr,
         o_out: match o_off {
             Some(off) => unsafe { arena_ptr.cast::<u8>().add(off) }.cast(),
-            // No stated slot: the driver's own landing buffer, sized to
-            // the fire's attention output and pooled like the rest so a
+            // No stated slot: the driver's own landing buffer, pooled so a
             // capture that baked its address keeps addressing something.
             None => d_attn_out,
         },
@@ -3347,10 +2482,14 @@ pub(crate) fn step_impl(
         kv_page_indptr_d: d_kv_indptr.cast(),
         kv_last_page_lens_d: d_kv_lens.cast(),
         qo_indptr_d: d_qo.cast(),
-        qo_indptr_h: if planless { qo_indptr.as_ptr() } else { core::ptr::null() },
-        kv_page_indptr_h: if planless { kv_indptr.as_ptr() } else { core::ptr::null() },
+        qo_indptr_h: if planless_prefill { qo_indptr.as_ptr() } else { core::ptr::null() },
+        kv_page_indptr_h: if planless_prefill { kv_indptr.as_ptr() } else { core::ptr::null() },
         num_requests: requests as i32,
         num_pages_in_batch: kv_indices.len() as i32,
+        max_pages_per_request: i32::try_from(
+            kv_indptr.windows(2).map(|w| w[1].saturating_sub(w[0])).max().unwrap_or(0),
+        )
+        .unwrap_or(0),
         first_token: 0,
         w_page_d: d_w_page.cast(),
         w_off_d: d_w_off.cast(),
@@ -3358,23 +2497,16 @@ pub(crate) fn step_impl(
         lse_out_d: lse.cast(),
         window_left: -1,
         window_left_by_layer: window_by_layer,
-        // The ATTENTION cap, off the statement. gemma-2 is the one
-        // family that states one (`attn_logit_softcapping: 50.0`) and
-        // this was the literal `0.0` — so its scores went through
-        // uncapped while `Gemma2AttnFacts::attn_logit_softcap` recorded
-        // `true` and its doc explained that the kernel takes the cap as
-        // a dispatch parameter. It does. Nothing filled it. A capped
-        // gemma-2 and an uncapped one attended IDENTICALLY, which is
-        // the failure `facts_are_read` had listed and named.
+        // The attention cap, off the statement: gemma-2 states one
+        // (`attn_logit_softcapping: 50.0`), and a literal `0.0` here would
+        // attend uncapped while its facts claim capped.
         logits_soft_cap: model.deployment.attn_logit_softcap,
         sm_scale,
         score_window: state.boot.attn_score_window,
     };
 
-    // THE PHASE TAKES ITS FIELDS, not the shell — `north-star.md`'s move
-    // 3 again. `model` is a shared borrow of `state` that outlives this
-    // call, so a phase taking `&mut Shell` does not compile; naming the
-    // five fields it touches does.
+    // The phase takes its fields, not the shell: `model` is a shared borrow of
+    // `state` that outlives this call, so a `&mut Shell` phase would not compile.
     let lora_state = lora_phase(
         &state.ptir_programs,
         &state.ptir_sessions,
@@ -3395,8 +2527,8 @@ pub(crate) fn step_impl(
         rows,
     );
 
-    // ONE HANDLE FOR THE DRIVER, its stream rebound per fire. See
-    // `Shell::cublas`: creating and destroying one per fire cost 3.2 ms.
+    // One handle for the driver, its stream rebound per fire: creating and
+    // destroying one per fire cost 3.2 ms.
     let mut cublas_ops = crate::device::cublas::LiveCublas;
     if state.cublas.is_none() {
         state.cublas =
@@ -3404,58 +2536,23 @@ pub(crate) fn step_impl(
     }
     let cublas = state.cublas.as_mut().expect("just ensured");
     cublas.set_stream(&mut cublas_ops, raw_stream)?;
-    // The family's per-layer tables and named constants — the C++
-    // parse-time vectors (`per_layer_rope_theta`, `rotary_of`) and the
-    // prologue's `scale.*` values plus the load-read layer scalars. A
-    // family whose rope is one theta and whose epilogue caps nothing
-    // answers with empties.
-    // OFF THE VALUE, and the empties are the value's too: a stack whose
-    // rope is one theta answers with an empty table, because the binder
-    // checks emptiness and a table of identical values is one it would
-    // walk for nothing. `Deployment` stores per layer and folds here.
+    // The family's per-layer tables, off the value: a stack whose rope is one
+    // theta answers with an empty table, because the binder checks emptiness
+    // and would walk a table of identical values for nothing.
     let theta_by_layer = dep.theta_by_layer();
     let rotary_by_layer = dep.rotary_by_layer();
     let softcap = dep.logit_softcap;
-    // `u32` on the deployment, `i32` on the ctx, narrowed HERE because this
-    // is the one place that holds both types. Saturating rather than
+    // `u32` on the deployment, `i32` on the ctx, narrowed here. Saturating, not
     // wrapping: a PLE width past `i32::MAX` is a corrupt config, and a grid
-    // divided by a negative extent is a launch of nothing rather than a
-    // refusal. `unwrap_or` never fires on any real deployment — gemma-4's is
-    // 256.
+    // divided by a negative extent launches nothing rather than refusing.
     let ple_dim = i32::try_from(dep.ple_dim).unwrap_or(i32::MAX);
     let scales = dep.scales.clone();
-    // THE PEEL WINDOW, and this is where layer 3 stops being vocabulary.
-    //
-    // It used to be `set(0, rows)` on every fire — "start 0, count ALL",
-    // which is the word for NO SPLIT. Nothing ever computed a boundary, so
-    // the per-row polymorphism the `_devwin` kernels exist for had never
-    // once executed (`.wiki/driver/graph.md` §2, §5 ③).
-    //
-    // Worse than unused: WRONG whenever a peel did lower. `lower::split_at`
-    // computes the real boundary from the fire's rows and gives the tail
-    // region the rectangle `[split, N)` — but a `_devwin` launch ignores
-    // `bound.rows.start` by contract and reads this word instead. Saying
-    // "all rows" therefore ran the tail's program over the PREFIX rows
-    // too, silently, on every peeled fire.
-    //
-    // RE-DERIVED FROM THE ROWS, and it used to be read off the tail
-    // rectangle. That was right, and then `captures_across_splits` began
-    // following the guard mode — under `Union` BOTH regions get the whole
-    // window as their rectangle, deliberately, because the launches are
-    // full-window grids and this word is what they read.
-    //
-    // So the rectangle stopped carrying the split at the exact moment the
-    // word became the only thing that does. `l.rows.start` read `0`, the
-    // word said "start 0, count ALL", and that is the no-split word the
-    // whole `_devwin` mechanism exists to stop being: the tail's program
-    // over the prefix's rows, and the prefix's over none of them, because
-    // `qkv_fused.cu`'s prefix form early-outs on `r >= win[0]`.
-    //
-    // The comment here used to argue that re-deriving is "how two
-    // derivations of one split drift". It is, and the answer is to derive
-    // it from the SAME PLACE `lower::split_at` does — the fire's rows and
-    // the axis's own predicate — rather than from a rectangle that is
-    // allowed to describe something else.
+    // The peel window word, re-derived from the fire's rows rather than read
+    // off the tail rectangle: under `Union` both regions get the whole window
+    // as their rectangle (the launches are full-window grids), so the rectangle
+    // no longer carries the split and this word is the only thing that does.
+    // Derived from the same place `lower::split_at` uses — the rows and the
+    // axis's predicate — so the two cannot drift.
     if state.peel_win.is_none() {
         state.peel_win = Some(crate::device::PeelWindowWord::new(alloc)?);
     }
@@ -3466,22 +2563,18 @@ pub(crate) fn step_impl(
     peel_win.upload(stream.as_ref())?;
     let peel_window_ptr = peel_win.device_ptr();
 
-    // ── The dispatch context: what every generated branch reads. ──
-    //
-    // The other half of the pair. `AttnCtx` is what an ATTENTION
-    // rectangle reads and this is what any rectangle does — the stream,
-    // the cublas handle, the per-layer tables, the fire's own words.
+    // The dispatch context: what any rectangle reads (the stream, the cublas
+    // handle, the per-layer tables, the fire's own words) — the other half of
+    // the pair with `AttnCtx`.
     let ctx = DispatchCtx {
         sampling_indices: d_sampled.cast::<i32>(),
         sampled_rows: i32::try_from(sampled_rows.len()).unwrap_or(0),
         stream: raw_stream,
         cublas: cublas.handle().expect("created").cast(),
         eps: model.deployment.norm_eps,
-        // The FIRST layer's base, which is what a single `rope_theta`
-        // ever meant: the stacks that use one theta throughout repeat
-        // it per layer, and the stacks that do not are read out of
-        // `rope_theta_by_layer` on the next line. Zero for a
-        // deployment with no attention layers at all.
+        // The first layer's base, which is what a single `rope_theta` meant;
+        // the per-layer values are read from `rope_theta_by_layer`. Zero for a
+        // deployment with no attention layers.
         rope_theta: model.deployment.attention.first().map_or(0.0, |a| a.rope_theta),
         rope_theta_by_layer: theta_by_layer,
         rotary_by_layer,
@@ -3496,29 +2589,18 @@ pub(crate) fn step_impl(
         final_logit_softcap: softcap,
         ple_dim,
         scales,
-        // THE ROW'S convention, not a constant. `moe::topk_sigmoid_bias`
-        // and its two siblings take this as `Source::Ctx`, and a `false`
-        // here routed every mixture on weights that sum to less than one
-        // whatever its config said -- right for DeepSeek-V3 and Kimi-K2,
-        // wrong for GLM-4.5, which publishes `norm_topk_prob: true` from
-        // the same sigmoid-plus-bias router.
+        // The row's convention, not a constant: `moe::topk_sigmoid_bias` takes
+        // this as `Source::Ctx`, and a `false` here would route every mixture
+        // on weights summing to less than one — wrong for GLM-4.5, which
+        // publishes `norm_topk_prob: true`.
         moe_norm_topk: model.deployment.norm_topk_prob,
-        // As above: the row's, not a constant. DeepSeek-V3 and GLM-4.5
-        // publish 2.5 and Kimi-K2 publishes 2.0, so a 1.0 here delivered
-        // two-fifths of a routed token's trained contribution.
+        // As above: the row's, not a constant. DeepSeek-V3 and GLM-4.5 publish
+        // 2.5 and Kimi-K2 publishes 2.0, so a `1.0` here would deliver a
+        // fraction of a routed token's trained contribution.
         moe_routed_scaling: model.deployment.routed_scaling,
-        // YaRN's four, off the statement. `rope_yarn_original` takes all
-        // of them plus `yarn_original_max` from this context and nothing
-        // else does, so a zeroed array was not a neutral default for the
-        // rows that reach it — gpt-oss-20b states `factor: 32.0,
-        // beta_fast: 32.0, beta_slow: 1.0, original_max_position: 4096`,
-        // and a factor of zero is a degenerate ramp, not an absent one.
-        //
-        // driver-metal met the same slot and REFUSED, in as many words:
-        // "zeroing YaRN's factor would serve the model with an unrescaled
-        // ladder rather than refuse it". This driver has the kernel, so
-        // it reads instead of refusing — but the alternative was never
-        // "zero", it was one of those two.
+        // YaRN's four, off the statement: `rope_yarn_original` takes all of
+        // them, so a zeroed array is not a neutral default for the rows that
+        // reach it — a factor of zero is a degenerate ramp, not an absent one.
         yarn: match model.deployment.rope_scaling {
             Some(model::deployment::RopeScaling::Yarn {
                 factor,
@@ -3535,14 +2617,9 @@ pub(crate) fn step_impl(
             }
             _ => 0,
         },
-        // gpt-oss's CLAMPED GLU, read off the statement rather than left
-        // at zero. `mxfp4_moe_gate_up` takes both from this context, and
-        // gpt-oss is routed all the way down — so a zeroed pair was not a
-        // neutral default on the path that uses it. `alpha` scales the
-        // gate INSIDE the sigmoid, so `0.0` makes `silu(a*x)` collapse to
-        // `x/2`, and `limit` clamps both halves, so `0.0` clamps them to
-        // nothing. Metal has read this off `mlp_gate` since the gate
-        // became a statement (`batch/geometry.rs`); this is the same read.
+        // gpt-oss's clamped GLU, off the statement not left at zero: `alpha`
+        // scales the gate inside the sigmoid, so `0.0` collapses `silu(a*x)` to
+        // `x/2`, and `limit` clamps both halves to nothing at `0.0`.
         glu_limit: match model.deployment.mlp_gate {
             model::deployment::MlpGate::SiluClamped { limit, .. } => limit,
             _ => 0.0,
@@ -3554,48 +2631,36 @@ pub(crate) fn step_impl(
         situ_beta: 0.0,
         situ_linear_beta: 0.0,
         wna16_group_size: 0,
-        // THE FIRE'S OWN FANOUT, derived once from the lowered plan by
-        // symbol. `0` for a dense fire, and `0` for one whose routed
-        // statements disagree — see `fire_experts_per_token`, which argues
-        // both.
-        experts_per_token: fire_experts_per_token(lowered),
+        // The fire's own fanout, read off the deployment and derived only if it
+        // is silent: `experts_per_token` is a stated field, and
+        // `fire_experts_per_token` stays below it as the fallback.
+        experts_per_token: {
+            let stated = i32::try_from(model.deployment.shape.experts_per_token).unwrap_or(0);
+            if stated > 0 { stated } else { fire_experts_per_token(lowered) }
+        },
         altup_streams: 0,
         altup_active: 0,
         altup_std_mult_by_layer: Vec::new(),
-        // THE STAGED ADAPTER, or `None` for the fires that carry none —
-        // which is every fire until a program states a `lora` sink in
-        // its prologue.
-        //
-        // `None` is not a refusal here: the executor's arm returns
-        // `Ok(())` for it, and that no-op is load-bearing for union
-        // captures, because under `GuardMode::Union` every arm lowers
-        // and the predicate decides at replay. The arm has to be
-        // issuable with nothing to correct.
+        // The staged adapter, or `None` for a fire that carries none. `None` is
+        // not a refusal: the executor's arm returns `Ok(())`, load-bearing for
+        // union captures — every arm lowers and the predicate decides at
+        // replay, so the arm must be issuable with nothing to correct.
         lora: lora_state.as_ref().map(|(s, scratch)| (std::ptr::from_ref(s), *scratch)),
-        // The fire's peel window, published so a `_devwin` statement in a
-        // tail region can early-out per lane. The prefix is the rows that
-        // do NOT carry the axis's mark, so the tail begins where the
-        // marked suffix does; with no marked rows there is no split and
-        // the word says the whole fire.
+        // The fire's peel window, published so a `_devwin` tail statement can
+        // early-out per lane: the prefix is the rows that do not carry the
+        // axis's mark, so with no marked rows the word says the whole fire.
         peel_window: peel_window_ptr,
         rows_total: i32::try_from(rows).unwrap_or(0),
         moe_ptrs: std::cell::Cell::new(None),
     };
 
     lap("bind");
-    // THE TAIL'S OWN STATE, when the lowering peeled. `peel_start` is
-    // the split the fire already computed for its device word; a tail
-    // serves `[split, N)`, which is a different request count and
-    // therefore a different FlashInfer schedule.
-    //
-    // Built after the adapter phase because it takes the scratch
-    // mutably, and before the resolver for the same reason `named_bufs`
-    // is: a shared borrow held across an upload would forbid the growth.
-    // AN EMPTY TAIL IS NOT A TAIL. Under `Union` both peel regions lower
-    // whether or not this fire marks any rows, so `peel_axis` is `Some`
-    // on an unpeeled fire too and the split lands at `rows` — "the tail
-    // begins after the last row", which is the word for no split. The
-    // context is for a tail that has rows in it.
+    // The tail's own state, when the lowering peeled: a tail serves `[split, N)`,
+    // a different request count and so a different FlashInfer schedule. Built
+    // after the adapter phase because it takes the scratch mutably. An empty
+    // tail is not a tail: under `Union` `peel_axis` is `Some` even on an
+    // unpeeled fire, with the split at `rows`, so the guard below requires rows
+    // in the tail.
     let tail_ctx = if peel_start > 0 && peel_count > 0 && (peel_start as usize) < rows {
         let fs = state.scratch.as_mut().ok_or(PIE_STATUS_DRIVER_ERROR)?;
         let (tail_plan, tail_ws) = (&mut fs.tail_plan, &mut fs.tail_ws);
@@ -3613,10 +2678,9 @@ pub(crate) fn step_impl(
             &qo_indptr,
             peel_start as usize,
             rows,
-            dep.decode_head_dims().is_some(),
-            // The same two extents `publish_seam_pins` and the LSE
-            // allocation are sized from, so a stride cannot drift from
-            // the buffer it walks.
+            two_decode_kinds,
+            // The same two extents `publish_seam_pins` and the LSE allocation
+            // are sized from, so a stride cannot drift from its buffer.
             model.deployment.shape.q_heads as usize * model.deployment.shape.head_dim as usize * 2,
             model.deployment.shape.q_heads as usize * 4,
             i32::try_from(model.deployment.shape.q_heads).unwrap_or(0),
@@ -3629,15 +2693,14 @@ pub(crate) fn step_impl(
     };
     let named_bufs = &state.fire_arrays.named;
     let mut resolver = LiveResolver { model, named: named_bufs };
-    // ── Which prepared state each rectangle gets. ──
+    // Which prepared state each rectangle gets.
     let regions = match tail_ctx.as_ref() {
         Some(tail) => AttnRegions::split(&attn, tail),
         None => AttnRegions::whole(Some(&attn)),
     };
     // The last use of `alloc` is above, so the shared borrow is dead and the
-    // capture can take the same allocator mutably — which is the point: a
-    // capture has to be opened on the allocator that owns what the fire
-    // frees, or the frees are not deferred.
+    // capture can take the same allocator mutably — a capture must be opened on
+    // the allocator that owns what the fire frees, or the frees are not deferred.
     if state.preds.is_none() {
         state.preds = crate::device::PredicateWord::new(
             state.fire_alloc.as_ref().expect("the fire allocator exists"),
@@ -3649,7 +2712,7 @@ pub(crate) fn step_impl(
         _ => return Err(PIE_STATUS_EXHAUSTED),
     };
     lap("ctx");
-    // ── The walk: capture, replay, or straight onto the stream. ──
+    // The walk: capture, replay, or straight onto the stream.
     let result = if union {
         capture_or_replay(
             &mut state.supergraph,
@@ -3675,11 +2738,9 @@ pub(crate) fn step_impl(
         run(&lowered, &dplan, exec_frame, &mut resolver, &ctx, regions, gdn_ctx.as_ref())
     };
     lap("run");
-    // A step that owes nothing SYNCHRONIZES, because the next step in the
-    // frame reads what this one wrote. A step that owes the frame's
-    // completion does not: its debt rides a stream-ordered callback and
-    // this call returns with the work still queued, which is the whole
-    // point.
+    // A step that owes nothing synchronizes, because the next step reads what
+    // this one wrote. A step that owes the completion does not: its debt rides
+    // a stream-ordered callback and this call returns with the work queued.
     let sync =
         if owes.is_some() && state.runahead { Ok(()) } else { stream.as_ref().synchronize() };
     lap("sync");
@@ -3696,11 +2757,9 @@ pub(crate) fn step_impl(
     }
 
     lap("post-match");
-    // THE FRAME'S DEBT, built before the delivery below because it is
-    // owed whether or not this fire has logits to deliver. Paying it
-    // inside the delivery block meant a fire with no readout channel
-    // never published its terminal cells and never notified — the
-    // runtime waited forever on a frame the driver had finished.
+    // The frame's debt, built before the delivery below because it is owed
+    // whether or not this fire has logits: paying it inside delivery would
+    // leave a fire with no readout channel never publishing its terminal cells.
     let mut debt = owes.map(|(completion, cells)| FireDebt {
         staging: None,
         readouts: Vec::new(),
@@ -3710,33 +2769,18 @@ pub(crate) fn step_impl(
         broker: state.broker.clone(),
     });
 
-    // ── Sampling: the instance's PROGRAM, if it has one. ──
-    //
-    // Before the delivery below and not after, because a program that
-    // published is a fire whose answer has already gone out — top-p,
-    // top-k, temperature and argmax are its stages, and handing the
-    // caller raw logits beside them would deliver twice and disagree
-    // with itself.
-    //
-    // Everything about this degrades to the old behaviour: no program, a
-    // program that declines, inputs not ready, or channels this shell
-    // does not hold all return `false` and fall through to the raw
-    // logits. That is what the driver did before this existed, so the
-    // worst case is the status quo rather than a broken fire.
-    // A FRESH borrow of the allocator, not the one from the top of the
-    // fire. The capture above takes `&mut state.fire_alloc` — deliberately,
-    // since a capture must be opened on the allocator that owns what the
-    // fire frees — and reusing the earlier binding here would extend a
-    // shared borrow across it. Re-deriving is one line and says where the
-    // mutable window ended.
+    // Sampling: the instance's program, if it has one — before the delivery
+    // below, because a program that published has already sent its answer and
+    // raw logits beside it would deliver twice. No program, a decline, inputs
+    // not ready, or missing channels all fall through to raw logits.
+    // A fresh borrow of the allocator: the capture above takes
+    // `&mut state.fire_alloc`, so reusing the earlier binding here would extend
+    // a shared borrow across it.
     let alloc = state.fire_alloc.as_ref().expect("the fire allocator exists");
-    // ONE INSTANCE PER WIRE REQUEST, off the step's own roster. See
-    // `request_instances`.
+    // One instance per wire request, off the step's own roster.
     let request_instances = request_instances(frame, step, requests);
-    // NO REGISTRY MEANS NO INSTANCE THIS SHELL RINGED, so every request falls
-    // through to raw logits — the same decline `run_program` gives for an
-    // instance with no program. `ensure_sessions` builds the registry for
-    // every frame that names one, so this is the empty-roster case.
+    // No registry means no instance this shell ringed, so every request falls
+    // through to raw logits — the empty-roster case.
     let unsampled = match state.ptir_rings.as_mut() {
         None => (0..qo_indptr.len().saturating_sub(1)).collect(),
         Some(rings) => run_sampling_programs(
@@ -3784,20 +2828,16 @@ pub(crate) fn step_impl(
         )?;
     }
 
-    // The debt goes last in stream order, so it runs after every
-    // launch and after the D2H above.
+    // The debt goes last in stream order, so it runs after every launch and
+    // after the D2H above.
     if let Some(d) = debt {
         let raw = Box::into_raw(Box::new(d)).cast::<std::ffi::c_void>();
-        // ONE SET OF DEBTS, TWO WAYS TO PAY THEM. Gated off, this
-        // thread pays after the synchronize above — which is what the
-        // driver always did, and what every caller reading a result
-        // on the next line still expects. Gated on, a stream-ordered
-        // callback pays them and this call returns with the work
-        // still queued.
+        // One set of debts, two ways to pay them: with runahead off, this
+        // thread pays after the synchronize above; with it on, a stream-ordered
+        // callback pays and this call returns with the work queued.
         if !state.runahead {
-            // The D2H above was ENQUEUED, so paying here means waiting
-            // here. Without this the callback's staging is read before
-            // the copy into it has landed.
+            // The D2H above was enqueued, so paying here means waiting here —
+            // without it the staging is read before the copy into it lands.
             stream.as_ref().synchronize()?;
             unsafe { retire_fire(raw) };
             return Ok(());
@@ -3811,21 +2851,15 @@ pub(crate) fn step_impl(
             unsafe { retire_fire(raw) };
             return Err(PIE_STATUS_DRIVER_ERROR);
         }
-        // AND THE SCRATCH SURVIVES THE CALL. Dropping it here would
-        // `cudaFree` while the fire runs, which synchronizes the
-        // device and undoes everything above. The next launch
-        // reclaims it — see `InFlight`.
+        // The scratch survives the call: dropping it here would `cudaFree`
+        // while the fire runs, synchronizing the device. The next launch
+        // reclaims it.
         lap("debt");
-        // A LIVE DEBT WITH NO ENTRY IS THE ONE HOLE in "nothing in flight
-        // proves every debt is paid". `host_fn` has already succeeded
-        // here, so the debt is on the stream; if `Event::new` or `record`
-        // fails and `?` returns, no `InFlight` is ever pushed, the next
-        // `ready_device_state` sees an empty queue, and it clears
-        // `retired_staging` out from under a callback that has not run.
-        //
-        // Paid inline instead, exactly as the `host_fn` failure path
-        // above does — the callback WILL still run, but after a
-        // synchronize it has nothing left to read that is not stable.
+        // A live debt with no entry is the one hole in "nothing in flight
+        // proves every debt is paid": `host_fn` has succeeded, so the debt is
+        // on the stream, but if `Event::new`/`record` fails no `InFlight` is
+        // pushed and the next `ready_device_state` would clear `retired_staging`
+        // under a callback that has not run. Pay inline instead.
         let done = match crate::device::Event::new()
             .and_then(|e| stream.as_ref().record(&e).map(|()| e))
         {
@@ -3837,8 +2871,8 @@ pub(crate) fn step_impl(
         };
         state.in_flight.push_back(InFlight {
             done,
-            // `lse` and `d_valid` are POOLED now, so they are not here:
-            // handing a pooled buffer to `InFlight` would free the pool.
+            // `lse` and `d_valid` are pooled, so they are not here: handing a
+            // pooled buffer to `InFlight` would free the pool.
             scratch: [_slot_ids_buf].into_iter().flatten().collect(),
             closed_channels: Vec::new(),
         });
@@ -3859,20 +2893,16 @@ mod peel_tests {
         hooked.iter().map(|&h| Row { hooked: h, ..Row::default() }).collect()
     }
 
-    /// The three cases the two kernel forms have to agree on.
-    ///
-    /// PREFIX form runs `[0, start)`; TAIL form runs
-    /// `[start, start + count)`. Read the assertions as "which rows does
-    /// each kernel form execute", because that is the only thing the word
-    /// means.
+    /// The three cases the two kernel forms must agree on: the prefix form runs
+    /// `[0, start)`, the tail form `[start, start + count)`.
     #[test]
     fn the_peel_word_says_which_rows_each_form_runs() {
-        // NO PEEL IN THE LOWERING: prefix runs all four, tail runs none.
+        // No peel: prefix runs all four, tail none.
         assert_eq!(peel_word(&rows(&[false; 4]), None, 4), (4, 0));
 
-        // A PEEL LOWERED AND NO ROW MARKED — which is what `Union` does
-        // to an unpeeled fire, since both regions lower unconditionally.
-        // Same answer: the whole fire is the prefix.
+        // A peel lowered, no row marked — what `Union` does to an unpeeled
+        // fire, since both regions lower unconditionally. The whole fire is the
+        // prefix.
         assert_eq!(
             peel_word(&rows(&[false; 4]), Some(PeelWindow::HookFreePrefix), 4),
             (4, 0),
@@ -3881,13 +2911,13 @@ mod peel_tests {
              NOTHING and the tail form run over all four"
         );
 
-        // A CONTIGUOUS MARKED SUFFIX: prefix [0,2), tail [2,4).
+        // A contiguous marked suffix: prefix [0,2), tail [2,4).
         assert_eq!(
             peel_word(&rows(&[false, false, true, true]), Some(PeelWindow::HookFreePrefix), 4),
             (2, 2)
         );
 
-        // EVERY ROW MARKED: no prefix, the tail is the fire.
+        // Every row marked: no prefix, the tail is the fire.
         assert_eq!(peel_word(&rows(&[true; 4]), Some(PeelWindow::HookFreePrefix), 4), (0, 4));
     }
 
@@ -3896,9 +2926,9 @@ mod peel_tests {
     fn the_axis_decides_which_mark_splits() {
         let r = rows(&[false, false, true, true]);
         assert_eq!(peel_word(&r, Some(PeelWindow::HookFreePrefix), 4), (2, 2));
-        // The same rows carry no `custom_mask`, so the mask axis sees no
-        // split at all — a fire hooked but unmasked is one region on the
-        // mask axis and two on the hook axis.
+        // The same rows carry no `custom_mask`, so the mask axis sees no split:
+        // a fire hooked but unmasked is one region on the mask axis and two on
+        // the hook axis.
         assert_eq!(peel_word(&r, Some(PeelWindow::UnmaskedPrefix), 4), (4, 0));
     }
 
@@ -3918,10 +2948,9 @@ mod peel_tests {
              index 3 — the value `kv_indptr[2]` holds"
         );
 
-        // A SLICE would have been `[3, 6, 7]` and `[2, 3, 4]`, which
-        // FlashInfer reads as a batch whose first request already has
-        // three pages behind it. Real pointers, plausible numbers, a plan
-        // for requests that are not these.
+        // A slice would have been `[3, 6, 7]` and `[2, 3, 4]`, which FlashInfer
+        // reads as a batch whose first request already has three pages behind
+        // it — a plan for requests that are not these.
         assert_ne!(got.indptr, kv_indptr[2..].to_vec());
     }
 
@@ -3935,12 +2964,9 @@ mod peel_tests {
         assert_eq!(got.base, 2);
     }
 
-    /// A split past the array answers empty rather than panicking.
-    ///
-    /// `peel_tail_ctx` refuses that case before it gets here, and this
-    /// pins that the arithmetic does not depend on the refusal — a
-    /// bounds check in one place and a panic in the other is how the
-    /// second one gets reached by a caller nobody expected.
+    /// A split past the array answers empty rather than panicking —
+    /// `peel_tail_ctx` refuses that case first, and this pins that the
+    /// arithmetic does not depend on the refusal.
     #[test]
     fn a_split_past_the_end_is_empty_not_a_panic() {
         let got = tail_csrs(&[0, 2], &[0, 1], 9);

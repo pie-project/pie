@@ -538,24 +538,67 @@ fn attn(name: &str) -> Option<Vec<Vec<ArgValue>>> {
         let mut args = Vec::new();
         let mut buffers = 0u32;
         let mut envs = 0usize;
-        for (ty, prov) in sig.args {
+        // `Provenance` says where a value comes from and `Ty` says how WIDE it
+        // is, and a recipe has to read both. These arms read only the first for
+        // as long as every environment scalar happened to be an `i32`: upstream
+        // retyped `attention_mask_stride` to `Ask<_, u32>`, the catch-all kept
+        // handing it an `I32`, and every attention routine refused with
+        // `Kind { at: 13, want: U32 }` — four tests at once, because one
+        // refusal panics the shared fixture.
+        let as_ty = |ty: &Ty, v: i32| match ty {
+            Ty::U32 => ArgValue::U32(u32::try_from(v).expect("an env width is not negative")),
+            _ => ArgValue::I32(v),
+        };
+        for (i, (ty, prov)) in sig.args.iter().enumerate() {
+            // WHICH QUESTION THIS ARGUMENT IS, where the signature says.
+            //
+            // This used to place the head width on the FIRST `Env` and call it
+            // `head_dim`, with a comment asserting the tail ran `head_dim,
+            // q_heads, rows`. It runs `n_rows, head_dim, q_heads`, so the width
+            // landed on the row count and `head_dim` got the 8 meant for
+            // `q_heads` -- which `sdpa_paged_mma` refused as `Narrow { what:
+            // "the head width", at: 8 }`, taking the whole suite down with it
+            // because one refusal panics the shared fixture.
+            //
+            // A position is a guess and `sources` is the answer: upstream added
+            // it to say which of the environment's questions each argument
+            // asks. Reading it means an argument can be REORDERED without this
+            // recipe silently handing values to the wrong parameter.
+            let named = sig.sources.get(i).and_then(|s| match s {
+                Some(kernels::Source::Named(k)) => Some(*k),
+                _ => None,
+            });
             let value = match (ty, prov) {
                 (Ty::Buf | Ty::BufMut | Ty::I32s | Ty::U32s | Ty::U8s, _) => {
                     let v = b(buffers);
                     buffers += 1;
                     v
                 }
+                (_, Provenance::Env)
+                    if named == Some(<kernels::keys::HeadDim as kernels::keys::Fact>::KEY)
+                        && head_dim != 0 =>
+                {
+                    envs += 1;
+                    as_ty(ty, head_dim)
+                }
+                (_, Provenance::Env)
+                    if named == Some(<kernels::keys::NumQHeads as kernels::keys::Fact>::KEY) =>
+                {
+                    envs += 1;
+                    as_ty(ty, 8)
+                }
                 (_, Provenance::Env) => {
+                    // Everything the signature does not name: the same
+                    // plausible-and-distinct values as before, so the routines
+                    // whose `sources` say nothing are placed exactly as they
+                    // were.
                     let v = match envs {
-                        // The head width, where there is one.
-                        0 if head_dim != 0 => ArgValue::I32(head_dim),
-                        // `q_heads` for the attentions, and the sole `Env` of
-                        // the writes -- eight either way.
-                        0 | 1 => ArgValue::I32(8),
-                        _ => ArgValue::I32(7),
+                        0 if head_dim != 0 && named.is_none() => head_dim,
+                        0 | 1 => 8,
+                        _ => 7,
                     };
                     envs += 1;
-                    v
+                    as_ty(ty, v)
                 }
                 (Ty::F32, _) => ArgValue::F32(0.125),
                 (Ty::Usize, _) => ArgValue::Usize(4096),
@@ -602,23 +645,38 @@ fn quant(name: &str) -> Option<Vec<Vec<ArgValue>>> {
         ("qmm_splitk_reduce", &[64]),               // m
         ("qmm_splitk_reduce_f32", &[64]),           // m
         ("cast_qmm_input_bfloat16_to_float16", &[]), // no Env
-        ("cast_qmm_input_strided_bfloat16_to_float16", &[7]), // rows
+        // THREE: `n` and `count` joined `rows` in the `Env` column, because the
+        // strided cast's uniform block is `{ k, row_stride }` and neither of
+        // them reaches the shader -- `n` is the slot the packed and strided
+        // forms share and `count` is `rows * k`, derived from the grid.
+        (
+            "cast_qmm_input_strided_bfloat16_to_float16",
+            &[64, 448, 7],
+        ), // n, count, rows
         ("qmv_fast", &[64, 4, 7]),                  // group, bits, vecs
         ("qmv_fast_residual", &[64, 4, 7]),         // group, bits, vecs
         ("qmv_tail", &[4, 7]),                      // bits, vecs
         ("qmv_tail_bias", &[4, 7]),                 // bits, vecs
-        ("qmv_wide_strided", &[4]),                 // bits
+        // TWO, and in the OTHER order from its siblings: this one takes the
+        // vector count before the bit width, which `[4, 7]` gets exactly
+        // backwards -- the body then reads 7 as the width and refuses it as
+        // `Narrow { what: "the bit width", at: 7 }`. Stated in the order the
+        // signature takes them, like every row here.
+        ("qmv_wide_strided", &[7, 4]),              // vecs, bits
         ("qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4", &[64]), // m
         ("qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2", &[64]), // m
         ("qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2", &[64]), // m
         ("qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1", &[64]), // m
         ("qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4", &[64]), // m
-        // NO `Env` values: the transcode encoders state their group/block
-        // count as a TRACE scalar, because `transcode.wgsl` reads it to bound
-        // its own loop and an `Env` argument is not forwarded to the shader.
-        ("encode_u4_bf16", &[]),
-        ("encode_u4_f32", &[]),
-        ("mxfp4_dequant_bf16", &[]),
+        // ONE `Env` value each, and this note used to say none. The transcode
+        // encoders stated their group/block count as a TRACE scalar; upstream
+        // moved it to `Env`, which is the read-side repair -- a count the
+        // RUNTIME has and no statement places as an operand. The value still
+        // reaches the shader either way: `Env` is about who SUPPLIES an
+        // argument, not about whether it is forwarded.
+        ("encode_u4_bf16", &[1]),      // groups
+        ("encode_u4_f32", &[1]),       // groups
+        ("mxfp4_dequant_bf16", &[1]),  // blocks
     ];
 
     let envs = ENVS.iter().find(|(n, _)| *n == name)?.1;
@@ -637,7 +695,17 @@ fn quant(name: &str) -> Option<Vec<Vec<ArgValue>>> {
                 v
             }
             (_, Provenance::Env) => {
-                let v = ArgValue::I32(envs[env_at]);
+                // NAMED, because a bare subscript panic here says "len is 4
+                // but the index is 4" and leaves the reader to find which of
+                // ninety routines grew an environment scalar.
+                let v = ArgValue::I32(*envs.get(env_at).unwrap_or_else(|| {
+                    panic!(
+                        "`{name}` takes at least {} environment scalars and this \
+                         file's `ENVS` row gives {}",
+                        env_at + 1,
+                        envs.len()
+                    )
+                }));
                 env_at += 1;
                 v
             }
@@ -669,29 +737,70 @@ fn ssm(name: &str) -> Option<Vec<Vec<ArgValue>>> {
         ("gdn_core_slotted", &[7, 8, 64]),               // rows, v_heads, v_dim
         ("gdn_prep", &[7, 8]),                           // rows, v_heads
         ("gdn_prep_slotted", &[7, 8]),                   // rows, v_heads
-        ("gdn_prep_prefill", &[7, 8]),                   // rows, v_heads
+        // `row_pitch` and `n_scan` joined the `Env` column with the scan's;
+        // see the note below.
+        ("gdn_prep_prefill", &[2048, 1, 7, 8]), // row_pitch, n_scan, rows, v_heads
         ("gdn_core_recurrent", &[7, 8, 64]),             // rows, v_heads, v_dim
         ("gdn_core_recurrent_slotted", &[7, 8, 64]),     // rows, v_heads, v_dim
-        ("gdn_core_recurrent_prefill", &[32, 4, 64, 8]), // lanes, vrows, dv, hv
+        // FOUR again. This row has tracked upstream's provenance work twice
+        // now: `row_pitch` and `n_scan` joined the tiling here when the whole
+        // family was marked `Env`, and they have since gone back to being
+        // ASKED facts, which the type walk supplies as plain extents rather
+        // than reading from this row. Only the pair the spelling table indexes
+        // and the two rectangle numbers are left.
+        // `(lanes, vrows) = (32, 4)` because `scan_point` compiles that pair.
+        ("gdn_core_recurrent_prefill", &[2048, 1, 64, 8]), // row_pitch, n_scan, dv, hv
     ];
+
+    /// The scalars this family takes from the STATEMENT rather than the
+    /// environment, which the type walk cannot invent.
+    ///
+    /// `lanes` and `vrows` are `Param<11>` and `Param<12>` -- `Provenance::
+    /// Trace`, not `Env` -- so they fall past the `ENVS` arm to the catch-all,
+    /// and 2048 is not a tile anybody compiled. They INDEX a spelling table,
+    /// so the value has to be one of the nine pairs `scan_point` carries; the
+    /// rest of the family's trace scalars are extents the catch-all is right
+    /// about.
+    const TILES: &[(&str, &[i32])] = &[("gdn_core_recurrent_prefill", &[32, 4])];
 
     let envs = ENVS.iter().find(|(n, _)| *n == name)?.1;
     let sig = kernels_wgpu::routines()
         .into_iter()
         .find(|r| r.name == name)?;
 
+    let tiles = TILES.iter().find(|(n, _)| *n == name).map(|(_, t)| *t);
     let mut args = Vec::new();
     let mut buffers = 0u32;
     let mut env_at = 0usize;
+    let mut tile_at = 0usize;
     for (ty, prov) in sig.args {
         let value = match (ty, prov) {
+            // The spelling table's index, before the catch-all can call it an
+            // extent.
+            (Ty::I32, Provenance::Trace)
+                if tiles.is_some_and(|t| tile_at < t.len()) =>
+            {
+                let v = ArgValue::I32(tiles.expect("checked")[tile_at]);
+                tile_at += 1;
+                v
+            }
             (Ty::Buf | Ty::BufMut | Ty::I32s | Ty::U32s | Ty::U8s | Ty::F32s | Ty::F32sMut, _) => {
                 let v = b(buffers);
                 buffers += 1;
                 v
             }
             (_, Provenance::Env) => {
-                let v = ArgValue::I32(envs[env_at]);
+                // NAMED, because a bare subscript panic here says "len is 4
+                // but the index is 4" and leaves the reader to find which of
+                // ninety routines grew an environment scalar.
+                let v = ArgValue::I32(*envs.get(env_at).unwrap_or_else(|| {
+                    panic!(
+                        "`{name}` takes at least {} environment scalars and this \
+                         file's `ENVS` row gives {}",
+                        env_at + 1,
+                        envs.len()
+                    )
+                }));
                 env_at += 1;
                 v
             }
@@ -703,6 +812,11 @@ fn ssm(name: &str) -> Option<Vec<Vec<ArgValue>>> {
         args.push(value);
     }
     assert_eq!(env_at, envs.len(), "`{name}`'s recipe is stale");
+    assert_eq!(
+        tile_at,
+        tiles.map_or(0, <[i32]>::len),
+        "`{name}`'s tile row is stale"
+    );
     Some(vec![args])
 }
 
@@ -790,24 +904,40 @@ fn fired() -> Vec<(&'static Routine, Vec<ArgValue>, Seen)> {
 #[test]
 fn a_body_passes_the_arguments_its_signature_takes_in_order() {
     for (r, args, seen) in fired() {
-        let want: Vec<ArgValue> = r
+        // EVERY argument, not only the `Trace` ones. This filtered on
+        // provenance, which was right while `Env` meant a scalar the runtime
+        // knows and the body never forwards. It does not any more: upstream
+        // marked params blocks, slabs and seat tables `Env` -- they are the
+        // FIRE's, not the statement's -- and a body forwards those. So
+        // `split_qkv_bf16` passes five buffers against a `Trace`-only
+        // expectation of four, and the filter is what is wrong.
+        //
+        // Provenance says who SUPPLIES an argument. It never said whether the
+        // argument reaches the shader, and the skip allowance below is what
+        // covers the `Env` scalars that do not.
+        // The SOURCE rides along too: `Provenance` says who supplies an
+        // argument and `Source` says WHICH question it is, and only the second
+        // can tell a statement's own scalar from one the statement may omit.
+        let want: Vec<(ArgValue, Provenance, Option<kernels::Source>)> = r
             .args
             .iter()
             .zip(&args)
-            .filter(|((_, prov), _)| *prov == Provenance::Trace)
-            .map(|(_, value)| *value)
+            .enumerate()
+            .map(|(i, ((_, prov), value))| {
+                (*value, *prov, r.sources.get(i).copied().flatten())
+            })
             .collect();
 
         for (entrypoint, _, got) in seen.0.borrow().iter() {
             // A subsequence walk, keeping what was skipped so it can be
             // judged rather than merely allowed.
-            let mut skipped: Vec<ArgValue> = Vec::new();
+            let mut skipped: Vec<(ArgValue, Provenance, Option<kernels::Source>)> = Vec::new();
             let mut at = 0usize;
-            for value in &want {
+            for (value, prov, source) in &want {
                 if got.get(at) == Some(value) {
                     at += 1;
                 } else {
-                    skipped.push(*value);
+                    skipped.push((*value, *prov, *source));
                 }
             }
             assert_eq!(
@@ -816,18 +946,59 @@ fn a_body_passes_the_arguments_its_signature_takes_in_order() {
                 "`{}` fires `{entrypoint}` with arguments that are not its \
                  signature's in order: it passed {got:?} where the signature \
                  states {want:?}. Skipping is legal for a buffer the module \
-                 does not declare; reordering and inventing are not.",
+                 does not declare and for an environment fact the shader never \
+                 sees; reordering and inventing are not.",
                 r.name
             );
-            for value in &skipped {
+            for (value, prov, source) in &skipped {
+                // A BUFFER may be skipped because its module may declare no
+                // binding for it. An `Env` SCALAR may be skipped because it is
+                // not the shader's at all -- it is a grid fact the runtime
+                // hands the ROUTINE, and `elementwise_rows(*width, *rows)` is
+                // what it is for.
+                //
+                // A `Trace` scalar may not, as a rule: those are packed into
+                // the uniform block by walking this very list, so a dropped one
+                // is read as the field that lives at that offset.
+                //
+                // The exception is a scalar that CHOSE THE SPELLING. A tiling
+                // pair like `gdn_core_recurrent_prefill`'s `(lanes, vrows)`
+                // indexes a table of compiled entrypoints and is baked into the
+                // symbol -- `..._l_32_v_4` -- rather than forwarded, because
+                // the shader reads it as a constant. Passing it as well would
+                // be the defect, so this is not a hole in the rule but the rest
+                // of it: the value must APPEAR in the name it selected, as a
+                // whole `_`-separated token, which a scalar that merely went
+                // missing cannot do.
+                // AN EXTENT IS NOT A FIELD. A `ParamOr<N, K, T>` is the
+                // statement's Nth param OR the fact `K` when the statement
+                // places none, and it carries `Provenance::Trace` because the
+                // statement is where it comes from when it comes from
+                // anywhere placeable -- so provenance cannot tell it from a
+                // scalar the block packs. `Source` can: it is `Or(..)`, and
+                // every one of them in this tree is a GRID number that the
+                // routine reads to build its `lanes` and the shader reads back
+                // from the dispatch. `route_gather`'s `padded` and
+                // `neox_decode`'s `rotary` are the two, and neither was ever a
+                // field of the uniform block.
+                //
+                // That is the same argument the `Env` exemption makes, drawn
+                // where the signature actually draws it.
+                let chose_the_spelling = match value {
+                    ArgValue::I32(v) => {
+                        let v = v.to_string();
+                        entrypoint.split('_').any(|t| t == v)
+                    }
+                    _ => false,
+                };
                 assert!(
-                    matches!(value, ArgValue::Buffer(_)),
-                    "`{}` fires `{entrypoint}` without passing {value:?}, \
-                     which is not a buffer. Only a BUFFER may be skipped, and \
-                     only because its module declares no binding for it -- a \
-                     scalar has no declaration to appeal to, and the uniform \
-                     block is packed by walking this very list, so a dropped \
-                     scalar is read as the field that lives at that offset.",
+                    matches!(value, ArgValue::Buffer(_))
+                        || *prov == Provenance::Env
+                        || chose_the_spelling
+                        || matches!(source, Some(kernels::Source::Or(..))),
+                    "`{}` fires `{entrypoint}` without passing {value:?}, which \
+                     is neither a buffer, nor an environment fact, nor a value \
+                     that appears in the entrypoint it selected.",
                     r.name
                 );
             }

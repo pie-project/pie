@@ -67,7 +67,7 @@ pub fn manifest(f: &Gemma2Facts) -> Manifest {
         .with(TensorSpec::required("norm", [hidden]))
         // Gemma-2 ties, and a tie is an ABSENCE: it is the only thing
         // that tells tied from untied when every extent agrees.
-        .either(!f.tied_embeddings, "lm_head", [vocab, hidden])
+        .tie(f.tied_embeddings, "lm_head", [vocab, hidden])
         .with(TensorSpec::required(
             "layer.{}.self_attn.q_proj",
             [q, hidden],
@@ -144,6 +144,7 @@ pub fn deployment(f: &Gemma2Facts, rope_theta: f32, norm_eps: f32) -> Deployment
             rope_theta,
             // Full rotation at the head dim.
             rotary_dim: 0,
+            q_gate: false,
         })
         .collect();
     Deployment {

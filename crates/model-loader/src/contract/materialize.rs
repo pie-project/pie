@@ -44,8 +44,15 @@ pub struct Materialization {
     /// is rewritten, which is the common case: a BF16 checkpoint copies whole,
     /// and so now does a GGUF.
     pub contract: ModelContract,
-    /// Tensors rewritten on the way in — today that is F16 or F32 narrowed to
-    /// BF16, and only that.
+    /// Tensors rewritten on the way in — as this function leaves it, F16 or
+    /// F32 narrowed to BF16 and nothing else.
+    ///
+    /// "As this function leaves it" is load-bearing: `pie model import`
+    /// PROMOTES into this set afterwards. A tensor that needs a transform the
+    /// checkpoint's vocabulary asks for — llama's Q/K row permutation, gemma's
+    /// unfolded norms — cannot be a byte copy, so import moves it out of
+    /// `passthrough` and adds it here, keeping whatever encoding it had.
+    /// Since blocks began surviving import, some of those are blocked.
     ///
     /// The name is older than the meaning. It once also held every blocked
     /// tensor, because import unpacked them; since it stopped, this set is

@@ -1128,33 +1128,31 @@ impl<'a> Builder<'a> {
             RuntimeQuant::Mxfp4 => QuantScheme::Mxfp4E2M1E8M0,
             RuntimeQuant::Int4 => QuantScheme::MlxAffineU4,
         };
-        // For FP4 a pre-quantized checkpoint is accepted (GLM-5.1 ships FP8
-        // experts). Otherwise only weights the checkpoint DECLARES unquantized
-        // are re-quantized.
+        // **There is deliberately no "is the source already quantized" test
+        // here, and there used to be.** It read `self.encoding` -- the
+        // checkpoint's own `config.json` -- and returned `Ok(None)`, silently
+        // authoring an unquantized model for an operator who had asked for a
+        // quantized one. Three things were wrong with it and only the third
+        // is the reason it is gone.
         //
-        // **What this does not catch, stated because it reads as though it
-        // does.** `self.encoding` is `model::encoding::Encoding`, read from
-        // the checkpoint's `config.json`, so this refuses a checkpoint that
-        // SAYS it is quantized — an AWQ or GPTQ repo, which is a real case and
-        // the one it is here for. An archive `pie model import` wrote does not
-        // say so, whatever its tensors hold: GGUF states its quantization per
-        // tensor, and the synthesized config has no `quantization_config` to
-        // read. `Q4_K -> MlxAffineU4` therefore runs here with nothing to
-        // object to.
+        // It could not see the case it was written for: FP8 arrives as
+        // `Raw(F8E4M3)` with the declaration in a sibling scale, so
+        // `is_none()` is true and it passed. It refused a case it never
+        // claimed: `scheme != Mxfp4` also catches INT4, which the comment
+        // above it did not mention. And a checkpoint's declaration is the
+        // wrong fact to ask anyway -- the question is about PROVENANCE, which
+        // is a property of the file rather than of the model, and which this
+        // author neither carries nor should.
         //
-        // That is not repaired by widening this test, because the fact is not
-        // in the checkpoint to be tested — it is in provenance, which the
-        // author does not carry and should not, being a fact about the file
-        // rather than about the model. It is answered one level up, where all
-        // three deciding facts are in hand at once: `build::resolve_quant`
-        // reads `pie_source_encoding` and either refuses or warns, depending
-        // on whether the backend can serve the model without requantizing it.
-        // What reaches this function has therefore already been checked
-        // against the source; this test is the second line, for the
-        // checkpoints that state their own encoding.
-        if !self.encoding.is_none() && scheme != QuantScheme::Mxfp4E2M1E8M0 {
-            return Ok(None);
-        }
+        // That question is answered once, at the CLI boundary, by
+        // `build::resolve_quant`, which is the only place holding all three
+        // deciding facts at once: what was requested, what the backend can
+        // bind, and what `pie_source_encoding` says the bytes are. It refuses
+        // where the backend could serve the model without a second rounding
+        // and warns where requantizing is the only way to serve it. A second
+        // line here bought nothing on top of that and cost the silence: when
+        // the two disagreed, this one won by doing nothing at all, and an
+        // artifact came out the size of the request nobody honored.
         let allowed = if scheme == QuantScheme::Mxfp4E2M1E8M0 {
             self.allow_mxfp4_rq
         } else {
@@ -2225,15 +2223,21 @@ mod tests {
         );
     }
 
-    /// An already-quantized checkpoint is re-quantized to FP4 and to nothing
-    /// else.
+    /// An already-quantized checkpoint is re-quantized to whatever it is
+    /// asked for, because declining is no longer this level's job.
     ///
-    /// GLM-5.1 ships FP8 experts and is still asked for FP4. The same
-    /// checkpoint asked for FP8 must fall through to the ordinary path
-    /// rather than re-encoding what is already encoded -- and `Ok(None)`,
-    /// not an error, because there is nothing wrong with the request.
+    /// GLM-5.1 ships FP8 experts and is still asked for FP4, which is why
+    /// `Mxfp4` was always allowed through. The FP8-over-FP8 case used to be
+    /// declined *here*, silently, with `Ok(None)` -- and the silence was the
+    /// problem: an operator who asked for a rounding got an artifact that had
+    /// not been rounded and no line saying so. It is refused earlier now, by
+    /// `build::resolve_quant`, which reads `pie_source_encoding` -- and which
+    /// sees this case only because `import::source_encoding` files an FP8
+    /// dtype under `quant:` rather than `raw:`. That tagging and this test
+    /// are two halves of one change; if the tagging regresses, the second
+    /// rounding comes back and nothing below this line will object.
     #[test]
-    fn a_prequantized_checkpoint_admits_only_the_fp4_request() {
+    fn a_prequantized_checkpoint_is_requantized_by_whatever_asks() {
         let rows = [(
             "model.layers.0.mlp.experts.0.up_proj.weight",
             vec![64, 128],
@@ -2248,10 +2252,10 @@ mod tests {
         let c = publish(&rows, &quantized, &rq(RuntimeQuant::Fp8), |b| {
             b.allow_bf16_runtime_quant();
         })
-        .expect("an FP8 request over a quantized checkpoint is declined, not refused");
+        .expect("nothing here objects to the request");
         assert!(
-            !matches!(&c.tensors[0].encoding, Encoding::Quant(s) if s.scheme == QuantScheme::Fp8E4M3),
-            "it must not re-encode an already-encoded checkpoint"
+            matches!(&c.tensors[0].encoding, Encoding::Quant(s) if s.scheme == QuantScheme::Fp8E4M3),
+            "the declaration is not a fact this author acts on any more"
         );
 
         let c = publish(&rows, &quantized, &rq(RuntimeQuant::Mxfp4), |b| {
@@ -2539,14 +2543,16 @@ mod tests {
         }
     }
 
-    /// An already-quantized weight is re-quantized, because the guard that
-    /// says it will not cannot see FP8.
+    /// An already-quantized weight is re-quantized, and nothing at this level
+    /// can tell that it should not be.
     ///
-    /// `runtime_quant_scheme` states the rule -- "For FP8/INT8 only BF16
-    /// weights are re-quantized, never an already-quantized checkpoint" --
-    /// and enforces it with `!self.encoding.is_none()`, which only ever sees
-    /// a *group*-quantized checkpoint. FP8 arrives as `Raw(F8E4M3)`,
-    /// `is_none()` is true, and the guard passes.
+    /// This test used to be evidence against a guard: `runtime_quant_scheme`
+    /// refused an already-quantized checkpoint by asking `self.encoding`, and
+    /// FP8 walked past it because FP8 arrives as `Raw(F8E4M3)` with its
+    /// declaration in a sibling scale, so `is_none()` was true. The guard is
+    /// gone -- `build::resolve_quant` decides this once, where provenance is
+    /// actually known -- and the behaviour it failed to prevent is unchanged,
+    /// which is what this test now pins.
     ///
     /// What comes out is a weight at `Fp8E4M3, group_size 1` -- rounded onto
     /// a per-output-channel grid from values that were already quantized --
@@ -2558,7 +2564,7 @@ mod tests {
     /// they differ only in where they came from. That is the argument for
     /// provenance, and this test is what makes the argument checkable.
     #[test]
-    fn requantizing_an_fp8_weight_is_not_refused_by_the_guard_that_claims_to() {
+    fn requantizing_an_fp8_weight_is_a_second_rounding_nothing_here_can_see() {
         let rows = [
             (
                 "model.layers.0.mlp.down_proj.weight",
@@ -2579,7 +2585,7 @@ mod tests {
                 b.allow_bf16_runtime_quant();
             },
         )
-        .expect("no refusal: the guard cannot see an FP8 weight");
+        .expect("no refusal: provenance is not a fact this author holds");
         let w = c
             .tensors
             .iter()

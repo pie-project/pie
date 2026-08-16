@@ -22,7 +22,7 @@
 //! reuses the SAME driver path the beam-designb + sliding-window e2es proved,
 //! at B=1 with a compound sink+window mask.
 //!
-//!   cargo test -p pie-gpu-tests --features driver-cuda \
+//!   cargo test -p pie-gpu-tests --features driver-cuda-13 \
 //!     --test cuda_attention_sink_e2e -- --ignored --nocapture
 
 mod common;

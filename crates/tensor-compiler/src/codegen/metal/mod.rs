@@ -1,38 +1,16 @@
 //! # Metal (MSL) region emitters
 //!
-//! The only producer of Pie's generated MSL. Emission is a pure function of
-//! the plan — no device-architecture inputs — so the same stage emits the same
-//! bytes every time, and `compiler/tests/golden-msl/` pins them.
+//! The only producer of Pie's generated MSL. Emission is a pure function of the
+//! plan — no device-architecture inputs — so the same stage emits the same bytes
+//! every time and `compiler/tests/golden-msl/` pins them. Those goldens are the
+//! contract itself: nothing can re-derive them, so a diff is a decision to be
+//! justified rather than a comparison to be re-run.
 //!
-//! Those goldens started as a dump of an in-driver C++ emitter that no longer
-//! exists, which is why they are formatted as a foreign dump and why
-//! regenerating one is guarded. They are now the contract itself rather than a
-//! transcript of one: nothing can re-derive them, so a diff is a decision to be
-//! justified, not a comparison to be re-run.
-//!
-//! Most emitters return [`Result<String, EmitError>`] and refuse rather than
-//! emit a kernel they cannot justify. The three that take no plan —
-//! [`singleton::emit_singleton_region`], [`effects::emit_grouped_readiness`]
-//! and [`effects::emit_grouped_commit`] — return a bare `String`, because their
-//! inputs are a name and a closed-enum tag and there is nothing left to refuse.
-//!
-//! Three refusals the earlier design needed have no counterpart here — an
-//! out-of-range symbolic extent role, an out-of-range dtype, and an unknown op
-//! tag — because `SymbolicExtent`, `DType` and `Op` are closed enums whose
-//! variants are exactly the legal values. A refusal that the types already make
-//! unrepresentable is dead code that reads like a live guard.
-//!
-//! [`EmitError`]: crate::codegen::error::EmitError
-//!
-//! ## Modules
-//!
-//! * [`preamble`] — the embedded runtime and the shared MSL struct preambles.
-//! * [`validate`] — `validate_singleton_plan` and the region ABI checks.
-//! * [`singleton`] — the one-op-per-dispatch kernel.
-//! * [`effects`] — readiness/commit kernels, single-lane and grouped.
-//! * [`fused`] — whole-region kernels, single-lane and grouped.
-//! * [`nucleus`] — the grouped nucleus-sampling library kernel.
-//! * [`topk`] — the grouped top-k library kernel.
+//! Most emitters return `Result<String, EmitError>` and refuse rather than emit
+//! a kernel they cannot justify; the three taking no plan return a bare `String`
+//! because their inputs are a name and a closed-enum tag. For the same reason
+//! there is no out-of-range extent-role, dtype or op-tag refusal — a refusal the
+//! types make unrepresentable is dead code that reads like a live guard.
 
 pub mod effects;
 pub mod fused;
@@ -53,8 +31,7 @@ pub use singleton::emit_singleton_region;
 pub use topk::emit_grouped_topk;
 pub use validate::validate_singleton_plan;
 
-/// `kMetalM1EmitterVersion` — bumped whenever emitted MSL changes, so the
-/// driver's pipeline cache keys on it.
+/// `kMetalM1EmitterVersion` — bumped whenever emitted MSL changes; the driver's pipeline cache keys on it.
 pub const METAL_M1_EMITTER_VERSION: u16 = 36;
 
 /// `kMetalM1MaxChannels` — the single-lane readiness/commit kernels bind one
@@ -85,9 +62,8 @@ pub struct M1ChannelEffect {
     pub capacity: u32,
 }
 
-/// `M1OpMeta` — one accepted singleton op: where it sits in the stage, the
-/// SSA id its first result defines, and the `COp` view the driver dispatches
-/// on.
+/// `M1OpMeta` — one accepted singleton op: where it sits in the stage, the SSA
+/// id its first result defines, and the `COp` view the driver dispatches on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct M1OpMeta {
     /// The op's position in the stage op list.

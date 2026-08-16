@@ -19,8 +19,7 @@
 //! separate, and one boot per process.
 //!
 //! ```text
-//! PIE_KERNELS_VULKAN_SPV_DIR=<abs>/out/spv \
-//!   PIE_VULKAN_ARTIFACT=/tmp/q4full.zt:/tmp/q25full.zt \
+//! PIE_VULKAN_ARTIFACT=/tmp/q4full.zt:/tmp/q25full.zt \
 //!   cargo test -p pie-gpu-tests --features driver-vulkan \
 //!   --test vulkan_second_model -- --ignored --nocapture
 //! ```

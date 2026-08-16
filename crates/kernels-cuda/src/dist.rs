@@ -1,100 +1,36 @@
 //! The NCCL collectives — declared, and refused, because no NCCL bindings
 //! are generated and nothing in this tree calls a communicator.
 //!
-//! # Why a module of refusals is the honest shape
+//! Declared because a lowered TP text may NAME them, and `check_plan` refuses
+//! a model whose launched symbol is undeclared — which would name the wrong
+//! problem. Refused because `cudarc` is built without its `nccl` feature, so
+//! no `ncclAllReduce` binding exists to call. These are the ABOVE-crossover
+//! arm a sharded text picks for large messages; [`crate::comm`]'s P2P kernel
+//! is the below-crossover one, and its absence is independent of this one.
 //!
-//! Three symbols a tensor-parallel model text states, and nothing in this
-//! tree implements any of them. That combination is not a gap to be papered
-//! over; it is a fact with two halves, and both need saying:
+//! Every row is `whole` because every rank must enter the same collective the
+//! same number of times: a row window that split one rank's launch and not
+//! another's would DEADLOCK rather than compute a wrong answer.
 //!
-//! * **A lowered model text may name them.** `dsl::cuda` records all three,
-//!   and `mistral_7b_v03.cuda.tp2.decode` is a real sharded trace that fires
-//!   two of them 32 times each. `model-compiler`'s `check_plan` refuses a
-//!   model at LOAD whose launched symbol is undeclared — so if these are not
-//!   declared, a TP model text is rejected with *"no such symbol"*, which
-//!   names the wrong problem. The symbol is fine. There are no bindings.
-//! * **This build cannot run them.** `cudarc` is depended on with
-//!   `default-features = false` and an explicit feature list — `std`,
-//!   `driver`, `runtime`, `nvrtc`, `cublas`, `cublaslt` — which does **not**
-//!   include `nccl`, so no `ncclCommInitRank` or `ncclAllReduce` binding is
-//!   generated for any body here to call. Nothing else in the workspace names
-//!   an NCCL symbol either. These bodies are the backstop under
-//!   `driver-cuda`'s `serve::load` refusal, not the place it is normally
-//!   made.
+//! # Why these are `routine!` and the `comm::` pair is not
 //!
-//! # These three are the ABOVE-THRESHOLD path
+//! A collective takes a communicator, and that was read as putting all five
+//! TP symbols out of the column's reach. It does not: NCCL resolves its own
+//! communicator inside the call, so what these three take is a buffer, a
+//! second buffer and a count -- and the count is `rows x width`, which F6
+//! gives to the launcher. `driver-cuda` held three arms doing that
+//! multiplication until this row said `routine!`.
 //!
-//! A sharded model text picks between two spellings by message size.
-//! [`crate::comm`]'s P2P kernel wins on LATENCY below a crossover — 1 MiB at
-//! world size 4, 256 KiB above it, and the plane's whole `max_bytes` at world
-//! size 2 — and NCCL wins on BANDWIDTH above it. That is what
-//! `CustomAllReduce::can_handle` reports with `Decline::AboveCrossover`, and
-//! its doc says in as many words that such a decline is *"the caller's cue to
-//! fall back to `ncclAllReduce`"*. **These are that fallback.**
-//!
-//! So a refusal here is not a duplicate of `comm`'s. `comm` declines because
-//! the repository does not vendor the header its launcher lives in;
-//! `dist` refuses because the build generates no bindings to a communicator
-//! at all. The two absences are independent, and closing either one alone
-//! leaves tensor parallelism working over a different half of the message
-//! sizes.
-//!
-//! They were three rows in `not_yet_crossed.rs`, hand-stating their columns.
-//! A `fn` that refuses states the same thing and derives them, and it puts
-//! the reason at the point of fire rather than in a table a fire never reads.
-//!
-//! # A declined implementation is still an implementation
-//!
-//! This is not a stub pretending to be a kernel. `Refusal::Absent` is the
-//! vocabulary's own word for *"this build has no answer for that"*, and
-//! `attn::kv_paged::write_kv_to_pages` already ends one of its arms with
-//! `Err(Refusal::Absent { what: "a quantised writer for Native storage" })`
-//! — a real host program declining a case it does not cover. The difference
-//! here is one of degree: every case is uncovered, because the dependency is
-//! absent rather than the arm.
-//!
-//! The day NCCL is linked, these bodies fill in and nothing else moves: the
-//! symbols keep their names, the rows keep deriving, and the callers keep
-//! calling. That is the property a hand-written row could not have.
-//!
-//! # The columns, and why every one of them is `whole`
-//!
-//! Recovered from `9e3936fb9^` with the rest, and pinned by
-//! `tests/stated_columns.rs`. The reason is stronger than "a reduction is
-//! over the whole value": **every rank must enter the same collective the
-//! same number of times.** A row window that split one rank's launch and not
-//! another's would DEADLOCK rather than compute a wrong answer, so the
-//! refusal is not an optimisation and `Uncovered::WholeKernelSplit` is the
-//! diagnosis that has to fire. They are also synchronisation points, which
-//! the graph-capture rules have to know.
+//! `comm::`'s custom reduction is the one that really wants a handle: it maps
+//! peer memory and takes a PLANE, which no statement carries and no `Source`
+//! names.
 
 use crate::jit::Ctx;
+use crate::jit::abi::bf16;
 use kernels::Refusal;
+use kernels::routine::{In, Out};
 
-/// What every body here says, in one place so three refusals cannot drift
-/// into three different accounts of one absence.
-///
-/// # The sentence this replaced was wrong twice
-///
-/// It read *"NCCL: this build links no communicator"*. `driver-cuda`'s
-/// `build.rs` emitted `cargo:rustc-link-lib=nccl` under the `abi` feature, so
-/// the build DID name the library — and named it uselessly, since no symbol
-/// in the workspace resolved out of it (`--as-needed` dropped it from the
-/// artifact's `NEEDED` list, leaving only a link-time requirement for a
-/// `libnccl.so` nothing called). That flag is gone. What was never true is
-/// the implication a reader takes from "links no communicator": that linking
-/// one would be enough. It would not — `cudarc`'s `nccl` feature is off, so
-/// there is no `ncclAllReduce` to call in the first place.
-///
-/// It also said `serve::load` refuses `tp_size > 1` *"for the same reason"*.
-/// It does not, and never did: the driver's gate is
-/// `kernels_cuda::comm::CAN_LAUNCH`, which has nothing to do with NCCL. That
-/// constant was `false` while `flashinfer/comm/` was unvendored; both headers
-/// are internalised now and it is `true`, so `tp_size > 1` is no longer
-/// refused on it at all. These three are the above-crossover arm a sharded
-/// model text picks when the message is large, and they still refuse — which
-/// makes them the one remaining hole in tensor parallelism rather than the
-/// symptom of a larger one.
+/// What every body here says, in one place so three refusals cannot drift.
 fn no_nccl(what: &'static str) -> Refusal {
     let _ = what;
     Refusal::Absent {
@@ -107,25 +43,56 @@ fn no_nccl(what: &'static str) -> Refusal {
 
 /// `dist::all_reduce_bf16` — the in-place sum across the group.
 ///
-/// `in_place = &[(0, 0)]`: the buffer is read and written, which is what
-/// distinguishes it from [`all_reduce_bf16_out`] below and is the whole of
-/// the difference between the two rows.
+/// `in_place = &[(0, 0)]`: the buffer is read and written, which is the whole
+/// difference from [`all_reduce_bf16_out`].
 ///
 /// # Errors
-///
 /// Always. See the module header.
-pub fn all_reduce_bf16(_ctx: &Ctx, _buf: *mut core::ffi::c_void, _elems: i64) -> Result<(), Refusal> {
+#[kernels_macros::routine]
+pub fn all_reduce_bf16(ctx: &Ctx, buf: Out<0, bf16>) -> Result<(), Refusal> {
+    let r = buf.all("out_width(0)")?;
+    all_reduce_in_place(ctx, r.ptr.cast(), i64::from(r.elements()))
+}
+
+/// [`all_reduce_bf16`] over a span the caller already holds.
+///
+/// The routine above is the statement's door; this is the one a launcher
+/// reaches, and there is exactly one body under both.
+///
+/// # Errors
+/// Always. See the module header.
+pub fn all_reduce_in_place(
+    _ctx: &Ctx,
+    _buf: *mut core::ffi::c_void,
+    _elems: i64,
+) -> Result<(), Refusal> {
     Err(no_nccl("all_reduce"))
 }
 
-/// `dist::all_reduce_bf16_out` — the same collective, a separate
-/// destination, and no alias pair. That absence is the whole difference from
-/// the row above.
+/// `dist::all_reduce_bf16_out` — the same collective with a separate
+/// destination and no alias pair.
 ///
 /// # Errors
-///
 /// Always. See the module header.
+#[kernels_macros::routine]
 pub fn all_reduce_bf16_out(
+    ctx: &Ctx,
+    src: In<0, bf16>,
+    dst: Out<0, bf16>,
+) -> Result<(), Refusal> {
+    let d = dst.all("out_width(0)")?;
+    all_reduce_out_of_place(ctx, src.ptr.cast(), d.ptr.cast(), i64::from(d.elements()))
+}
+
+/// [`all_reduce_bf16_out`] over spans the caller already holds.
+///
+/// `comm::fall_back_out_of_place` is the caller: the P2P reduction declines
+/// and reaches NCCL with raw pointers and a count, having never had a
+/// statement in hand.
+///
+/// # Errors
+/// Always. See the module header.
+pub fn all_reduce_out_of_place(
     _ctx: &Ctx,
     _src: *const core::ffi::c_void,
     _dst: *mut core::ffi::c_void,
@@ -137,9 +104,21 @@ pub fn all_reduce_bf16_out(
 /// `dist::all_gather_bf16` — each rank's shard concatenated on every rank.
 ///
 /// # Errors
-///
 /// Always. See the module header.
-pub fn all_gather_bf16(
+#[kernels_macros::routine]
+pub fn all_gather_bf16(ctx: &Ctx, src: In<0, bf16>, dst: Out<0, bf16>) -> Result<(), Refusal> {
+    // The INPUT's width, not the output's: the count is per rank, and the
+    // destination is `world_size` times as wide. Reading the output here would
+    // have every rank write past its own band.
+    let s = src.all("in_width(0)")?;
+    all_gather(ctx, s.ptr.cast(), dst.ptr.cast(), i64::from(s.elements()))
+}
+
+/// [`all_gather_bf16`] over spans the caller already holds.
+///
+/// # Errors
+/// Always. See the module header.
+pub fn all_gather(
     _ctx: &Ctx,
     _src: *const core::ffi::c_void,
     _dst: *mut core::ffi::c_void,
@@ -151,14 +130,14 @@ pub fn all_gather_bf16(
 /// The three symbols, declared so a TP model text resolves rather than being
 /// refused for the wrong reason.
 ///
-/// `driver_bound!` and not `routine!`: a collective takes a COMMUNICATOR,
-/// which is a property of the deployment's process group and something no
-/// trace statement carries or could. That is true of the implementation this
-/// module does not have, so it stays true when it arrives.
+/// `routine!` and not `driver_bound!`: NCCL resolves its own communicator
+/// inside the collective, so every argument these take IS one a statement
+/// supplies, and a `driver_bound!` row's empty column is what kept three
+/// hand-written arms alive in `driver-cuda` for arithmetic a launcher owns.
 pub static ROUTINES: &[crate::jit::Routine] = &[
-    crate::driver_bound!(all_reduce_bf16, whole, in_place = &[(0, 0)]),
-    crate::driver_bound!(all_reduce_bf16_out, whole),
-    crate::driver_bound!(all_gather_bf16, whole),
+    crate::routine!(all_reduce_bf16, whole, in_place = &[(0, 0)]),
+    crate::routine!(all_reduce_bf16_out, whole),
+    crate::routine!(all_gather_bf16, whole),
 ];
 
 /// `dist`, as a trace names it.

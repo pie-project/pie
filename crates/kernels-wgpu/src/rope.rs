@@ -28,7 +28,8 @@ pub static ENTRYPOINTS: &[&str] = &[
     "neox_strided_bfloat16",
 ];
 
-use crate::routine::{Bind, Buf, BufMut, Ctx, Env, Fire, I32s, Routine};
+use crate::routine::{keys, Ask, Bind, Buf, BufMut, Ctx, Fire, I32s, Param, ParamF32, ParamOr, Routine};
+use crate::routine::OutSlot;
 use kernels::routine::Refusal;
 
 /// One invocation per `(pair, head, row)`.
@@ -89,19 +90,19 @@ fn rope_grid(rotary: i32, width: i32, head_dim: i32, rows: i32) -> Result<[u32; 
 /// See `rope_grid`.
 pub fn neox_decode(
     ctx: &Ctx<'_>,
-    x: BufMut,
-    position: I32s,
-    scale: f32,
-    base: f32,
-    head_dim: i32,
-    rotary: Env<i32>,
-    width: Env<i32>,
+    x: OutSlot<0, BufMut>,
+    position: Ask<keys::Positions, I32s>,
+    scale: ParamF32<0>,
+    base: ParamF32<1>,
+    head_dim: ParamOr<2, keys::HeadDim, i32>,
+    rotary: ParamOr<3, keys::RotaryWidth, i32>,
+    width: Ask<keys::Width, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "rope/neox.wgsl",
             entrypoint: "neox_decode_bfloat16",
-            lanes: rope_grid(*rotary, *width, head_dim, 1)?,
+            lanes: rope_grid(*rotary, *width, *head_dim, 1)?,
         },
         &[x.v(), position.v(), scale.v(), base.v(), head_dim.v()],
     )
@@ -114,20 +115,20 @@ pub fn neox_decode(
 /// See `rope_grid`.
 pub fn neox_mb(
     ctx: &Ctx<'_>,
-    x: BufMut,
-    position: I32s,
-    scale: f32,
-    base: f32,
-    head_dim: i32,
-    rotary: Env<i32>,
-    width: Env<i32>,
-    rows: Env<i32>,
+    x: OutSlot<0, BufMut>,
+    position: Ask<keys::Positions, I32s>,
+    scale: ParamF32<0>,
+    base: ParamF32<1>,
+    head_dim: ParamOr<2, keys::HeadDim, i32>,
+    rotary: ParamOr<3, keys::RotaryWidth, i32>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "rope/neox.wgsl",
             entrypoint: "neox_mb_bfloat16",
-            lanes: rope_grid(*rotary, *width, head_dim, *rows)?,
+            lanes: rope_grid(*rotary, *width, *head_dim, *rows)?,
         },
         &[x.v(), position.v(), scale.v(), base.v(), head_dim.v()],
     )
@@ -144,20 +145,20 @@ pub fn neox_mb(
 /// See `rope_grid`.
 pub fn neox_freqs_decode(
     ctx: &Ctx<'_>,
-    x: BufMut,
-    position: I32s,
-    scale: f32,
-    inv_freq: Buf,
-    head_dim: i32,
-    mscale: f32,
-    rotary: Env<i32>,
-    width: Env<i32>,
+    x: OutSlot<0, BufMut>,
+    position: Ask<keys::Positions, I32s>,
+    scale: ParamF32<0>,
+    inv_freq: Ask<keys::RopeFrequencies, Buf>,
+    head_dim: ParamOr<1, keys::HeadDim, i32>,
+    mscale: ParamF32<2>,
+    rotary: ParamOr<3, keys::RotaryWidth, i32>,
+    width: Ask<keys::Width, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "rope/neox.wgsl",
             entrypoint: "neox_freqs_decode_bfloat16",
-            lanes: rope_grid(*rotary, *width, head_dim, 1)?,
+            lanes: rope_grid(*rotary, *width, *head_dim, 1)?,
         },
         &[
             x.v(),
@@ -177,21 +178,21 @@ pub fn neox_freqs_decode(
 /// See `rope_grid`.
 pub fn neox_freqs_mb(
     ctx: &Ctx<'_>,
-    x: BufMut,
-    position: I32s,
-    scale: f32,
-    inv_freq: Buf,
-    head_dim: i32,
-    mscale: f32,
-    rotary: Env<i32>,
-    width: Env<i32>,
-    rows: Env<i32>,
+    x: OutSlot<0, BufMut>,
+    position: Ask<keys::Positions, I32s>,
+    scale: ParamF32<0>,
+    inv_freq: Ask<keys::RopeFrequencies, Buf>,
+    head_dim: ParamOr<1, keys::HeadDim, i32>,
+    mscale: ParamF32<2>,
+    rotary: ParamOr<3, keys::RotaryWidth, i32>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "rope/neox.wgsl",
             entrypoint: "neox_freqs_mb_bfloat16",
-            lanes: rope_grid(*rotary, *width, head_dim, *rows)?,
+            lanes: rope_grid(*rotary, *width, *head_dim, *rows)?,
         },
         &[
             x.v(),
@@ -215,19 +216,19 @@ pub fn neox_freqs_mb(
 /// See `rope_grid`.
 pub fn neox_prop_decode(
     ctx: &Ctx<'_>,
-    x: BufMut,
-    position: I32s,
-    scale: f32,
-    base: f32,
-    head_dim: i32,
-    rotary: Env<i32>,
-    width: Env<i32>,
+    x: OutSlot<0, BufMut>,
+    position: Ask<keys::Positions, I32s>,
+    scale: ParamF32<0>,
+    base: ParamF32<1>,
+    head_dim: ParamOr<2, keys::HeadDim, i32>,
+    rotary: ParamOr<3, keys::RotaryWidth, i32>,
+    width: Ask<keys::Width, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "rope/neox.wgsl",
             entrypoint: "neox_prop_decode_bfloat16",
-            lanes: rope_grid(*rotary, *width, head_dim, 1)?,
+            lanes: rope_grid(*rotary, *width, *head_dim, 1)?,
         },
         &[x.v(), position.v(), scale.v(), base.v(), head_dim.v()],
     )
@@ -240,20 +241,20 @@ pub fn neox_prop_decode(
 /// See `rope_grid`.
 pub fn neox_prop_mb(
     ctx: &Ctx<'_>,
-    x: BufMut,
-    position: I32s,
-    scale: f32,
-    base: f32,
-    head_dim: i32,
-    rotary: Env<i32>,
-    width: Env<i32>,
-    rows: Env<i32>,
+    x: OutSlot<0, BufMut>,
+    position: Ask<keys::Positions, I32s>,
+    scale: ParamF32<0>,
+    base: ParamF32<1>,
+    head_dim: ParamOr<2, keys::HeadDim, i32>,
+    rotary: ParamOr<3, keys::RotaryWidth, i32>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "rope/neox.wgsl",
             entrypoint: "neox_prop_mb_bfloat16",
-            lanes: rope_grid(*rotary, *width, head_dim, *rows)?,
+            lanes: rope_grid(*rotary, *width, *head_dim, *rows)?,
         },
         &[x.v(), position.v(), scale.v(), base.v(), head_dim.v()],
     )
@@ -266,21 +267,21 @@ pub fn neox_prop_mb(
 /// See `rope_grid`.
 pub fn neox_strided(
     ctx: &Ctx<'_>,
-    x: BufMut,
-    position: I32s,
-    scale: f32,
-    base: f32,
-    head_dim: i32,
-    row_pitch: i32,
-    rotary: Env<i32>,
-    width: Env<i32>,
-    rows: Env<i32>,
+    x: OutSlot<0, BufMut>,
+    position: Ask<keys::Positions, I32s>,
+    scale: ParamF32<0>,
+    base: ParamF32<1>,
+    head_dim: ParamOr<2, keys::HeadDim, i32>,
+    row_pitch: Param<4, i32>,
+    rotary: ParamOr<3, keys::RotaryWidth, i32>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "rope/neox.wgsl",
             entrypoint: "neox_strided_bfloat16",
-            lanes: rope_grid(*rotary, *width, head_dim, *rows)?,
+            lanes: rope_grid(*rotary, *width, *head_dim, *rows)?,
         },
         &[
             x.v(),
@@ -293,12 +294,31 @@ pub fn neox_strided(
     )
 }
 
+/// This family's routines.
+///
+/// EVERY ONE STATES `in_place = &[(0, 0)]`, and an earlier draft that removed
+/// it had the right gate and the wrong word. The claim then was that a
+/// rotation's single operand is an `Out` with no input to alias -- but
+/// `dsl::metal::rope_one`, the only place any plane's neox is stated, places
+/// that operand as an INPUT and declares no result on purpose. A statement
+/// that declared a separate result had `Out(0)` bind the RESULT's slot, which
+/// no kernel had written, and the rotated value everything downstream wanted
+/// was never produced; position zero makes rope the identity, so the first
+/// reference gate agreed anyway. Stating no result is what makes
+/// `dispatch::reorder` bind `Out(0)` to the one widthed operand -- the input,
+/// the buffer the kernel mutates.
+///
+/// So `(0, 0)` is not a second spelling of `BufMut`. It is the only thing that
+/// says the write and the placement are ONE buffer, which §6.2's arity rule
+/// needs on both sides: without it a rotation reads NOTHING against a
+/// statement placing one operand, and writes one pointer against a statement
+/// declaring none.
 pub static ROUTINES: &[Routine] = &[
-    crate::routine!(neox_decode),
-    crate::routine!(neox_freqs_decode),
-    crate::routine!(neox_freqs_mb),
-    crate::routine!(neox_mb),
-    crate::routine!(neox_prop_decode),
-    crate::routine!(neox_prop_mb),
-    crate::routine!(neox_strided),
+    crate::routine!(neox_decode, in_place = &[(0, 0)]),
+    crate::routine!(neox_freqs_decode, in_place = &[(0, 0)]),
+    crate::routine!(neox_freqs_mb, in_place = &[(0, 0)]),
+    crate::routine!(neox_mb, in_place = &[(0, 0)]),
+    crate::routine!(neox_prop_decode, in_place = &[(0, 0)]),
+    crate::routine!(neox_prop_mb, in_place = &[(0, 0)]),
+    crate::routine!(neox_strided, in_place = &[(0, 0)]),
 ];

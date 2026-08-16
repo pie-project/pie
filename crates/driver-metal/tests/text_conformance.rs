@@ -67,6 +67,8 @@ const QUANTISED: Geometry = Geometry {
     global_head_dim: 0,
     global_kv_heads: 0,
     full_attn_every: 0,
+    v_heads: 0,
+    v_dim: 0,
     // Zero is "one affine point", which is every text here but gpt-oss,
     // whose router gates arrived at their own width.
     router_group: 0,
@@ -318,6 +320,8 @@ fn texts() -> Vec<Text> {
                 global_head_dim: 256,
                 global_kv_heads: 4,
                 full_attn_every: 6,
+                v_heads: 0,
+                v_dim: 0,
                 ..QUANTISED
             },
         },
@@ -401,6 +405,8 @@ fn texts() -> Vec<Text> {
                 global_head_dim: 256,
                 global_kv_heads: 4,
                 full_attn_every: 6,
+                v_heads: 0,
+                v_dim: 0,
                 ..QUANTISED
             },
         },
@@ -1493,7 +1499,7 @@ fn every_routine_agrees_with_the_shader_its_stem_names() {
 
 /// **The slots nothing fills, held against the shader that declares them.**
 ///
-/// A row's `Source::Unbound` operand was a slot nobody fills, and a slot
+/// A row's unsourced operand was a slot nobody fills, and a slot
 /// nobody fills is read anyway -- on this backend, whatever the last dispatch
 /// left there. Two tests asked about it: this one counted the holes, and a
 /// second counted the `Source::Param` scalars a statement had to supply.
@@ -1696,7 +1702,7 @@ fn prefill_tiles_the_attention_decode_walks_row_by_row() {
 //
 // `every_source_a_metal_row_states_is_one_the_operand_walk_names` stood here.
 // It source-parsed `lowering/dispatch.rs` for `Source::X` mentions and
-// asserted every non-`Unbound` source a `KERNELS_METAL` row states appears
+// asserted every non-`None` source a `KERNELS_METAL` row states appears
 // among them, on the reading that the walk's `_ => nothing` would otherwise
 // bind an empty region.
 //

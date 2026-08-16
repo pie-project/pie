@@ -44,7 +44,7 @@
 //! ```text
 //!   for pol in 1 0; do
 //!     PIE_DECLARED_FORWARD_GEMMA4=$pol cargo test -p pie-gpu-tests --release \
-//!       --no-default-features --features driver-cuda \
+//!       --no-default-features --features driver-cuda-13 \
 //!       --test cuda_declared_family_parity gemma4_declared \
 //!       -- --ignored --nocapture --test-threads=1
 //!   done

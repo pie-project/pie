@@ -15,7 +15,7 @@
 //! (bravo's `e92d30f8` batch-level granularity) makes co-batched streams diverge.
 //!
 //! `#[ignore]` (needs 4090 + cuda + qwen3-0.6b). Run:
-//!   PIE_COMPILER_LAUNCHER=env cargo test -p pie-gpu-tests --features driver-cuda \
+//!   PIE_COMPILER_LAUNCHER=env cargo test -p pie-gpu-tests --features driver-cuda-13 \
 //!     --test cuda_runahead_concurrent -- --ignored --nocapture
 
 mod common;

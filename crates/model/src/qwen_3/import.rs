@@ -1,4 +1,4 @@
-//! Qwen3 as llama.cpp spells it, in the vocabulary the catalog reads.
+//! Qwen3's dense tensor names, in pie's vocabulary and the two foreign ones.
 //!
 //! # Why this is a rename and nothing more
 //!
@@ -44,74 +44,81 @@
 //! that do publish one, on the same reasoning as `qwen_2::import`: GGUF
 //! states no tie key, so dropping the tensor here would be a guess at a fact
 //! the file does not contain.
+//!
+//! # Why this generation has two tables and not one
+//!
+//! `import_moe` is the other. One GENERATION can be several llama.cpp
+//! ARCHITECTURES -- `qwen3` and `qwen3moe` are both `crate::qwen_3` -- and
+//! the two disagree about the MLP: this table's `ffn_gate` is one
+//! `mlp.gate_proj` per layer, and that one's `ffn_gate_exps` is a stack that
+//! becomes one `mlp.experts.{}.gate_proj` per expert. Those are different
+//! members with different pie names, so the tables are disjoint where they
+//! differ, and a GGUF is answered by exactly the table its architecture
+//! names. A HuggingFace checkpoint, which declares a `model_type` and not an
+//! architecture, is offered both in order.
 
-/// The HuggingFace name for a GGUF tensor, or `None` if this map has none.
-///
-/// `None` is a refusal and not a skip. A tensor silently left out is a model
-/// that loads with a layer missing, and the caller turns this into an error
-/// naming the tensor.
-#[must_use]
-pub fn hf_name(gguf: &str) -> Option<String> {
-    let (stem, suffix) = match gguf.rsplit_once('.') {
-        Some((stem, tail @ ("weight" | "bias"))) => (stem, tail),
-        _ => return None,
-    };
-    let hf = match split_layer(stem) {
-        Some((layer, member)) => format!("model.layers.{layer}.{}", LAYER.get_member(member)?),
-        None if stem == "output" => "lm_head".to_string(),
-        None => format!("model.{}", MODEL.get_member(stem)?),
-    };
-    Some(format!("{hf}.{suffix}"))
-}
+use crate::shared::vocabulary::{Member, Vocab};
 
-/// `blk.7.attn_q` as `(7, "attn_q")`.
-///
-/// The index is parsed rather than matched so that a malformed `blk.x.` falls
-/// through to the unmapped case instead of being read as layer 0.
-fn split_layer(stem: &str) -> Option<(u32, &str)> {
-    let rest = stem.strip_prefix("blk.")?;
-    let (index, member) = rest.split_once('.')?;
-    Some((index.parse().ok()?, member))
-}
-
-/// A small ordered table, looked up by scan.
-struct Table(&'static [(&'static str, &'static str)]);
-
-impl Table {
-    fn get_member(&self, member: &str) -> Option<&'static str> {
-        self.0
-            .iter()
-            .find(|(gguf, _)| *gguf == member)
-            .map(|(_, hf)| *hf)
-    }
-}
-
-/// The per-layer members, all eleven of them.
+/// Every tensor a dense Qwen3 publishes, and what each vocabulary calls it.
 ///
 /// `attn_norm` and `ffn_norm` are the pair worth reading twice: llama.cpp
-/// names them for what they precede, HuggingFace for where they sit in the
-/// block, so `ffn_norm` is `post_attention_layernorm` and NOT anything with
-/// "ffn" in it.
-const LAYER: Table = Table(&[
-    ("attn_q", "self_attn.q_proj"),
-    ("attn_k", "self_attn.k_proj"),
-    ("attn_v", "self_attn.v_proj"),
-    ("attn_output", "self_attn.o_proj"),
-    ("attn_q_norm", "self_attn.q_norm"),
-    ("attn_k_norm", "self_attn.k_norm"),
-    ("attn_norm", "input_layernorm"),
-    ("ffn_norm", "post_attention_layernorm"),
-    ("ffn_gate", "mlp.gate_proj"),
-    ("ffn_up", "mlp.up_proj"),
-    ("ffn_down", "mlp.down_proj"),
+/// names a norm for what it PRECEDES and HuggingFace for where it SITS, so
+/// `ffn_norm` is `post_attention_layernorm` and NOT anything with "ffn" in
+/// it.
+///
+/// `post_feedforward_layernorm` has no GGUF column: rows in `crate::qwen_3`
+/// ask for it and no Qwen3 GGUF measured here publishes one.
+pub const VOCAB: Vocab = Vocab(&[
+    // ── Inside a decoder layer ───────────────────────────────────────
+    Member::gguf(
+        "model.layers.{layer}.self_attn.q_proj",
+        "blk.{layer}.attn_q",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.self_attn.k_proj",
+        "blk.{layer}.attn_k",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.self_attn.v_proj",
+        "blk.{layer}.attn_v",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.self_attn.o_proj",
+        "blk.{layer}.attn_output",
+    ),
+    // 128 elements, one head dimension and not one hidden size, so a map
+    // that sent these anywhere plausible would be caught by shape
+    // identification rather than by name. Stated anyway, because a `None`
+    // here stops the import.
+    Member::gguf(
+        "model.layers.{layer}.self_attn.q_norm",
+        "blk.{layer}.attn_q_norm",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.self_attn.k_norm",
+        "blk.{layer}.attn_k_norm",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.input_layernorm",
+        "blk.{layer}.attn_norm",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.post_attention_layernorm",
+        "blk.{layer}.ffn_norm",
+    ),
+    Member::same("model.layers.{layer}.post_feedforward_layernorm"),
+    Member::gguf("model.layers.{layer}.mlp.gate_proj", "blk.{layer}.ffn_gate"),
+    Member::gguf("model.layers.{layer}.mlp.up_proj", "blk.{layer}.ffn_up"),
+    Member::gguf("model.layers.{layer}.mlp.down_proj", "blk.{layer}.ffn_down"),
+    // ── Outside it ───────────────────────────────────────────────────
+    Member::gguf("model.embed_tokens", "token_embd"),
+    Member::gguf("model.norm", "output_norm"),
+    Member::gguf("lm_head", "output"),
 ]);
-
-/// The model-level tables. `output` is handled above, outside `model.`.
-const MODEL: Table = Table(&[("token_embd", "embed_tokens"), ("output_norm", "norm")]);
 
 #[cfg(test)]
 mod tests {
-    use super::hf_name;
+    use super::VOCAB;
 
     /// Every name a real Qwen3 GGUF holds is mapped.
     ///
@@ -167,7 +174,7 @@ mod tests {
             ("token_embd.weight", "model.embed_tokens.weight"),
         ];
         for (gguf, hf) in published {
-            assert_eq!(hf_name(gguf).as_deref(), Some(hf), "mapping {gguf}");
+            assert_eq!(VOCAB.from_gguf(gguf).as_deref(), Some(hf), "mapping {gguf}");
         }
     }
 
@@ -181,8 +188,10 @@ mod tests {
     #[test]
     fn a_head_norm_is_not_read_as_the_projection_it_precedes() {
         for (norm, proj) in [("attn_q", "q"), ("attn_k", "k")] {
-            let n = hf_name(&format!("blk.0.{norm}_norm.weight")).unwrap();
-            let p = hf_name(&format!("blk.0.{norm}.weight")).unwrap();
+            let n = VOCAB
+                .from_gguf(&format!("blk.0.{norm}_norm.weight"))
+                .unwrap();
+            let p = VOCAB.from_gguf(&format!("blk.0.{norm}.weight")).unwrap();
             assert_eq!(n, format!("model.layers.0.self_attn.{proj}_norm.weight"));
             assert_eq!(p, format!("model.layers.0.self_attn.{proj}_proj.weight"));
             assert_ne!(n, p);
@@ -194,7 +203,9 @@ mod tests {
     fn the_layer_index_is_carried_through() {
         for layer in [0u32, 7, 27, 199] {
             assert_eq!(
-                hf_name(&format!("blk.{layer}.attn_q_norm.weight")).as_deref(),
+                VOCAB
+                    .from_gguf(&format!("blk.{layer}.attn_q_norm.weight"))
+                    .as_deref(),
                 Some(format!("model.layers.{layer}.self_attn.q_norm.weight").as_str())
             );
         }
@@ -212,7 +223,7 @@ mod tests {
             "token_embd",                 // no suffix
             "rope_freqs.weight",          // llama's, and not published here
         ] {
-            assert_eq!(hf_name(unknown), None, "should not map {unknown}");
+            assert_eq!(VOCAB.from_gguf(unknown), None, "should not map {unknown}");
         }
     }
 }

@@ -1,89 +1,33 @@
-//! The page mask: `FirePageMask` and the hook-graph prepare pass that has to
-//! predict it exactly.
-//!
-//! Port of `driver-cuda/csrc/src/model/attn_page_mask.{hpp,cu}`.
-//!
-//! # What the object is
-//!
-//! `attn_page_mask` is the one PTIR sideband that flows *into* the backend: a
-//! program hands the model a per-page keep mask and the layer's attention is
-//! expected to honour it. Honouring it is a page-table gather, not a kernel
-//! change — FlashInfer already takes the page list as a launch argument — so
-//! this type owns the mask, owns the gathered CSR the gather produces, and
-//! owns nothing else.
-//!
-//! One instance brackets a whole layer loop. The page geometry belongs to the
-//! fire, not to the layer, so the five buffers are carved once and every layer
-//! reuses them.
-//!
-//! # The invariant this module is built around
-//!
-//! Two separate call paths compute the carve:
-//!
-//! - [`FirePageMask::new`], at fire time; and
-//! - [`prepare_page_mask_capture`], during the hook-graph prepare pass, which
-//!   **bakes the addresses it computes into a captured CUDA graph**.
-//!
-//! If those two disagree by one byte, the replayed graph writes its compacted
-//! page table where the attention does not read, and the model attends over
-//! stale pages with no error anywhere. So — exactly as the C++ does — there is
-//! **one** layout function, [`MaskSlotLayout::plan`], and both paths call it.
-//! The parity oracle records both carves for all eleven fire geometries and
-//! compares them row by row; see `tests/page_mask_parity.rs`.
-//!
-//! This is the same shape as the `workspace_bytes` bug (`.wiki/kernel-refactor`
-//! §8), where two hand-written walks of one layout drifted. The C++ here got it
-//! right by construction, and the port keeps that property rather than
-//! re-deriving it.
-//!
-//! # Why the keep rows have a fixed stride
-//!
-//! The obvious layout — one entry per page, sliced by the fire's page CSR —
-//! forces the writer (host) and the reader (a device kernel walking the real
-//! page table) to agree on that CSR, and they do not. On the decode-envelope
-//! path the host holds a conservative *bound* while the device resolves the
-//! real geometry itself. A per-request stride removes the page CSR from the
-//! mask's addressing entirely: the only shared fact left is "slot `p` of
-//! request `r`", which is exactly what a program means when it writes
-//! `mask[p]`.
-//!
-//! A conservative host CSR therefore only ever over-allocates. It cannot
-//! mis-address anything.
+//! The page mask: `FirePageMask` and the hook-graph prepare pass that must predict it
+//! exactly (port of `csrc/src/model/attn_page_mask.{hpp,cu}`).
+//! Both paths must agree to the byte or the replayed graph misreads the compacted
+//! table; both call one layout, [`MaskSlotLayout::plan`].
 
 use core::ffi::c_void;
 
 use super::sideband_arena::{Refusal, Region, SidebandArena};
 
-/// Sub-buffer alignment inside the arena's mask slot.
-///
-/// Mirrors `attn_score.cu`. 256 also happens to be `cudaMalloc`'s guarantee,
-/// so an offset that is a multiple of it lands aligned for any of the four
-/// element types carved here.
+/// Sub-buffer alignment inside the arena's mask slot: 256 is also `cudaMalloc`'s
+/// guarantee, so any multiple aligns all four element types.
 pub const SIDEBAND_ALIGN: usize = 256;
 
 const fn align_up(n: usize) -> usize {
     n.next_multiple_of(SIDEBAND_ALIGN)
 }
 
-/// Why a fire cannot carry a page mask.
-///
-/// The C++ throws `std::runtime_error` with a message for the first two and
-/// returns a default-constructed plan for all of them; splitting them out
-/// lets a caller tell "this fire has no pages" (routine — a first-token fire
-/// has none) from "this fire's CSR is malformed" (a bug upstream).
+/// Why a fire cannot carry a page mask. Split out so a caller can tell "no pages"
+/// (routine — a first-token fire has none) from a malformed CSR (a bug).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaskError {
-    /// The observation is missing geometry the carve needs. C++ message:
-    /// `attn_page_mask needs a fire with kv geometry`.
+    /// The observation is missing geometry the carve needs.
     NoGeometry,
     /// The fire has no KV pages at all, so there is nothing to mask.
     NoPages,
     /// A request's page range runs backwards or past the end of the table.
     MalformedCsr,
-    /// A compaction was asked for a different request count than the fire
-    /// carries. Distinct from [`Self::MalformedCsr`] because the CSR is fine —
-    /// the *caller* is out of step, which is a different bug in a different
-    /// place.
+    /// A compaction asked for a different request count than the fire carries —
+    /// distinct from [`Self::MalformedCsr`]: the CSR is fine, the caller is out of
+    /// step.
     RequestCountMismatch,
     /// The fire carries no `sideband_arena` to carve from.
     NoArena,
@@ -92,8 +36,7 @@ pub enum MaskError {
 }
 
 impl MaskError {
-    /// The C++ `what()` string this corresponds to, or `None` where the C++
-    /// reports the failure by returning a null pointer instead of throwing.
+    /// The C++ `what()` string this corresponds to, or `None` where C++ returned null.
     #[must_use]
     pub const fn cpp_message(self) -> Option<&'static str> {
         match self {
@@ -110,28 +53,20 @@ impl MaskError {
     }
 }
 
-/// The fire geometry the carve reads.
-///
-/// This is the sliver of `AttentionObservation` that `attn_page_mask` touches:
-/// the host page CSR, and nothing else. The device CSR is deliberately absent
-/// — the host copy *sizes* the rows and never addresses them, and a type that
-/// cannot see the device pointers cannot accidentally address with the host
-/// ones.
+/// The fire geometry the carve reads: the host page CSR of `AttentionObservation`,
+/// nothing else — the device CSR is deliberately absent, since the host copy only sizes
+/// rows and never addresses them.
 #[derive(Debug, Clone, Copy)]
 pub struct FireGeometry<'a> {
-    /// Host page CSR: `num_requests + 1` entries, a *bound* on the real
-    /// per-request page counts.
+    /// Host page CSR: `num_requests + 1` entries, a conservative *bound* on the real
+    /// per-request page counts (only ever over-allocates).
     pub kv_page_indptr_h: &'a [u32],
 }
 
 impl<'a> FireGeometry<'a> {
-    /// Wraps a host page CSR, rejecting one too short to describe a fire.
-    ///
-    /// The C++ gates on `AttentionObservation::usable()`, which additionally
-    /// requires six device pointers to be non-null. Those are not the carve's
-    /// business, so the port checks the one thing that is: a CSR with fewer
-    /// than two entries describes zero requests, which is `usable()`'s
-    /// `num_requests > 0`.
+    /// Wraps a host page CSR, rejecting one too short to describe a fire: fewer than
+    /// two entries is zero requests. Device-pointer checks are `usable()`'s job, not
+    /// this one's.
     pub const fn new(kv_page_indptr_h: &'a [u32]) -> Result<Self, MaskError> {
         if kv_page_indptr_h.len() < 2 {
             return Err(MaskError::NoGeometry);
@@ -146,18 +81,14 @@ impl<'a> FireGeometry<'a> {
     }
 }
 
-/// The mask slot's size and the offsets of the five buffers inside it.
-///
-/// **The single definition of the carve.** Both `FirePageMask::new` and
-/// `prepare_page_mask_capture` go through here; see the module docs for why
-/// there must not be a second one.
+/// The mask slot's size and the offsets of its five buffers — the single definition of
+/// the carve, used by both `FirePageMask::new` and `prepare_page_mask_capture`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaskSlotLayout {
-    /// Requests in the fire; the keep rows and both length arrays are this
-    /// long.
+    /// Requests in the fire; the keep rows and both length arrays are this long.
     pub num_requests: u32,
-    /// Entries per keep row: the widest request's page count, so every row is
-    /// at least as long as the page list it governs.
+    /// Entries per keep row: the widest request's page count, so every row is at least
+    /// as long as its page list.
     pub stride: u32,
     /// Bytes to acquire from the arena's [`Region::Mask`] slot.
     pub total: usize,
@@ -169,18 +100,15 @@ pub struct MaskSlotLayout {
     pub counts_offset: usize,
     /// Compacted per-request last-page lengths.
     pub last_lens_offset: usize,
-    /// The `[num_requests, stride]` u8 keep rows. Last, because u8 is the one
-    /// element type here with no alignment requirement.
+    /// The `[num_requests, stride]` u8 keep rows. Last: u8 is the one element type here
+    /// with no alignment requirement.
     pub keep_offset: usize,
 }
 
 impl MaskSlotLayout {
-    /// Sizes and carves the mask slot for a fire, or says why it cannot.
-    ///
-    /// The order — u32 outputs first, u8 keep rows last, each aligned — is not
-    /// arbitrary: `keep` is the only sub-buffer whose element type has no
-    /// alignment requirement, so putting it last is what lets the total be
-    /// `keep_offset + keep_bytes` with no trailing pad.
+    /// Sizes and carves the mask slot for a fire, or says why it cannot. u32 outputs
+    /// come first, u8 keep rows last (no alignment needed), so the total is
+    /// `keep_offset + keep_bytes` with no pad.
     pub fn plan(geometry: FireGeometry<'_>) -> Result<Self, MaskError> {
         let requests = geometry.num_requests();
         let indptr = geometry.kv_page_indptr_h;
@@ -225,21 +153,17 @@ impl MaskSlotLayout {
         })
     }
 
-    /// Bytes `begin_layer` must seed. Every keep row in full — a seed short by
-    /// one row leaves a stale mask governing a request, which evicts pages the
-    /// program never asked to evict.
+    /// Bytes `begin_layer` must seed — every keep row in full; a seed short by one row
+    /// leaves a stale mask evicting pages the program never asked to evict.
     #[must_use]
     pub const fn keep_bytes(&self) -> usize {
         self.num_requests as usize * self.stride as usize
     }
 }
 
-/// The write side of the attention hook: `[num_requests, stride]` u8,
-/// row-major, 1 keeps the page.
-///
-/// Entry `[r, p]` governs slot `p` of request `r`'s page list. Pre-filled with
-/// 1 before every hook, so a program that emits no sink for a layer leaves
-/// that layer's attention unrestricted rather than evicting everything.
+/// The write side of the attention hook: `[num_requests, stride]` u8 row-major; 1 keeps
+/// the page, entry `[r, p]` governing request `r`'s slot `p`. Pre-filled with 1 each
+/// hook, so a layer with no sink stays unrestricted.
 #[derive(Debug)]
 pub struct AttentionMaskSink {
     /// The `[num_requests, stride]` u8 rows, row-major.
@@ -248,12 +172,8 @@ pub struct AttentionMaskSink {
     pub num_requests: u32,
     /// Entries per row: an upper bound on any request's page count.
     pub stride: u32,
-    /// Layer whose sink last wrote `keep`, or `None` for "nothing written".
-    ///
-    /// The C++ spells this `int written_layer = -1`. The tag is what stops a
-    /// mask computed for layer L from silently governing layer L+1 when the
-    /// program stops emitting the sink — the same stale-view guard the layer
-    /// tag on `AttentionScores` provides.
+    /// Layer whose sink last wrote `keep`, or `None` for "nothing written" — stops a
+    /// mask for layer L silently governing L+1 when the sink stops.
     pub written_layer: Option<u32>,
 }
 
@@ -265,10 +185,8 @@ impl AttentionMaskSink {
     }
 }
 
-/// What a captured hook body needs to know before it exists.
-///
-/// Returned by [`prepare_page_mask_capture`]. Every pointer here is baked into
-/// the graph, so all of them must equal what the fire-time carve produces.
+/// What a captured hook body needs before it exists. Every pointer here is baked into
+/// the graph, so all must equal what the fire-time carve produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageMaskCapturePlan {
     /// Where the sink kernel's destination rows will be.
@@ -285,13 +203,9 @@ pub struct PageMaskCapturePlan {
     pub out_last_lens: *const u32,
 }
 
-/// The prepare pass: pre-grow the mask slot and report where it carves.
-///
-/// **Acquire-and-release.** Growth is a stream-synchronised free-and-realloc
-/// and must not happen inside a captured region, so it is pulled forward to
-/// here; the capture-time [`FirePageMask::new`] then finds sufficient capacity
-/// and its own acquire is a host-side pointer return with no stream work at
-/// all. The slot is released immediately because this pass holds nothing.
+/// The prepare pass: pre-grow the mask slot and report where it carves. Growth is a
+/// stream-synchronised free-and-realloc that must not happen inside a captured region,
+/// so it happens here; capture-time [`FirePageMask::new`] then just finds capacity.
 pub fn prepare_page_mask_capture<M: super::sideband_arena::DeviceMemory>(
     arena: &mut SidebandArena,
     mem: &mut M,
@@ -307,9 +221,7 @@ pub fn prepare_page_mask_capture<M: super::sideband_arena::DeviceMemory>(
 }
 
 /// The carve itself, applied to a base pointer.
-///
-/// # Safety
-/// `base` must point at `layout.total` writable bytes.
+/// # Safety: `base` must point at `layout.total` writable bytes.
 unsafe fn plan_from_base(base: *mut u8, layout: &MaskSlotLayout) -> PageMaskCapturePlan {
     unsafe {
         PageMaskCapturePlan {
@@ -323,23 +235,15 @@ unsafe fn plan_from_base(base: *mut u8, layout: &MaskSlotLayout) -> PageMaskCapt
     }
 }
 
-/// The stream operations `FirePageMask` needs.
-///
-/// A trait rather than direct CUDA calls for the same reason
-/// [`super::sideband_arena::DeviceMemory`] is one: it makes the layer loop's
-/// device traffic — which is exactly two calls, a memset and a kernel launch —
-/// observable, so the parity oracle can check the *extent* of the seed and
-/// which carved buffer landed in which kernel parameter.
+/// The stream operations `FirePageMask` needs — a trait, not direct CUDA calls, so the
+/// parity oracle can observe the layer loop's memset and kernel-launch calls.
 pub trait MaskOps {
     /// `cudaMemsetAsync(dst, value, bytes, stream)`.
     fn memset_async(&mut self, dst: *mut u8, value: u8, bytes: usize);
 
-    /// `kernels::attn::compact_page_csr`.
-    ///
-    /// Gathers the fire's page table down to the kept pages. The inputs are
-    /// never modified: the fire's CSR remains the source of truth for the KV
-    /// append and for `kv_len`, and compacting it in place would corrupt the
-    /// cache.
+    /// `kernels::attn::compact_page_csr`. Gathers the fire's page table down to the
+    /// kept pages; inputs are never modified, since the fire's CSR stays source of
+    /// truth for the KV append and `kv_len`.
     #[allow(clippy::too_many_arguments)]
     fn compact_page_csr(
         &mut self,
@@ -356,33 +260,20 @@ pub trait MaskOps {
     );
 }
 
-/// Fire-scoped owner of the page mask and of the compacted CSR it produces.
-///
-/// Per layer:
-///
-/// ```text
-/// mask.begin_layer(ops);                 // re-seed to "keep everything"
-/// invoke_stage_hook(.., mask.sink());    // the program's sink may write
-/// if mask.written_for(layer) { mask.compact(..); }
-/// // ... attention, over mask.page_indices() when compacted ...
-/// ```
-///
-/// An **inactive** mask — the fire wants none — answers every call with a
-/// no-op, because the layer loop calls `begin_layer` unconditionally and a
-/// conditional at every site is where a missed one hides.
+/// Fire-scoped owner of the page mask and the compacted CSR it produces. An inactive
+/// mask (fire wants none) answers every call with a no-op, since `begin_layer` runs
+/// unconditionally and a conditional per site is where a missed one hides.
 #[derive(Debug)]
 pub struct FirePageMask {
     sink: Option<AttentionMaskSink>,
     out_indices: *mut u32,
     out_indptr: *mut u32,
     out_last_lens: *mut u32,
-    /// Per-request survivor counts for the compaction. Acquired once per fire
-    /// and reused by all ~28 layers: this runs once per layer, and an
-    /// alloc/free pair costs more than both compaction kernels put together at
-    /// decode batch sizes.
+    /// Per-request survivor counts for the compaction. Acquired once per fire and
+    /// reused by every layer — cheaper than an alloc/free pair at decode batch sizes.
     counts: *mut u32,
-    /// Set when the [`Region::Mask`] slot is held, so [`Self::release`] knows
-    /// whether it owes the arena a hand-back.
+    /// Set when the [`Region::Mask`] slot is held, so [`Self::release`] knows whether
+    /// it owes the arena a hand-back.
     holds_slot: bool,
 }
 
@@ -400,17 +291,10 @@ impl FirePageMask {
         }
     }
 
-    /// Carves the fire's five buffers out of one arena slot.
-    ///
-    /// `wants_page_mask` is the launch's own answer to "does any program write
-    /// the sink"; a `false` here is not an error, it is the common case, and
-    /// it returns [`Self::inactive`] without touching the arena.
-    ///
-    /// Reuse across fires is safe because every buffer is rewritten before it
-    /// is read — `begin_layer` re-seeds `keep` each layer, and `compact`
-    /// writes the outputs before attention reads them. Nothing here needs a
-    /// fresh-allocation guarantee, which is what makes the whole steady state
-    /// allocation-free.
+    /// Carves the fire's five buffers out of one arena slot. A `false`
+    /// `wants_page_mask` is the common case, not an error — returns [`Self::inactive`]
+    /// untouched. Reuse across fires is safe since every buffer is rewritten before
+    /// read, so the steady state is alloc-free.
     pub fn new<M: super::sideband_arena::DeviceMemory>(
         wants_page_mask: bool,
         geometry: Option<FireGeometry<'_>>,
@@ -450,16 +334,14 @@ impl FirePageMask {
         self.sink.is_some()
     }
 
-    /// The write destination for a layer's `OnAttnProj` sideband; `None` when
-    /// the fire wants no mask.
+    /// The write destination for a layer's `OnAttnProj` sideband; `None` when the fire
+    /// wants no mask.
     pub const fn sink(&mut self) -> Option<&mut AttentionMaskSink> {
         self.sink.as_mut()
     }
 
-    /// Re-seed to "keep everything" and clear the layer tag.
-    ///
-    /// An all-ones seed is the only safe default: an all-zero one would evict
-    /// the entire cache for any layer whose policy chose not to score.
+    /// Re-seed to "keep everything" and clear the layer tag: all-zero would evict the
+    /// whole cache for a layer that chose not to score.
     pub fn begin_layer<O: MaskOps>(&mut self, ops: &mut O) {
         let Some(sink) = self.sink.as_mut() else {
             return;
@@ -474,10 +356,8 @@ impl FirePageMask {
         self.sink.as_ref().is_some_and(|s| s.written_layer == Some(layer))
     }
 
-    /// Gather the fire's page table down to the kept pages.
-    ///
-    /// `num_requests` must match the fire's: the kernel walks `keep` by row,
-    /// and a disagreement would read past the last row.
+    /// Gather the fire's page table down to the kept pages. `num_requests` must match
+    /// the fire's, or the kernel (which walks `keep` by row) reads past the last row.
     pub fn compact<O: MaskOps>(
         &mut self,
         ops: &mut O,
@@ -525,17 +405,10 @@ impl FirePageMask {
         self.out_last_lens
     }
 
-    /// Hand the slot back for the next fire's mask to reuse.
-    ///
-    /// Nothing is freed: the bytes belong to the arena.
-    ///
-    /// The C++ does this in `~FirePageMask`. The port cannot, for the same
-    /// reason [`SidebandArena`] cannot free in `Drop` — the arena is not owned
-    /// here, and a `Drop` that needed `&mut SidebandArena` would have to hold
-    /// a borrow for the mask's whole life, which is exactly the borrow the
-    /// layer loop needs for everything else. Calling this is therefore the
-    /// caller's obligation; [`Self::still_holds_slot`] exists so a test can
-    /// prove the caller met it.
+    /// Hand the slot back for the next fire's mask to reuse; nothing is freed, the
+    /// bytes belong to the arena. Not done in `Drop`, since that would need to borrow
+    /// `&mut SidebandArena` for the mask's whole life; [`Self::still_holds_slot`] lets
+    /// a test check the caller met the obligation.
     pub fn release(&mut self, arena: &mut SidebandArena) {
         if self.holds_slot {
             arena.release(Region::Mask);
@@ -548,11 +421,8 @@ impl FirePageMask {
         self.counts = core::ptr::null_mut();
     }
 
-    /// Whether this mask still owes the arena a [`Self::release`].
-    ///
-    /// A leaked hold is not a leak of memory — it turns every subsequent
-    /// fire's acquire into a busy refusal, which surfaces as a fire that
-    /// cannot mask rather than as anything resembling its cause.
+    /// Whether this mask still owes the arena a [`Self::release`]. A leaked hold turns
+    /// every later acquire into a busy refusal, far from its cause.
     #[must_use]
     pub const fn still_holds_slot(&self) -> bool {
         self.holds_slot
@@ -560,9 +430,8 @@ impl FirePageMask {
 }
 
 impl Drop for FirePageMask {
-    /// Cannot release — the arena is not reachable from here. This exists only
-    /// to make a forgotten [`Self::release`] loud in a debug build instead of
-    /// silently jamming the next fire.
+    /// Cannot release (the arena is not reachable here); exists only to make a
+    /// forgotten [`Self::release`] loud in a debug build.
     fn drop(&mut self) {
         debug_assert!(
             !self.holds_slot,
@@ -572,8 +441,7 @@ impl Drop for FirePageMask {
     }
 }
 
-/// The raw base of a carve, for callers that hold the plan rather than the
-/// mask.
+/// The raw base of a carve, for callers that hold the plan rather than the mask.
 #[must_use]
 pub const fn plan_base(plan: &PageMaskCapturePlan) -> *const c_void {
     plan.out_indices.cast::<c_void>()
@@ -693,8 +561,7 @@ mod tests {
 
     #[test]
     fn the_prepare_pass_and_the_fire_carve_land_on_the_same_addresses() {
-        // The whole reason both functions exist. A captured graph bakes what
-        // the first one returns and the second one must reproduce it.
+        // A captured graph bakes what prepare returns and new must reproduce.
         for csr in [
             vec![0u32, 1],
             vec![0, 129],
@@ -812,8 +679,7 @@ mod tests {
 
     #[test]
     fn the_steady_state_across_fires_allocates_nothing_and_never_moves() {
-        // The graph-capture precondition, end to end. Once the arena has grown
-        // to the widest fire, every narrower one reuses the same base.
+        // Once the arena has grown to the widest fire, every narrower one reuses the base.
         let mut mem = Slab::new();
         let mut arena = SidebandArena::new();
         let widest = vec![0u32, 8000, 16000, 24000];
@@ -863,23 +729,15 @@ mod tests {
     }
 }
 
-/// The ELEMENT mask the custom-mask attention dispatch reads — a different
-/// object from everything above, which is page-granularity.
-///
-/// FlashInfer's custom dispatch takes `mask_d` as one byte per `(q, kv)`
-/// pair and `mask_indptr_d` as the per-request base into it. This is the
-/// resident, always-published form: a plain causal mask, which is what the
-/// unmasked arm computes anyway, so a fire that takes the custom arm with
-/// nothing else staged gets the same answer as the fire that does not.
-///
-/// It exists so the arm can be RECORDED. Under `GuardMode::Union` both
-/// arms of `HasCustomMask` are captured whether this fire takes either,
-/// and an arm whose mask was never built aborts the whole recording —
-/// which is why the union used to decline every lowering mentioning
-/// `_custom`. See `.wiki/driver/graph.md` §5 ①.
+/// The element mask the custom-mask attention dispatch reads — element-, not
+/// page-granularity like everything above. FlashInfer wants `mask_d` as one byte per
+/// `(q, kv)` pair plus a per-request `mask_indptr_d`.
+/// This always-published causal mask exists so the unmasked arm can still be RECORDED
+/// under `GuardMode::Union`, which captures both arms and aborts if either's mask was
+/// never built.
 pub mod element_mask {
-    /// A mask this large is refused rather than published: the extent is
-    /// `sum_r qo_len[r] * kv_len[r]`, which grows with the context.
+    /// A mask this large is refused rather than published — the extent (`sum_r
+    /// qo_len[r] * kv_len[r]`) grows with the context.
     const MAX_MASK_BYTES: u64 = 1 << 30;
 
     /// One fire's element mask, planned but not allocated.
@@ -897,11 +755,9 @@ pub mod element_mask {
         pub mask: Vec<u8>,
     }
 
-    /// Plan and fill a causal element mask for the fire's geometry.
-    ///
-    /// `None` when there is nothing to mask or the mask would exceed
-    /// [`MAX_MASK_BYTES`], in which case the pointers stay null and the
-    /// custom arm declines as it always did.
+    /// Plan and fill a causal element mask for the fire's geometry. `None` when there
+    /// is nothing to mask or it would exceed [`MAX_MASK_BYTES`]; the custom arm
+    /// declines in that case.
     #[must_use]
     pub fn plan_causal(
         qo_indptr_h: &[u32],
@@ -937,8 +793,8 @@ pub mod element_mask {
         let mut mask = vec![0u8; mask_bytes];
         let mut at = 0usize;
         for &(qo, kv) in &extents {
-            // The query at local row `qi` sits at absolute position
-            // `kv - qo + qi`, so it attends every key at or before that.
+            // Local row `qi` sits at absolute position `kv - qo + qi`, so it attends
+            // every key at or before that.
             for qi in 0..qo {
                 let last = kv.saturating_sub(qo) + qi;
                 for ki in 0..kv {
@@ -957,23 +813,12 @@ pub mod element_mask {
         })
     }
 
-    /// The ENGINE'S mask, unpacked into the bytes the launcher reads.
-    ///
-    /// `brle` never needed porting: the engine decodes its own BRLE runs
-    /// host-side (`MaskWordsStorage::from_plan`) and ships a plain packed
-    /// bitset. One mask per QUERY ROW -- `request_indptr` partitions the
-    /// masks by request, `word_indptr` the `u32` words by mask, and bit
-    /// `i` of a mask says whether that row attends KV position `i`.
-    ///
-    /// FlashInfer wants one BYTE per `(q, kv)` pair, so this is a widen
-    /// and a relayout, and the CSR it produces is the same one
-    /// [`plan_causal`] produces for the same geometry -- which is what
-    /// lets the two be published through one path.
-    ///
-    /// `None` when the fire's shape and the table's disagree, which is a
-    /// REFUSAL rather than a fallback: a fire asked to attend over a
-    /// caller's mask and served causally instead returns an answer that
-    /// looks exactly like a correct one.
+    /// The engine's mask, unpacked into the bytes the launcher reads: a packed bitset
+    /// (one mask per query row, bit `i` whether that row attends KV position `i`)
+    /// widened to FlashInfer's one-byte-per-`(q, kv)` layout, with the same CSR as
+    /// [`plan_causal`].
+    /// `None` when the fire's and table's shapes disagree — a REFUSAL, not a fallback,
+    /// since serving causally would look exactly right.
     #[must_use]
     pub fn from_words(
         qo_indptr_h: &[u32],
@@ -1001,8 +846,7 @@ pub mod element_mask {
                 (pages - 1) * page + kv_last_page_lens_h.get(r).copied().unwrap_or(0)
             } as usize;
             indptr[r] = i32::try_from(total).ok()?;
-            // One mask per query row, and the count has to match or the
-            // table is describing a different fire.
+            // One mask per query row; the count must match or the table describes a different fire.
             let (lo, hi) = (request_indptr[r] as usize, request_indptr[r + 1] as usize);
             if hi.saturating_sub(lo) != qo || hi > word_indptr.len().saturating_sub(1) {
                 return None;
@@ -1010,8 +854,8 @@ pub mod element_mask {
             for m in lo..hi {
                 let (wlo, whi) = (word_indptr[m] as usize, word_indptr[m + 1] as usize);
                 let row = words.get(wlo..whi)?;
-                // A mask shorter than the row's KV extent cannot say what
-                // the tail attends, and guessing is the thing this refuses.
+                // A mask shorter than the row's KV extent can't say what the tail
+                // attends, and guessing is what this refuses.
                 if row.len() * 32 < kv {
                     return None;
                 }
@@ -1066,8 +910,8 @@ pub mod element_mask {
             assert_eq!(p.indptr, vec![0, 2, 6]);
         }
 
-        /// The engine's bitset, widened. One decode row attending its
-        /// whole 3-long context is three set bits and three bytes.
+        /// The engine's bitset, widened: one decode row attending 3 KV positions is
+        /// three set bits and three bytes.
         #[test]
         fn a_set_bit_becomes_a_kept_byte() {
             let p = from_words(&[0, 1], &[0, 1], &[3], 16, &[0, 1], &[0, 1], &[0b111])
@@ -1076,9 +920,8 @@ pub mod element_mask {
             assert_eq!(p.indptr, vec![0, 3]);
         }
 
-        /// And a CLEARED bit is a byte the kernel skips -- which is the
-        /// whole point of a caller's mask, and the thing a causal
-        /// fallback would silently undo.
+        /// A CLEARED bit is a byte the kernel skips — the whole point of a caller's
+        /// mask, and what a causal fallback would silently undo.
         #[test]
         fn a_cleared_bit_becomes_a_dropped_byte() {
             let p = from_words(&[0, 1], &[0, 1], &[4], 16, &[0, 1], &[0, 1], &[0b1011])
@@ -1086,9 +929,8 @@ pub mod element_mask {
             assert_eq!(p.mask, vec![1, 1, 0, 1]);
         }
 
-        /// A prefill's rows are its own masks, laid out row-major -- the
-        /// same extent `plan_causal` produces, so the two publish through
-        /// one path.
+        /// A prefill's rows are its own masks, row-major — the same extent
+        /// `plan_causal` produces, so both publish through one path.
         #[test]
         fn each_query_row_brings_its_own_mask() {
             let p = from_words(&[0, 2], &[0, 1], &[3], 16, &[0, 2], &[0, 1, 2], &[0b001, 0b011])
@@ -1098,9 +940,8 @@ pub mod element_mask {
             assert_eq!(p.indptr, causal.indptr, "same geometry, same CSR");
         }
 
-        /// A table describing a different fire is REFUSED. Serving it
-        /// causally returns an answer that looks exactly like a correct
-        /// one, which is the failure this whole path exists to avoid.
+        /// A table describing a different fire is REFUSED — serving it causally would
+        /// look exactly like a correct answer.
         #[test]
         fn a_table_that_does_not_describe_this_fire_is_refused() {
             // Two query rows, one mask.

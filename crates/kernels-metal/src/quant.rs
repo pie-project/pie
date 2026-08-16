@@ -14,7 +14,8 @@
 
 use kernels::routine::Refusal;
 
-use crate::routine::{Bind, Buf, BufMut, Ctx, Env, Fire, Routine};
+use crate::routine::{keys, Ask, Bind, Block, Buf, BufMut, Ctx, Env, Fire, Param, Routine};
+use crate::routine::{InSlot, OutSlot, Weight};
 
 /// The shaders this family's routines reach: `(file, entrypoint)`, one pair
 /// per instantiated name.
@@ -1634,13 +1635,26 @@ fn wide_point(group: i32, bits: i32, bm: i32) -> Result<usize, Refusal> {
 /// whatever follows the output. The driver's `Rule::Qmm` refused a row count
 /// its tile did not divide for that reason, and this keeps the refusal --
 /// `Refusal::Misaligned` -- rather than rounding up and trusting the
-/// allocation to be a whole number of tiles. The COLUMN overhang is guarded,
-/// by `n`, which every one of them does carry.
+/// allocation to be a whole number of tiles.
+///
+/// # The column axis divides too, and this said otherwise
+///
+/// This read "the COLUMN overhang is guarded, by `n`, which every one of them
+/// does carry", and `n` guards the epilogue's STORE. It does not guard the
+/// weight tile the MMA loop loads: `qmm_t.metal`'s own header states `M % BM
+/// == 0, N % BN == 0 and K % BK == 0` as the condition under which the driver
+/// may select the kernel at all, because `load_unsafe` is the only path the
+/// hot loop takes and it reads a whole tile whether or not one exists.
+///
+/// qwen3.6's `in_proj_a` is 48 wide and the deployment's tile is `bn = 32`.
+/// The second column tile read sixteen rows past the end of a 4-bit weight
+/// and the projection came back partly NaN, from row 32 of 64, differently on
+/// each fire. A guard on the store cannot undo a load.
 ///
 /// # Errors
 ///
 /// [`Refusal::Empty`] for an empty extent or a non-positive tile,
-/// [`Refusal::Misaligned`] for a row count off the tile, and
+/// [`Refusal::Misaligned`] for a row or column count off the tile, and
 /// [`Refusal::Grid`] if a tile count times its local size leaves a `u32`.
 fn qmm_grid(n: i32, bn: i32, m: i32, bm: i32, split_k: i32) -> Result<[u32; 3], Refusal> {
     if n <= 0 {
@@ -1665,6 +1679,14 @@ fn qmm_grid(n: i32, bn: i32, m: i32, bm: i32, split_k: i32) -> Result<[u32; 3], 
         return Err(Refusal::Misaligned {
             what: "the row count, which the tile must divide because no \
                    entrypoint takes m and the shader reads it from the grid",
+        });
+    }
+    if n % bn != 0 {
+        return Err(Refusal::Misaligned {
+            what: "the column count, which the tile must divide: `qmm_t.metal` \
+                   states `M % BM == 0, N % BN == 0 and K % BK == 0` as the \
+                   condition under which the driver may select it at all, and \
+                   `load_unsafe` is the only path its hot loop takes",
         });
     }
     let lanes = |groups: u32, local: u32, what: &'static str| -> Result<u32, Refusal> {
@@ -1753,24 +1775,24 @@ const TRANSCODE_FILE: &str = "quant/transcode.metal";
 /// whatever [`qmm_grid`] refuses.
 pub fn qmm_t(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    k: i32,
-    n: i32,
-    group: Env<i32>,
-    bits: Env<i32>,
-    bm: Env<i32>,
-    bn: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
+    bm: Ask<keys::TileM, i32>,
+    bn: Ask<keys::TileN, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: QMM_T[qmm_point(*group, *bits, *bm, *bn)?],
             file: QMM_FILE,
-            lanes: qmm_grid(n, *bn, *m, *bm, 1)?,
+            lanes: qmm_grid(*n, *bn, *m, *bm, 1)?,
             group: QMM_GROUP,
         },
         &[w.v(), scales.v(), biases.v(), x.v(), y.v(), k.v(), n.v()],
@@ -1789,25 +1811,25 @@ pub fn qmm_t(
 /// whatever [`qmm_grid`] refuses.
 pub fn qmm_t_bias(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    bias: Buf,
-    k: i32,
-    n: i32,
-    group: Env<i32>,
-    bits: Env<i32>,
-    bm: Env<i32>,
-    bn: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    bias: Weight<3, Buf>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
+    bm: Ask<keys::TileM, i32>,
+    bn: Ask<keys::TileN, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: QMM_T_BIAS[qmm_point(*group, *bits, *bm, *bn)?],
             file: QMM_FILE,
-            lanes: qmm_grid(n, *bn, *m, *bm, 1)?,
+            lanes: qmm_grid(*n, *bn, *m, *bm, 1)?,
             group: QMM_GROUP,
         },
         &[
@@ -1836,25 +1858,25 @@ pub fn qmm_t_bias(
 /// whatever [`qmm_grid`] refuses.
 pub fn qmm_t_residual(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    k: i32,
-    n: i32,
-    residual: Buf,
-    group: Env<i32>,
-    bits: Env<i32>,
-    bm: Env<i32>,
-    bn: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    residual: InSlot<1, Buf>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
+    bm: Ask<keys::TileM, i32>,
+    bn: Ask<keys::TileN, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: QMM_T_RESIDUAL[qmm_point(*group, *bits, *bm, *bn)?],
             file: QMM_FILE,
-            lanes: qmm_grid(n, *bn, *m, *bm, 1)?,
+            lanes: qmm_grid(*n, *bn, *m, *bm, 1)?,
             group: QMM_GROUP,
         },
         &[
@@ -1884,23 +1906,23 @@ pub fn qmm_t_residual(
 /// whatever [`qmm_grid`] refuses.
 pub fn qmm_t_fp16_precast(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    pad: Buf,
-    y: BufMut,
-    half_in: Buf,
-    k: i32,
-    n: i32,
-    bm: Env<i32>,
-    bn: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    pad: Weight<0, Env<Buf>>,
+    y: OutSlot<0, BufMut>,
+    half_in: InSlot<0, Buf>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    bm: Ask<keys::TileM, i32>,
+    bn: Ask<keys::TileN, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: QMM_T_FP16_PRECAST[tile_point(*bm, *bn)?],
             file: QMM_FILE,
-            lanes: qmm_grid(n, *bn, *m, *bm, 1)?,
+            lanes: qmm_grid(*n, *bn, *m, *bm, 1)?,
             group: QMM_GROUP,
         },
         &[
@@ -1929,24 +1951,24 @@ pub fn qmm_t_fp16_precast(
 /// whatever [`qmm_grid`] refuses.
 pub fn qmm_t_bias_fp16_precast(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    pad: Buf,
-    y: BufMut,
-    bias: Buf,
-    half_in: Buf,
-    k: i32,
-    n: i32,
-    bm: Env<i32>,
-    bn: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    pad: Weight<0, Env<Buf>>,
+    y: OutSlot<0, BufMut>,
+    bias: Weight<3, Buf>,
+    half_in: InSlot<0, Buf>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    bm: Ask<keys::TileM, i32>,
+    bn: Ask<keys::TileN, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: QMM_T_BIAS_FP16_PRECAST[tile_point(*bm, *bn)?],
             file: QMM_FILE,
-            lanes: qmm_grid(n, *bn, *m, *bm, 1)?,
+            lanes: qmm_grid(*n, *bn, *m, *bm, 1)?,
             group: QMM_GROUP,
         },
         &[
@@ -1975,24 +1997,24 @@ pub fn qmm_t_bias_fp16_precast(
 /// whatever [`qmm_grid`] refuses.
 pub fn qmm_t_residual_fp16_precast(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    pad: Buf,
-    y: BufMut,
-    residual: Buf,
-    half_in: Buf,
-    k: i32,
-    n: i32,
-    bm: Env<i32>,
-    bn: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    pad: Weight<0, Env<Buf>>,
+    y: OutSlot<0, BufMut>,
+    residual: InSlot<1, Buf>,
+    half_in: InSlot<0, Buf>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    bm: Ask<keys::TileM, i32>,
+    bn: Ask<keys::TileN, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: QMM_T_RESIDUAL_FP16_PRECAST[tile_point(*bm, *bn)?],
             file: QMM_FILE,
-            lanes: qmm_grid(n, *bn, *m, *bm, 1)?,
+            lanes: qmm_grid(*n, *bn, *m, *bm, 1)?,
             group: QMM_GROUP,
         },
         &[
@@ -2030,27 +2052,27 @@ pub fn qmm_t_residual_fp16_precast(
 /// whatever [`qmm_grid`] refuses.
 pub fn qmm_t_splitk(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    pad: Buf,
-    x: Buf,
-    out: BufMut,
-    k: i32,
-    n: i32,
-    k_partition_size: i32,
-    split_k_partition_stride: i32,
-    split_k: i32,
-    group: Env<i32>,
-    bits: Env<i32>,
-    bm: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    pad: Weight<0, Buf>,
+    x: InSlot<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    k_partition_size: Param<3, i32>,
+    split_k_partition_stride: Param<4, i32>,
+    split_k: Param<5, i32>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
+    bm: Ask<keys::TileM, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: QMM_T_SPLITK[wide_point(*group, *bits, *bm)?],
             file: QMM_FILE,
-            lanes: qmm_grid(n, WIDE_BN, *m, *bm, split_k)?,
+            lanes: qmm_grid(*n, WIDE_BN, *m, *bm, *split_k)?,
             group: QMM_GROUP,
         },
         &[
@@ -2081,27 +2103,27 @@ pub fn qmm_t_splitk(
 /// whatever [`qmm_grid`] refuses.
 pub fn qmm_t_splitk_f32(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    pad: Buf,
-    x: Buf,
-    out: BufMut,
-    k: i32,
-    n: i32,
-    k_partition_size: i32,
-    split_k_partition_stride: i32,
-    split_k: i32,
-    group: Env<i32>,
-    bits: Env<i32>,
-    bm: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    pad: Weight<0, Buf>,
+    x: InSlot<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    k_partition_size: Param<3, i32>,
+    split_k_partition_stride: Param<4, i32>,
+    split_k: Param<5, i32>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
+    bm: Ask<keys::TileM, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: QMM_T_SPLITK_F32[wide_point(*group, *bits, *bm)?],
             file: QMM_FILE,
-            lanes: qmm_grid(n, WIDE_BN, *m, *bm, split_k)?,
+            lanes: qmm_grid(*n, WIDE_BN, *m, *bm, *split_k)?,
             group: QMM_GROUP,
         },
         &[
@@ -2128,25 +2150,25 @@ pub fn qmm_t_splitk_f32(
 /// whatever [`qmm_grid`] refuses.
 pub fn qmm_t_splitk_fp16_precast(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    pad: Buf,
-    out: BufMut,
-    half_in: Buf,
-    k: i32,
-    n: i32,
-    k_partition_size: i32,
-    split_k_partition_stride: i32,
-    split_k: i32,
-    bm: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    pad: Weight<0, Env<Buf>>,
+    out: OutSlot<0, BufMut>,
+    half_in: InSlot<0, Buf>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    k_partition_size: Param<3, i32>,
+    split_k_partition_stride: Param<4, i32>,
+    split_k: Param<5, i32>,
+    bm: Ask<keys::TileM, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: QMM_T_SPLITK_FP16_PRECAST[row_tile_point(*bm)?],
             file: QMM_FILE,
-            lanes: qmm_grid(n, WIDE_BN, *m, *bm, split_k)?,
+            lanes: qmm_grid(*n, WIDE_BN, *m, *bm, *split_k)?,
             group: QMM_GROUP,
         },
         &[
@@ -2175,25 +2197,25 @@ pub fn qmm_t_splitk_fp16_precast(
 /// whatever [`qmm_grid`] refuses.
 pub fn qmm_t_splitk_fp16_precast_f32(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    pad: Buf,
-    out: BufMut,
-    half_in: Buf,
-    k: i32,
-    n: i32,
-    k_partition_size: i32,
-    split_k_partition_stride: i32,
-    split_k: i32,
-    bm: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    pad: Weight<0, Env<Buf>>,
+    out: OutSlot<0, BufMut>,
+    half_in: InSlot<0, Buf>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    k_partition_size: Param<3, i32>,
+    split_k_partition_stride: Param<4, i32>,
+    split_k: Param<5, i32>,
+    bm: Ask<keys::TileM, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: QMM_T_SPLITK_FP16_PRECAST_F32[row_tile_point(*bm)?],
             file: QMM_FILE,
-            lanes: qmm_grid(n, WIDE_BN, *m, *bm, split_k)?,
+            lanes: qmm_grid(*n, WIDE_BN, *m, *bm, *split_k)?,
             group: QMM_GROUP,
         },
         &[
@@ -2226,25 +2248,25 @@ pub fn qmm_t_splitk_fp16_precast_f32(
 /// whatever [`qmm_grid`] refuses.
 pub fn qmm_t_strided(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    pad: Buf,
-    x: Buf,
-    y: BufMut,
-    k: i32,
-    n: i32,
-    row_stride: i32,
-    group: Env<i32>,
-    bits: Env<i32>,
-    bm: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    pad: Weight<0, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    row_stride: Param<2, i32>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
+    bm: Ask<keys::TileM, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: QMM_T_STRIDED[wide_point(*group, *bits, *bm)?],
             file: QMM_FILE,
-            lanes: qmm_grid(n, WIDE_BN, *m, *bm, 1)?,
+            lanes: qmm_grid(*n, WIDE_BN, *m, *bm, 1)?,
             group: QMM_GROUP,
         },
         &[
@@ -2270,25 +2292,25 @@ pub fn qmm_t_strided(
 /// whatever [`qmm_grid`] refuses.
 pub fn qmm_t_strided_residual(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    residual: Buf,
-    k: i32,
-    n: i32,
-    row_stride: i32,
-    group: Env<i32>,
-    bits: Env<i32>,
-    bm: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    residual: InSlot<1, Buf>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    row_stride: Param<2, i32>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
+    bm: Ask<keys::TileM, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: QMM_T_STRIDED_RESIDUAL[wide_point(*group, *bits, *bm)?],
             file: QMM_FILE,
-            lanes: qmm_grid(n, WIDE_BN, *m, *bm, 1)?,
+            lanes: qmm_grid(*n, WIDE_BN, *m, *bm, 1)?,
             group: QMM_GROUP,
         },
         &[
@@ -2313,23 +2335,23 @@ pub fn qmm_t_strided_residual(
 /// whatever [`qmm_grid`] refuses.
 pub fn qmm_t_strided_fp16_precast(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    pad: Buf,
-    y: BufMut,
-    half_in: Buf,
-    k: i32,
-    n: i32,
-    row_stride: i32,
-    bm: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    pad: Weight<0, Env<Buf>>,
+    y: OutSlot<0, BufMut>,
+    half_in: InSlot<0, Buf>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    row_stride: Param<2, i32>,
+    bm: Ask<keys::TileM, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: QMM_T_STRIDED_FP16_PRECAST[row_tile_point(*bm)?],
             file: QMM_FILE,
-            lanes: qmm_grid(n, WIDE_BN, *m, *bm, 1)?,
+            lanes: qmm_grid(*n, WIDE_BN, *m, *bm, 1)?,
             group: QMM_GROUP,
         },
         &[
@@ -2358,24 +2380,24 @@ pub fn qmm_t_strided_fp16_precast(
 /// whatever [`qmm_grid`] refuses.
 pub fn qmm_t_strided_fp16_precast_residual(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    pad: Buf,
-    y: BufMut,
-    residual: Buf,
-    half_in: Buf,
-    k: i32,
-    n: i32,
-    row_stride: i32,
-    bm: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    pad: Weight<0, Env<Buf>>,
+    y: OutSlot<0, BufMut>,
+    residual: InSlot<1, Buf>,
+    half_in: InSlot<0, Buf>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    row_stride: Param<2, i32>,
+    bm: Ask<keys::TileM, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: QMM_T_STRIDED_FP16_PRECAST_RESIDUAL[row_tile_point(*bm)?],
             file: QMM_FILE,
-            lanes: qmm_grid(n, WIDE_BN, *m, *bm, 1)?,
+            lanes: qmm_grid(*n, WIDE_BN, *m, *bm, 1)?,
             group: QMM_GROUP,
         },
         &[
@@ -2407,19 +2429,19 @@ pub fn qmm_t_strided_fp16_precast_residual(
 /// Whatever [`crate::routine::elementwise_rows`] refuses.
 pub fn qmm_splitk_reduce(
     ctx: &Ctx<'_>,
-    y: BufMut,
-    partial: Buf,
-    pad: Buf,
-    n: i32,
-    split_k_partition_stride: i32,
-    split_k: i32,
-    m: Env<i32>,
+    y: OutSlot<0, BufMut>,
+    partial: InSlot<0, Buf>,
+    pad: InSlot<0, Buf>,
+    n: Param<1, i32>,
+    split_k_partition_stride: Param<3, i32>,
+    split_k: Param<4, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: "qmm_splitk_reduce_bfloat16",
             file: QMM_FILE,
-            lanes: crate::routine::elementwise_rows(n, *m)?,
+            lanes: crate::routine::elementwise_rows(*n, *m)?,
             group: [GROUP_X, 1, 1],
         },
         &[
@@ -2450,19 +2472,19 @@ pub fn qmm_splitk_reduce(
 /// Whatever [`crate::routine::elementwise_rows`] refuses.
 pub fn qmm_splitk_reduce_f32(
     ctx: &Ctx<'_>,
-    y: BufMut,
-    partial: Buf,
-    pad: Buf,
-    n: i32,
-    split_k_partition_stride: i32,
-    split_k: i32,
-    m: Env<i32>,
+    y: OutSlot<0, BufMut>,
+    partial: InSlot<0, Buf>,
+    pad: InSlot<0, Buf>,
+    n: Param<1, i32>,
+    split_k_partition_stride: Param<3, i32>,
+    split_k: Param<4, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: "qmm_splitk_reduce_f32_bfloat16",
             file: QMM_FILE,
-            lanes: crate::routine::elementwise_rows(n, *m)?,
+            lanes: crate::routine::elementwise_rows(*n, *m)?,
             group: [GROUP_X, 1, 1],
         },
         &[
@@ -2511,16 +2533,16 @@ pub fn qmm_splitk_reduce_f32(
 /// Whatever [`crate::routine::elementwise`] refuses.
 pub fn cast_qmm_input_bfloat16_to_float16(
     ctx: &Ctx<'_>,
-    pad: Buf,
-    cast_in: Buf,
-    half_out: BufMut,
-    count: i32,
+    pad: InSlot<0, Buf>,
+    cast_in: InSlot<0, Buf>,
+    half_out: OutSlot<0, BufMut>,
+    count: Param<3, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: "cast_qmm_input_bfloat16_to_float16",
             file: QMM_FILE,
-            lanes: crate::routine::elementwise(count, 1)?,
+            lanes: crate::routine::elementwise(*count, 1)?,
             group: [GROUP_X, 1, 1],
         },
         &[
@@ -2556,18 +2578,18 @@ pub fn cast_qmm_input_bfloat16_to_float16(
 /// Whatever [`crate::routine::elementwise_rows`] refuses.
 pub fn cast_qmm_input_strided_bfloat16_to_float16(
     ctx: &Ctx<'_>,
-    pad: Buf,
-    cast_in: Buf,
-    half_out: BufMut,
-    k: i32,
-    row_stride: i32,
-    rows: Env<i32>,
+    pad: InSlot<0, Env<Buf>>,
+    cast_in: InSlot<0, Buf>,
+    half_out: OutSlot<0, BufMut>,
+    k: Param<0, i32>,
+    row_stride: Param<2, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: "cast_qmm_input_strided_bfloat16_to_float16",
             file: QMM_FILE,
-            lanes: crate::routine::elementwise_rows(k, *rows)?,
+            lanes: crate::routine::elementwise_rows(*k, *rows)?,
             group: [GROUP_X, 1, 1],
         },
         &[
@@ -2601,22 +2623,22 @@ pub fn cast_qmm_input_strided_bfloat16_to_float16(
 /// whatever [`qmv_grid`] refuses.
 pub fn qmv_fast(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    in_vec_size: i32,
-    out_vec_size: i32,
-    group: Env<i32>,
-    bits: Env<i32>,
-    vecs: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    in_vec_size: Param<0, i32>,
+    out_vec_size: Param<1, i32>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
+    vecs: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: QMV_FAST[codec_point(*group, *bits)?],
             file: QMV_FILE,
-            lanes: qmv_grid(*vecs, out_vec_size)?,
+            lanes: qmv_grid(*vecs, *out_vec_size)?,
             group: QMV_GROUP,
         },
         &[
@@ -2640,23 +2662,23 @@ pub fn qmv_fast(
 /// whatever [`qmv_grid`] refuses.
 pub fn qmv_fast_residual(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    in_vec_size: i32,
-    out_vec_size: i32,
-    residual: Buf,
-    group: Env<i32>,
-    bits: Env<i32>,
-    vecs: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    in_vec_size: Param<0, i32>,
+    out_vec_size: Param<1, i32>,
+    residual: InSlot<1, Buf>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
+    vecs: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: QMV_FAST_RESIDUAL[codec_point(*group, *bits)?],
             file: QMV_FILE,
-            lanes: qmv_grid(*vecs, out_vec_size)?,
+            lanes: qmv_grid(*vecs, *out_vec_size)?,
             group: QMV_GROUP,
         },
         &[
@@ -2684,22 +2706,22 @@ pub fn qmv_fast_residual(
 /// whatever [`qmv_grid`] refuses.
 pub fn qmv_tail(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    pad: Buf,
-    x: Buf,
-    y: BufMut,
-    in_vec_size: i32,
-    out_vec_size: i32,
-    bits: Env<i32>,
-    vecs: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    pad: Weight<0, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    in_vec_size: Param<0, i32>,
+    out_vec_size: Param<1, i32>,
+    bits: Ask<keys::QuantBits, i32>,
+    vecs: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: QMV_TAIL[bits_point(*bits)?],
             file: QMV_FILE,
-            lanes: qmv_grid(*vecs, out_vec_size)?,
+            lanes: qmv_grid(*vecs, *out_vec_size)?,
             group: QMV_GROUP,
         },
         &[
@@ -2727,23 +2749,23 @@ pub fn qmv_tail(
 /// whatever [`qmv_grid`] refuses.
 pub fn qmv_tail_bias(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    pad: Buf,
-    x: Buf,
-    y: BufMut,
-    bias: Buf,
-    in_vec_size: i32,
-    out_vec_size: i32,
-    bits: Env<i32>,
-    vecs: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    pad: Weight<0, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    bias: Weight<3, Buf>,
+    in_vec_size: Param<0, i32>,
+    out_vec_size: Param<1, i32>,
+    bits: Ask<keys::QuantBits, i32>,
+    vecs: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: QMV_TAIL_BIAS[bits_point(*bits)?],
             file: QMV_FILE,
-            lanes: qmv_grid(*vecs, out_vec_size)?,
+            lanes: qmv_grid(*vecs, *out_vec_size)?,
             group: QMV_GROUP,
         },
         &[
@@ -2779,23 +2801,23 @@ pub fn qmv_tail_bias(
 /// whatever [`qmv_grid`] refuses.
 pub fn qmv_wide_strided(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    pad: Buf,
-    x: Buf,
-    y: BufMut,
-    in_vec_size: i32,
-    out_vec_size: i32,
-    row_stride: i32,
-    m: i32,
-    bits: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    pad: Weight<0, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    in_vec_size: Param<0, i32>,
+    out_vec_size: Param<1, i32>,
+    row_stride: Param<2, i32>,
+    m: Ask<keys::Rows, i32>,
+    bits: Ask<keys::QuantBits, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: QMV_WIDE_STRIDED[bits_point(*bits)?],
             file: QMM_FILE,
-            lanes: qmv_grid(quarters(m), out_vec_size)?,
+            lanes: qmv_grid(quarters(*m), *out_vec_size)?,
             group: QMV_GROUP,
         },
         &[
@@ -2825,20 +2847,20 @@ pub fn qmv_wide_strided(
 /// Whatever [`qmm_grid`] refuses.
 pub fn qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    k: i32,
-    n: i32,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: "affine_qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4",
             file: QMM_FILE,
-            lanes: qmm_grid(n, 32, *m, 128, 1)?,
+            lanes: qmm_grid(*n, 32, *m, 128, 1)?,
             group: QMM_GROUP,
         },
         &[w.v(), scales.v(), biases.v(), x.v(), y.v(), k.v(), n.v()],
@@ -2857,20 +2879,20 @@ pub fn qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4(
 /// Whatever [`qmm_grid`] refuses.
 pub fn qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    k: i32,
-    n: i32,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2",
             file: QMM_FILE,
-            lanes: qmm_grid(n, 32, *m, 32, 1)?,
+            lanes: qmm_grid(*n, 32, *m, 32, 1)?,
             group: QMM_GROUP,
         },
         &[w.v(), scales.v(), biases.v(), x.v(), y.v(), k.v(), n.v()],
@@ -2889,20 +2911,20 @@ pub fn qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2(
 /// Whatever [`qmm_grid`] refuses.
 pub fn qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    k: i32,
-    n: i32,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2",
             file: QMM_FILE,
-            lanes: qmm_grid(n, 32, *m, 64, 1)?,
+            lanes: qmm_grid(*n, 32, *m, 64, 1)?,
             group: QMM_GROUP,
         },
         &[w.v(), scales.v(), biases.v(), x.v(), y.v(), k.v(), n.v()],
@@ -2921,20 +2943,20 @@ pub fn qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2(
 /// Whatever [`qmm_grid`] refuses.
 pub fn qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    k: i32,
-    n: i32,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1",
             file: QMM_FILE,
-            lanes: qmm_grid(n, 32, *m, 64, 1)?,
+            lanes: qmm_grid(*n, 32, *m, 64, 1)?,
             group: QMM_GROUP,
         },
         &[w.v(), scales.v(), biases.v(), x.v(), y.v(), k.v(), n.v()],
@@ -2953,20 +2975,20 @@ pub fn qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1(
 /// Whatever [`qmm_grid`] refuses.
 pub fn qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    k: i32,
-    n: i32,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4",
             file: QMM_FILE,
-            lanes: qmm_grid(n, 64, *m, 64, 1)?,
+            lanes: qmm_grid(*n, 64, *m, 64, 1)?,
             group: QMM_GROUP,
         },
         &[w.v(), scales.v(), biases.v(), x.v(), y.v(), k.v(), n.v()],
@@ -2984,12 +3006,12 @@ pub fn qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4(
 /// Whatever [`crate::routine::elementwise`] refuses.
 pub fn encode_u4_bf16(
     ctx: &Ctx<'_>,
-    input: Buf,
-    codes: BufMut,
-    scales: BufMut,
-    biases: BufMut,
-    params: Buf,
-    groups: Env<i32>,
+    input: InSlot<0, Buf>,
+    codes: OutSlot<0, BufMut>,
+    scales: OutSlot<1, BufMut>,
+    biases: OutSlot<2, BufMut>,
+    params: Block<Buf>,
+    groups: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -3013,12 +3035,12 @@ pub fn encode_u4_bf16(
 /// Whatever [`crate::routine::elementwise`] refuses.
 pub fn encode_u4_f32(
     ctx: &Ctx<'_>,
-    input: Buf,
-    codes: BufMut,
-    scales: BufMut,
-    biases: BufMut,
-    params: Buf,
-    groups: Env<i32>,
+    input: InSlot<0, Buf>,
+    codes: OutSlot<0, BufMut>,
+    scales: OutSlot<1, BufMut>,
+    biases: OutSlot<2, BufMut>,
+    params: Block<Buf>,
+    groups: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -3041,11 +3063,11 @@ pub fn encode_u4_f32(
 /// Whatever [`crate::routine::elementwise`] refuses.
 pub fn mxfp4_dequant_bf16(
     ctx: &Ctx<'_>,
-    payload: Buf,
-    exponents: Buf,
-    out: BufMut,
-    params: Buf,
-    blocks: Env<i32>,
+    payload: InSlot<0, Buf>,
+    exponents: InSlot<1, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    blocks: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -3113,15 +3135,23 @@ mod tests {
         }
     }
 
-    /// A row count the tile does not divide is refused, not rounded up.
+    /// An extent the tile does not divide is refused, on EITHER axis.
     ///
-    /// No entrypoint in `quant/qmm_t.metal` takes `m`, so `write_out` guards
-    /// the column axis with `n` and nothing at all guards the row axis: a grid
-    /// rounded up past the row count writes the overhang into whatever
-    /// follows the output allocation. The driver's `Rule::Qmm` refused this
-    /// and the routine keeps the refusal.
+    /// No entrypoint in `quant/qmm_t.metal` takes `m`, so nothing at all
+    /// guards the row axis: a grid rounded up past the row count writes the
+    /// overhang into whatever follows the output allocation. The driver's
+    /// `Rule::Qmm` refused that and the routine keeps the refusal.
+    ///
+    /// The column half asserted the opposite -- "the COLUMN overhang is
+    /// guarded by n, which every entrypoint takes" -- and `n` guards the
+    /// epilogue's STORE, not the weight tile the MMA loop loads. The file's
+    /// own header states `M % BM == 0, N % BN == 0 and K % BK == 0` as the
+    /// condition under which the driver may select it at all. qwen3.6's
+    /// `in_proj_a` is 48 wide against a `bn` of 32; the second column tile
+    /// read past the end of the weight and the projection came back NaN from
+    /// row 32 of 64, in a different place on each fire.
     #[test]
-    fn a_row_count_the_tile_does_not_divide_is_refused() {
+    fn an_extent_the_tile_does_not_divide_is_refused() {
         assert!(
             matches!(
                 qmm_grid(4096, 32, 100, 32, 1),
@@ -3131,8 +3161,15 @@ mod tests {
         );
         assert_eq!(qmm_grid(4096, 32, 96, 32, 1), Ok([4096, 6, 2]));
         assert!(
-            qmm_grid(4095, 32, 96, 32, 1).is_ok(),
-            "the COLUMN overhang is guarded by n, which every entrypoint takes"
+            matches!(
+                qmm_grid(4095, 32, 96, 32, 1),
+                Err(Refusal::Misaligned { .. })
+            ),
+            "and a column count off the tile is the same refusal"
+        );
+        assert!(
+            matches!(qmm_grid(48, 32, 64, 32, 1), Err(Refusal::Misaligned { .. })),
+            "qwen3.6's `in_proj_a`, which is what found this"
         );
     }
 
@@ -3181,18 +3218,19 @@ mod tests {
         let seen = Seen::default();
         qmm_t_strided(
             &seen,
-            Buf(1),
-            Buf(2),
-            Buf(3),
-            Buf(4),
-            BufMut(5),
-            4096,
-            2048,
-            8192,
-            Env(64),
-            Env(4),
-            Env(32),
-            Env(64),
+            Weight::new(Buf(1)),
+            Weight::new(Buf(2)),
+            Weight::new(Buf(3)),
+            Weight::new(Buf(4)),
+            InSlot::new(Buf(5)),
+            OutSlot::new(BufMut(6)),
+            Param::new(4096),
+            Param::new(2048),
+            Param::new(8192),
+            Ask::new(64),
+            Ask::new(4),
+            Ask::new(32),
+            Ask::new(64),
         )
         .expect("a launch");
         let calls = seen.0.borrow();
@@ -3204,37 +3242,54 @@ mod tests {
         );
     }
 
-    /// The split-K matmul states its partition count twice: once as the
-    /// grid's z extent and once as an argument.
+    /// The split-K matmul states its partition count on the GRID, and the
+    /// argument table has a hole where a caller might expect it.
     ///
-    /// Both are read. The position tells a threadgroup which partition it is,
-    /// and the count is what it strides the partial buffer by.
+    /// It used to say "twice: once as the grid's z extent and once as an
+    /// argument", and asserted the count at `args[10]`. The shader says
+    /// otherwise. `affine_qmm_t_splitk` declares `w`, `scales`, `biases` and
+    /// `x` at buffers 0-3, `y` at 8, `K` and `N` at 5 and 6, and
+    /// `k_partition_size` and `split_k_partition_stride` at 9 and 10 --
+    /// buffers 4 and 7 are declared by nothing, which is what the two `pad`
+    /// arguments hold open, and NO slot carries `split_k`. A threadgroup
+    /// learns which partition it is from its z position and strides the
+    /// partial buffer by `split_k_partition_stride`; the count itself it
+    /// never needs.
+    ///
+    /// So the grid half is the whole claim, and `args[10]` is pinned to the
+    /// stride it actually carries -- which is the assertion that would have
+    /// caught the table shifting under the count in the first place.
     #[test]
-    fn a_split_k_matmul_states_its_partitions_on_the_grid_and_in_the_table() {
+    fn a_split_k_matmul_states_its_partitions_on_the_grid() {
         let seen = Seen::default();
         qmm_t_splitk(
             &seen,
-            Buf(1),
-            Buf(2),
-            Buf(3),
-            Buf(4),
-            BufMut(5),
-            4096,
-            2048,
-            2048,
-            512,
-            65536,
-            8,
-            Env(64),
-            Env(4),
-            Env(32),
-            Env(64),
+            Weight::new(Buf(1)),
+            Weight::new(Buf(2)),
+            Weight::new(Buf(3)),
+            Weight::new(Buf(4)),
+            InSlot::new(Buf(5)),
+            OutSlot::new(BufMut(6)),
+            Param::new(4096),
+            Param::new(2048),
+            Param::new(512),
+            Param::new(65536),
+            Param::new(8),
+            Ask::new(64),
+            Ask::new(4),
+            Ask::new(32),
+            Ask::new(64),
         )
         .expect("a launch");
         let calls = seen.0.borrow();
         let (fire, args) = &calls[0];
         assert_eq!(fire.lanes[2], 8 * QMM_GROUP[2], "eight partitions of k");
-        assert_eq!(args[10], 8.v(), "and the kernel is told there are eight");
+        assert_eq!(
+            args[10],
+            65536.v(),
+            "slot 10 is the partial buffer's stride, which is what the \
+             shader declares there"
+        );
         assert_eq!(args.len(), 11);
     }
 
@@ -3249,16 +3304,16 @@ mod tests {
         let seen = Seen::default();
         qmv_fast(
             &seen,
-            Buf(10),
-            Buf(11),
-            Buf(12),
-            Buf(13),
-            BufMut(14),
-            2048,
-            4096,
-            Env(64),
-            Env(4),
-            Env(1),
+            Weight::new(Buf(10)),
+            Weight::new(Buf(11)),
+            Weight::new(Buf(12)),
+            InSlot::new(Buf(13)),
+            OutSlot::new(BufMut(14)),
+            Param::new(2048),
+            Param::new(4096),
+            Ask::new(64),
+            Ask::new(4),
+            Ask::new(1),
         )
         .expect("a launch");
         let calls = seen.0.borrow();
@@ -3288,16 +3343,17 @@ mod tests {
         let seen = Seen::default();
         qmv_wide_strided(
             &seen,
-            Buf(1),
-            Buf(2),
-            Buf(3),
-            Buf(4),
-            BufMut(5),
-            2048,
-            4096,
-            8192,
-            9,
-            Env(4),
+            Weight::new(Buf(1)),
+            Weight::new(Buf(2)),
+            Weight::new(Buf(3)),
+            Weight::new(Buf(4)),
+            InSlot::new(Buf(5)),
+            OutSlot::new(BufMut(6)),
+            Param::new(2048),
+            Param::new(4096),
+            Param::new(8192),
+            Ask::new(9),
+            Ask::new(4),
         )
         .expect("a launch");
         let calls = seen.0.borrow();
@@ -3307,7 +3363,12 @@ mod tests {
             3 * 32,
             "nine vectors is three groups of four"
         );
-        assert_eq!(args[8], 9.v(), "and the kernel is told there are nine");
+        // Slot 9, not 8. `affine_qmv_wide_strided` declares `row_stride` at
+        // buffer 8 and `M` at 9, with 7 declared by nothing -- which is the
+        // `pad` this call now passes. The count is still stated; the table
+        // grew a hole in front of it.
+        assert_eq!(args[8], 8192.v(), "the row stride the shader reads at 8");
+        assert_eq!(args[9], 9.v(), "and the kernel is told there are nine");
         assert_eq!(
             fire.file, QMM_FILE,
             "it lives with the tiles, not the other matvecs"
@@ -3325,12 +3386,12 @@ mod tests {
         let seen = Seen::default();
         encode_u4_bf16(
             &seen,
-            Buf(1),
-            BufMut(2),
-            BufMut(3),
-            BufMut(4),
-            Buf(5),
-            Env(1024),
+            InSlot::new(Buf(1)),
+            OutSlot::new(BufMut(2)),
+            OutSlot::new(BufMut(3)),
+            OutSlot::new(BufMut(4)),
+            Block::new(Buf(5)),
+            Ask::new(1024),
         )
         .expect("a launch");
         let calls = seen.0.borrow();

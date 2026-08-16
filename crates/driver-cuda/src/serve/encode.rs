@@ -1,12 +1,9 @@
 //! `pie_cuda_encode`: the multimodal towers, run outside a fire.
 //!
-//! A deployment's vision and audio encoders write rows the next fire reads
-//! as embeddings. It is its own entry point because it is its own pass — no
-//! KV, no sampling, no logits.
-//!
-//! The tensor NAMES and their launcher order are
-//! [`model::shared::tower_names`]'s, not this file's: what is here is the
-//! resolution of a name to a device pointer and the call.
+//! A deployment's vision and audio encoders write rows the next fire reads as
+//! embeddings — its own pass: no KV, no sampling, no logits. Tensor names and
+//! launcher order are [`model::shared::tower_names`]'s; this file resolves a
+//! name to a device pointer and makes the call.
 
 use driver_api::local::{
     PIE_STATUS_DRIVER_ERROR, PIE_STATUS_INVALID_ARGUMENT, PIE_STATUS_OK, PIE_STATUS_UNSUPPORTED,
@@ -15,34 +12,24 @@ use model::shared::tower_names::{Slot, VISION_SLOTS_PER_LAYER, vision_head, visi
 
 use super::guard;
 use super::state::{LoadedModel, Shell};
-// ALIASED, and `tests/no_family_names.rs` is the reason. Both tower walks are
-// Rust now and this file calls them; spelled out, each call would be a line
-// naming a family, and the budget this file sits on is a CEILING that only
-// ratchets down. The names are still here — once each, at the imports, where
-// a reader looks to find out what `vis_tower` and `aud_tower` are — which is
-// the same shape the budget's own comment argues for: what is left is the
-// name of the thing being called, not a routing decision made on it.
-//
-// The count did not move when the audio launcher went. It was two before —
-// one import and one `pie_k_vision_gemma4_audio_encode` — and it is two now,
-// one import each. The difference is that neither is a C++ symbol.
-use crate::tower::gemma4_audio as aud_tower;
-use crate::tower::gemma4_vision as vis_tower;
+use crate::Error;
+// Aliased to keep family names out of call sites; `tests/no_family_names.rs`
+// enforces it.
+use kernels_cuda::tower::gemma4_audio as aud_tower;
+use kernels_cuda::tower::gemma4_vision as vis_tower;
 
-/// Awaits: the MULTIMODAL encoders — image/audio features to embedding
-/// rows (the vision/audio towers, which stayed hand-written C++). The
-/// plan once mislabeled this as the Sampling-IR path; the desc's fields
-/// (`image_pixels`, `audio_features`, `output_rows`) say what it is. A
-/// text-only shell refuses it honestly.
-/// The audio half of the encode arm: the tower's name table as the
-/// stride-62 pointer list the launcher indexes, the media row width from the
-/// embed projection's own bytes, and the `PieEncodeDesc` audio slices passed
-/// straight through.
+/// A tower's refusal in this crate's vocabulary.
 ///
-/// THE NAMES ARE NOT THIS CRATE'S. `model::shared::tower_names` states them,
-/// in launcher order, for the reason its module doc gives: a tower's tensors
-/// are named by the checkpoint and consumed by a launcher, and a backend is
-/// neither. What stood here spelled some fifty paths inline.
+/// Every one names an extent the caller passed -- an image's pixel span, a
+/// weight table's length -- so all of them are `Invalid`, and `Refused::who`
+/// is already the `&'static str` the call name wants.
+fn tower_refused(why: kernels_cuda::tower::Refused) -> Error {
+    Error::invalid(why.who, why.why)
+}
+
+/// The audio half of the encode arm: the tower's name table as the stride-62
+/// pointer list the launcher indexes, the media row width from the embed
+/// projection's bytes, and the `PieEncodeDesc` audio slices passed through.
 fn encode_audio_arm(
     model: &LoadedModel,
     features: &[u8],
@@ -73,8 +60,6 @@ fn encode_audio_arm(
             .get(n)
             .map_or(core::ptr::null(), |b| b.ptr.cast_const())
     };
-    // A slot says which of the two it is; that is the whole reason the list
-    // is `Slot` and not `String`.
     let bind = |slot: &Slot| -> Result<*const std::ffi::c_void, i32> {
         match slot {
             Slot::Required(n) => need(n),
@@ -117,15 +102,8 @@ fn encode_audio_arm(
         .weights
         .get(embed)
         .map_or(0, |b| b.bytes / (ac.output_dims.max(1) as usize * 2));
-    // THE STRUCT REBUILD `gemma4_towers_c.cpp` DID, as a call. That file
-    // existed to turn the two lists below into the C++ `AudioRawWeights` the
-    // walk consumed; the walk is Rust and consumes them directly.
-    //
-    // Two arrays and not twenty-three positional arguments: `from_flat` took
-    // eight head pointers and nine dimensions as `[_; 8]` and `[_; 9]` for
-    // the reason a `dim3` pair is written as a struct — a transposed
-    // `(sscp_ch0, sscp_ch1)` in a positional list is invisible at the call
-    // site and silent at run time.
+    // Two arrays, not positional args: a transposed `(sscp_ch0, sscp_ch1)` in
+    // a positional list would be silent at the call site.
     let heads_flat = [
         sscp0_conv,
         sscp0_norm,
@@ -151,6 +129,7 @@ fn encode_audio_arm(
         heads_flat,
         &table,
         ac.layers as usize,
+        AUDIO_SLOTS_PER_LAYER,
         dims,
         ac.logit_cap,
         ac.residual_weight,
@@ -158,14 +137,13 @@ fn encode_audio_arm(
     );
     let weights = match built {
         Ok(w) => w.with_context(ac.context_left as i32, ac.context_right as i32),
-        // `i32::from(Error)` prints the refusal itself and maps it to a
-        // `PIE_STATUS_*`; an `eprintln!` here would say it twice.
-        Err(why) => return i32::from(why),
+        // `i32::from(Error)` already prints and maps the refusal; an
+        // `eprintln!` here would say it twice.
+        Err(why) => return i32::from(tower_refused(why)),
     };
-    // The CLIP COUNT is the anchor table's length, which is what the C++
-    // `Gemma4AudioInputs::num_clips` carried. `output_row_indptr` is the
-    // whole plan's and may be longer — the vision arm's rows come first when
-    // both are present — so the tower is handed exactly the window it writes.
+    // Clip count is the anchor table's length. `output_row_indptr` is the
+    // whole plan's and may be longer — vision rows come first when both are
+    // present — so the tower is handed exactly the window it writes.
     let num_clips = anchor_rows.len();
     if indptr.len() < num_clips + 1 {
         eprintln!("[driver-cuda] encode: audio CSR is shorter than its clip count");
@@ -174,15 +152,18 @@ fn encode_audio_arm(
     let Ok(stream) = crate::device::OwnedStream::new(0) else {
         return PIE_STATUS_DRIVER_ERROR;
     };
+    // SAFETY: `stream` is this walk's `OwnedStream`, live until it is
+    // synchronised below and dropped after.
+    let walk_stream = unsafe { kernels_cuda::tower::Stream::new(stream.as_ref().as_raw().cast()) };
     if let Err(why) = aud_tower::encode(
         &weights,
         features,
         feature_indptr,
         out,
         &mut indptr[..num_clips + 1],
-        stream.as_ref(),
+        walk_stream,
     ) {
-        return i32::from(why);
+        return i32::from(tower_refused(why));
     }
     if stream.as_ref().synchronize().is_err() {
         return PIE_STATUS_DRIVER_ERROR;
@@ -190,9 +171,8 @@ fn encode_audio_arm(
     PIE_STATUS_OK
 }
 
-/// The MULTIMODAL encode: image/audio media in, embedding rows out —
-/// the towers behind `vision::gemma4_*_encode`. One media kind per call
-/// today; mixed batches await the offset plumbing.
+/// The multimodal encode: image/audio media in, embedding rows out — the
+/// towers behind `vision::gemma4_*_encode`.
 impl Shell {
     /// Encode media into the model's embedding space.
     ///
@@ -206,19 +186,13 @@ impl Shell {
     ) -> Result<(), i32> {
         guard("encode", Err(PIE_STATUS_DRIVER_ERROR), move || {
             let state = self;
-            // Most of `validate_encode_desc` was NOT about the C shape: the
-            // plane counts, the `f32` alignment, the exact partitions. All of it
-            // is `MediaEncodePlan::validate`.
             if let Err(why) = encode.validate() {
                 eprintln!("[driver-cuda] encode: {why}");
                 return Err(PIE_STATUS_INVALID_ARGUMENT);
             }
-            // THE PLAN, DESTRUCTURED. The vision tower now writes
-            // `output_rows` from Rust while it reads `image_pixels`, and one
-            // `&mut` to the whole plan cannot say that two of its fields are
-            // disjoint. The C++ shape took the out-params as raw pointers to
-            // dodge exactly this; a destructure says it in the type system
-            // instead, and the towers take slices.
+            // Destructured so the disjoint fields can be borrowed separately:
+            // the towers read `image_pixels` while writing `output_rows`, which
+            // one `&mut` to the whole plan cannot express.
             let driver_api::MediaEncodePlan {
                 image_grids: _,
                 image_pixels,
@@ -268,10 +242,9 @@ impl Shell {
                 eprintln!("[driver-cuda] encode: this deployment carries no vision tower");
                 return Err(PIE_STATUS_UNSUPPORTED);
             };
-            // The vision table, in the stride-41 layout the launcher indexes,
-            // built per call from the loaded weights — name lookups, no stored
-            // pointers. The NAMES and their order are
-            // `model::shared::tower_names`'s; this resolves them.
+            // The vision table in the stride-41 layout the launcher indexes,
+            // built per call by name lookup; names and order are
+            // `model::shared::tower_names`'s.
             let need = |n: &str| -> Result<*const std::ffi::c_void, i32> {
                 model
                     .weights
@@ -331,15 +304,17 @@ impl Shell {
             let Ok(stream) = crate::device::OwnedStream::new(0) else {
                 return Err(PIE_STATUS_DRIVER_ERROR);
             };
-            // The tower's weights, marshalled from the flat table by the Rust
-            // that replaced `gemma4_towers_c.cpp` — the same stride-41 offsets,
-            // in the crate that walks them.
+            // SAFETY: `stream` is this walk's `OwnedStream`, live until it
+            // is synchronised below and dropped after.
+            let walk_stream =
+                unsafe { kernels_cuda::tower::Stream::new(stream.as_ref().as_raw().cast()) };
             let weights = match vis_tower::Weights::from_flat(
                 patch_w,
                 pos_table,
                 embed_proj,
                 &table,
                 vc.layers as usize,
+                VISION_SLOTS_PER_LAYER,
                 vc.hidden as i32,
                 vc.heads as i32,
                 vc.intermediate as i32,
@@ -350,14 +325,10 @@ impl Shell {
                 vc.rope_theta,
             ) {
                 Ok(w) => w,
-                Err(why) => return Err(i32::from(why)),
+                Err(why) => return Err(i32::from(tower_refused(why))),
             };
-            // ONE cuBLAS handle for the whole encode, bound to this stream.
-            // The C++ walk built one per IMAGE (`kernels::gemm::CublasHandle
-            // cublas(S)` inside `run_gemma4_vision`), and `Shell::cublas`
-            // records what that costs: `cublasDestroy` is 3.2 ms, most of it
-            // the workspace. One per call is the same object with the same
-            // stream bound, made once.
+            // One cuBLAS handle for the whole encode, bound to this stream, not
+            // one per image: `cublasDestroy` costs ~3.2 ms.
             let mut cublas_ops = crate::device::cublas::LiveCublas;
             let mut cublas = match crate::device::cublas::CublasHandle::create(
                 &mut cublas_ops,
@@ -380,20 +351,18 @@ impl Shell {
                 output_rows,
                 &mut vis_bounds,
                 cublas_raw,
-                stream.as_ref(),
+                walk_stream,
             );
-            // Released on BOTH paths: `CublasHandle`'s destructor asserts the
-            // token was handed back, because the C++ class's was the leak this
-            // port is not repeating.
+            // Released on both paths; the destructor asserts the token was
+            // handed back.
             cublas.release(&mut cublas_ops);
             if let Err(why) = walked {
-                return Err(i32::from(why));
+                return Err(i32::from(tower_refused(why)));
             }
             if stream.as_ref().synchronize().is_err() {
                 return Err(PIE_STATUS_DRIVER_ERROR);
             }
-            // Compose the shared CSR the C++ `Context::encode` writes: the
-            // vision segment's boundaries verbatim, then the audio segment's
+            // Compose the shared CSR: vision boundaries verbatim, then audio
             // shifted by the vision row count.
             output_row_indptr[..num_images + 1].copy_from_slice(&vis_bounds);
             if num_clips > 0 {

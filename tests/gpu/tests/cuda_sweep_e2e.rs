@@ -25,7 +25,7 @@
 //!
 //! `#[ignore]` (needs cuda + a resident qwen3). Run:
 //!   PIE_COMPILER_LAUNCHER=env \
-//!     cargo test -p pie-gpu-tests --features driver-cuda \
+//!     cargo test -p pie-gpu-tests --features driver-cuda-13 \
 //!     --test cuda_sweep_e2e -- --ignored --nocapture
 
 mod common;

@@ -1,26 +1,11 @@
 //! `nlohmann::json::dump()`, reproduced for `serde_json::Value`.
 //!
-//! # Why not `serde_json::to_string_pretty`
-//!
-//! Three reasons, each independently sufficient.
-//!
-//! **Key order.** `nlohmann`'s default object is a `std::map`, so `dump()`
-//! emits keys in byte-wise sorted order. `serde_json`'s order depends on the
-//! `preserve_order` feature -- and Cargo unifies features across a build
-//! graph, so whether this crate sorted would depend on a sibling crate's
-//! dependency list. `crates/engine` already turns that feature on. Sorting
-//! here explicitly cannot be reconfigured from outside.
-//!
-//! **Indentation.** `to_string_pretty` and `dump(2)` differ in where they put
-//! spaces around `:` and how they render empty containers.
-//!
-//! **Doubles.** See [`super::dtoa`]: `nlohmann` uses Grisu2, Rust uses
-//! shortest-correctly-rounded, and they disagree about 0.07% of the time.
-//!
-//! The planner profile cache is read-merge-rewritten by whichever process
-//! calibrates next, and either implementation may be the one doing it. If the
-//! two did not produce identical bytes, every write would rewrite entries it
-//! never touched.
+//! The profile cache is read-merge-rewritten by whichever process calibrates
+//! next, so both C++ and Rust must emit identical bytes or every write churns
+//! untouched entries. `to_string_pretty` differs on three axes: key order
+//! (`nlohmann` sorts byte-wise via `std::map`), `:`-spacing and empty
+//! containers, and doubles (Grisu2 vs Rust's shortest-round disagree ~0.07%
+//! of the time; see [`super::dtoa`]).
 
 use serde_json::Value;
 
@@ -28,11 +13,8 @@ use super::dtoa::write_f64;
 
 /// Escape a string the way `nlohmann::json::dump()` does.
 ///
-/// The five short escapes, `\"`, `\\`, and `\u00XX` for every other control
-/// character. Notably it does **not** escape `/`, and it leaves non-ASCII
-/// UTF-8 as literal bytes rather than emitting surrogate pairs -- both are
-/// observable in the cache file, and a GPU name is a vendor string this code
-/// does not get to constrain.
+/// Does not escape `/`, and leaves non-ASCII UTF-8 as literal bytes rather
+/// than surrogate pairs — both are observable in the cache file.
 pub fn write_string(out: &mut String, s: &str) {
     out.push('"');
     for c in s.chars() {
@@ -93,8 +75,8 @@ fn write_value(out: &mut String, value: &Value, indent: usize, depth: usize) {
                 out.push_str("{}");
                 return;
             }
-            // Sorted, because `nlohmann`'s object is a `std::map`. `str`'s
-            // `Ord` is byte-wise, which is what `std::string::operator<` is.
+            // Sorted byte-wise: `nlohmann`'s object is a `std::map` and `str`'s
+            // `Ord` matches `std::string::operator<`.
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort_unstable();
             out.push('{');
@@ -133,15 +115,13 @@ fn write_number(out: &mut String, n: &serde_json::Number) {
     if let Some(u) = n.as_u64() {
         out.push_str(itoa(u, false).as_str());
     } else if let Some(i) = n.as_i64() {
-        // `unsigned_abs` is used rather than `-i as u64` because i64::MIN has
-        // no positive counterpart and would overflow the negation.
+        // `unsigned_abs`, not `-i as u64`: i64::MIN would overflow negation.
         out.push_str(itoa(i.unsigned_abs(), i < 0).as_str());
     } else if let Some(f) = n.as_f64() {
         write_f64(out, f);
     } else {
-        // `serde_json` with `arbitrary_precision` keeps the source text. It is
-        // not enabled here, so this is unreachable; emitting the debug form is
-        // still better than silently dropping the field.
+        // Unreachable without `arbitrary_precision`; debug form beats dropping
+        // the field.
         out.push_str(&n.to_string());
     }
 }
@@ -161,8 +141,6 @@ mod tests {
 
     #[test]
     fn objects_are_emitted_in_sorted_key_order() {
-        // Not insertion order: `nlohmann`'s object is a `std::map`, so a file
-        // it writes is sorted and a file this writes must be too.
         let v = json!({"b": 1, "a": 2, "C": 3});
         assert_eq!(
             dump_pretty(&v, 2),
@@ -190,16 +168,12 @@ mod tests {
 
     #[test]
     fn zero_indent_drops_the_space_after_the_colon() {
-        // `dump()` with no argument is compact, and the colon separator
-        // changes with it -- not just the whitespace between members.
         let v = json!({"a": 1, "b": [2]});
         assert_eq!(dump_pretty(&v, 0), "{\"a\":1,\"b\":[2]}\n");
     }
 
     #[test]
     fn floats_go_through_grisu2_and_integers_do_not() {
-        // A float that happens to be integral still prints a fractional part,
-        // and an integer must not acquire one.
         let v = json!({"f": 1.0, "i": 1, "n": -3, "big": 18446744073709551615u64});
         assert_eq!(
             dump_pretty(&v, 0),

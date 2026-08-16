@@ -1,35 +1,47 @@
-//! No entry point reads a descriptor without validating it.
+//! No entry point reads a plan without validating it, and none lets a
+//! panic out.
 //!
-//! North star rule 4: *a shared capability must not be optional — if it
-//! can be skipped, it will be.* `driver-api` ships seventeen `validate_*`
-//! functions, and nothing calls them now: this shell called NONE and
-//! re-derived similar checks by hand at 51 sites, and the one caller that
-//! did — `driver-dummy`, the interpreter backend — is deleted. The
-//! capability was built, shipped, and routed around by every
-//! implementation there was.
+//! North star rule 4: *a shared capability must not be optional -- if it
+//! can be skipped, it will be.* `driver-api` shipped seventeen `validate_*`
+//! functions and nothing called them: this shell called NONE and re-derived
+//! similar checks by hand at 51 sites, and the one caller that did --
+//! `driver-dummy`, the interpreter backend -- is deleted. The capability was
+//! built, shipped, and routed around by every implementation there was.
 //!
-//! `serve::checked` makes the dereference and the validation one
-//! operation — there is no way to obtain a `&PieKvCopyDesc` without
-//! having run a validator over it, because the only thing that turns the
-//! pointer into a reference takes the validator as an argument. This test
-//! holds the other half: that nothing goes around it.
+//! ## What changed, and what that costs this file
 //!
-//! ## Why a source scan, and what it is worth
+//! Half of that is now settled, and not by anyone remembering to call
+//! anything. The entry points stopped being `extern "C"` (see
+//! `serve::guard`'s header) and take typed references and owned plans, so
+//! the descriptors that needed a `validate_*_desc` -- the null test, the
+//! ptr/len agreement -- do not arrive as pointers to be checked. Three
+//! tests here scanned for that mechanism, and when it went they found ZERO
+//! `checked(` sites and ZERO validators and FAILED, rather than passing over
+//! an empty corpus. That is the only reason this file could be repaired
+//! instead of quietly believed; see `no_entry_point_takes_a_raw_descriptor`,
+//! which is what replaced them, and which holds the door shut behind them.
 //!
-//! The rule is "every raw descriptor pointer in this file is dereferenced
-//! through `checked`", and the compiler cannot state it — `as_ref` is
-//! inherent on every raw pointer and always will be. So the check reads
-//! the source, which is the same trade `executor_bind`'s arm scan makes
-//! and for the same reason: a narrower question than the one the code
-//! answers, aimed at the failure that actually keeps happening.
+//! What did NOT go away is the half the type system cannot state: the
+//! frame's roster bounds, the copy's memory domains, the encode plan's CSR
+//! partitioning. Those are `plan.validate()` calls that a new entry point
+//! can simply not make, and the three `*_validates_its_*` tests below run
+//! each one against a plan that is wrong in exactly that way.
 //!
-//! The failure it catches is a NEW entry point written the old way. Every
-//! one of the eleven took its descriptor with a bare
-//! `unsafe { p.as_ref() }`, because that is what the one above it did.
+//! ## Why source scans, and what they are worth
+//!
+//! Two of these tests read the source, because the compiler cannot say
+//! "every method that answers a status catches its own panics" -- the same
+//! trade `executor_bind`'s arm scan makes, aimed at the failure that keeps
+//! happening: a NEW entry point written like the one above it.
+//!
+//! A source scan's whole risk is finding nothing and reporting success. This
+//! test has been broken by a move twice, and both times it kept passing,
+//! because a shrinking corpus finds fewer violations rather than more. So
+//! every scan below derives its own subjects from the source and asserts a
+//! floor on how many it found. The lists are never hand-kept: a hand-kept
+//! list is the same debt in a different place.
 
 #![cfg(feature = "abi")]
-
-use std::collections::BTreeSet;
 
 /// The shell's source, read once.
 ///
@@ -44,7 +56,7 @@ use std::collections::BTreeSet;
 /// passing, because a shrinking corpus finds fewer violations rather
 /// than more — which is why the emptiness assertions below are not
 /// decoration.
-fn shell_source() -> String {
+fn shell_modules() -> Vec<String> {
     let dirs = [
         concat!(env!("CARGO_MANIFEST_DIR"), "/src/serve"),
         concat!(env!("CARGO_MANIFEST_DIR"), "/src/fire"),
@@ -63,141 +75,103 @@ fn shell_source() -> String {
     files
         .iter()
         .map(|p| std::fs::read_to_string(p).expect("a shell module reads"))
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect()
 }
 
-/// Every `unsafe { <ident>.as_ref() }` in the shell, by the name it
-/// dereferences.
-fn bare_derefs(src: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    for line in src.lines() {
-        let Some(at) = line.find("unsafe { ") else {
+/// The same modules, concatenated, for the checks that ask "anywhere".
+fn shell_source() -> String {
+    shell_modules().join("\n")
+}
+
+/// Every method of `impl Shell`, with its signature and its body.
+///
+/// The entry points are derived, never listed: someone adds a verb and does
+/// not add it here is the same debt the validators decayed into.
+fn shell_entries() -> Vec<(String, String, String)> {
+    // Scoped to the `impl Shell` blocks, not to the whole shell source.
+    // `fire/` is full of `*const c_void` -- device buffers, which are raw
+    // because a device address IS raw -- and counting those as entry points
+    // taking a descriptor would make the test below fire on the wrong thing
+    // and then be relaxed until it fired on nothing.
+    let mut out = Vec::new();
+    for src in shell_modules() {
+        let Some(at) = src.find("\nimpl Shell {") else {
             continue;
         };
-        let rest = &line[at + "unsafe { ".len()..];
-        let Some(end) = rest.find(".as_ref() }") else {
-            continue;
-        };
-        let name = rest[..end].trim();
-        if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-            out.insert(name.to_string());
+        // To the `}` in column zero that closes the impl.
+        let block = &src[at..];
+        let block = &block[..block[1..].find("\n}").map_or(block.len(), |e| e + 2)];
+        let mut rest = block;
+        while let Some(at) = rest.find("\n    pub fn ") {
+            let after = &rest[at + "\n    pub fn ".len()..];
+            let name: String = after.chars().take_while(|c| *c != '(').collect();
+            let Some(open) = after.find(" {") else { break };
+            let sig = after[..open].to_string();
+            let body_end = after[open..]
+                .find("\n    }")
+                .map_or(after.len(), |e| open + e);
+            out.push((name, sig, after[open..body_end].to_string()));
+            rest = &after[open..];
         }
     }
     out
 }
 
-/// A descriptor reaches an entry point through `checked`, or not at all.
+/// No entry point takes a raw descriptor, so none can dereference one
+/// unvalidated.
 ///
-/// The allowed set is ONE name and it is `checked`'s own — the function
-/// whose whole job is to pair the dereference with the validator. A
-/// second name here is an entry point that took its descriptor raw.
+/// # What replaced `checked`, and why this test is not the one that was here
+///
+/// This file used to hold three tests over a mechanism that is gone.
+/// `serve::checked` paired the dereference with a `driver_api::local::
+/// validate_*`, and the tests asserted that every entry point called it, that
+/// nothing went around it with a bare `unsafe { p.as_ref() }`, and that four
+/// named validators were still reached. All three scanned for a shape that no
+/// longer occurs: they found ZERO `checked(` sites, zero bare dereferences and
+/// zero validators, and said so rather than passing -- which is the emptiness
+/// assertion in each of them doing exactly its job, and the reason this could
+/// be repaired instead of discovered later.
+///
+/// The thirteen entry points are not `extern "C"` any more (see
+/// `serve::guard`'s header). They take `&driver_api::ModelLoadDesc`,
+/// `&ChannelRegistrationPlan`, `FrameSubmission` -- typed references and owned
+/// plans. There is no pointer to be null, no length to be mismatched against
+/// its buffer, and nothing for a `validate_*_desc` to check that the type does
+/// not already state. The capability was not routed around this time; it was
+/// subsumed.
+///
+/// So the claim that survives is structural, and this holds it: a raw
+/// descriptor cannot come back without failing here first. The rules that were
+/// NOT about the C shape -- the frame's roster bounds, the copy's domains, the
+/// encode plan's CSR partitioning -- are still real and still skippable, and
+/// the three `*_validates_its_*` tests below are what keep them on the path.
 #[test]
-fn every_descriptor_is_dereferenced_through_its_validator() {
-    let src = shell_source();
-
-    // SELF-VACUITY, and it is the same shape as the arm scan's: a
-    // scanner that stopped recognising the pattern would find nothing
-    // and report a clean file. `checked` is the one site that must
-    // always match, because it is the site the pattern exists to allow.
-    let found = bare_derefs(&src);
+fn no_entry_point_takes_a_raw_descriptor() {
+    let entries = shell_entries();
     assert!(
-        !found.is_empty(),
-        "the scan found no `unsafe {{ x.as_ref() }}` at all, so its shape \
-         assumption broke rather than the shell being clean"
+        entries.len() >= 12,
+        "the scan found {} `impl Shell` methods, so it stopped recognising \
+         them and would pass while every one of them took a raw pointer: {:?}",
+        entries.len(),
+        entries.iter().map(|(n, ..)| n).collect::<Vec<_>>()
     );
 
-    // `p` is `checked`'s parameter. Nothing else may name one.
-    let allowed: BTreeSet<String> = ["p"].iter().map(|s| (*s).to_string()).collect();
-    let bare: BTreeSet<&String> = found.difference(&allowed).collect();
+    let raw: Vec<&str> = entries
+        .iter()
+        .filter(|(_, sig, _)| sig.contains("*const ") || sig.contains("*mut "))
+        .map(|(n, ..)| n.as_str())
+        .collect();
     assert!(
-        bare.is_empty(),
-        "these dereference a descriptor pointer WITHOUT its validator: {bare:?}\n\
-         Use `checked(ptr, driver_api::local::validate_*, \"<entry>\")`, which \
-         pairs the null test and the validation so neither can be forgotten. \
-         If the descriptor has no validator, say so at the call with a \
-         closure and a reason, as `launch` and `encode` do."
+        raw.is_empty(),
+        "these entry points take a RAW pointer: {raw:?}\n  \
+         A descriptor reaching this shell as a pointer brings back everything \
+         `driver_api::local::validate_*` existed for -- the null test, the \
+         ptr/len agreement, the reserved words -- and this crate no longer has \
+         a `checked` to pair the dereference with the validation. Take a typed \
+         reference or an owned plan, as the other entry points do; if it must \
+         be a pointer, restore `checked` and the scan that proved nothing went \
+         around it (this file, before the shell stopped being `extern \"C\"`)."
     );
-}
-
-/// The entry points that take a descriptor all call `checked`.
-///
-/// The scan above proves nothing goes AROUND it; this proves the calls
-/// are there at all, so that deleting one is a failure rather than a
-/// silent return to the old shape.
-#[test]
-fn every_descriptor_entry_point_calls_checked() {
-    let src = shell_source();
-    let calls = src.matches("checked(").count();
-    // Five entry points still take a C DESCRIPTOR: create, load_model,
-    // register_channel, bind_instance and the create out-params. `checked(`
-    // also appears in its own definition, so the floor is the count of those
-    // entry points.
-    //
-    // It was eleven. The frame verb, the three transfer verbs, the encode
-    // verb and the program verb take owned plans now, which have no pointer
-    // to check — `launch_validates_its_frame`, `copy_kv_validates_its_plan`
-    // and `encode_validates_its_plan` below are the floors that keep the
-    // three with rules of their own honest. The program verb needs none:
-    // `validate_program_desc` stated an `abi_version` and two reserved words
-    // and nothing else, all three of which a `ProgramRegistration` lacks.
-    assert!(
-        calls >= 4,
-        "only {calls} `checked(` sites — an entry point stopped validating \
-         its descriptor, or the helper was renamed and this floor was not"
-    );
-}
-
-/// EVERY entry point that takes a descriptor validates it.
-///
-/// This test used to hold the opposite: that `validate_frame_desc` and
-/// `validate_encode_desc` stayed DEFERRED, because their rules were right
-/// and the callers were short. They are not short any more, so the claim
-/// inverts — and the inversion is the point of having written it as a
-/// test rather than a note.
-///
-/// What the two of them caught, all of it in fixtures that had passed for
-/// as long as they existed:
-///
-/// * `roster_rows` stated one entry per TOKEN of a prefill, every one
-///   zero — which the validator reads as N requests all claiming roster
-///   index 0. The engine builds it with
-///   `Vec::with_capacity(instance_ids.len())`, one per REQUEST.
-/// * `sub_batch_indptr` partitioned tokens where it partitions roster
-///   rows.
-/// * steps with no terminal cell at all, and then two steps SHARING one —
-///   which would have had the frame report whichever finished last as the
-///   answer for both.
-/// * `rs_slot_ids` with no matching `rs_slot_flags`: a recurrent slot the
-///   driver cannot know whether to reset or continue.
-/// * encode descriptors with no `image_grids`, which the engine sends
-///   (`engine/src/driver/abi.rs:323`) and this shell never reads.
-///
-/// Not one of those was reachable through the engine, because the engine
-/// builds these correctly. They were reachable through the tests, which
-/// is the point of `validators-unskippable`: a test fixture is a caller,
-/// and an unchecked contract lets it drift exactly as far as any other.
-#[test]
-fn no_validator_is_deferred() {
-    let src = shell_source();
-    for validator in [
-        "validate_driver_create_desc",
-        "validate_model_load_desc",
-        "validate_channel_desc",
-        "validate_instance_desc",
-    ] {
-        // The NAME, not a call: a validator reaches `checked` as a value
-        // (`checked(p, local::validate_x, "…")`) or inside a closure when
-        // it is `unsafe`, so matching an open paren would find only half
-        // of them and report the other half as missing.
-        let named = format!("local::{validator}");
-        assert!(
-            src.contains(&named),
-            "`{validator}` is no longer called — an entry point stopped \
-             validating its descriptor, and the shared checks it names are \
-             the ones this shell used to hand-roll at 51 sites"
-        );
-    }
 }
 
 /// The launch entry point validates its frame.
@@ -279,29 +253,29 @@ fn encode_validates_its_plan() {
 /// only way to be exempt is to not be an entry point.
 #[test]
 fn no_entry_point_lets_a_panic_out() {
-    let src = shell_source();
-    let lines: Vec<&str> = src.lines().collect();
-
-    let mut entries = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        let Some(rest) = line.strip_prefix("pub fn pie_cuda_") else {
-            continue;
-        };
-        let name = rest.split('(').next().unwrap_or("").to_string();
-        // The signature runs to the brace; the body starts after it.
-        let body_at = (i..lines.len().min(i + 30))
-            .find(|&j| lines[j].contains('{'))
-            .map_or(i, |j| j + 1);
-        // `guard` is the FIRST thing the body does or it is not a guard —
-        // work above it is work outside the catch.
-        let guarded = lines[body_at..lines.len().min(body_at + 6)]
-            .iter()
-            .any(|l| l.contains("guard(\""));
-        entries.push((name, guarded));
-    }
+    // An entry point is one that ANSWERS A STATUS. That is the derivation,
+    // and it is why `device_facts` and `live_device_bytes` are not on the
+    // list without being written down as exceptions: they return a borrowed
+    // field and an integer, they cannot fail, and there is no status for
+    // `guard` to answer with. Anything that can report `Err(i32)` to the
+    // engine is a door, and every door catches.
+    let entries: Vec<(String, bool)> = shell_entries()
+        .into_iter()
+        .filter(|(_, sig, _)| sig.contains(", i32>"))
+        .map(|(name, _, body)| {
+            // `guard` is the FIRST thing the body does or it is not a guard --
+            // work above it is work outside the catch. Six lines of slack for
+            // the multi-line call form, which is what three of them use.
+            let guarded = body
+                .lines()
+                .take(7)
+                .any(|l| l.contains("guard(\"") || l.trim() == "guard(");
+            (name, guarded)
+        })
+        .collect();
 
     assert!(
-        entries.len() >= 13,
+        entries.len() >= 12,
         "the entry scan found {} entries, so it stopped recognising them \
          and would pass while every one of them was unguarded: {entries:?}",
         entries.len()
@@ -315,9 +289,11 @@ fn no_entry_point_lets_a_panic_out() {
     assert!(
         naked.is_empty(),
         "these entry points let a panic reach the caller: {naked:?}. \
-         `serve::guard` turns it into a failed request instead; a \
-         panic that escapes an `extern \"C\"` boundary is undefined \
-         behaviour, and even where it is not, it kills every other \
-         request the engine was serving"
+         `serve::guard` turns it into a failed request instead. These are \
+         plain Rust now, so the panic unwinds rather than being undefined \
+         behaviour -- which is precisely why it can be caught, and why not \
+         catching it is a choice. It unwinds through the engine's worker and \
+         kills every other request that worker was serving, over one bad \
+         plan. Answer the status these signatures already return."
     );
 }

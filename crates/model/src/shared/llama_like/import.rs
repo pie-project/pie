@@ -1,19 +1,41 @@
-//! Llama as llama.cpp spells it, in the vocabulary the catalog reads.
+//! The llama-like lineage's tensor names, in every vocabulary that spells them.
 //!
 //! Sibling of [`crate::qwen_2::import`], and the family that one deferred:
 //! "a permutation applied when it was not wanted, or skipped when it was, is
 //! not an error. It is a model that loads, serves, and answers slightly
 //! wrong, and pie has no cheap check that notices."
 //!
-//! # One GGUF architecture, several pie generations
+//! # Why this is the one import table that lives in `shared`
 //!
-//! `general.architecture` is `llama` for Llama 2, Llama 3, Mistral and
-//! everything else llama.cpp folds into that converter, so this module is
-//! named for the earliest generation that carries it rather than for a family
-//! of its own. That is not a shortcut around "an import pass is
-//! self-contained": the pass is per INPUT vocabulary, and llama.cpp has one
-//! `llama`. Which pie row the result identifies as is decided afterwards, by
-//! the tensors and shapes the artifact actually holds.
+//! It used to be `llama_2::import`, "named for the earliest generation that
+//! carries it rather than for a family of its own" -- and `llama_2` has no
+//! catalog rows at all, so the table that feeds Llama 3's rows lived in a
+//! directory nothing reachable is written in.
+//!
+//! Both halves of the sharing were then measured. On the HuggingFace side,
+//! the rows of `llama_3`, `mistral_3`, `olmo_2`, `olmo_3` and `phi_3` name
+//! the SAME THIRTEEN tensors, character for character -- five generations,
+//! one member set. On the GGUF side, `general.architecture` is `llama` for
+//! Llama 2, Llama 3, Mistral and everything else llama.cpp folds into that
+//! converter, so the input vocabulary is one too.
+//!
+//! That is `shared`'s bar met twice over -- the same bar
+//! [`crate::shared::llama_like::contract`] met when ten generations reached
+//! across a sibling edge for it. Being written first is a fact about who
+//! wrote it, not a claim of ownership.
+//!
+//! # The `gguf` column belongs to one architecture, not to five generations
+//!
+//! `phi_3` and `olmo_2` are llama-like to pie and have their OWN
+//! `general.architecture` in llama.cpp (`phi3`, `olmo2`). Neither has an arm
+//! in [`crate::ingest`], so neither can reach the column below -- the GGUF
+//! door is keyed on the architecture, and the HuggingFace door never reads
+//! that column at all. The column is the `llama` architecture's, and a
+//! generation naming this table for its HuggingFace names is not claiming
+//! llama.cpp spells it that way.
+//!
+//! Which pie row an import identifies as is decided afterwards, by the
+//! tensors and shapes the artifact actually holds.
 //!
 //! # The permutation, measured rather than ported
 //!
@@ -50,27 +72,62 @@
 //! only ever moves whole rows -- so a Q4_0 llama regroups without being
 //! decoded first.
 
+use crate::shared::vocabulary::{Member, Vocab, gguf_member};
 use model_loader::checkpoint::Attributes;
-
-/// The HuggingFace name for a GGUF tensor, or `None` if this map has none.
+/// Every tensor the llama-like lineage publishes, and what each vocabulary
+/// calls it.
 ///
-/// `None` is a refusal and not a skip, exactly as in [`crate::qwen_2::import`].
-#[must_use]
-pub fn hf_name(gguf: &str) -> Option<String> {
-    if is_derived(gguf) {
-        return None;
-    }
-    let (stem, suffix) = match gguf.rsplit_once('.') {
-        Some((stem, tail @ ("weight" | "bias"))) => (stem, tail),
-        _ => return None,
-    };
-    let hf = match split_layer(stem) {
-        Some((layer, member)) => format!("model.layers.{layer}.{}", member_of(LAYER, member)?),
-        None if stem == "output" => "lm_head".to_string(),
-        None => format!("model.{}", member_of(MODEL, stem)?),
-    };
-    Some(format!("{hf}.{suffix}"))
-}
+/// Thirteen rows, which is the exact set the rows of `crate::llama_3`,
+/// `crate::mistral_3`, `crate::olmo_2`, `crate::olmo_3` and `crate::phi_3`
+/// name between them. `crate::qwen_2` and `crate::qwen_3` are llama-like in
+/// `forward` and NOT here -- they add a `q_norm`, and qwen2 adds three
+/// attention biases -- which is why they keep their own tables and this one
+/// does not try to cover them.
+///
+/// The `attn_norm`/`ffn_norm` pair carries the trap it does everywhere:
+/// llama.cpp names a norm for what it PRECEDES and HuggingFace for where it
+/// SITS, so `ffn_norm` is `post_attention_layernorm`. Gemma is the family
+/// where copying that row would go wrong -- see `crate::gemma_3::import`.
+///
+/// `rope_freqs.weight` has no row. It is not a weight; see [`is_derived`].
+pub const VOCAB: Vocab = Vocab(&[
+    // ── Inside a decoder layer ───────────────────────────────────────
+    Member::gguf(
+        "model.layers.{layer}.self_attn.q_proj",
+        "blk.{layer}.attn_q",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.self_attn.k_proj",
+        "blk.{layer}.attn_k",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.self_attn.v_proj",
+        "blk.{layer}.attn_v",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.self_attn.o_proj",
+        "blk.{layer}.attn_output",
+    ),
+    // No GGUF column: the `llama` converter publishes no query norm, and
+    // rows in `crate::llama_3` and `crate::olmo_2` ask for one.
+    Member::same("model.layers.{layer}.self_attn.q_norm"),
+    Member::gguf(
+        "model.layers.{layer}.input_layernorm",
+        "blk.{layer}.attn_norm",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.post_attention_layernorm",
+        "blk.{layer}.ffn_norm",
+    ),
+    Member::same("model.layers.{layer}.post_feedforward_layernorm"),
+    Member::gguf("model.layers.{layer}.mlp.gate_proj", "blk.{layer}.ffn_gate"),
+    Member::gguf("model.layers.{layer}.mlp.up_proj", "blk.{layer}.ffn_up"),
+    Member::gguf("model.layers.{layer}.mlp.down_proj", "blk.{layer}.ffn_down"),
+    // ── Outside it ───────────────────────────────────────────────────
+    Member::gguf("model.embed_tokens", "token_embd"),
+    Member::gguf("model.norm", "output_norm"),
+    Member::gguf("lm_head", "output"),
+]);
 
 /// Tensors llama.cpp computed and pie computes for itself.
 ///
@@ -94,8 +151,7 @@ pub fn is_derived(gguf: &str) -> bool {
 /// for them to be wrong.
 #[must_use]
 pub fn regroup_heads(attributes: &Attributes, gguf: &str) -> Option<u32> {
-    let (stem, _) = gguf.rsplit_once('.')?;
-    let (_, member) = split_layer(stem)?;
+    let (_, member) = gguf_member(gguf)?;
     let key = match member {
         "attn_q" => "llama.attention.head_count",
         "attn_k" => "llama.attention.head_count_kv",
@@ -107,41 +163,6 @@ pub fn regroup_heads(attributes: &Attributes, gguf: &str) -> Option<u32> {
     }
     .filter(|heads| *heads > 0)
 }
-
-/// `blk.7.attn_q` as `(7, "attn_q")`.
-fn split_layer(stem: &str) -> Option<(u32, &str)> {
-    let rest = stem.strip_prefix("blk.")?;
-    let (index, member) = rest.split_once('.')?;
-    Some((index.parse().ok()?, member))
-}
-
-fn member_of(table: &[(&str, &'static str)], member: &str) -> Option<&'static str> {
-    table
-        .iter()
-        .find(|(gguf, _)| *gguf == member)
-        .map(|(_, hf)| *hf)
-}
-
-/// The per-layer members.
-///
-/// Nine, where qwen2 has the same nine plus three biases: llama publishes no
-/// attention bias at all. The `attn_norm`/`ffn_norm` pair carries the same
-/// trap it does there -- llama.cpp names a norm for what it precedes,
-/// HuggingFace for where it sits, so `ffn_norm` is `post_attention_layernorm`.
-const LAYER: &[(&str, &str)] = &[
-    ("attn_q", "self_attn.q_proj"),
-    ("attn_k", "self_attn.k_proj"),
-    ("attn_v", "self_attn.v_proj"),
-    ("attn_output", "self_attn.o_proj"),
-    ("attn_norm", "input_layernorm"),
-    ("ffn_norm", "post_attention_layernorm"),
-    ("ffn_gate", "mlp.gate_proj"),
-    ("ffn_up", "mlp.up_proj"),
-    ("ffn_down", "mlp.down_proj"),
-];
-
-/// The model-level tensors. `output` is handled above, outside `model.`.
-const MODEL: &[(&str, &str)] = &[("token_embd", "embed_tokens"), ("output_norm", "norm")];
 
 #[cfg(test)]
 mod tests {
@@ -170,14 +191,38 @@ mod tests {
     #[test]
     fn every_tensor_a_llama_gguf_publishes_has_an_answer() {
         let published = [
-            ("blk.3.attn_k.weight", "model.layers.3.self_attn.k_proj.weight"),
-            ("blk.3.attn_norm.weight", "model.layers.3.input_layernorm.weight"),
-            ("blk.3.attn_output.weight", "model.layers.3.self_attn.o_proj.weight"),
-            ("blk.3.attn_q.weight", "model.layers.3.self_attn.q_proj.weight"),
-            ("blk.3.attn_v.weight", "model.layers.3.self_attn.v_proj.weight"),
-            ("blk.3.ffn_down.weight", "model.layers.3.mlp.down_proj.weight"),
-            ("blk.3.ffn_gate.weight", "model.layers.3.mlp.gate_proj.weight"),
-            ("blk.3.ffn_norm.weight", "model.layers.3.post_attention_layernorm.weight"),
+            (
+                "blk.3.attn_k.weight",
+                "model.layers.3.self_attn.k_proj.weight",
+            ),
+            (
+                "blk.3.attn_norm.weight",
+                "model.layers.3.input_layernorm.weight",
+            ),
+            (
+                "blk.3.attn_output.weight",
+                "model.layers.3.self_attn.o_proj.weight",
+            ),
+            (
+                "blk.3.attn_q.weight",
+                "model.layers.3.self_attn.q_proj.weight",
+            ),
+            (
+                "blk.3.attn_v.weight",
+                "model.layers.3.self_attn.v_proj.weight",
+            ),
+            (
+                "blk.3.ffn_down.weight",
+                "model.layers.3.mlp.down_proj.weight",
+            ),
+            (
+                "blk.3.ffn_gate.weight",
+                "model.layers.3.mlp.gate_proj.weight",
+            ),
+            (
+                "blk.3.ffn_norm.weight",
+                "model.layers.3.post_attention_layernorm.weight",
+            ),
             ("blk.3.ffn_up.weight", "model.layers.3.mlp.up_proj.weight"),
             ("output_norm.weight", "model.norm.weight"),
             ("token_embd.weight", "model.embed_tokens.weight"),
@@ -185,11 +230,11 @@ mod tests {
             ("output.weight", "lm_head.weight"),
         ];
         for (gguf, hf) in published {
-            assert_eq!(hf_name(gguf).as_deref(), Some(hf), "mapping {gguf}");
+            assert_eq!(VOCAB.from_gguf(gguf).as_deref(), Some(hf), "mapping {gguf}");
         }
         // The twelfth pattern, and the only one with no name.
         assert!(is_derived("rope_freqs.weight"));
-        assert_eq!(hf_name("rope_freqs.weight"), None);
+        assert_eq!(VOCAB.from_gguf("rope_freqs.weight"), None);
     }
 
     /// Q regroups by `n_head`, K by `n_head_kv`, and nothing else regroups.
@@ -231,7 +276,7 @@ mod tests {
     fn the_layer_index_is_carried_through() {
         for layer in [0u32, 7, 31, 199] {
             assert_eq!(
-                hf_name(&format!("blk.{layer}.attn_q.weight")).as_deref(),
+                VOCAB.from_gguf(&format!("blk.{layer}.attn_q.weight")).as_deref(),
                 Some(format!("model.layers.{layer}.self_attn.q_proj.weight").as_str())
             );
         }
@@ -248,7 +293,7 @@ mod tests {
             "blk.3.attn_q.scales",
             "token_embd",
         ] {
-            assert_eq!(hf_name(unknown), None, "should not map {unknown}");
+            assert_eq!(VOCAB.from_gguf(unknown), None, "should not map {unknown}");
         }
     }
 }

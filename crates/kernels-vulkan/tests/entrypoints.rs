@@ -97,6 +97,28 @@ fn the_table_names_exactly_what_the_shaders_instantiate() {
 /// in the same diff whether Metal grew one too, because a number that moves on
 /// one side alone is exactly the fact this assertion exists to surface.
 ///
+/// 481 became 490 with the flash decode: four `sdpa_paged_decode_split`
+/// widths, four `sdpa_paged_decode_combine` widths and one sinked fold. Metal
+/// did NOT grow those nine, and that is the divergence this assertion is for:
+/// they are a Vulkan occupancy fix -- a 128-SM card ran a 16-workgroup
+/// dispatch -- and not an operation the shared text can name. No model asks
+/// for a "split decode"; `sdpa_paged_decode` is still the op, and which of
+/// the three modules serves it is a decision `attn::decode_splits` makes from
+/// the history length. The parity tests below compare OPS, so they stay
+/// green without an exception list.
+///
+/// 490 became 496 with `rms_rope`, the fused per-head norm and NEOX
+/// rotation. Metal did NOT grow those six, and unlike the flash decode that
+/// divergence is TEMPORARY rather than principled: the fusion is a real op
+/// that a shared text will have to name, and until Metal carries it the
+/// statement is gated so that no plan text can ask for it. Six and not one
+/// because the family mirrors `neox`'s exactly -- plain, `freqs` and `prop`,
+/// each in a decode and a multi-batch shape -- and only the plain multi-batch
+/// arm has a routine today. The other five are compiled and unreachable, and
+/// that is deliberate: they are what llama-3.1's frequency table and gemma-4's
+/// partial rotation will need, and instantiating them one at a time is how a
+/// family ends up with five subtly different bodies.
+///
 /// 99/480 became 100/481 with `add_bias`, and Metal grew the same row in the
 /// same diff. It was written here first — the Qwen-2 biases are a Vulkan
 /// wrong-answer this driver could measure against a CPU oracle — and closing
@@ -105,7 +127,7 @@ fn the_table_names_exactly_what_the_shaders_instantiate() {
 /// would have meant an exception list on the parity tests below, which is
 /// precisely how the next real divergence gets waved through.
 #[test]
-fn the_table_is_one_hundred_kernels_over_four_hundred_and_eighty_one_entrypoints() {
+fn the_table_is_one_hundred_and_one_kernels_over_four_hundred_and_ninety_six_entrypoints() {
     // Rows PLUS retired rows: `.wiki/kernel-x/refactor-bigplan.md` §7 empties
     // the table family by family, and coverage is what the two together name.
     // The hundred is the invariant; which side of the crossing a kernel sits
@@ -114,8 +136,8 @@ fn the_table_is_one_hundred_kernels_over_four_hundred_and_eighty_one_entrypoints
     // the table family by family and coverage was what the two together
     // named. Every family has crossed, so the first term is 0 and the retired
     // list carries the whole hundred on its own.
-    assert_eq!(kernels_vulkan::retired_rows().len(), 100);
-    assert_eq!(kernels_vulkan::entrypoints().len(), 481);
+    assert_eq!(kernels_vulkan::retired_rows().len(), 101);
+    assert_eq!(kernels_vulkan::entrypoints().len(), 496);
 }
 
 // `every_entrypoint_resolves_through_sig_in` STOOD HERE. It walked the shader
@@ -300,10 +322,11 @@ fn shader_sources() -> Vec<(String, String)> {
 // which is the trade Stage 3 was for. `kernels-wgpu/tests/entrypoints.rs`
 // records the same retirement from the last crate that still has rows.
 //
-// The one divergence these carried is NOT resolved and must not be read as
-// such: `kernels`'s `DRIFTED` still names all six `sdpa_paged_*` rows at
-// operand 13, where metal reads the text's scalar and wgpu reads
-// `Source::AttentionMaskStride`, and
-// `the_two_settled_drifts_are_still_true_of_the_drivers_they_name` still
-// reports `AttentionMaskStride` in ZERO places in `driver-metal`. The defect
-// is live; only this crate's view of it is gone.
+// The one divergence these carried IS resolved now, and it is worth saying
+// which way. It was operand 13 of the six `sdpa_paged_*` rows: metal read the
+// text's scalar, wgpu read the fire's. All three planes now say
+// `Ask<keys::AttentionMaskStride, u32>` and each driver answers for its own
+// fire -- this one and wgpu with the pitch of the mask they staged, metal
+// with zero, because metal stages an enable word per token and no mask. The
+// entry in `kernels`'s `DRIFTED` went when the sentence became true, and the
+// gate that read `driver-metal`'s sources from the outside went with it.

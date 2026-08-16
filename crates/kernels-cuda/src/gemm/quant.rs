@@ -99,13 +99,17 @@ use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 
 use crate::jit::abi::bf16;
+// `In` and `Out` for the one cross-family call this file makes. Nothing here
+// is a `#[routine]` -- the three symbols these bodies serve are
+// `driver_bound!` rows in `gemm/mod.rs`, with no column and no binder -- so
+// the wrappers arrive as a CALLER's vocabulary rather than a launcher's.
+use kernels::routine::{In, Out};
 
 use cudarc::cublas::sys::{
     cublasComputeType_t, cublasContext, cublasGemmAlgo_t, cublasGemmEx, cublasGetStream_v2,
     cublasOperation_t, cublasStatus_t, cudaDataType,
 };
 use cudarc::cublaslt::sys as lt;
-
 
 // ─────────────────────────────────────────────────────────────────────────
 // The vocabulary the router switches on — the archive crate's `DType` and
@@ -844,12 +848,16 @@ unsafe fn dequant_then_bf16(
             let ctx = crate::jit::Ctx::on(fill_stream);
             crate::quant::dequant_fp8_e4m3_to_bf16_per_group(
                 &ctx,
-                w_fp8.cast(),
-                bf16_w.cast(),
-                w_scale_fp32_dev.cast(),
-                n,
+                kernels::routine::In { ptr: w_fp8.cast(), rows: 0, width: 0 },
+                kernels::routine::Out { ptr: bf16_w.cast(), rows: 0, width: 0 },
+                kernels::routine::In { ptr: w_scale_fp32_dev.cast(), rows: 0, width: 0 },
+                // A LAUNCHER CALLING A LAUNCHER, so the wrappers are written
+                // out: this caller is the host program's, not a statement's,
+                // and `n`/`k`/`group_size` are its own numbers rather than
+                // anything a trace placed.
+                <kernels::keys::Rows as kernels::keys::Fact>::env(n),
                 k,
-                group_size,
+                kernels::routine::Param(group_size),
             )
         });
     } else if scale_kind == quant_kind::PER_CHANNEL {
@@ -858,11 +866,11 @@ unsafe fn dequant_then_bf16(
             let ctx = crate::jit::Ctx::on(fill_stream);
             crate::quant::dequant_fp8_e4m3_to_bf16_per_channel(
                 &ctx,
-                w_fp8.cast(),
-                bf16_w.cast(),
-                w_scale_fp32_dev.cast(),
-                n,
-                k,
+                kernels::routine::In { ptr: w_fp8.cast(), rows: 0, width: 0 },
+                kernels::routine::Out { ptr: bf16_w.cast(), rows: 0, width: 0 },
+                kernels::routine::In { ptr: w_scale_fp32_dev.cast(), rows: 0, width: 0 },
+                kernels::routine::Param(n),
+                kernels::routine::Param(k),
             )
         });
     } else {
@@ -895,7 +903,7 @@ unsafe fn dequant_then_bf16(
         // `quant::dequant_fp8_e4m3_to_bf16`, `LaunchRule::Elementwise`:
         // `(fp8_in, bf16_out, scale, n)`.
         // The scale crosses BY VALUE as an `f32`, which is the one thing the
-        // deleted row could not spell: `Ty::F32` with `Source::Param(0)` is
+        // deleted row could not spell: `Ty::F32` with `Source::Slot(Kind::Param, 0)` is
         // ungenerable — `abi.rs:1119` turns a `Param` into an `i32` and
         // `cast_for` adds no conversion — so this fire was ALWAYS the live
         // path and the row's `ParamF32` operand was never reached. The host
@@ -904,10 +912,14 @@ unsafe fn dequant_then_bf16(
             let ctx = crate::jit::Ctx::on(fill_stream);
             crate::quant::dequant_fp8_e4m3_to::<bf16>(
                 &ctx,
-                w_fp8.cast(),
-                bf16_w.cast(),
-                scale,
-                weight_elems,
+                kernels::routine::In { ptr: w_fp8.cast(), rows: 0, width: 0 },
+                kernels::routine::Out { ptr: bf16_w.cast(), rows: 0, width: 0 },
+                // The host program's own scale, not a statement's param slot;
+                // the wrapper is written out for the same reason the one
+                // above is.
+                kernels::routine::ParamF32(scale),
+                kernels::routine::Param(n),
+                kernels::routine::Param(k),
             )
         });
     }
@@ -944,9 +956,9 @@ unsafe fn int8_dequant_then_bf16(
         let ctx = crate::jit::Ctx::on(stream);
         crate::quant::dequant_int8_to_bf16_per_channel(
             &ctx,
-            w_int8.cast(),
-            bf16_w.cast(),
-            w_scale_inv.cast(),
+            kernels::routine::In { ptr: w_int8.cast(), rows: 0, width: 0 },
+            kernels::routine::Out { ptr: bf16_w.cast(), rows: 0, width: 0 },
+            kernels::routine::In { ptr: w_scale_inv.cast(), rows: 0, width: 0 },
             n,
             k,
         )
@@ -1031,9 +1043,9 @@ unsafe fn blockwise_w8a8(
         let ctx = crate::jit::Ctx::on(stream);
         crate::quant::quantize_bf16_to_fp8_e4m3_per_token_group(
             &ctx,
-            act.cast(),
-            act_fp8.cast(),
-            act_scale.cast(),
+            kernels::routine::In { ptr: act.cast(), rows: 0, width: 0 },
+            kernels::routine::Out { ptr: act_fp8.cast(), rows: 0, width: 0 },
+            kernels::routine::Out { ptr: act_scale.cast(), rows: 0, width: 0 },
             m,
             k,
             128,
@@ -1380,9 +1392,9 @@ unsafe fn int8_w_bf16_act(
         let ctx = crate::jit::Ctx::on(stream);
         crate::quant::quantize_bf16_to_int8_per_channel(
             &ctx,
-            act_bf16.cast(),
-            act_int8.cast(),
-            act_scale.cast(),
+            kernels::routine::In { ptr: act_bf16.cast(), rows: 0, width: 0 },
+            kernels::routine::Out { ptr: act_int8.cast(), rows: 0, width: 0 },
+            kernels::routine::Out { ptr: act_scale.cast(), rows: 0, width: 0 },
             m,
             k,
         )
@@ -1456,10 +1468,10 @@ unsafe fn int8_w_bf16_act(
             let ctx = crate::jit::Ctx::on(stream);
             crate::quant::dequant_int32_w8a8_to_bf16(
                 &ctx,
-                acc_int32.cast(),
-                act_scale.cast(),
-                w_scale_inv.cast(),
-                y_bf16.cast(),
+                kernels::routine::In { ptr: acc_int32.cast::<i32>().cast_const(), rows: 0, width: 0 },
+                kernels::routine::In { ptr: act_scale.cast::<f32>().cast_const(), rows: 0, width: 0 },
+                kernels::routine::In { ptr: w_scale_inv.cast(), rows: 0, width: 0 },
+                kernels::routine::Out { ptr: y_bf16.cast(), rows: 0, width: 0 },
                 m,
                 n,
             )
@@ -1471,10 +1483,10 @@ unsafe fn int8_w_bf16_act(
             let ctx = crate::jit::Ctx::on(stream);
             crate::quant::dequant_int32_w8a8_to_bf16(
                 &ctx,
-                acc_int32.cast(),
-                act_scale.cast(),
-                w_scale_inv.cast(),
-                dq_dst.cast(),
+                kernels::routine::In { ptr: acc_int32.cast::<i32>().cast_const(), rows: 0, width: 0 },
+                kernels::routine::In { ptr: act_scale.cast::<f32>().cast_const(), rows: 0, width: 0 },
+                kernels::routine::In { ptr: w_scale_inv.cast(), rows: 0, width: 0 },
+                kernels::routine::Out { ptr: dq_dst.cast(), rows: 0, width: 0 },
                 m,
                 n,
             )
@@ -1484,9 +1496,32 @@ unsafe fn int8_w_bf16_act(
         // crossed contract states none, so it refused `Geometry { Unstated }`
         // -- which `bind::jit::fire` reports only for `Unknown` and otherwise
         // swallows, making this a launch that silently did not happen.
+        //
+        // THE RECTANGLE THIS CALLER ALREADY HELD, HANDED OVER AS ONE THING.
+        // The call read `residual_add(&ctx, y_bf16.cast(), dq_dst.cast(),
+        // mn)`, where `mn` was `m * n` folded flat by this tuner and then
+        // unfolded by nobody: two loose extents travelling beside the
+        // pointers they describe, which is §1.3 exactly. `norm::residual_add`
+        // takes `Out<0, _>` and `In<1, _>` now and multiplies them back out
+        // itself (`norm.rs`'s `y.rows.saturating_mul(y.width)`), so the
+        // flattening happens once, at the callee, on numbers that arrived
+        // attached to the buffer.
+        //
+        // `mn` IS STILL COMPUTED AND STILL USED, four lines up, to size the
+        // scratch -- `ctx.dequant.ensure(mn * 2)` is a BYTE count and not an
+        // extent, which is why it did not travel into a region with the rest.
+        //
+        // The two regions are honest here in a way a hand-built region is not
+        // always: `m` and `n` are this function's own parameters, the same
+        // pair the dequant above was handed, and `dq_dst` was allocated from
+        // their product. Nothing is invented to fill a field.
         empty_or_panic("norm::residual_add_bf16", unsafe {
             let ctx = crate::jit::Ctx::on(stream);
-            crate::norm::residual_add::<bf16>(&ctx, y_bf16.cast(), dq_dst.cast(), mn)
+            crate::norm::residual_add::<bf16>(
+                &ctx,
+                Out { ptr: y_bf16.cast::<bf16>(), rows: m, width: n },
+                In { ptr: dq_dst.cast::<bf16>().cast_const(), rows: m, width: n },
+            )
         });
     }
 }
@@ -1682,11 +1717,11 @@ pub unsafe fn act_x_w(
             let ctx = crate::jit::Ctx::on(stream);
             crate::quant::dequant_mxfp4_to::<bf16>(
                 &ctx,
-                w.data.cast(),
-                w.scale_data.cast(),
-                bf16_w.cast(),
-                n,
-                k,
+                kernels::routine::In { ptr: w.data.cast(), rows: 0, width: 0 },
+                kernels::routine::In { ptr: w.scale_data.cast(), rows: 0, width: 0 },
+                kernels::routine::Out { ptr: bf16_w.cast(), rows: 0, width: 0 },
+                kernels::routine::Param(n),
+                kernels::routine::Param(k),
             )
         });
         unsafe { gemm_bf16(handle, act, bf16_w, y, m, n, k, beta) };
@@ -1720,6 +1755,20 @@ pub unsafe fn act_x_w(
 /// from. So `n` and `k` are ordinary `i32` parameters now, passed in the
 /// kernel's own order, and a swap is a type error at the two places where the
 /// types differ rather than a transposed grid at run time.
+// `rows: 0, width: 0` ON EVERY WRAPPER IN THIS FILE, AND IT IS A STATEMENT.
+//
+// These are HOST PROGRAMS: the arena fires them at load time, off a plan,
+// with no trace and no statement placing anything. Every one of them used to
+// spell `InSlot`/`OutSlot`, which carried an address and no extent at all --
+// so the launchers they call have never read one, and could not have.
+//
+// F1 says a layout is 1:1 with the address and never absent, and that what
+// looks like absence is *"a transport that dropped it"*. This is that
+// transport, named. A zero here is not a guess at the rectangle; it is the
+// record that this caller states none, and the moment one of these callees
+// asks -- `In::all` refuses a zero width -- the refusal will name the caller
+// that owes it, which is this file.
+
 fn empty_or_panic(symbol: &str, fired: Result<(), crate::Refusal>) {
     if let Err(why) = fired
         && !matches!(why, crate::Refusal::Empty { .. })

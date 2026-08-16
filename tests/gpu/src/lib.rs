@@ -11,7 +11,7 @@
 //! `cargo test --workspace` compiles them and runs none. Run one explicitly:
 //!
 //! ```text
-//! cargo test -p pie-gpu-tests --features driver-cuda \
+//! cargo test -p pie-gpu-tests --features driver-cuda-13 \
 //!     --test cuda_contention -- --ignored --nocapture
 //! ```
 //!

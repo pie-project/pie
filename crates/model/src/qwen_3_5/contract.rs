@@ -260,10 +260,111 @@ pub fn author_qwen3_5_mlx(b: &mut Builder<'_>) -> Result<(), Error> {
     let tied = b.shape().tied_embeddings && !has_lm_head;
     mlx::author_mlx_file(b, "Qwen3.5", &move |_, raw_name| {
         qwen3_5_mlx_name(raw_name, tied)
-    })
+    })?;
+    gdn_metal_operands(b)
+}
+
+/// The two gated-DeltaNet operands the Metal shaders read and the loop
+/// above cannot publish.
+///
+/// Both are disagreements between a checkpoint and a kernel, and neither
+/// side is wrong on its own terms:
+///
+///   * **`A_log` is `float`.** `gdn_core.metal` and `gdn_prep.metal`
+///     declare it `const device float*` where every other operand is
+///     `T` — the decay is `exp(-exp(A_log) * softplus(...))` and a bf16
+///     exponent of an exponent is not worth the two bytes.
+///     `mlx-community/Qwen3.6-35B-A3B-4bit` ships it BF16 `[32]`, so
+///     the contract casts. Reading a bf16 plane through a `float*` is
+///     the quiet kind of wrong: it binds, it dispatches, and every
+///     decay is a different number.
+///
+///   * **`conv1d` has no bias.** `Qwen3NextGatedDeltaNet` builds its
+///     depthwise convolution with `bias=False` and the checkpoint ships
+///     no such tensor, while the shader seeds its accumulator from
+///     `conv_b[c]` unconditionally. A zero plane is published rather
+///     than the kernel growing a branch, because the branch would be
+///     dead in every checkpoint that will ever reach it and the plane
+///     costs `conv_dim` bf16 per linear layer — 16 KiB a layer at this
+///     family's widest.
+///
+/// Rank-1 only, which is what `metal_kernel_refusal` already states:
+/// both are published at full width with no shard.
+fn gdn_metal_operands(b: &mut Builder<'_>) -> Result<(), Error> {
+    // Both names are built by asking the rename rule for the MODULE and
+    // appending the member, rather than by asking it for the tensor.
+    // `A_log` is skipped by that rule -- it has to be, or the loop above
+    // would publish a bf16 plane under the name this pass wants -- and
+    // the conv bias is not a tensor the rule has ever seen.
+    let module = |b: &Builder<'_>, name: &str, drop: &str| -> Result<String, Error> {
+        let base = &name[..name.len() - drop.len()];
+        match qwen3_5_mlx_name(base, false)? {
+            Some(m) => Ok(m),
+            None => mlx::fail(format!(
+                "Metal Qwen3.5 has no name for the module '{base}' holds, so \
+                 it cannot publish what the gated-DeltaNet shaders read \
+                 beside it (of {} decoder tensors)",
+                b.tensors().len()
+            )),
+        }
+    };
+    for raw in b.tensors().to_vec() {
+        if raw.name.ends_with(".linear_attn.A_log") {
+            let f32enc = Encoding::Raw(DType::F32);
+            let expr = if is_raw(&raw.encoding, DType::BF16) {
+                Expr::src(&raw.name).cast(f32enc.clone())
+            } else if is_raw(&raw.encoding, DType::F32) {
+                Expr::src(&raw.name)
+            } else {
+                return mlx::fail(format!(
+                    "Metal Qwen3.5 needs '{}' as bf16 or f32; the shader reads \
+                     it through a `float*`",
+                    raw.name
+                ));
+            };
+            let out = module(b, &raw.name, ".A_log")?;
+            b.define(
+                format!("{out}.A_log"),
+                expr,
+                f32enc,
+                Some(raw.shape.clone()),
+            );
+            b.consume(raw.id);
+        } else if raw.name.ends_with(".linear_attn.conv1d.weight") {
+            // `[conv_dim, K, 1]`, so the bias is one value per output
+            // channel: the first axis and nothing else.
+            let conv_dim = raw.shape.first().copied().unwrap_or_default();
+            if conv_dim <= 0 {
+                return mlx::fail(format!(
+                    "Metal Qwen3.5 read '{}' with no output channel count, so \
+                     it cannot state the width of the zero bias the \
+                     convolution kernel reads",
+                    raw.name
+                ));
+            }
+            let bf16 = Encoding::Raw(DType::BF16);
+            let out = module(b, &raw.name, ".conv1d.weight")?;
+            b.define(
+                format!("{out}.conv1d.bias"),
+                Expr::fill(
+                    0.0,
+                    model_loader::contract::TensorType::raw(vec![conv_dim], DType::BF16),
+                ),
+                bf16,
+                Some(vec![conv_dim]),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn qwen3_5_mlx_name(raw_name: &str, tied: bool) -> Result<Option<String>, Error> {
+    // The decay log, republished as f32 by `gdn_metal_operands` because
+    // the shader reads it through a `float*`. Skipped HERE so the direct
+    // loop does not claim the name first with the checkpoint's bf16.
+    if raw_name.ends_with(".linear_attn.A_log") {
+        return Ok(None);
+    }
     // Not the text decoder. The vision tower has the same two spellings as
     // the decoder does; `mtp.` is the multi-token-prediction head, which this
     // driver does not run.

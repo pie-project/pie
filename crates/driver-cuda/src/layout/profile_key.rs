@@ -1,32 +1,17 @@
 //! The planner profile cache's key: what makes two calibration runs
 //! comparable.
 //!
-//! Port of the key handling in
-//! `driver-cuda/csrc/src/store/planner_profile_cache.cpp`.
-//!
-//! The planner can spend real time sweeping a lattice, so the winning shape is
-//! written to `~/.cache` and looked up on later boots. The lookup is only
-//! sound if the key captures everything that would change the answer -- and
-//! only useful if it captures nothing that drifts between boots. This file is
-//! that boundary.
-//!
-//! What is deliberately **not** in the key is as load-bearing as what is:
-//! `budget_bytes` is recorded on the stored shape instead, because it is a
-//! continuous quantity that moves by a few MiB between boots and would turn
-//! every lookup into a miss. See [`ProfileShape::budget_bytes`].
-//!
-//! The file I/O, the `flock` over read-merge-rename, and the JSON document
-//! walking stay in the C++ for now. What is here is the part with decisions in
-//! it: the key's contents, its canonical serialisation, and the matching rule.
+//! The winning lattice shape is written to `~/.cache` and looked up on later
+//! boots; the key must capture everything that changes the answer and nothing
+//! that drifts. So `budget_bytes` is excluded — it moves a few MiB between
+//! boots — and lives on the stored shape ([`ProfileShape::budget_bytes`]).
 
 use std::fmt::Write as _;
 
 /// Bump whenever the meaning of a stored field changes.
 ///
 /// A document not carrying this exact version is refused rather than partially
-/// interpreted. Version 2 added `budget_bytes`; a version-1 entry cannot be
-/// read forward because its *absence* of a budget is indistinguishable from
-/// "any budget", which is precisely what the field exists to deny.
+/// interpreted.
 pub const SCHEMA_VERSION: i32 = 2;
 
 /// Everything that must match for a cached plan to apply.
@@ -71,26 +56,17 @@ pub struct ProfileShape {
     pub max_forward_requests: i32,
     /// The planner budget the sweep ran inside.
     ///
-    /// Not part of [`ProfileKey`]: it drifts by a few MiB between boots, and
-    /// keying on it would miss every time. It is recorded so a reader can
-    /// decide the entry no longer applies -- the key pins the device and the
-    /// model, and neither notices that the memory situation changed
-    /// underneath them. Two ways that happens and matter: another process
-    /// holding VRAM (which is how a contaminated GPU silently produced a
-    /// different plan once), and a checkpoint whose weights are a different
-    /// size, which `pie model build --quant fp8` makes an ordinary thing to
-    /// do without changing one field of the key.
+    /// Not part of [`ProfileKey`] (it drifts by a few MiB between boots and
+    /// would miss every time); recorded so a reader can decide the entry no
+    /// longer applies when VRAM pressure or a requantised checkpoint changes
+    /// the memory situation the key can't see.
     pub budget_bytes: u64,
 }
 
 /// A field as it was found in a stored document.
 ///
-/// The C++ compares through `nlohmann::json`, whose `is_string()` and
-/// `is_number_integer()` are type-strict: a `sm_count` stored as `"132"` does
-/// not match `132`, and one stored as `132.0` does not either, because
-/// `is_number_integer()` is false for a float. Modelling the stored side as
-/// this enum keeps that distinction visible rather than making it an artefact
-/// of whichever parser gets used later.
+/// Matching is JSON-type-strict: a `sm_count` stored as `"132"` or `132.0`
+/// does not match the integer `132`. This enum keeps that distinction visible.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StoredField {
     /// The field is absent from the document.
@@ -117,7 +93,7 @@ impl StoredField {
     }
 }
 
-/// The twelve key fields, in the order the C++ lists them.
+/// The twelve key fields.
 pub const KEY_FIELDS: [&str; 12] = [
     "gpu_name",
     "compute_major",
@@ -136,11 +112,8 @@ pub const KEY_FIELDS: [&str; 12] = [
 impl ProfileKey {
     /// Does a stored key object describe the same configuration?
     ///
-    /// `lookup` returns the field as stored, or [`StoredField::Missing`].
     /// Every field must be present, of the right JSON type, and equal; a
-    /// missing field is a mismatch rather than a wildcard, so a document
-    /// written by an older build cannot match on the subset it happens to
-    /// share.
+    /// missing field is a mismatch, not a wildcard.
     pub fn matches(&self, lookup: impl Fn(&str) -> StoredField) -> bool {
         lookup("gpu_name").matches_str(&self.gpu_name)
             && lookup("compute_major").matches_int(self.compute_major)
@@ -158,16 +131,9 @@ impl ProfileKey {
 
     /// The key as canonical JSON.
     ///
-    /// Keys are emitted in **alphabetical** order, not the declaration order
-    /// above. That is not a choice: `nlohmann::json`'s default object is a
-    /// `std::map`, so `dump()` sorts, and a document this crate writes has to
-    /// be readable by the C++ that may still write it.
-    ///
-    /// Serialised by hand rather than through `serde_json` on purpose. The
-    /// ordering guarantee would then depend on the `preserve_order` feature
-    /// being off, and Cargo unifies features across a build graph -- another
-    /// crate in this workspace enables it. A hand-written writer cannot be
-    /// reconfigured by a sibling crate's dependency choice.
+    /// Keys are emitted alphabetically, not in declaration order, to match
+    /// `nlohmann`'s sorted `std::map` output. Serialised by hand so the key
+    /// order can't be flipped by a sibling crate enabling `preserve_order`.
     #[must_use]
     pub fn to_json(&self) -> String {
         let mut o = String::with_capacity(256);
@@ -212,11 +178,8 @@ enum Field<'a> {
 
 /// Escape a string the way `nlohmann::json::dump()` does.
 ///
-/// The five short escapes, `\"`, `\\`, and `\u00XX` for every other control
-/// character. Notably it does **not** escape `/`, and it leaves non-ASCII
-/// UTF-8 as literal bytes rather than emitting `\u` pairs -- both are
-/// observable in the cache file, and a GPU name is a vendor string that this
-/// code does not get to constrain.
+/// Does not escape `/`, and leaves non-ASCII UTF-8 as literal bytes rather
+/// than `\u` pairs — both are observable in the cache file.
 fn write_json_string(o: &mut String, s: &str) {
     o.push('"');
     for c in s.chars() {
@@ -285,8 +248,6 @@ mod tests {
 
     #[test]
     fn every_field_is_load_bearing() {
-        // If any one of the twelve could be dropped without failing the
-        // match, the key would be admitting plans it should not.
         let k = key();
         for dropped in KEY_FIELDS {
             let base = exact(&k);
@@ -306,7 +267,6 @@ mod tests {
 
     #[test]
     fn a_number_stored_as_a_string_does_not_match() {
-        // nlohmann's is_number_integer() is type-strict, so "132" != 132.
         let k = key();
         let base = exact(&k);
         let lookup = |n: &str| {
@@ -365,8 +325,6 @@ mod tests {
 
     #[test]
     fn json_keys_come_out_alphabetically_not_in_declaration_order() {
-        // Forced by nlohmann's std::map-backed object; a document this crate
-        // writes has to be readable by the C++ that may still write it.
         let json = key().to_json();
         let mut expected = KEY_FIELDS;
         expected.sort_unstable();
@@ -403,8 +361,6 @@ mod tests {
 
     #[test]
     fn a_forward_slash_is_not_escaped_and_utf8_stays_literal() {
-        // Both are nlohmann's behaviour, and a vendor GPU string is not
-        // something this code gets to constrain.
         let k = ProfileKey {
             gpu_name: "a/b".into(),
             model_type: "日本".into(),

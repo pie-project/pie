@@ -1,47 +1,40 @@
+//! The `layout` family: the reshaping kernels a fire needs around its matmuls
+//! — row splits, gathers, embeds, transposes and the KV envelope updates.
+//!
+//! Most entries are `routine!`-declared, so a statement places their operands
+//! and the derived column binds them. The four envelope roots are the
+//! exception: the driver composes their operands while building a wave, so
+//! their host programs live in `crate::driver_internal`.
 #![allow(clippy::too_many_arguments)]
 
 use crate::jit::{Ctx, Family, Launch, Routine, aligned16};
-// `driver_bound!` names its `fn` by IDENTIFIER, exactly as `routine!` does, so
-// the one host program declared here that does not live in this file has to be
-// nameable without its path.
+// The one host program declared elsewhere still needs a bare identifier here.
 use crate::driver_internal::split_q_gate_bf16;
-use crate::{driver_bound, routine};
+use crate::routine;
 use crate::jit::Abi;
-use crate::jit::abi::Elem;
+use crate::jit::abi::Inst;
 use crate::jit::abi::bf16;
+use kernels::Env;
 use kernels::Refusal;
+use kernels::Region;
+// `keys` is imported as the module, not the facts inside it: `stated_source`
+// only emits a source when the path's second-to-last segment is `keys`, so
+// `use kernels::keys::Vocab;` would silently derive `None`.
+use kernels::keys;
+use kernels::{In, Out, Unbound, Weight};
 
-// ===========================================================================
-// The four roots whose launchers are the DRIVER's
-//
-// Each of the four `.cuh` files below was orphaned in the same way: the `.cu`
-// beside it in the archive crate held the only `<<<>>>` that named its
-// kernels, that file was deleted, and nothing in THIS crate had ever named
-// its text. `src/source.rs` lists every file under `kernels/` regardless, so the six
-// kernels stayed in the binary as text no compile could arrive at, which is
-// what `every_carried_file_is_reachable` reported. A root is what answers it,
-// and `every_instantiation_compiles` is what then hands each of the six to
-// NVRTC.
-//
-// None of the four gets a `routine!` line, and that is not an omission. A
-// routine is a symbol a TRACE may name, and each of these files says in its own
-// header why no statement can name its kernels: the operands are composed by
-// the driver while it builds a wave, not produced by a `Source`. So the host
-// programs are `crate::driver_internal`'s, which is the module for exactly this
-// -- and `deinterleave::inst`'s `split_q_gate` was already the shape, one
-// kernel of a family root fired only from there.
-// ===========================================================================
+// The four roots below get no `routine!` line — the driver composes their
+// operands while building a wave, not a statement. They still exist so
+// `every_carried_file_is_reachable` and `every_instantiation_compiles` find
+// the kernel text and hand it to NVRTC.
 
-/// `runtime/launch.rs:578` — `const BLOCK: u32 = 256;`.
 const BLOCK: u32 = 256;
 
-/// `runtime/launch.rs:584` — `const WARP: u32 = 32;`.
 const WARP: u32 = 32;
 
 /// `LaunchRule::RouteRows`, as the expression it evaluates to.
 #[must_use]
 fn route_rows(rows: i32, width: i32) -> Launch {
-    /// `runtime/launch.rs:581` — `const MAX_BLOCK: u32 = 1024;`, the cap
     const MAX_BLOCK: u32 = 1024;
 
     Launch::per_row(
@@ -56,30 +49,61 @@ const fn elementwise(n: u32) -> Launch {
     Launch::flat(n, BLOCK)
 }
 
+/// A whole-region view, refused in this file's variant.
+///
+/// [`In::all`] and [`Out::all`] refuse a zero-width region as
+/// [`Refusal::Absent`]; every guard in this file instead wants
+/// [`Refusal::Empty`], since a region's zero width means a statement declared
+/// none, not that the fire dropped an argument.
+///
+/// # Errors
+///
+/// Whatever `view` holds, with [`Refusal::Absent`] rewritten to
+/// [`Refusal::Empty`] over the same word.
+pub(crate) fn stated<P>(view: Result<Region<P>, Refusal>) -> Result<Region<P>, Refusal> {
+    match view {
+        Err(refusal) => Err(this_family(refusal)),
+        ok => ok,
+    }
+}
+
+/// [`Refusal::Absent`] said in this file's variant; everything else verbatim.
+#[must_use]
+const fn this_family(refusal: Refusal) -> Refusal {
+    match refusal {
+        Refusal::Absent { what } => Refusal::Empty { what },
+        said => said,
+    }
+}
+
 /// `layout::split_bf16_rows` — one packed row out to two.
 ///
 /// # Safety
 ///
-/// `src` must address `n * (left_dim + right_dim)` live bf16 elements, `left`
-/// and `right` `n * left_dim` and `n * right_dim` writable ones, and `ctx`'s
-/// stream must be live across the launch.
+/// `src` addresses `n * (left_dim + right_dim)` live bf16 elements; `left`
+/// and `right` `n * left_dim`/`n * right_dim` writable ones.
+#[kernels_macros::routine]
 pub fn split_bf16_rows(
     ctx: &Ctx,
-    src: *const bf16,
-    left: *mut bf16,
-    right: *mut bf16,
-    n: i32,
-    left_dim: i32,
-    right_dim: i32,
+    src: In<0, bf16>,
+    left: Out<0, bf16>,
+    right: Out<1, bf16>,
 ) -> Result<(), Refusal> {
-    // SAFETY: `call()`'s contract -- every pointer bound here addresses live
-    // device memory of the extent the kernel reads it as.
+    // Views come from the results, not `src`; `all()` also catches a
+    // zero-width half that `route_rows`'s `.max(1)` would otherwise hide.
+    let left_half = stated(left.all("left_dim or right_dim"))?;
+    let right_half = stated(right.all("left_dim or right_dim"))?;
+    let n = left_half.rows;
+    // Row pitches, not element counts; `.0` reads one back as a plain `i32`.
+    let left_dim = left_half.stride;
+    let right_dim = right_half.stride;
+    // SAFETY: every pointer is live for the extent the kernel reads it as.
     unsafe {
         ctx.launch(
             "layout/deinterleave.cuh",
             "::pie::layout::split_rows<::pie::bf16>",
-            route_rows(n, left_dim),
-            &[src.arg(), left.arg(), right.arg(), left_dim.arg(), right_dim.arg()],
+            route_rows(n, left_dim.0),
+            &[src.ptr.arg(), left.ptr.arg(), right.ptr.arg(), left_dim.arg(), right_dim.arg()],
         )
     }
 }
@@ -88,30 +112,32 @@ pub fn split_bf16_rows(
 ///
 /// # Safety
 ///
-/// `ba` must address `n * 2 * v_h` live bf16 elements, `b_out` and `a_out`
-/// `n * v_h` writable ones each, and `ctx`'s stream must be live across the
-/// launch.
+/// `ba` addresses `n * 2 * v_h` live bf16 elements; `b_out`/`a_out`
+/// `n * v_h` writable ones each.
+#[kernels_macros::routine]
 pub fn split_qwen_gdn_ba<T>(
     ctx: &Ctx,
-    ba: *const T,
-    b_out: *mut T,
-    a_out: *mut T,
-    n: i32,
-    v_h: i32,
+    ba: In<0, T>,
+    b_out: Out<0, T>,
+    a_out: Out<1, T>,
 ) -> Result<(), Refusal>
 where
-    T: Elem,
+    T: Inst + kernels::Elem,
     *const T: Abi,
     *mut T: Abi,
 {
-    // SAFETY: `call()`'s contract -- every pointer bound here addresses live
-    // device memory of the extent the kernel reads it as.
+    // One view, off result 0, serves both halves: the kernel strides each by
+    // the same `v_h` pitch.
+    let half = stated(b_out.all("v_h"))?;
+    let n = half.rows;
+    let v_h = half.stride;
+    // SAFETY: every pointer is live for the extent the kernel reads it as.
     unsafe {
         ctx.launch(
             "layout/deinterleave.cuh",
             &format!("::pie::layout::split_qwen_gdn_ba<{}>", T::CPP),
-            route_rows(n, v_h),
-            &[ba.arg(), b_out.arg(), a_out.arg(), v_h.arg()],
+            route_rows(n, v_h.0),
+            &[ba.ptr.arg(), b_out.ptr.arg(), a_out.ptr.arg(), v_h.arg()],
         )
     }
 }
@@ -120,30 +146,32 @@ where
 ///
 /// # Safety
 ///
-/// `fused` must address `2 * rows * h` live bf16 elements, `gate_out` and
-/// `up_out` `rows * h` writable ones each, and `ctx`'s stream must be live
-/// across the launch.
+/// `fused` addresses `2 * rows * h` live bf16 elements; `gate_out`/`up_out`
+/// `rows * h` writable ones each.
+#[kernels_macros::routine]
 pub fn deinterleave_rows<T>(
     ctx: &Ctx,
-    fused: *const T,
-    gate_out: *mut T,
-    up_out: *mut T,
-    rows: i32,
-    h: i32,
+    fused: In<0, T>,
+    gate_out: Out<0, T>,
+    up_out: Out<1, T>,
 ) -> Result<(), Refusal>
 where
-    T: Elem,
+    T: Inst + kernels::Elem,
     *const T: Abi,
     *mut T: Abi,
 {
-    // SAFETY: `call()`'s contract -- every pointer bound here addresses live
-    // device memory of the extent the kernel reads it as.
+    // Unstated: shapes come off `gate_out` itself — `h` its row pitch,
+    // `rows` its row count.
+    let gate = stated(gate_out.all("h"))?;
+    let rows = gate.rows;
+    let h = gate.stride;
+    // SAFETY: every pointer is live for the extent the kernel reads it as.
     unsafe {
         ctx.launch(
             "layout/deinterleave.cuh",
             &format!("::pie::layout::deinterleave_rows<{}>", T::CPP),
-            route_rows(rows, h),
-            &[fused.arg(), gate_out.arg(), up_out.arg(), h.arg()],
+            route_rows(rows, h.0),
+            &[fused.ptr.arg(), gate_out.ptr.arg(), up_out.ptr.arg(), h.arg()],
         )
     }
 }
@@ -152,28 +180,34 @@ where
 ///
 /// # Safety
 ///
-/// `fused` must address `2 * i` live bf16 elements and `gate_out`/`up_out`
-/// `i` writable ones each; `ctx`'s stream must be live across the launch.
+/// `fused` addresses `2 * i` live bf16 elements; `gate_out`/`up_out` `i`
+/// writable ones each.
+#[kernels_macros::routine]
 pub fn deinterleave_vec<T>(
     ctx: &Ctx,
-    fused: *const T,
-    gate_out: *mut T,
-    up_out: *mut T,
-    i: i32,
+    fused: In<0, T>,
+    gate_out: Out<0, T>,
+    up_out: Out<1, T>,
 ) -> Result<(), Refusal>
 where
-    T: Elem,
+    T: Inst + kernels::Elem,
     *const T: Abi,
     *mut T: Abi,
 {
-    // SAFETY: `call()`'s contract -- every pointer bound here addresses live
-    // device memory of the extent the kernel reads it as.
+    // `i` is `rows * width`, saturating (`Region::elements`). `all()` catches
+    // a zero width; this catches a zero row count.
+    let gate = stated(gate_out.all("i"))?;
+    let i = gate.elements();
+    if i <= 0 {
+        return Err(Refusal::Empty { what: "i" });
+    }
+    // SAFETY: every pointer is live for the extent the kernel reads it as.
     unsafe {
         ctx.launch(
             "layout/deinterleave.cuh",
             &format!("::pie::layout::deinterleave_vec<{}>", T::CPP),
             elementwise(i.unsigned_abs()),
-            &[fused.arg(), gate_out.arg(), up_out.arg(), i.arg()],
+            &[fused.ptr.arg(), gate_out.ptr.arg(), up_out.ptr.arg(), i.arg()],
         )
     }
 }
@@ -182,29 +216,29 @@ where
 ///
 /// # Safety
 ///
-/// `left` and `right` must address `rows * left_dim` and `rows * right_dim`
-/// live bf16 elements, `out` `rows * (left_dim + right_dim)` writable ones,
-/// and `ctx`'s stream must be live across the launch.
+/// `left`/`right` address `rows * left_dim`/`rows * right_dim` live bf16
+/// elements; `out` `rows * (left_dim + right_dim)` writable ones.
+#[kernels_macros::routine]
 pub fn concat_bf16_rows(
     ctx: &Ctx,
-    left: *const bf16,
-    right: *const bf16,
-    out: *mut bf16,
-    rows: i32,
-    left_dim: i32,
-    right_dim: i32,
+    left: In<0, bf16>,
+    right: In<1, bf16>,
+    out: Out<0, bf16>,
 ) -> Result<(), Refusal> {
-    if left_dim + right_dim <= 0 {
-        return Err(Refusal::Empty { what: "left_dim + right_dim" });
-    }
-    // SAFETY: `call()`'s contract -- every pointer bound here addresses live
-    // device memory of the extent the kernel reads it as.
+    // Each operand needs its own view: one guard on the summed width would
+    // miss a zero-width half (`0 + 512` is still a nonzero 512).
+    let left_half = stated(left.all("left_dim or right_dim"))?;
+    let right_half = stated(right.all("left_dim or right_dim"))?;
+    let rows = out.rows;
+    let left_dim = left_half.stride;
+    let right_dim = right_half.stride;
+    // SAFETY: every pointer is live for the extent the kernel reads it as.
     unsafe {
         ctx.launch(
             "layout/deinterleave.cuh",
             "::pie::layout::concat_rows<::pie::bf16>",
-            route_rows(rows, left_dim),
-            &[left.arg(), right.arg(), out.arg(), left_dim.arg(), right_dim.arg()],
+            route_rows(rows, left_dim.0),
+            &[left.ptr.arg(), right.ptr.arg(), out.ptr.arg(), left_dim.arg(), right_dim.arg()],
         )
     }
 }
@@ -213,55 +247,84 @@ pub fn concat_bf16_rows(
 ///
 /// # Safety
 ///
-/// `src` must address the rows `row_indices` names at `width` u16 elements
-/// each, `row_indices` `num_dst_rows` live `i32`s, `dst` `num_dst_rows *
-/// width` writable u16 elements, and `ctx`'s stream must be live across the
-/// launch.
+/// `src` addresses the rows `row_indices` names at `width` u16 elements
+/// each; `row_indices` `num_dst_rows` live `i32`s; `dst` `num_dst_rows *
+/// width` writable u16 elements.
+#[kernels_macros::routine]
 pub fn gather_bf16_rows(
     ctx: &Ctx,
-    src: *const u16,
-    row_indices: *const i32,
-    dst: *mut u16,
-    num_dst_rows: i32,
-    width: i32,
+    src: In<0, u16>,
+    // Environmental — the fire supplies this, not a statement, hence `Env`.
+    row_indices: Env<keys::SamplingIndices>,
+    dst: Out<0, u16>,
 ) -> Result<(), Refusal> {
-    // SAFETY: `call()`'s contract -- every pointer bound here addresses live
-    // device memory of the extent the kernel reads it as.
+    // `dst` is the dense side, so its view supplies rows and width; `src`
+    // has neither since `row_indices` indexes it. The width is a pitch
+    // shared by both, advancing a source row and a destination slot alike.
+    let dense = stated(dst.all("width"))?;
+    let num_dst_rows = dense.rows;
+    let width = dense.stride;
+    // SAFETY: every pointer is live for the extent the kernel reads it as.
     unsafe {
         ctx.launch(
             "layout/gather_rows.cuh",
             "::pie::layout::gather_rows<::pie::u16>",
-            route_rows(num_dst_rows, width),
-            &[src.arg(), row_indices.arg(), dst.arg(), width.arg()],
+            route_rows(num_dst_rows, width.0),
+            &[src.ptr.arg(), row_indices.arg(), dst.ptr.arg(), width.arg()],
         )
     }
 }
 
 /// `layout::transpose_bf16_nld_to_lnd` — the PLE relay.
 ///
+/// A row that is not a whole number of PLE planes is refused rather than
+/// truncated, which would silently transpose fewer planes than placed.
+///
+/// # Errors
+///
+/// [`Refusal::Empty`] if `dim` is zero or negative, and [`Refusal::Narrow`]
+/// if `width` is not a whole number of `dim`-wide planes.
+///
 /// # Safety
 ///
-/// `src` and `dst` must address `n * layers * dim` live u16 elements, `dst`
-/// writable, and `ctx`'s stream must be live across the launch.
+/// `src`/`dst` address `n * width` live u16 elements, `dst` writable.
+#[kernels_macros::routine]
 pub fn transpose_bf16_nld_to_lnd(
     ctx: &Ctx,
-    src: *const u16,
-    dst: *mut u16,
-    n: i32,
-    layers: i32,
-    dim: i32,
+    src: In<0, u16>,
+    dst: Out<0, u16>,
+    // Neither operand carries this: `width` is `layers * dim`, and the
+    // factor split isn't in the rectangle — so `dim` is a checkpoint fact.
+    dim: Env<keys::PleDim>,
 ) -> Result<(), Refusal> {
+    // Off `src`, not `dst`: this transposes, so `dst` is the same elements
+    // reordered. `.width`, not `.stride` — no pitch reaches this kernel,
+    // which rebuilds addresses from `n`, `layers` and `dim`.
+    let source = stated(src.all("width"))?;
+    let n = source.rows;
+    let width = source.width;
+    // `**dim`: comparison, `%`, `/` and `try_from` don't deref through the
+    // wrapper the way a method call does.
+    if **dim <= 0 {
+        return Err(Refusal::Empty { what: "ple_dim" });
+    }
+    if width % **dim != 0 {
+        return Err(Refusal::Narrow {
+            what: "the row is not a whole number of PLE planes",
+            at: i64::from(width),
+        });
+    }
+    let layers = width / **dim;
     let total = usize::try_from(n).unwrap_or(0)
         * usize::try_from(layers).unwrap_or(0)
-        * usize::try_from(dim).unwrap_or(0);
-    // SAFETY: `call()`'s contract -- every pointer bound here addresses live
-    // device memory of the extent the kernel reads it as.
+        * usize::try_from(**dim).unwrap_or(0);
+    // SAFETY: every pointer is live for the extent the kernel reads it as.
     unsafe {
         ctx.launch(
             "layout/gather_rows.cuh",
             "::pie::layout::transpose_nld_to_lnd<::pie::u16>",
             elementwise(u32::try_from(total).unwrap_or(u32::MAX)),
-            &[src.arg(), dst.arg(), n.arg(), layers.arg(), dim.arg(), total.arg()],
+            &[src.ptr.arg(), dst.ptr.arg(), n.arg(), layers.arg(), dim.arg(), total.arg()],
         )
     }
 }
@@ -270,30 +333,32 @@ pub fn transpose_bf16_nld_to_lnd(
 ///
 /// # Safety
 ///
-/// `src` and `dst` must address `bytes` live bytes, `dst` writable,
-/// `slot_ids` must be indexable at `request`, and `ctx`'s stream must be live
-/// across the launch.
+/// `src`/`dst` address `bytes` live bytes, `dst` writable, `slot_ids`
+/// indexable at `request`.
+#[kernels_macros::routine]
 pub fn copy_if_valid_slot(
     ctx: &Ctx,
-    src: *const u8,
-    dst: *mut u8,
+    // The pointers state their slots; the scalars below don't.
+    src: In<0, u8>,
+    dst: Out<0, u8>,
+    // `bytes`/`request` are both unbound, bare `usize`s — swapping them
+    // compiles cleanly. `bytes` is a byte count, not an element count.
     bytes: usize,
-    slot_ids: *const i32,
+    // The index is stated (`In<1, _>`), not left to counting position.
+    slot_ids: In<1, i32>,
     request: usize,
 ) -> Result<(), Refusal> {
-    // SAFETY: `call()`'s contract -- every pointer bound here addresses live
-    // device memory of the extent the kernel reads it as.
+    // SAFETY: every pointer is live for the extent the kernel reads it as.
     unsafe {
         ctx.launch(
             "layout/slot_ops.cuh",
             "::pie::layout::copy_if_valid_slot",
             Launch::grid([1, 1, 1], [256, 1, 1]),
-            &[src.arg(), dst.arg(), bytes.arg(), slot_ids.arg(), request.arg()],
+            &[src.ptr.arg(), dst.ptr.arg(), bytes.arg(), slot_ids.ptr.arg(), request.arg()],
         )
     }
 }
 
-/// `envelope.cu:37` and `:134` — `head_dim < 256 ? head_dim : 256`.
 const fn threads_for(head_dim: i32) -> u32 {
     if head_dim < 256 { head_dim.unsigned_abs() } else { 256 }
 }
@@ -302,21 +367,26 @@ const fn threads_for(head_dim: i32) -> u32 {
 ///
 /// # Safety
 ///
-/// Every pointer is a device address the caller keeps live across the launch,
-/// and `ctx`'s stream is held live for the same window.
+/// Every pointer is a device address the caller keeps live, with `ctx`'s
+/// stream live across the launch.
+#[kernels_macros::routine]
 pub fn envelope_merge_written(
     ctx: &Ctx,
-    k_curr: *const bf16,
-    w_page: *const u32,
-    w_off: *const u32,
-    row_valid: crate::jit::abi::MaybeConst<u8>,
-    env_min: *mut bf16,
-    env_max: *mut bf16,
+    // Unbound throughout: fired by path (`bind/abi.rs`, `attn/mod.rs`), not a
+    // statement, so `In`/`Out` would be the wrong kind — a path-fired launch
+    // has no `Facts`, even for the five pointers matching a `keys::` entry.
+    k_curr: Unbound<*const bf16>,
+    w_page: Unbound<*const u32>,
+    w_off: Unbound<*const u32>,
+    row_valid: Unbound<crate::jit::abi::MaybeConst<u8>>,
+    env_min: Unbound<*mut bf16>,
+    env_max: Unbound<*mut bf16>,
+    // Same reason: no statement means no result to ask a width from and no
+    // fire to count rows on.
     num_tokens: i32,
     num_kv_heads: i32,
     head_dim: i32,
 ) -> Result<(), Refusal> {
-    /// `envelope.cuh:374`, `kEnvelopeFuseMaxTokens`.
     const FUSE_MAX_TOKENS: i32 = 128;
 
     let launch = Launch::grid(
@@ -325,20 +395,19 @@ pub fn envelope_merge_written(
     );
 
     if num_tokens <= FUSE_MAX_TOKENS {
-        // SAFETY: `call()`'s contract -- every pointer bound here addresses
-        // live device memory of the extent the kernel reads it as.
+        // SAFETY: every pointer is live for the extent the kernel reads it as.
         return unsafe {
             ctx.launch(
                 "layout/envelope.cuh",
                 "::pie::layout::merge_written_fused<::pie::i32(0)>",
                 launch,
                 &[
-                    k_curr.arg(),
-                    w_page.arg(),
-                    w_off.arg(),
-                    row_valid.arg(),
-                    env_min.arg(),
-                    env_max.arg(),
+                    k_curr.ptr.arg(),
+                    w_page.ptr.arg(),
+                    w_off.ptr.arg(),
+                    row_valid.ptr.arg(),
+                    env_min.ptr.arg(),
+                    env_max.ptr.arg(),
                     num_tokens.arg(),
                     num_kv_heads.arg(),
                     head_dim.arg(),
@@ -347,23 +416,20 @@ pub fn envelope_merge_written(
         };
     }
 
-    // Past the fuse threshold the step is TWO launches, in this order: the
-    // reset writes the identity into every page this batch STARTS, and a
-    // merge that ran first would have its folds overwritten.
-    //
-    // SAFETY: `call()`'s contract -- every pointer bound here addresses live
-    // device memory of the extent the kernel reads it as.
+    // Two launches, in order: the reset seeds every page this batch starts,
+    // or a merge running first would have its folds overwritten.
+    // SAFETY: every pointer is live for the extent the kernel reads it as.
     unsafe {
         ctx.launch(
             "layout/envelope.cuh",
             "::pie::layout::reset_started_pages<::pie::i32(0)>",
             launch,
             &[
-                w_page.arg(),
-                w_off.arg(),
-                row_valid.arg(),
-                env_min.arg(),
-                env_max.arg(),
+                w_page.ptr.arg(),
+                w_off.ptr.arg(),
+                row_valid.ptr.arg(),
+                env_min.ptr.arg(),
+                env_max.ptr.arg(),
                 num_tokens.arg(),
                 num_kv_heads.arg(),
                 head_dim.arg(),
@@ -374,11 +440,11 @@ pub fn envelope_merge_written(
             "::pie::layout::merge_written<::pie::i32(0)>",
             launch,
             &[
-                k_curr.arg(),
-                w_page.arg(),
-                row_valid.arg(),
-                env_min.arg(),
-                env_max.arg(),
+                k_curr.ptr.arg(),
+                w_page.ptr.arg(),
+                row_valid.ptr.arg(),
+                env_min.ptr.arg(),
+                env_max.ptr.arg(),
                 num_tokens.arg(),
                 num_kv_heads.arg(),
                 head_dim.arg(),
@@ -391,17 +457,19 @@ pub fn envelope_merge_written(
 ///
 /// # Safety
 ///
-/// Both planes are device addresses the caller keeps live across the launch,
-/// and `ctx`'s stream is held live for the same window.
+/// Both planes are device addresses the caller keeps live, with `ctx`'s
+/// stream live across the launch.
+#[kernels_macros::routine]
 pub fn envelope_seed_empty(
     ctx: &Ctx,
-    env_min: *mut bf16,
-    env_max: *mut bf16,
+    // The pool's planes — see `envelope_merge_written`'s standing note. This
+    // fires once at pool construction, before any fire exists.
+    env_min: Unbound<*mut bf16>,
+    env_max: Unbound<*mut bf16>,
     num_pages: i32,
     num_kv_heads: i32,
     head_dim: i32,
 ) -> Result<(), Refusal> {
-    /// `envelope.cu:71` — the seed's own block, which is fixed rather than
     const SEED_BLOCK: u32 = 256;
 
     let n = usize::try_from(num_pages).unwrap_or(0)
@@ -409,14 +477,14 @@ pub fn envelope_seed_empty(
         * usize::try_from(head_dim).unwrap_or(0);
     let blocks = n.div_ceil(SEED_BLOCK as usize);
 
-    // SAFETY: `call()`'s contract -- every pointer bound here addresses live
-    // device memory of the extent the kernel reads it as.
+    // SAFETY: every pointer is live device memory of the extent the kernel
+    // reads it as.
     unsafe {
         ctx.launch(
             "layout/envelope.cuh",
             "::pie::layout::seed_empty<::pie::i32(0)>",
             Launch::grid([u32::try_from(blocks).unwrap_or(u32::MAX), 1, 1], [SEED_BLOCK, 1, 1]),
-            &[env_min.arg(), env_max.arg(), n.arg()],
+            &[env_min.ptr.arg(), env_max.ptr.arg(), n.arg()],
         )
     }
 }
@@ -427,23 +495,27 @@ pub fn envelope_seed_empty(
 ///
 /// Every pointer is a device address the caller keeps live across the launch,
 /// and `ctx`'s stream is held live for the same window.
+#[kernels_macros::routine]
 pub fn envelope_update_appended(
     ctx: &Ctx,
-    k_pages: *const bf16,
-    qo_indptr: *const u32,
-    kv_page_indices: *const u32,
-    kv_page_indptr: *const u32,
-    kv_last_page_lens: *const u32,
-    env_min: *mut bf16,
-    env_max: *mut bf16,
+    // Same standing note as `envelope_merge_written`. `k_pages` is `*const
+    // bf16` where `keys::KvKeys` is `*mut u8` — same key, but this parameter
+    // has already picked an element type the fact deliberately leaves open.
+    k_pages: Unbound<*const bf16>,
+    qo_indptr: Unbound<*const u32>,
+    kv_page_indices: Unbound<*const u32>,
+    kv_page_indptr: Unbound<*const u32>,
+    kv_last_page_lens: Unbound<*const u32>,
+    env_min: Unbound<*mut bf16>,
+    env_max: Unbound<*mut bf16>,
     num_requests: i32,
     max_touched: i32,
     page_size: i32,
     num_kv_heads: i32,
     head_dim: i32,
 ) -> Result<(), Refusal> {
-    // SAFETY: `call()`'s contract -- every pointer bound here addresses live
-    // device memory of the extent the kernel reads it as.
+    // SAFETY: every pointer is live device memory of the extent the kernel
+    // reads it as.
     unsafe {
         ctx.launch(
             "layout/envelope.cuh",
@@ -453,13 +525,13 @@ pub fn envelope_update_appended(
                 [threads_for(head_dim), 1, 1],
             ),
             &[
-                k_pages.arg(),
-                qo_indptr.arg(),
-                kv_page_indices.arg(),
-                kv_page_indptr.arg(),
-                kv_last_page_lens.arg(),
-                env_min.arg(),
-                env_max.arg(),
+                k_pages.ptr.arg(),
+                qo_indptr.ptr.arg(),
+                kv_page_indices.ptr.arg(),
+                kv_page_indptr.ptr.arg(),
+                kv_last_page_lens.ptr.arg(),
+                env_min.ptr.arg(),
+                env_max.ptr.arg(),
                 num_requests.arg(),
                 page_size.arg(),
                 num_kv_heads.arg(),
@@ -469,10 +541,9 @@ pub fn envelope_update_appended(
     }
 }
 
-/// `embed.cu:35` — the vector width, in `bf16` elements.
 const VEC_WIDTH: i32 = 8;
 
-/// `embed.cu:33-35` — the host test that picks `VEC`.
+/// Host-side mirror of `embed.cu`'s vectorised-path test.
 #[must_use]
 pub fn vectorisable(hidden: i32, weight: *const bf16, y: *const bf16) -> bool {
     hidden % VEC_WIDTH == 0 && aligned16(weight.cast()) && aligned16(y.cast())
@@ -485,27 +556,35 @@ pub fn vectorisable(hidden: i32, weight: *const bf16, y: *const bf16) -> bool {
 /// `token_ids` must address `num_tokens` live `i32`s, `weight` `vocab *
 /// hidden` live bf16 elements, `y` `num_tokens * hidden` writable ones, and
 /// `ctx`'s stream must be live across the launch.
+#[kernels_macros::routine]
 pub fn embed_bf16(
     ctx: &Ctx,
-    token_ids: *const i32,
-    weight: *const bf16,
-    y: *mut bf16,
-    num_tokens: i32,
-    hidden: i32,
-    vocab: i32,
+    // `Env<keys::TokenIds>`, not `Env<*const i32>`: both derive the same
+    // source, but only the key survives a parameter rename.
+    token_ids: Env<keys::TokenIds>,
+    weight: Weight<0, *const bf16>,
+    y: Out<0, bf16>,
+    // `vocab` is the named weight's vocabulary, not a region's shape — no
+    // operand in this signature carries it.
+    vocab: Env<keys::Vocab>,
 ) -> Result<(), Refusal> {
-    /// `embed.cu:31` — `constexpr int BLOCK = 256;`.
     const EMBED_BLOCK: u32 = 256;
 
-    let vec = vectorisable(hidden, weight, y.cast_const());
-    let per_row = if vec { hidden / VEC_WIDTH } else { hidden };
+    let dst = stated(y.all("hidden"))?;
+    let num_tokens = dst.rows;
+    // A pitch, not a plain extent: the kernel strides both the weight and
+    // `y` by it, and the vectorised path also divides by it via `.0`.
+    let hidden = dst.stride;
+
+    let vec = vectorisable(hidden.0, weight.ptr, dst.ptr.cast_const());
+    let per_row = if vec { hidden.0 / VEC_WIDTH } else { hidden.0 };
     let total = i64::from(num_tokens) * i64::from(per_row);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let blocks = ((total + i64::from(EMBED_BLOCK) - 1) / i64::from(EMBED_BLOCK)) as u32;
     let instantiation = if vec { "::pie::layout::embed<\
                                       ::pie::true_type::value>" } else { "::pie::layout::embed<::pie::false_type::value>" };
-    // SAFETY: `call()`'s contract -- every pointer bound here addresses live
-    // device memory of the extent the kernel reads it as.
+    // SAFETY: every pointer is live device memory of the extent the kernel
+    // reads it as.
     unsafe {
         ctx.launch(
             "layout/embed.cuh",
@@ -513,8 +592,8 @@ pub fn embed_bf16(
             Launch::grid([blocks, 1, 1], [EMBED_BLOCK, 1, 1]),
             &[
                 token_ids.arg(),
-                weight.arg(),
-                y.arg(),
+                weight.ptr.arg(),
+                dst.ptr.arg(),
                 hidden.arg(),
                 vocab.arg(),
                 num_tokens.arg(),
@@ -524,42 +603,189 @@ pub fn embed_bf16(
     }
 }
 
+// `#[routine]` derives the argument column from the signature alone, and a
+// weight and an input are both `const T*` — indistinguishable by counting.
+// The wrappers state what counting can't: `Env<keys::_>` for a fact,
+// `Weight<n, _>` for a named tensor, `In`/`Out`/`InSlot`/`OutSlot` for an
+// operand, `Unbound` for a parameter no statement places.
+//
+// A source pin alone is blind to a permutation: swapping two same-variant
+// parameters passes every indexed assert below. `derived_name_is` closes
+// that gap with a byte loop, since `str` can't yet be compared in a const on
+// stable (rust-lang/rust#143874).
+pub(crate) const fn derived_name_is(actual: &str, expected: &str) -> bool {
+    let (a, b) = (actual.as_bytes(), expected.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+const _: () = {
+    // Entries 0 and 1 are what the macro gets wrong from the signature
+    // alone.
+    assert!(<embed_bf16 as ::kernels::Derivation>::DERIVED.len() == 4);
+    assert!(kernels::source_is_named(&<embed_bf16 as ::kernels::Derivation>::DERIVED[0].source, <kernels::keys::TokenIds as kernels::keys::Fact>::KEY));
+    assert!(kernels::source_is_named(&<embed_bf16 as ::kernels::Derivation>::DERIVED[1].source, <kernels::keys::NamedWeight as kernels::keys::Fact>::KEY));
+    assert!(matches!(<embed_bf16 as ::kernels::Derivation>::DERIVED[2].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(kernels::source_is_named(&<embed_bf16 as ::kernels::Derivation>::DERIVED[3].source, <kernels::keys::Vocab as kernels::keys::Fact>::KEY));
+    assert!(!<embed_bf16 as ::kernels::Derivation>::DERIVED[2].nullable);
+    // Stated, so `alias()` must leave it alone — it only ever corrects a
+    // derived guess, not a stated index.
+    assert!(<embed_bf16 as ::kernels::Derivation>::DERIVED[2].stated);
+
+    assert!(<gather_bf16_rows as ::kernels::Derivation>::DERIVED.len() == 3);
+    assert!(matches!(<gather_bf16_rows as ::kernels::Derivation>::DERIVED[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(kernels::source_is_named(&<gather_bf16_rows as ::kernels::Derivation>::DERIVED[1].source, <kernels::keys::SamplingIndices as kernels::keys::Fact>::KEY));
+    assert!(matches!(<gather_bf16_rows as ::kernels::Derivation>::DERIVED[2].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    // Result zero answers both itself: its `rows` is the row count, its
+    // `width` the out width.
+    assert!(<gather_bf16_rows as ::kernels::Derivation>::DERIVED[0].stated);
+    assert!(<gather_bf16_rows as ::kernels::Derivation>::DERIVED[2].stated);
+
+    // Pinned for the second result: no scalar is left for a subtraction to
+    // answer wrongly.
+    assert!(<split_bf16_rows as ::kernels::Derivation>::DERIVED.len() == 3);
+    assert!(matches!(<split_bf16_rows as ::kernels::Derivation>::DERIVED[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(<split_bf16_rows as ::kernels::Derivation>::DERIVED[1].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(<split_bf16_rows as ::kernels::Derivation>::DERIVED[2].source, Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
+    assert!(<split_bf16_rows as ::kernels::Derivation>::DERIVED[2].stated);
+    assert!(<split_qwen_gdn_ba as ::kernels::Derivation>::DERIVED.len() == 3);
+    assert!(matches!(<split_qwen_gdn_ba as ::kernels::Derivation>::DERIVED[2].source, Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
+
+    // Pinned against entry 2 flipping back if the PLE width word is ever
+    // removed.
+    assert!(<transpose_bf16_nld_to_lnd as ::kernels::Derivation>::DERIVED.len() == 3);
+    assert!(matches!(<transpose_bf16_nld_to_lnd as ::kernels::Derivation>::DERIVED[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(<transpose_bf16_nld_to_lnd as ::kernels::Derivation>::DERIVED[1].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(kernels::source_is_named(&<transpose_bf16_nld_to_lnd as ::kernels::Derivation>::DERIVED[2].source, <kernels::keys::PleDim as kernels::keys::Fact>::KEY));
+
+    // `bytes`/`request` stay unbound — see the note at the signature above.
+    // Entries 0, 1 and 3 state which operand, nothing about shape.
+    assert!(<copy_if_valid_slot as ::kernels::Derivation>::DERIVED.len() == 5);
+    assert!(<copy_if_valid_slot as ::kernels::Derivation>::DERIVED[2].source.is_none());
+    assert!(<copy_if_valid_slot as ::kernels::Derivation>::DERIVED[4].source.is_none());
+    // Non-adjacent but still interchangeable: both `usize`, both `None` — a
+    // source pin can't tell them apart, so name pins hold them apart.
+    assert!(derived_name_is(<copy_if_valid_slot as ::kernels::Derivation>::DERIVED[2].name, "bytes"));
+    assert!(derived_name_is(<copy_if_valid_slot as ::kernels::Derivation>::DERIVED[4].name, "request"));
+
+    // Unbound because a path-fired launch has no stated `Facts`: an
+    // `In<0, _>` here would force every caller to invent a rows/width for
+    // the driver's own arena.
+    assert!(<envelope_update_appended as ::kernels::Derivation>::DERIVED.len() == 12);
+    assert!(<envelope_update_appended as ::kernels::Derivation>::DERIVED[7].source.is_none());
+    assert!(<envelope_update_appended as ::kernels::Derivation>::DERIVED[8].source.is_none());
+    assert!(<envelope_update_appended as ::kernels::Derivation>::DERIVED[9].source.is_none());
+    assert!(<envelope_update_appended as ::kernels::Derivation>::DERIVED[10].source.is_none());
+    assert!(<envelope_update_appended as ::kernels::Derivation>::DERIVED[11].source.is_none());
+    // `None` five times asserts nothing about order; the names below fix the
+    // launch order — permuting the last three (a page geometry) is a wrong
+    // stride, not a type error.
+    assert!(derived_name_is(<envelope_update_appended as ::kernels::Derivation>::DERIVED[7].name, "num_requests"));
+    assert!(derived_name_is(<envelope_update_appended as ::kernels::Derivation>::DERIVED[8].name, "max_touched"));
+    assert!(derived_name_is(<envelope_update_appended as ::kernels::Derivation>::DERIVED[9].name, "page_size"));
+    assert!(derived_name_is(<envelope_update_appended as ::kernels::Derivation>::DERIVED[10].name, "num_kv_heads"));
+    assert!(derived_name_is(<envelope_update_appended as ::kernels::Derivation>::DERIVED[11].name, "head_dim"));
+
+    // The sharpest case in the file: `env_min`/`env_max` are both `*mut
+    // bf16`, both `Unbound`. Swapping them compiles, launches, and seeds the
+    // running minimum into the maximum plane — no source pin catches it.
+    assert!(derived_name_is(<envelope_seed_empty as ::kernels::Derivation>::DERIVED[0].name, "env_min"));
+    assert!(derived_name_is(<envelope_seed_empty as ::kernels::Derivation>::DERIVED[1].name, "env_max"));
+    assert!(derived_name_is(<envelope_seed_empty as ::kernels::Derivation>::DERIVED[2].name, "num_pages"));
+    assert!(derived_name_is(<envelope_seed_empty as ::kernels::Derivation>::DERIVED[3].name, "num_kv_heads"));
+    assert!(derived_name_is(<envelope_seed_empty as ::kernels::Derivation>::DERIVED[4].name, "head_dim"));
+
+    // Unstated launchers, pinned as the baseline: if `model-dsl` ever states
+    // one of them, this is what it is checked against.
+    assert!(<deinterleave_rows as ::kernels::Derivation>::DERIVED.len() == 3);
+    assert!(matches!(<deinterleave_rows as ::kernels::Derivation>::DERIVED[1].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(<deinterleave_rows as ::kernels::Derivation>::DERIVED[2].source, Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
+    assert!(<deinterleave_vec as ::kernels::Derivation>::DERIVED.len() == 3);
+    assert!(matches!(<deinterleave_vec as ::kernels::Derivation>::DERIVED[2].source, Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
+    assert!(<concat_bf16_rows as ::kernels::Derivation>::DERIVED.len() == 3);
+    assert!(matches!(<concat_bf16_rows as ::kernels::Derivation>::DERIVED[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(<concat_bf16_rows as ::kernels::Derivation>::DERIVED[1].source, Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    assert!(matches!(<concat_bf16_rows as ::kernels::Derivation>::DERIVED[2].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+};
+
 /// This family's routines, and what a trace may say about each.
 ///
-/// The argument lists are DERIVED from the `fn`s above -- `routine!` sees only
-/// the identifier. What is stated beside it is what no signature carries, and
-/// for `layout` that is NOTHING: not one contract here claims `whole`, an
-/// in-place pair or a depth-prefix plan, because every one of these kernels
-/// reads one buffer and writes another.
-///
-/// The last line is `driver_bound!` and its host program is not above it —
-/// see [`crate::driver_internal`]'s header, which is where that `fn` lives
-/// and why it stays there.
+/// The argument lists are derived from the `fn`s above — `routine!` sees
+/// only the identifier. Nothing here states `whole`, an in-place pair or a
+/// depth-prefix plan: every one of these kernels reads one buffer and
+/// writes another.
 pub static ROUTINES: &[Routine] = &[
-    routine!(split_bf16_rows),
-    routine!(split_qwen_gdn_ba_bf16 = split_qwen_gdn_ba::<bf16>),
-    routine!(deinterleave_rows_bf16 = deinterleave_rows::<bf16>),
-    routine!(deinterleave_vec_bf16 = deinterleave_vec::<bf16>),
-    routine!(concat_bf16_rows),
-    routine!(gather_bf16_rows),
-    routine!(transpose_bf16_nld_to_lnd),
-    routine!(copy_if_valid_slot),
-    routine!(envelope_merge_written),
-    routine!(envelope_seed_empty),
-    routine!(envelope_update_appended),
-    routine!(embed_bf16),
-    // The qwen3.5 hybrid lowers `OpKind::SplitQGate` to this symbol, and
-    // nothing declared it. The host program is
-    // `driver_internal::split_q_gate_bf16` and stays there; the declaration
-    // has to be here, because `Family::symbol` is the module path's first
-    // segment plus the routine's name and no `Family` in `driver_internal`
-    // could offer a `layout::` symbol at all.
-    //
-    // **This declares the symbol and does not arm it.** A fire naming it
-    // still refuses with `NoArm` -- `bind/arms/layout.rs` has no entry for
-    // it, and writing one is fire-path work this declaration does not do.
-    driver_bound!(split_q_gate_bf16),
+    routine!(split_bf16_rows, ),
+    // Named after the generic `fn`, so one derived column serves every
+    // instantiation.
+    routine!(split_qwen_gdn_ba_bf16 = split_qwen_gdn_ba::<bf16>, ),
+    routine!(deinterleave_rows_bf16 = deinterleave_rows::<bf16>, ),
+    routine!(deinterleave_vec_bf16 = deinterleave_vec::<bf16>, ),
+    routine!(concat_bf16_rows, ),
+    routine!(gather_bf16_rows, ),
+    routine!(transpose_bf16_nld_to_lnd, ),
+    routine!(copy_if_valid_slot, ),
+    routine!(envelope_merge_written, ),
+    routine!(envelope_seed_empty, ),
+    routine!(envelope_update_appended, ),
+    routine!(embed_bf16, ),
+    // Declared here though the host program is `driver_internal`'s:
+    // `Family::symbol` reads this module path's first segment, and only
+    // here is that `layout::`.
+    routine!(split_q_gate_bf16, ),
 ];
 
 /// `layout`, as a trace names it.
 pub static FAMILY: Family = crate::family!(ROUTINES);
+
+// Three facts every view above relies on, none checkable at run time:
+// `Stride` is layout-identical to `i32` (every `.0` depends on it, and `Ty`
+// checks by name only); `Region::elements` saturates, which `deinterleave_vec`
+// relies on for a refusal-sized rather than negative product; and
+// `this_family` rewrites only `Absent` into `Empty`, leaving `Narrow` and a
+// fact's own `Empty` untouched.
+const _: () = {
+    assert!(core::mem::size_of::<kernels::Stride>() == core::mem::size_of::<i32>());
+    assert!(core::mem::align_of::<kernels::Stride>() == core::mem::align_of::<i32>());
+
+    let r = kernels::Region {
+        ptr: core::ptr::null::<u16>(),
+        rows: 7,
+        width: 5,
+        stride: kernels::Stride(5),
+    };
+    assert!(r.elements() == 35);
+
+    let wide = kernels::Region {
+        ptr: core::ptr::null::<u16>(),
+        rows: i32::MAX,
+        width: i32::MAX,
+        stride: kernels::Stride(i32::MAX),
+    };
+    assert!(wide.elements() == i32::MAX);
+
+    let Refusal::Empty { what } = this_family(Refusal::Absent { what: "v_h" }) else {
+        panic!("Absent must come back said in this family's variant")
+    };
+    assert!(derived_name_is(what, "v_h"));
+
+    let Refusal::Empty { what } = this_family(Refusal::Empty { what: "ple_dim" }) else {
+        panic!("a fact's own Empty must pass through")
+    };
+    assert!(derived_name_is(what, "ple_dim"));
+
+    let Refusal::Narrow { what, at } = this_family(Refusal::Narrow { what: "i", at: 3 }) else {
+        panic!("only Absent is rewritten")
+    };
+    assert!(derived_name_is(what, "i"));
+    assert!(at == 3);
+};

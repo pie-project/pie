@@ -1027,6 +1027,28 @@ pub struct Device {
     errors: Arc<Mutex<Vec<(bool, String)>>>,
 }
 
+/// How many `@group(0)` bindings each entrypoint's module declares.
+///
+/// Parsed ONCE for the process. Every entrypoint in the tree has to be read to
+/// answer it, and a `Device` is opened per test and per deployment -- doing it
+/// at each open took the device suite from 21 seconds to 169.
+///
+/// The count does not depend on the adapter; only the COMPARISON does, so the
+/// expensive half is cached and the cheap half is per-device.
+fn widest_bindings() -> &'static [(&'static str, u32)] {
+    static COUNTS: std::sync::OnceLock<Vec<(&'static str, u32)>> = std::sync::OnceLock::new();
+    COUNTS.get_or_init(|| {
+        kernels_wgpu::entrypoints()
+            .into_iter()
+            .filter_map(|name| {
+                let declared =
+                    crate::reflect::entrypoint(&name, kernels_wgpu::Capability::Baseline).ok()?;
+                Some((&*String::leak(name), declared.bindings))
+            })
+            .collect()
+    })
+}
+
 impl Device {
     /// Open the best adapter this machine offers.
     ///
@@ -1190,10 +1212,27 @@ impl Device {
         let limits = Limits::of(&limits);
         // Computed here rather than asked for later, so the answer to "what
         // can this machine not run" is available before a model is loaded.
-        let unreachable = kernels_wgpu::KERNELS
+        // Counted off the MODULES and not the table, which is empty. This read
+        // `storage_count(sig)` over `KERNELS` until every kernel crossed to a
+        // routine, at which point it answered "none" for every adapter -- and
+        // `shell.rs` REFUSES A DEPLOYMENT on this list being non-empty, so the
+        // guard would have gone permanently open rather than loudly wrong.
+        //
+        // `Declared::bindings` is one past the highest `@group(0)` binding a
+        // module declares, which is the number a bind group layout must cover;
+        // a variant may leave HOLES and `wgpu` checks entry for entry, so the
+        // count of declared buffers would be the wrong number and this is the
+        // right one. It is the same quantity `storage_count` stood in for.
+        //
+        // Done ONCE at open, for the reason the old comment gave: the answer
+        // to "what can this machine not run" has to be available before a
+        // model is loaded, not discovered when a pipeline fails. An entrypoint
+        // whose source will not even parse is not this question's business and
+        // is left to `Failed::Module`.
+        let unreachable = widest_bindings()
             .iter()
-            .filter(|sig| kernels_wgpu::storage_count(sig) > limits.storage_buffers)
-            .map(|sig| sig.name)
+            .filter(|(_, bindings)| *bindings > limits.storage_buffers)
+            .map(|(name, _)| *name)
             .collect();
 
         Ok(Self {
@@ -2418,8 +2457,6 @@ pub struct Read {
     pub tier: Capability,
     /// What the module binds and how it must be launched.
     pub declared: crate::reflect::Declared,
-    /// The table row, or `None` for a symbol the table does not state.
-    pub sig: Option<&'static kernels::KernelSig>,
 }
 
 impl Default for Pipelines {

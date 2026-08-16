@@ -40,14 +40,18 @@ fn from_the_table() -> BTreeSet<String> {
     kernels_metal::entrypoints().into_iter().collect()
 }
 
-/// The shader-vs-table comparison lived here: every entrypoint the census
-/// listed had to be one a row declares, and every one a row declares had to be
-/// in the census.
-///
-/// It is deleted with the census it read. `scripts/metal-kernel-audit.py
-/// --table` performs the same comparison, which is where it has to live now —
-/// the shader set is an `instantiate_*` expansion and a preprocessor is the
-/// only thing that produces it.
+// The shader-vs-table comparison lived here: every entrypoint the census
+// listed had to be one a row declares, and every one a row declares had to be
+// in the census.
+//
+// It is deleted with the census it read. `scripts/metal-kernel-audit.py
+// --table` performs the same comparison, which is where it has to live now —
+// the shader set is an `instantiate_*` expansion and a preprocessor is the
+// only thing that produces it.
+//
+// A `//` tombstone and not a `///` one: it documents nothing, and as a doc
+// comment it attached itself to the item below and read as that item's
+// description.
 
 /// Two families claiming one entrypoint would make the census a set of 480
 /// while ten lists sum to 481, and [`from_the_table`] cannot see it: a
@@ -111,8 +115,25 @@ fn no_two_families_claim_the_same_entrypoint() {
 /// Those three numbers are now the whole of the cross-backend claim. The
 /// entrypoint-for-entrypoint diff that backed it read the three crates'
 /// committed censuses, and they are deleted.
+///
+/// # 100 became 101, and the three backends no longer agree
+///
+/// `rms_rope` -- the fused per-head norm and NEOX rotation -- is a Vulkan
+/// kernel. It is named here because Vulkan consumes the metal-flavoured plan
+/// text and `model-ir` resolves every launched symbol through THIS crate's
+/// census, and it is named here ONLY: there is no `ENTRYPOINTS` row and no
+/// `.metal` body, so `entrypoints()` is still 481. `kernels-wgpu` is
+/// untouched and still pins 100.
+///
+/// So the claim this file has always made -- three backends, one hundred
+/// kernels -- is now 101/101/100, and that is not a bookkeeping slip to be
+/// tidied away by adding the name to wgpu too. Adding a name to a backend
+/// that has no shader behind it is exactly the silence these counts exist to
+/// break. The honest state is that one backend has a kernel the other two do
+/// not, and the honest way to close it is to write the kernel twice more, not
+/// to write the name twice more.
 #[test]
-fn the_table_is_one_hundred_kernels_over_four_hundred_and_eighty_one_entrypoints() {
+fn the_table_is_one_hundred_and_one_kernels_over_four_hundred_and_eighty_one_entrypoints() {
     // Rows PLUS retired, because the hundred is a claim about the shader tree
     // and rows are no longer the only thing that names it. A family that
     // crosses moves its names from the left term to the right and the sum is
@@ -121,7 +142,7 @@ fn the_table_is_one_hundred_kernels_over_four_hundred_and_eighty_one_entrypoints
     // edited every time one does.
     assert_eq!(
         kernels_metal::KERNELS.len() + kernels_metal::retired_rows().len(),
-        100
+        101
     );
     assert!(kernels_metal::KERNELS.is_empty(), "every family crossed");
     assert_eq!(kernels_metal::entrypoints().len(), 481);
@@ -388,8 +409,8 @@ fn module_sources() -> Vec<PathBuf> {
 fn entrypoint_tables() -> BTreeMap<String, Vec<String>> {
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let push = |out: &mut BTreeMap<String, Vec<String>>,
-                    open: &mut Option<(String, Vec<String>)>,
-                    text: &str| {
+                open: &mut Option<(String, Vec<String>)>,
+                text: &str| {
         let (name, mut acc) = open.take().expect("an open declaration");
         acc.extend(text.split('"').skip(1).step_by(2).map(str::to_owned));
         if text.trim_end().ends_with("];") {

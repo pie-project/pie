@@ -1,64 +1,25 @@
-//! What a Metal load OBSERVED, and the one door to the row's Metal text.
+//! What a Metal load observed, and the one door to the row's Metal text.
 //!
-//! # This file is what is left of `model/text.rs`
-//!
-//! That module held an eleven-entry table of architecture STRING names
-//! (`LLAMA_LIKE`), a `canonical()` that reduced a spelling to one of them, a
-//! `serves()` predicate over it, and a `facts_from_with()` that rebuilt the
-//! model's own twenty-nine `LlamaLikeFacts` from NINE `has_tensor` probes. It
-//! was **the third dispatch key** the catalog refactor exists to delete: a
-//! checkpoint's identity was decided once by `catalog::identify` from the
-//! tensors, and then decided again here from a string the row had handed out.
-//!
-//! Two keys for one identity is not a tidiness problem, and this crate has
-//! the receipts for what it costs:
-//!
-//! * `LLAMA_LIKE` listed `"gemma4"` and `"gpt_oss"`, so `serve/load.rs`
-//!   CLAIMED to serve them at its pre-staging gate and then refused them
-//!   ninety lines later on a completely different ground — the checkpoint
-//!   ships a `pre_feedforward_layernorm` and the projected geometry could
-//!   only state a SiLU gate. One driver, two answers, and the second one
-//!   arrived after 17 GB of weights had been staged.
-//! * `facts_from_with` decided the norm variant by asking whether
-//!   `layers.0.pre_feedforward_layernorm.weight` exists. gemma-4 publishes
-//!   that norm and stores its gains as a plain multiplier, so the probe read
-//!   `(1 + w)` for a stack that means `w` — a norm whose LARGEST value agreed
-//!   with MLX to three digits while its ordinary ones were off by a third.
-//!   A row states the fold; a tensor's existence never could.
-//!
-//! Both are unrepresentable now. `catalog::Variant::trace` takes a
-//! `catalog::Deployed` whose `backend` says which driver is asking, so the
-//! Metal text is the ROW's answer for the Metal backend, and a row this build
-//! has no Metal text for refuses in the one place the CUDA driver's refusal
-//! also lives.
-//!
-//! # What a driver may still say about a model, and why it is only this
-//!
-//! [`MetalBinding`] is six values and every one of them is about the BYTES
+//! [`MetalBinding`] is six values, and every one of them is about the BYTES
 //! that arrived or about the KERNELS this binary was built with. None is
 //! about the model:
 //!
-//! * the affine group and bit width, because `mlx-community` publishes one
-//!   model at g64/b4 and at g128/b8 and the two pack to identical extents —
-//!   no tensor can be asked which it is, and no row may be split four ways to
-//!   record it;
+//! * the affine group and bit width, because a model may be published at
+//!   more than one affine point that packs to identical extents — no tensor
+//!   can be asked which it is, and no row may be split four ways to record it;
 //! * whether the expert bank reached the device still in MXFP4, which is a
 //!   statement about what the LOADER did and is only knowable after staging;
 //! * and the three kernel capabilities, which are facts about
 //!   `crates/kernels-metal` as compiled into this binary.
 //!
 //! [`observed`] takes an [`AffineFormat`](crate::batch::AffineFormat) and a
-//! single tensor probe, and that narrowness is the design rather than an
-//! economy: **it cannot see a `DecodeGeometry`, so it cannot smuggle a model
-//! fact into a binding.** The nine probes that used to decide head norms,
-//! fused projections, attention biases, routers, sinks, per-layer scalars and
-//! the activation have nowhere to be written down here.
+//! single tensor probe: it cannot see a `DecodeGeometry`, so it cannot
+//! smuggle a model fact into a binding.
 
 use model::catalog::MetalBinding;
 use model_ir::trace::{FireClass, ForwardPlan};
 
-/// The FIRST of the two tensors this driver asks a question of, and the
-/// question is about an ENCODING.
+/// The tensor probed to learn the expert bank's own affine encoding.
 ///
 /// `mlx-community/gpt-oss-20b-MXFP4-Q4` names 98 tensors as affine/64/4 and
 /// leaves the expert banks out, so they take the top-level default, mxfp4/32.
@@ -89,13 +50,20 @@ pub const EXPERT_BANK: &str = "layers.0.mlp.experts.gate_proj.weight";
 /// this tensor arrive in. Whether the model HAS a router is the row's answer
 /// and is not asked here.
 ///
-/// TWO SPELLINGS, because a router is not always a member of the mlp:
+/// THREE SPELLINGS, because a router is not always a member of the mlp and
+/// is not always called a router:
 ///
 /// - `layers.0.mlp.router.weight` — gpt-oss, whose routed block replaces the
 ///   dense one, so the router hangs where the mlp was.
 /// - `layers.0.router.proj.weight` — gemma-4, whose routed block sits BESIDE
 ///   a dense one that is still there, so the router is a sibling of both and
 ///   is a module with a `proj` inside it rather than a bare weight.
+/// - `layers.0.mlp.gate.weight` — qwen3.6, which calls the thing a GATE.
+///   `mlx-community` publishes it and `mlp.shared_expert_gate` at eight bits
+///   inside a four-bit stack, for all forty layers, and this list not having
+///   the name refused the whole checkpoint as *"2 affine points beside its
+///   router gate's"* with one of the two being that gate — the same failure
+///   gemma-4 had, under the third spelling.
 ///
 /// A list rather than a suffix rule for the reason
 /// [`ROUTER_GATE_AT_ANY_LAYER`] gives at length: these names are not nested,
@@ -111,6 +79,7 @@ pub const EXPERT_BANK: &str = "layers.0.mlp.experts.gate_proj.weight";
 pub const ROUTER_GATES: &[&str] = &[
     "layers.0.mlp.router.weight",
     "layers.0.router.proj.weight",
+    "layers.0.mlp.gate.weight",
 ];
 
 /// The affine point of whichever router gate this checkpoint spells.
@@ -148,33 +117,36 @@ pub fn router_point(
 /// the same question about the same weight.
 pub const ROUTER_GATE_AT_ANY_LAYER: &str = ".router";
 
-/// What this build's kernels can do, at any encoding.
+/// Every statement-side spelling of a gate that arrived at the router's
+/// affine point.
 ///
-/// Three booleans that are true of the BINARY: the projection GEMV folds the
-/// block residual in its epilogue (`affine_qmv_fast_residual`), the M>1 lane
-/// addresses the KV cache through a page table (`sdpa_paged_decode`), and the
-/// M>1 projections take MLX's steel quantized GEMM (`affine_qmm_t`). They
-/// were hardcoded `true` inside `facts_from_with` beside twenty-six values
-/// that were the MODEL's; separating them is most of what this file is.
+/// [`ROUTER_GATE_AT_ANY_LAYER`] is one entry of it and the reason there are
+/// two is qwen3.6: `mlx-community` lists `mlp.gate` AND
+/// `mlp.shared_expert_gate` at eight bits for all forty layers, and the text
+/// names the second `layer.{n}.shared_gate_proj`, which does not end with
+/// `.router` under any reading. A statement matched by neither is composed at
+/// the STACK's width, so the trace asks for `_gs_64_b_8` and the body builds
+/// `_gs_64_b_4` -- caught here as `Misspelled`, and the reason that check
+/// exists is that the two pack to identical extents and would otherwise have
+/// returned fluent nonsense.
 ///
-/// A `const fn` so that [`ANY_ENCODING`] and [`observed`] cannot drift: a
-/// build capability answered one way for a real load and another way for the
-/// pre-staging question would make the refusal at the door disagree with the
-/// text at the fire, which is exactly the two-answers defect this module's
-/// predecessor was.
+/// The shared expert's gate is a projection to ONE row -- a scalar per token
+/// that scales the dense expert's contribution -- so reading it at the wrong
+/// width does not fault either: it scales by the wrong number.
+pub const ROUTER_POINT_AT_ANY_LAYER: &[&str] = &[ROUTER_GATE_AT_ANY_LAYER, ".shared_gate_proj"];
+
+/// What this build's kernels can do, at any encoding: the projection GEMV
+/// folds the block residual in its epilogue, the M>1 lane addresses the KV
+/// cache through a page table, and M>1 projections use the quantized GEMM.
+/// A `const fn` so [`ANY_ENCODING`] and [`observed`] cannot disagree about a
+/// build capability.
 #[must_use]
 pub const fn build_kernels(quant_group: u32, quant_bits: u32, moe_mxfp4: bool) -> MetalBinding {
     build_kernels_at(quant_group, quant_bits, 0, 0, moe_mxfp4)
 }
 
-/// [`build_kernels`], for a checkpoint whose ROUTER GATE arrived at its own
-/// affine point.
-///
-/// `(0, 0)` for the router is "the same as the dense projections", which is
-/// every checkpoint but gpt-oss's. Kept as a separate constructor rather than
-/// four arguments on the common one because `ANY_ENCODING` and every test
-/// fixture below want the three-argument question, and a gate width is not
-/// part of "what can this build do".
+/// [`build_kernels`], for a checkpoint whose router gate has its own affine
+/// point; `(0, 0)` means "the same as the dense projections".
 #[must_use]
 pub const fn build_kernels_at(
     quant_group: u32,
@@ -192,61 +164,33 @@ pub const fn build_kernels_at(
         fuse_residual_gemv: true,
         paged_multi_batch: true,
         qmm_multi_batch: true,
-        // TRUE, and it is a statement about this binary rather than about
-        // the Qwen-2 family. It was false for as long as the thing it named
-        // was missing: `norm/add_bias.metal` was written, but the row hands
-        // the bias its OUTPUT width and `lowering::dispatch`'s scalar layout
-        // had no arm for `Source::OutWidth` -- it fell through `_ => continue`
-        // and emitted no slot at all, so the kernel's `width` argument would
-        // have been whatever the encoder last left at that index.
-        //
-        // `derived` is that arm, and `every_scalar_source_the_table_names_is
-        // _one_this_binder_resolves` is why the next such source cannot go
-        // quiet the same way. With it the seven Qwen-2.5 rows this catalog
-        // serves on Metal state their q/k/v biases and launch them, which is
-        // the difference `driver-vulkan`'s numpy oracle measured: `[88204,
-        // 6100, 41777, 2930]` with the biases against `[5937, 1560, 16925,
-        // 43715]` without.
+        // A statement about this binary, not the model: it requires
+        // `lowering::dispatch` to resolve every scalar source the table
+        // names, or a kernel's width argument silently gets whatever the
+        // encoder last left at that index.
         add_bias: true,
+        // FALSE: there is no Metal `rms_rope`. The name resolves through this
+        // backend's census so that `model-ir` can check a VULKAN text -- which
+        // consumes the metal-flavoured plan -- and there is no shader behind
+        // it here.
+        fused_qk_rope: false,
     }
 }
 
-/// The binding to ask with when the question is "is there a Metal text at
-/// all".
-///
-/// # The refusal must not depend on the binding facts
-///
-/// `serve/load.rs` refuses an unservable row BEFORE it stages a byte, and
-/// that placement is load-bearing: on the 31B gemma the alternative is 17 GB
-/// of staging spent to reach an answer identification had already settled.
-/// But `moe_mxfp4` cannot be known until the tensors are on the device, so
-/// the full binding does not exist yet at the moment the question is asked.
-///
-/// That is not a gap, because **a row that refuses Metal refuses it for every
-/// encoding.** `Refusal::Unsupported` from `trace` means this build has no
-/// Metal text for the row — a statement about which texts were written, which
-/// no group size, bit width or expert-bank format can change. So the probe
-/// below stands for every encoding, and the g64/b4 it names is the shipped
-/// body format rather than a fact anything reads.
-///
-/// `a_row_is_served_the_same_way_at_every_encoding` in this file's tests is
-/// that sentence as an assertion, over the whole catalog: if some row's
-/// answer ever DID move with the binding, the pre-staging refusal would be
-/// lying and this constant would have to go.
+/// The binding to probe "is there a Metal text at all" before any weights
+/// are staged: `moe_mxfp4` cannot be known until the tensors are on the
+/// device, but a row that refuses Metal refuses it at every encoding, so
+/// g64/b4 stands in for all of them.
+/// `a_row_is_served_the_same_way_at_every_encoding` asserts this over the
+/// whole catalog.
 pub const ANY_ENCODING: MetalBinding = build_kernels(64, 4, false);
 
 /// What THIS load observed, once its weights are on the device.
 ///
-/// `quant` is the geometry's affine point and not the encoding's: a
-/// checkpoint that declares no quantization arrives here as g64/b4, because
-/// `geometry_from_deployment` has already replaced an unset format with the
-/// one a shader is actually instantiated at — `gs_0_b_0` is a symbol no
-/// kernel exports. Reading the encoding directly would name it.
-///
-/// `is_mxfp4` is `Loaded::mxfp4`, the set of names the LOAD PLAN left in the
-/// checkpoint's own format. Exactly one name is put to it ([`EXPERT_BANK`]),
-/// and the signature is why that is checkable rather than promised: nothing
-/// else about the deployment is in scope here to be asked about.
+/// `quant` is the resolved affine point: `geometry_from_deployment` has
+/// already replaced an unset format with the one a shader is instantiated
+/// at, so `gs_0_b_0` never appears here. `is_mxfp4` is asked about exactly
+/// one name, [`EXPERT_BANK`].
 #[must_use]
 pub fn observed(
     quant: crate::batch::AffineFormat,
@@ -270,71 +214,34 @@ pub fn observed(
     )
 }
 
-/// A row that answered a Metal load with some other backend's text.
-///
-/// Named as a constant because it is the sentence an operator would read,
-/// and it should say what happened rather than name a symbol. No row in this
-/// build produces it — every generation states its own Metal answer, so a
-/// row either refuses in its own words or traces `llama_like.metal.*` — and
-/// this is deliberately the driver's sentence rather than the row's, because
-/// reaching it means a row said something about Metal that was not true.
+/// A row that answered a Metal load with another backend's text — never
+/// produced today, since every generation states its own Metal answer or
+/// refuses in its own words.
 const NOT_A_METAL_TEXT: &str = "this row answered a Metal load with another backend's text; the text \
      exists but it was written for other kernels, so a fire would lower \
      symbols no Metal shader exports";
 
 /// The row's Metal text for one fire class.
 ///
-/// Nearly a one-line function on purpose: it is the ONLY place this driver
-/// reaches a forward text, so "which text does this checkpoint run" has
-/// exactly one answer site, and that answer is a row's. What it replaces —
-/// `text::plan_for(arch, class, &facts, &metal)` — took an architecture
-/// STRING and a facts struct the driver had rebuilt itself, which is two
-/// chances to describe a different model than the one that was loaded.
+/// The only place this driver reaches a forward text, so "which text does
+/// this checkpoint run" has exactly one answer site, and that answer is a
+/// row's.
 ///
 /// # The one thing it checks, and why it is not a second list
 ///
-/// `Deployed::backend` is a REQUEST, and the answer is checked against it.
-/// Every generation now states its own Metal answer: NINE trace one
-/// (`llama_3`, `qwen_2`, `qwen_3`, `mistral_3`, `phi_3`, `olmo_2`, `olmo_3`,
-/// `gemma_3`, `gemma_4`) and the rest refuse by name, each with a
-/// `Refusal::Unsupported` literal that names the generation and the CUDA text
-/// it has instead. So this check does not currently fire for any row, and
-/// that is the state it is meant to hold.
-///
-/// The count is not kept in step by hand: `catalog_backends`'s
-/// `the_rows_that_serve_metal_are_the_llama_like_ones` walks the catalog and
-/// names the nine, so a generation that grows or loses a Metal text fails
-/// there before this sentence can go stale. It HAD gone stale — gemma-4 grew
-/// its text while this still said eight.
-///
-/// What it is FOR is the way a Metal arm goes wrong. `gemma_3`'s is a
-/// `match` on `load.backend` whose two arms differ by one call —
-/// `family::trace(f, row, class, load)` against
-/// `llama_like_metal(f, &metal_facts(..), class)` — and both return
-/// `Ok(ForwardPlan)`. A generation that grows a Metal arm and reaches for
-/// the neighbouring builder compiles, deploys, projects a geometry, and
-/// answers `trace` with a text whose every symbol is looked up in the Metal
-/// table at fire time. `Backend::of_family` reads the backend the trace
-/// stamped on ITSELF, so that slip is a refusal at this door instead of a
-/// missing shader at the first dispatch.
-///
-/// That is not the string table coming back. The table said which
-/// ARCHITECTURES a text had been written for and had to be edited by hand
-/// every time one was; this reads what the text ITSELF says it is, from the
-/// same value that is about to be lowered, so there is nothing to keep in
-/// step and nothing to be wrong about. The distinction is the whole point:
-/// `LLAMA_LIKE` could name `gemma4` while no gemma-4 text existed, and this
-/// cannot. It also cannot refuse a row the catalog serves: `gemma3` was
-/// never IN that table, and it traces a Metal text today.
+/// `Deployed::backend` is a request, and the answer is checked against it:
+/// `Backend::of_family` reads the backend the trace stamped on itself, so a
+/// generation whose Metal arm mistakenly reaches for another backend's
+/// builder is refused here rather than failing at a missing shader on the
+/// device. This driver holds no list of architectures of its own to check
+/// first — `catalog_backends`'s test enumerates which generations serve
+/// Metal and must be kept in sync with reality.
 ///
 /// # Errors
 ///
 /// [`Refusal::Unsupported`](model::deployment::Refusal) when this build has
 /// no Metal text for the row — almost always the row's own refusal, carried
-/// out unchanged. Beyond that the driver does not second-guess the row and
-/// holds no list of its own to check first: `LLAMA_LIKE` naming `gemma4`
-/// while the load path refused every gemma-4, and omitting `gemma3` which
-/// this build serves, is what a second list is worth.
+/// out unchanged.
 pub fn text(
     row: &dyn model::catalog::Variant,
     class: FireClass,
@@ -351,19 +258,13 @@ pub fn text(
 
 /// Whether this build has a Metal text for `row`, asked without the weights.
 ///
-/// Answered by the ROW, through [`ANY_ENCODING`] — see that constant for why
-/// asking before the binding is known is sound. `FireClass::Decode` because
-/// every text states a decode; a row that had one class and not the other
-/// would be a row that loads and dies at its first prefill, which is the
-/// failure `Variant::trace`'s own doc records `unbuilt_kv_store()` existing
-/// for.
+/// Uses [`ANY_ENCODING`] and `FireClass::Decode`, since every text states a
+/// decode.
 ///
 /// # Errors
 ///
 /// The row's own [`Refusal`](model::deployment::Refusal), carried unchanged
-/// so the caller can print what the row said rather than a sentence this
-/// driver made up about it — or [`text`]'s, when the row answered for a
-/// backend that is not this one.
+/// — or [`text`]'s, when the row answered for a backend that is not this one.
 pub fn serves(row: &dyn model::catalog::Variant) -> Result<(), model::deployment::Refusal> {
     text(row, FireClass::Decode, &ANY_ENCODING).map(|_| ())
 }
@@ -446,14 +347,8 @@ mod tests {
         assert_eq!(g64.quant_group, 64);
     }
 
-    /// ONE tensor is probed, and it is the expert bank.
-    ///
-    /// The count is the assertion. `facts_from_with` made nine probes and
-    /// eight of them decided a MODEL fact — the per-head q-norm, the fused
-    /// QKV, the attention bias, the router, the shared expert, the sandwich
-    /// norm, the attention sink, the per-layer scalar. Every one is a row's
-    /// answer now, and a regression would show up here as a second name
-    /// being asked for.
+    /// Exactly one tensor is probed, and it is the expert bank; a
+    /// regression would show up here as a second name being asked for.
     #[test]
     fn exactly_one_tensor_is_asked_about_and_it_decides_an_encoding() {
         let asked = std::cell::RefCell::new(Vec::new());
@@ -493,31 +388,15 @@ mod tests {
         assert_eq!(real.qmm_multi_batch, ANY_ENCODING.qmm_multi_batch);
     }
 
-    /// **A row that refuses Metal at the probe refuses it at every
-    /// encoding.**
+    /// A row refused at the probe binding is refused at every real encoding
+    /// — asserted over the whole catalog, since `serves` is asked before a
+    /// byte is staged and `moe_mxfp4` cannot yet be known.
     ///
-    /// The premise [`ANY_ENCODING`] rests on, asserted over the whole
-    /// catalog rather than argued for in prose. `serves` is asked before a
-    /// byte is staged and therefore before `moe_mxfp4` can be known; if a
-    /// row that refused at the probe could be served at some other group
-    /// size, the pre-staging refusal would be turning away a checkpoint
-    /// this build can run, and the honest response would be to delete the
-    /// constant rather than keep the placement.
-    ///
-    /// # Why this is one-directional and was not
-    ///
-    /// It asserted EQUALITY, and the other direction is false: a routed
-    /// row that serves at the probe is refused at g128/b8, because
-    /// `quant/qmv.metal` instantiates `affine_qmv_routed` at group 64
-    /// alone — `AffineQ::group_size` is a template constant, so a second
-    /// point would name a kernel that dequantises at 64 whatever it
-    /// claimed. `qwen3-30b-a3b` is the row that says so.
-    ///
-    /// That direction was never the premise. `serves` is allowed to be
-    /// PERMISSIVE — it exists so 17 GB of gemma is not staged to reach an
-    /// answer identification already had — and a later refusal at the
-    /// real encoding costs a load, not a wrong answer. What it may not be
-    /// is wrong in the other direction, and that is what this holds.
+    /// The converse is not asserted and is false: a routed row served at the
+    /// probe can still be refused at a real encoding, since
+    /// `affine_qmv_routed` is templated at group 64 alone. `serves` may be
+    /// permissive — a later refusal costs a load, not a wrong answer — but
+    /// it may never under-refuse.
     #[test]
     fn a_row_is_served_the_same_way_at_every_encoding() {
         let bindings = [
@@ -551,21 +430,10 @@ mod tests {
         );
     }
 
-    /// A refusal reaches the operator as the ROW's own sentence.
-    ///
-    /// The last hop of the path this module exists to build. `serve/load.rs`
-    /// refuses at the door and `serve/launch.rs` propagates at the fire, and
-    /// both do it by `Error::from`, so what an operator reads is what the row
-    /// said — `Refusal::Unsupported`'s `Display` — rather than a paraphrase
-    /// this driver invented from a lookup that failed.
-    ///
-    /// The `what` matters as much as the message and is asserted separately:
-    /// `"deployment unsupported"` is a statement about the BUILD, and an
-    /// operator's next move for it (run a pie built with that text) is a
-    /// different move than for a malformed checkpoint. The deleted
-    /// `plan_for` call site flattened every refusal into `"no text for this
-    /// fire: {why:?}"`, which is a `Debug` of an error the caller then could
-    /// not classify.
+    /// A refusal reaches the operator as the ROW's own sentence:
+    /// `serve/load.rs` and `serve/launch.rs` both propagate it by
+    /// `Error::from`, so `"deployment unsupported"` and the row's own
+    /// message survive the conversion unchanged.
     #[test]
     fn a_refused_row_reaches_the_operator_as_the_rows_own_sentence() {
         let refusal = model::deployment::Refusal::Unsupported("no Metal text for this row");
@@ -580,16 +448,10 @@ mod tests {
         );
     }
 
-    /// The text is the ROW's, and it is a METAL text.
-    ///
-    /// Two claims in one test, and the second is the one with teeth. [`text`]
-    /// exists to be the one door and not a translation, so equality with the
-    /// row's own answer is the first. The second reads the family name:
-    /// `Backend::of_family` parts `llama_like.metal.decode` from
-    /// `llama_like.cuda.decode`, which is one call's difference inside the
-    /// generation's own `match load.backend` — so a Metal arm that reached
-    /// for the neighbouring CUDA builder fails here rather than at a missing
-    /// symbol on a device nobody in CI has.
+    /// The plan is the row's own answer, and it names a METAL family:
+    /// [`text`] must add nothing to the row's answer, and `Backend::of_family`
+    /// must read `Metal` from it — otherwise a Metal arm that reached for a
+    /// CUDA builder would only fail at a missing symbol on the device.
     #[test]
     fn the_plan_is_the_rows_own_answer_and_it_is_the_metal_one() {
         use model_ir::kernels::Backend;
@@ -621,29 +483,9 @@ mod tests {
         }
     }
 
-    /// A row whose answer is not this backend's is REFUSED, not served.
-    ///
-    /// The half of [`text`] that is not a pass-through, asserted over the
-    /// whole catalog in both directions: every row that states a Metal text
-    /// is served, and every row that does not is refused. The driver holds no
-    /// list, so this is the only thing that can be checked — and it is
-    /// exactly the thing the deleted `LLAMA_LIKE` got wrong in both
-    /// directions at once. It listed `gpt_oss`, which no publication of
-    /// reaches a Metal device here at all, and omitted `gemma3`, which
-    /// `llama_like_metal` serves today: sandwich norms, the `(1+w)` weight
-    /// fold, the scaled gather, two rope bases and the per-layer window are
-    /// all in that text. A hand-kept table drifts in whichever direction
-    /// nobody is looking — and so does a per-row refusal nobody re-measures,
-    /// which is how `gemma_4` spent a merge refusing a text that states every
-    /// width it needs.
-    ///
-    /// Ten generations refuse in their own words — `qwen_3_5` because its
-    /// linear-attention interleave is a different shape, `gpt_oss` because
-    /// the bank its manifest pins and the bank `resolve` names are two
-    /// different publications —
-    /// and `serve/control.rs`'s `copy_state` refusal still rests on the first
-    /// of those: no model this backend serves has recurrent state to copy.
-    /// That sentence is true only while this passes.
+    /// A row whose answer is not this backend's is refused, not served —
+    /// asserted over the whole catalog in both directions, since the driver
+    /// keeps no list of its own to check against.
     #[test]
     fn a_row_that_answers_for_another_backend_is_not_served() {
         use model_ir::kernels::Backend;
@@ -706,21 +548,11 @@ mod tests {
         );
     }
 
-    /// An ENCODING is not a model fact, measured on the plan itself.
-    ///
-    /// Two loads of one row that differ ONLY in the bytes their weights
-    /// arrived as must state the same PROGRAM: the same operations, in the
-    /// same order, over the same values, with the same dataflow between
-    /// them. What may differ is which instantiation of a kernel each names —
-    /// `_gs_64_b_4` against `_gs_128_b_8` — and that is the whole of what an
-    /// affine point is, which is why the kernel strings are deliberately not
-    /// compared.
-    ///
-    /// This is the property the deleted `facts_from_with` could not have.
-    /// It built the model's facts and the encoding's facts in ONE pass over
-    /// one `DecodeGeometry`, so nothing separated them and nothing could
-    /// have checked that they were separate — which is how a `norm_variant`
-    /// came to be decided by which norms a checkpoint shipped.
+    /// An encoding is not a model fact, measured on the plan itself: two
+    /// loads of one row that differ only in the bytes their weights arrived
+    /// as must state the same program — same operations, order, values and
+    /// dataflow. Only the kernel instantiation may differ, so kernel
+    /// strings are deliberately not compared.
     #[test]
     fn two_encodings_of_one_row_state_the_same_program() {
         let row = model::catalog::find("qwen3-0.6b").expect("a row the device gates open");

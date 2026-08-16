@@ -1,28 +1,11 @@
-//! The driver's cuBLAS handle — gate-cublas.
-//!
-//! Ports the `CublasHandle` of `kernels-cuda` — the archive crate, deleted
-//! at `85c6c674b` — out of its `gemm/gemm.hpp`, which by the campaign's own
-//! rule is driver C++ that was living in the kernels crate: the
-//! launchers take a raw `cublasHandle_t`, only the driver ever constructs
-//! the wrapper. The generated bodies call `.handle()` 3,590 times and
-//! pass it into the gemm launchers; construction is once per engine.
-//!
-//! # A reproduced leak
-//!
-//! The C++ constructor runs `cublasCreate`, then `cublasSetStream` (only
-//! when a stream was given), then `cublasSetMathMode(TENSOR_OP)` — and a
-//! failure in the LAST step throws out of a half-built object, so the
-//! destructor never runs and the created handle leaks. The port
-//! reproduces that exactly: on a post-create failure the token is dropped
-//! WITHOUT a destroy call. Recorded as a finding rather than fixed here
-//! (the non-goals rule); in practice construction is at boot and the
-//! failure is fatal, so the leak is one handle on a path that ends the
-//! process.
+//! The driver's cuBLAS handle — gate-cublas. Wraps a raw `cublasHandle_t`:
+//! create, set-stream (only if given), then tensor-op math mode. A failure
+//! after create drops the token without destroying it — reproduced C++
+//! behaviour, benign since create is fatal.
 
 use std::ffi::c_void;
 
-/// What the wrapper asks of cuBLAS. The real implementation calls the
-/// library; the parity test's recorder answers with tokens.
+/// What the wrapper asks of cuBLAS — the real impl calls it, tests answer with tokens.
 pub trait CublasOps {
     /// The opaque `cublasHandle_t`.
     type Handle;
@@ -35,18 +18,11 @@ pub trait CublasOps {
     fn set_stream(&mut self, handle: &Self::Handle, stream: *mut c_void) -> Result<(), i32>;
     /// `cublasGetStream`.
     fn get_stream(&mut self, handle: &Self::Handle) -> *mut c_void;
-    /// `cublasSetMathMode(CUBLAS_TENSOR_OP_MATH)` — bf16 multiplies with
-    /// fp32 accumulation — or the failing status.
+    /// `cublasSetMathMode(CUBLAS_TENSOR_OP_MATH)`: bf16 x fp32, or the failing status.
     fn set_math_mode_tensor_op(&mut self, handle: &Self::Handle) -> Result<(), i32>;
 }
 
-/// The live [`CublasOps`] (retirement plan phase B): the five library calls
-/// the wrapper names, through cudarc's dynamically-loaded cuBLAS — nothing
-/// links, so the toolkit-free build survives, and the first call is what
-/// resolves the library.
-///
-/// The statuses cross as the raw `cublasStatus_t` numbers, which is what
-/// keeps [`CublasError`]'s Display identical to the C++ `check`'s message.
+/// The live [`CublasOps`] via cudarc's dynamic cuBLAS, so the toolkit-free build links.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LiveCublas;
 
@@ -58,16 +34,6 @@ impl CublasOps for LiveCublas {
         let mut h: Self::Handle = std::ptr::null_mut();
         let status = unsafe { cublasCreate_v2(&mut h) };
         if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-            // A draft of the step-5 `gemm` port published this handle into a
-            // static here so a `bind!` body could read it back. It does not,
-            // and the reason is the floor's: a bind is handed a `Cx`, and a
-            // static that reaches around `Cx` is worse than widening it,
-            // because a widening is reviewable. `x::gemm` declares contracts
-            // and no `Entry`, its symbols resolve to `Route::Driver`, and
-            // the driver passes `ctx.cublas` to the host programs directly.
-            // This handle stays exactly what it was: the engine's one
-            // handle, made here, destroyed once -- `cublasDestroy` costs
-            // 3.2 ms and there is exactly one per `Shell`.
             Ok(h)
         } else {
             Err(status as i32)
@@ -76,15 +42,12 @@ impl CublasOps for LiveCublas {
 
     #[allow(clippy::not_unsafe_ptr_arg_deref)] // seam method; recorders share it
     fn destroy(&mut self, handle: Self::Handle) {
-        // The C++ destructor ignores the status — a failed destroy on
-        // teardown has nowhere to report to.
+        // Status ignored — a failed destroy on teardown has nowhere to report.
         let _ = unsafe { cudarc::cublas::sys::cublasDestroy_v2(handle) };
     }
 
-    // The seam's method is safe by design — the recorders that share the
-    // trait never touch the pointer, and the live caller hands in a stream
-    // it owns. Marking one impl `unsafe` would change the trait every
-    // oracle drives.
+    // Safe by design: recorders never touch the pointer; the live caller
+    // owns the stream it hands in.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn set_stream(&mut self, handle: &Self::Handle, stream: *mut c_void) -> Result<(), i32> {
         use cudarc::cublas::sys::{cublasSetStream_v2, cublasStatus_t};
@@ -113,8 +76,7 @@ impl CublasOps for LiveCublas {
     }
 }
 
-/// Why construction or a rebind refused — the C++ `check`'s
-/// `runtime_error`, message format included.
+/// Why construction or a rebind refused — the C++ `check`'s `runtime_error`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CublasError {
     /// The failing `cublasStatus_t`.
@@ -131,17 +93,14 @@ impl std::fmt::Display for CublasError {
 
 impl std::error::Error for CublasError {}
 
-/// The RAII handle. See the module docs; `release` is the destructor, as
-/// everywhere else in this crate.
+/// The RAII handle; `release` is the destructor, as everywhere in this crate.
 #[derive(Debug)]
 pub struct CublasHandle<H> {
     handle: Option<H>,
 }
 
 impl<H> CublasHandle<H> {
-    /// The C++ constructor: create, bind the stream only when one was
-    /// given, then tensor-op math mode. A failure after create drops the
-    /// token without destroying it — the reproduced leak.
+    /// Create, bind the stream if one was given, then tensor-op math mode.
     pub fn create<O: CublasOps<Handle = H>>(
         ops: &mut O,
         stream: *mut c_void,
@@ -175,7 +134,7 @@ impl<H> CublasHandle<H> {
         self.handle.as_ref()
     }
 
-    /// Rebind the stream. Ports `set_stream`, throw included.
+    /// Rebind the stream.
     pub fn set_stream<O: CublasOps<Handle = H>>(
         &self,
         ops: &mut O,
@@ -188,8 +147,7 @@ impl<H> CublasHandle<H> {
         })
     }
 
-    /// The stream currently bound — what keeps a body's loose kernel
-    /// launches on the same stream as cuBLAS for graph capture.
+    /// The stream currently bound, kept so capture shares cuBLAS's loose launches.
     pub fn stream<O: CublasOps<Handle = H>>(&self, ops: &mut O) -> *mut c_void {
         let h = self.handle.as_ref().expect("a created handle");
         ops.get_stream(h)
@@ -204,29 +162,7 @@ impl<H> CublasHandle<H> {
 }
 
 impl<H> Drop for CublasHandle<H> {
-    /// The leak check — **except while the thread is already panicking.**
-    ///
-    /// `release` needs the `CublasOps` a destructor cannot reach, so the
-    /// only thing left here is to notice when a caller forgot. That is
-    /// worth a `debug_assert!` on the ordinary path and is actively
-    /// harmful on the unwinding one: a panic raised inside a `Drop` that
-    /// is running BECAUSE of another panic aborts the process, and the
-    /// message that reaches the terminal is *"panic in a destructor during
-    /// cleanup"* — this one — while the assertion that actually failed is
-    /// never printed at all.
-    ///
-    /// It cost a whole debugging session. A logit A/B failed, the process
-    /// died on SIGABRT with this text on top, and the real message
-    /// underneath it — *"argmax drifted (ours 11.875 at 14582)"* — was
-    /// simply gone. Every GPU test in the crate that holds a handle
-    /// across an assertion had the same hole.
-    ///
-    /// A handle leaked on the way out of a panic is also the case where
-    /// the check is worth least: the fire is being torn down, the process
-    /// is going down with it, and the leak is a consequence of the
-    /// failure rather than the failure. So the check keeps the path where
-    /// it can still be true and yields the one where it can only shout
-    /// over the answer.
+    /// Leak check, skipped while panicking — a nested panic in `Drop` buries the assertion.
     fn drop(&mut self) {
         debug_assert!(
             self.handle.is_none() || std::thread::panicking(),

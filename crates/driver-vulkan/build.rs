@@ -1,13 +1,8 @@
-//! Hand the module directory down to the tests.
-//!
-//! `kernels-vulkan` declares `links = "pie_kernels_vulkan"` and prints
-//! `cargo:spv_dir`, which cargo delivers to a DEPENDENT's build script as
-//! `DEP_PIE_KERNELS_VULKAN_SPV_DIR`. It does not deliver it to the dependent's
-//! own code, so this re-emits it as a rustc env for `option_env!` to pick up.
-//!
-//! `option_` is load-bearing: without `kernels-vulkan/native` there are no
-//! modules at all, and a test that cross-checks against them has to be able to
-//! SAY it has none rather than fail to compile.
+//! Hands the module directory down to the tests: `kernels-vulkan`'s `cargo:spv_dir` (via
+//! `links = "pie_kernels_vulkan"`) reaches this build script as
+//! `DEP_PIE_KERNELS_VULKAN_SPV_DIR` but not the crate's own code, so it is re-emitted as a
+//! rustc env for `option_env!`. `option_` is load-bearing: without `kernels-vulkan/native`
+//! there are no modules, so dependents must be able to say so rather than fail to compile.
 
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");

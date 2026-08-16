@@ -535,7 +535,32 @@ fn run_dense_tactic(
     lt_workspace: Option<(*mut c_void, usize)>,
     bias: *const c_void,
 ) -> bool {
-    if !bias.is_null() && t.kind != GemmKind::Gemv {
+    // `&& t.kind != GemmKind::Gemv` IS GONE, AND DELETING `gemv_bf16`'s
+    // `bias` IS WHAT REQUIRED IT.
+    //
+    // The exemption was honest while it lasted: every OTHER tactic refused
+    // a non-null bias because it had nowhere to put one, and `Gemv` was
+    // exempt because it did -- it forwarded the pointer straight into
+    // `gemv_bf16`'s fourth argument. *"Refuses a non-null bias for every
+    // tactic BUT this one, which is why the parameter exists"*, as `gemv.rs`
+    // put it.
+    //
+    // §3.9 deleted that argument, so the reason for the exemption is gone
+    // and only the exemption would have been left. THAT IS THE DANGEROUS
+    // RESIDUE OF A DELETION AND IT IS NOT THE DELETION'S OWN FILE. A
+    // non-null bias with `GemmKind::Gemv` would have gone from FORWARDED to
+    // SILENTLY DROPPED, still returning `true`, still reporting the tactic
+    // ran -- and the caller would have got an unbiased result reported as a
+    // biased one.
+    //
+    // Behaviour-neutral today, which is the only reason it is a one-line
+    // change rather than a bug report: both call sites (`dense.rs`'s tuner
+    // and its capture path) pass `std::ptr::null()`, so no branch changes
+    // for any input the tree produces. It is the FUTURE caller this stops,
+    // and the deletion is what made it possible to stop cheaply -- with the
+    // parameter gone there is no longer any way to express a bias here, so
+    // refusing one is now the whole truth rather than a policy.
+    if !bias.is_null() {
         return false;
     }
     match t.kind {
@@ -548,7 +573,18 @@ fn run_dense_tactic(
             };
             // SAFETY: the tuner's arena, live across the launch.
             let ctx = unsafe { crate::jit::Ctx::on(stream) };
-            gemv_bf16(&ctx, w, act, bias, y, n, k, beta).is_ok()
+            // `Weight(w)`, because the leg's parameter is `Weight<..>` now
+            // (`gemv.rs:53`) and this is the call the mark describes: `w`
+            // arrives here as `act_x_wt_bf16`'s named bank and goes on as
+            // one.
+            gemv_bf16(
+                &ctx,
+                kernels::Weight { ptr: w },
+                kernels::In { ptr: act, rows: 0, width: k },
+                kernels::Out { ptr: y, rows: 0, width: n },
+                beta,
+            )
+            .is_ok()
         }
         GemmKind::Lt => {
             let Some(plan) = plan else { return false };
@@ -1127,12 +1163,9 @@ pub unsafe fn act_x_wt_bf16(
         if let Some(stream) = cublas_stream(handle)
             && gemv_bf16(
                 &unsafe { crate::jit::Ctx::on(stream) },
-                w,
-                act,
-                std::ptr::null(),
-                y,
-                n,
-                k,
+                kernels::Weight { ptr: w },
+                kernels::In { ptr: act, rows: 0, width: k },
+                kernels::Out { ptr: y, rows: 0, width: n },
                 0.0,
             )
             .is_ok()
@@ -1414,14 +1447,30 @@ pub unsafe fn act_x_wt_bf16_out_fp32(
 ///
 /// # Safety
 ///
-/// The three pointer arrays must be HOST arrays of `group_count` device
-/// addresses (cuBLAS reads them on the host for the grouped form), and
-/// `m_array_host` a host array of `group_count` row counts.
+/// The three pointer arrays must be **DEVICE** arrays of `group_count` device
+/// addresses, and `m_array_host` a **host** array of `group_count` row counts.
+/// The split is real and is cuBLAS's: the scalar arrays (`m`/`n`/`k`, the
+/// leading dimensions, alpha and beta, the group sizes) are read on the host,
+/// and the `Aarray`/`Barray`/`Carray` pointer arrays are dereferenced on the
+/// device like every other batched form.
+///
+/// This said HOST for the pointer arrays, and said cuBLAS "reads them on the
+/// host for the grouped form". It does not. Handing it host addresses is
+/// `cudaErrorIllegalAddress` at the next synchronize on CUDA 13 / sm_120 --
+/// measured, not inferred, and the same call is clean when the arrays are
+/// staged to the device. It evidently went unpunished on whatever card
+/// recorded `tests/oracle/gemm_service/golden.txt`, since those rows hash to
+/// real products rather than to the untouched output buffer, which is what
+/// let a wrong sentence survive as a correct-looking one.
+///
+/// The only caller that matters already gets this right: `lora.rs` passes a
+/// slot in `staged.ptr_slab`, whose own doc calls it "the device pointer
+/// slab". The names were the bug, not the behaviour.
 pub unsafe fn grouped_act_x_wt_bf16(
     handle: *mut c_void,
-    act_ptrs_host: *const *const c_void,
-    w_ptrs_host: *const *const c_void,
-    y_ptrs_host: *const *mut c_void,
+    act_ptrs_dev: *const *const c_void,
+    w_ptrs_dev: *const *const c_void,
+    y_ptrs_dev: *const *mut c_void,
     m_array_host: *const i32,
     group_count: i32,
     n: i32,
@@ -1455,14 +1504,14 @@ pub unsafe fn grouped_act_x_wt_bf16(
             n_arr.as_ptr(),
             k_arr.as_ptr(),
             alpha.as_ptr().cast(),
-            w_ptrs_host,
+            w_ptrs_dev,
             cudaDataType::CUDA_R_16BF,
             lda.as_ptr(),
-            act_ptrs_host,
+            act_ptrs_dev,
             cudaDataType::CUDA_R_16BF,
             ldb.as_ptr(),
             beta_values.as_ptr().cast(),
-            y_ptrs_host,
+            y_ptrs_dev,
             cudaDataType::CUDA_R_16BF,
             ldc.as_ptr(),
             group_count,

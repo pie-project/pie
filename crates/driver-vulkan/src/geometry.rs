@@ -463,7 +463,7 @@ pub fn lanes(rule: Rule, dims: Dims, module: Module) -> Result<[u32; 3], Ungeome
         //
         // The rows round UP, which `groups` does by dividing by `local.y`, and
         // the rows of the last tile that are past the end are exactly why the
-        // row hands the kernel `Source::Rows`: they stay in the loop, reach
+        // row hands the kernel `Source::Named(<keys::Rows as keys::Fact>::KEY)`: they stay in the loop, reach
         // every barrier, and contribute nothing. `driver-metal`'s `sdpa_tiles`
         // is the same grid with the multiply written out, because a Metal
         // dispatch takes threads and quantises at the threadgroup.

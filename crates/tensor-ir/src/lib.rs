@@ -42,13 +42,6 @@
 //!
 
 #![cfg_attr(not(feature = "std"), no_std)]
-// This crate turns bytes it did not write into the vocabulary every other
-// crate trusts, and it is the one crate in the toolchain with no truncating
-// cast left in it. A narrowing `as` here would silently re-describe a decoded
-// count, extent or index as a smaller one, and the program that results is
-// well-formed -- so the failure surfaces as a wrong answer rather than a
-// rejected container. Narrow through `try_from` and say what happens when it
-// does not fit.
 #![deny(clippy::cast_possible_truncation)]
 
 extern crate alloc;

@@ -152,6 +152,17 @@ const CONFIGURED: &[(&str, &[&str], Headers, Toolchain)] = &[
         Headers::LibraryAndUpstream,
         Toolchain::ANY,
     ),
+    // FA4 forward, authored device code over FlashInfer's `mma.cuh`,
+    // `cp_async.cuh` and `permuted_smem.cuh` -- hence the upstream header set.
+    // Without `--device-as-default-execution-space` NVRTC parses those
+    // upstream helpers as host functions, the identical reason `attn/fa2.cuh`
+    // and `cascade/merge_states.cuh` give above.
+    (
+        "attn/fa4.cuh",
+        &["--device-as-default-execution-space"],
+        Headers::LibraryAndUpstream,
+        Toolchain::ANY,
+    ),
     // XQA's one file. The header set is the file's; the `-D` set is NOT, and
     // is the one thing in this crate that genuinely varies per point -- five
     // members compile this text five ways -- so `xqa` states its own with

@@ -345,13 +345,14 @@ mod tests {
         assert!(cuda.contains(&"driver.gpu_mem_utilization".to_string()));
         assert!(!metal.contains(&"driver.gpu_mem_utilization".to_string()));
         assert!(metal.contains(&"driver.total_pages".to_string()));
-        // The two portable shells are the pair worth separating, because they
-        // are the two whose tables overlap: both state `kv_pages` and only
-        // Vulkan states `kernels`. A wgpu listing that offered `kernels` would
-        // invite an operator to point this driver at a directory of SPIR-V it
-        // has no way to read -- its shaders are in the rlib.
+        // The two portable shells both state `kv_pages` and NEITHER states
+        // `kernels`. Vulkan used to: it named a directory of compiled SPIR-V,
+        // which invited an operator to point a driver at a `target/` tree.
+        // Both backends now carry their kernels in the rlib, so the key that
+        // told them apart is gone from the one that had it rather than added
+        // to the one that did not.
         assert!(vulkan.contains(&"driver.kv_pages".to_string()));
-        assert!(vulkan.contains(&"driver.kernels".to_string()));
+        assert!(!vulkan.contains(&"driver.kernels".to_string()));
         assert!(wgpu.contains(&"driver.kv_pages".to_string()));
         assert!(!wgpu.contains(&"driver.kernels".to_string()));
         // And the knobs the configured drivers have that this one does not --

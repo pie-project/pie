@@ -300,7 +300,7 @@ pub async fn boot_dummy() -> Result<pie::StandaloneHandle> {
 // The capability-test half: build a capability inferlet to wasm, submit it to
 // the engine `boot_4090()` brought up, and return its structured-JSON result
 // for hotel's `sampler_assert`. Pure client-side (no GPU), so it compiles +
-// type-checks Rust-only (without `--features driver-cuda`).
+// type-checks Rust-only (without `--features driver-cuda-13`).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -383,14 +383,15 @@ pub async fn run_inferlet(
 
 /// The standalone TOML for a Vulkan deployment.
 ///
-/// `[driver] kernels` names the SPIR-V directory the seam reads at `create`
-/// and `kv_pages` sizes the pool. There is no `gpu_mem_utilization` here:
+/// `kv_pages` sizes the pool. `kernels` STOOD beside it, naming the SPIR-V
+/// directory the seam read at `create`; the modules are in the binary now, so
+/// this block states one knob. There is no `gpu_mem_utilization` here:
 /// this driver does not derive a pool from a fraction of the card, it is told
 /// how many pages to hold. `device` is stated because the config requires it
 /// and ignored because `Device::open` takes the first Vulkan device the
 /// loader reports -- a selector here would be a setting nothing acts on.
-pub fn vulkan_standalone_toml(artifact: &str, kernels: &str) -> String {
-    vulkan_standalone_toml_with_pages(artifact, kernels, 256)
+pub fn vulkan_standalone_toml(artifact: &str) -> String {
+    vulkan_standalone_toml_with_pages(artifact, 256)
 }
 
 /// The same, with the pool sized by the caller.
@@ -399,8 +400,8 @@ pub fn vulkan_standalone_toml(artifact: &str, kernels: &str) -> String {
 /// thousand tokens, which no gate here comes close to, so the driver's
 /// `Exhausted` answer and the engine's re-post are never taken at the default.
 #[must_use]
-pub fn vulkan_standalone_toml_with_pages(artifact: &str, kernels: &str, kv_pages: u32) -> String {
-    vulkan_standalone_toml_named(artifact, kernels, kv_pages, "qwen3")
+pub fn vulkan_standalone_toml_with_pages(artifact: &str, kv_pages: u32) -> String {
+    vulkan_standalone_toml_named(artifact, kv_pages, "qwen3")
 }
 
 /// The same, with `[model] name` stated by the caller.
@@ -412,12 +413,7 @@ pub fn vulkan_standalone_toml_with_pages(artifact: &str, kernels: &str, kv_pages
 /// name were doing work, and the next person to change the boot path would
 /// have to re-derive that it is not.
 #[must_use]
-pub fn vulkan_standalone_toml_named(
-    artifact: &str,
-    kernels: &str,
-    kv_pages: u32,
-    name: &str,
-) -> String {
+pub fn vulkan_standalone_toml_named(artifact: &str, kv_pages: u32, name: &str) -> String {
     format!(
         "         [server]\n\
          port = 0\n\
@@ -429,17 +425,16 @@ pub fn vulkan_standalone_toml_named(
          [driver]\n\
          type = \"vulkan\"\n\
          device = [\"vulkan:0\"]\n\
-         kernels = \"{kernels}\"\n\
          kv_pages = {kv_pages}\n"
     )
 }
 
 /// The standalone TOML for the WebGPU driver.
 ///
-/// No artifact and no kernels path, which is the whole difference from the
-/// Vulkan block: the shaders are inside the binary, and the weights come from
-/// the `$PIE_HOME` model cache that `pie serve` reads -- so a gate names a
-/// model the cache already holds rather than a file it was handed.
+/// No artifact, which is the whole difference from the Vulkan block now that
+/// both backends carry their shaders in the binary: the weights come from the
+/// `$PIE_HOME` model cache that `pie serve` reads, so a gate names a model the
+/// cache already holds rather than a file it was handed.
 ///
 /// `device` says `gpu:0` and no driver reads it as a selector: `wgpu` asks the
 /// platform for an adapter itself. It is written because `device` is required
@@ -518,7 +513,8 @@ pub async fn boot_wgpu_named(
 /// vulkan` authored -- an artifact rather than a snapshot because this driver
 /// reads its declared quantization out of the embedded `model/config`, and
 /// one carrying its tokenizer because the runtime parses one at boot
-/// unconditionally. `PIE_KERNELS_VULKAN_SPV_DIR` names the compiled modules.
+/// unconditionally. The compiled modules need no variable: they are in the
+/// binary under `kernels-vulkan/native`.
 /// A colon-separated list is accepted and the first entry used: a deployment
 /// serves one model, and the engine's own tests take the list.
 pub async fn boot_vulkan() -> Result<pie::StandaloneHandle> {
@@ -559,12 +555,7 @@ pub async fn boot_vulkan_nth(
             )
         })?
         .to_string();
-    let kernels = std::env::var("PIE_KERNELS_VULKAN_SPV_DIR")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .context("PIE_KERNELS_VULKAN_SPV_DIR names the compiled modules")?;
-    let (controller, gateway, worker) = derive_standalone(&vulkan_standalone_toml_named(
-        &artifact, &kernels, kv_pages, name,
-    ))?;
+    let (controller, gateway, worker) =
+        derive_standalone(&vulkan_standalone_toml_named(&artifact, kv_pages, name))?;
     run_standalone(controller, gateway, worker).await
 }

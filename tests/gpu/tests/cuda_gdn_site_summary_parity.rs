@@ -22,7 +22,7 @@
 //! not matter here.
 //!
 //! `#[ignore]`, driver-cuda. Run OFF then ON, the second invocation gates:
-//!   cargo test -p pie-gpu-tests --features driver-cuda \
+//!   cargo test -p pie-gpu-tests --features driver-cuda-13 \
 //!     --test cuda_gdn_site_summary_parity -- --ignored --nocapture
 //!   PIE_DECLARED_FORWARD=1 cargo test ... --test cuda_gdn_site_summary_parity ...
 

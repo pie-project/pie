@@ -1,42 +1,12 @@
 //! Storage element types, and how many bytes one of them costs.
 //!
-//! A faithful mirror of `kernels-cuda/csrc/src/tensor.hpp`'s `DType`, right
-//! down to the discriminants -- see [`DType`] for why that is not incidental.
-//! That header was the ARCHIVE crate's, deleted with it at `85c6c674b`, and
-//! so is every other `kernels-cuda/csrc` path in this file: they are
-//! citations of a tree that is gone, not of one a reader can open.
-//!
-//! # Why not one of the four `DType`s the workspace already has
-//!
-//! Because none of them is this one:
-//!
-//! * `tensor_ir::DType` is the DSL's arithmetic vocabulary: `f32`, `i32`,
-//!   `u32`, `bool`. It describes what a kernel *computes in*, and it has no
-//!   notion of a packed nibble or an exponent-only scale byte because nothing
-//!   computes in those.
-//! * `driver_api::KvDtype` is the cross-node *wire* vocabulary, and is
-//!   deliberately narrow -- five variants, no `FP8_E5M2`, no `UINT8`, both of
-//!   which a KV cache format here can select. Widening it to fit would put
-//!   local storage decisions into a type whose job is to be stable across a
-//!   network.
-//! * `model_loader::DType` is the closest in spirit -- storage dtypes with a
-//!   `bytes()` -- but it describes what is *in a checkpoint file*, and it
-//!   arrives through a crate carrying `ztensor`, `safetensors`, `gguf`,
-//!   `pickle`, `hdf5` and `onnx`. That is a large dependency for a shell, and
-//!   the wrong direction of dependency besides.
-//!
-//! The right long-run answer is probably that the loader's and this one's
-//! converge. Until something forces that, this is the enum the C++ it is
-//! replacing actually uses, which is the property that matters while both are
-//! alive.
+//! A faithful mirror of the C++ `DType`, discriminants included (see [`DType`]).
+//! Separate from the workspace's other dtype enums because none fits.
 
 /// Element type of a stored tensor.
 ///
-/// The discriminants are the C++ enum's, exactly, and that is load-bearing
-/// rather than tidy: while the migration is in flight a `DType` will be handed
-/// across the FFI boundary as a `uint8_t`, and the two sides agreeing on the
-/// *numbers* is what makes that a cast instead of a translation table. A
-/// variant may be added at the end; none may be renumbered.
+/// Discriminants are the C++ enum's exactly: a `DType` crosses the FFI as a
+/// `uint8_t`, so a variant may be appended but none renumbered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum DType {
@@ -62,8 +32,7 @@ pub enum DType {
     Int4Packed = 9,
     /// Marlin-packed MXFP4 (E2M1 values with E8M0 block scales).
     Mxfp4Packed = 10,
-    /// OCP Microscaling's exponent-only scale byte: `b` denotes `2^(b - 127)`.
-    /// Only ever a block-scale companion, never a weight.
+    /// OCP Microscaling exponent-only scale byte (`2^(b-127)`); never a weight.
     E8M0 = 11,
 }
 
@@ -86,15 +55,8 @@ impl DType {
 
     /// Bytes one *storage* element occupies.
     ///
-    /// Storage, not logical: the packed types report 1, because one byte is
-    /// what they take, even though it carries two logical values. Callers that
-    /// need the logical count divide separately -- which is exactly what
-    /// [`crate::layout::KvCacheFormat::storage_head_dim`] does.
-    ///
-    /// Total rather than a `Result`: the C++ closes an exhaustive `switch`
-    /// with `throw std::runtime_error("unknown dtype")`, which is unreachable
-    /// there and does not exist here, because `match` on a Rust enum has no
-    /// unknown arm to fall out of.
+    /// Storage, not logical: the packed types report 1 (one byte, two logical
+    /// values); callers divide for the logical count.
     #[must_use]
     pub const fn size_bytes(self) -> usize {
         match self {
@@ -149,10 +111,7 @@ mod tests {
 
     #[test]
     fn the_tags_are_the_cpp_enums_discriminants() {
-        // Pinned literally, against `kernels-cuda/csrc/src/tensor.hpp`. These
-        // numbers cross the FFI boundary during the migration, so a
-        // reordering here is a silent misinterpretation there -- the kind that
-        // shows up as a wrong-sized allocation rather than a compile error.
+        // Pinned literally: a reordering is a silent FFI misread, not an error.
         assert_eq!(DType::Bf16.tag(), 0);
         assert_eq!(DType::Fp16.tag(), 1);
         assert_eq!(DType::Fp32.tag(), 2);
@@ -188,8 +147,7 @@ mod tests {
         assert_eq!(DType::Uint8.size_bytes(), 1);
         assert_eq!(DType::Fp8E4M3.size_bytes(), 1);
         assert_eq!(DType::Fp8E5M2.size_bytes(), 1);
-        // The packed pair report the byte they occupy, not the two logical
-        // values in it. Everything downstream sizes buffers off this.
+        // The packed pair report their byte, not the two logical values in it.
         assert_eq!(DType::Int4Packed.size_bytes(), 1);
         assert_eq!(DType::Mxfp4Packed.size_bytes(), 1);
         assert_eq!(DType::E8M0.size_bytes(), 1);
@@ -197,12 +155,7 @@ mod tests {
 
     #[test]
     fn the_names_are_the_cpp_dtype_name_spellings_verbatim() {
-        // Not a naming convention: these are the literals in
-        // `kernels-cuda/csrc/src/tensor.hpp`'s `dtype_name`, and they are
-        // inconsistent -- `u8` is abbreviated where `int8` is not, the FP8
-        // pair drops the underscore that the KV format names keep, and the
-        // packed pair uses a hyphen. Regularising any of them changes what a
-        // synthesised `KvCacheFormat::name` reports.
+        // Verbatim C++ `dtype_name` literals; the inconsistency is load-bearing.
         assert_eq!(DType::Uint8.name(), "u8");
         assert_eq!(DType::Fp8E4M3.name(), "fp8e4m3");
         assert_eq!(DType::Fp8E5M2.name(), "fp8e5m2");

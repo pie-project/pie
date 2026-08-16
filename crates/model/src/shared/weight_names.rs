@@ -146,7 +146,10 @@ impl Names {
             ("q_proj", "self_attn.q_proj"),
             ("k_proj", "self_attn.k_proj"),
             ("v_proj", "self_attn.v_proj"),
-            ("o_proj", "self_attn.o_proj"),
+            // TWO modules, because a hybrid stack's landing lives under
+            // whichever block the layer is. Attention first: it is the
+            // spelling twelve families ship and the only one they ship.
+            ("o_proj", "self_attn.o_proj|linear_attn.out_proj"),
             // The Qwen-2 family's projection biases, which are ADDITIVE
             // vectors and not a quantizer's zero points.
             //
@@ -233,6 +236,50 @@ impl Names {
             ("attn_sinks", "self_attn.sinks"),
             ("q_norm", "self_attn.q_norm"),
             ("k_norm", "self_attn.k_norm"),
+            // ── the GATED DELTANET's nine, which only qwen-3.5 names. ──
+            //
+            // A hybrid stack interleaves these with the attention roles
+            // above and publishes NEITHER set in the layers that use the
+            // other, so every one of them resolves to nothing in a llama
+            // -- which is right, and is why they cost that family
+            // nothing to carry here.
+            //
+            // Measured on `mlx-community/Qwen3.6-35B-A3B-4bit`, layer 0:
+            // `in_proj_qkv` is `[8192, 256]` u32 (conv_dim 8192 = two key
+            // planes of 2048 plus a value plane of 4096, at group 64 /
+            // 4 bits), `conv1d.weight` is `[8192, 4, 1]`, `A_log` and
+            // `dt_bias` are `[32]` (one per VALUE head) and `norm.weight`
+            // is `[128]` (one per value head DIM).
+            ("in_proj_qkv", "linear_attn.in_proj_qkv"),
+            ("in_proj_z", "linear_attn.in_proj_z"),
+            ("in_proj_a", "linear_attn.in_proj_a"),
+            ("in_proj_b", "linear_attn.in_proj_b"),
+            ("conv_w", "linear_attn.conv1d"),
+            // The convolution bias the SHADER reads and the checkpoint
+            // does not have. `Qwen3NextGatedDeltaNet` builds its
+            // depthwise conv with `bias=False`, and `gdn_core.metal`
+            // seeds its accumulator from `conv_b[c]` unconditionally --
+            // so the contract publishes a zero plane under this name
+            // rather than the kernel growing a branch for a tensor that
+            // is absent from every checkpoint that will ever reach it.
+            // Named `.bias` and not `.bias.weight`, which resolves
+            // because `weight_suffix` tries the bare name second.
+            ("conv_b", "linear_attn.conv1d.bias"),
+            // `gdn_core.metal` declares `A_log` as `const device float*`
+            // where every other operand is `T`. The checkpoint ships it
+            // bf16, so the contract casts; see `author_qwen3_5_mlx`.
+            ("a_log", "linear_attn.A_log"),
+            // `dt`, and NOT `dt_bias`, which is what the checkpoint calls
+            // the tensor. A role whose name ends in `_bias` means
+            // "the `.bias` of the module this row names" in this
+            // vocabulary -- `q_bias` and `q_proj` are one module and two
+            // tensors -- so a role spelled `dt_bias` would resolve to
+            // `linear_attn.dt_bias.bias`, which nothing publishes. The
+            // reserved tail is the reason for the shorter role; the map
+            // is where a checkpoint's spelling and a text's meet, and
+            // this is one of the meetings.
+            ("dt", "linear_attn.dt_bias"),
+            ("gate_norm", "linear_attn.norm"),
             ("attn_norm", "input_layernorm"),
             // TWO spellings, and which one a checkpoint means is decided by
             // which one it ships. Under `NormPlacement::Pre` the pre-FFN norm

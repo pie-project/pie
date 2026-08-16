@@ -14,10 +14,11 @@ byte -- steps 1 and 2 mechanically, step 3 from upstream and not from here:
        `tests/upstream_manifest.rs` and was empty; see THE TEST IS GONE
        below;
     3. put back everything a `// PIE: REMOVED` marker names, the files listed
-       under HOST C++ below, and the one EDIT listed under THE EDIT THAT IS
-       NOT A REMOVAL.  A strip cannot perform step 3 on its own: removed text
-       leaves nothing to strip, only a marker saying what stood there.  Step 3
-       needs the upstream tarball; steps 1 and 2 do not.
+       under HOST C++ below, and the two EDITS listed under THE EDIT THAT IS
+       NOT A REMOVAL and THE SECOND EDIT below it.  A strip cannot perform
+       step 3 on its own: removed text leaves nothing to strip, only a marker
+       saying what stood there.  Step 3 needs the upstream tarball; steps 1
+       and 2 do not.
 
 THE DIRECTION OF STEP 3 REVERSED, and this document said the opposite until
 it did.  It used to read "restore `#include "exception.h"` to `page.cuh` and
@@ -102,6 +103,39 @@ So the record is here, and `mha.cuh`'s own header says so at the top of the
 file where a rebaser will read it before touching anything.  What a strip must
 not do is produce a file that claims to be upstream's and is not; naming the
 line in two places it will be read is what prevents that.
+
+THE SECOND EDIT IS UPSTREAM'S BUG RATHER THAN OUR SHIM'S, AND IT IS THE ONLY
+ONE OF THESE THAT A ROOT COULD NOT COMPILE WITHOUT:
+
+    attention/mla.cuh:762    o_smem.stmatrix_m8n8x4(o_smem_offset_w, o_frag_f16);
+    upstream mla.cuh:762     o_smem.template stmatrix_m8n8x4(o_smem_offset_w, o_frag_f16);
+
+`smem_t::stmatrix_m8n8x4` (`permuted_smem.cuh:148`) is not a template.  The
+`template` disambiguator asserts that the name which follows IS one, so the
+compiler demands the argument list that a non-template cannot take, and NVRTC
+says *"argument list for template ... is missing"*.  Upstream's own TEN other
+call sites -- `mla.cuh:531` and nine in `prefill.cuh`, from `:892` to `:1900`
+-- all spell it without the keyword; 762 is the only one that does not.  This
+is not our shim making an upstream line unbuildable, which is what the XQA
+edit above was; it is a line that no compiler accepts, and reporting it
+upstream is the right disposition.
+
+IT WAS INVISIBLE UNTIL THE ARCH REACHED IT.  The line sits under
+`#ifdef FLASHINFER_STMATRIX_M8N8X4_ENABLED`, which `mma.cuh:38` defines only
+for `__CUDA_ARCH__ >= 900`.  Every arch below that compiles the `#else` branch
+and never parses the faulty one, so the bug ships dead and stays dead until
+something targets Hopper or newer.  `every_instantiation_compiles` is what
+reached it: `attn/attention_mla_fa2` was 1 of 127 roots failing, and the whole
+kernel was unreachable at run time on this machine because a JIT root that
+does not compile is a kernel that does not exist.
+
+IT CARRIES NO MARKER FOR THE SAME ARITHMETIC AS THE FIRST, AND THE CITATIONS
+THAT WOULD BREAK ARE NAMED.  `attn/attention_mla_fa2.cuh` cites this file at
+`:78-81`, `:98`, `:879`, `:1061`, `:1100-1120`, `:1124`, `:1125` and `:1132` --
+every one of them below 762 -- so a marker line inserted above the edit would
+falsify all eight.  A one-token change that costs no lines is worth less than
+eight citations that still land where they say.  This entry is the record, and
+this file is the place a rebaser is sent.
 
 HOST C++ IS GONE, AND THAT IS WHY THIS TABLE LOST FOUR ROWS.  The move
 carried 28 files.  Four of them contained no device code at all -- not one

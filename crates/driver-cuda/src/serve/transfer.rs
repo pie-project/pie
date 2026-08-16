@@ -1,10 +1,8 @@
 //! Moving and resizing what the fires read: KV pages, recurrent state, and
 //! the pools that hold them.
 //!
-//! Three exports that touch device memory and nothing else. They share a
-//! shape — validate every index, then move — which `.wiki/driver/graph.md`
-//! §3 rule 3 states as a rule and `store/control.rs` on the Metal side
-//! records the bug it prevents.
+//! Three exports that touch device memory and nothing else, sharing one shape:
+//! validate every index, then move.
 
 use super::guard;
 use super::state::{KvState, Shell, SwapPool};
@@ -13,19 +11,10 @@ use driver_api::local::{
     PIE_STATUS_UNSUPPORTED,
 };
 
-/// KV copies across all four domains: whole-page moves (`src_page_ids` →
-/// `dst_page_ids`, every layer, every buffer) and beam-repair CELL moves
-/// through the bridged `copy_kv_cells_bf16`.
-///
-/// The host legs go through `pools::swap_pool` and `layout::swap_plan`,
-/// which is a change of substance and not of spelling. This used to
-/// refuse them, then quietly grew an inline pool that assumed TWO buffers
-/// per layer of ONE width — so a quantized cache (four buffers: `k`, `v`,
-/// `k_scale`, `v_scale`) and gemma-4 (layers disagreeing on head dim)
-/// were both turned away by a stride check rather than served. The ported
-/// pool derives its regions from `KvCacheLayout::page_buffers`, which
-/// answers per layer and per buffer, and `SwapPlan` builds the copy list
-/// against that same geometry.
+/// KV copies across all four domains: whole-page moves (every layer, every
+/// buffer) and beam-repair cell moves through `copy_kv_cells_bf16`. Host legs
+/// derive regions per layer and per buffer from `KvCacheLayout::page_buffers`,
+/// so scale planes and gemma-4's differing head dims are geometry, not refusal.
 impl Shell {
     /// Move KV pages, within this device or across the host boundary.
     ///
@@ -43,8 +32,7 @@ impl Shell {
 
             let state = self;
             // The two rules a `Vec` does not state: both domains name a real
-            // one, and the page lists are parallel. The rest of
-            // `validate_kv_copy_desc` was `ptr/len mismatch`.
+            // one, and the page lists are parallel.
             if let Err(why) = copy.validate() {
                 eprintln!("[driver-cuda] copy_kv: {why}");
                 return Err(PIE_STATUS_INVALID_ARGUMENT);
@@ -75,9 +63,6 @@ impl Shell {
             let page_size: i32 = 16;
             let _layers_n = model.deployment.layers as usize;
 
-            // THE POOL, planned rather than assumed. `page_buffers` answers
-            // per layer AND per buffer, so a quantized cache's scale planes and
-            // gemma-4's differing head dims are geometry rather than a refusal.
             if host_src || host_dst {
                 use crate::fire::attention_workspace::{LiveStagingOps, StagingOps};
                 let kv_ref = state.kv.as_ref().expect("checked");
@@ -100,11 +85,8 @@ impl Shell {
                     kv_heads,
                     head_dim,
                 );
-                // Reuse when the geometry AND the capacity still cover this
-                // move. `check_against` is the pool's own test that the device
-                // side has not changed shape underneath it — a resize that
-                // moved a stride would otherwise write host pages of the wrong
-                // width, which is corruption rather than degradation.
+                // Reuse only when geometry and capacity still cover this move;
+                // else a moved stride writes host pages of the wrong width.
                 let reusable = matches!(&state.swap, Some(sp)
                 if sp.plan.num_pages() >= plan.num_pages()
                     && sp.plan.geometry() == plan.geometry());
@@ -121,12 +103,9 @@ impl Shell {
                         };
                         regions.push(p);
                     }
-                    // The two stream ROLES the plan asks for, created once and
-                    // kept: a restore is on the critical path — an evicted
-                    // process cannot run until its pages are back — and queueing
-                    // it behind pending evictions is the stall the second stream
-                    // exists to avoid. The old code made a fresh stream per
-                    // call, which is neither.
+                    // The two stream roles the plan asks for, created once: a
+                    // restore is on the critical path, so it must not queue
+                    // behind pending evictions — the second stream avoids that.
                     let st = plan.streams();
                     let mk = |want: bool| -> Option<crate::device::OwnedStream> {
                         want.then(|| crate::device::OwnedStream::new(0).ok())
@@ -145,9 +124,8 @@ impl Shell {
                 }
             }
 
-            // The stream the DEVICE legs and the cell moves ride. The host
-            // legs take the pool's own evict/restore streams instead, which is
-            // why those are made with the pool rather than here.
+            // The stream the device legs and cell moves ride; host legs take
+            // the pool's own evict/restore streams instead.
             let stream = match crate::device::OwnedStream::new(0) {
                 Ok(s) => s,
                 Err(_) => return Err(PIE_STATUS_DRIVER_ERROR),
@@ -162,24 +140,19 @@ impl Shell {
                 }
             }
 
-            // THE COPY LIST IS BUILT, not nested by hand.
-            //
             // `SwapPlan::build` walks layer × page × buffer and emits one
-            // `CopyOp` per contiguous move, with the offsets in each side's own
-            // index space. That last part is the reason it exists: the two
-            // pools generally have different capacities, so a transposed
-            // src/dst is not reliably caught by a bounds check, and `Direction`
-            // names which side is which so a call site cannot read
-            // ambiguously.
+            // `CopyOp` per contiguous move, with offsets in each side's own
+            // index space: the two pools differ in capacity, so a transposed
+            // src/dst is not caught by a bounds check, and `Direction` names
+            // which side is which.
             use crate::layout::swap_plan::{Direction, Pool, SwapPlan};
             let direction = match (host_src, host_dst) {
                 (false, true) => Direction::DeviceToHost,
                 (true, false) => Direction::HostToDevice,
                 _ => Direction::DeviceToDevice,
             };
-            // The DEVICE geometry, which is what a device-to-device move is in.
-            // A host leg uses the pool's, which was planned from this same
-            // `page_buffers` and therefore agrees by construction.
+            // The device geometry a device-to-device move is in; a host leg
+            // uses the pool's.
             let layout = kv_ref.cache.layout();
             let dev_geometry = crate::layout::swap_plan::PoolGeometry::new(
                 (0..kv_ref.layers())
@@ -209,16 +182,13 @@ impl Shell {
             .map_or_else(|| stream.as_ref(), crate::device::OwnedStream::as_ref);
             for op in plan.ops() {
                 // A layer that owns no pages has nothing to move: gemma-4's
-                // KV-shared trailing layers read through their source's pool,
-                // so visiting them would move the same bytes twice.
+                // KV-shared trailing layers read through their source's pool.
                 let resolve = |e: Pool| -> Option<*mut u8> {
                     match e {
                         Pool::Device { layer, buffer } => {
                             let (k, v) = kv_ref.owned(layer as usize)?;
                             // Buffers beyond the k/v pair are the quantized
-                            // format's scale planes, which this shell does not
-                            // hand out yet -- and cannot move what it cannot
-                            // address.
+                            // format's scale planes, not addressable yet.
                             match buffer {
                                 0 => Some(k.cast::<u8>()),
                                 1 => Some(v.cast::<u8>()),
@@ -229,19 +199,17 @@ impl Shell {
                     }
                 };
                 let (Some(dst), Some(src)) = (resolve(op.dst), resolve(op.src)) else {
-                    // Both sides absent is a layer with no pages; one side
-                    // absent is a buffer this shell cannot address, and a
-                    // partial move is worse than none.
+                    // Both absent is a layer with no pages; one absent is an
+                    // unaddressable buffer, and a partial move is worse than none.
                     if resolve(op.dst).is_some() != resolve(op.src).is_some() {
                         eprintln!(
                             "[driver-cuda] copy_kv: this cache carries a buffer the \
                          shell cannot address, so the move would be partial"
                         );
-                        // DRAIN WHAT IS ALREADY QUEUED. Earlier buffers of
-                        // this same op enqueued onto `leg`, and a later
-                        // `copy_kv` that finds the pool unusable does
-                        // `swap.take(); old.free()` — a `cudaFreeHost` of
-                        // regions those copies are still reading.
+                        // Drain what is already queued: earlier buffers of this
+                        // op enqueued onto `leg`, and a later `copy_kv` that
+                        // frees the pool would `cudaFreeHost` regions those
+                        // copies are still reading.
                         let _ = leg.synchronize();
                         return Err(PIE_STATUS_UNSUPPORTED);
                     }
@@ -272,7 +240,7 @@ impl Shell {
             }
 
             // Cell moves: the bridged beam-repair launcher, per layer. Disjoint
-            // spans are the CALLER's contract, as the kernel's header states.
+            // spans are the caller's contract.
             if !cells.is_empty() {
                 let alloc = crate::device::Allocator::new();
                 let up = |vals: &[u32]| -> Result<crate::device::DeviceBuffer, i32> {
@@ -289,9 +257,8 @@ impl Shell {
                     (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
                     _ => return Err(PIE_STATUS_EXHAUSTED),
                 };
-                // Only the layers that OWN pages: a shared layer's cells live
-                // in its source's pool, so visiting it too would copy them
-                // twice.
+                // Only the layers that own pages: a shared layer's cells live in
+                // its source's pool, so visiting it too would copy them twice.
                 for i in 0..kv_ref.layers() {
                     let (Some((k, v)), Some(d)) = (kv_ref.owned(i), kv_ref.head_dim(i)) else {
                         continue;
@@ -318,15 +285,9 @@ impl Shell {
                         native_bf16: true,
                     };
                     unsafe {
-                        // `attn/kv_paged.cu`'s `copy_kv_cells_bf16` was this
-                        // call's only consumer, so the port was Rust-to-Rust
-                        // and the C++ launcher, its declaration and its
-                        // `driver_internal` row went with it. The return is
-                        // `#[must_use]` and is read: `Declined(NoCells)` is
+                        // The return is `#[must_use]`: `Declined(NoCells)` is
                         // the `N <= 0` exit, which cannot happen under the
-                        // `!cells.is_empty()` this loop runs under, and
-                        // discarding it silently would spell "it declined"
-                        // the same as "it ran".
+                        // `!cells.is_empty()` this loop runs under.
                         let moved = crate::fire::kv_paged::copy_kv_cells_bf16(
                             layer,
                             d_dp.as_ptr().cast(),
@@ -343,25 +304,12 @@ impl Shell {
                     }
                 }
             }
-            // BOTH STREAMS, and it synchronized only one.
-            //
-            // A HOST leg rides the pool's own `evict`/`restore` stream — that
-            // is what `leg` selects above — while the cell moves ride this
-            // call's. `OwnedStream::new` asks for `cudaStreamNonBlocking`
-            // precisely so unrelated streams do NOT order against each other,
-            // so synchronizing `stream` said nothing about the page copies.
-            //
-            // The engine was therefore told an evicted process's pages were
-            // back while the H2D was still queued: it schedules a fire, the
-            // fire reads KV pages that are partly unwritten, and the logits
-            // are wrong rather than late. The other direction frees device
-            // pages the D2H is still reading.
-            //
-            // `leg` is `stream` when the pool has no stream for this
-            // direction, so the second synchronize is a no-op in the device
-            // case rather than a special case here.
-            // BOTH, not `||`. Short-circuiting on the first failure left the
-            // pool's stream loaded, which is the state the whole fix is about.
+            // Synchronize both streams, not just `stream`: `leg` may be the
+            // pool's own non-blocking evict/restore stream, which does not
+            // order against `stream`, so leaving it unsynchronized would let a
+            // fire read KV pages the H2D has not finished writing. Both, not
+            // `||`: short-circuiting on the first failure leaves the other
+            // stream loaded.
             let (a, b) = (stream.as_ref().synchronize(), leg.synchronize());
             if a.is_err() || b.is_err() {
                 return Err(PIE_STATUS_DRIVER_ERROR);
@@ -374,12 +322,8 @@ impl Shell {
         })
     }
 
-    /// Direct recurrent-state copies: WHOLE-SLOT d2d over the hybrid's GDN
-    /// slabs (conv + recurrent, every linear layer), the C++ shape
-    /// (`context.cpp` ignores the token fields — those ride for the rs
-    /// BUFFER pool, spec-decode machinery). Slot ids are the engine's; the
-    /// slabs grow with migration to cover them.
-    /// Move recurrent state.
+    /// Move recurrent state: whole-slot d2d over the hybrid's GDN slabs. The
+    /// token fields ride for the rs buffer pool (spec-decode machinery).
     ///
     /// # Errors
     ///
@@ -391,12 +335,10 @@ impl Shell {
     ) -> Result<(), i32> {
         guard("copy_state", Err(PIE_STATUS_DRIVER_ERROR), move || {
             let state = self;
-            // `validate_state_copy_desc` stated only `ptr/len mismatch` and the
-            // header words. A `StateCopyPlan` cannot be in either state.
             let desc = copy;
             let Some(gdn) = state.gdn.as_mut() else {
-                // No recurrent family is loaded — the C++ shape: state copies
-                // only mean something once the rs cache exists.
+                // No recurrent family is loaded: state copies only mean
+                // something once the rs cache exists.
                 return Err(PIE_STATUS_INVALID_ARGUMENT);
             };
             let ranges = desc.slot_ranges.as_slice();
@@ -409,26 +351,18 @@ impl Shell {
                 .map(|r| r.src_slot_id.max(r.dst_slot_id) + 1)
                 .max()
                 .unwrap_or(0);
-            // The epoch rides IN, because growing is what bumps it. This
-            // call site used to do it by hand and the two in the fire path
-            // did too — three copies of one rule, and a fourth caller that
-            // forgot would be a capture replaying into a freed slab.
+            // The epoch rides in because growing is what bumps it; a caller
+            // that forgot would let a capture replay into a freed slab.
             if let Err(code) = gdn.ensure_slots(need, &mut state.fire_arrays.epoch, &alloc, &stream)
             {
                 return Err(code);
             }
             for range in ranges {
-                // WHOLE SLOTS, and this comment used to name the function it
-                // was reimplementing: "The C++ (`context.cpp::copy_state`)
-                // copies WHOLE SLOTS (`rs_cache->copy_slot_d2d(src, dst)`)".
-                // It calls it now. The token fields still ride for the rs
-                // BUFFER pool, which is spec-decode machinery.
-                //
-                // `copy_slot_d2d` carries the MTP pending-hidden row too where
-                // `copy_linear_state_slot_d2d` (the fold's) deliberately does
-                // not -- a state copy is a clone and wants everything, a fold
-                // is a rollback and would overwrite a newer MTP value with an
-                // older one.
+                // Whole slots. `copy_slot_d2d` carries the MTP pending-hidden
+                // row too, where the fold's `copy_linear_state_slot_d2d`
+                // deliberately does not: a state copy is a clone and wants
+                // everything, a fold is a rollback and must not overwrite a
+                // newer MTP value with an older one.
                 let Ok(ops) = gdn.cache.copy_slot_d2d(
                     i32::try_from(range.src_slot_id).unwrap_or(-1),
                     i32::try_from(range.dst_slot_id).unwrap_or(-1),
@@ -447,12 +381,8 @@ impl Shell {
         })
     }
 
-    /// Resize the KV pool to `target_pages`, MIGRATING the surviving pages —
-    /// the migration the launch-time growth deliberately skipped. Shrinks
-    /// drop the tail; `map_ranges`/`unmap_ranges` (the elastic-VMM form) are
-    /// accepted but the shell's pools are plain allocations, so the target
-    /// page count is the whole contract here — stated, not hidden.
-    /// Commit or release pool pages.
+    /// Resize the KV pool to `target_pages`, migrating the surviving pages;
+    /// shrinks drop the tail.
     ///
     /// # Errors
     ///
@@ -465,8 +395,6 @@ impl Shell {
     ) -> Result<(), i32> {
         guard("resize_pool", Err(PIE_STATUS_DRIVER_ERROR), move || {
             let state = self;
-            // Same as `copy_state`: that validator stated `ptr/len mismatch` and
-            // the header words, and this plan has neither.
             let desc = resize;
             let Ok(target) = u32::try_from(desc.target_pages) else {
                 return Err(PIE_STATUS_INVALID_ARGUMENT);
@@ -477,8 +405,6 @@ impl Shell {
             let Some(model) = state.model.as_ref() else {
                 return Err(PIE_STATUS_INVALID_ARGUMENT);
             };
-            // The head dim is per LAYER on the row and no longer needed as a
-            // scalar here: `PerLayer::head_dim` below takes the table.
             let kv_heads = i32::try_from(model.deployment.shape.kv_heads).unwrap_or(0);
             let page_size: usize = 16;
 
@@ -487,47 +413,23 @@ impl Shell {
                 Err(_) => return Err(PIE_STATUS_DRIVER_ERROR),
             };
             let alloc = crate::device::Allocator::new();
-            // BORROWED, not taken. This read `state.kv.take()`, and seven
-            // early returns sit between here and the `install_kv` that
-            // repopulates it — each one dropping the cache, freeing every KV
-            // page, and leaving the shell with `kv: None`.
-            //
-            // The realistic one is `materialize` answering
-            // `PIE_STATUS_EXHAUSTED`, which is exactly what an engine asking
-            // to GROW past available VRAM gets and exactly the status it is
-            // meant to treat as retryable. It saw a recoverable "not enough
-            // memory" and an unrecoverably dead driver: every later
-            // `pie_cuda_launch` fails on `state.kv.as_ref()` and every
-            // request's context is gone.
-            //
-            // `old` is only ever READ here — the geometry and the page
-            // contents to copy forward — so a borrow is all it needed.
-            // `install_kv` drops the old one at the end, where the new one is
-            // already in hand. `pie_cuda_copy_kv` in this same file shows the
-            // shape: build the replacement, then release what it replaces.
+            // Borrowed, not taken: `old` is only read (its geometry and the
+            // pages to copy forward), and several early returns sit between
+            // here and `install_kv`. Taking it would drop the cache and leave
+            // the shell `kv: None` on an otherwise-retryable `EXHAUSTED` from
+            // growing past VRAM. `install_kv` drops the old cache at the end,
+            // once the new one is in hand.
             let old = state.kv.as_ref();
-            // Per-layer page bytes: an existing pool states its own stride
-            // (the two-head-dim families' rows disagree); before any pool
-            // exists the DEPLOYMENT decides.
-            //
-            // It used to be re-derived here from `hf.layer_types` — a
-            // gemma-4 sniff on a weight name, a `num_kv_shared_layers`
-            // subtraction, and a reverse scan for the last earlier layer of
-            // the same kind — which is `fire/launch.rs`'s per-layer table
-            // written a second time, from a different source, and required
-            // to come out identical. It is not a hypothetical: a resize that
-            // laid out one stride while the fire path bound another would
-            // read every shared layer's pages at the wrong pitch and emit
-            // plausible tokens.
-            //
-            // The row states the table once. Both readers take it.
+            // Per-layer page bytes: an existing pool states its own stride (the
+            // two-head-dim families disagree); before any pool exists the
+            // deployment decides. The resize and fire paths must read the same
+            // table, or a shared layer's pages get read at the wrong pitch.
             let dep = &model.deployment;
             let n_layers = dep.layers as usize;
 
-            // A resize changes the page COUNT and nothing else, so an
-            // existing cache states its own geometry and nothing is
-            // re-derived. Before any cache exists there is nothing to ask,
-            // and the deployment answers.
+            // A resize changes the page count and nothing else, so an existing
+            // cache states its own geometry; before any exists, the deployment
+            // answers.
             let layout = match old
                 .as_ref()
                 .map(|o| o.cache.layout().with_num_pages(target as i32))
@@ -537,9 +439,8 @@ impl Shell {
                 None => {
                     let per = crate::pools::kv_cache::PerLayer {
                         head_dim: dep.attention.iter().map(|a| a.head_dim as i32).collect(),
-                        // gemma-4's tail attends through the last earlier
-                        // layer of its own kind; every other family owns its
-                        // pages. A fact about a LAYER, and the row says it.
+                        // gemma-4's tail attends through the last earlier layer
+                        // of its own kind; every other family owns its pages.
                         kv_source_layer: dep.attention.iter().map(|a| a.kv_source as i32).collect(),
                         num_kv_heads: vec![kv_heads; n_layers],
                     };
@@ -609,11 +510,10 @@ impl Shell {
             if stream.as_ref().synchronize().is_err() {
                 return Err(PIE_STATUS_DRIVER_ERROR);
             }
-            // A RESIZE MOVES THE KV PAGES, and a captured graph baked their old
-            // addresses into every attention launch. `install_kv` is what tells
+            // A resize moves the KV pages, and a captured graph baked their old
+            // addresses into every attention launch; `install_kv` tells
             // `Recordings` to recapture instead of replaying into memory the
-            // pool no longer owns — which showed up as a segfault the moment decode
-            // fires became capturable at all.
+            // pool no longer owns.
             crate::serve::state::install_kv(&mut state.kv, &mut state.fire_arrays.epoch, fresh);
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
             state

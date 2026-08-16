@@ -514,6 +514,53 @@ mod tests {
         VARIANTS.iter().find(|v| v.id == id).expect("row present")
     }
 
+    /// The `attention_k_eq_v` rows are refused on CUDA, and the others
+    /// are not.
+    ///
+    /// `Refusal` was imported by this module and used by nothing, which
+    /// is what a deleted assertion leaves behind. The fact it was
+    /// standing for is real and load-bearing: `trace` declines 31B and
+    /// 26B-A4B because they read V out of the K projection and ship no
+    /// `v_proj`, while the hand-written CUDA text projects one
+    /// unconditionally -- so tracing them would bind a tensor the
+    /// checkpoint does not contain.
+    ///
+    /// It was checked nowhere. `driver-cuda`'s `catalog_coverage` is
+    /// behind `_cuda` and `abi` and does not run in this crate's CI job,
+    /// and it read `gemma-4-31b` as fully servable until it learned to
+    /// ask `trace()` rather than only `deployment()`. Both rows DEPLOY;
+    /// the refusal is here and only here, which is exactly why deleting
+    /// the import would have been the wrong repair.
+    ///
+    /// Both fire classes, because they are traced separately.
+    #[test]
+    fn the_k_eq_v_rows_are_refused_on_cuda() {
+        use model_ir::trace::FireClass;
+        for class in [FireClass::Prefill, FireClass::Decode] {
+            for id in ["gemma-4-31b", "gemma-4-26b-a4b"] {
+                let r = row(id).trace(class, Deployed::single());
+                assert!(
+                    matches!(r, Err(Refusal::Unsupported(m)) if m.contains("attention_k_eq_v")),
+                    "{id} must refuse {class:?} on CUDA for `attention_k_eq_v`"
+                );
+                // The refusal is the TEXT's, not the door's: both rows
+                // open. A row that failed here and at `deployment` too
+                // would make this test pass for the wrong reason.
+                assert!(
+                    row(id).deployment(Deployed::single()).is_ok(),
+                    "{id} deploys -- that is what makes the trace refusal the \
+                     one that matters"
+                );
+            }
+            for id in ["gemma-4-e2b", "gemma-4-e4b"] {
+                assert!(
+                    row(id).trace(class, Deployed::single()).is_ok(),
+                    "{id} does not read V out of K and must still trace {class:?}"
+                );
+            }
+        }
+    }
+
     /// The fixture and the row are the same measurement, so if they
     /// disagree one of them is wrong. Each of these three constructors
     /// was committed as a reading of a real `config.json`; so is the
@@ -979,6 +1026,7 @@ mod tests {
             paged_multi_batch: true,
             qmm_multi_batch: true,
             add_bias: false,
+            fused_qk_rope: false,
         };
         assert!(!VARIANTS.is_empty());
         let mut two_shaped = 0usize;
@@ -1081,3 +1129,7 @@ mod tests {
         assert!(matches!(Deployed::single().backend, Backend::Cuda));
     }
 }
+
+/// This generation's tensor names, in every vocabulary that spells them.
+#[cfg(feature = "contract")]
+pub mod import;

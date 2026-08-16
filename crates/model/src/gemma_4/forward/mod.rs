@@ -262,7 +262,7 @@ pub fn gemma4_cuda(facts: &Gemma4Facts, cuda: &Gemma4CudaFacts, class: FireClass
             dsl::seam(attn_in.trace(), &dsl::seam::ATTN_Q, &[&attn_in], Some(l));
             let a = match class {
                 FireClass::Decode => {
-                    dsl::cuda::attention_flashinfer_decode(&attn_in, &kv, window_left)
+                    dsl::cuda::attention_flashinfer_decode(&attn_in, &kv, window_left, facts.head_dim_of(l))
                 }
                 FireClass::Prefill if d == 512 => {
                     dsl::cuda::attention_naive_paged(&attn_in, &kv, window_left)

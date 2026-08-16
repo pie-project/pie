@@ -303,7 +303,7 @@ __global__ void mxfp4_moe_gate_up_decode(
         const auto* gb = gate_bias_ptrs != nullptr
             ? static_cast<const bf16*>(gate_bias_ptrs[expert])
             : nullptr;
-        const auto* ub = gate_bias_ptrs != nullptr
+        const auto* ub = up_bias_ptrs != nullptr
             ? static_cast<const bf16*>(up_bias_ptrs[expert])
             : nullptr;
 #pragma unroll
@@ -573,7 +573,7 @@ __global__ void mxfp4_moe_gate_up_decode_grouped(
             const auto* gb = gate_bias_ptrs != nullptr
                 ? static_cast<const bf16*>(gate_bias_ptrs[expert])
                 : nullptr;
-            const auto* ub = gate_bias_ptrs != nullptr
+            const auto* ub = up_bias_ptrs != nullptr
                 ? static_cast<const bf16*>(up_bias_ptrs[expert])
                 : nullptr;
             for (int t = 0; t < nt; ++t) {

@@ -102,6 +102,35 @@ pub struct TensorSpec {
     /// still states one layout and the rest are what a differently
     /// divided publication may bring instead.
     pub instead: Vec<Vec<(String, Vec<u64>)>>,
+    /// Extents at which a REDUNDANT copy of an [`Absent`] tensor is
+    /// tolerated. Empty — the default — tolerates none.
+    ///
+    /// For exactly one situation: a tie. `tie_word_embeddings: true`
+    /// says the head IS the embedding table, so the head is not a
+    /// tensor and [`Absent`] is the honest spec. But an HF export
+    /// writes what the module tree holds, and a tied `lm_head.weight`
+    /// is still a materialised parameter, so `save_pretrained` often
+    /// publishes a second copy of the same matrix. Both statements are
+    /// true at once: the model has no separate head, and the file has
+    /// two tensors.
+    ///
+    /// Without this, that ordinary export matches NO row. A stock
+    /// `Qwen/Qwen3-0.6B` -- every extent agreeing, the tie declared in
+    /// its own `config.json` -- was refused with `qwen3-0.6b:
+    /// unexpected lm_head`, and the same refusal is recorded from a
+    /// second direction in `driver-vulkan/tests/checkpoint.rs`.
+    ///
+    /// It is deliberately NOT [`Optional`]. Optional means "either
+    /// answer matches, this is a binding decision" and would accept a
+    /// copy at ANY extents -- including a genuinely untied head, which
+    /// is a different model. This accepts a copy only where it is
+    /// REDUNDANT: at the extents the tie implies, which are the
+    /// embedding table's own. A head that disagrees with the table it
+    /// claims to tie is still `unexpected`.
+    ///
+    /// [`Absent`]: Presence::Absent
+    /// [`Optional`]: Presence::Optional
+    pub tied_copy: Vec<u64>,
 }
 
 impl TensorSpec {
@@ -113,6 +142,7 @@ impl TensorSpec {
             extents: extents.into(),
             presence: Presence::Required,
             instead: Vec::new(),
+            tied_copy: Vec::new(),
         }
     }
 
@@ -127,6 +157,7 @@ impl TensorSpec {
             extents: Vec::new(),
             presence: Presence::Required,
             instead: Vec::new(),
+            tied_copy: Vec::new(),
         }
     }
 
@@ -138,6 +169,25 @@ impl TensorSpec {
             extents: Vec::new(),
             presence: Presence::Absent,
             instead: Vec::new(),
+            tied_copy: Vec::new(),
+        }
+    }
+
+    /// A tensor this variant TIES, which an export may publish anyway.
+    ///
+    /// [`Absent`] with one tolerance: see [`TensorSpec::tied_copy`].
+    /// `extents` are the tied quantity's own — the embedding table's,
+    /// for a tied head — and a copy at anything else is still a fault.
+    ///
+    /// [`Absent`]: Presence::Absent
+    #[must_use]
+    pub fn tied(name: impl Into<String>, extents: impl Into<Vec<u64>>) -> Self {
+        Self {
+            name: name.into(),
+            extents: Vec::new(),
+            presence: Presence::Absent,
+            instead: Vec::new(),
+            tied_copy: extents.into(),
         }
     }
 
@@ -149,6 +199,7 @@ impl TensorSpec {
             extents: extents.into(),
             presence: Presence::Optional,
             instead: Vec::new(),
+            tied_copy: Vec::new(),
         }
     }
 
@@ -229,6 +280,31 @@ impl Manifest {
         }
     }
 
+    /// State a tie: required when untied, [`TensorSpec::tied`] when tied.
+    ///
+    /// [`either`] with one difference, and it is not a loosening of
+    /// `either` — `either` states a genuine mutual exclusion (a latent
+    /// q projection is there or it is not, and a file that carries both
+    /// layouts is two models) and must keep refusing. A TIE is the one
+    /// case where the two states differ by whether a tensor is
+    /// REDUNDANT rather than by whether it exists, so an export that
+    /// writes it out has not described a different model.
+    ///
+    /// Both rows still discriminate: the untied row demands the head,
+    /// this one accepts it only at the tied extents, and
+    /// `every_row_is_identified_as_itself_and_not_as_a_sibling` holds
+    /// the whole catalog to one-to-one identification either way.
+    ///
+    /// [`either`]: Manifest::either
+    #[must_use]
+    pub fn tie(self, tied: bool, name: &str, extents: impl Into<Vec<u64>>) -> Self {
+        if tied {
+            self.with(TensorSpec::tied(name, extents))
+        } else {
+            self.with(TensorSpec::required(name, extents))
+        }
+    }
+
     /// Every row, under the name an [`Observed`] carries it by.
     ///
     /// Which is the spec's own name, `{}` and all: [`Observed::logical`]
@@ -258,6 +334,15 @@ impl Manifest {
             match (spec.presence, observed.extents(&name)) {
                 (Presence::Required, None) if applies(&spec.instead, observed) => {}
                 (Presence::Required, None) => faults.push(Fault::Missing(name)),
+                // A tie the export published anyway — tolerated only where
+                // the copy is REDUNDANT, at the extents the tie implies.
+                (Presence::Absent, Some(seen))
+                    if !spec.tied_copy.is_empty()
+                        && extents_agree(
+                            &spec.tied_copy,
+                            seen,
+                            observed.has(&format!("{name}.scales")),
+                        ) => {}
                 (Presence::Absent, Some(_)) => faults.push(Fault::Unexpected(name)),
                 (Presence::Required | Presence::Optional, Some(seen))
                     if !spec.extents.is_empty()
@@ -1465,6 +1550,70 @@ mod tests {
         ]);
         let err = spec.check(&wrong).expect_err("three faults");
         assert_eq!(err.faults.len(), 3, "{err}");
+    }
+
+    /// An HF export that publishes a TIED head is the model it says it is.
+    ///
+    /// `save_pretrained` writes what the module tree holds, and a tied
+    /// `lm_head.weight` is still a materialised parameter, so an ordinary
+    /// export carries a second copy of the embedding table. Before
+    /// [`TensorSpec::tied`] this matched no row in the catalog at all: a
+    /// stock `Qwen/Qwen3-0.6B` -- every extent agreeing -- was refused
+    /// with `qwen3-0.6b: unexpected lm_head`.
+    #[test]
+    fn a_tied_head_the_export_published_anyway_is_not_a_fault() {
+        let tied = Manifest::new(1)
+            .with(TensorSpec::required("embed_tokens", [151_936u64, 1024]))
+            .tie(true, "lm_head", [151_936u64, 1024]);
+        // The deduplicated export, which always worked.
+        assert!(
+            tied.check(&seen(&[("model.embed_tokens.weight", &[151_936, 1024])]))
+                .is_ok()
+        );
+        // The ordinary one, which did not.
+        assert!(
+            tied.check(&seen(&[
+                ("model.embed_tokens.weight", &[151_936, 1024]),
+                ("lm_head.weight", &[151_936, 1024]),
+            ]))
+            .is_ok()
+        );
+    }
+
+    /// The tolerance is REDUNDANCY, not indifference.
+    ///
+    /// The control on the test above: if `tie` had been spelled
+    /// [`Presence::Optional`] it would accept a head at any extents, and a
+    /// genuinely untied model whose head is a different matrix would load
+    /// as the tied row. A copy that disagrees with the table it claims to
+    /// tie is not a copy.
+    #[test]
+    fn a_head_that_disagrees_with_the_table_it_ties_is_still_unexpected() {
+        let tied = Manifest::new(1)
+            .with(TensorSpec::required("embed_tokens", [151_936u64, 1024]))
+            .tie(true, "lm_head", [151_936u64, 1024]);
+        let err = tied
+            .check(&seen(&[
+                ("model.embed_tokens.weight", &[151_936, 1024]),
+                ("lm_head.weight", &[8192, 1024]),
+            ]))
+            .expect_err("a head at other extents is not a redundant copy");
+        assert!(err.to_string().contains("lm_head"), "{err}");
+    }
+
+    /// `absent` is untouched: it still forbids.
+    ///
+    /// The other control. `tie` is a new spelling, not a change to what
+    /// [`TensorSpec::absent`] means -- `either`'s mutual exclusions (a
+    /// latent q projection is there or it is not) must keep refusing, and
+    /// they share the `Absent` arm this now has an exception in.
+    #[test]
+    fn a_plain_absence_still_forbids_the_tensor() {
+        let spec = Manifest::new(1).with(TensorSpec::absent("lm_head"));
+        assert!(
+            spec.check(&seen(&[("lm_head.weight", &[151_936, 1024])]))
+                .is_err()
+        );
     }
 
     /// A `[n]` gamma and an `[n, 1]` one are the same vector; which a

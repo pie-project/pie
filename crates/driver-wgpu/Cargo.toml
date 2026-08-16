@@ -12,11 +12,15 @@ publish = false
 name = "driver_wgpu"
 path = "src/lib.rs"
 
-# No `build.rs`, where `driver-vulkan` has one. Its script exists to relay
-# `DEP_PIE_KERNELS_VULKAN_SPV_DIR`, because SPIR-V is a build product that has
-# to be found on disk. `kernels-wgpu` embeds every shader source in its rlib
-# with `include_str!` and serves them from `kernels_wgpu::entrypoint_source`,
-# so there is no directory to locate and nothing to relay.
+# No `build.rs`. `kernels-wgpu` embeds every shader source in its rlib with
+# `include_str!` and serves them from `kernels_wgpu::entrypoint_source`, so
+# there is no directory to locate and nothing to relay.
+#
+# `driver-vulkan` had one, whose only job was to relay
+# `DEP_PIE_KERNELS_VULKAN_SPV_DIR` on the grounds that SPIR-V is a build
+# product that has to be found on disk. It is deleted: a build product can be
+# `include_bytes!`d as easily as a source can be `include_str!`d, so neither
+# sibling has a script now.
 
 # NOT `[lints] workspace = true`, for the reason both siblings give: that table
 # sets `unsafe_code = "forbid"`, and they cannot keep it because every `ash`

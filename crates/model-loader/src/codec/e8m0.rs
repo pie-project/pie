@@ -1,21 +1,17 @@
 //! E8M0: a power-of-two scale factor in one byte, bias 127.
 //!
-//! The shared exponent of an MX block. Kept apart from [`super::mxfp4`]
-//! because FP8 blocks carry one too, and a second copy of the bias would be
-//! a second place for it to be wrong.
+//! The shared exponent of an MX block, kept apart from [`super::mxfp4`]
+//! because FP8 blocks carry one too and a second copy of the bias would be a
+//! second place for it to be wrong.
 
 /// The E8M0 byte for one group: the smallest `b` with `6 · 2^(b-127) ≥ absmax`
 /// (`quant_bf16_to_mxfp4.cu::encode_e8m0`), and `0` for a group of zeros — or
-/// of NaNs, which is what the kernel's `!(absmax > 0)` spelling covers.
+/// of NaNs, which the kernel's `!(absmax > 0)` spelling covers.
 ///
-/// The `log2` is the one place this can drift from the device: CUDA's `log2f`
-/// is within 1 ulp, the host's is correctly rounded, and a disagreement flips
-/// the `ceil` only when `absmax / 6` sits within an ulp of a power of two.
-/// The driver-side parity test is the check that it does not happen on real
-/// weights.
-// The negated comparison is the port: `!(absmax > 0.0)` is false for NaN
-// where `absmax <= 0.0` is not, and NaN-means-scale-zero is the kernel's
-// behaviour.
+/// The `log2` is where this can drift from the device: CUDA's `log2f` is within
+/// 1 ulp and the host's is correctly rounded, so a disagreement flips the
+/// `ceil` only when `absmax / 6` is within an ulp of a power of two.
+// `!(absmax > 0.0)` is false for NaN where `absmax <= 0.0` is not.
 #[allow(clippy::neg_cmp_op_on_partial_ord)]
 pub fn encode_e8m0(absmax: f32) -> u8 {
     if !(absmax > 0.0) {

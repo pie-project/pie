@@ -6,7 +6,7 @@
 //! crate that is neither. The worker does not need to know where the C++
 //! trees are or how to build them; it needs a driver. So `driver-cuda` and
 //! `driver-metal` are crates now, each building its own `csrc/` and emitting
-//! its own link line, and `--features driver-cuda` turns on a dependency
+//! its own link line, and `--features driver-cuda-13` turns on a dependency
 //! edge rather than a branch here.
 //!
 //! Cargo carries the rest: link directives from any build script in the graph
@@ -20,16 +20,12 @@
 //! without symbol collisions.
 
 fn main() {
-    // Almost nothing to build. Kept as an explicit no-op for most of its
-    // history rather than deleted: the file's absence would read as "this
-    // crate never needed a build script", and the reason it barely does is
-    // worth finding here.
     println!("cargo:rerun-if-changed=build.rs");
 
     // `-lnccl`, AND THIS IS THE CRATE THAT OWES IT.
     //
     // `embedded_driver.rs` declares `ncclGetUniqueId` and
-    // `ncclGetErrorString` as `extern "C"` under `feature = "driver-cuda"`
+    // `ncclGetErrorString` as `extern "C"` under `feature = "_driver-cuda"`
     // and calls both, to mint the unique id a tensor-parallel group
     // rendezvouses on. Those are the ONLY two NCCL symbols anything in this
     // workspace references; no collective is called anywhere, and `cudarc`'s
@@ -45,9 +41,18 @@ fn main() {
     //
     // Here instead, because a link line belongs to the crate whose source
     // names the symbol, and because the `#[cfg]` and the flag now share one
-    // condition: a build without `driver-cuda` neither declares them nor
+    // condition: a build without the CUDA shell neither declares them nor
     // asks the linker for them.
-    if std::env::var_os("CARGO_FEATURE_DRIVER_CUDA").is_some() {
+    //
+    // `cfg!` and not `env::var_os("CARGO_FEATURE_...")`. The env var spelling
+    // is a STRING that no tool checks: when this feature was renamed from
+    // `driver-cuda` to `_driver-cuda`, `CARGO_FEATURE_DRIVER_CUDA` went
+    // quietly false and took `-lnccl` with it -- the same two undefined
+    // `nccl*` symbols described above, reached a third way. A `cfg!` on a
+    // feature this package does not declare is caught by `unexpected_cfgs`,
+    // which is the difference between a warning and a binary that only loads
+    // under `LD_PRELOAD`.
+    if cfg!(feature = "_driver-cuda") {
         println!("cargo:rustc-link-lib=nccl");
     }
 }

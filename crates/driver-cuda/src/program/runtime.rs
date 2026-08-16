@@ -1,47 +1,10 @@
-//! The compile plane: emitted sources in, launchable regions out, cached at
-//! three tiers.
+//! The compile plane: emitted sources in, launchable regions out.
 //!
-//! # What this owns and what it deliberately does not
-//!
-//! Everything about a PTIR program that is *not* CUDA lives in
-//! [`driver_pipeline`]: adopting the launch package, indexing the emitted
-//! table, the cache keys, the LRU tiers, the channel rings, the reference
-//! pass. This file is the CUDA half and only the CUDA half — NVRTC, cubins,
-//! `CUmodule`s — and the fact that it is this short is the claim the shared
-//! crate was extracted to make.
-//!
-//! # Why CUDA only ever compiles fused regions
-//!
-//! The host emitter's CUDA arm emits exactly one kind of kernel:
-//! `PIE_KERNEL_FUSED`, one per generated region, named
-//! `ptir_fused_{signature:016x}_r{region}`. It emits no readiness kernel, no
-//! commit kernel and no grouped kernel, because on CUDA those are prebuilt —
-//! and the fused kernel is already lane-parallel (`dispatch_lane = blockIdx.x`,
-//! one CTA per lane), which is what Metal needs a separate grouped emission
-//! for. So [`Runtime::compile`] walks one kind, and a region that is a
-//! *library* region (nucleus, top-k, sort, scan, matmul) is not compiled here
-//! at all: the driver implements those natively and the host emits nothing for
-//! them.
-//!
-//! # The three tiers, and why a miss at each one is different
-//!
-//! 1. **Program cache**, keyed on `program_hash`. A program is registered once
-//!    and bound many times; this is what makes the second bind free.
-//! 2. **Stage cache**, keyed on the identity hash with a second identity
-//!    compared on hit. Two programs that share a stage share its cubin.
-//! 3. **Disk cache**, keyed on the identity *plus the source fingerprint*. See
-//!    [`disk`](super::disk) for why that last part is not optional.
-//!
-//! and a fourth that is not a tier but an answer: the **negative cache**, for
-//! compiles that failed deterministically. Recompiling a program NVRTC will
-//! reject again, once per fire, is the difference between slow and unusable.
-//!
-//! # Assembly happens past the last failure
-//!
-//! Nothing is installed into any cache until every region of every stage has
-//! compiled. A program that fails halfway leaves the caches exactly as it
-//! found them, because the alternative — a half-installed program that a later
-//! bind finds and believes — is a wrong answer rather than a slow one.
+//! The CUDA half only — NVRTC, cubins, `CUmodule`s; backend-agnostic work
+//! (cache keys, LRU tiers, channel rings) lives in [`driver_pipeline`]. CUDA
+//! emits one kind, `PIE_KERNEL_FUSED`, one per region; library regions the
+//! driver implements natively. Nothing is cached until every region of every
+//! stage compiles — a half-installed program is a wrong answer, not a slow one.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -57,11 +20,8 @@ use super::cache::{Disk, disk_key};
 use super::compile::FailureKind;
 use super::compile::Module;
 
-/// `PIE_KERNEL_FUSED` — the only kind the CUDA emitter produces.
-///
-/// Taken from the ABI rather than written as a literal: the numbering is the
-/// host's, and a driver that hardcodes it looks up an empty slot forever after
-/// a renumbering instead of failing at the seam.
+/// `PIE_KERNEL_FUSED` — the only kind the CUDA emitter produces. From the ABI,
+/// not a literal, so a renumbering is a build break, not an empty slot forever.
 const KERNEL_FUSED: u32 = driver::driver_api::local::PIE_KERNEL_FUSED;
 
 /// `PIE_REGION_LIBRARY` — a region the driver implements rather than compiles.
@@ -78,10 +38,8 @@ pub struct Region {
 
 /// One compiled stage: every generated region it declares, in region order.
 ///
-/// Shared rather than owned because two programs that name the same stage
-/// share the cubin — that is the whole point of the stage tier — and a
-/// `CUmodule` unloaded while another program's launch is in flight is a fault
-/// inside the driver rather than an error anybody can report.
+/// Shared, not owned: two programs naming the same stage share the cubin, and a
+/// `CUmodule` unloaded while another program's launch is in flight is a fault.
 #[derive(Debug, Clone)]
 pub struct Stage {
     /// The stage's signature hash, as the plan states it.
@@ -91,11 +49,8 @@ pub struct Stage {
 }
 
 impl Stage {
-    /// The region with this index, if it was generated.
-    ///
-    /// `None` for a library region — those are not compiled here — and for a
-    /// region the host declined. A caller must distinguish those two by asking
-    /// the plan, not by asking this.
+    /// The region with this index, if it was generated. `None` for a library
+    /// or host-declined region; distinguish those by asking the plan, not this.
     #[must_use]
     pub fn region(&self, region_index: u32) -> Option<&Region> {
         self.regions
@@ -109,26 +64,13 @@ impl Stage {
 pub struct Compiled {
     /// The stages, in plan order.
     pub stages: Arc<Vec<Stage>>,
-    /// The stage plans these were compiled FROM, in the same order.
-    ///
-    /// Carried rather than looked up, and that is the point: firing needs
-    /// the plan — its ops say which channels the stage reads and puts, its
-    /// value types size the scratch — and a driver that kept the two in
-    /// separate tables keyed by the same id would have two things to keep
-    /// in step. A compiled program that could disagree with the plan it
-    /// came from is exactly the drift `Compiled` exists to make
-    /// impossible.
+    /// The stage plans these were compiled from, same order. Carried, not
+    /// looked up, so the compiled program cannot drift from its plan.
     pub plans: Arc<Vec<LaunchStagePlan>>,
-    /// Each stage's ATTACHMENT POINT — `LaunchStage::kind`: Prologue
-    /// 0, OnAttnProj 1, OnAttn 2, Epilogue 3.
-    ///
-    /// Carried because `LaunchStagePlan` has no `kind` field and the
-    /// package's `stages` table is not kept: the driver could see how
-    /// many stages a program had and not what any of them WAS. It fired
-    /// `plans.first()`, which is the epilogue only by the accident that
-    /// no program in the tree has a prologue — the moment one does
-    /// (`fwd.adapter` puts its `lora` sink there), `first()` is the
-    /// adapter and the sampler never runs.
+    /// Each stage's attachment point (`LaunchStage::kind`: prologue 0,
+    /// on-attn-proj 1, on-attn 2, epilogue 3). Carried because `LaunchStagePlan`
+    /// has no `kind`; firing by position picks the adapter, not the sampler,
+    /// once a program has a prologue.
     pub kinds: Arc<Vec<u8>>,
 }
 
@@ -159,16 +101,12 @@ mod kind_tests {
         }
     }
 
-    /// A program's stages are found by what they ARE, not by position.
-    ///
-    /// `run_program` fired `plans.first()` because `Compiled` had no
-    /// kinds to ask. That is the epilogue only while no program has a
-    /// prologue — and `fwd.adapter` puts its `lora` sink in one, so the
-    /// first adapter-carrying program would have fired its ADAPTER as
-    /// the sampler and never run the sampler at all.
+    /// A program's stages are found by attachment point, not by position:
+    /// firing `plans.first()` picks the adapter, not the sampler, once a
+    /// program has a prologue.
     #[test]
     fn a_stage_is_found_by_its_attachment_point() {
-        // The shape that breaks position: prologue FIRST.
+        // The shape that breaks position: prologue first.
         let both = compiled(&[stage_kind::PROLOGUE, stage_kind::EPILOGUE]);
         assert_eq!(
             both.stage_of_kind(stage_kind::EPILOGUE),
@@ -182,15 +120,13 @@ mod kind_tests {
             "a kind the program does not carry is absent, not stage 0"
         );
 
-        // Today's shape: one epilogue, where position and kind agree —
-        // which is exactly why the bug was invisible.
+        // One epilogue, where position and kind agree.
         let one = compiled(&[stage_kind::EPILOGUE]);
         assert_eq!(one.stage_of_kind(stage_kind::EPILOGUE), Some(0));
     }
 }
 
-/// The attachment points a stage can have, as `LaunchStage::kind`
-/// numbers them.
+/// The attachment points a stage can have, as `LaunchStage::kind` numbers them.
 pub mod stage_kind {
     /// Runs before the forward; where `fwd.adapter`'s `lora` sink lands.
     pub const PROLOGUE: u8 = 0;
@@ -242,12 +178,8 @@ impl Default for Runtime {
 }
 
 impl Runtime {
-    /// The cache this runtime compiles into.
-    ///
-    /// `Control::compile` wants one too, and it must be the SAME one: the
-    /// control kernels and the program kernels are cached by the same
-    /// key scheme, so a second directory would recompile both on every
-    /// boot and neither would ever hit.
+    /// The cache this runtime compiles into. `Control::compile` must share the
+    /// same one, or the two would recompile each other's kernels on every boot.
     #[must_use]
     pub fn disk(&self) -> &Disk {
         &self.disk
@@ -271,19 +203,14 @@ impl Runtime {
         self.stats
     }
 
-    /// Compile `plan`'s generated regions, or answer from a cache.
-    ///
-    /// `kernels` is the host's emitted table, already indexed. `versions`
-    /// carries the four numbers the identity is keyed on — the emitter version
-    /// among them, taken from the registration rather than hardcoded, so a
-    /// host-side bump misses instead of reusing a stale cubin.
+    /// Compile `plan`'s generated regions, or answer from a cache. `versions`
+    /// carries the identity's four version numbers, so a host-side bump misses
+    /// rather than reusing a stale cubin.
     ///
     /// # Errors
     ///
-    /// [`Failure::Deterministic`] when the program cannot compile on this
-    /// driver — a malformed emitted table, a source NVRTC rejects — and
-    /// [`Failure::Retryable`] when the machine could not, this time. Only the
-    /// first is remembered.
+    /// [`Failure::Deterministic`] when the program cannot compile here (only
+    /// these are remembered); [`Failure::Retryable`] when the machine could not.
     pub fn compile(
         &mut self,
         program_hash: u64,
@@ -319,8 +246,7 @@ impl Runtime {
                 Ok(compiled)
             }
             Err(failure) => {
-                // A program that failed halfway must leave no half-stage
-                // behind for the next program to find and believe.
+                // A half-failed program leaves no half-stage behind.
                 self.stages.abandon();
                 if let Failure::Deterministic { reason } = &failure {
                     self.negative.insert(program_key, reason.clone());
@@ -358,9 +284,8 @@ impl Runtime {
                 stage_plan.signature_hash,
                 versions,
             );
-            // The NVRTC version is not in `cache_identity` -- that record is
-            // shared with a backend that has no NVRTC -- so it is folded into
-            // the memory key here, where it is a CUDA fact.
+            // NVRTC version isn't in `cache_identity` (shared with a non-NVRTC
+            // backend), so it's folded into the memory key here.
             let key = fnv1a64_with(
                 identity_string.as_bytes(),
                 &[
@@ -377,9 +302,8 @@ impl Runtime {
                         continue;
                     }
                 }
-                // A signature collision builds the stage UNSHARED rather than
-                // rejecting the program: two stages that hash alike are still
-                // two valid stages, and the C++ refused the second one.
+                // A signature collision builds the stage unshared: two stages
+                // that hash alike are still two valid stages.
                 Lookup::Collided | Lookup::Miss => {}
             }
 
@@ -399,10 +323,8 @@ impl Runtime {
         Ok(Compiled {
             stages: Arc::new(stages),
             plans: Arc::new(plan.package.plans.clone()),
-            // `plans` is parallel to `package.stages` — the plans are the
-            // stages' own, in the same order — so the kinds index the
-            // same way. A missing entry would be a package whose two
-            // tables disagree, which `adopt_launch_package` refuses.
+            // `plans` is parallel to `package.stages`, so kinds index the same
+            // way; a mismatch is refused by `adopt_launch_package`.
             kinds: Arc::new(plan.package.stages.iter().map(|s| s.kind).collect()),
         })
     }
@@ -421,19 +343,14 @@ impl Runtime {
             let region_index = u32::try_from(region_index).map_err(|_| Failure::Deterministic {
                 reason: "a stage with more than 4 billion regions is not a stage".into(),
             })?;
-            // A library region -- nucleus, top-k, sort, scan, matmul -- is
-            // implemented by the driver natively, so the host emits nothing
-            // for it. That is not a gap in the table and must not be looked up
-            // as one: `Slot::Absent` here would refuse a program that is fine.
+            // A library region is implemented natively, so the host emits
+            // nothing for it — not a gap, so don't look it up as `Slot::Absent`.
             if region.kind == REGION_LIBRARY {
                 continue;
             }
             let (source, entry) = match index.get(KERNEL_FUSED, stage_index, region_index) {
                 Slot::Kernel { source, entry } => (source, entry),
-                // The host declined ON PURPOSE and said why. Not a failure:
-                // the driver takes its own path for this region. The C++
-                // collapsed this into "no kernel" and could not tell the two
-                // apart.
+                // The host declined on purpose; the driver takes its own path.
                 Slot::Refused(_) => continue,
                 Slot::Absent => {
                     return Err(Failure::Deterministic {
@@ -482,9 +399,7 @@ impl Runtime {
                     self.stats.persistent_hits += 1;
                     return Ok(Arc::new(module));
                 }
-                // A cubin that will not load is a cubin that must not stay on
-                // disk: the alternative is paying this read, and this failure,
-                // on every launch forever.
+                // A cubin that won't load must not stay on disk.
                 Err(_) => self.disk.invalidate(&key, region_index),
             }
         }
@@ -502,8 +417,7 @@ impl Runtime {
         let module = Module::load(&cubin, entry).map_err(|error| Failure::Retryable {
             reason: format!("loading '{entry}': {error}"),
         })?;
-        // Stored only after it has been proven loadable, so a cubin that
-        // cannot be used never reaches the disk in the first place.
+        // Stored only after it loads, so an unusable cubin never reaches disk.
         self.disk.store(&key, region_index, entry, &cubin);
         Ok(Arc::new(module))
     }
@@ -514,11 +428,8 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     fnv1a64_with(bytes, &[])
 }
 
-/// FNV-1a over `bytes` followed by each of `tails`, as one stream.
-///
-/// Folding the extra fields in rather than formatting them into the string
-/// keeps `cache_identity`'s record — which is shared with a backend that has
-/// no NVRTC — free of CUDA facts.
+/// FNV-1a over `bytes` then each of `tails`, as one stream. Folding the extra
+/// fields in keeps `cache_identity` free of CUDA-only facts like NVRTC version.
 fn fnv1a64_with(bytes: &[u8], tails: &[&[u8]]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     let mut fold = |slice: &[u8]| {
@@ -534,12 +445,9 @@ fn fnv1a64_with(bytes: &[u8], tails: &[&[u8]]) -> u64 {
     hash
 }
 
-/// The compiled programs a shell holds, by program id.
-///
-/// A thin map rather than a type: what it exists for is to be the one place a
-/// `Compiled` is dropped, so the `CUmodule`s a closed program owns are unloaded
-/// at a point the shell chose rather than whenever the last `Arc` happens to
-/// die.
+/// The compiled programs a shell holds, by program id. The one place a
+/// `Compiled` is dropped, so a closed program's `CUmodule`s unload when the
+/// shell chooses, not whenever the last `Arc` dies.
 #[derive(Debug, Default)]
 pub struct Programs {
     compiled: HashMap<u64, Compiled>,
@@ -573,16 +481,14 @@ impl Programs {
 mod tests {
     use super::*;
 
-    /// The fold must be the one the rest of the workspace uses, since the
-    /// string being folded came from `cache_identity`.
+    /// The fold must be the workspace's, since the string came from `cache_identity`.
     #[test]
     fn the_fold_is_fnv1a() {
         assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fnv1a64(b"ptir"), driver::tensor_ir::fnv1a64(b"ptir"));
     }
 
-    /// Folding the tails in must be identical to folding the concatenation,
-    /// or the key depends on how it was assembled rather than on what is in it.
+    /// Folding tails in must equal folding the concatenation.
     #[test]
     fn folding_in_tails_is_the_same_as_folding_the_concatenation() {
         let joined = fnv1a64(b"identity\x0c\x00\x00\x00\x00\x00\x00\x00");
@@ -590,9 +496,7 @@ mod tests {
         assert_eq!(joined, split);
     }
 
-    /// An NVRTC upgrade must miss. The identity record has no NVRTC field --
-    /// it is shared with a backend that has none -- so this is the only thing
-    /// standing between a toolkit bump and a cubin compiled by the old one.
+    /// An NVRTC upgrade must miss; the identity record carries no NVRTC field.
     #[test]
     fn an_nvrtc_version_bump_changes_the_stage_key() {
         let identity = b"the-same-identity";
@@ -601,8 +505,7 @@ mod tests {
         assert_ne!(before, after);
     }
 
-    /// The kind this driver looks up is the ABI's, not a literal, so a
-    /// renumbering is a build break rather than an empty table at run time.
+    /// The looked-up kind is the ABI's, so a renumbering is a build break.
     #[test]
     fn cuda_compiles_the_fused_kind_the_abi_names() {
         assert_eq!(KERNEL_FUSED, driver::driver_api::local::PIE_KERNEL_FUSED);

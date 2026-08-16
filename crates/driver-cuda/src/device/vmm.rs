@@ -1,32 +1,6 @@
-//! The elastic virtual-memory arena: `store/elastic.{hpp,cpp}` in Rust.
-//!
-//! # What this is for
-//!
-//! The KV store must be able to hand back physical memory to the rest of the
-//! process without moving the tensors that live on top of it. CUDA's VMM API
-//! is the only way to do that: reserve a virtual range once with
-//! `cuMemAddressReserve`, then map and unmap physical handles underneath it as
-//! demand moves. Pointers stay valid across a shrink; only the backing goes
-//! away.
-//!
-//! The awkward part is not the CUDA calls -- there are seven of them and they
-//! are mechanical. It is the *accounting*: several arenas share one budget,
-//! growth must be reserved before it is attempted so a caller learns it cannot
-//! grow instead of failing halfway, and a failed growth has to put every page
-//! back exactly once. The C++ gets this right through five member variables, a
-//! mutex, and a lot of care.
-//!
-//! # The split
-//!
-//! Here the accounting is [`PoolBudget`] -- a struct with no CUDA in it at
-//! all, holding only `usize`s. Every rule that the C++ spreads across
-//! `try_reserve` / `mark_committed` / `unreserve` / `recalibrate_budget` lives
-//! there as a plain method, and the tests at the bottom of this file drive all
-//! of it on any machine, GPU or not. [`PhysicalPool`] is that struct behind a
-//! mutex plus the handle lifecycle; [`Arena`] is the mapping loop.
-//!
-//! That is the same trick as [`crate::device::alloc`]'s `DeferState`, for the
-//! same reason: the bugs in this file were never in the CUDA calls.
+//! The elastic virtual-memory arena: hands physical memory back without moving
+//! the tensors on top. One reserved virtual range has handles mapped and
+//! unmapped under it, so pointers survive a shrink.
 
 use std::sync::Mutex;
 
@@ -40,18 +14,11 @@ use cudarc::runtime::sys::cudaDeviceCanAccessPeer;
 
 use crate::error::{Error, Result, check_cu, ignore_in_drop};
 
-/// The logical page the budget is denominated in: 2 MiB.
-///
-/// Not CUDA's allocation granularity, and not the map unit. It is the unit the
-/// *budget* counts in, chosen so that the number stays meaningful as the map
-/// unit changes across devices. `elastic.hpp` notes that Metal's allocator
-/// independently arrives at the same size, and deliberately does not share a
-/// header with this one -- the two allocators agree on a constant and on
-/// nothing else.
+/// The logical page the budget is denominated in: 2 MiB. Not CUDA's allocation
+/// granularity or map unit — stays meaningful as the map unit varies by device.
 pub const LOGICAL_PAGE_BYTES: usize = 2 * 1024 * 1024;
 
-/// Logical pages needed to cover `bytes`, rounding up. Zero bytes need zero
-/// pages, which is not what the rounding formula would say on its own.
+/// Logical pages needed to cover `bytes`, rounding up; zero bytes need zero pages.
 #[must_use]
 pub const fn pages_for_bytes(bytes: usize, page_bytes: usize) -> usize {
     if bytes == 0 || page_bytes == 0 {
@@ -69,32 +36,18 @@ const fn align_up(value: usize, alignment: usize) -> usize {
     }
 }
 
-/// The shared page budget, with no CUDA in it.
-///
-/// Two counters, not one, and the distinction is the whole design:
-///
-/// * `held` -- pages promised to a caller that has not yet mapped them. A
-///   caller reserves *before* it starts calling `cuMemCreate`, so that a
-///   budget refusal arrives before any physical memory has been touched.
-/// * `committed` -- pages actually mapped.
-///
-/// A page moves `held -> committed` on success ([`Self::mark_committed`]) or
-/// `held -> gone` on failure ([`Self::unreserve`]). Both counters charge
-/// against the budget the whole time, so a second arena cannot be told there
-/// is room that a first arena is midway through claiming.
+/// The shared page budget, with no CUDA in it. Two counters — `held` (reserved
+/// before `cuMemCreate`, so a refusal costs no physical touch) and `committed`
+/// (mapped) — with a page charged the whole time it moves between them.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PoolBudget {
     budget_pages: usize,
-    /// The ceiling the budget may be recalibrated back up to. Recalibration
-    /// tracks free device memory, which moves; without a high-water mark a
-    /// transient dip would permanently shrink the pool.
+    /// High-water ceiling: recalibration won't permanently shrink the pool from a
+    /// transient memory dip.
     hard_budget_pages: usize,
     held_pages: usize,
     committed_pages: usize,
-    /// Bumped whenever pages come back or the budget changes -- i.e. whenever
-    /// a caller that was previously refused might now succeed. Callers cache
-    /// "the pool is full" against this, so a stale cache is impossible without
-    /// also being a stale generation.
+    /// Bumped on release or budget change, so a cached "pool full" result knows to retry.
     generation: u64,
 }
 
@@ -154,8 +107,7 @@ impl PoolBudget {
         self.generation
     }
 
-    /// Claim `pages`. `false` means the budget cannot cover them and nothing
-    /// changed.
+    /// Claim `pages`; `false` means the budget cannot cover them, unchanged.
     pub const fn try_reserve(&mut self, pages: usize) -> bool {
         if pages > self.free_pages() {
             return false;
@@ -164,11 +116,8 @@ impl PoolBudget {
         true
     }
 
-    /// Give back pages that were reserved but never mapped.
-    ///
-    /// Saturating rather than checked: this is the failure path, reached from
-    /// unwinding and from `Drop`, and over-releasing there should not be a
-    /// second failure on top of the first.
+    /// Give back pages that were reserved but never mapped. Saturating, not
+    /// checked — on the failure/unwind path, over-releasing must not itself fail.
     pub const fn unreserve(&mut self, pages: usize) {
         let released = if pages < self.held_pages {
             pages
@@ -181,11 +130,8 @@ impl PoolBudget {
         }
     }
 
-    /// Move `pages` from held to committed, after they were actually mapped.
-    ///
-    /// Errors if they were never reserved -- the C++ throws `std::logic_error`
-    /// here, and it is right to: it means the reserve and the commit have
-    /// drifted apart, and continuing would silently overrun the budget.
+    /// Move `pages` from held to committed. Errors if they were never reserved
+    /// — reserve/commit would have drifted, silently overrunning the budget.
     pub fn mark_committed(&mut self, pages: usize) -> Result<()> {
         if pages > self.held_pages {
             return Err(Error::invalid(
@@ -214,14 +160,8 @@ impl PoolBudget {
         }
     }
 
-    /// Re-derive the budget from how much device memory is actually free.
-    ///
-    /// The new ceiling is "what is charged now, plus what is free beyond the
-    /// safety floor" -- never below what is already charged, because those
-    /// pages exist and pretending otherwise would make every subsequent
-    /// arithmetic underflow. `reset_hard_ceiling` drops the high-water mark to
-    /// the new value, for when something outside the process has taken memory
-    /// for good rather than transiently.
+    /// Re-derive the budget from free device memory: charged plus free beyond
+    /// the safety floor, never below charged. `reset_hard_ceiling` also drops the high-water mark.
     pub fn recalibrate(
         &mut self,
         available_bytes: usize,
@@ -246,8 +186,7 @@ impl PoolBudget {
     }
 }
 
-/// A device's supply of physical pages: [`PoolBudget`] plus the CUDA handle
-/// lifecycle.
+/// A device's supply of physical pages: [`PoolBudget`] plus the CUDA handle lifecycle.
 #[derive(Debug)]
 pub struct PhysicalPool {
     device_ordinal: i32,
@@ -259,12 +198,7 @@ pub struct PhysicalPool {
 
 impl PhysicalPool {
     /// Query the device's allocation granularity and open a budget over
-    /// `budget_bytes`.
-    ///
-    /// `handle_bytes` is the size of one `cuMemCreate` allocation -- the unit
-    /// growth happens in. It is raised to at least the granularity and rounded
-    /// up to a multiple of it, because `cuMemCreate` rejects anything else.
-    /// The C++ default of 32 MiB is [`Self::DEFAULT_HANDLE_BYTES`].
+    /// `budget_bytes`; `handle_bytes` is rounded up to a multiple of it, as `cuMemCreate` requires.
     pub fn new(device_ordinal: i32, budget_bytes: usize, handle_bytes: usize) -> Result<Self> {
         let prop = allocation_prop(device_ordinal);
         let mut granularity: usize = 0;
@@ -359,17 +293,9 @@ impl PhysicalPool {
         });
     }
 
-    /// Name the peers that may read this pool's pages directly.
-    ///
-    /// VMM mappings are private to the owning device unless a peer appears in
-    /// the access descriptor, so without this a same-process tensor-parallel
-    /// peer faults reading this rank's activations -- which is exactly what
-    /// the custom P2P all-reduce does. Must be called before any arena grows;
-    /// pages mapped afterwards pick the list up on their own.
-    ///
-    /// Peers that cannot actually be reached are dropped with a warning rather
-    /// than refused, matching the C++: a machine without NVLink between two
-    /// ranks should run device-private, not fail to start.
+    /// Name the peers that may read this pool's pages directly. VMM mappings
+    /// are device-private otherwise, so call before any arena grows. Unreachable
+    /// peers are dropped with a warning, not refused.
     pub fn set_peer_devices(&mut self, peers: &[i32]) {
         self.peer_devices.clear();
         for &peer in peers {
@@ -390,8 +316,7 @@ impl PhysicalPool {
         }
     }
 
-    /// The peers named by [`Self::set_peer_devices`] that were actually
-    /// reachable.
+    /// The peers named by [`Self::set_peer_devices`] that were reachable.
     #[must_use]
     pub fn peer_devices(&self) -> &[i32] {
         &self.peer_devices
@@ -426,9 +351,8 @@ impl PhysicalPool {
 }
 
 fn allocation_prop(device_ordinal: i32) -> CUmemAllocationProp {
-    // Zeroed then filled, like the C++ `CUmemAllocationProp prop{}`: the struct
-    // has a reserved tail and a win32-only member that must stay zero, and
-    // naming every field would break on the next CUDA minor that grows one.
+    // Zeroed then filled: a reserved/win32-only tail must stay zero; naming every field
+    // would break on a CUDA bump.
     let mut prop: CUmemAllocationProp = unsafe { std::mem::zeroed() };
     prop.type_ = CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location = memory_location(device_ordinal);
@@ -442,12 +366,8 @@ fn memory_location(device_ordinal: i32) -> cudarc::driver::sys::CUmemLocation {
     loc
 }
 
-/// A contiguous virtual range whose physical backing grows and shrinks
-/// underneath it.
-///
-/// The address returned by [`Arena::base`] is fixed for the arena's life. That
-/// is the property the whole VMM detour buys: tensors can hold offsets into
-/// this range across a shrink and a regrow without being rebased.
+/// A contiguous virtual range whose physical backing grows and shrinks under a
+/// fixed base address, so tensors hold offsets across a shrink/regrow without rebasing.
 #[derive(Debug)]
 pub struct Arena<'p> {
     pool: &'p PhysicalPool,
@@ -456,25 +376,17 @@ pub struct Arena<'p> {
     max_bytes: usize,
     virtual_bytes: usize,
     map_unit_bytes: usize,
-    /// Handles currently mapped, in address order: handle `i` backs
-    /// `[base + i*map_unit, base + (i+1)*map_unit)`.
+    /// Handles currently mapped, in address order: handle `i` backs `[base +
+    /// i*map_unit, base + (i+1)*map_unit)`.
     mapped: Vec<CUmemGenericAllocationHandle>,
-    /// Handles unmapped by a trim but not released, ready to be re-mapped.
-    ///
-    /// Trim/regrow churn is the common case for a KV store that tracks a
-    /// varying batch, and `cuMemCreate` is expensive enough that paying it on
-    /// every oscillation shows up. Holding the handle keeps the physical
-    /// memory charged to this process, which is the deliberate trade.
+    /// Handles unmapped by a trim but not released, ready to re-map — trim/regrow
+    /// churn is common and `cuMemCreate` is expensive, at the cost of keeping memory charged.
     cached: Vec<CUmemGenericAllocationHandle>,
 }
 
 impl<'p> Arena<'p> {
-    /// Reserve a virtual range for an arena that will hold at most
-    /// `max_bytes`.
-    ///
-    /// Reserves twice `max_bytes` of *address space*, which costs nothing but
-    /// address bits and leaves room for the range to be extended in place
-    /// later.
+    /// Reserve a virtual range for an arena that will hold at most `max_bytes`,
+    /// reserving twice that in *address space* to leave room to extend in place.
     pub fn new(pool: &'p PhysicalPool, max_bytes: usize, label: impl Into<String>) -> Result<Self> {
         let label = label.into();
         if max_bytes == 0 {
@@ -488,12 +400,8 @@ impl<'p> Arena<'p> {
             .handle_bytes()
             .min(align_up(max_bytes, granularity))
             .max(granularity);
-        // Twice the capacity, in address space only -- but `checked_mul`
-        // rather than `saturating_mul`, because saturating would ask for a
-        // `usize::MAX` reservation on overflow where the C++ falls back to the
-        // plain size. Unreachable either way; the point is that the failure
-        // mode of an absurd `max_bytes` is "no headroom", not "reserve the
-        // entire address space".
+        // `checked_mul`, not `saturating_mul`: overflow falls back to the plain size,
+        // not `usize::MAX`.
         let virtual_bytes = align_up(
             max_bytes.checked_mul(2).unwrap_or(max_bytes),
             map_unit_bytes,
@@ -561,10 +469,7 @@ impl<'p> Arena<'p> {
     }
 
     /// Logical pages that reaching `bytes` would newly charge to the pool.
-    ///
-    /// Cached handles are already charged, so they do not count -- getting
-    /// this wrong is a double-charge that shrinks the effective budget every
-    /// oscillation.
+    /// Cached handles are already charged and don't count, or oscillation double-charges.
     pub fn physical_growth_pages(&self, bytes: usize) -> Result<usize> {
         let target = self.target_committed_bytes(bytes)?;
         let committed = self.committed_bytes();
@@ -579,12 +484,8 @@ impl<'p> Arena<'p> {
         ))
     }
 
-    /// Back at least `bytes` with physical memory.
-    ///
-    /// Reserves from the pool first, so a budget refusal costs nothing. If any
-    /// mapping fails partway the arena is rolled back to exactly where it
-    /// started and the reservation is returned -- the arena is never left in a
-    /// half-grown state.
+    /// Back at least `bytes` with physical memory. Reserves from the pool first
+    /// so a refusal costs nothing; a partial failure rolls back fully, never half-grown.
     pub fn ensure_committed(&mut self, bytes: usize) -> Result<()> {
         let before = self.committed_bytes();
         let cached_before = self.cached.len();
@@ -612,38 +513,20 @@ impl<'p> Arena<'p> {
     }
 
     /// Drop physical backing above `bytes`, keeping the addresses reserved.
-    ///
-    /// See [`Arena::release_tail`] for what happens to the freed handles.
     pub fn trim_committed(&mut self, bytes: usize) -> Result<()> {
         let target = self.target_committed_bytes(bytes)?;
         self.release_tail(target);
         Ok(())
     }
 
-    /// How many unmapped handles this arena keeps against a regrow.
-    ///
-    /// One, and only while the arena is holding at least two -- i.e. a single
-    /// unit of hysteresis for an arena that is oscillating, and nothing at all
-    /// for one that is being emptied.
-    ///
-    /// The cap is the important part, and it is not a tuning choice. A cached
-    /// handle is still physical memory this process owns, so it stays charged
-    /// to the pool as committed (which is why
-    /// [`Arena::physical_growth_pages`] does not charge for reusing one). An
-    /// uncapped cache would therefore be an uncapped charge against a budget
-    /// other arenas are sharing: memory that nothing can use and nothing can
-    /// reclaim.
+    /// How many unmapped handles this arena keeps against a regrow: one while
+    /// holding at least two (hysteresis), zero otherwise — a cached handle still costs budget.
     const fn cache_goal(target_handles: usize) -> usize {
         if target_handles >= 2 { 1 } else { 0 }
     }
 
-    /// Unmap everything above `target_bytes`, then reconcile the cache and the
-    /// pool.
-    ///
-    /// Only handles actually released back to the driver are reported to the
-    /// pool as uncommitted. Cached ones are not: they are still held, and
-    /// telling the pool otherwise would let it hand the same physical pages to
-    /// a second arena.
+    /// Unmap everything above `target_bytes`, then reconcile cache and pool.
+    /// Only handles released to the driver are reported uncommitted — cached ones stay held.
     fn release_tail(&mut self, target_bytes: usize) {
         let target = align_up(target_bytes, self.map_unit_bytes);
         let goal = Self::cache_goal(target / self.map_unit_bytes);
@@ -664,8 +547,8 @@ impl<'p> Arena<'p> {
             }
         }
 
-        // A trim also shrinks a cache left over from a larger arena, so the
-        // hysteresis buffer cannot grow across successive trims.
+        // A trim also shrinks a cache left over from a larger arena, so hysteresis
+        // can't grow across trims.
         while self.cached.len() > goal {
             let Some(handle) = self.cached.pop() else {
                 break;
@@ -708,9 +591,8 @@ impl<'p> Arena<'p> {
             });
 
             if let Err(e) = outcome {
-                // Put the handle back where it came from: the cache if that is
-                // where it came from, otherwise released outright. Getting this
-                // branch wrong leaks physical memory on every failed growth.
+                // Put the handle back where it came from: the cache, or released
+                // outright. Getting this wrong leaks on every failed grow.
                 if reused.is_some() {
                     self.cached.push(handle);
                 } else {
@@ -723,15 +605,10 @@ impl<'p> Arena<'p> {
         Ok(())
     }
 
-    /// Undo a failed growth: unmap back to `bytes`, restoring the cache to the
-    /// size it had before and releasing anything beyond that.
-    ///
-    /// Distinct from [`Arena::release_tail`], and not merely a special case of
-    /// it. Nothing here is reported to the pool as uncommitted, because these
-    /// pages were never committed: they are still `held` against the
-    /// reservation `ensure_committed` took out, and it is that caller's
-    /// `unreserve` that gives them back. Routing this through `release_tail`
-    /// would credit the same pages twice.
+    /// Undo a failed growth: unmap back to `bytes`, restoring the cache to its
+    /// prior size. Nothing here is reported uncommitted — these pages were only
+    /// `held`, and `ensure_committed`'s `unreserve` returns them; routing through
+    /// `release_tail` would double-credit.
     fn rollback(&mut self, bytes: usize, cached_handle_count: usize) {
         let target_handles = align_up(bytes, self.map_unit_bytes) / self.map_unit_bytes;
         while self.mapped.len() > target_handles {
@@ -752,8 +629,8 @@ impl<'p> Arena<'p> {
 
 impl Drop for Arena<'_> {
     fn drop(&mut self) {
-        // `release_tail(0)` has `cache_goal(0) == 0`, so it unmaps everything,
-        // drains the cache, and credits the whole lot back to the pool.
+        // `release_tail(0)` has `cache_goal(0) == 0`, so it unmaps and drains
+        // everything back to the pool.
         self.release_tail(0);
         if self.base != 0 {
             ignore_in_drop(unsafe { cuMemAddressFree(self.base, self.virtual_bytes) });
@@ -765,8 +642,7 @@ impl Drop for Arena<'_> {
 mod tests {
     use super::*;
 
-    // `PoolBudget` is the part of this file with the bugs in it, and it needs
-    // no GPU, so it gets the tests.
+    // `PoolBudget` needs no GPU, so it gets the tests.
 
     #[test]
     fn a_budget_is_whole_pages_and_partial_pages_are_dropped() {
@@ -789,8 +665,6 @@ mod tests {
 
     #[test]
     fn held_pages_charge_against_the_budget_before_they_are_committed() {
-        // The reason there are two counters. A second arena asking while a
-        // first is midway through growing must be told no.
         let mut b = PoolBudget::new(4 * LOGICAL_PAGE_BYTES);
         assert!(b.try_reserve(3));
         assert_eq!(b.free_pages(), 1, "held pages are charged immediately");
@@ -829,8 +703,6 @@ mod tests {
 
     #[test]
     fn a_failed_growth_returns_every_page_it_reserved() {
-        // The rollback contract: reserve, fail, unreserve, and the budget is
-        // exactly where it started.
         let start = PoolBudget::new(8 * LOGICAL_PAGE_BYTES);
         let mut b = start.clone();
         assert!(b.try_reserve(5));
@@ -855,9 +727,8 @@ mod tests {
 
     #[test]
     fn over_releasing_saturates_rather_than_underflowing() {
-        // Both release paths run from unwinding and from Drop, where a second
-        // failure on top of the first helps nobody -- and where a `usize`
-        // underflow would turn a small bug into a budget of 2^64 pages.
+        // Runs from unwinding/Drop; a `usize` underflow would turn a small bug into a
+        // budget of 2^64 pages.
         let mut b = PoolBudget::new(4 * LOGICAL_PAGE_BYTES);
         assert!(b.try_reserve(1));
         b.unreserve(100);
@@ -868,8 +739,7 @@ mod tests {
 
     #[test]
     fn recalibration_never_drops_the_budget_below_what_is_already_charged() {
-        // The invariant that keeps `free_pages` from going negative-by-wrapping
-        // when the device turns out to have less memory than the pool is using.
+        // Keeps `free_pages` from wrapping when the device has less memory than the pool is using.
         let mut b = PoolBudget::new(16 * LOGICAL_PAGE_BYTES);
         assert!(b.try_reserve(10));
         b.mark_committed(10).unwrap();
@@ -903,12 +773,10 @@ mod tests {
         b.recalibrate(20 * LOGICAL_PAGE_BYTES, 0, false);
         assert_eq!(b.hard_budget_pages(), 20);
 
-        // Something else took memory for a moment.
         b.recalibrate(5 * LOGICAL_PAGE_BYTES, 0, false);
         assert_eq!(b.budget_pages(), 5);
         assert_eq!(b.hard_budget_pages(), 20, "the high-water mark remembers");
 
-        // It took it for good.
         b.recalibrate(5 * LOGICAL_PAGE_BYTES, 0, true);
         assert_eq!(b.hard_budget_pages(), 5);
     }
@@ -923,10 +791,6 @@ mod tests {
 
     #[test]
     fn the_handle_cache_is_capped_at_one_and_empties_completely_on_teardown() {
-        // A cached handle is physical memory still charged to the pool, so an
-        // uncapped cache is an uncapped charge nothing can reclaim. One unit
-        // of hysteresis for an oscillating arena; none for one being emptied,
-        // which is what makes `Drop`'s `release_tail(0)` give everything back.
         assert_eq!(Arena::cache_goal(0), 0, "teardown keeps nothing");
         assert_eq!(
             Arena::cache_goal(1),

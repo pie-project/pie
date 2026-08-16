@@ -48,6 +48,12 @@ _cuda = ["dep:cudarc"]
 # The vocabulary a row is written in: `KernelSig`, `LaunchRule`, `Ty`,
 # `Source`. Layer 1 is this crate's re-export of it.
 kernels = { path = "../kernels" }
+# `#[routine]`, which reads a launcher's Rust signature and derives the
+# `Source` per parameter. A separate crate because `proc-macro = true`
+# forbids exporting anything else and because `kernels` keeps its "no
+# dependencies, and none is wanted" line. The edge is compile-time only:
+# nothing of `syn` reaches a built artifact.
+kernels-macros = { path = "../kernels-macros" }
 
 # NO dependency on the ARCHIVE crate, and the absence is worth stating even
 # now that the archive is deleted and this crate has taken its name. This

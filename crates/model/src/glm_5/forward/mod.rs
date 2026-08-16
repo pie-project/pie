@@ -137,7 +137,13 @@ pub fn glm5_cuda(facts: &Glm5Facts, class: FireClass) -> ForwardPlan {
                 facts.dsa.index_n_heads,
                 facts.dsa.index_head_dim,
             );
-            dsl::cuda::dsa_index_topk_mask(
+            // The mask is STATED, not threaded: `mla_absorbed_attention`
+            // below takes no operand for it, and the binding is what
+            // says the drop is deliberate. `builder!` marks every
+            // statement it generates `#[must_use]`, and
+            // `model-dsl/src/cuda/mla.rs` folded this one into the block
+            // its two index ropes were already in.
+            let _index_mask = dsl::cuda::dsa_index_topk_mask(
                 &idx_q,
                 &idx_k,
                 &idx_w,
@@ -202,7 +208,7 @@ pub fn glm5_cuda(facts: &Glm5Facts, class: FireClass) -> ForwardPlan {
                 &experts,
                 facts.moe.top_k,
             );
-            let act = dsl::cuda::swiglu(&gate_up, facts.moe.moe_intermediate, true);
+            let act = dsl::cuda::swiglu(&gate_up, facts.moe.moe_intermediate);
             let route_out = dsl::cuda::moe_down_gemv(
                 &act,
                 &MatW {
@@ -221,8 +227,8 @@ pub fn glm5_cuda(facts: &Glm5Facts, class: FireClass) -> ForwardPlan {
             // `moe_out` is scratch and nothing folded into it.
             let moe_out = if facts.moe.shared_intermediate > 0 {
                 let sgate = matmul(&m, &w.shared_gate);
-                let _sup = matmul(&m, &w.shared_up);
-                let sact = dsl::cuda::swiglu(&sgate, facts.moe.shared_intermediate, false);
+                let sup = matmul(&m, &w.shared_up);
+                let sact = dsl::cuda::swiglu_pair(&sgate, &sup, facts.moe.shared_intermediate);
                 let shared = matmul(&sact, &w.shared_down);
                 dsl::cuda::residual_add(&routed, &shared, facts.hidden)
             } else {

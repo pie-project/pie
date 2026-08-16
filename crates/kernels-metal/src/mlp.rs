@@ -6,7 +6,8 @@
 
 use kernels::routine::Refusal;
 
-use crate::routine::{Bind, Buf, BufMut, Ctx, Env, Fire, Routine, elementwise};
+use crate::routine::{elementwise, keys, Ask, Bind, Block, Buf, BufMut, Ctx, Fire, Routine};
+use crate::routine::{InSlot, OutSlot};
 
 /// Threads per threadgroup for every elementwise body in this file.
 ///
@@ -34,12 +35,12 @@ const GROUP_X: u32 = 256;
 /// See [`crate::routine::elementwise`].
 pub fn geglu_tanh(
     ctx: &Ctx<'_>,
-    gate: Buf,
-    up: Buf,
-    out: BufMut,
-    params: Buf,
-    width: Env<i32>,
-    rows: Env<i32>,
+    gate: InSlot<0, Buf>,
+    up: InSlot<1, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -71,12 +72,12 @@ pub fn geglu_tanh(
 /// See [`crate::routine::elementwise`].
 pub fn geglu_tanh_strided(
     ctx: &Ctx<'_>,
-    gate: Buf,
-    up: Buf,
-    out: BufMut,
-    params: Buf,
-    width: Env<i32>,
-    rows: Env<i32>,
+    gate: InSlot<0, Buf>,
+    up: InSlot<1, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -104,12 +105,12 @@ pub fn geglu_tanh_strided(
 /// See [`crate::routine::elementwise`].
 pub fn gptoss_swiglu(
     ctx: &Ctx<'_>,
-    gate: Buf,
-    up: Buf,
-    out: BufMut,
-    params: Buf,
-    width: Env<i32>,
-    rows: Env<i32>,
+    gate: InSlot<0, Buf>,
+    up: InSlot<1, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -139,11 +140,11 @@ pub fn gptoss_swiglu(
 /// See [`crate::routine::elementwise`].
 pub fn silu_mul(
     ctx: &Ctx<'_>,
-    gate: Buf,
-    up: Buf,
-    out: BufMut,
-    width: Env<i32>,
-    rows: Env<i32>,
+    gate: InSlot<0, Buf>,
+    up: InSlot<1, Buf>,
+    out: OutSlot<0, BufMut>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -221,11 +222,11 @@ mod tests {
     #[test]
     fn all_four_bodies_bind_gate_up_and_out_at_zero_one_and_two() {
         let seen = Seen::default();
-        geglu_tanh(&seen, Buf(1), Buf(2), BufMut(3), Buf(4), Env(8), Env(2)).expect("a launch");
-        geglu_tanh_strided(&seen, Buf(1), Buf(2), BufMut(3), Buf(4), Env(8), Env(2))
+        geglu_tanh(&seen, InSlot::new(Buf(1)), InSlot::new(Buf(2)), OutSlot::new(BufMut(3)), Block::new(Buf(4)), Ask::new(8), Ask::new(2)).expect("a launch");
+        geglu_tanh_strided(&seen, InSlot::new(Buf(1)), InSlot::new(Buf(2)), OutSlot::new(BufMut(3)), Block::new(Buf(4)), Ask::new(8), Ask::new(2))
             .expect("a launch");
-        gptoss_swiglu(&seen, Buf(1), Buf(2), BufMut(3), Buf(4), Env(8), Env(2)).expect("a launch");
-        silu_mul(&seen, Buf(1), Buf(2), BufMut(3), Env(8), Env(2)).expect("a launch");
+        gptoss_swiglu(&seen, InSlot::new(Buf(1)), InSlot::new(Buf(2)), OutSlot::new(BufMut(3)), Block::new(Buf(4)), Ask::new(8), Ask::new(2)).expect("a launch");
+        silu_mul(&seen, InSlot::new(Buf(1)), InSlot::new(Buf(2)), OutSlot::new(BufMut(3)), Ask::new(8), Ask::new(2)).expect("a launch");
 
         let calls = seen.0.borrow();
         assert_eq!(calls.len(), 4, "one activation is one dispatch");
@@ -235,9 +236,10 @@ mod tests {
                 [
                     ArgValue::Buffer(1),
                     ArgValue::Buffer(2),
-                    ArgValue::Buffer(3)
+                    ArgValue::BufferMut(3)
                 ],
-                "`{}` binds gate, up, out at 0, 1, 2",
+                "`{}` binds gate, up, out at 0, 1, 2 -- and `out` says so in \
+                 the VALUE, which is where the encoder reads the direction",
                 fire.entrypoint
             );
             assert_eq!(
@@ -277,7 +279,7 @@ mod tests {
     #[test]
     fn the_grid_is_every_element_of_the_rectangle_and_not_one_row_of_it() {
         let seen = Seen::default();
-        geglu_tanh_strided(&seen, Buf(1), Buf(2), BufMut(3), Buf(4), Env(256), Env(8))
+        geglu_tanh_strided(&seen, InSlot::new(Buf(1)), InSlot::new(Buf(2)), OutSlot::new(BufMut(3)), Block::new(Buf(4)), Ask::new(256), Ask::new(8))
             .expect("eight rows is a launch");
 
         let calls = seen.0.borrow();
@@ -300,7 +302,7 @@ mod tests {
     #[test]
     fn a_rectangle_with_no_elements_is_a_refusal_and_not_a_launch() {
         let seen = Seen::default();
-        let refused = silu_mul(&seen, Buf(1), Buf(2), BufMut(3), Env(8), Env(0))
+        let refused = silu_mul(&seen, InSlot::new(Buf(1)), InSlot::new(Buf(2)), OutSlot::new(BufMut(3)), Ask::new(8), Ask::new(0))
             .expect_err("zero rows is not a launch");
         assert!(
             matches!(refused, Refusal::Empty { what: "rows" }),

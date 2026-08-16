@@ -12,7 +12,7 @@ use crate::config::DriverKind;
 /// build could never reach a device.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum Flavor {
-    #[cfg(feature = "driver-cuda")]
+    #[cfg(feature = "_driver-cuda")]
     Cuda,
     #[cfg(feature = "driver-metal")]
     Metal,
@@ -26,7 +26,7 @@ impl Flavor {
     /// Lowercase string used in error messages and configuration plumbing.
     pub fn as_str(self) -> &'static str {
         match self {
-            #[cfg(feature = "driver-cuda")]
+            #[cfg(feature = "_driver-cuda")]
             Flavor::Cuda => "cuda",
             #[cfg(feature = "driver-metal")]
             Flavor::Metal => "metal",
@@ -43,11 +43,11 @@ impl Flavor {
     pub fn from_kind(kind: DriverKind) -> Result<Self, String> {
         match kind {
             DriverKind::CudaNative => {
-                #[cfg(feature = "driver-cuda")]
+                #[cfg(feature = "_driver-cuda")]
                 {
                     Ok(Flavor::Cuda)
                 }
-                #[cfg(not(feature = "driver-cuda"))]
+                #[cfg(not(feature = "_driver-cuda"))]
                 {
                     Err(missing_feature_msg("cuda_native", "driver-cuda"))
                 }
@@ -87,7 +87,7 @@ impl Flavor {
 }
 
 #[cfg(any(
-    not(feature = "driver-cuda"),
+    not(feature = "_driver-cuda"),
     not(feature = "driver-metal"),
     not(feature = "driver-vulkan"),
     not(feature = "driver-wgpu"),
@@ -111,7 +111,7 @@ fn missing_feature_msg(toml_type: &str, feature: &str) -> String {
 pub fn compiled_summary() -> String {
     #[cfg_attr(
         not(any(
-            feature = "driver-cuda",
+            feature = "_driver-cuda",
             feature = "driver-metal",
             feature = "driver-vulkan",
             feature = "driver-wgpu"
@@ -119,7 +119,7 @@ pub fn compiled_summary() -> String {
         allow(unused_mut, reason = "every push below is feature-gated")
     )]
     let mut out: Vec<&'static str> = Vec::new();
-    #[cfg(feature = "driver-cuda")]
+    #[cfg(feature = "_driver-cuda")]
     out.push("cuda");
     #[cfg(feature = "driver-metal")]
     out.push("metal");
@@ -139,7 +139,7 @@ pub fn compiled_summary() -> String {
 /// only the compiled ones cannot say that the one you asked for is missing.
 pub fn compiled_embedded() -> [(&'static str, bool); 4] {
     [
-        ("cuda_native", cfg!(feature = "driver-cuda")),
+        ("cuda_native", cfg!(feature = "_driver-cuda")),
         ("metal", cfg!(feature = "driver-metal")),
         ("vulkan", cfg!(feature = "driver-vulkan")),
         ("wgpu", cfg!(feature = "driver-wgpu")),
@@ -157,16 +157,16 @@ pub fn compiled_embedded() -> [(&'static str, bool); 4] {
 /// for the more specific one too — wgpu may well end up running over Vulkan,
 /// and if that is what a deployment wants it can say so in one word.
 pub fn default_flavor() -> Option<Flavor> {
-    #[cfg(feature = "driver-cuda")]
+    #[cfg(feature = "_driver-cuda")]
     {
         return Some(Flavor::Cuda);
     }
-    #[cfg(all(not(feature = "driver-cuda"), feature = "driver-metal"))]
+    #[cfg(all(not(feature = "_driver-cuda"), feature = "driver-metal"))]
     {
         return Some(Flavor::Metal);
     }
     #[cfg(all(
-        not(feature = "driver-cuda"),
+        not(feature = "_driver-cuda"),
         not(feature = "driver-metal"),
         feature = "driver-vulkan"
     ))]
@@ -174,7 +174,7 @@ pub fn default_flavor() -> Option<Flavor> {
         return Some(Flavor::Vulkan);
     }
     #[cfg(all(
-        not(feature = "driver-cuda"),
+        not(feature = "_driver-cuda"),
         not(feature = "driver-metal"),
         not(feature = "driver-vulkan"),
         feature = "driver-wgpu"

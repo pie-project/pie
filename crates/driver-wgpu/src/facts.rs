@@ -1,57 +1,19 @@
 //! What this driver tells the engine about the device it opened.
 //!
-//! # The first thing the seam asks
-//!
-//! Every backend's door answers two verbs before anything else can happen:
-//! create the driver, and state the device's facts. The engine keeps the
-//! answer for the whole run and plans against it -- `driver/backend.rs` clones
-//! it out of `create` and hands it to the scheduler -- so a fact stated wrong
-//! here is not caught later by anything. It is believed.
-//!
-//! # Measured, not declared, and here that is not optional
-//!
-//! `driver-metal` states its facts as constants and is entitled to: it serves
-//! one vendor's parts. `driver-vulkan` measures, because the same binary runs
-//! on a discrete card, an integrated one and a software implementation.
-//!
-//! WebGPU is Vulkan's case widened. The same build runs over Vulkan, Metal,
-//! D3D12 and -- the point of the backend -- a browser, where the alignment is
-//! whatever the page's implementation decided. So the alignment is measured,
-//! and the specification's guaranteed FLOOR of 256 is the number a plan has to
-//! satisfy to bind anywhere rather than only here.
-//!
-//! # Why the measured half takes a number and not a device
-//!
-//! [`of`] is handed a `u32` alignment. `driver-vulkan`'s counterpart takes a
-//! `&Device` and is therefore untestable without a GPU -- its own facts test
-//! can only check the two constants. Passing the number instead means the
-//! whole answer is checkable here, and the device half's job shrinks to asking
-//! `wgpu::Limits::min_storage_buffer_offset_alignment` and forwarding it,
-//! which is not a place a defect can hide.
-//!
-//! # The two that are stated rather than measured, and why
-//!
-//! `fp8_native` and `native_mxfp4_moe` are false, and no adapter query would
-//! make them true. They do not ask what the hardware can do; they ask whether
-//! this driver has a KERNEL that does it. `kernels-wgpu`'s table is the answer
-//! and neither format is in it. A driver that reported `fp8_native` from a
-//! device feature bit would be promising a kernel that does not exist.
+//! Every backend's door answers two verbs first: create the driver, and state
+//! the device's facts. The engine keeps the answer for the whole run, so a
+//! fact stated wrong here is believed. The alignment is MEASURED, because the
+//! same build runs over Vulkan, Metal, D3D12 and a browser; the guaranteed
+//! FLOOR of 256 is what a plan must satisfy to bind anywhere. `fp8_native` and
+//! `native_mxfp4_moe` are stated false because they ask whether this driver
+//! has a KERNEL, and `kernels-wgpu`'s table has neither format.
 
 /// The facts, given the one number that is a property of the device.
 ///
-/// `storage_alignment` is
-/// `wgpu::Limits::min_storage_buffer_offset_alignment` from the adapter that
-/// was actually opened. It is a parameter rather than a device query for the
-/// reason the module doc gives: it makes the whole answer testable with no
-/// adapter, and it is the number
-/// [`binding::Bound::within`](crate::binding::Bound::within) refuses a
-/// sub-range for not having, so stating a different one here would mean the
-/// engine's arena laid tensors out at offsets this driver then declined to
-/// bind.
-///
-/// `unified` is the other device fact: whether the adapter reports an
-/// integrated or a software device, which is what decides if a staging copy is
-/// a copy or a formality.
+/// `storage_alignment` is the opened adapter's
+/// `min_storage_buffer_offset_alignment`: a parameter, not a query, so the
+/// whole answer is checkable with no adapter, and it is the number
+/// [`Bound::within`](crate::binding::Bound::within) refuses a sub-range for not having.
 ///
 /// # Panics
 ///
@@ -66,13 +28,9 @@ pub fn of(storage_alignment: u32, unified: bool) -> driver_api::DeviceFacts {
         fp8_native: false,
         native_mxfp4_moe: false,
         storage_alignment,
-        // NOT a tile map. Both are zero on both siblings for the reason they
-        // are zero here: the loader's `TileMap` instructions are executed
-        // host-side by `model-loader`, and what reaches this driver is bytes.
-        // A non-zero `storage_max_tile_bytes` would be a promise to accept a
-        // sparse residency plan nothing here implements -- and WebGPU has no
-        // sparse binding at all, so it is a promise this backend could not
-        // keep even if something did.
+        // NOT a tile map: `model-loader` executes the loader's `TileMap`
+        // instructions host-side and what reaches this driver is bytes. WebGPU
+        // has no sparse binding, so a non-zero value could not be honoured.
         storage_max_tile_bytes: 0,
         storage_tile_map_mask: 0,
         page_size: PAGE_SIZE,
@@ -81,44 +39,34 @@ pub fn of(storage_alignment: u32, unified: bool) -> driver_api::DeviceFacts {
 
 /// What this backend calls itself in the handshake.
 ///
-/// The engine matches on this string to pick a backend, so it is a name in an
-/// interface rather than a description. `wgpu` and not `webgpu`: it names the
-/// crate the shell is written against, which is what a deployment selects, and
-/// it is distinct from `vulkan` even though this backend may well be running
-/// over Vulkan -- the engine is choosing a SHELL, not a driver stack.
+/// The engine matches on this string to pick a backend. `wgpu` and not
+/// `webgpu`: it names the crate the shell is written against, and it is
+/// distinct from `vulkan` even when this backend runs over Vulkan.
 pub const BACKEND: &str = "wgpu";
 
 /// Rows per KV page.
 ///
-/// Sixteen because the tiled GEMM is compiled at `bm = 16`: a page that held
-/// some other number of rows would still work for attention and would put a
-/// prefill's row count out of step with the tile count, which the dispatch
-/// refuses rather than pads. `kernels-wgpu`'s tile axis is `kernels-metal`'s
-/// row for row -- `_bm_16_bn_16`, `_bm_32_bn_32`, `_bm_64_bn_64` -- so the
-/// narrowest tile is 16 here as it is on both siblings, and this is one number
-/// in two places.
-///
-/// The engine's `kv_translation` indices are in units of this, which is why it
-/// is in the handshake at all: a scheduler that assumed 16 against a driver
-/// that used 32 would address every page after the first at the wrong row.
+/// Sixteen because the tiled GEMM is compiled at `bm = 16`: a page of any
+/// other size would put a prefill's row count out of step with the tile count,
+/// which the dispatch refuses rather than pads. The engine's `kv_translation`
+/// indices are in units of this, so a scheduler assuming 16 against a driver
+/// using 32 would address every page after the first at the wrong row.
 pub const PAGE_SIZE: u32 = 16;
 
 /// The storage-buffer offset alignment WebGPU guarantees, in bytes.
 ///
 /// `wgpu::Limits::downlevel_defaults().min_storage_buffer_offset_alignment`,
 /// restated so the portable half can name it without `wgpu` present. A real
-/// adapter may report a SMALLER one -- the limit is a maximum a caller may
-/// request, and 256 is the value every implementation must accept -- so a plan
-/// whose offsets all divide 256 binds everywhere, and one that only divides
-/// the local card's number binds here.
+/// adapter may report a SMALLER one, so a plan whose offsets all divide 256
+/// binds everywhere and one that divides only the local card's number binds
+/// here.
 pub const GUARANTEED_STORAGE_ALIGNMENT: u32 = 256;
 
 /// The uniform-buffer offset alignment WebGPU guarantees, in bytes.
 ///
-/// The same 256, and named separately because it is a different limit that
-/// happens to share a value: `min_uniform_buffer_offset_alignment` is what a
-/// launch's parameter block has to start at, and a shell that folded the two
-/// into one constant would not notice an implementation that raised one.
+/// The same 256, named separately because it is a different limit that happens
+/// to share a value: folding the two into one constant would not notice an
+/// implementation that raised one.
 pub const GUARANTEED_UNIFORM_ALIGNMENT: u32 = 256;
 
 #[cfg(test)]
@@ -128,9 +76,8 @@ mod tests {
     /// The constants that are shared with something else, held against it.
     #[test]
     fn the_stated_page_size_is_the_one_the_tiles_need() {
-        // `dispatch.rs` refuses a prefill whose rows are not a whole number of
-        // 16-row tiles. A page of any other size would let a caller fill one
-        // page exactly and be refused for it.
+        // `dispatch.rs` refuses a prefill whose rows are not a whole number
+        // of 16-row tiles, so a page of any other size is refused when full.
         assert_eq!(
             PAGE_SIZE, 16,
             "the tiled GEMM takes 16-row tiles, so a page holds 16 rows"
@@ -139,10 +86,8 @@ mod tests {
             PAGE_SIZE.is_power_of_two(),
             "the engine indexes in units of this"
         );
-        // And the tile the table's narrowest entrypoint names is that same
-        // sixteen, read off the row rather than restated. `driver-vulkan`
-        // holds this in its device suite, where it needs a GPU; here it is a
-        // string in a table and needs nothing.
+        // The tile the table's narrowest entrypoint names is that same
+        // sixteen, read off the row rather than restated.
         let narrowest = kernels_wgpu::entrypoints()
             .into_iter()
             .filter_map(|e| crate::geometry::Tile::from_entrypoint(&e).map(|t| t.rows))
@@ -173,11 +118,9 @@ mod tests {
         assert_eq!(facts.storage_tile_map_mask, 0);
     }
 
-    /// The alignment is forwarded and not overridden.
-    ///
-    /// A device reporting a coarser granularity than the guaranteed floor is
-    /// legal, and a driver that clamped to 256 would tell the engine it may
-    /// place a tensor at an offset this driver would then refuse.
+    /// The alignment is forwarded and not overridden: a device reporting a
+    /// coarser granularity than the guaranteed floor is legal, and clamping to
+    /// 256 would promise the engine an offset this driver would then refuse.
     #[test]
     fn a_coarser_device_alignment_reaches_the_engine_unchanged() {
         assert_eq!(of(1024, true).storage_alignment, 1024);

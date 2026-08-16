@@ -1,86 +1,54 @@
 //! The adapter correction: every staged LoRA lane's `x·Aᵀ·Bᵀ` delta landed
 //! on the materialised q and v projections.
 //!
-//! # Why a `gemm` and not a family of its own
+//! It is a `gemm` and not a family of its own because every launch in its three
+//! passes is a matmul: the solo lanes are pairs of [`super::act_x_wt_bf16`],
+//! the grouped lanes are three [`super::grouped_act_x_wt_bf16`] over a staged
+//! pointer slab, and the scale pass is `quant::scale_rows_bf16`. **There is no
+//! device text here** — the LoRA seam is batched cuBLAS, so no `__global__` was
+//! ever written for it. `gemm::mla_absorb_*` is the precedent, in this same
+//! directory.
 //!
-//! Because that is what it IS. Three passes, and every launch in them is a
-//! matmul: the solo lanes are pairs of [`super::act_x_wt_bf16`], the grouped
-//! lanes are three [`super::grouped_act_x_wt_bf16`] over a staged pointer
-//! slab, and the scale pass is `quant::scale_rows_bf16`. **There is no device
-//! text here and there never was** — the LoRA seam is batched cuBLAS, so no
-//! `__global__` was ever written for it.
-//!
-//! `gemm::mla_absorb_*` is the exact precedent and it is in this directory:
-//! two `cublasGemmStridedBatchedEx`, no `__global__`, crossed as routines
-//! because a cuBLAS host program is a host program. The alternative — a
-//! `lora` family — would mint a namespace to hold one symbol whose whole
-//! body is other families' entry points.
-//!
-//! # The symbol was `pie_lora_qkv_correction`, and the rename is the point
-//!
-//! This crate rests on one equation: **the module path IS the trace
-//! namespace**, derived from `module_path!()` by [`jit::Family::new`] and
-//! therefore unable to drift. A bare symbol has no family to derive from —
-//! [`jit::Family::symbol`] is a namespace, `::`, and a name, and there is no
-//! way for it to produce a string with no `::` in it. So while the symbol was
-//! `pie_lora_qkv_correction` its row could only ever be hand-written, and the
-//! `pie_` on the front was the prefix of a C ABI this tree no longer has.
-//!
-//! It is `gemm::lora_qkv_correction`, the row derives from the `fn` below,
-//! and the equation holds for one more symbol than it did.
+//! The symbol is `gemm::lora_qkv_correction` and its row derives from the `fn`
+//! below, because **the module path IS the trace namespace**, taken from
+//! `module_path!()` by [`jit::Family::new`] and therefore unable to drift. A
+//! bare symbol has no family to derive from — [`jit::Family::symbol`] is a
+//! namespace, `::`, and a name — so its row could only ever be hand-written.
 //!
 //! [`jit::Family::new`]: crate::jit::Family::new
 //! [`jit::Family::symbol`]: crate::jit::Family::symbol
 //!
-//! # What came down and what did not
-//!
-//! `driver-cuda`'s `fire/lora.rs` had two halves under one type, and only one
-//! of them is a host program for this symbol.
-//!
-//! **Down: the launch half.** [`Lane`], [`Group`] and the pointer-slab
-//! arithmetic over them, because every field of both exists to be READ by
-//! [`lora_qkv_correction`] — `a_bf16`, `b_bf16`, `xa_offset`, `slab_off`,
-//! `m`/`mq`/`mv` are written once by the staging and never looked at again by
-//! anything else. A record whose only reader is one function belongs beside
-//! that function. [`LoraLaneView`] and its site vocabulary come with them
-//! because they are the words the three passes are written in.
-//!
-//! **Up: the staging half.** `LoraFireState::stage` validates a lane table,
-//! casts the fp32 adapters to bf16 and lays out the slab, and it does all of
-//! that through `fire::sideband_arena::DeviceMemory` — a trait with five
-//! implementors in `driver-cuda` and no counterpart here. `LoraStageArena` is
-//! a per-FIRE bump arena with retire-on-grow; [`Ctx`] is per CALL and
-//! `jit::device`'s scratch is per PROCESS, so neither of this crate's two
-//! device-memory shapes is the one staging needs. That is the boundary FA2's
-//! descent drew as well: the arithmetic came down and the caches' lifetimes
-//! stayed with the driver that owns them.
+//! The launch half of `driver-cuda`'s `fire/lora.rs` lives here: [`Lane`],
+//! [`Group`] and the pointer-slab arithmetic over them, because every field of
+//! both exists to be READ by [`lora_qkv_correction`]. [`LoraLaneView`] and its
+//! site vocabulary come with them, being the words the three passes are written
+//! in. The staging half stays in the driver: `LoraFireState::stage` validates
+//! the lane table, casts the fp32 adapters to bf16 and lays out the slab
+//! through `fire::sideband_arena::DeviceMemory`, and neither of this crate's
+//! device-memory shapes serves that — [`Ctx`] is per call and `jit::device`'s
+//! scratch is per process, where staging wants a per-fire bump arena.
 //!
 //! [`Staged`] is the seam, and it is a borrow rather than a copy because the
 //! two `Vec`s are the fire's and outlive every launch made from them.
-//!
-//! # Two things got better in the crossing
-//!
-//! `apply` returned `()`, so its two callees' refusals had nowhere to go: a
-//! private `grouped_or_panic` aborted on any `Err` from the grouped GEMM,
-//! with a doc explaining that the one refusal it could produce was
-//! unreachable. The signature carries a [`Refusal`] now, so the abort is a
-//! value and `bind`'s arm reports it the way it reports every other
-//! statement's decline. Nothing observable changes — the argument for
-//! unreachability is still in `stage`, which guards every extent this reads.
-//!
-//! And `apply` built THREE contexts where there is one. The solo pass handed
-//! `cublas` straight to the dense GEMM, the scale pass built `Ctx::on(stream)`
-//! with no handle, and `grouped_or_panic` built
-//! `Ctx::on(null).with_cublas(handle)` — **a context whose stream was null**,
-//! which was harmless only because the grouped form reads the handle's stream
-//! and never the context's. One `Ctx` carrying both is what a routine takes,
-//! and the null does not survive it.
 
 use core::ffi::c_void;
 
 use crate::jit::Ctx;
 use crate::jit::abi::bf16;
 use kernels::Refusal;
+use kernels::routine::Unbound;
+// `act_x_wt_bf16`'s weight position wears `Weight<0, _>` so that `#[routine]`
+// derives `Source::Named(<keys::NamedWeight as keys::Fact>::KEY)` for it rather
+// than `In(1)`. LoRA is the one caller for whom that derived claim is false —
+// these are adapter matrices off a `LoraLane` — and it costs nothing, because
+// this file never fires through the binder: it is a host program calling a Rust
+// function, and the column it would have used is one it never reads. The three
+// calls below likewise build an `In` and an `Out` by hand for extents that live
+// inside the regions; the SHAPE they carry is true, and every number passed is
+// the lane view's own.
+use kernels::{In, Out, Weight};
+// `#[kernels_macros::routine]` on the correction below is fully qualified,
+// because the family spells it that way in all four files that hold a launcher.
 
 // ── the sink's vocabulary ────────────────────────────────────────────────
 
@@ -277,6 +245,7 @@ pub fn bf16_row(base: *const c_void, row: u32, width: i32) -> *const c_void {
 /// scratch's, and every pointer [`Staged`] carries must be one the staging
 /// laid down for THIS fire — a slab from a previous fire is a set of
 /// addresses that have since been reused.
+#[kernels_macros::routine]
 pub fn lora_qkv_correction(
     ctx: &Ctx,
     staged: Staged<'_>,
@@ -312,29 +281,50 @@ pub fn lora_qkv_correction(
             r,
         );
         let x = bf16_row(qkv_in, v.token_start, h);
-        super::act_x_wt_bf16(ctx, x, a_l, xa_scratch, t, r, h, 0.0)?;
+        // THE THREE EXTENTS ARE STILL HERE AND THEY ARE ARGUMENTS TO A
+        // STRUCT NOW. `act_x_wt_bf16` lost `m`, `n` and `k` in STAGE 3
+        // (`gemm/mod.rs`'s ledger), so this call site supplies the same
+        // three numbers as the regions' own fields: `m = t`, `k = h` on the
+        // activation, `n = r` on the result.
+        //
+        // CONSTRUCTING A REGION BY HAND IS LEGITIMATE HERE AND WOULD NOT BE
+        // ON THE GEMV LEG, which is the distinction `gemv.rs`'s header
+        // draws. These three numbers are the lane view's own -- `v.rank`,
+        // `v.d_in`, `v.token_count`, read off the staging that allocated
+        // `xa_scratch` -- so the shape a `In`/`Out` carries here is the
+        // shape the buffer actually has. Nothing is being invented to fill
+        // a field.
+        super::act_x_wt_bf16(
+            ctx,
+            In { ptr: x, rows: t, width: h },
+            Weight { ptr: a_l },
+            Out { ptr: xa_scratch, rows: t, width: r },
+            0.0,
+        )?;
         let d_out = i32::try_from(v.d_out).unwrap_or(0);
         if v.sites_bits & LORA_SITE_Q != 0 {
             super::act_x_wt_bf16(
                 ctx,
-                xa_scratch.cast_const(),
-                b_l,
-                bf16_row(q_out.cast_const(), v.token_start, hq).cast_mut(),
-                t,
-                d_out,
-                r,
+                In { ptr: xa_scratch.cast_const(), rows: t, width: r },
+                Weight { ptr: b_l },
+                Out {
+                    ptr: bf16_row(q_out.cast_const(), v.token_start, hq).cast_mut(),
+                    rows: t,
+                    width: d_out,
+                },
                 1.0,
             )?;
         }
         if v.sites_bits & LORA_SITE_V != 0 {
             super::act_x_wt_bf16(
                 ctx,
-                xa_scratch.cast_const(),
-                b_l,
-                bf16_row(v_out.cast_const(), v.token_start, hk).cast_mut(),
-                t,
-                d_out,
-                r,
+                In { ptr: xa_scratch.cast_const(), rows: t, width: r },
+                Weight { ptr: b_l },
+                Out {
+                    ptr: bf16_row(v_out.cast_const(), v.token_start, hk).cast_mut(),
+                    rows: t,
+                    width: d_out,
+                },
                 1.0,
             )?;
         }
@@ -360,12 +350,19 @@ pub fn lora_qkv_correction(
         unsafe {
             let a_ptrs = x_ptrs.add(n);
             let xa_ptrs = x_ptrs.add(2 * n);
+            // THE FOUR TABLES ARE `#[source(Unbound)]` AT THE SIGNATURE, and
+            // these are the call sites that note cites as its evidence: every
+            // argument below is visibly slab arithmetic -- `x_ptrs.add(n)`,
+            // `base.add(2 * g.nv as usize)`, `g.m.as_ptr()` on a host
+            // `Vec<i32>` -- so there is no operand behind any of them. The
+            // three pointer runs are DEVICE addresses out of `ptr_slab`;
+            // only `g.m` is host, which is the split cuBLAS asks for.
             super::grouped_act_x_wt_bf16(
                 ctx,
-                x_ptrs,
-                a_ptrs,
-                xa_ptrs.cast::<*mut c_void>().cast_mut(),
-                g.m.as_ptr(),
+                Unbound { ptr: x_ptrs },
+                Unbound { ptr: a_ptrs },
+                Unbound { ptr: xa_ptrs.cast::<*mut c_void>().cast_mut() },
+                Unbound { ptr: g.m.as_ptr() },
                 i32::try_from(n).unwrap_or(0),
                 g.rank,
                 g.d_in,
@@ -375,10 +372,12 @@ pub fn lora_qkv_correction(
                 let base = x_ptrs.add(3 * n);
                 super::grouped_act_x_wt_bf16(
                     ctx,
-                    base,
-                    base.add(g.nq as usize),
-                    base.add(2 * g.nq as usize).cast::<*mut c_void>().cast_mut(),
-                    g.mq.as_ptr(),
+                    Unbound { ptr: base },
+                    Unbound { ptr: base.add(g.nq as usize) },
+                    Unbound {
+                        ptr: base.add(2 * g.nq as usize).cast::<*mut c_void>().cast_mut(),
+                    },
+                    Unbound { ptr: g.mq.as_ptr() },
                     g.nq,
                     g.d_out,
                     g.rank,
@@ -389,10 +388,12 @@ pub fn lora_qkv_correction(
                 let base = x_ptrs.add(3 * n + 3 * g.nq as usize);
                 super::grouped_act_x_wt_bf16(
                     ctx,
-                    base,
-                    base.add(g.nv as usize),
-                    base.add(2 * g.nv as usize).cast::<*mut c_void>().cast_mut(),
-                    g.mv.as_ptr(),
+                    Unbound { ptr: base },
+                    Unbound { ptr: base.add(g.nv as usize) },
+                    Unbound {
+                        ptr: base.add(2 * g.nv as usize).cast::<*mut c_void>().cast_mut(),
+                    },
+                    Unbound { ptr: g.mv.as_ptr() },
                     g.nv,
                     g.d_out,
                     g.rank,
@@ -413,23 +414,53 @@ pub fn lora_qkv_correction(
         if v.sites_bits & LORA_SITE_Q != 0 {
             crate::quant::scale_rows::<bf16>(
                 ctx,
-                bf16_row(q_out.cast_const(), v.token_start, hq)
-                    .cast_mut()
-                    .cast::<crate::jit::abi::bf16>(),
-                l_l.cast::<crate::jit::abi::bf16>(),
-                t,
-                d_out,
+                // THE SAME RECTANGLE THE `act_x_wt_bf16` CALL ABOVE BUILDS
+                // FROM THE SAME POINTER, which is why this is a conversion
+                // and not an invention. `scale_rows` deleted its `rows` and
+                // `width` parameters when its `OutSlot<0, _>` became
+                // `Out<0, _>`; the two scalars that used to follow this
+                // argument were `t` and `d_out`, and they are the two the
+                // region carries now.
+                Out {
+                    ptr: bf16_row(q_out.cast_const(), v.token_start, hq)
+                        .cast_mut()
+                        .cast::<crate::jit::abi::bf16>(),
+                    rows: t,
+                    width: d_out,
+                },
+                // THE SCALE VECTOR NOW CARRIES ITS EXTENT, because `InSlot`
+                // is gone and F1 says why: a layout is 1:1 with the address
+                // and never absent -- what was absent was a TRANSPORT that
+                // dropped it. This caller has always known both numbers; the
+                // wrapper simply had nowhere to put them.
+                In {
+                    ptr: l_l.cast::<crate::jit::abi::bf16>(),
+                    rows: t,
+                    width: d_out,
+                },
             )?;
         }
         if v.sites_bits & LORA_SITE_V != 0 {
             crate::quant::scale_rows::<bf16>(
                 ctx,
-                bf16_row(v_out.cast_const(), v.token_start, hk)
-                    .cast_mut()
-                    .cast::<crate::jit::abi::bf16>(),
-                l_l.cast::<crate::jit::abi::bf16>(),
-                t,
-                d_out,
+                // As the Q site above, and the same pair of numbers.
+                Out {
+                    ptr: bf16_row(v_out.cast_const(), v.token_start, hk)
+                        .cast_mut()
+                        .cast::<crate::jit::abi::bf16>(),
+                    rows: t,
+                    width: d_out,
+                },
+                // THE SCALE VECTOR NOW CARRIES ITS EXTENT, because `InSlot`
+                // is gone and F1 says why: a layout is 1:1 with the address
+                // and never absent -- what was absent was a TRANSPORT that
+                // dropped it. This caller has always known both numbers; the
+                // wrapper simply had nowhere to put them.
+                In {
+                    ptr: l_l.cast::<crate::jit::abi::bf16>(),
+                    rows: t,
+                    width: d_out,
+                },
             )?;
         }
     }

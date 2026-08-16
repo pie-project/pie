@@ -42,7 +42,7 @@ const EXECUTOR_HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 #[cfg(test)]
 const EXECUTOR_HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
-#[cfg(feature = "driver-cuda")]
+#[cfg(feature = "_driver-cuda")]
 unsafe extern "C" {
     fn cudaMemcpy(
         dst: *mut std::ffi::c_void,
@@ -55,10 +55,10 @@ unsafe extern "C" {
     fn cudaSetDevice(device: i32) -> i32;
 }
 
-#[cfg(feature = "driver-cuda")]
+#[cfg(feature = "_driver-cuda")]
 struct CudaDeviceGuard(i32);
 
-#[cfg(feature = "driver-cuda")]
+#[cfg(feature = "_driver-cuda")]
 impl CudaDeviceGuard {
     fn select(device: u32) -> Result<Self> {
         let mut previous = 0;
@@ -72,7 +72,7 @@ impl CudaDeviceGuard {
     }
 }
 
-#[cfg(feature = "driver-cuda")]
+#[cfg(feature = "_driver-cuda")]
 impl Drop for CudaDeviceGuard {
     fn drop(&mut self) {
         unsafe {
@@ -95,7 +95,7 @@ fn append_region_bytes(
         }
 
         MemoryDomain::CudaDevice(_device) => {
-            #[cfg(feature = "driver-cuda")]
+            #[cfg(feature = "_driver-cuda")]
             {
                 let _guard = CudaDeviceGuard::select(_device)?;
                 let offset = out.len();
@@ -111,7 +111,7 @@ fn append_region_bytes(
                 anyhow::ensure!(status == 0, "cudaMemcpy D2H failed with status {status}");
                 Ok(())
             }
-            #[cfg(not(feature = "driver-cuda"))]
+            #[cfg(not(feature = "_driver-cuda"))]
             {
                 Err(anyhow::anyhow!(
                     "CUDA KV export requires feature \"driver-cuda\""
@@ -146,7 +146,7 @@ fn zero_grant(handle: &driver_api::KvHandle, grant: ScratchGrant) -> Result<()> 
                 std::ptr::write_bytes(base as *mut u8, 0, bytes);
             },
             MemoryDomain::CudaDevice(_device) => {
-                #[cfg(feature = "driver-cuda")]
+                #[cfg(feature = "_driver-cuda")]
                 {
                     let _guard = CudaDeviceGuard::select(_device)?;
                     let status = unsafe { cudaMemset(base as *mut std::ffi::c_void, 0, bytes) };
@@ -155,7 +155,7 @@ fn zero_grant(handle: &driver_api::KvHandle, grant: ScratchGrant) -> Result<()> 
                         "cudaMemset scratch grant failed with status {status}"
                     );
                 }
-                #[cfg(not(feature = "driver-cuda"))]
+                #[cfg(not(feature = "_driver-cuda"))]
                 {
                     anyhow::bail!("CUDA scratch zeroing requires feature \"driver-cuda\"");
                 }
@@ -453,13 +453,13 @@ pub(crate) struct ExecutorServer {
 impl ExecutorServer {
     /// The one caller is `embedded_driver`'s
     /// `gemma4_encode_component_loads_and_encodes`, which is
-    /// `#[cfg(feature = "driver-cuda")]` inside a `#[cfg(test)]` module -- so
+    /// `#[cfg(feature = "_driver-cuda")]` inside a `#[cfg(test)]` module -- so
     /// the gate that builds this crate with no driver feature sees a
     /// `#[cfg_attr(not(test), allow(dead_code))]` function nothing calls, and
     /// `-D warnings` refuses it. Gated to match its caller instead of allowed
     /// past: an allow that hides a real absence is how the accessor two
     /// modules over survived with no observer.
-    #[cfg(all(test, feature = "driver-cuda"))]
+    #[cfg(all(test, feature = "_driver-cuda"))]
     pub(crate) async fn bind(
         addr: &str,
         drivers: ModelDrivers,

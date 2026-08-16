@@ -85,12 +85,23 @@
 //!
 //! **Qwen3.5-0.8B is out of reach, and qwen3-0.6B is the substitution** — stated
 //! here rather than made quietly. Its `config.json` declares 24 layers of which
-//! **18 are `linear_attention`**; `kernels-wgpu`'s `ssm.rs` rows (`gdn_core`,
-//! `gdn_core_recurrent`, `gdn_core_recurrent_prefill`) declare axes and no
-//! operands, and `geometry.rs` refuses `Rule::RecurrentScan` and the rest of
-//! that family as `Ungeometric::Unruled`. `pie model list` says the same thing
-//! one level up: *unsupported type: qwen3_5_text*. A GDN model needs kernels
-//! this tree does not have, which is a coverage statement and not a defect.
+//! **18 are `linear_attention`**.
+//!
+//! THE REASON GIVEN HERE WAS WRONG, and it is worth saying which part. It read:
+//! *"`kernels-wgpu`'s `ssm.rs` rows declare axes and no operands, and
+//! `geometry.rs` refuses `Rule::RecurrentScan` as `Ungeometric::Unruled`. A GDN
+//! model needs kernels this tree does not have."* The tree HAS those kernels —
+//! `ssm` crossed, all eight have routines and arms — and no launch rule is
+//! consulted any more, so nothing can be refused as unruled. `tests/hybrid_
+//! probe.rs` lowers the hybrid and plans every rectangle: **twelve of fourteen
+//! symbols plan, and none is unclaimed by an arm.**
+//!
+//! What actually blocks it is RECURRENT STATE. `driver-metal` reads
+//! `conv_state` from `o.slab(layer, "conv_state")`; this crate's `Resolve` has
+//! no slab seam at all, so its GDN arms improvised and read the wrong operands.
+//! That is a feature this backend does not have, not a kernel it is missing,
+//! and the probe names both blocked symbols so the next attempt starts from a
+//! measurement instead of a sentence.
 //!
 //! # What it costs, and why that is paid rather than trimmed
 //!
@@ -632,12 +643,45 @@ fn shelled(real: &BTreeMap<String, Vec<u8>>, pages: u32) -> Shell {
 /// `driver-vulkan`'s `the_tiled_gemm_answers_the_way_the_vector_kernel_does`
 /// asked here.
 fn shelled_with(real: &BTreeMap<String, Vec<u8>>, pages: u32, vector: bool) -> Shell {
+    shelled_tuned(real, pages, vector, None)
+}
+
+/// [`shelled_with`], optionally overriding the GEMM tile the text is lowered
+/// at.
+///
+/// `project::QMM_TILE` is a SHARED constant, and its doc says it was chosen
+/// against a cooperative-matrix build: *"32 rather than 16 because 16 has no
+/// cooperative-matrix build to compile into."* This backend stamps no such
+/// build, so that reason cannot apply here and the value it produced is
+/// inherited rather than measured. The same doc already names the remedy —
+/// *"a backend wanting its own tile has `qmm_tile` on `MetalBinding`"* — so
+/// this parameter exists to find out whether this one does, before anybody
+/// sets it.
+///
+/// (It says "stamps no such build" and not "cannot": the adapter under this
+/// suite offers `EXPERIMENTAL_COOPERATIVE_MATRIX` at 16x16x16, so the shared
+/// constant's reason may yet become this backend's reason too. See
+/// `kernels-wgpu`'s
+/// `whether_this_adapter_offers_the_cooperative_matrix_this_tree_calls_absent`.)
+fn shelled_tuned(
+    real: &BTreeMap<String, Vec<u8>>,
+    pages: u32,
+    vector: bool,
+    tile: Option<(u32, u32)>,
+) -> Shell {
     let facts = facts();
+    let backend = match tile {
+        Some(qmm_tile) => LlamaLikeMetalFacts {
+            qmm_tile,
+            ..backend_facts()
+        },
+        None => backend_facts(),
+    };
     let text = Text {
-        decode: llama_like_metal(&facts, &backend_facts(), FireClass::Decode),
+        decode: llama_like_metal(&facts, &backend, FireClass::Decode),
         prefill: llama_like_metal(
             &facts,
-            &backend_facts(),
+            &backend,
             if vector {
                 FireClass::Decode
             } else {
@@ -654,6 +698,7 @@ fn shelled_with(real: &BTreeMap<String, Vec<u8>>, pages: u32, vector: bool) -> S
             rotary_dims: facts.head_dim,
             n_experts: 0,
             experts_per_token: 0,
+            ..Default::default()
         },
         layers: facts.layers as u16,
     };
@@ -679,6 +724,33 @@ fn shelled_with(real: &BTreeMap<String, Vec<u8>>, pages: u32, vector: bool) -> S
             .unwrap_or_else(|e| panic!("`{name}` would not stage: {e}"));
     }
     shell
+}
+
+/// **A measurement in the dev profile is a measurement of the dev profile.**
+///
+/// `cargo test` builds `dev` and this workspace sets no `[profile.dev]`
+/// opt-level, so a timing taken the obvious way is host-arithmetic-bound in a
+/// way the shipped binary never is. Three conclusions on this branch were
+/// published off debug timings before anybody noticed, and they went three
+/// different ways: the llama.cpp gap was overstated 2-4x, the batching lever
+/// was understated by half, and a kernel comparison came out backwards. **A
+/// debug number is not a slower version of a release number, it is a different
+/// measurement.**
+///
+/// So the measurement tests refuse rather than mislead. This is why they are
+/// all `#[ignore]`d as well: nothing in the gate runs them, and the only way
+/// to reach one is to ask for it, at which point being told the profile is
+/// wrong costs a rerun instead of a retraction.
+fn release_only() {
+    // `if` rather than `assert!`: in release the condition folds to a
+    // constant and `clippy::assertions_on_constants` is right that asserting
+    // one says nothing. The refusal is the point, not the assertion.
+    if cfg!(debug_assertions) {
+        panic!(
+            "this is a measurement and `cargo test` builds the dev profile; \
+             rerun it with `--release`"
+        );
+    }
 }
 
 /// The prompt: [`PERIOD`] five times, then the first two of a sixth repeat, so
@@ -3081,6 +3153,7 @@ fn a_step_of_no_turns_is_refused_and_not_served() {
                 rotary_dims: facts.head_dim,
                 n_experts: 0,
                 experts_per_token: 0,
+                ..Default::default()
             },
             layers: facts.layers as u16,
         },
@@ -3338,6 +3411,7 @@ fn a_real_fire_is_one_command_buffer_and_shadows_nothing() {
 #[test]
 #[ignore = "measurement"]
 fn what_a_decode_costs_at_length() {
+    release_only();
     let _lock = gpu();
     let Some(real) = weights() else {
         eprintln!("no checkpoint; skipped");
@@ -3389,4 +3463,853 @@ fn what_a_decode_costs_at_length() {
         1000.0 / median
     );
     println!("  fastest {:.3}, slowest {:.3}", ms[0], ms[ms.len() - 1]);
+}
+
+/// **What a 512-token prefill costs, which is the half a decode cannot show.**
+///
+/// `#[ignore]`, and a measurement rather than an assertion.
+///
+/// # Why this exists beside [`what_a_decode_costs_at_length`]
+///
+/// A decode fires ONE row, so it reaches none of this backend's arithmetic:
+/// `serve::record`'s table puts a decode's 12.7 ms in 452 launches and ~5.5 ms
+/// of host work, and the kernels themselves are a rounding error inside it. A
+/// prefill fires 512 rows through the tiled GEMM on the same weights, so it is
+/// the only shape in this file where the WGSL is what is being timed.
+///
+/// The two therefore answer different questions and a single "tok/s" for this
+/// backend is a category error. Both are reported per token so that neither
+/// can be quoted as the other.
+///
+/// # The cross-runtime baseline, measured rather than recalled
+///
+/// llama.cpp b8994, CUDA, the same RTX 4090, the same model at a comparable
+/// width — this driver quantises every weight to MLX affine-U4 at group 64
+/// with an fp16 scale and an fp16 bias, which is 4.5 bits a weight and exactly
+/// the 335,372,288 bytes it stages; `Q4_0` is 4.5 bits a weight too, and
+/// `Q4_1` is the one that also carries a bias:
+///
+/// | | llama.cpp | here | |
+/// | --- | --- | --- | --- |
+/// | decode @512 | 676-702 tok/s | 46.4 tok/s | **15x** |
+/// | prefill 512 | 40,369-41,430 tok/s | 628 tok/s | **65x** |
+///
+/// # Both sides in the same profile, which took two goes to get right
+///
+/// **Every driver figure above is `--release`, and the first set published
+/// here was not.** `cargo test` builds the dev profile, this workspace sets no
+/// `[profile.dev]` opt-level, and llama.cpp was configured
+/// `CMAKE_BUILD_TYPE=Release` — so the original table compared a debug Rust
+/// binary against an optimised C++ one and reported 34x and 270x. Rebuilt:
+///
+/// | | debug | release | |
+/// | --- | --- | --- | --- |
+/// | decode @512 | 49.2 ms | 21.6 ms | 2.3x |
+/// | prefill 512 | 2709 ms | 815 ms | 3.3x |
+/// | staging the weights | 105 s | 9.4 s | 11x |
+///
+/// The tell was in the tree the whole time and was read past: `serve::record`'s
+/// cost table says *"release"* in its first line, and this file's numbers
+/// disagreed with it by twelve. **A ratio between two runtimes is a claim about
+/// two BUILDS**, and the profile belongs beside the hardware and the model in
+/// anything that quotes one.
+///
+/// **That comparison is only worth the conditions it was taken in.** This
+/// machine carries a permanent unrelated load — 72 % of 32 cores, nine days
+/// old — and the two runtimes do not feel it equally: llama.cpp repeated
+/// within 6 % (678.5, 676.1, 692.1, 701.6) while this driver's median moved
+/// 49.2, 51.4 and 127.6 ms across three runs of ONE binary. The llama.cpp
+/// figures above bracket the driver's runs on both sides for that reason.
+///
+/// So the decode's honest span is 8.8x at this driver's best recorded 12.7 ms
+/// and 15x at what a loaded machine delivers, and the spread between those two
+/// is itself the finding: **what varies is host time**. The prefill is 4x
+/// worse than the decode's gap, and it is the half of this backend nobody had
+/// measured until this test.
+///
+/// # Where the gap is NOT
+///
+/// It is not the GPU sitting behind a wrong plan. A 512-row fire records
+/// **564 dispatches** against a one-row decode's 452, flat across twelve
+/// consecutive fires — so the batched tiled GEMM is being chosen, and this is
+/// not 512 matvecs wearing a prefill's name.
+///
+/// It is not the GPU being busy, either. `nvidia-smi dmon` over a whole run of
+/// the decode probe returned 0 % for 93 of 96 samples and never exceeded 56 %,
+/// and the card is otherwise empty (43 MiB, 0 %). The weights are 335 MB and a
+/// 4090 reads them in 0.33 ms, so a 49 ms token is 148x the bandwidth floor.
+/// A prefill does peg the card — 100 % for about 7 of its 44 seconds — which
+/// is the one place in this driver where the WGSL, not the host, is the cost.
+///
+/// It is not mainly the absence of command-buffer reuse either, which was the
+/// obvious guess: WebGPU has no CUDA-graph equivalent, so the whole graph is
+/// re-encoded every token. But `GGML_CUDA_DISABLE_GRAPHS=1` costs llama.cpp
+/// only 692 -> 459 tok/s, **1.5x of the 34x**. Graph replay is worth having and
+/// is not what separates these two.
+///
+/// # Where it is
+///
+/// Two different places, which is why one number could not have found them.
+///
+/// The decode is launch COUNT times per-launch cost: 452 dispatches at ~15 us
+/// against roughly 250 fused kernels on the other side. `serve::record`'s
+/// table already names the lever — *"the way down from here is FEWER
+/// LAUNCHES"* — and it is a lowering problem, not a WGSL one.
+///
+/// The prefill is the opposite, and the sweep this test prints is what says
+/// so. Fastest of three interleaved rounds, `--release`, an RTX 4090:
+///
+/// | rows | ms | tok/s | ms a row |
+/// | --- | --- | --- | --- |
+/// | 32 | 122.4 | 261 | 3.825 |
+/// | 64 | 152.5 | 420 | 2.383 |
+/// | 128 | 232.1 | 551 | 1.814 |
+/// | 256 | 437.7 | 585 | 1.710 |
+/// | 512 | 815.3 | 628 | 1.592 |
+///
+/// **Still falling at 512**, so a prefill has not yet reached its per-row cost
+/// and is carrying a fixed cost worth roughly 60 ms. It is nonetheless
+/// dominated by per-row work where the decode is dominated by fixed cost — the
+/// two halves of this backend fail for different reasons, and a fix aimed at
+/// one does little for the other.
+///
+/// (In the debug profile this table read 428.6 / 412.1 / 702.7 / 1332.0 /
+/// 2709.3 and was FLAT from 64 rows on at ~5.2 ms a row. Optimisation did not
+/// merely scale it — it changed the shape, because what it removed was host
+/// work. A curve's shape is a claim about a build too.)
+///
+/// The ceiling I named here was wrong. This said *"WebGPU's baseline tier has
+/// no cooperative-matrix instruction at all"* and treated 815 ms against a
+/// tensor-core ~4 ms as partly structural. The baseline half is true and the
+/// inference is not: `kernels-wgpu`'s
+/// `whether_this_adapter_offers_the_cooperative_matrix_this_tree_calls_absent`
+/// asks the adapter in front of this suite and it answers
+/// `EXPERIMENTAL_COOPERATIVE_MATRIX: true`, six shapes, including
+/// **16x16x16 F16 in, F32 accumulate** — from `wgpu 30`, the version already
+/// in this tree's lock file, on `VK_KHR_cooperative_matrix`. A device opens
+/// with it too, so this is not an advertised bit that request-time refuses.
+/// What stands between this backend and the tensor cores is `device.rs`
+/// asking for `ExperimentalFeatures::disabled()`, not the standard — and the
+/// price of asking otherwise is signing wgpu's `unsafe` experimental token.
+///
+/// So 815 ms is 200x off a reachable number rather than an unreachable one,
+/// and "structural" was doing work that "unimplemented" should have done.
+/// Measured, not merely available: `kernels-wgpu`'s
+/// `what_the_cooperative_matrix_is_worth_at_a_projections_shape` runs a
+/// `coop_mat16x16` f16->f32 GEMM at this exact projection shape in **0.168 ms
+/// against the shipped quantised kernel's 1.412 — 8.4x — with every one of
+/// 1,835,008 output elements verified exact**, from a naive tile with no
+/// staging and no register blocking.
+///
+/// It is not the projections, and it is not the tile — and ~30 % of it is not
+/// the plan at all: `where_a_prefills_time_goes_across_its_plan` fires the same
+/// prompt recording ZERO rectangles and still pays 176 ms of the 815.
+///
+/// # It is not the projections, and it is not the tile
+///
+/// `kernels-wgpu`'s isolated sweep does the gate/up projection `[3584, 1024]`
+/// at m=512 in 1.382 ms in release, which is 2.7 TFLOP/s. If every GEMM in the
+/// model ran at that rate a 512-row prefill would take 224 ms. It takes 815, of
+/// which 176 is host work outside the plan — so the projections are roughly a
+/// third of what a prefill spends on the GPU and the rest is the other
+/// kernels, with no large unexplained remainder. (In debug the same
+/// subtraction left ~85 % unaccounted, which was the profile and not the
+/// kernels.)
+///
+/// The tile is the same story measured a second way, and in release there is
+/// barely a story: the shipped `(32, 32)` is 1.412 ms against the best tile's
+/// 1.382, two percent. End to end, fired through the whole shell interleaved,
+/// four tiles land within 7 % of each other
+/// (`which_tile_a_512_row_prefill_wants`). The debug run of the kernel sweep
+/// showed a 1.34x that neither survived release nor reached the shell.
+///
+/// Run with `--ignored --nocapture`.
+#[test]
+#[ignore = "measurement"]
+fn what_a_prefill_costs_at_length() {
+    release_only();
+    let _lock = gpu();
+    let Some(real) = weights() else {
+        eprintln!("no checkpoint; skipped");
+        return;
+    };
+    let mut long: Vec<u32> = Vec::new();
+    while long.len() + PERIOD.len() <= 510 {
+        long.extend_from_slice(&PERIOD);
+    }
+    while !long.len().is_multiple_of(16) {
+        long.push(PERIOD[0]);
+    }
+    assert_eq!(long.len(), 512);
+
+    // A fresh `who` per fire, so every one is a prefill rather than a
+    // continuation, and enough pages for all of them to coexist.
+    let mut shell = shelled(real, 8192);
+    let mut who = 0u64;
+    let mut fire = |shell: &mut Shell, rows: usize| -> f64 {
+        who += 1;
+        let t = std::time::Instant::now();
+        let f = shell
+            .step(&[Turn {
+                who,
+                tokens: long[..rows].to_vec(),
+            }])
+            .expect("the prompt fires");
+        let took = t.elapsed().as_secs_f64() * 1000.0;
+        // Read the row out, so the timing cannot exclude the readback that a
+        // caller always pays.
+        let _ = argmax(f.logits.row(f.readout_of[0]).expect("it read out"));
+        took
+    };
+    // Every length is a whole number of 32-row tiles, so `TokensMultipleOf`
+    // admits all of them and the sweep is of SIZE rather than of admission.
+    let rows: [usize; 5] = [32, 64, 128, 256, 512];
+    let mut best = vec![f64::INFINITY; rows.len()];
+    const ROUNDS: usize = 4;
+    for round in 0..ROUNDS {
+        for (i, &r) in rows.iter().enumerate() {
+            let took = fire(&mut shell, r);
+            // The first round builds pipelines and grows buffers.
+            if round > 0 && took < best[i] {
+                best[i] = took;
+            }
+        }
+    }
+    println!("\n  a prefill, fastest of {} interleaved rounds:", ROUNDS - 1);
+    for (i, &r) in rows.iter().enumerate() {
+        println!(
+            "    {r:4} rows {:8.1} ms  {:6.0} tok/s  {:7.3} ms a row",
+            best[i],
+            r as f64 * 1000.0 / best[i],
+            best[i] / r as f64
+        );
+    }
+    let at_512 = best[rows.len() - 1];
+    println!(
+        "\n  prefill 512: {at_512:.3} ms -> {:.0} tok/s",
+        512_000.0 / at_512
+    );
+}
+
+/// **Where a 512-row prefill's time is, walked one plan prefix at a time.**
+///
+/// `#[ignore]`, and a measurement rather than an assertion.
+///
+/// # Why a prefix walk and not a guess
+///
+/// `what_a_prefill_costs_at_length` establishes that a prefill is linear in
+/// its rows at ~5.2 ms each, and arithmetic then rules the obvious suspect
+/// out: at the isolated GEMM's 1.52 TFLOP/s the whole 610-GFLOP fire should
+/// take 401 ms and it takes 2709, so ~85 % is somewhere the projections are
+/// not. Three candidates read equally well from the source — the paged
+/// attention, the readout over all 512 rows (`Step::logits` is *"one
+/// distribution per row of the fire"*, which is 159 GFLOP of `lm_head`), and
+/// host work that scales with the arena.
+///
+/// `Shell::fire_prefix` settles it without picking one. It records only the
+/// first `n` rectangles, so firing the same prompt at a rising `n` gives a
+/// CUMULATIVE cost curve over the plan and the jumps name their own
+/// rectangles. The answer is not a fire — a truncated plan computes nothing
+/// anybody wants — but the timing is the timing.
+///
+/// # And the plan is not all of where the time is
+///
+/// A fire recording ZERO rectangles, fastest of two interleaved rounds,
+/// `--release`:
+///
+/// | rows | ms | ms a row |
+/// | --- | --- | --- |
+/// | 1 | 0.3 | 0.317 |
+/// | 16 | 2.0 | 0.124 |
+/// | 32 | 3.9 | 0.123 |
+/// | 128 | 36.4 | 0.284 |
+/// | 256 | 119.2 | 0.466 |
+/// | 512 | 249.9 | 0.488 |
+///
+/// So of an 815 ms prefill, ~250 ms is paid before any rectangle runs, and the
+/// walk from 0 to 564 rectangles climbs 174 -> 846, putting all 564 dispatches
+/// together at ~600 ms with no single one a hog. **Call it 70/30 between the
+/// plan and the host.**
+///
+/// # The row that answers the decode
+///
+/// **One row with zero rectangles is 0.3 ms**, against a real decode's 21.6.
+/// So 1.4 % of a decode is overhead that is not per-dispatch, and the other
+/// 98.6 % is the 452 rectangles — about 47 us each. That is the decode's whole
+/// story in one number, and it is why nothing in the kernel tree moves it:
+/// `serve::record`'s table splits those 47 us into host recording (`plan_one`,
+/// the bind group, the encode) and the GPU's own wait, and both are PER
+/// LAUNCH. Against llama.cpp's ~250 fused kernels replayed from a CUDA graph
+/// at ~6 us, that is 1.8x the launches at ~8x the price.
+///
+/// Note what this measurement does NOT separate: recording no rectangles skips
+/// the per-dispatch host work too, so the 0.3 ms is the per-FIRE floor and not
+/// "the host share". The host share lives inside the 47 us with the GPU.
+///
+/// # A prefill's budget, and the third of it nobody has attributed
+///
+/// Assembling the pieces above into one account, because the interesting
+/// question is not "what is slow" but "what would fixing each buy". Every line
+/// names where it comes from; the last one names that it does not.
+///
+/// qwen3-0.6B is hidden 1024, 28 layers, intermediate 3072, 16 q-heads and 8
+/// kv-heads of 128, vocab 151,936. That is 440.4 M parameters in the layers
+/// plus a 155.6 M tied readout = 596.0 M, which is the number this driver
+/// stages: 596.0 M at 4.5 bits is 335,372,288 bytes, and 335,372,288 is
+/// exactly what it prints. So 512 rows is `2 * 596.0 M * 512` = **610 GFLOP of
+/// weight GEMM**, the readout's 159 GFLOP included, plus ~30-60 GFLOP of
+/// attention that no weight touches.
+///
+/// | | ms | where from |
+/// | --- | --- | --- |
+/// | whole fire | 815 | this test's sibling |
+/// | per-fire host | 250 | zero-rectangle row above |
+/// | the 564 rectangles | 565 | the difference |
+/// | — of which weight GEMM | ~226 | 610 GFLOP at the 2.7 TFLOP/s `qmm_t` measures |
+/// | — **of which unattributed** | **~339** | **nothing measured this** |
+///
+/// The residual is 60 % of the GPU time and it is NOT the projections. Two
+/// guesses that do not cover it: attention is 30-60 GFLOP, ~11-22 ms at the
+/// same rate; and 564 launches at the decode's 47 us is ~26 ms. So most of
+/// that 339 ms is real work in the non-GEMM kernels — norm, rope, softmax,
+/// `kv_append`, the elementwise chain — and **that is the next measurement,
+/// not the next conclusion.**
+///
+/// # What this budget says about the tensor cores
+///
+/// `kernels-wgpu` measures `coop_mat16x16` at 8.4x the shipped quantised
+/// `qmm_t`. Put it in the table: 226 ms becomes ~27, the other 339 does not
+/// move, the host 250 does not move, and 815 ms becomes ~616. **1.3x**, for
+/// the single largest lever in the tree.
+///
+/// That is the tile result again in a bigger costume — an isolated 8.4x that
+/// reaches the shell as 1.3x — and it is worth writing down before anyone
+/// spends a month on a cooperative-matrix GEMM. The order the numbers argue
+/// for is: attribute the 339 first, narrow the readout second, and reach for
+/// the tensor cores when the thing they multiply is the majority of the fire.
+///
+/// # The debug reading of this table said 80 %, and it was the profile
+///
+/// The first version of this measurement ran the dev profile, and reported
+/// 125.1 / 518.2 / 1074.0 / **2150.5** ms for the same four row counts —
+/// linear at ~4.2 ms a row, 80 % of a 2709 ms fire, with the conclusion that
+/// a prefill is *"paid before a single rectangle runs"*. Rebuilt `--release`
+/// the same measurement is 176.0 ms, **twelve times less**, and the conclusion
+/// does not survive: the host share is under a third.
+///
+/// The reason it moved so far is what it was measuring. `serve::logits` widens
+/// `rows * vocab` values element by element through
+/// `chunks_exact().map().collect()` — 77.8 million of them at 512 rows — and a
+/// scalar loop over 77.8 million elements is exactly the code an optimiser
+/// helps most and a debug build punishes most. **The bigger a number's
+/// debug-to-release ratio, the more of it was host arithmetic**, which makes
+/// that ratio a diagnostic rather than merely an embarrassment.
+///
+/// # What is still per-row and outside a dispatch
+///
+/// The readout, materialised for EVERY row. `Step::logits` is documented as
+/// *"one distribution per row of the fire"*, so a 512-token prompt whose
+/// caller wants one row gets 512, and at this vocabulary that is
+/// 512 x 151,936. Asked rather than inferred, and this test prints it:
+/// `logits.rows 512, 77,791,232 values, 296.8 MB as f32`. It is paid twice
+/// over — the plane sits in the arena, which is a fresh allocation every step
+/// (`serve::record` says so), and then `serve::logits` reads all of it back
+/// and widens it into that `Vec`.
+///
+/// `Logits::rows`'s own doc said the opposite — *"one per readout"* — which is
+/// how a 296.8 MB return value went unremarked. It now says what it does, and
+/// carries the counted blast radius of narrowing it: seventeen call sites
+/// reach rows through `readout_of`/`readouts_of` and would survive a remap,
+/// five index by fire row and would each need reading.
+///
+/// 176 ms for 155.6 MB read back and 77.8 M values widened is ~0.9 GB/s, which
+/// no longer disagrees with the 0.35 ms `serve::record` measured for a one-row
+/// decode the way the debug figure did. So the remaining question is not "why
+/// is this twelve times slower than it should be" but the plainer one: a
+/// caller that wants one row is charged for 512.
+///
+/// The comparison that makes it worth doing: llama.cpp's prompt-processing
+/// path computes logits for the LAST token of a batch, not all of them, and
+/// turns in 40,400 tok/s where this turns in 628.
+///
+/// Run with `--ignored --nocapture --release`.
+#[test]
+#[ignore = "measurement"]
+fn where_a_prefills_time_goes_across_its_plan() {
+    release_only();
+    let _lock = gpu();
+    let Some(real) = weights() else {
+        eprintln!("no checkpoint; skipped");
+        return;
+    };
+    let mut long: Vec<u32> = Vec::new();
+    while long.len() + PERIOD.len() <= 510 {
+        long.extend_from_slice(&PERIOD);
+    }
+    while !long.len().is_multiple_of(16) {
+        long.push(PERIOD[0]);
+    }
+    assert_eq!(long.len(), 512);
+
+    let mut shell = shelled(real, 8192);
+    let mut who = 0u64;
+    let mut fire = |shell: &mut Shell, rows: usize, n: Option<usize>| -> (f64, usize) {
+        who += 1;
+        shell.fire_prefix(n);
+        let t = std::time::Instant::now();
+        let f = shell
+            .step(&[Turn {
+                who,
+                tokens: long[..rows].to_vec(),
+            }])
+            .expect("the prompt fires");
+        let took = t.elapsed().as_secs_f64() * 1000.0;
+        shell.fire_prefix(None);
+        if n.is_none() {
+            // WHICH OF TWO DOCS IS RIGHT ABOUT THE READOUT'S WIDTH.
+            //
+            // `Logits::rows` says "one per readout, so `Frame::readouts` and
+            // `Lowered::n_requests` and this are the same number"; `Step::
+            // readout_of` says "every row samples -- so a prefill of four
+            // tokens produces four distributions". For a one-turn prefill
+            // those are 1 and `rows`, and the difference is the whole
+            // question of whether a prefill pays its vocabulary once or
+            // once per token. Printed rather than reasoned.
+            println!(
+                "    {rows} rows -> logits.rows {}, {} values, {:.1} MB as f32",
+                f.logits.rows,
+                f.logits.values.len(),
+                (f.logits.values.len() * 4) as f64 / (1024.0 * 1024.0)
+            );
+        }
+        (took, f.fired.dispatches)
+    };
+    // What the whole plan is, asked rather than assumed.
+    println!("\n  what a full fire hands back:");
+    let (_, total) = fire(&mut shell, 512, None);
+    let _ = fire(&mut shell, 32, None);
+    println!("  a 512-row prefill records {total} rectangles");
+    // A fire that records NOTHING still pays whatever a fire pays per row:
+    // the arena is allocated and zeroed by the row count, and `serve::logits`
+    // reads back and widens `rows * vocab` whether or not anybody wants more
+    // than one row of it. Sweeping rows at n=0 separates "per fire" from "per
+    // row" without attributing either.
+    let empty_rows: [usize; 6] = [1, 16, 32, 128, 256, 512];
+    let mut empty_best = vec![f64::INFINITY; empty_rows.len()];
+    for round in 0..3 {
+        for (i, &r) in empty_rows.iter().enumerate() {
+            let (took, _) = fire(&mut shell, r, Some(0));
+            if round > 0 && took < empty_best[i] {
+                empty_best[i] = took;
+            }
+        }
+    }
+    println!("  a fire recording ZERO rectangles, fastest of two:");
+    for (i, &r) in empty_rows.iter().enumerate() {
+        println!(
+            "    {r:4} rows {:8.1} ms  {:7.3} ms a row",
+            empty_best[i],
+            empty_best[i] / r as f64
+        );
+    }
+    let step = total.div_ceil(16);
+    let points: Vec<usize> = (0..=total)
+        .step_by(step)
+        .chain(std::iter::once(total))
+        .collect();
+    let mut best = vec![f64::INFINITY; points.len()];
+    const ROUNDS: usize = 3;
+    for round in 0..ROUNDS {
+        for (i, &n) in points.iter().enumerate() {
+            let (took, _) = fire(&mut shell, 512, Some(n));
+            // The first round builds pipelines and grows buffers.
+            if round > 0 && took < best[i] {
+                best[i] = took;
+            }
+        }
+    }
+    println!("  cumulative, fastest of {} rounds:", ROUNDS - 1);
+    let mut prev = 0.0;
+    for (i, &n) in points.iter().enumerate() {
+        let d = best[i] - prev;
+        println!(
+            "    first {n:4} rectangles {:8.1} ms   (+{d:7.1} over the last {step})",
+            best[i]
+        );
+        prev = best[i];
+    }
+}
+
+/// **Which GEMM tile a 512-row prefill wants, fired through the whole shell.**
+///
+/// `#[ignore]`, and a measurement rather than an assertion.
+///
+/// # Why the isolated sweep does not settle this
+///
+/// `kernels-wgpu`'s `which_tile_the_batched_projection_wants` times one
+/// `[3584, 1024]` projection at m=512 and reports `bm=32 bn=64` fastest at
+/// 2.475 ms against the shipped `(32, 32)`'s 3.304. But `project::QMM_TILE`'s
+/// own doc reports an END-TO-END pair that inverts an isolated ordering —
+/// *"a 1024-token prefill takes 2563 ms at (16, 32) and 565 ms at (32, 32)"* —
+/// where the isolated numbers put `(16, 32)` AHEAD of `(32, 32)`, 2.886 to
+/// 3.304. One projection is not one prefill: a fire is 564 dispatches over
+/// many shapes, and `TokensMultipleOf(bm)` moves which prompts are even
+/// admitted. So the tile has to be chosen where it is used.
+///
+/// # Interleaved, because this machine will not hold still
+///
+/// Every shell is built and staged FIRST and the fires then go round-robin,
+/// tile after tile, so a slow minute lands on all of them rather than on
+/// whichever went last. Taking all of one tile's fires and then all of the
+/// next's is how a 2.6x machine drift gets published as a tile result: this
+/// file has already watched one binary's decode median move 49.2, 51.4 and
+/// 127.6 ms.
+///
+/// # The answer, and it is that the question was aimed wrong
+///
+/// Fastest of five interleaved rounds, `--release`, an RTX 4090:
+///
+/// | tile | ms | tok/s | vs shipped |
+/// | --- | --- | --- | --- |
+/// | 32x32 (shipped) | 802.1 | 638 | 1.00x |
+/// | 32x64 | 855.0 | 599 | 0.94x |
+/// | 16x32 | 798.3 | 641 | 1.00x |
+/// | 16x64 | 810.4 | 632 | 0.99x |
+///
+/// **Within 7 %, and the isolated 1.34x is gone.** The shipped tile is not
+/// wrong here — the isolated win was real and simply too small a part of a
+/// fire to see. So `qmm_tile` stays at `project::QMM_TILE` and this backend
+/// does NOT need its own, which is the negative that stops the next person
+/// setting one off a kernel bench.
+///
+/// Measured twice for a reason. The first run of this sweep was in the dev
+/// profile, where a fire's host share is three times what release pays, and a
+/// null result under a large constant is the cheapest kind of false negative.
+/// Rebuilt `--release` the ordering is unchanged and the spread is if anything
+/// tighter, so the conclusion is the tile's rather than the profile's — unlike
+/// this file's prefill headline, which the same recheck overturned.
+///
+/// It also retires the reason this test was written. The doc quoted above was
+/// right that a shared constant chosen against a cooperative-matrix build is
+/// suspect on a backend with no such instruction; it was wrong that the
+/// suspicion would pay.
+///
+/// Run with `--ignored --nocapture --release`.
+#[test]
+#[ignore = "measurement"]
+fn which_tile_a_512_row_prefill_wants() {
+    release_only();
+    let _lock = gpu();
+    let Some(real) = weights() else {
+        eprintln!("no checkpoint; skipped");
+        return;
+    };
+    let mut long: Vec<u32> = Vec::new();
+    while long.len() + PERIOD.len() <= 510 {
+        long.extend_from_slice(&PERIOD);
+    }
+    while !long.len().is_multiple_of(16) {
+        long.push(PERIOD[0]);
+    }
+    assert_eq!(long.len(), 512);
+
+    // Every `bm` here divides 512, so `TokensMultipleOf` admits this prompt
+    // under all of them and the comparison is of speed rather than of who was
+    // allowed to run.
+    let tiles: [(u32, u32); 4] = [(32, 32), (32, 64), (16, 32), (16, 64)];
+    for (bm, _) in tiles {
+        assert_eq!(
+            long.len() % bm as usize,
+            0,
+            "a tile whose guard refuses this prompt would be timed as absent"
+        );
+    }
+    let mut shells: Vec<Shell> = tiles
+        .iter()
+        .map(|&t| shelled_tuned(real, 2048, false, Some(t)))
+        .collect();
+    let mut best = vec![f64::INFINITY; tiles.len()];
+    let mut who = 0u64;
+    const ROUNDS: usize = 6;
+    for round in 0..ROUNDS {
+        for (i, shell) in shells.iter_mut().enumerate() {
+            who += 1;
+            let t = std::time::Instant::now();
+            let f = shell
+                .step(&[Turn {
+                    who,
+                    tokens: long.clone(),
+                }])
+                .expect("the prompt fires");
+            let took = t.elapsed().as_secs_f64() * 1000.0;
+            let _ = argmax(f.logits.row(f.readout_of[0]).expect("it read out"));
+            // The first round builds pipelines and grows buffers.
+            if round > 0 && took < best[i] {
+                best[i] = took;
+            }
+        }
+    }
+    println!("\n  a 512-token prefill, fastest of {} rounds:", ROUNDS - 1);
+    let shipped = best[0];
+    for (i, (bm, bn)) in tiles.iter().enumerate() {
+        println!(
+            "    bm={bm:<3} bn={bn:<3} {:8.1} ms  {:5.0} tok/s  {:.2}x the shipped tile",
+            best[i],
+            512_000.0 / best[i],
+            shipped / best[i]
+        );
+    }
+}
+
+/// **Every rectangle a 512-row prefill fires, counted by symbol.**
+///
+/// `where_a_prefills_time_goes_across_its_plan` budgets 815 ms as 250 host +
+/// ~226 weight GEMM + **~339 ms of non-GEMM GPU work nobody had named**, which
+/// is the largest line in the tree and the only one reached purely by
+/// subtraction. This names what is in it — exactly, without timing anything.
+///
+/// # Naming a rectangle, which `fire_prefix` alone cannot
+///
+/// `Shell::fire_prefix` says a caller that walks `n` *"finds the rectangle
+/// rather than the subsystem"* — but a walk alone finds an INDEX. The names
+/// are in the lowering: `Lowered::launches` carries one per rectangle and each
+/// indexes `Lowered::kernels`. `lower` is a pure function of the plan and the
+/// row shape, so this derives the same lowering the shell will and reads the
+/// symbols off it. **No adapter and no checkpoint**, which is why it is a gate
+/// test and not a measurement.
+///
+/// # What a prefill actually fires
+///
+/// | count | symbol |
+/// | --- | --- |
+/// | 140 | `affine_qmm_t` |
+/// | 113 | `rms_single_row` |
+/// | **112** | **`cast_qmm_input_strided_bfloat16_to_float16`** |
+/// | 56 | `affine_qmm_t_residual` |
+/// | 56 | `neox_mb` |
+/// | 28 | `kv_append_paged` |
+/// | 28 | `sdpa_paged_tiled` |
+/// | 28 | `silu_mul` |
+/// | 1 each | `affine_qmv_fast`, `embed_gather_mb_4bit`, `row_gather` |
+/// | 564 | total |
+///
+/// **112 of 564 rectangles — one launch in five — are a CAST**, bf16 to f16
+/// with no arithmetic in them at all. Add the 113 norms and 225 of 564 are
+/// norm-or-cast. The 196 that are GEMM (`affine_qmm_t` and its residual
+/// variant) are 35 %.
+///
+/// That is a fusion target with a name, and llama.cpp's WebGPU backend ships
+/// the shape of the answer: its `rms_norm_mul.wgsl` puts a norm and the
+/// multiply after it in one entrypoint. A cast that exists only to feed the
+/// next kernel's operand type is the easiest thing in this table to stop
+/// launching.
+///
+/// # And the decode, which is where the 15x is
+///
+/// | count | symbol |
+/// | --- | --- |
+/// | 141 | `affine_qmv_fast` |
+/// | 113 | `rms_single_row` |
+/// | 56 | `affine_qmv_fast_residual` |
+/// | 56 | `neox_mb` |
+/// | 28 | `kv_append_paged` |
+/// | 28 | `sdpa_paged_decode` |
+/// | 28 | `silu_mul` |
+/// | 1 each | `embed_gather_mb_4bit`, `row_gather` |
+/// | 452 | total |
+///
+/// **No casts at all** — those 112 are the prefill's, because the matvec path
+/// takes bf16 where the tiled GEMM wants f16, so a fifth of a prefill's
+/// launches exist only to bridge that. And `where_a_prefills_time_goes_across
+/// _its_plan` shows a decode is 98.6 % its 452 rectangles at ~47 us each, so
+/// this table is the decode's cost almost exactly.
+///
+/// **169 of 452 — 37 % — are a norm or a rope.** 197 are the matvec. That is
+/// what `serve::record`'s *"the way down from here is FEWER LAUNCHES"* is
+/// pointing at, and upstream is already there: `Name the merge that survives
+/// every constraint: rms into rope` is a commit on this branch. The counts
+/// say how much it is worth before anybody measures it.
+///
+/// # The timing this test does NOT do, and why
+///
+/// It first tried to price each symbol by walking prefixes one rectangle at a
+/// time and differencing. That does not work and the test's own arithmetic
+/// said so: the per-symbol estimates summed to **4269 ms against a plan that
+/// takes ~565**, 7.5x over. Differencing two ~600 ms fires cannot resolve a
+/// ~1 ms rectangle, and flooring the negative steps at zero — which seemed
+/// like the careful choice — turns symmetric noise into a systematic credit.
+///
+/// **Kept as a refutation rather than as a table**, because a plausible-looking
+/// per-kernel cost table is worse than none. The right instrument is
+/// `Features::TIMESTAMP_QUERY`, which wgpu has and this driver does not yet
+/// ask for; the counts above need no instrument at all, which is why they are
+/// what this test returns.
+#[test]
+fn which_kernels_a_prefill_spends_its_gpu_time_in() {
+    // NO ADAPTER AND NO CHECKPOINT. `lower` is a pure function of the plan and
+    // the row shape, so the rectangle list is available on a build box, which
+    // is why this is a gate test rather than a measurement.
+    let long_len = 512usize;
+
+    // The same lowering the shell derives, read for its names.
+    let facts = facts();
+    let plan = llama_like_metal(&facts, &backend_facts(), FireClass::Prefill);
+    let mut lowerings = driver_wgpu::lowering::cached::Lowerings::new();
+    let shape = driver_wgpu::lowering::cached::Shape {
+        prefill: true,
+        rows: vec![
+            model_compiler::lower::Row {
+                multi_token: true,
+                ..Default::default()
+            };
+            long_len
+        ],
+    };
+    let lowered = lowerings
+        .get(&plan, shape, model_compiler::lower::Fire::default())
+        .expect("the prefill lowers");
+    let names: Vec<String> = lowered
+        .launches
+        .iter()
+        .map(|l| lowered.kernels[l.kernel as usize].clone())
+        .collect();
+    println!(
+        "\n  {} rectangles over {} distinct symbols",
+        names.len(),
+        lowered.kernels.len()
+    );
+    let mut per_symbol_count: BTreeMap<&str, usize> = BTreeMap::new();
+    for nm in &names {
+        *per_symbol_count.entry(nm.as_str()).or_default() += 1;
+    }
+
+    let mut rows: Vec<(usize, &str)> = per_symbol_count
+        .iter()
+        .map(|(nm, c)| (*c, *nm))
+        .collect();
+    rows.sort_by_key(|r| std::cmp::Reverse(r.0));
+    println!("\n  every rectangle a 512-row prefill fires, by symbol:");
+    for (count, nm) in &rows {
+        println!("    {count:4}  {nm}");
+    }
+    let total: usize = rows.iter().map(|r| r.0).sum();
+    assert_eq!(
+        total,
+        names.len(),
+        "the histogram must account for every rectangle"
+    );
+    println!("    {total:4}  total");
+
+    // AND THE DECODE, which is the shape the 15x against llama.cpp is measured
+    // at. One row, the decode text, everything else the same read.
+    let dplan = llama_like_metal(&facts, &backend_facts(), FireClass::Decode);
+    let dshape = driver_wgpu::lowering::cached::Shape {
+        prefill: false,
+        rows: vec![model_compiler::lower::Row::default(); 1],
+    };
+    let dlowered = lowerings
+        .get(&dplan, dshape, model_compiler::lower::Fire::default())
+        .expect("the decode lowers");
+    let mut dcount: BTreeMap<&str, usize> = BTreeMap::new();
+    for l in &dlowered.launches {
+        *dcount
+            .entry(dlowered.kernels[l.kernel as usize].as_str())
+            .or_default() += 1;
+    }
+    let mut drows: Vec<(usize, &str)> = dcount.iter().map(|(nm, c)| (*c, *nm)).collect();
+    drows.sort_by_key(|r| std::cmp::Reverse(r.0));
+    println!("\n  and a ONE-ROW decode:");
+    for (count, nm) in &drows {
+        println!("    {count:4}  {nm}");
+    }
+    let dtotal: usize = drows.iter().map(|r| r.0).sum();
+    assert_eq!(
+        dtotal,
+        dlowered.launches.len(),
+        "the histogram must account for every rectangle"
+    );
+    println!("    {dtotal:4}  total");
+
+    // AND THE SAME PREFILL AT 64 ROWS, because the lane depends on it.
+    // `tests/arena.rs` sweeps its prefills at 64 and stopped reaching
+    // `sdpa_paged_tiled_bfloat16_d_128` when upstream gave a batched decode
+    // its own attention lane; at 512 the table above still reaches it. Both
+    // printed here so the row count is visible as the variable it is.
+    let sshape = driver_wgpu::lowering::cached::Shape {
+        prefill: true,
+        rows: vec![
+            model_compiler::lower::Row {
+                multi_token: true,
+                ..Default::default()
+            };
+            64
+        ],
+    };
+    let slowered = lowerings
+        .get(&plan, sshape, model_compiler::lower::Fire::default())
+        .expect("the short prefill lowers");
+    let mut scount: BTreeMap<&str, usize> = BTreeMap::new();
+    for l in &slowered.launches {
+        *scount
+            .entry(slowered.kernels[l.kernel as usize].as_str())
+            .or_default() += 1;
+    }
+    println!("\n  a 64-row prefill's attention:");
+    for (nm, c) in scount.iter().filter(|(nm, _)| nm.contains("sdpa")) {
+        println!("    {c:4}  {nm}");
+    }
+    println!("    of {} rectangles", slowered.launches.len());
+}
+
+/// **A prefill that is longer than the first one this shell saw.**///
+/// # Where this came from
+///
+/// `tests/hybrid_probe.rs` found qwen3.5 going permanently dark after a
+/// three-token prefill that followed a two-token one: every later fire — a
+/// fresh row, a length that had already answered, a decode — returns a row
+/// with a span of zero, with no refusal and nothing in `wgpu`'s error sink.
+/// Re-holding every weight does not bring it back.
+///
+/// **Nothing in that description mentions the gated DeltaNet**, and this file
+/// is the place to find out whether it needs to. The suite here fires this
+/// shell in dozens of shapes and has never once GROWN a prefill: `prompt()` is
+/// a fixed 26 tokens, so the first lowering is always the widest one, and a
+/// buffer sized on first use would never be asked for more.
+///
+/// So the order matters and it is the whole test: **short first, then longer.**
+/// Reversed, this passes on a shell with the defect.
+#[test]
+fn a_prefill_longer_than_the_first_one_is_still_answered() {
+    let Some(_held) = gpu() else { return };
+    let Some(real) = weights() else { return };
+    let mut shell = shelled(real, 64);
+
+    let mut spans = Vec::new();
+    for (i, n) in [2usize, 3, 4, 2].into_iter().enumerate() {
+        let step = shell
+            .step(&[Turn {
+                who: 10 + i as u64,
+                tokens: PERIOD[..n.min(PERIOD.len())].to_vec(),
+            }])
+            .unwrap_or_else(|e| panic!("the {n}-token prefill was refused: {e}"));
+        let row = step
+            .logits
+            .row(step.readout_of[0])
+            .expect("the turn's own row");
+        let span = row.iter().copied().fold(0.0f32, |m, v| m.max(v.abs()));
+        println!("  {n} tokens: span {span:.3}, argmax {}", argmax(row));
+        spans.push((n, span));
+    }
+
+    // A span, not a token: what a dark fire produces is not garbage text, it
+    // is a hidden state of zeros through a quantized `lm_head`, which reads
+    // out as a quarter of a million tiny constants. Asking for a plausible
+    // argmax would pass on that; asking for a distribution does not.
+    for (n, span) in &spans {
+        assert!(
+            *span > 1.0,
+            "the {n}-token prefill answered with a span of {span}, which is a \
+             row nothing wrote: {spans:?}"
+        );
+    }
 }

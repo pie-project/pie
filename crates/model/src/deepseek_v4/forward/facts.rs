@@ -1,16 +1,5 @@
-//! deepseek_v4's per-backend binding facts — of which this generation
-//! has none, yet.
-//!
-//! The SHAPE moved to `../spec.rs` (ungated: a row is written in it, and
-//! a row has to exist under every aspect — `chat`, `contract` and
-//! `forward` all read it, and only one of those compiles the tracer).
-//!
-//! What would live here is what a deployment BOUND rather than what the
-//! model IS — kimi-k2's `KimiCudaFacts` is the shape of it: one fused
-//! latent GEMM instead of two, a YaRN rope the config asked for. This
-//! generation's text reads neither, so the file is the re-export that
-//! keeps `forward`'s spelling of the facts working unchanged.
+//! deepseek_v4's per-backend binding facts — of which this generation has
+//! none. What would live here is what a deployment BOUND rather than what the
+//! model IS, so the file is the re-export of the shape in `../spec.rs`.
 
-/// The shape, re-exported so a declaration reaches its facts and the
-/// words they are stated in from one place.
 pub use super::super::spec::{Dsv4AttnFacts, Dsv4Facts, Dsv4HcFacts, Dsv4MoeFacts};

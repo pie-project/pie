@@ -1,88 +1,45 @@
 //! What a launch rule means when the workgroup is not the driver's to choose.
 //!
-//! `driver-metal` answers a [`Rule`] with a thread grid AND a threadgroup,
-//! because `dispatchThreads` takes both and Metal sizes the group at dispatch.
-//! `dispatch_workgroups` takes neither. It takes a count of WORKGROUPS, and the
-//! size of one is `@workgroup_size(...)` in the WGSL — a compile-time attribute
-//! fixed when the module was written, not when it was launched.
+//! `dispatch_workgroups(x, y, z)` takes a count of WORKGROUPS; the size of one
+//! is `@workgroup_size(...)` in the WGSL, fixed when the module was written.
+//! The Metal shapes in `lowering/grid.rs` remain the reference for the
+//! iteration space a kernel must cover, but the answer here is a different kind
+//! of number. The arithmetic below is `driver-vulkan`'s, because `vkCmdDispatch`
+//! counts the same things and a grid that differed between two shells would
+//! mean one of them is wrong.
 //!
-//! So this module cannot be a port of `lowering/grid.rs`. The Metal shapes are
-//! still the reference — they are the ones proved against real checkpoints, and
-//! the iteration space a kernel must cover does not change with the API — but
-//! the answer here is a different kind of number, and getting from one to the
-//! other is where the whole class of porting bug in this tree lives.
-//!
-//! # This is the file that changed least in the Vulkan port, on purpose
-//!
-//! `dispatch_workgroups(x, y, z)` counts exactly what `vkCmdDispatch(x, y, z)`
-//! counts, so every line of arithmetic below is `driver-vulkan`'s, and the
-//! reasons attached to each rounding are its reasons unedited. That is not
-//! laziness: a rule is a claim about a KERNEL, the three trees are one tree of
-//! kernels, and a grid that differed between two shells would mean one of them
-//! is wrong rather than that the APIs differ.
-//!
-//! One thing is added, and it is the API's: [`Ungeometric::PastDeviceLimit`].
-//! Vulkan reports `maxComputeWorkGroupCount` in the millions on every real
-//! device and a driver may reasonably never think about it. WebGPU's
+//! One thing is this API's: [`Ungeometric::PastDeviceLimit`]. WebGPU's
 //! `max_compute_workgroups_per_dimension` has a guaranteed floor of **65535**,
-//! which a 4096-wide elementwise launch over 32 rows reaches, so it is a limit
-//! a real fire can hit — and `wgpu` answers a dispatch past it by refusing the
-//! encode, which is a panic or a validation error at submit rather than a
-//! sentence about the launch. [`groups_within`] is where that sentence is.
+//! which a 4096-wide elementwise launch over 32 rows reaches, and `wgpu`
+//! answers a dispatch past it by refusing the encode. [`groups_within`] turns
+//! that into a sentence instead of a panic at submit.
 //!
-//! # Undershoot is the failure that does not report itself
+//! [`groups`] rounds up everywhere, because an undershot grid reports nothing:
+//! the lanes never launched write nothing, the gap reads back as whatever the
+//! buffer was born with, and the queue returns success. Any test of it must use
+//! a shape that does NOT divide evenly — at 512 elements over a 256-wide
+//! workgroup, `div_ceil` and plain division are the same expression. The tests
+//! below run at 460 and at 13.
 //!
-//! An overshot grid is caught by a shader's own tail guard. An UNDERSHOT grid
-//! is not caught by anything: the lanes that were never launched write nothing,
-//! the gap reads back as whatever the buffer was born with — zeros, from a
-//! fresh pool — and the queue returns success. Every kernel in this tree that
-//! was wrong after the Vulkan port was wrong this way, and none of them were
-//! wrong in the arithmetic.
-//!
-//! That is why [`groups`] rounds up everywhere, and why any test of it must use
-//! a shape that does NOT divide evenly: at 512 elements over a 256-wide
-//! workgroup, `div_ceil` and plain division are the same expression and the
-//! rounding is unproven. `driver-vulkan` learned that with five tests that all
-//! ran at exact multiples and caught nothing; the tests below run at 460 and
-//! at 13.
-//!
-//! # The module's own size is an input
-//!
-//! Each rule below takes the `local` size read from the module it is about to
-//! dispatch, rather than assuming one. Two rules need this and the rest are
-//! merely honest about it:
-//!
-//! * `SdpaVector` compiles one module per head dimension — 64, 128, 256, 512 —
-//!   and each declares `@workgroup_size(PIE_HEAD_DIM / 2)`. A geometry that
-//!   assumed 256 would launch a quarter of the workgroups for a 64-wide head.
-//! * `Elementwise` is 256 wide in most of its modules and 16x16 in the strided
-//!   gathers, which are laid out per (channel, row).
+//! Each rule takes the `local` size read from the module it is about to
+//! dispatch rather than assuming one. `SdpaVector` compiles one module per head
+//! dimension, each declaring `@workgroup_size(PIE_HEAD_DIM / 2)`; `Elementwise`
+//! is 256 wide in most of its modules and 16x16 in the strided gathers.
 //!
 //! **That `/ 2` is the one place a launch rule's ARITHMETIC differs from
-//! `driver-vulkan`'s**, and it is forced rather than chosen. WGSL has no 16-bit
-//! storage type, so every bf16 tensor crosses as `array<u32>` with two values
-//! to a word — and a lane that owned one channel would read-modify-write a word
-//! its neighbour writes at the same instant, which WGSL has no sub-word atomic
-//! to make safe. So a decode-attention lane owns the PAIR, the workgroup is
-//! half as wide as the head, and [`lanes`] halves with it. Getting it wrong is
-//! not an undershoot to be caught by a tail guard: `sdpa_vector.wgsl` reads
+//! `driver-vulkan`'s**: WGSL has no 16-bit storage type, so every bf16 tensor
+//! crosses as `array<u32>` with two values to a word, and a decode-attention
+//! lane owns the PAIR because there is no sub-word atomic to make sharing one
+//! safe. [`lanes`] halves with it. `sdpa_vector.wgsl` also reads
 //! `num_workgroups.x` as its query-head COUNT, so the Vulkan expression would
-//! build a grid twice as wide AND tell every lane the model has twice the heads
-//! it has.
+//! both build a grid twice as wide and tell every lane the model has twice the
+//! heads it has.
 //!
-//! The GEMM tile is the same kind of fact and was nearly missed in the Vulkan
-//! port. Every `Qmm` entrypoint names its tile IN THE ENTRYPOINT —
-//! `..._bm_16_bn_64` — so the tile a module was compiled for is a property of
-//! the module the driver selected, not something to be inferred from the row
-//! count. Inferring it is what the first draft of that file did, and picking
-//! the widest tile that divides 64 rows while dispatching a module written at
-//! `bm_16` launches a quarter of the workgroups needed. That undershoot writes
-//! three quarters of nothing and returns success.
-//!
-//! Reading these from the module is also the only way the agreement can be
-//! CHECKED, and here that check costs nothing at all: [`Module::loaded`] takes
-//! a [`crate::reflect::Declared`], which is `naga` reading the WGSL that will
-//! be dispatched, on any machine, with no adapter.
+//! Every `Qmm` entrypoint names its tile IN THE ENTRYPOINT — `..._bm_16_bn_64`
+//! — so the tile is a property of the module the driver selected, never
+//! inferred from the row count. [`Module::loaded`] checks the agreement against
+//! a [`crate::reflect::Declared`], which is `naga` reading the WGSL that will be
+//! dispatched, on any machine, with no adapter.
 
 pub use kernels::LaunchRule as Rule;
 
@@ -628,7 +585,7 @@ pub fn lanes(rule: Rule, dims: Dims, module: Module) -> Result<[u32; 3], Ungeome
             // grid is correct rather than a defect. `sdpa_paged.wgsl` takes the
             // true row count as `params.n_rows` and its rows loop skips
             // `row >= n_rows`, so a partial last tile knows it is past the end
-            // -- and the row states `n_rows <- Source::Rows` so that it gets
+            // -- and the row states `n_rows <- Source::Named(<keys::Rows as keys::Fact>::KEY)` so that it gets
             // told. Every other rounded axis in this file is refused because
             // the shader has no such scalar.
             let tiles = rows.div_ceil(TILE).max(1);
@@ -871,7 +828,7 @@ fn rope_heads(dims: Dims) -> Result<u32, Ungeometric> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lowering::arm::Facts;
+    use crate::lowering::hold::Facts;
     use crate::lowering::routine::Stated;
 
     /// A plausible fire, at a width that does not divide a workgroup.
@@ -945,7 +902,7 @@ mod tests {
 
     /// The fire a sweep states, as the `Env` values a body reads.
     fn firing(symbol: &str, rows: u32, width: u32, fire: crate::dispatch::Geometry) -> Facts {
-        crate::lowering::arm::facts(symbol, rows, fire, 3, width, width)
+        crate::lowering::hold::facts(symbol, rows, fire, 3, width, width)
     }
 
     /// What one body asks for, run through the arm that feeds it.
@@ -959,15 +916,17 @@ mod tests {
     ///
     /// A body may state MORE than one dispatch, so this answers all of them.
     fn fired(symbol: &str, facts: Facts, scalars: &[u32]) -> Result<Vec<Stated>, String> {
-        let (routine, arm) = crate::lowering::routine::armed(symbol)
+        let routine = crate::lowering::routine::armed(symbol)
             .ok_or_else(|| format!("`{symbol}` is claimed by no armed stem"))?;
         let args = statement();
-        let mut handles = crate::lowering::arm::Handles::with_scalars(
+        let mut handles = crate::lowering::hold::Handles::with_scalars(
             &args,
             crate::lowering::routine::results(routine),
             scalars,
         );
-        let taken = arm(&mut handles, facts).map_err(|why| format!("its arm refused: {why:?}"))?;
+        let taken =
+            crate::lowering::bind::bind(routine.args, routine.sources, &mut handles, facts)
+                .map_err(|why| format!("the binder refused: {why:?}"))?;
         crate::lowering::routine::state(routine, &taken).map_err(|why| why.to_string())
     }
 
@@ -1016,6 +975,7 @@ mod tests {
                     rotary_dims: 64,
                     n_experts: 8,
                     experts_per_token: 2,
+                    ..Default::default()
                 },
                 [128u32, 96, 64, 48, 32, 16, 8, 4, 2, 3, 5, 7],
             ),
@@ -1029,6 +989,7 @@ mod tests {
                     rotary_dims: 64,
                     n_experts: 16,
                     experts_per_token: 4,
+                    ..Default::default()
                 },
                 [256u32, 160, 96, 64, 4, 48, 24, 12, 6, 9, 15, 21],
             ),
@@ -1057,6 +1018,7 @@ mod tests {
                     rotary_dims: 128,
                     n_experts: 32,
                     experts_per_token: 8,
+                    ..Default::default()
                 },
                 [512u32, 32, 128, 96, 8, 64, 48, 24, 12, 10, 18, 30],
             ),
@@ -1572,6 +1534,7 @@ mod tests {
                     rotary_dims: head_dim,
                     n_experts: 0,
                     experts_per_token: 0,
+                    ..Default::default()
                 };
                 // A width this body is not compiled for is a refusal and not a
                 // gap: the pinned list below is what says which pairs were
@@ -1684,15 +1647,15 @@ mod tests {
     /// It is also a NARROWER population, and the narrowing is the honest part.
     /// A module no body names at any of [`widest`]'s three fires has no grid
     /// to be wrong about, so it is not measured here; that an entrypoint is
-    /// reachable at all is `arm.rs`'s
+    /// reachable at all is `hold.rs`'s
     /// `every_entrypoint_is_claimed_by_the_stem_that_owns_it` and `reflect`'s
     /// own census sweep, not this one's.
     ///
     /// `crate::reflect` already computes which axes a module reads, and it has
     /// been computed and never asked. It is safe to ask because it errs in the
     /// right direction: where the call walk cannot follow a builtin into a
-    /// helper it answers "every axis" rather than "no axis", so a module this
-    /// check cannot read makes the check STRICTER rather than vacuous.
+    /// helper it answers "every axis", so a module this check cannot read makes
+    /// it STRICTER rather than vacuous.
     ///
     /// `kernels-wgpu`'s `a_flat_rows_shader_does_not_read_its_row_off_the_y_
     /// axis` is the same claim from the shader side, on the bodies that call
@@ -2055,6 +2018,7 @@ mod tests {
                     rotary_dims: 64,
                     n_experts: 8,
                     experts_per_token: slots,
+                    ..Default::default()
                 };
                 let stated = fired(symbol, firing(symbol, rows, 128, fire), &scalars)
                     .unwrap_or_else(|e| panic!("`{symbol}` is a matvec this tree plans: {e}"));

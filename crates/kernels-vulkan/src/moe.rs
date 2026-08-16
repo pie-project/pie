@@ -18,10 +18,10 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use kernels::KernelSig;
 use kernels::routine::Refusal;
 
-use crate::routine::{Bind, Buf, BufMut, Ctx, Env, Fire, Routine};
+use crate::routine::{keys, Ask, Bind, Block, Buf, BufMut, Ctx, Env, Fire, Null, Param, ParamOr, Routine};
+use crate::routine::{InSlot, OutSlot, Weight};
 
 /// The entrypoints this family's crossed routines spell, now that their
 /// rows are gone. See [`crate::RETIRED`].
@@ -109,8 +109,6 @@ pub static ENTRYPOINTS: &[&str] = &[
     "shared_expert_combine",
     "shared_expert_combine_strided",
 ];
-
-pub static KERNELS: &[KernelSig] = &[];
 
 /// The workgroup a routed matmul tile walks with, on both axes.
 ///
@@ -355,12 +353,12 @@ const MXFP4_QMM: &[&str] = &[
 /// [`Refusal::Empty`] for an empty row count.
 pub fn router_topk(
     ctx: &Ctx<'_>,
-    logits: Buf,
-    expert_ids: BufMut,
-    expert_weights: BufMut,
-    params: Buf,
-    _per_expert_scale: Buf,
-    rows: Env<i32>,
+    logits: InSlot<0, Buf>,
+    expert_ids: OutSlot<0, BufMut>,
+    expert_weights: OutSlot<1, BufMut>,
+    params: Block<Buf>,
+    _per_expert_scale: Null<Buf>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -378,12 +376,12 @@ pub fn router_topk(
 /// [`Refusal::Empty`] for an empty row count.
 pub fn router_topk_scaled(
     ctx: &Ctx<'_>,
-    logits: Buf,
-    expert_ids: BufMut,
-    expert_weights: BufMut,
-    params: Buf,
-    per_expert_scale: Buf,
-    rows: Env<i32>,
+    logits: InSlot<0, Buf>,
+    expert_ids: OutSlot<0, BufMut>,
+    expert_weights: OutSlot<1, BufMut>,
+    params: Block<Buf>,
+    per_expert_scale: Weight<0, Buf>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -433,12 +431,12 @@ const SORT_LANES: u32 = 1024;
 /// Only what the encoder refuses; the grid is a constant.
 pub fn route_sort(
     ctx: &Ctx<'_>,
-    expert_ids: Buf,
-    perm: BufMut,
-    row_expert: BufMut,
-    tile_expert: BufMut,
-    params: Buf,
-    inv: BufMut,
+    expert_ids: InSlot<0, Buf>,
+    perm: OutSlot<0, BufMut>,
+    row_expert: OutSlot<1, BufMut>,
+    tile_expert: OutSlot<2, BufMut>,
+    params: Block<Buf>,
+    inv: OutSlot<3, BufMut>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -469,12 +467,12 @@ pub fn route_sort(
 /// See [`crate::routine::elementwise_rows`].
 pub fn route_gather(
     ctx: &Ctx<'_>,
-    x: Buf,
-    out: BufMut,
-    perm: Buf,
-    params: Buf,
-    width: Env<i32>,
-    padded: Env<i32>,
+    x: InSlot<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    perm: InSlot<1, Buf>,
+    params: Block<Buf>,
+    width: Ask<keys::Width, i32>,
+    padded: ParamOr<4, keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -496,13 +494,13 @@ pub fn route_gather(
 /// See [`crate::routine::elementwise_rows`].
 pub fn combine_sorted(
     ctx: &Ctx<'_>,
-    y: Buf,
-    expert_weights: Buf,
-    out: BufMut,
-    params: Buf,
-    inv: Buf,
-    width: Env<i32>,
-    tokens: Env<i32>,
+    y: InSlot<0, Buf>,
+    expert_weights: InSlot<1, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    inv: InSlot<2, Buf>,
+    width: Ask<keys::Width, i32>,
+    tokens: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -524,17 +522,17 @@ pub fn combine_sorted(
 /// See [`crate::routine::elementwise_rows`].
 pub fn shared_expert_combine(
     ctx: &Ctx<'_>,
-    routed: Buf,
-    shared: Buf,
-    gate: Buf,
-    out: BufMut,
-    width: u32,
-    rows: Env<i32>,
+    routed: InSlot<0, Buf>,
+    shared: InSlot<1, Buf>,
+    gate: InSlot<2, Buf>,
+    out: OutSlot<0, BufMut>,
+    width: ParamOr<0, keys::Width, u32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: "shared_expert_combine",
-            lanes: combine_grid(width, *rows)?,
+            lanes: combine_grid(*width, *rows)?,
         },
         &[routed.v(), shared.v(), gate.v(), out.v(), width.v()],
     )
@@ -556,18 +554,18 @@ pub fn shared_expert_combine(
 /// See [`crate::routine::elementwise_rows`].
 pub fn shared_expert_combine_strided(
     ctx: &Ctx<'_>,
-    routed: Buf,
-    shared: Buf,
-    gate: Buf,
-    out: BufMut,
-    width: u32,
-    row_pitch: i32,
-    rows: Env<i32>,
+    routed: InSlot<0, Buf>,
+    shared: InSlot<1, Buf>,
+    gate: InSlot<2, Buf>,
+    out: OutSlot<0, BufMut>,
+    width: ParamOr<0, keys::Width, u32>,
+    row_pitch: Param<1, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: "shared_expert_combine_strided",
-            lanes: combine_grid(width, *rows)?,
+            lanes: combine_grid(*width, *rows)?,
         },
         &[
             routed.v(),
@@ -607,24 +605,24 @@ fn combine_grid(width: u32, rows: i32) -> Result<[u32; 3], Refusal> {
 /// See [`routed_qmv_grid`].
 pub fn qmv_routed(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    in_vec_size: i32,
-    out_vec_size: i32,
-    _bias: Buf,
-    expert_ids: Buf,
-    x_slot_stride: i32,
-    x_row_stride: i32,
-    slots_per_row: i32,
-    rows: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    in_vec_size: Param<0, i32>,
+    out_vec_size: Param<1, i32>,
+    _bias: Null<Env<Buf>>,
+    expert_ids: InSlot<1, Buf>,
+    x_slot_stride: Param<2, i32>,
+    x_row_stride: Param<3, i32>,
+    slots_per_row: Param<4, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: "affine_qmv_routed_bfloat16_gs_64_b_4",
-            lanes: routed_qmv_grid(*rows, out_vec_size, slots_per_row)?,
+            lanes: routed_qmv_grid(*rows, *out_vec_size, *slots_per_row)?,
         },
         &[
             w.v(),
@@ -649,24 +647,24 @@ pub fn qmv_routed(
 /// See [`routed_qmv_grid`].
 pub fn qmv_routed_bias(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    in_vec_size: i32,
-    out_vec_size: i32,
-    bias: Buf,
-    expert_ids: Buf,
-    x_slot_stride: i32,
-    x_row_stride: i32,
-    slots_per_row: i32,
-    rows: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    in_vec_size: Param<0, i32>,
+    out_vec_size: Param<1, i32>,
+    bias: Weight<3, Buf>,
+    expert_ids: InSlot<1, Buf>,
+    x_slot_stride: Param<2, i32>,
+    x_row_stride: Param<3, i32>,
+    slots_per_row: Param<4, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: "affine_qmv_routed_bias_bfloat16_gs_64_b_4",
-            lanes: routed_qmv_grid(*rows, out_vec_size, slots_per_row)?,
+            lanes: routed_qmv_grid(*rows, *out_vec_size, *slots_per_row)?,
         },
         &[
             w.v(),
@@ -706,24 +704,24 @@ pub fn qmv_routed_bias(
 /// See [`routed_qmv_grid`].
 pub fn mxfp4_qmv_routed_bias(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    _biases: Buf,
-    x: Buf,
-    y: BufMut,
-    in_vec_size: i32,
-    out_vec_size: i32,
-    bias: Buf,
-    expert_ids: Buf,
-    x_slot_stride: i32,
-    x_row_stride: i32,
-    slots_per_row: i32,
-    rows: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    _biases: Null<Env<Buf>>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    in_vec_size: Param<0, i32>,
+    out_vec_size: Param<1, i32>,
+    bias: Weight<2, Buf>,
+    expert_ids: InSlot<1, Buf>,
+    x_slot_stride: Param<2, i32>,
+    x_row_stride: Param<3, i32>,
+    slots_per_row: Param<4, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: "mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4",
-            lanes: routed_qmv_grid(*rows, out_vec_size, slots_per_row)?,
+            lanes: routed_qmv_grid(*rows, *out_vec_size, *slots_per_row)?,
         },
         &[
             w.v(),
@@ -753,24 +751,24 @@ pub fn mxfp4_qmv_routed_bias(
 /// whatever [`routed_qmm_grid`] refuses.
 pub fn qmm_t_routed(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    tile_expert: Buf,
-    k: i32,
-    n: i32,
-    rows: Env<i32>,
-    group: Env<i32>,
-    bits: Env<i32>,
-    tile_m: Env<i32>,
-    tile_n: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    tile_expert: InSlot<2, Buf>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    rows: Ask<keys::Rows, i32>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
+    tile_m: Ask<keys::TileM, i32>,
+    tile_n: Ask<keys::TileN, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: AFFINE_QMM[affine_qmm_point(*group, *bits, *tile_m, *tile_n)?],
-            lanes: routed_qmm_grid(*rows, n, *tile_m, *tile_n)?,
+            lanes: routed_qmm_grid(*rows, *n, *tile_m, *tile_n)?,
         },
         &[
             w.v(),
@@ -796,22 +794,22 @@ pub fn qmm_t_routed(
 /// whatever [`routed_qmm_grid`] refuses.
 pub fn qmm_t_routed_fp16(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    tile_expert: Buf,
-    k: i32,
-    n: i32,
-    rows: Env<i32>,
-    tile_m: Env<i32>,
-    tile_n: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    tile_expert: InSlot<2, Buf>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    rows: Ask<keys::Rows, i32>,
+    tile_m: Ask<keys::TileM, i32>,
+    tile_n: Ask<keys::TileN, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: FP16_QMM[tile_point(*tile_m, *tile_n)?],
-            lanes: routed_qmm_grid(*rows, n, *tile_m, *tile_n)?,
+            lanes: routed_qmm_grid(*rows, *n, *tile_m, *tile_n)?,
         },
         &[
             w.v(),
@@ -842,22 +840,22 @@ pub fn qmm_t_routed_fp16(
 /// whatever [`routed_qmm_grid`] refuses.
 pub fn mxfp4_qmm_t_routed_bias(
     ctx: &Ctx<'_>,
-    w: Buf,
-    exponents: Buf,
-    x: Buf,
-    y: BufMut,
-    bias: Buf,
-    tile_expert: Buf,
-    k: i32,
-    n: i32,
-    rows: Env<i32>,
-    tile_m: Env<i32>,
-    tile_n: Env<i32>,
+    w: Weight<0, Buf>,
+    exponents: Weight<1, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    bias: Weight<2, Buf>,
+    tile_expert: InSlot<2, Buf>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    rows: Ask<keys::Rows, i32>,
+    tile_m: Ask<keys::TileM, i32>,
+    tile_n: Ask<keys::TileN, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: MXFP4_QMM[tile_point(*tile_m, *tile_n)?],
-            lanes: routed_qmm_grid(*rows, n, *tile_m, *tile_n)?,
+            lanes: routed_qmm_grid(*rows, *n, *tile_m, *tile_n)?,
         },
         &[
             w.v(),
@@ -933,18 +931,18 @@ mod tests {
         let seen = Seen::default();
         route_sort(
             &seen,
-            Buf(0),
-            BufMut(1),
-            BufMut(2),
-            BufMut(3),
-            Buf(4),
-            BufMut(5),
+            InSlot::new(Buf(0)),
+            OutSlot::new(BufMut(1)),
+            OutSlot::new(BufMut(2)),
+            OutSlot::new(BufMut(3)),
+            Block::new(Buf(4)),
+            OutSlot::new(BufMut(5)),
         )
         .unwrap();
         assert_eq!(one(&seen).1, [1024, 1, 1]);
 
         let seen = Seen::default();
-        router_topk(&seen, Buf(0), BufMut(1), BufMut(2), Buf(3), Buf(4), Env(7)).unwrap();
+        router_topk(&seen, InSlot::new(Buf(0)), OutSlot::new(BufMut(1)), OutSlot::new(BufMut(2)), Block::new(Buf(3)), Null::new(Buf(4)), Ask::new(7)).unwrap();
         assert_eq!(one(&seen).1, [1024, 7, 1]);
     }
 
@@ -960,19 +958,19 @@ mod tests {
     #[test]
     fn the_gather_runs_over_padded_rows_and_the_combine_over_tokens() {
         let seen = Seen::default();
-        route_gather(&seen, Buf(0), BufMut(1), Buf(2), Buf(3), Env(64), Env(96)).unwrap();
+        route_gather(&seen, InSlot::new(Buf(0)), OutSlot::new(BufMut(1)), InSlot::new(Buf(2)), Block::new(Buf(3)), Ask::new(64), ParamOr::new(96)).unwrap();
         assert_eq!(one(&seen).1, [64, 96, 1]);
 
         let seen = Seen::default();
         combine_sorted(
             &seen,
-            Buf(0),
-            Buf(1),
-            BufMut(2),
-            Buf(3),
-            Buf(4),
-            Env(64),
-            Env(24),
+            InSlot::new(Buf(0)),
+            InSlot::new(Buf(1)),
+            OutSlot::new(BufMut(2)),
+            Block::new(Buf(3)),
+            InSlot::new(Buf(4)),
+            Ask::new(64),
+            Ask::new(24),
         )
         .unwrap();
         assert_eq!(one(&seen).1, [64, 24, 1]);
@@ -991,19 +989,19 @@ mod tests {
         let seen = Seen::default();
         qmv_routed(
             &seen,
-            Buf(0),
-            Buf(1),
-            Buf(2),
-            Buf(3),
-            BufMut(4),
-            512,
-            256,
-            Buf(7),
-            Buf(8),
-            1,
-            1,
-            4,
-            Env(3),
+            Weight::new(Buf(0)),
+            Weight::new(Buf(1)),
+            Weight::new(Buf(2)),
+            InSlot::new(Buf(3)),
+            OutSlot::new(BufMut(4)),
+            Param::new(512),
+            Param::new(256),
+            Null::new(Env(Buf(7))),
+            InSlot::new(Buf(8)),
+            Param::new(1),
+            Param::new(1),
+            Param::new(4),
+            Ask::new(3),
         )
         .unwrap();
         let (entrypoint, lanes, args) = one(&seen);
@@ -1035,19 +1033,19 @@ mod tests {
         let seen = Seen::default();
         mxfp4_qmv_routed_bias(
             &seen,
-            Buf(0),
-            Buf(1),
-            Buf(2),
-            Buf(3),
-            BufMut(4),
-            512,
-            256,
-            Buf(7),
-            Buf(8),
-            1,
-            1,
-            1,
-            Env(1),
+            Weight::new(Buf(0)),
+            Weight::new(Buf(1)),
+            Null::new(Env(Buf(2))),
+            InSlot::new(Buf(3)),
+            OutSlot::new(BufMut(4)),
+            Param::new(512),
+            Param::new(256),
+            Weight::new(Buf(7)),
+            InSlot::new(Buf(8)),
+            Param::new(1),
+            Param::new(1),
+            Param::new(1),
+            Ask::new(1),
         )
         .unwrap();
         let (entrypoint, _, args) = one(&seen);
@@ -1079,17 +1077,17 @@ mod tests {
         let seen = Seen::default();
         mxfp4_qmm_t_routed_bias(
             &seen,
-            Buf(0),
-            Buf(1),
-            Buf(2),
-            BufMut(3),
-            Buf(4),
-            Buf(5),
-            128,
-            64,
-            Env(32),
-            Env(32),
-            Env(16),
+            Weight::new(Buf(0)),
+            Weight::new(Buf(1)),
+            InSlot::new(Buf(2)),
+            OutSlot::new(BufMut(3)),
+            Weight::new(Buf(4)),
+            InSlot::new(Buf(5)),
+            Param::new(128),
+            Param::new(64),
+            Ask::new(32),
+            Ask::new(32),
+            Ask::new(16),
         )
         .unwrap();
         let (entrypoint, lanes, args) = one(&seen);
@@ -1127,19 +1125,19 @@ mod tests {
         let seen = Seen::default();
         qmm_t_routed(
             &seen,
-            Buf(0),
-            Buf(1),
-            Buf(2),
-            Buf(3),
-            BufMut(4),
-            Buf(5),
-            256,
-            192,
-            Env(65),
-            Env(128),
-            Env(8),
-            Env(64),
-            Env(32),
+            Weight::new(Buf(0)),
+            Weight::new(Buf(1)),
+            Weight::new(Buf(2)),
+            InSlot::new(Buf(3)),
+            OutSlot::new(BufMut(4)),
+            InSlot::new(Buf(5)),
+            Param::new(256),
+            Param::new(192),
+            Ask::new(65),
+            Ask::new(128),
+            Ask::new(8),
+            Ask::new(64),
+            Ask::new(32),
         )
         .unwrap();
         let (entrypoint, lanes, _) = one(&seen);
@@ -1156,19 +1154,19 @@ mod tests {
         let seen = Seen::default();
         let refused = qmm_t_routed(
             &seen,
-            Buf(0),
-            Buf(1),
-            Buf(2),
-            Buf(3),
-            BufMut(4),
-            Buf(5),
-            256,
-            192,
-            Env(65),
-            Env(128),
-            Env(8),
-            Env(48),
-            Env(32),
+            Weight::new(Buf(0)),
+            Weight::new(Buf(1)),
+            Weight::new(Buf(2)),
+            InSlot::new(Buf(3)),
+            OutSlot::new(BufMut(4)),
+            InSlot::new(Buf(5)),
+            Param::new(256),
+            Param::new(192),
+            Ask::new(65),
+            Ask::new(128),
+            Ask::new(8),
+            Ask::new(48),
+            Ask::new(32),
         );
         assert!(matches!(refused, Err(Refusal::Narrow { .. })));
     }
@@ -1184,11 +1182,11 @@ mod tests {
     #[test]
     fn the_shared_expert_blend_launches_on_the_width_in_both_forms() {
         let seen = Seen::default();
-        shared_expert_combine(&seen, Buf(0), Buf(1), Buf(2), BufMut(3), 512, Env(9)).unwrap();
+        shared_expert_combine(&seen, InSlot::new(Buf(0)), InSlot::new(Buf(1)), InSlot::new(Buf(2)), OutSlot::new(BufMut(3)), ParamOr::new(512), Ask::new(9)).unwrap();
         assert_eq!(one(&seen).1, [512, 9, 1]);
 
         let seen = Seen::default();
-        shared_expert_combine_strided(&seen, Buf(0), Buf(1), Buf(2), BufMut(3), 512, 4096, Env(9))
+        shared_expert_combine_strided(&seen, InSlot::new(Buf(0)), InSlot::new(Buf(1)), InSlot::new(Buf(2)), OutSlot::new(BufMut(3)), ParamOr::new(512), Param::new(4096), Ask::new(9))
             .unwrap();
         let (_, lanes, args) = one(&seen);
         assert_eq!(lanes, [512, 9, 1], "the width, and not the 4096 pitch");

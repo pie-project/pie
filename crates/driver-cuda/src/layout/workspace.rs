@@ -1,40 +1,16 @@
-//! The per-fire forward workspace: the reusable scratch every llama-like
-//! forward path writes into, sized once against `max_tokens`.
+//! The per-fire forward workspace: reusable scratch every llama-like forward
+//! path writes into, sized once against `max_tokens`.
 //!
-//! # Why this is a table rather than two functions
-//!
-//! The C++ used to say the same layout twice. `Workspace::allocate_full`
-//! created the tensors, and `workspace_bytes` — a separate function, a hundred
-//! lines further down — added up what they cost so the memory planner could
-//! subtract the arena from the KV pool. Nothing compared them, and its own
-//! comment stated the stakes:
-//!
-//! > *this function is the planner's arena figure (`memory_planner.cpp`) and
-//! > every byte missing from it is a byte handed to the KV pool instead.*
-//!
-//! They had drifted. `declared_values` (`[N, hidden + intermediate]` bf16) and
-//! `mtp_row0_save` (`[1, vocab]` bf16) were allocated and never budgeted, so
-//! the planner under-charged the arena on every model it had ever run — 503 MB
-//! on a Qwen3-32B shape, 151 MB on Llama-3-8B. Porting is what surfaced it:
-//! reconciling two statements of one layout is work a port cannot skip.
-//!
-//! Both sides now state the layout ONCE. Here it is [`WorkspaceLayout::slots`],
-//! which [`WorkspaceLayout::bytes`] sums and [`WorkspaceLayout::specs`] hands
-//! to the allocator; in C++ it is `workspace_slots`, which `allocate_full` and
-//! `workspace_bytes` both walk. Neither pair can drift again, because in
-//! neither is there a second list to drift from.
+//! [`WorkspaceLayout::slots`] is the single statement of the layout; `bytes`
+//! sums it and `specs` hands it to the allocator, so the planner's subtracted
+//! figure and the tensors allocated cannot drift apart.
 
 use crate::dtype::DType;
 use crate::error::Result;
 use crate::tensor::TensorSpec;
 
-/// A named buffer in the workspace.
-///
-/// The order of this enum is the order `allocate_full` creates the tensors,
-/// which is the order the parity transcript records. It is neither
-/// alphabetical nor the declaration order of the C++ struct — those differ
-/// from each other too, and the allocation order is the one that is
-/// observable.
+/// A named buffer in the workspace. Declaration order is allocation order,
+/// which the parity transcript records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Slot {
     /// `[N, hidden]` — the residual stream.
@@ -92,22 +68,14 @@ pub enum Slot {
 
 /// Running (value, index) slots per row for the fused-argmax epilogue.
 ///
-/// Mirrors `kernels::sample::kArgmaxAccumSlots`. The parity oracle reads the
-/// C++ value out of the shipping header rather than retyping it, so this
-/// constant going stale is a test failure and not a silent mis-size.
+/// Must match `kernels::sample::kArgmaxAccumSlots`; the parity oracle checks it.
 pub const ARGMAX_ACCUM_SLOTS: i64 = 32;
 
 /// Most a single program may reserve.
-///
-/// Mirrors `Workspace::kMtpDraftRowsPerProgram`.
 pub const MTP_DRAFT_ROWS_PER_PROGRAM: i32 = 32;
 
-/// The shape parameters `allocate_full` takes, named.
-///
-/// The C++ signature is seven positional `int`s of which four are bounds and
-/// three are model dimensions, and adjacent pairs are interchangeable at the
-/// call site without a diagnostic. Naming them is the entire reason this
-/// struct exists.
+/// The shape parameters `allocate_full` takes, named so adjacent same-typed
+/// args can't be swapped silently at a call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkspaceShape {
     /// `cfg.hidden_size`.
@@ -130,8 +98,7 @@ pub struct WorkspaceShape {
     pub max_hk: i64,
     /// `max_output_rows`; `0` means "same as `max_tokens`".
     pub max_output_rows: i64,
-    /// MTP draft rows reserved at the tail of `logits`. Negative is clamped
-    /// to zero, as the C++ `std::max(0, ...)` does.
+    /// MTP draft rows reserved at the tail of `logits`. Negative is clamped to zero.
     pub max_mtp_draft_rows: i64,
 }
 
@@ -155,20 +122,13 @@ impl WorkspaceLayout {
         &self.shape
     }
 
-    /// First `logits` row reserved for MTP drafts.
-    ///
-    /// Mirrors `workspace_mtp_draft_row_base`, which is the identity on
-    /// `max_tokens`. It exists as a named function because the *meaning* —
-    /// "drafts start where the target rows end" — is what callers depend on,
-    /// and it would be re-derived at each of them otherwise.
+    /// First `logits` row reserved for MTP drafts: where the target rows end.
     #[must_use]
     pub const fn mtp_draft_row_base(&self) -> i64 {
         self.shape.max_tokens
     }
 
     /// Rows in `logits`: the target rows plus any MTP draft reserve.
-    ///
-    /// Mirrors `workspace_logits_rows`.
     #[must_use]
     pub const fn logits_rows(&self) -> i64 {
         self.shape.max_tokens + self.draft_rows()
@@ -185,16 +145,6 @@ impl WorkspaceLayout {
     }
 
     /// Rows in `probs`: `max_output_rows`, or `max_tokens` when unset.
-    ///
-    /// The C++ used to hold two different fallbacks for this one field:
-    /// `allocate_full` read `max_output_rows > 0 ? max_output_rows :
-    /// max_tokens` while `workspace_bytes` read `std::max(1, output_rows)`.
-    /// They agree for every positive value and differ at zero, where the
-    /// allocator made `max_tokens` rows and the budget charged one. The
-    /// planner has only ever passed a positive count, so it was unreachable
-    /// rather than harmless. Merging the two layouts settled it on the
-    /// allocator's reading, kept here, because that is the one that reserves
-    /// memory.
     #[must_use]
     pub const fn output_rows(&self) -> i64 {
         if self.shape.max_output_rows > 0 {
@@ -231,10 +181,8 @@ impl WorkspaceLayout {
         }
     }
 
-    /// The divisor `allocate_full` uses to recover a head count.
-    ///
-    /// It divides by `std::max(1, cfg.head_dim)`, not by `head_dim`, so a
-    /// config with a zero head dim yields zero heads instead of trapping.
+    /// Head-count divisor: `head_dim` floored at 1, so a zero head dim
+    /// yields zero heads instead of trapping.
     #[must_use]
     const fn head_dim_divisor(&self) -> i64 {
         if self.shape.head_dim >= 1 {
@@ -256,10 +204,8 @@ impl WorkspaceLayout {
         self.shape.max_hk / self.head_dim_divisor()
     }
 
-    /// Every buffer in the layout, in allocation order.
-    ///
-    /// This is the single statement of the layout. Both the allocator and the
-    /// byte budget read it; neither restates it.
+    /// Every buffer in the layout, in allocation order — the single
+    /// statement both the allocator and byte budget read.
     #[must_use]
     pub fn slots(&self) -> Vec<(Slot, DType, [i64; 2])> {
         let s = &self.shape;
@@ -329,13 +275,8 @@ impl WorkspaceLayout {
             .sum()
     }
 
-    /// What the C++ `workspace_bytes` reports for this shape.
-    ///
-    /// Equal to [`Self::bytes`] — that is the point, and
-    /// [`Self::budget_shortfall`] asserting zero is what keeps it true. It is
-    /// kept as a separate computation rather than an alias because it is
-    /// derived the way the C++ derives it, so the parity oracle compares two
-    /// independent walks rather than one value against itself.
+    /// Equal to [`Self::bytes`], derived independently the way the C++ does
+    /// so the parity oracle compares two walks, not a value against itself.
     #[must_use]
     pub fn cpp_budget_bytes(&self) -> u64 {
         self.slots()
@@ -353,12 +294,8 @@ impl WorkspaceLayout {
     }
 
     /// Bytes the planner is not told about: [`Self::bytes`] less
-    /// [`Self::cpp_budget_bytes`].
-    ///
-    /// Zero, and the parity test requires it to stay zero on every shape in
-    /// the grid. It is not dead code but the assertion's subject: this is the
-    /// quantity that was 503 MB before the two layouts were merged, and the
-    /// only thing standing between a future edit and that number coming back.
+    /// [`Self::cpp_budget_bytes`]. Zero, and the parity test requires it to
+    /// stay zero on every shape in the grid.
     #[must_use]
     pub fn budget_shortfall(&self) -> u64 {
         self.bytes().saturating_sub(self.cpp_budget_bytes())
@@ -392,8 +329,6 @@ mod tests {
         assert_eq!(l.bytes(), l.cpp_budget_bytes());
     }
 
-    /// The two buffers whose omission was the bug, priced so the fix has a
-    /// number attached rather than only an assertion.
     #[test]
     fn the_two_formerly_unbudgeted_buffers_are_worth_asserting_over() {
         let l = qwen3_0_6b();

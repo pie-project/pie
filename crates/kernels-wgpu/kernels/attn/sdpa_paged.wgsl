@@ -65,12 +65,13 @@ struct Params {
     // past the end, and this is what tells them so.
     n_rows: i32,
 //#if defined(PIE_STRIDED)
-    // `sdpa_paged_tiled_strided` is UNSTATED -- the table names no operands for
-    // it -- so these two are not derivable from a row, and they are appended
-    // here in the order `kernels-vulkan`'s push block states them. A driver
-    // launching an unstated row follows the lowered plan's own argument order,
-    // and this is that order. The same fallback fixes `n_rows` above at 24 for
-    // THIS variant; the stated rows agree with it, which is why one struct
+    // These two are appended here in the order `kernels-vulkan`'s push block
+    // states them, which is the order `attn::sdpa_paged_tiled_strided`'s
+    // signature takes them in. Nothing derived them: the row named no operands
+    // for this variant, so the lowered plan's own argument order was the only
+    // description, and the routine is that order written down. The same
+    // reasoning fixes `n_rows` above at 24 for THIS variant; every other
+    // variant agrees with it, which is why one struct
     // serves both.
     q_row_pitch: i32,
     o_row_pitch: i32,
@@ -325,6 +326,24 @@ fn decode_row(row: u32, q_head: u32, lane: u32, n_q_heads: u32) {
     //
     // Recorded so the next person spends the ten minutes on the bench rather
     // than on the edit. `how_long_a_decodes_kernels_take` is how to check.
+    //
+    // # The one restructure none of the above covers
+    //
+    // Every measurement above keeps the SHAPE: each lane owns two head-dim
+    // elements, all lanes cooperate on one key, and the tree runs ONCE PER KEY
+    // -- 2048 reductions at 2048 keys. Flash-decoding inverts it: give each
+    // lane its own KEYS, let it carry a private running max/sum/accumulator
+    // over the whole head dim, and merge across lanes ONCE at the end. The
+    // multiply-adds are identical and the 63-add tree stops being per key,
+    // which is the third of the kernel the note above calls inherent -- it is
+    // inherent to reducing 64 lanes PER KEY, not to the problem.
+    //
+    // It is not free: lanes would read different key rows instead of one row
+    // cooperatively, trading a perfectly coalesced load for a per-lane
+    // contiguous one, and the online-softmax merge has to be written and shown
+    // to be exact. So it is a rewrite with a real correctness surface, not a
+    // tweak, and the ceiling on it is the 1.5x that removing a third implies.
+    // Named here because everything cheaper has been tried and written down.
     var max_score = PIE_SDPA_NEG_INF;
     var sum_exp = 0.0;
     var acc = vec2<f32>(0.0, 0.0);

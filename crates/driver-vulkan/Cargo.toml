@@ -33,7 +33,7 @@ path = "src/lib.rs"
 default = []
 
 # The device half: `ash`, an instance, a queue, real pipelines.
-native = ["dep:ash"]
+native = ["dep:ash", "kernels-vulkan/native"]
 
 [dependencies]
 # The handshake the engine's seam speaks: `DeviceFacts` and the ABI version.
@@ -51,9 +51,19 @@ driver-api = { path = "../driver-api", default-features = false }
 kernels = { path = "../kernels" }
 
 # The Vulkan signature table, and the SPIR-V it builds. `default-features =
-# false` keeps this to the table -- host-portable, no `slangc` -- and the
-# `native` feature does not turn the shader build on here either, because a
-# driver consumes modules rather than producing them.
+# false` keeps the portable half to the table -- host-portable, no `slangc` --
+# and `native` turns the shader build on, because that half is the one that
+# means to RUN and `vkCreateShaderModule` takes words rather than source.
+#
+# This edge used to be `default-features = false` at BOTH halves, on the
+# grounds that "a driver consumes modules rather than producing them". The
+# boundary was right and the conclusion drawn from it was wrong: declining to
+# enable the feature did not stop the modules being produced, it only moved
+# who asked for them to a build script the deployment could not see, and left
+# this crate reading them back out of an `OUT_DIR` path relayed through two
+# environment variables. `slangc` still runs in `kernels-vulkan`'s build and
+# nowhere else; what changed is that its output arrives as data in an rlib
+# rather than as a directory a server has to be told about.
 kernels-vulkan = { path = "../kernels-vulkan", default-features = false }
 
 # The plan a driver executes: `Lowered`, `Launch`, `Arg`. `src/binding.rs`

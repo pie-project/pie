@@ -1,45 +1,10 @@
-//! Every boot knob this driver reads, parsed once and answered from a
-//! value.
+//! Every boot knob this driver reads, parsed once and answered from a value.
 //!
-//! Named for the BOOT rather than for configuration, because the two
-//! things called "config" here are unrelated: one is what a deployment
-//! asked this driver to do, the other is what the weights on disk say
-//! they are. The second no longer has a schema — a checkpoint's identity
-//! is a [`model::catalog`] row now, matched by tensors rather than parsed
-//! from a `config.json` — which makes the distinction easier to keep than
-//! it was when a `model::config::schema` sat next to this file.
-//!
-//! # Why one struct rather than ten call sites
-//!
-//! The knobs used to be read where they were needed: `PIE_CUDA_RUNAHEAD`
-//! in the fire path, `PIE_CUDA_KV_ENVELOPES` in the KV pool,
-//! `PIE_ATTN_SCORE_WINDOW` behind a `OnceLock` in the score sink,
-//! `PIE_RS_STASH_TOKENS` in the recurrent cache, `PIE_LOADER_DEVICE_TRANSFORMS`
-//! in the weight arena. Each had its own parser, and they did not agree:
-//! one accepted `1|true|on`, another rejected only `0`, a third
-//! hand-rolled a signed integer scan over `OsStr` bytes.
-//!
-//! Three things follow from that, and one struct fixes all three:
-//!
-//! 1. **There was nowhere to ask what this driver is configured as.** A
-//!    reader had to already know the names to find them.
-//! 2. **A typo is silent.** `PIE_CUDA_RUNAHED=0` reads as absent, which
-//!    means enabled, which is the opposite of what was asked for.
-//! 3. **The parsers drift.** `PIE_LOADER_DEVICE_TRANSFORMS=false` turned
-//!    the transforms ON, because that one rejected only the string `"0"`.
-//!    That is not hypothetical; it is what the code did.
-//!
-//! # The environment is a fallback, not the source
-//!
-//! Every knob can come from the boot TOML the engine hands
-//! `pie_cuda_create`. The environment is read only where the TOML says
-//! nothing, and the order matters: the TOML is what a deployment
-//! STATED, and an inherited variable should not silently overrule it.
+//! A knob comes from the boot TOML, or the environment where the TOML is
+//! silent — that order matters, so an inherited variable cannot overrule what a
+//! deployment stated. One struct so the hand-rolled parsers cannot drift apart.
 
-/// A boolean knob's spelling, in one place.
-///
-/// `0`, `false`, `off`, `no` and empty are off; anything else present is
-/// on. The three hand-rolled versions this replaces disagreed.
+/// A boolean knob: `0`/`false`/`off`/`no`/empty are off, anything else on.
 fn truthy(v: &str) -> bool {
     !matches!(
         v.trim().to_ascii_lowercase().as_str(),
@@ -47,110 +12,49 @@ fn truthy(v: &str) -> bool {
     )
 }
 
-/// A positive integer knob, clamped to a stated ceiling.
-///
-/// `None` for absent, unparseable, non-positive or above `max` — all of
-/// which mean "the default stands" rather than "refuse", because a knob
-/// is an override and an override nobody can read is not one.
+/// A positive integer knob, clamped to `max`. `None` — the default stands —
+/// for absent, unparseable, non-positive or above `max`.
 fn positive(v: &str, max: i64) -> Option<i64> {
     let t = v.trim();
     let n: i64 = t.strip_prefix('+').unwrap_or(t).parse().ok()?;
     (n > 0 && n <= max).then_some(n)
 }
 
-/// The KV page size, in tokens.
-///
-/// SIXTEEN, and it is here because it was written five times: in the
-/// fire path, in the capabilities, in the planner's fallback and twice
-/// more. It is not a preference — the paged-attention kernels are
-/// compiled for it — so it is a constant rather than a knob, and the
-/// point of stating it once is that a sixth restatement cannot disagree
-/// with the other five.
+/// The KV page size, in tokens. Not a knob: the paged-attention kernels are
+/// compiled for 16.
 pub const KV_PAGE_SIZE: i32 = 16;
 
 /// The whole driver's configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Boot {
-    /// Run ahead of the device: return from a launch before the fire
-    /// retires. `[driver] runahead`, `PIE_CUDA_RUNAHEAD`.
-    ///
-    /// It was OFF, and the reason was honest: `pie_cuda_launch` used to
-    /// finish the fire before it returned, and a caller reading the ring
-    /// on the next line was asserting that. The gate protected a CONTRACT
-    /// CHANGE.
-    ///
-    /// It is on because the contract is now the ABI's: the notify says the
-    /// fire retired, the engine waits for it, and this tree's tests do
-    /// too. And because there is finally something to gain — a warm decode
-    /// issues in 0.68 ms and retires 3.75 ms later, so the call returns
-    /// with 3 ms of GPU work queued behind it. When the gate was written
-    /// those two numbers were the same, and run-ahead bought nothing.
+    /// Return from a launch before the fire retires. `PIE_CUDA_RUNAHEAD`.
     pub runahead: bool,
     /// Capture fires into a unionized supergraph. `PIE_CUDA_SUPERGRAPH`.
     ///
-    /// It was OFF, deliberately, with this reason: every A/B in the tree
-    /// pins the EAGER leg, and a capture is an optimisation that has to
-    /// prove itself against that rather than replace it silently. It has
-    /// now proved it, on the three claims that were the actual doubt:
-    ///
-    /// - the whole ABI suite records and replays (19/19 with the gate on),
-    ///   which is every family this shell opens and every fire shape it
-    ///   serves;
-    /// - one exec runs two structurally distinct KV-write programs and
-    ///   returns byte-identical logits, selected by a byte of device
-    ///   memory (`bridge_smoke::the_union_captures_and_replays_the_same_\
-    ///   decode`, in the 5,097-line target deleted with `bind::abi::ffi` —
-    ///   the property is recorded here because nothing else states it);
-    /// - and one exec serves a SECOND fire's tokens
-    ///   (`a_cached_exec_serves_the_next_fire`), which is the property that
-    ///   makes a cached exec worth caching and the only one that can tell
-    ///   a baked address from baked contents.
-    ///
-    /// What cannot be replayed still refuses rather than being captured
-    /// wrong: recurrent-state families stay eager at the LOWERING
-    /// decision, and an arm whose prepared state the fire declines to
-    /// build is refused. So default-on changes which leg runs, not which
-    /// answers are possible.
-    ///
-    /// The knob inverts rather than disappears, because a default is a
-    /// judgement and a judgement should stay reversible without a rebuild.
+    /// What cannot be replayed stays eager rather than being captured wrong; the
+    /// default-on switch changes which leg runs, not which answers are possible.
     pub supergraph: bool,
-    /// Trace the supergraph's decisions to stderr.
+    /// Trace the supergraph's decisions to stderr. `PIE_CUDA_TRACE_SUPERGRAPH`.
     ///
-    /// **Nothing reads this field**, and the knob it names still works:
-    /// `fire::launch::sg_trace` reads `PIE_CUDA_TRACE_SUPERGRAPH` itself,
-    /// lazily, at each of its fourteen call sites. That is the same
-    /// second-parser shape this struct exists to end, and it is left
-    /// standing on purpose rather than by oversight — routing it here
-    /// means threading a `Boot` to fourteen sites deep inside the launch
-    /// walk, for a knob whose only cost when unset is one `getenv`. The
-    /// field is the record that the two are meant to be one; closing it is
-    /// a change to `sg_trace`'s signature, not to this line.
+    /// Nothing reads this field yet; `sg_trace` still reads the env var itself,
+    /// deliberately, to avoid threading a `Boot` to every call site.
     pub trace_supergraph: bool,
     /// Apply weight transforms on the device rather than the host.
     pub device_transforms: bool,
-    /// Advertise and allocate KV envelopes.
-    ///
-    /// Read by BOTH the pool that would allocate them and the caps that
-    /// advertise them, and the two MUST agree — which is the clearest
-    /// case for this struct, because agreeing used to be a matter of
-    /// two sites spelling the same parse by hand.
+    /// Advertise and allocate KV envelopes — read by both the allocating pool
+    /// and the advertising caps, which must agree.
     pub kv_envelopes: bool,
-    /// How many attention-score rows the sink keeps. Default 32,
-    /// ceiling 4096.
+    /// Attention-score rows the sink keeps. Default 32, ceiling 4096.
     pub attn_score_window: u32,
     /// Cap on the recurrent verify stash, in tokens. `None` is uncapped.
     pub rs_stash_tokens: Option<i32>,
-    /// Sweep the shape ladder at load and store the winner.
-    /// `[batching] calibrate_planner`.
+    /// Sweep the shape ladder at load and store the winner. `PIE_CUDA_CALIBRATE`.
     pub calibrating: bool,
 }
 
 impl Default for Boot {
-    /// What this driver does when nothing says otherwise.
-    ///
-    /// Run-ahead and the supergraph are ON: they are what this shell is
-    /// FOR, and their knobs exist to switch them off while bisecting.
+    /// What this driver does when nothing says otherwise — run-ahead and the
+    /// supergraph on, their knobs there to switch them off while bisecting.
     fn default() -> Self {
         Self {
             runahead: true,
@@ -166,12 +70,9 @@ impl Default for Boot {
 }
 
 impl Boot {
-    /// Parse the boot TOML, then let the environment fill what it did
-    /// not state.
+    /// Parse the boot TOML, then let the environment fill what it did not state.
     ///
-    /// `env` is a parameter rather than a call to [`std::env::var`] so
-    /// this is testable without mutating process state — the same
-    /// reason `layout::profile_cache::cache_path` takes one.
+    /// `env` is a parameter, not [`std::env::var`], so it is testable.
     pub fn parse(boot: Option<&toml::Table>, env: impl Fn(&str) -> Option<String>) -> Self {
         let mut cfg = Self::default();
         let table =
@@ -238,8 +139,7 @@ impl Boot {
         cfg
     }
 
-    /// Read the real environment. The one place [`std::env::var`] is
-    /// called for a driver knob.
+    /// Read the real environment — the one [`std::env::var`] site for a knob.
     #[must_use]
     pub fn from_boot(boot: Option<&toml::Table>) -> Self {
         Self::parse(boot, |k| std::env::var(k).ok())
@@ -254,8 +154,7 @@ mod tests {
         None
     }
 
-    /// The defaults are what the driver does with an empty boot file,
-    /// and they are not all `false`.
+    /// The defaults are the driver's ordinary behaviour, and not all `false`.
     #[test]
     fn the_defaults_are_the_drivers_ordinary_behaviour() {
         let cfg = Boot::parse(None, no_env);
@@ -270,10 +169,7 @@ mod tests {
         assert_eq!(cfg.rs_stash_tokens, None, "uncapped");
     }
 
-    /// The disagreement this struct exists to end. The weight arena
-    /// rejected only the string `"0"`, so
-    /// `PIE_LOADER_DEVICE_TRANSFORMS=false` turned the transforms ON —
-    /// the opposite of what was asked for.
+    /// Every false spelling reads as off — the parser drift this struct ends.
     #[test]
     fn every_boolean_knob_reads_false_the_same_way() {
         for spelling in ["0", "false", "off", "no", "FALSE", " off "] {
@@ -290,8 +186,7 @@ mod tests {
         }
     }
 
-    /// The TOML wins, because it is what a deployment STATED and the
-    /// environment is what a shell happened to inherit.
+    /// The TOML outranks an inherited environment variable.
     #[test]
     fn the_boot_config_outranks_the_environment() {
         let boot: toml::Table = "[driver]\nrunahead = false\n".parse().expect("parses");

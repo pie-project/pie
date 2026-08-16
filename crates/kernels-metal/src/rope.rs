@@ -3,12 +3,21 @@
 //! Four spellings of the schedule (`neox`, `freqs`, `prop`, and the strided
 //! form), each in a decode and a multi-batch shape. The `freqs` pair reads a
 //! host-computed table, which is what llama-3.1's wavelength ramp needs.
+//!
+//! EVERY ROUTINE HERE TAKES ITS `position` AS `Env<I32s>`, and the `freqs`
+//! pair its `inv_freq` as `Env<Buf>`. A rotation's only trace operand is the
+//! tensor it turns: `driver-metal`'s shared `fn neox` arm binds `position`
+//! from `FireTable::Positions` and `inv_freq` from `FireTable::RopeFrequencies`
+//! -- where each token sits in its request, and a ramp the loader computed --
+//! so no statement places either and §6.2's arity rule would count two
+//! operands against a statement that carries none.
 
 #![allow(clippy::too_many_arguments)]
 
 use kernels::routine::Refusal;
 
-use crate::routine::{Bind, Buf, BufMut, Ctx, Env, Fire, I32s, Routine};
+use crate::routine::{keys, Ask, Bind, Buf, BufMut, Ctx, Fire, I32s, Param, ParamF32, ParamOr, Routine};
+use crate::routine::OutSlot;
 
 /// The shaders this family's routines reach: `(file, entrypoint)`, one pair
 /// per instantiated name.
@@ -111,15 +120,15 @@ const NEOX_FILE: &str = "rope/neox.metal";
 /// See [`rope_grid`].
 pub fn neox_decode(
     ctx: &Ctx<'_>,
-    x: BufMut,
-    position: I32s,
-    scale: f32,
-    base: f32,
-    head_dim: i32,
-    rotary: Env<i32>,
-    width: Env<i32>,
+    x: OutSlot<0, BufMut>,
+    position: Ask<keys::Positions, I32s>,
+    scale: ParamF32<0>,
+    base: ParamF32<1>,
+    head_dim: ParamOr<2, keys::HeadDim, i32>,
+    rotary: ParamOr<3, keys::RotaryWidth, i32>,
+    width: Ask<keys::Width, i32>,
 ) -> Result<(), Refusal> {
-    let lanes = rope_grid(*rotary, *width, head_dim, 1)?;
+    let lanes = rope_grid(*rotary, *width, *head_dim, 1)?;
     ctx.dispatch(
         Fire {
             entrypoint: "neox_decode_bfloat16",
@@ -139,16 +148,16 @@ pub fn neox_decode(
 /// See [`rope_grid`].
 pub fn neox_mb(
     ctx: &Ctx<'_>,
-    x: BufMut,
-    position: I32s,
-    scale: f32,
-    base: f32,
-    head_dim: i32,
-    rotary: Env<i32>,
-    width: Env<i32>,
-    rows: Env<i32>,
+    x: OutSlot<0, BufMut>,
+    position: Ask<keys::Positions, I32s>,
+    scale: ParamF32<0>,
+    base: ParamF32<1>,
+    head_dim: ParamOr<2, keys::HeadDim, i32>,
+    rotary: ParamOr<3, keys::RotaryWidth, i32>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
-    let lanes = rope_grid(*rotary, *width, head_dim, *rows)?;
+    let lanes = rope_grid(*rotary, *width, *head_dim, *rows)?;
     ctx.dispatch(
         Fire {
             entrypoint: "neox_mb_bfloat16",
@@ -179,16 +188,16 @@ pub fn neox_mb(
 /// See [`rope_grid`].
 pub fn neox_freqs_decode(
     ctx: &Ctx<'_>,
-    x: BufMut,
-    position: I32s,
-    scale: f32,
-    inv_freq: Buf,
-    head_dim: i32,
-    mscale: f32,
-    rotary: Env<i32>,
-    width: Env<i32>,
+    x: OutSlot<0, BufMut>,
+    position: Ask<keys::Positions, I32s>,
+    scale: ParamF32<0>,
+    inv_freq: Ask<keys::RopeFrequencies, Buf>,
+    head_dim: ParamOr<1, keys::HeadDim, i32>,
+    mscale: ParamF32<2>,
+    rotary: ParamOr<3, keys::RotaryWidth, i32>,
+    width: Ask<keys::Width, i32>,
 ) -> Result<(), Refusal> {
-    let lanes = rope_grid(*rotary, *width, head_dim, 1)?;
+    let lanes = rope_grid(*rotary, *width, *head_dim, 1)?;
     ctx.dispatch(
         Fire {
             entrypoint: "neox_freqs_decode_bfloat16",
@@ -222,17 +231,17 @@ pub fn neox_freqs_decode(
 /// See [`rope_grid`].
 pub fn neox_freqs_mb(
     ctx: &Ctx<'_>,
-    x: BufMut,
-    position: I32s,
-    scale: f32,
-    inv_freq: Buf,
-    head_dim: i32,
-    mscale: f32,
-    rotary: Env<i32>,
-    width: Env<i32>,
-    rows: Env<i32>,
+    x: OutSlot<0, BufMut>,
+    position: Ask<keys::Positions, I32s>,
+    scale: ParamF32<0>,
+    inv_freq: Ask<keys::RopeFrequencies, Buf>,
+    head_dim: ParamOr<1, keys::HeadDim, i32>,
+    mscale: ParamF32<2>,
+    rotary: ParamOr<3, keys::RotaryWidth, i32>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
-    let lanes = rope_grid(*rotary, *width, head_dim, *rows)?;
+    let lanes = rope_grid(*rotary, *width, *head_dim, *rows)?;
     ctx.dispatch(
         Fire {
             entrypoint: "neox_freqs_mb_bfloat16",
@@ -267,15 +276,15 @@ pub fn neox_freqs_mb(
 /// See [`rope_grid`].
 pub fn neox_prop_decode(
     ctx: &Ctx<'_>,
-    x: BufMut,
-    position: I32s,
-    scale: f32,
-    base: f32,
-    head_dim: i32,
-    rotary: Env<i32>,
-    width: Env<i32>,
+    x: OutSlot<0, BufMut>,
+    position: Ask<keys::Positions, I32s>,
+    scale: ParamF32<0>,
+    base: ParamF32<1>,
+    head_dim: ParamOr<2, keys::HeadDim, i32>,
+    rotary: ParamOr<3, keys::RotaryWidth, i32>,
+    width: Ask<keys::Width, i32>,
 ) -> Result<(), Refusal> {
-    let lanes = rope_grid(*rotary, *width, head_dim, 1)?;
+    let lanes = rope_grid(*rotary, *width, *head_dim, 1)?;
     ctx.dispatch(
         Fire {
             entrypoint: "neox_prop_decode_bfloat16",
@@ -300,16 +309,16 @@ pub fn neox_prop_decode(
 /// See [`rope_grid`].
 pub fn neox_prop_mb(
     ctx: &Ctx<'_>,
-    x: BufMut,
-    position: I32s,
-    scale: f32,
-    base: f32,
-    head_dim: i32,
-    rotary: Env<i32>,
-    width: Env<i32>,
-    rows: Env<i32>,
+    x: OutSlot<0, BufMut>,
+    position: Ask<keys::Positions, I32s>,
+    scale: ParamF32<0>,
+    base: ParamF32<1>,
+    head_dim: ParamOr<2, keys::HeadDim, i32>,
+    rotary: ParamOr<3, keys::RotaryWidth, i32>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
-    let lanes = rope_grid(*rotary, *width, head_dim, *rows)?;
+    let lanes = rope_grid(*rotary, *width, *head_dim, *rows)?;
     ctx.dispatch(
         Fire {
             entrypoint: "neox_prop_mb_bfloat16",
@@ -339,23 +348,23 @@ pub fn neox_prop_mb(
 /// the grid.
 pub fn neox_strided(
     ctx: &Ctx<'_>,
-    x: BufMut,
-    position: I32s,
-    scale: f32,
-    base: f32,
-    head_dim: i32,
-    row_pitch: i32,
-    rotary: Env<i32>,
-    width: Env<i32>,
-    rows: Env<i32>,
+    x: OutSlot<0, BufMut>,
+    position: Ask<keys::Positions, I32s>,
+    scale: ParamF32<0>,
+    base: ParamF32<1>,
+    head_dim: ParamOr<2, keys::HeadDim, i32>,
+    row_pitch: Param<4, i32>,
+    rotary: ParamOr<3, keys::RotaryWidth, i32>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
-    if row_pitch < *width {
+    if *row_pitch < *width {
         return Err(Refusal::Narrow {
             what: "row_pitch is narrower than the row it strides over",
-            at: i64::from(row_pitch),
+            at: i64::from(*row_pitch),
         });
     }
-    let lanes = rope_grid(*rotary, *width, head_dim, *rows)?;
+    let lanes = rope_grid(*rotary, *width, *head_dim, *rows)?;
     ctx.dispatch(
         Fire {
             entrypoint: "neox_strided_bfloat16",
@@ -376,20 +385,29 @@ pub fn neox_strided(
 
 /// This family's routines.
 ///
-/// None of them states `in_place`, and that is worth a line because it looks
-/// like it should. These rotations ARE in place: buffer 0 is read and written.
-/// But `in_place` names `(input, output)` pairs of TRACE OPERANDS that must be
-/// given the same address, and a rotation has only one operand -- an `Out`.
-/// There is no input to alias it to. What makes it in place is that the single
-/// buffer is `BufMut`, which the signature already says.
+/// Every one of them states `in_place = &[(0, 0)]`, and the reason is worth
+/// a line because this doc used to say the exact opposite. It argued that
+/// "a rotation has only one operand -- an `Out`; there is no input to alias
+/// it to", and that was true of the SIGNATURE and false of the STATEMENT.
+/// `in_place` pairs TRACE operands, not parameters: the trace states the
+/// tensor going in and the rotated tensor coming out, and the pair is what
+/// says they are one buffer. A rotation has exactly the two the pair needs.
+///
+/// The old reading cost the family every fire it had. Believing there was
+/// no input to alias, `model-dsl`'s `rope_one` stated the rotation with one
+/// input and NO result, and `arity_problem` reads a routine that writes one
+/// pointer against a statement declaring none. Both halves of its message
+/// fired at once. CUDA's `rope_bf16` is the same shape spelled correctly --
+/// two `Out`s, no `In`s, `in_place = &[(0, 0), (1, 1)]` -- and its
+/// statement declares two inputs and two results.
 pub static ROUTINES: &[Routine] = &[
-    crate::routine!(neox_decode),
-    crate::routine!(neox_freqs_decode),
-    crate::routine!(neox_freqs_mb),
-    crate::routine!(neox_mb),
-    crate::routine!(neox_prop_decode),
-    crate::routine!(neox_prop_mb),
-    crate::routine!(neox_strided),
+    crate::routine!(neox_decode, in_place = &[(0, 0)]),
+    crate::routine!(neox_freqs_decode, in_place = &[(0, 0)]),
+    crate::routine!(neox_freqs_mb, in_place = &[(0, 0)]),
+    crate::routine!(neox_mb, in_place = &[(0, 0)]),
+    crate::routine!(neox_prop_decode, in_place = &[(0, 0)]),
+    crate::routine!(neox_prop_mb, in_place = &[(0, 0)]),
+    crate::routine!(neox_strided, in_place = &[(0, 0)]),
 ];
 
 #[cfg(test)]
@@ -427,27 +445,27 @@ mod tests {
         let seen = Seen::default();
         neox_freqs_decode(
             &seen,
-            BufMut(1),
-            I32s(2),
-            1.0,
-            Buf(3),
-            128,
-            1.0,
-            Env(128),
-            Env(2048),
+            OutSlot::new(BufMut(1)),
+            Ask::new(I32s(2)),
+            ParamF32::new(1.0),
+            Ask::new(Buf(3)),
+            ParamOr::new(128),
+            ParamF32::new(1.0),
+            ParamOr::new(128),
+            Ask::new(2048),
         )
         .expect("a launch");
         neox_freqs_mb(
             &seen,
-            BufMut(1),
-            I32s(2),
-            1.0,
-            Buf(3),
-            128,
-            1.0,
-            Env(128),
-            Env(2048),
-            Env(37),
+            OutSlot::new(BufMut(1)),
+            Ask::new(I32s(2)),
+            ParamF32::new(1.0),
+            Ask::new(Buf(3)),
+            ParamOr::new(128),
+            ParamF32::new(1.0),
+            ParamOr::new(128),
+            Ask::new(2048),
+            Ask::new(37),
         )
         .expect("a launch");
 
@@ -480,14 +498,14 @@ mod tests {
         for rotary in [64, 128, 256] {
             neox_mb(
                 &seen,
-                BufMut(1),
-                I32s(2),
-                1.0,
-                10_000.0,
-                128,
-                Env(rotary),
-                Env(2048),
-                Env(4),
+                OutSlot::new(BufMut(1)),
+                Ask::new(I32s(2)),
+                ParamF32::new(1.0),
+                ParamF32::new(10_000.0),
+                ParamOr::new(128),
+                ParamOr::new(rotary),
+                Ask::new(2048),
+                Ask::new(4),
             )
             .expect("a launch");
         }
@@ -506,13 +524,13 @@ mod tests {
         let seen = Seen::default();
         let refused = neox_decode(
             &seen,
-            BufMut(1),
-            I32s(2),
-            1.0,
-            10_000.0,
-            128,
-            Env(65),
-            Env(2048),
+            OutSlot::new(BufMut(1)),
+            Ask::new(I32s(2)),
+            ParamF32::new(1.0),
+            ParamF32::new(10_000.0),
+            ParamOr::new(128),
+            ParamOr::new(65),
+            Ask::new(2048),
         )
         .expect_err("65 is not a whole number of pairs");
         assert!(
@@ -528,13 +546,13 @@ mod tests {
 
         let refused = neox_decode(
             &seen,
-            BufMut(1),
-            I32s(2),
-            1.0,
-            10_000.0,
-            128,
-            Env(64),
-            Env(2000),
+            OutSlot::new(BufMut(1)),
+            Ask::new(I32s(2)),
+            ParamF32::new(1.0),
+            ParamF32::new(10_000.0),
+            ParamOr::new(128),
+            ParamOr::new(64),
+            Ask::new(2000),
         )
         .expect_err("2000 is not a whole number of 128-wide heads");
         assert!(
@@ -561,27 +579,27 @@ mod tests {
         let seen = Seen::default();
         neox_prop_mb(
             &seen,
-            BufMut(1),
-            I32s(2),
-            0.5,
-            10_000.0,
-            256,
-            Env(128),
-            Env(2048),
-            Env(5),
+            OutSlot::new(BufMut(1)),
+            Ask::new(I32s(2)),
+            ParamF32::new(0.5),
+            ParamF32::new(10_000.0),
+            ParamOr::new(256),
+            ParamOr::new(128),
+            Ask::new(2048),
+            Ask::new(5),
         )
         .expect("a launch");
         neox_strided(
             &seen,
-            BufMut(1),
-            I32s(2),
-            0.5,
-            10_000.0,
-            256,
-            4096,
-            Env(128),
-            Env(2048),
-            Env(5),
+            OutSlot::new(BufMut(1)),
+            Ask::new(I32s(2)),
+            ParamF32::new(0.5),
+            ParamF32::new(10_000.0),
+            ParamOr::new(256),
+            Param::new(4096),
+            ParamOr::new(128),
+            Ask::new(2048),
+            Ask::new(5),
         )
         .expect("a launch");
 
@@ -589,7 +607,7 @@ mod tests {
         assert_eq!(
             calls[0].3,
             vec![
-                ArgValue::Buffer(1),
+                ArgValue::BufferMut(1),
                 ArgValue::Buffer(2),
                 ArgValue::F32(0.5),
                 ArgValue::F32(10_000.0),
@@ -599,7 +617,7 @@ mod tests {
         assert_eq!(
             calls[1].3,
             vec![
-                ArgValue::Buffer(1),
+                ArgValue::BufferMut(1),
                 ArgValue::Buffer(2),
                 ArgValue::F32(0.5),
                 ArgValue::F32(10_000.0),
@@ -620,15 +638,15 @@ mod tests {
         let seen = Seen::default();
         let refused = neox_strided(
             &seen,
-            BufMut(1),
-            I32s(2),
-            0.5,
-            10_000.0,
-            256,
-            1024,
-            Env(128),
-            Env(2048),
-            Env(5),
+            OutSlot::new(BufMut(1)),
+            Ask::new(I32s(2)),
+            ParamF32::new(0.5),
+            ParamF32::new(10_000.0),
+            ParamOr::new(256),
+            Param::new(1024),
+            ParamOr::new(128),
+            Ask::new(2048),
+            Ask::new(5),
         )
         .expect_err("a 1024 pitch cannot tile 2048-wide rows");
         assert!(

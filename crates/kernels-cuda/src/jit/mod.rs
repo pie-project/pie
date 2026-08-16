@@ -1,47 +1,16 @@
 //! The per-symbol JIT: a root, an instantiation, and one entry point.
 //!
-//! What changed from `runtime::cache` is the granularity. A UNIT carried a row
-//! list because the whole set of instantiations had to be enumerated before
-//! anything could be compiled, and one fire of one FA2 symbol compiled its
-//! unit's ten rows. Compilation is per instantiation now: the enumeration has
-//! no reader left, so it is not data any more.
+//! Compilation happens per instantiation: [`Root`] holds the device text,
+//! [`Ctx`] is what a routine body launches through, [`ArgValue`] is one bound
+//! argument, [`Abi`] says how a crossing type spells itself in C++, and
+//! [`nvrtc`]/[`Error`] are the compiler and its refusal type.
 //!
-//! The pieces:
-//!
-//! * [`Root`] — device text and what a compile of it needs.
-//! * [`Ctx`] — what a routine body launches through.
-//! * [`ArgValue`] — one bound argument, feature-free, because a routine body
-//!   is feature-free.
-//! * [`Cuda`] — the marker carrying those last two to the `kernels`
-//!   machinery.
-//! * [`Abi`] — how a crossing type spells itself in C++ and which
-//!   [`ArgValue`] it marshals into.
-//! * [`nvrtc`] and [`Error`] — the compiler and what it refuses with.
-//!
-//! # Why `nvrtc`, `error` and `abi` are HERE
-//!
-//! All three arrived from somewhere else, and each move deleted a
-//! cross-directory reference that pointed the wrong way.
-//!
-//! `nvrtc.rs` and `error.rs` were `runtime/`'s, and the split was a CYCLE:
-//! `cache.rs` and `launch.rs` reached up for `runtime::{Error, nvrtc}` while
-//! `nvrtc.rs` reached back down for `jit::{Toolchain, cache::bind_context}`.
-//! Nothing else was left in that directory — `runtime::{Launch, Ungeometric}`
-//! and `runtime::Stream` had zero readers, and `Launch` had no `cooperative`
-//! field, so it SHADOWED this module's [`Launch`] for anyone who reached by
-//! name. The whole of `runtime` was two live files and one hazard.
-//!
-//! `abi.rs` was `x/`'s, and the reference ran the same way for a different
-//! reason: [`arg_via_abi!`](crate::arg_via_abi) is machinery, it expands to
-//! the `Abi` path, and machinery reaching up into the FAMILIES for the CUDA
-//! type vocabulary is an inversion. `Abi` is not a family — it is how a
-//! crossing type spells itself in C++ and marshals into an [`ArgValue`], both
-//! of which are this directory's words. The file names no family path at all,
-//! so the move introduced nothing and turned an inversion into a
-//! same-directory reference.
+//! `nvrtc`, `error` and `abi` live here, not in `runtime`/`x`, because each
+//! previously pointed the wrong way across a module boundary.
 
 pub mod abi;
 mod arg;
+/// One instantiation, compiled at most once per process, and its entry point.
 #[cfg(feature = "_cuda")]
 pub mod cache;
 mod ctx;
@@ -55,36 +24,23 @@ pub mod nvrtc;
 mod root;
 #[cfg(feature = "_cuda")]
 pub(crate) mod device;
+/// The page-locked host buffer a capturable H2D must read from.
+pub mod pinned;
+/// One bound argument's value, as the launch ABI carries it.
 pub mod value;
 
 pub use abi::{Abi, ByValue, Layout, fp8_kind};
 pub use ctx::{Ctx, Cuda, Launch};
 #[cfg(feature = "_cuda")]
 pub use error::Error;
+pub use pinned::PinnedBytes;
 pub use root::{Headers, Root, Toolchain};
 pub use value::ArgValue;
 
 /// Is `p` 16-byte aligned — the test a body makes before it picks a vector
-/// width.
-///
-/// # Why this is one function and was four
-///
-/// It is a HOST test, made before any launch, and the device text says so
-/// itself: `kernels/gemm/gemv.cuh:91` records `<cstdint>` being dropped
-/// because *"its one use was `std::uintptr_t` in `aligned16`, which is a HOST
-/// alignment test made before any launch and is Rust now."*
-///
-/// It was shared once, as `fire::hand::aligned16` and then `x::fire::
-/// aligned16`. Both modules were deleted, and four families — `norm`, `moe`,
-/// `layout` and `gemm::gemv` — each grew a private copy. Three spellings of
-/// one predicate resulted (`p.addr() & 15 == 0` twice, `(p as usize) % 16 ==
-/// 0` once), each with a doc comment citing a different address that no
-/// longer resolves.
-///
-/// The reason the copies gave for not importing was *"`x::fire` is a
-/// `_cuda`-only module and a routine body is feature-free"*. That reason was
-/// true and is answered rather than repeated: this module's ungated half is
-/// feature-free, so a body may call this from either build.
+/// width. A host-side check, made before any launch (see
+/// `kernels/gemm/gemv.cuh:91`); shared here, feature-free, so any routine
+/// body may call it from either build.
 #[must_use]
 pub fn aligned16(p: *const core::ffi::c_void) -> bool {
     p.addr() & 15 == 0
@@ -103,23 +59,41 @@ pub fn aligned16(p: *const core::ffi::c_void) -> bool {
 /// ```
 #[macro_export]
 macro_rules! routine {
-    ($name:ident = $body:expr $(, $($fact:tt)*)?) => {
-        ::kernels::routine!($crate::jit::Cuda, $name = $body $(, $($fact)*)?)
+    // The generic form, split so the BASE reaches `Derivation`. `$name` is
+    // the trace symbol and carries no column; the column belongs to the `fn`
+    // the turbofish instantiates.
+    ($name:ident = $base:ident ::<$($g:ty),* $(,)?> $(, $($fact:tt)*)?) => {
+        ::kernels::routine!(
+            $crate::jit::Cuda,
+            $name = $base::<$($g),*>,
+            derived = <$base as ::kernels::Derivation>::DERIVED
+            $(, $($fact)*)?
+        )
+    };
+    // The one row whose launcher carries no `#[routine]` and should not:
+    // `attn::qkv_decode_fused_dispatch` is an inner leg whose caller has
+    // already bound every operand, so a column here would resolve end to end
+    // and claim a binding no statement made. Spelled at the call site because
+    // a silently empty column is how that would go unnoticed.
+    ($body:ident, uncolumned $(, $($fact:tt)*)?) => {
+        ::kernels::routine!($crate::jit::Cuda, $body $(, $($fact)*)?)
     };
     ($body:ident $(, $($fact:tt)*)?) => {
-        ::kernels::routine!($crate::jit::Cuda, $body $(, $($fact)*)?)
+        ::kernels::routine!(
+            $crate::jit::Cuda,
+            $body,
+            derived = <$body as ::kernels::Derivation>::DERIVED
+            $(, $($fact)*)?
+        )
     };
 }
 
 /// The same, for a symbol the DRIVER fires by path — see
-/// [`kernels::driver_bound!`] for what the distinction is and why it is not a
-/// weaker `routine!`.
+/// [`kernels::driver_bound!`] for the distinction.
 ///
-/// It sits beside `routine!` in the same `ROUTINES` list on purpose. Which
-/// symbols a statement can bind and which the driver binds is a per-symbol
-/// fact, stated where the symbol is; a second LIST would make it a property
-/// of where a line was written, which is how `not_yet_crossed.rs` came to
-/// carry columns nothing derived.
+/// It sits beside `routine!` in the same `ROUTINES` list on purpose: which
+/// symbols a statement can bind vs. the driver binds is a per-symbol fact,
+/// stated where the symbol is, not a property of a separate list.
 #[macro_export]
 macro_rules! driver_bound {
     ($body:ident $(, $($fact:tt)*)?) => {
@@ -132,34 +106,20 @@ pub type Routine = kernels::routine::Routine<Cuda>;
 
 /// One family's routines, and the namespace its trace symbols sit in.
 ///
-/// A `Routine`'s name is its `fn`'s name, which is what makes the table
-/// underivable-from-anything-else; a trace names `rope::rope_bf16`. The
-/// namespace is the difference.
+/// A `Routine`'s name is its `fn`'s name; the namespace is what turns that
+/// into a full trace symbol like `rope::rope_bf16`.
 ///
-/// # It is DERIVED, and that is what dissolving `x` bought
-///
-/// `namespace` was a stated field: `Family { namespace: "rope", routines }`,
-/// written by hand once per family. It was the last column of a row in this
-/// crate that a human typed, and typing it is what made it able to drift —
-/// nothing compared the string to anything, so a family whose module was
-/// renamed, or copied to seed a new one, kept the old prefix and every symbol
-/// it offered was silently the wrong string.
-///
-/// It could not be derived while the families lived under `x`, because
-/// `module_path!()` would have answered `kernels_cuda::rope` and the
-/// useful segment was neither the first nor the last. With them at the crate
-/// root the derivation is exactly [`Family::new`]'s one line — **the first
-/// path segment after the crate root** — and the Rust path and the trace
-/// symbol become the same string:
+/// `namespace` is DERIVED, not stated: [`Family::new`] takes the first path
+/// segment after the crate root out of `module_path!()`, so the Rust path
+/// and the trace symbol are always the same string:
 ///
 /// ```text
 /// kernels_cuda::rope::rope_bf16   <->   "rope::rope_bf16"
 /// ```
 ///
-/// The rule is "first segment" rather than "last" so that a family may have
-/// submodules without minting namespaces: `attn::fa2` and `attn::xqa` are
-/// separate `Family` values under one `attn` namespace, which is what their
-/// symbols have always said and what the Rust used to contradict.
+/// "First segment" rather than "last" so a family may have submodules
+/// without minting namespaces: `attn::fa2` and `attn::xqa` are separate
+/// `Family` values under one `attn` namespace.
 pub struct Family {
     /// What a trace prefixes this family's symbols with.
     ///

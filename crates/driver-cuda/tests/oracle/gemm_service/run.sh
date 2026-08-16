@@ -7,22 +7,44 @@
 # from the same inputs.
 #
 # cuBLAS picks its kernel from the device, so this transcript belongs to the
-# GPU that made it. `driver-cuda/build.rs` compiles for `sm_89` and nothing
-# else, so that is not a new constraint.
+# GPU that made it -- which is why there is now one golden per architecture
+# rather than one golden, and why this builds for the card in front of it.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.0}"
 
+# A GOLDEN PER ARCHITECTURE, and this never overwrites another card's.
+#
+# `golden.txt` is sm_89's, the first recording, and stays that. Two of the
+# twenty-eight rows -- the two `out_fp32` shapes large enough for cuBLAS to
+# choose a different kernel -- differ on sm_120, and the other twenty-six do
+# not. That is not drift to be re-pinned away: it is the sentence at the top
+# of this file, that the transcript belongs to the GPU that made it, finally
+# being true of two cards instead of one.
+#
+# So: build for the card that is actually here, and write beside the others.
+CC="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')"
+if [[ -z "$CC" ]]; then
+    echo "cannot read the device's compute capability; is there a GPU?" >&2
+    exit 1
+fi
+if [[ "$CC" == "89" ]]; then
+    OUT="$HERE/golden.txt"
+else
+    OUT="$HERE/golden.sm$CC.txt"
+fi
+
 "$CUDA_HOME/bin/nvcc" -std=c++17 -O2 \
-    -gencode arch=compute_89,code=sm_89 \
+    -gencode "arch=compute_$CC,code=sm_$CC" \
     -o "$HERE/oracle.bin" "$HERE/oracle.cu" \
     -lcublas
 
-"$HERE/oracle.bin" > "$HERE/golden.txt"
+"$HERE/oracle.bin" > "$OUT"
 rm -f "$HERE/oracle.bin"
 
-echo "wrote $HERE/golden.txt ($(wc -l < "$HERE/golden.txt") rows)" >&2
+echo "wrote $OUT ($(wc -l < "$OUT") rows, sm_$CC)" >&2
+echo "  add it to gemm_service_parity.rs's golden_for_device() if it is new" >&2
 
 # The bias fold: the archive's own `gemv_bf16` against the archive's own
 # `gemv_bf16` + `add_bias_bf16`, out of the real archive. This is the one

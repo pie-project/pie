@@ -7,6 +7,7 @@
 //! and the whole model's test read the same ops.
 
 pub mod facts;
+pub mod metal;
 
 /// The MoE aligned path's block size and block ceiling, as the driver picks
 /// them (`kernels::moe::moe_aligned_block`, `kMoeAlignedBlockMin/Max`).
@@ -23,10 +24,10 @@ use self::facts::{
     Qwen35MoeMlpFacts,
 };
 use model_dsl::{
-    self as dsl, ConvW, GdnPrepW, Kv, MatW, NormW, Rs, Trace, Val, WeightRepr, attention, causal_conv1d,
-    cuda, gated_delta, gdn_prep, matmul, matmul_per_token, rmsnorm, rmsnorm_gated, rope_partial,
-    sigmoid_gate_add, sigmoid_gate_mul, split_gdn, split_q_gate, split_qkv, swiglu, topk,
-    weighted_sum,
+    self as dsl, ConvW, GdnPrepW, Kv, MatW, NormW, Rs, Trace, Val, WeightRepr, attention,
+    causal_conv1d, cuda, gated_delta, gdn_prep, matmul, matmul_per_token, rmsnorm, rmsnorm_gated,
+    rope_partial, sigmoid_gate_add, sigmoid_gate_mul, split_gdn, split_q_gate, split_qkv, swiglu,
+    topk, weighted_sum,
 };
 use model_ir::trace::{
     DType, Dim, FireClass, ForwardPlan, GuardPred, NormVariant, RopeKind, Shape,
@@ -239,7 +240,7 @@ fn moe_mlp_body_aligned_cuda(l: u32, facts: &Qwen35MoeMlpFacts, y: &Val, repr: W
 
     if facts.shared_expert_intermediate > 0 {
         let inter = facts.shared_expert_intermediate;
-        let act = dsl::cuda::swiglu(&matmul(&m, &w.shared_gate_up), inter, true);
+        let act = dsl::cuda::swiglu(&matmul(&m, &w.shared_gate_up), inter);
         let shared = matmul(&act, &w.shared_down);
         dsl::cuda::sigmoid_dot_scalar_gate_add(&m, &w.shared_gate, &shared, &routed, facts.hidden)
     } else {
@@ -381,7 +382,7 @@ fn moe_mlp_body_cuda(
     // activation, then the landing accumulates into the stream the
     // routed block already wrote.
     let inter = facts.shared_expert_intermediate;
-    let act = dsl::cuda::swiglu(&matmul(&m, &w.shared_gate_up), inter, true);
+    let act = dsl::cuda::swiglu(&matmul(&m, &w.shared_gate_up), inter);
     let shared = matmul(&act, &w.shared_down);
     dsl::cuda::sigmoid_dot_scalar_gate_add(&m, &w.shared_gate, &shared, &y, facts.hidden)
 }
@@ -487,6 +488,8 @@ impl GdnLayerW {
             in_proj_b: mat("in_proj_b", f.value_heads),
             conv: ConvW {
                 name: w("conv"),
+                // `Qwen3NextGatedDeltaNet` builds its conv with `bias=False`.
+                bias: None,
                 kernel: f.conv_kernel,
                 layer: l,
             },
@@ -1000,19 +1003,19 @@ fn full_attn_body_cuda(
                 Some(out_shape),
                 |c| {
                     c.arm(dsl::Region::Fire(GuardPred::TokensLE(1)), || {
-                        cuda::attention_flashinfer_prefill(&q, &w.kv, window_left);
+                        cuda::attention_flashinfer_prefill(&q, &w.kv, window_left, facts.head_dim);
                     });
                 },
                 || {
-                    cuda::attention_flashinfer_decode(&q, &w.kv, window_left);
+                    cuda::attention_flashinfer_decode(&q, &w.kv, window_left, facts.head_dim);
                 },
             )
         }
-        FireClass::Decode => cuda::attention_flashinfer_decode(&q, &w.kv, window_left),
+        FireClass::Decode => cuda::attention_flashinfer_decode(&q, &w.kv, window_left, facts.head_dim),
         FireClass::Prefill => {
             // No dequant statement beside it: qwen3_5's full-attention
             // path gates on a native-bf16 cache.
-            cuda::attention_flashinfer_prefill(&q, &w.kv, window_left)
+            cuda::attention_flashinfer_prefill(&q, &w.kv, window_left, facts.head_dim)
         }
     };
     let attn = attn.expect("a plain attention statement produces its value");
@@ -1111,7 +1114,7 @@ fn dense_mlp_body_cuda(
     // verbatim -- one packed matmul into the chunked kernel, or two
     // matmuls into the pair form.
     let act = if packed {
-        dsl::cuda::swiglu(&matmul(&m, &gate_up), intermediate, true)
+        dsl::cuda::swiglu(&matmul(&m, &gate_up), intermediate)
     } else {
         dsl::cuda::swiglu_pair(
             &matmul(&m, &half("gate_proj")),
@@ -1628,7 +1631,8 @@ mod tests {
             .unwrap();
         assert!(matches!(
             &conv.kind,
-            OpKind::CausalConv1d { weight, layer: 0, kernel: 4 } if weight == "layer.0.conv"
+            OpKind::CausalConv1d { weight, bias: None, layer: 0, kernel: 4 }
+                if weight == "layer.0.conv"
         ));
         assert_eq!(
             shape_of(conv.outputs[0]),

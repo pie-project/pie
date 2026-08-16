@@ -1,46 +1,18 @@
 //! The swap pool's copy planning: which bytes move where when KV pages are
-//! evicted, restored, or grafted.
+//! evicted, restored, or grafted. [`SwapPlan`] separates offset arithmetic
+//! from execution so it can be inspected without a GPU.
 //!
-//! Port of the four `copy_*_async` routines in
-//! `driver-cuda/csrc/src/store/swap_pool.cpp`.
-//!
-//! # Why this is a plan and not a memcpy
-//!
-//! In the C++ the loop that computes offsets and the call that moves bytes are
-//! the same loop, so the arithmetic cannot be inspected without a GPU and a
-//! populated cache. It is also the arithmetic most likely to be wrong: four
-//! routines, three nested loops each, two independent page-index spaces (host
-//! slots and device pages) that are `u32` in both cases and therefore freely
-//! swappable by mistake.
-//!
-//! Separating [`SwapPlan`] from its execution makes the offsets a value. It
-//! also matches what the C++ is already reaching for -- `submit_batch` exists
-//! because issuing one `cudaMemcpyAsync` per `(layer, buffer, page)` cost more
-//! in submission overhead than the transfer itself (~56 calls of ~32 KB per
-//! page; 2.7 ms/page measured against ~0.07 ms/page of actual PCIe time). A
-//! plan is exactly the batch argument that API wants.
-//!
-//! # The two index spaces
-//!
-//! `PageIndex` values are never interchangeable across pools even though they
-//! are the same integer type:
-//!
-//! * a **device page** indexes the `KvCache`'s pages,
-//! * a **host slot** indexes the pinned pool's slots.
-//!
-//! The pools generally have different capacities, so transposing them is not
-//! reliably caught by a bounds check. [`Direction`] names which side is which
-//! for each routine so the call sites cannot be read ambiguously.
+//! Two index spaces share the `u32` `PageIndex` and never interchange: a device
+//! page indexes the `KvCache`, a host slot the pinned pool. Different
+//! capacities, so a transposition need not fail a bounds check.
 
 /// Which way a swap moves, and therefore which index space each side is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     /// Eviction: device pages out to pinned host slots.
     DeviceToHost,
-    /// Restore: pinned host slots back into device pages. On the critical
-    /// path -- an evicted process cannot run until its pages are back -- which
-    /// is why the C++ issues these on a second stream rather than queueing
-    /// them behind pending evictions.
+    /// Restore: pinned host slots back into device pages. On the critical path,
+    /// so issued on a separate stream from evictions.
     HostToDevice,
     /// Graft: device pages to other device pages, e.g. copy-on-write forks.
     DeviceToDevice,
@@ -84,9 +56,8 @@ pub struct CopyOp {
 
 /// The per-layer buffer widths a plan is built against.
 ///
-/// `page_bytes[layer][buffer]` -- ragged on purpose, because MLA layers carry
-/// two buffers of *different* widths and a rectangular table would quietly
-/// invite the assumption that they match.
+/// `page_bytes[layer][buffer]`, ragged because MLA layers carry two buffers of
+/// different widths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolGeometry {
     page_bytes: Vec<Vec<u64>>,
@@ -103,7 +74,6 @@ pub struct PageCountMismatch {
 
 impl std::fmt::Display for PageCountMismatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Same text the C++ throws, so a log grep spans the migration.
         write!(
             f,
             "swap_pool: src/dst page count mismatch ({} vs {})",
@@ -145,8 +115,7 @@ impl PoolGeometry {
             .map_or(&[], Vec::as_slice)
     }
 
-    /// Bytes moved for one page across every layer and buffer -- what the C++
-    /// accumulates into `page_bytes_`.
+    /// Bytes moved for one page across every layer and buffer.
     #[must_use]
     pub fn bytes_per_page(&self) -> u64 {
         self.page_bytes.iter().flatten().sum()
@@ -162,17 +131,13 @@ pub struct SwapPlan {
 impl SwapPlan {
     /// Build the plan for one swap.
     ///
-    /// The iteration order is layer-major, then page pair, then buffer --
-    /// exactly the C++'s loop nesting. Order is preserved rather than
-    /// normalised because a batch submission's semantics depend on it: within
-    /// one submission the copies are unordered with respect to each other, so
-    /// a plan that moved a page onto itself in a different order would not be
-    /// equivalent.
+    /// Iteration is layer-major, then page pair, then buffer. Order is
+    /// preserved because batch-submission copies are unordered with respect to
+    /// each other, so a differently-ordered plan is not equivalent.
     ///
     /// # Errors
     ///
-    /// [`PageCountMismatch`] when the two page lists differ in length, which
-    /// is the C++'s `check_pairs` throw.
+    /// [`PageCountMismatch`] when the two page lists differ in length.
     pub fn build(
         geometry: &PoolGeometry,
         direction: Direction,
@@ -247,12 +212,10 @@ impl SwapPlan {
         self.ops.iter().map(|o| o.bytes).sum()
     }
 
-    /// Which stream the C++ issues this plan on.
+    /// Which stream this plan is issued on.
     ///
-    /// Restores get their own stream because they are latency-critical while
-    /// evictions are background work; sharing one stream made every restore
-    /// queue behind every pending eviction, and PCIe is full duplex, so the
-    /// two directions can proceed at once.
+    /// Restores are latency-critical and get their own stream; PCIe is full
+    /// duplex, so restores and evictions proceed at once.
     #[must_use]
     pub const fn stream_for(direction: Direction) -> SwapStream {
         match direction {
@@ -281,8 +244,7 @@ mod tests {
 
     #[test]
     fn a_plan_covers_every_layer_and_buffer_for_every_page_pair() {
-        // The C++ applies swaps across ALL layers: the runtime treats KV
-        // pages as opaque per-page resources, not per-layer.
+        // Swaps cover all layers: KV pages are opaque per-page resources.
         let p = SwapPlan::build(&geo(), Direction::DeviceToHost, &[1, 2], &[5, 6]).unwrap();
         assert_eq!(p.len(), 3 * 2 * 2);
         assert_eq!(p.total_bytes(), 3 * 2 * 2 * 1024);
@@ -345,8 +307,6 @@ mod tests {
 
     #[test]
     fn same_pool_copies_use_one_pool_for_both_endpoints() {
-        // D2D and H2H address a single buffer twice; a port that resolved the
-        // two sides independently could send them to different layers.
         for d in [Direction::DeviceToDevice, Direction::HostToHost] {
             for op in SwapPlan::build(&geo(), d, &[0, 1], &[2, 3]).unwrap().ops() {
                 assert_eq!(op.src, op.dst, "{d:?}");
@@ -356,8 +316,8 @@ mod tests {
 
     #[test]
     fn a_ragged_geometry_gives_each_buffer_its_own_stride() {
-        // MLA's ckv and kpe pages differ in width, so page N of buffer 0 and
-        // page N of buffer 1 are at different offsets.
+        // MLA's ckv and kpe pages differ in width, so page N of each buffer is
+        // at a different offset.
         let g = PoolGeometry::new(vec![vec![512, 4096]]);
         let p = SwapPlan::build(&g, Direction::DeviceToHost, &[3], &[3]).unwrap();
         assert_eq!(p.ops()[0].src_offset, 3 * 512);
@@ -400,8 +360,7 @@ mod tests {
 
     #[test]
     fn no_two_copies_in_a_plan_write_the_same_bytes() {
-        // Distinct destination pages must not overlap, or the batch's
-        // unordered semantics would make the result depend on scheduling.
+        // Overlapping writes would make the unordered batch scheduling-dependent.
         let p = SwapPlan::build(&geo(), Direction::DeviceToHost, &[0, 1, 2], &[4, 5, 6]).unwrap();
         let mut writes: Vec<(Pool, u64)> = p.ops().iter().map(|o| (o.dst, o.dst_offset)).collect();
         let total = writes.len();

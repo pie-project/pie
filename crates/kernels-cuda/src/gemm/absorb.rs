@@ -7,40 +7,23 @@
 //! its `W_k` half and the second its `W_v` half, at a byte offset this file
 //! computes rather than at a pointer the caller passes.
 //!
-//! # Why these live in `gemm` and not in `attn`
+//! They carry `gemm`'s namespace rather than `attn`'s because
+//! [`crate::jit::Family::symbol`] joins a family's namespace to a routine's
+//! own name, and the device work IS a GEMM — only its caller is attention's.
 //!
-//! **They carry `gemm`'s namespace, and a routine's symbol is its family's
-//! namespace plus its own name.** [`crate::jit::Family::symbol`] is the whole
-//! of that join, so a host program in `attn` can only ever answer
-//! `attn::…`; these two are stated by a trace as
-//! `gemm::mla_absorb_q_to_latent_bf16` and `gemm::mla_absorb_latent_to_v_bf16`,
-//! and while they sat beside MLA's attention kernels **no `Family` resolved
-//! them at all** and both had to be carried by hand in
-//! `not_yet_crossed::NOT_YET_CROSSED`.
-//!
-//! Moving the host program is the fix rather than giving `Family` a second
-//! namespace. A second namespace would let one family claim symbols in
-//! another's, which is exactly the ambiguity
-//! `lib.rs`'s `no_symbol_is_declared_twice` exists to refuse — it can only
-//! check that two families do not collide, not adjudicate which of two
-//! claimants to a namespace is right. And the device work here IS a GEMM: it
-//! is `cublasGemmStridedBatchedEx` with a bf16 A, a bf16 B and a strided head
-//! batch, which is the same call [`crate::gemm::dense`] makes for every
-//! other dense matmul in this crate. Only its CALLER is attention's.
-//!
-//! # The handle is the context's, not an argument
-//!
-//! The C++ took a `cublasHandle_t` as its first parameter and so did the first
-//! Rust port. A routine cannot: a `cublasHandle_t` is not an
-//! [`crate::jit::ArgValue`] and a trace statement could not name one if it
-//! were. It comes off [`Ctx::cublas`] instead, which is where every other
-//! cuBLAS routine in this family gets it, and which refuses in a sentence for
-//! a context that was built without one.
+//! The `cublasHandle_t` is not a parameter: it is not an
+//! [`crate::jit::ArgValue`], so no trace statement could name one. It comes
+//! off [`Ctx::cublas`], which refuses for a context built without one.
 
 use core::ffi::c_void;
 
 use crate::jit::Ctx;
+use kernels::keys;
+use kernels::routine::{Bank, Env, In, Out};
 use kernels::Refusal;
+// Both launchers spell the attribute in full as `#[kernels_macros::routine]`:
+// there is deliberately no `use crate::routine` here, so `layout.rs:13-20`'s
+// collision cannot arise.
 
 #[cfg(feature = "_cuda")]
 use cudarc::cublas::sys::{
@@ -140,18 +123,58 @@ unsafe fn absorb(
 /// bank, and `q_latent` `tokens * heads * kv_lora_rank` writable elements —
 /// all live across the launch, which is asynchronous on the handle's stream.
 #[allow(clippy::too_many_arguments)]
+#[kernels_macros::routine]
 pub fn mla_absorb_q_to_latent_bf16(
     ctx: &Ctx,
-    q_nope: *const c_void,
-    kv_b_proj: *const c_void,
-    q_latent: *mut c_void,
-    tokens: i32,
+    // `bind/mod.rs`'s `mla_absorb` passes `b.args[0]`, which is input zero of
+    // the trace's operand run (inputs, outputs, weights, in that order).
+    q_nope: In<0, c_void>,
+    // THE POSITIONAL BANK, NOT THE NAMED ONE. This is bound from
+    // `b.args[spec.n_in + spec.n_out]` — a position in the statement's own
+    // operand list. `Weight<0, _>` would reach `f.weight_named(0)`, a
+    // different table holding a different pointer.
+    kv_b_proj: Bank<0, c_void>,
+    // `b.args[spec.n_in]` — output zero of the same run, read positionally.
+    q_latent: Out<0, c_void>,
+    // `mla_absorb` passes `rows`, which is this: `f.rows.count`, the rows this
+    // launch serves — NOT `f.rows.total`, the whole fire's count. `keys::Rows`
+    // is the fallback spelling for a signature with no region to read the row
+    // count off, and this one has none: the head pitch is not any operand's
+    // extent, so a region here would carry a true row count and a fictional
+    // width.
+    tokens: Env<keys::Rows>,
+    // THE FOUR THAT KEEP THIS ROW OFF THE TABLE PATH, and the reason moved
+    // in Stage 3. `mla_absorb` reads them as `spec.params[0..4]`, which
+    // `operand` now ANSWERS (`bind/table.rs:1054-1070`) -- so `Param<0, i32>`
+    // through `Param<3, i32>` would be true of every one of them, and the
+    // family header records why they still say `i32`: `bind/mod.rs:1404-1414`
+    // spells this signature out as a `call:` fn-pointer type with four bare
+    // `i32`s, and that type is the driver's. They stay unsourced until the
+    // two edits can land together.
+    //
+    // What has NOT changed is why they ride the param channel at all: each
+    // absorb takes the WHOLE `kv_b_proj` bank and slices it itself, so the
+    // head pitch is not any operand's extent and no `InWidth`/`OutWidth`
+    // could reach them.
     heads: i32,
     qk_nope_dim: i32,
     v_head_dim: i32,
     kv_lora_rank: i32,
 ) -> Result<(), Refusal> {
     let handle = ctx.cublas()?;
+    // The archive's `if (tokens <= 0 || heads <= 0) return;`, which was a
+    // bare return under `()`. This function's own `# Errors` has always said
+    // `Refusal::Empty` for it and `bind::mod`'s `mla_absorb` has always
+    // matched `Err(Refusal::Empty { .. }) => Ok(())` for it, calling it "the
+    // archive's `tokens <= 0 || heads <= 0`" -- so the doc, the caller and
+    // `gemm_service_parity`'s degenerate rows all named a refusal that the
+    // body never made. It fell through to cuBLAS with a zero extent instead.
+    if **tokens <= 0 {
+        return Err(Refusal::Empty { what: "tokens" });
+    }
+    if heads <= 0 {
+        return Err(Refusal::Empty { what: "heads" });
+    }
     // SAFETY: `call()`'s contract -- the three matrices address live device
     // memory of the extents above, and `handle`'s stream is this fire's.
     #[cfg(feature = "_cuda")]
@@ -159,11 +182,11 @@ pub fn mla_absorb_q_to_latent_bf16(
         absorb(
             handle,
             cublasOperation_t::CUBLAS_OP_N,
-            kv_b_proj,
-            q_nope,
-            q_latent,
+            kv_b_proj.ptr,
+            q_nope.ptr,
+            q_latent.ptr,
             kv_lora_rank,
-            tokens,
+            **tokens,
             qk_nope_dim,
             kv_lora_rank,
             i64::from(qk_nope_dim + v_head_dim) * i64::from(kv_lora_rank),
@@ -177,7 +200,7 @@ pub fn mla_absorb_q_to_latent_bf16(
     }
     #[cfg(not(feature = "_cuda"))]
     let _ =
-        (handle, q_nope, kv_b_proj, q_latent, tokens, heads, qk_nope_dim, v_head_dim, kv_lora_rank);
+        (handle, q_nope.ptr, kv_b_proj.ptr, q_latent.ptr, *tokens, heads, qk_nope_dim, v_head_dim, kv_lora_rank);
     Ok(())
 }
 
@@ -192,23 +215,49 @@ pub fn mla_absorb_q_to_latent_bf16(
 /// As [`mla_absorb_q_to_latent_bf16`]'s, with `attn_latent` in place of
 /// `q_nope` and `attn_v` (`tokens * heads * v_head_dim`) as the output.
 #[allow(clippy::too_many_arguments)]
+#[kernels_macros::routine]
 pub fn mla_absorb_latent_to_v_bf16(
     ctx: &Ctx,
-    attn_latent: *const c_void,
-    kv_b_proj: *const c_void,
-    attn_v: *mut c_void,
-    tokens: i32,
+    // As [`mla_absorb_q_to_latent_bf16`]'s `q_nope`: `bind/mod.rs` runs both
+    // symbols through one `mla_absorb` helper, so one binding decides both.
+    attn_latent: In<0, c_void>,
+    // The same positional bank, decided by the same binding.
+    kv_b_proj: Bank<0, c_void>,
+    attn_v: Out<0, c_void>,
+    // The twin of [`mla_absorb_q_to_latent_bf16`]'s `tokens`; the reasoning is
+    // written once, there.
+    tokens: Env<keys::Rows>,
+    // `spec.params[0..4]`, as above -- answerable as `Param<0..3, i32>` and
+    // unsourced until `bind/mod.rs:1404-1414`'s fn-pointer type can move with
+    // them. This row is the PROOF of the reason they ride the param channel:
+    // `qk_nope_dim` and `kv_lora_rank` are used below to OFFSET INSIDE the
+    // bank rather than to describe an operand, and an extent that names a
+    // slice of a weight is not a fact about any region the statement placed.
     heads: i32,
     qk_nope_dim: i32,
     v_head_dim: i32,
     kv_lora_rank: i32,
 ) -> Result<(), Refusal> {
     let handle = ctx.cublas()?;
+    // The archive's `if (tokens <= 0 || heads <= 0) return;`, which was a
+    // bare return under `()`. This function's own `# Errors` has always said
+    // `Refusal::Empty` for it and `bind::mod`'s `mla_absorb` has always
+    // matched `Err(Refusal::Empty { .. }) => Ok(())` for it, calling it "the
+    // archive's `tokens <= 0 || heads <= 0`" -- so the doc, the caller and
+    // `gemm_service_parity`'s degenerate rows all named a refusal that the
+    // body never made. It fell through to cuBLAS with a zero extent instead.
+    if **tokens <= 0 {
+        return Err(Refusal::Empty { what: "tokens" });
+    }
+    if heads <= 0 {
+        return Err(Refusal::Empty { what: "heads" });
+    }
     // SAFETY: the offset lands inside the same bank the caller guaranteed —
     // `W_v` begins after `W_k`'s `qk_nope_dim * kv_lora_rank` bf16 elements,
     // which is twice that many BYTES.
     let wv = unsafe {
         kv_b_proj
+            .ptr
             .cast::<u8>()
             .add(2 * (qk_nope_dim as usize) * (kv_lora_rank as usize))
             .cast::<c_void>()
@@ -221,10 +270,10 @@ pub fn mla_absorb_latent_to_v_bf16(
             handle,
             cublasOperation_t::CUBLAS_OP_T,
             wv,
-            attn_latent,
-            attn_v,
+            attn_latent.ptr,
+            attn_v.ptr,
             v_head_dim,
-            tokens,
+            **tokens,
             kv_lora_rank,
             kv_lora_rank,
             i64::from(qk_nope_dim + v_head_dim) * i64::from(kv_lora_rank),
@@ -238,6 +287,6 @@ pub fn mla_absorb_latent_to_v_bf16(
     }
     #[cfg(not(feature = "_cuda"))]
     let _ =
-        (handle, wv, attn_latent, attn_v, tokens, heads, qk_nope_dim, v_head_dim, kv_lora_rank);
+        (handle, wv, attn_latent.ptr, attn_v.ptr, *tokens, heads, qk_nope_dim, v_head_dim, kv_lora_rank);
     Ok(())
 }

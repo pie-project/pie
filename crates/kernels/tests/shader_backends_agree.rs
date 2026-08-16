@@ -39,9 +39,49 @@
 //! learn to edit.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
 
 use kernels::KernelSig;
+
+/// How many kernels the three backends declare between them.
+///
+/// It was written as `100` in two assertions and as "the hundred" in five
+/// sentences around them, which meant ADDING a kernel turned a gate that
+/// checks agreement into a gate that checks a number somebody last edited.
+/// `qmv_fast_rmsnorm` is the kernel that made the point, and it made it
+/// twice. It arrived correct on two planes and failed here three times
+/// over, none of them about the kernel; then a measurement refuted the
+/// fusion and it left again, and the departure was one edit here instead of
+/// seven. A gate that costs seven edits to tell the truth gets told to be
+/// quiet instead.
+///
+/// Raise it when a kernel is added to all the planes that want it. Lowering
+/// it is what `retired_rows` is for -- and for a kernel that never shipped,
+/// which is not a retirement, lower it and leave nothing behind.
+const CENSUS: usize = 100;
+
+/// How many of [`CENSUS`] are crossed by more than one backend, and so are
+/// actually compared below.
+///
+/// The difference from `CENSUS` is the kernels only one plane has. This
+/// number moving DOWN while `CENSUS` holds still is the failure worth
+/// naming: it means two spellings drifted apart, so the pair silently
+/// stopped being a pair and the comparison it used to make disappeared
+/// without any test going red. Moving down WITH `CENSUS` is just a kernel
+/// leaving.
+const COMPARED: usize = 199;
+
+/// A kernel a backend does not have AT ALL, and the sentence saying why.
+///
+/// Different from `retired_rows`, which is a name a backend gave up when it
+/// crossed: this is a name it never had. [`CENSUS`] counts the union of the
+/// three, so a kernel written for two planes leaves the third one short by
+/// exactly the names listed here.
+///
+/// It is a list rather than a subtraction so that the third plane's absence
+/// stays a QUESTION. A count that quietly allowed any shortfall would let a
+/// port lose a kernel and a port never write one look identical, which is
+/// the whole reason this file exists.
+const UNCROSSED: &[(&str, &str, &str)] = &[];
 
 /// One backend's table, under the name this file reports it by.
 struct Table {
@@ -84,76 +124,47 @@ fn tables() -> Vec<Table> {
 /// whoever settles them. Until then they are written down rather than
 /// tolerated silently.
 const DRIFTED: &[(&str, &str)] = &[
-    (
-        "sdpa_paged_decode",
-        "SETTLED, and metal is the wrong one. The mask stride is a FIRE fact: \
-         a custom mask is a rectangle the DRIVER stages, one byte per (row, \
-         key), so its pitch is whatever the driver made the widest row -- \
-         which is why `Source::AttentionMaskStride` exists at all. metal reads \
-         `Source::Param(3)` instead, the TEXT's scalar, and `llama_like` \
-         states a literal 0 there with the comment that this text carries no \
-         custom mask. `driver-metal` does stage masks (it resolves \
-         `AttentionMask` and `AttentionMaskEnabled`) and mentions \
-         `AttentionMaskStride` in ZERO places, so a deployment with a custom \
-         mask reads every row's mask at pitch 0. Six rows share it; that \
-         crate's fix. Stays here until then.",
-    ),
-    (
-        "sdpa_paged_decode_sink",
-        "As `sdpa_paged_decode`: the mask stride is a fire fact and metal \
-         reads a text scalar that is zero.",
-    ),
-    (
-        "sdpa_paged_mma",
-        "As `sdpa_paged_decode`: the mask stride is a fire fact and metal \
-         reads a text scalar that is zero.",
-    ),
-    (
-        "sdpa_paged_mma_sink",
-        "As `sdpa_paged_decode`: the mask stride is a fire fact and metal \
-         reads a text scalar that is zero.",
-    ),
-    (
-        "sdpa_paged_tiled",
-        "As `sdpa_paged_decode`: the mask stride is a fire fact and metal \
-         reads a text scalar that is zero.",
-    ),
-    (
-        "sdpa_paged_tiled_sink",
-        "As `sdpa_paged_decode`: the mask stride is a fire fact and metal \
-         reads a text scalar that is zero.",
-    ),
+    // EMPTY, and the six that stood here left the way their own message
+    // instructed. All of them said the same thing: the mask's pitch is a FIRE
+    // fact, and metal read `Slot(Param, 3)` -- the text's scalar, a literal
+    // zero -- while wgpu and vulkan read the fire.
+    //
+    // The fix was not to pick a winner. All three rows now `Ask` the fire the
+    // same question and each driver answers its own: wgpu and vulkan return
+    // the pitch of the rectangle they staged, and metal returns ZERO because
+    // the mask it stages is one enable word per token and no mask beside it.
+    // Metal's number did not change -- it arrived by the literal before and
+    // by its binder now -- but the SENTENCE is true, and the day metal learns
+    // to stage a user mask is one line in `driver-metal`'s `named()` rather
+    // than six signature rows in `kernels-metal`.
+    //
+    // `route_gather` left earlier the same way. An empty table here is the
+    // state this file is for, not an absence of vigilance: the gate above
+    // fails the moment two planes disagree again.
 ];
 
-/// Everything about a row that is a fact about the KERNEL rather than a fact
-/// about a device, rendered so two backends' answers can be compared.
+/// Every column of a row that two tables could disagree about.
+///
+/// Was `launch`, the four `*_param` indices, `axes`, `whole`, `in_place`,
+/// `depth_prefix_plan` and the whole operand list. `refactor-bigplan.md` §7
+/// Stage 5 deleted the positional half of `KernelSig` -- `launch`, `file`,
+/// `lacks`, `sink` and the four indices -- once no backend read them, so what
+/// is left to compare is the half a ROUTINE also states.
+///
+/// `operands` stood here too, and its comment said it survived "only because
+/// `driver-cuda::bind` still walks it for `Source::Aux`, and this compares it
+/// while it does". That walk turned out to have ended already:
+/// `kernels_cuda::sigs()` fills `operands` from a base whose value is `&[]`,
+/// so the filter crossed two hundred and five rows and matched none. Both the
+/// walk and the column are deleted, and the list below is what a row still
+/// says that a routine also says.
 fn kernel_facts(sig: &KernelSig) -> String {
-    let operands: Vec<String> = sig
-        .operands
-        .iter()
-        .map(|o| {
-            format!(
-                "{}:{:?}{}<-{:?}",
-                o.name,
-                o.ty,
-                if o.nullable { "?" } else { "" },
-                o.source
-            )
-        })
-        .collect();
     format!(
-        "launch={:?} axes={:?} grid={:?} head={:?} heads={:?} rows={:?} \
-         whole={} in_place={:?} depth_prefix_plan={} operands=[{}]",
-        sig.launch,
+        "axes={:?} whole={} in_place={:?} depth_prefix_plan={}",
         sig.axes.iter().map(|a| a.points).collect::<Vec<_>>(),
-        sig.grid_param,
-        sig.head_param,
-        sig.heads_param,
-        sig.rows_param,
         sig.whole,
         sig.in_place,
         sig.depth_prefix_plan,
-        operands.join(", ")
     )
 }
 
@@ -201,14 +212,14 @@ fn the_three_shader_backends_name_the_same_kernels() {
         .collect();
     assert_eq!(
         union.len(),
-        100,
-        "the union of the three tables is {} kernels, not the hundred all \
+        CENSUS,
+        "the union of the three tables is {} kernels, not the {CENSUS} all \
          three declare",
         union.len()
     );
 
     for (what, set) in &sets {
-        if set.len() == 100 {
+        if set.len() == CENSUS {
             continue;
         }
         // A shrinking table is a port in progress; say so rather than fail,
@@ -438,17 +449,24 @@ fn the_kernels_stated_twice_are_the_ones_written_down() {
             .iter()
             .find(|t| t.what == *what)
             .map_or(BTreeSet::new(), |t| t.retired.iter().copied().collect());
+        let uncrossed: BTreeSet<&str> = UNCROSSED
+            .iter()
+            .filter(|(b, ..)| b == what)
+            .map(|(_, name, _)| *name)
+            .collect();
         let union: BTreeSet<&str> = names
             .union(rows)
             .copied()
             .chain(retired.iter().copied())
+            .chain(uncrossed.iter().copied())
             .collect();
         assert_eq!(
             union.len(),
-            100,
+            CENSUS,
             "{what}'s rows, routines and retirements together are {} kernels, \
-             not the hundred. A port that loses a name loses it silently: the \
-             row is gone, no routine answers for it, and nothing recorded it.",
+             not the {CENSUS}. A port that loses a name loses it silently: \
+             the row is gone, no routine answers for it, and nothing recorded \
+             it.",
             union.len()
         );
 
@@ -513,102 +531,20 @@ fn the_kernels_stated_twice_are_the_ones_written_down() {
 // `two_backends_that_crossed_the_same_kernel_agree_on_its_signature`, which is
 // the same claim between two ROUTINE planes with the tables taken out of the
 // middle -- and which grew as these shrank, which is the trade §3 was for.
+// `the_two_settled_drifts_are_still_true_of_the_drivers_they_name` STOOD HERE
+// and is gone because both drifts it watched are settled.
+//
+// It asked a question about two OTHER crates by reading their sources: does
+// `driver-vulkan` resolve the padded extent, does `driver-metal` resolve
+// `AttentionMaskStride`. Both now do, and the second one is why: it failed
+// with "check whether its six rows now read `AttentionMaskStride`, and if
+// they do, delete the six entries." They did, so they were.
+//
+// A gate that reads another crate's TEXT is a second spelling of what that
+// crate does, and the shared binder made the first spelling askable: three
+// planes now state the same source and each driver answers it. There is
+// nothing left here to read from the outside.
 
-/// The two settled drifts say something about a DRIVER, and this is what
-/// keeps those sentences true.
-///
-/// `DRIFTED` does not merely record that two tables differ — for
-/// `route_gather` and the six sdpa rows it says *which backend is wrong and
-/// why*, and the why is a claim about a crate this test does not own:
-///
-/// * `driver-vulkan` reads `rows_param` **nowhere**, so it could not honour
-///   the column even if its row carried it;
-/// * `driver-metal` resolves `Source::AttentionMask` but mentions
-///   `AttentionMaskStride` **nowhere**, so it stages a mask and reads its
-///   pitch from a text scalar.
-///
-/// A judgement about another crate, written into a comment, is the shape this
-/// workspace has had to correct repeatedly — so it is asked as a question
-/// instead of asserted as an answer. When either driver learns to resolve its
-/// column this fails, which is the moment the `DRIFTED` entry stops being
-/// true and someone should be looking at it.
-///
-/// It reads sources rather than calling anything, because neither driver
-/// builds on every host that runs this test.
-#[test]
-fn the_two_settled_drifts_are_still_true_of_the_drivers_they_name() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crates/")
-        .to_path_buf();
-
-    /// How many times `needle` appears in a crate's `src`.
-    fn mentions(dir: &std::path::Path, needle: &str) -> usize {
-        fn walk(dir: &std::path::Path, needle: &str, n: &mut usize) {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return;
-            };
-            for e in entries.flatten() {
-                let path = e.path();
-                if path.is_dir() {
-                    walk(&path, needle, n);
-                } else if path.extension().is_some_and(|x| x == "rs") {
-                    *n += std::fs::read_to_string(&path)
-                        .unwrap_or_default()
-                        .matches(needle)
-                        .count();
-                }
-            }
-        }
-        let mut n = 0;
-        walk(dir, needle, &mut n);
-        n
-    }
-
-    let vulkan = root.join("driver-vulkan/src");
-    let metal = root.join("driver-metal/src");
-    assert!(
-        vulkan.is_dir() && metal.is_dir(),
-        "the two sibling drivers are not where this test looks: {} and {}",
-        vulkan.display(),
-        metal.display()
-    );
-
-    // `driver-vulkan`'s half of `DRIFTED["route_gather"]` STOOD HERE and is
-    // gone because the defect is fixed. `arm::route_gather` reads
-    // `stated(o, 4, f.rows)` now — the padded extent off the statement, with
-    // the fire's count as the fallback — which is exactly what this asserted
-    // it did not do. The entry above went with it, as its own message
-    // instructed.
-    //
-    // `driver-metal`'s half remains below, and its defect remains too.
-
-    assert_eq!(
-        mentions(&metal, "AttentionMaskStride"),
-        0,
-        "`driver-metal` has learned to resolve `AttentionMaskStride`. That is \
-         the defect `DRIFTED[\"sdpa_paged_decode\"]` names being half-fixed — \
-         check whether its six rows now read `Source::AttentionMaskStride`, \
-         and if they do, delete the six entries."
-    );
-
-    // And the other half of that claim: metal DOES stage masks, so reading
-    // their pitch as a text constant is a defect rather than an absence.
-    //
-    // Two spellings, because `4d2753b4d` deleted metal's table interpreter and
-    // with it the `Source::` enum this used to look for: the same fact is now
-    // spelled `FireTable::AttentionMask`, staged by an ARM. The needle
-    // followed the rename rather than the claim being dropped — metal still
-    // stages masks, which is what makes reading their pitch as a text
-    // constant a defect rather than an absence.
-    assert!(
-        mentions(&metal, "Source::AttentionMask") + mentions(&metal, "FireTable::AttentionMask")
-            > 0,
-        "`driver-metal` no longer resolves a mask under either spelling. If it \
-         has stopped supporting custom masks, the mask-stride entries are not \
-         a defect any more and the sentence in DRIFTED is wrong."
-    );
-}
 
 /// A retired row's ENTRYPOINTS are still in the backend's census.
 ///
@@ -626,25 +562,94 @@ fn the_two_settled_drifts_are_still_true_of_the_drivers_they_name() {
 /// entrypoints fails here, whichever backend goes first.
 #[test]
 fn retiring_a_row_does_not_shrink_a_backends_census() {
+    // Entrypoints ONE backend has and the others do not, named individually.
+    //
+    // The assertion below is an equality between three censuses, and its
+    // message is written for the case that made it: a backend that deleted
+    // rows without stating what they named. That is a SHRINK. A backend that
+    // gains a family the others have not got is the opposite, and reading it
+    // as the same failure would leave only two ways out -- teach the other
+    // backends a kernel they do not implement, or stop comparing -- and the
+    // second is how a census quietly stops covering anything.
+    //
+    // So an addition is allowed, and the price of allowing it is naming every
+    // entrypoint of it here. The list is subtracted from each census before
+    // the comparison, so the SHARED census is still held to being identical
+    // and to its exact size, and a deletion anywhere in it still fails.
+    //
+    // These nine are the flash decode: `decode_split` computes an
+    // unnormalised partial over a slice of the key range and `decode_combine`
+    // folds the slices, which is how a decode gets more than
+    // `q_heads * rows` workgroups onto a card with 128 SMs. Vulkan-only
+    // because it is a two-pass decomposition of a kernel the other backends
+    // still fire in one pass, not a shader any of them is short of. Only
+    // `d_64` has a sink form, because the sink texts are the ones with that
+    // head width.
+    const EXCLUSIVE: &[(&str, &str)] = &[
+        ("vulkan", "sdpa_paged_decode_combine_bfloat16_d_64"),
+        ("vulkan", "sdpa_paged_decode_combine_bfloat16_d_128"),
+        ("vulkan", "sdpa_paged_decode_combine_bfloat16_d_256"),
+        ("vulkan", "sdpa_paged_decode_combine_bfloat16_d_512"),
+        ("vulkan", "sdpa_paged_decode_combine_sink_bfloat16_d_64"),
+        ("vulkan", "sdpa_paged_decode_split_bfloat16_d_64"),
+        ("vulkan", "sdpa_paged_decode_split_bfloat16_d_128"),
+        ("vulkan", "sdpa_paged_decode_split_bfloat16_d_256"),
+        ("vulkan", "sdpa_paged_decode_split_bfloat16_d_512"),
+        // THE FUSED NORM+MATVEC, which metal and vulkan both have and
+        // wgpu has not crossed. Two backends gaining a family reads
+        // oddly in a list called EXCLUSIVE, but the question the list
+        // answers is the right one either way: what to leave out of a
+        // comparison of what the backends SHARE.
+    ];
+
+    let shared = |what: &str, census: &[String]| -> Vec<String> {
+        census
+            .iter()
+            .filter(|e| {
+                !EXCLUSIVE
+                    .iter()
+                    .any(|(b, n)| b == &what && n == &e.as_str())
+            })
+            .cloned()
+            .collect()
+    };
+
     let censuses = [
         ("wgpu", kernels_wgpu::entrypoints()),
         ("vulkan", kernels_vulkan::entrypoints()),
         ("metal", kernels_metal::entrypoints()),
     ];
-    let (first, reference) = (&censuses[0].0, &censuses[0].1);
+    // Every name in the list must actually be there. Otherwise an allowance
+    // outlives the thing it allowed and starts hiding a deletion, which is
+    // the failure this test exists for.
+    for (backend, name) in EXCLUSIVE {
+        let census = &censuses
+            .iter()
+            .find(|(w, _)| w == backend)
+            .expect("EXCLUSIVE names a backend this test does not compare")
+            .1;
+        assert!(
+            census.iter().any(|e| e == name),
+            "`kernels-{backend}` does not have `{name}`, which is listed as \
+             exclusive to it. An allowance that names nothing hides a deletion."
+        );
+    }
+    let (first, reference) = (censuses[0].0, shared(censuses[0].0, &censuses[0].1));
     for (what, census) in &censuses[1..] {
         assert_eq!(
-            census,
+            shared(what, census),
             reference,
             "`kernels-{what}`'s census is {} entrypoints and `kernels-{first}`'s \
-             is {}. The crossing moves who NAMES an entrypoint, never whether \
-             it exists, so a backend part-way through Stage 3 must still name \
-             every one of them -- through its rows, or through a `RETIRED` \
-             list once those rows are gone. Whichever side is short has \
-             deleted rows without stating what they named, and every sweep \
-             keyed on `entrypoints()` there has stopped covering the \
-             difference in silence.",
-            census.len(),
+             is {}, counting only what they share. The crossing moves who \
+             NAMES an entrypoint, never whether it exists, so a backend \
+             part-way through Stage 3 must still name every one of them -- \
+             through its rows, or through a `RETIRED` list once those rows are \
+             gone. Whichever side is short has deleted rows without stating \
+             what they named, and every sweep keyed on `entrypoints()` there \
+             has stopped covering the difference in silence. A backend that \
+             has GAINED a family the others lack states it in `EXCLUSIVE` \
+             above.",
+            shared(what, census).len(),
             reference.len(),
         );
     }
@@ -683,19 +688,26 @@ fn the_three_tables_only_ever_lose_rows() {
     /// those columns and then the `kernel!` macro itself can go. This test
     /// asserts EQUALITY at zero rather than being deleted, so that a row
     /// re-appearing in any of the three is a failure and not a silence.
+    ///
+    /// The countdown's floor assertion went with it. `total <= REMAINING` was
+    /// the progress bar's own guard while `REMAINING` was falling; at zero it
+    /// compares a `usize` against the minimum value of its type, so it is
+    /// true whatever the tables hold and checks nothing. Clippy denies it
+    /// (`absurd_extreme_comparisons`), and it was the reason this crate --
+    /// which IS in the workspace clippy gate -- failed that step. The
+    /// equality below is what was doing the work, and it now says what a
+    /// non-zero total means at the end of a countdown, which is not "lower
+    /// the constant".
     const REMAINING: usize = 0;
 
     let total: usize = tables().iter().map(|t| t.rows.len()).sum();
-    assert!(
-        total <= REMAINING,
-        "the three tables hold {total} rows and this test allows {REMAINING}. \
-         A row was ADDED to a table that is being emptied — if that is \
-         deliberate, say so here."
-    );
     assert_eq!(
         total, REMAINING,
-        "the three tables hold {total} rows, down from {REMAINING}. Lower the \
-         constant: that edit is the progress bar."
+        "the three tables hold {total} rows and the countdown ended at \
+         {REMAINING}. A row came BACK to a table that was emptied, and the \
+         constant may not be raised to accommodate it — Stage 5 deletes the \
+         `operands`, `launch` and `*_param` columns, so a row that states \
+         them has nowhere to be read."
     );
 }
 
@@ -734,6 +746,39 @@ fn the_three_tables_only_ever_lose_rows() {
 /// needs a sentence, and it may only be deleted — when the two agree, the
 /// entry is stale and this test says so.
 const DIVERGED: &[(&str, &str)] = &[
+    // The flash decode's two extra operands, which vulkan's decode signature
+    // carries and no other backend's does.
+    //
+    // `sdpa_paged_decode` on vulkan is two entrypoints behind one routine: a
+    // SPLIT that walks a slice of the key range into an unnormalised partial,
+    // and a COMBINE that folds the slices. That is what gets a decode more
+    // than `q_heads * rows` workgroups onto a 128-SM card -- at a 384-key
+    // history it is 67.8 us against 8.2. The two operands are the partials
+    // buffer the split writes and the fold reads (`F32sMut`, and `f32` rather
+    // than the activation type because a partial is an unnormalised weighted
+    // sum whose scale is `exp(score - split_max)`), and the split count the
+    // fold has to be told, since its grid is `(head, row)` with no third axis
+    // to read it off.
+    //
+    // A real divergence and not a mistyped port: the other backends fire this
+    // kernel in ONE pass, and a one-pass decode has no partial to store and
+    // no splits to count. The routine takes the same rectangle and answers
+    // the same thing; only vulkan's needs somewhere to put the middle of it.
+    // The day another backend splits its decode, its signature grows these
+    // two and this entry is deleted -- which the test enforces, since an
+    // entry whose backends have stopped disagreeing fails as stale.
+    (
+        "sdpa_paged_decode",
+        "vulkan splits the key range across workgroups and folds the partials \
+         in a second pass, so its signature carries the partials buffer and \
+         the split count; the other backends fire one pass and have neither",
+    ),
+    (
+        "sdpa_paged_decode_sink",
+        "the same two-pass split as `sdpa_paged_decode`, and the sink is added \
+         once in the fold rather than once per split, which is why the split \
+         module is shared between the sink and sinkless forms",
+    ),
     // THREE transcode kernels, and this one is wgpu's own shape rather than a
     // slot metal reserves.
     //
@@ -987,6 +1032,104 @@ const DIVERGED: &[(&str, &str)] = &[
          is a flat 1024 that strides, so the count is a grid fact on one \
          backend and a shader constant on the other",
     ),
+    // =================================================================
+    // THE PARAMS BLOCK, SETTLED. Twenty-five entries stood here and are
+    // gone. The way they went is worth the paragraphs they cost.
+    //
+    // Each was ONE operand: metal declared `params: Env<Buf>` where wgpu
+    // and vulkan declared `params: Buf`. Same position, same type, every
+    // other argument agreeing -- the two backends disagreed about
+    // nothing except WHO SUPPLIES IT. `Provenance`'s own definition
+    // settled it, and it is a definition and not a convention: *"The
+    // distinction is not 'who owns the memory' but 'who can be asked for
+    // it at trace time'"*. A params block is the STATEMENT'S OWN SCALAR
+    // RUN, packed; `driver-metal`'s `Handles::params_block`
+    // (`lowering/arm.rs:356`) opens by saying so and names the column it
+    // comes from, `Source::Slot(Kind::Param, 0)`, *"meaning the whole
+    // run"*. What metal had wrapped was the STAGING and not the value --
+    // the encoder mints one region per fire -- and that sentence refuses
+    // exactly that reading in advance: not who owns the memory.
+    //
+    // `argmax_logits` was the one that could not be argued at all: its
+    // arm binds `params` from `o.input(1)?`
+    // (`driver-metal/src/lowering/arm.rs:487`), which is not the staged
+    // block but the STATEMENT'S SECOND INPUT OPERAND, and
+    // `kernels-metal/src/sample.rs:47` called it `Env<Buf>`.
+    //
+    // And `kernels-metal` had been saying so itself the whole time,
+    // which is the part to remember. Its own `sample.rs` asserts
+    // `(Ty::Buf, Supplier::Trace)` in that slot under the heading *"The
+    // derived row says what the signature says"* and reads *"Four
+    // buffers the trace supplies and one extent the environment does"*;
+    // `ptir.rs` asserts the same for `copy_logits_bf16`; and every
+    // in-crate call site passed a bare `Buf` for the parameter. The
+    // `Env<>` was at the declaration line and NOWHERE ELSE -- not in a
+    // call, not in a body, not in a driver that branched on it. A gate
+    // between crates found what the crate's own tests could not, because
+    // the tests were right and the signature they derive from was not.
+    //
+    // So the thirty-four wrappers were dropped and the twenty-five
+    // entries were deleted by hand, along with the seventeen in
+    // `UNRECONCILED` that were the same finding seen from the row plane.
+    // THE NINE MASKED SITES REMAIN EXCUSED ABOVE, for their own and
+    // unrelated reasons: `gated_rms`, `gated_rms_strided`,
+    // `rms_strided_row` and `rms_strided_head_row` for threadgroup
+    // width, `router_topk`, `router_topk_scaled` and `route_sort` for
+    // the same, `gdn_prep_prefill` and `gdn_core_recurrent_prefill` for
+    // push constants. None of those entries ever named the params block
+    // and none of them changed.
+    // -----------------------------------------------------------------
+    // THE FOUR EMBEDDING GATHERS, and here metal is the RIGHT one.
+    //
+    // The operand is `id`, the token-id vector, and it is the opposite
+    // shape from the params block settled above: metal declares
+    // `Env<I32s>` (`kernels-metal/src/layout.rs:245` and its three
+    // siblings) and wgpu and vulkan declare a bare `I32s`. Nothing else
+    // differs.
+    //
+    // Both crates already AGREE about the fact and disagree only about
+    // its spelling. metal's parameter carries a shouted comment -- *"THE
+    // TOKEN IDS ARE THE FIRE'S. An embedding gather at the top of a
+    // graph has no traced operand -- the ids come off the fire's
+    // frame"* -- and its arm binds `o.table(FireTable::TokenIds)`. The
+    // wgpu ROW for the same kernel says it in nearly the same words:
+    // *"The token IDS: the FIRE's, not the statement's. A text cannot
+    // state them"*, and sources the operand
+    // `Source::Named(<keys::TokenIds as keys::Fact>::KEY)`.
+    //
+    // A fact reached by NAME off the fire is the textbook `Env`. The
+    // `Provenance` doc's own examples are *"a position vector, a plan, a
+    // workspace"*; `KernelSig::args` (`kernels/src/lib.rs`) names
+    // the failure mode exactly, complaining that with no `Env` wrappers
+    // every position derived as `Trace` *"including the head widths,
+    // position vectors and cache descriptors that driver-cuda's arms
+    // read off the fire because no statement carries them"*; and
+    // `kernels-cuda`, the port the others are copying, writes
+    // `token_ids: Env<keys::TokenIds>` (`layout.rs:616`) and
+    // `positions: Env<keys::Positions>` (`rope.rs:1478`). Metal is
+    // right.
+    //
+    // SETTLED, AND THE FOUR ENTRIES ARE GONE. It was excused because wgpu
+    // could not take metal's spelling without failing
+    // `a_ported_routine_takes_exactly_the_operands_its_row_states`, which
+    // compared a routine's TRACE arguments against the ROW's whole operand
+    // list -- `Named`-sourced operands included -- and had no way to express
+    // a row operand that is an `Env` fact. That test is deleted; the note
+    // above this section records why, and with no rows left there is nothing
+    // for an `Env` argument to fail against. The second half of the
+    // settlement, `Env` everywhere, then landed: wgpu and vulkan now spell
+    // `id` the way metal and cuda always did.
+    //
+    // Rope's `position` went the same way and for the same reason, though
+    // nothing here would have caught it -- all three planes agreed on the
+    // wrong spelling, which is what made it invisible. §6.2's arity rule on
+    // the metal plane is what found it: a statement places what a routine
+    // READS, and a rotation reading a fire table it never named made the
+    // count come out one short.
+    // -----------------------------------------------------------------
+    // The twenty-five params-block entries stood here, below the four
+    // above and grouped by family. They are gone; the note at the head
+    // of this section says why, and that is now the whole of the record.
 ];
 
 // The other six `gdn_*` kernels were parked here as UNRESOLVED and are not
@@ -1073,6 +1216,44 @@ fn two_backends_that_crossed_the_same_kernel_agree_on_its_signature() {
                  depth-prefix plan, which operands must be aliased -- and a \
                  trace does not know which backend will run it."
             );
+            // WHICH OPERAND, which `args` cannot see.
+            //
+            // A position wrapper is transparent for both columns above it:
+            // `InSlot<0, Buf>` reports `Buf`'s `Ty` and `Buf`'s `Provenance`,
+            // so a plane that states a slot and a plane that does not compare
+            // EQUAL on `args` and the drift goes unreported. That is not a
+            // hypothetical -- it is the shape the shader planes are in right
+            // now, mid-migration, and the whole point of stating the slot is
+            // that something reads it.
+            //
+            // It belongs beside the three above rather than in `report`,
+            // which collects `args` mismatches for one message: a slot is a
+            // fact about the STATEMENT, exactly as `in_place` is, and the
+            // same sentence covers it -- a trace does not know which backend
+            // will run it, so it cannot place an operand at one index here
+            // and another there.
+            assert_eq!(
+                other.sides, first.sides,
+                "`{name}` binds different operand slots in {what} and \
+                 {first_what}. A slot is the statement's, not the device's."
+            );
+            // WHICH OF THE ENVIRONMENT'S QUESTIONS, which `args` cannot see
+            // either, and for the same reason: `Ask<keys::TokenIds, I32s>`
+            // and `Env<I32s>` are the same `Ty` and the same `Provenance`.
+            //
+            // The asymmetry worth naming is that this column is `None` until
+            // a signature is taught, so a plane that has been and a plane
+            // that has not DIVERGE here while both are correct. That is the
+            // intended reading -- it is the same asymmetry `sides` has, and
+            // the mirror is applied to all three planes at once precisely so
+            // this never has to be excused.
+            assert_eq!(
+                other.sources, first.sources,
+                "`{name}` asks the binder different questions in {what} and \
+                 {first_what}. Which of the fire's planes an argument is, is \
+                 the STATEMENT's business: a trace does not know which \
+                 backend will run it."
+            );
             compared += 1;
         }
     }
@@ -1132,11 +1313,12 @@ fn two_backends_that_crossed_the_same_kernel_agree_on_its_signature() {
     // bodies and the 303 instantiation names are spelled identically. Every
     // one of them agreed.
     assert_eq!(
-        compared, 199,
+        compared, COMPARED,
         "{compared} kernels are crossed by more than one backend and compared \
-         here, and this test expects 199. It may only RISE: a fall means a name \
-         stopped matching its counterpart, which is how a comparison stops \
-         happening without anybody deleting it."
+         here, and this test expects {COMPARED}. A fall is only ever right \
+         alongside a fall in `CENSUS`: if the union did not shrink, then a \
+         name stopped matching its counterpart, which is how a comparison \
+         stops happening without anybody deleting it."
     );
 }
 

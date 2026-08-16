@@ -29,6 +29,38 @@
 // `dispatch_workgroups(pairs, heads, rows)` reproduce `LaunchRule::Rope`'s grid
 // exactly, which is the same choice `kernels-vulkan` makes for the same reason.
 //
+// ## What that choice costs, which nobody had weighed
+//
+// The paragraph above is right about the hazard and silent about the price.
+// `kernels-vulkan: fuse the per-head RMS norm with the NEOX rotation` weighed
+// it on the sibling and found the same shape: *"`neox.slang` is
+// `[numthreads(1, 1, 1)]`, so a 512-token prefill dispatches 524288 one-thread
+// workgroups -- widening that grid alone would recover most of the 270 us with
+// no fusion."*
+//
+// That number is this backend's too, because it is a property of the model and
+// not of the language. qwen3-0.6B rotates a whole 128-wide head over 16 query
+// heads, so a 512-row prefill is `64 pairs * 16 heads * 512 rows` = **524,288
+// workgroups of one thread each**, and `driver-wgpu`'s
+// `which_kernels_a_prefill_spends_its_gpu_time_in` counts 56 `neox_mb`
+// rectangles in a fire that has 564 -- one launch in ten, at an occupancy of
+// 1/64th of a subgroup.
+//
+// ## The way out is already in the signature
+//
+// The hazard is only that `pairs` is read off `num_workgroups`. It does not
+// have to be: `rope::neox_mb` ALREADY TAKES `rotary: ParamOr<3,
+// keys::RotaryWidth, i32>` and then does not forward it -- the dispatch passes
+// `[x, position, scale, base, head_dim]` and stops. Adding it to the block and
+// reading `pairs` from `params` instead of `grid.x` frees the x axis to be
+// widened by any factor, with the existing `if (i0 >= pairs) { return; }`
+// already covering the round-up the paragraph above is afraid of.
+//
+// Not done here. It touches seven instantiations, the block layout every caller
+// builds, and the partial-rotary arm gemma-4 needs, and the sibling's version
+// of this work landed with two purpose-written correctness tests beside it.
+// Recorded rather than attempted, with the count that says what it is worth.
+//
 // ## In place, and two bf16 to a word
 //
 // The tensor is read and written, so a body that stored the first element of a

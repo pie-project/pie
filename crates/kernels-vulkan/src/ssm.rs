@@ -4,10 +4,10 @@
 //! the same call the CUDA table makes for `delta_attn_kda` and `indexer_dsa`.
 #![allow(clippy::too_many_arguments)]
 
-use kernels::KernelSig;
 use kernels::routine::Refusal;
 
-use crate::routine::{Bind, Buf, BufMut, Ctx, Env, F32s, F32sMut, Fire, Routine, U32s};
+use crate::routine::{keys, Ask, Bind, Block, Buf, BufMut, Ctx, Env, F32s, F32sMut, Fire, Held, Param, Routine, U32s};
+use crate::routine::{InSlot, OutSlot, Weight};
 
 /// The entrypoints this family's crossed routines spell, now that their
 /// rows are gone. See [`crate::RETIRED`].
@@ -30,49 +30,29 @@ pub static ENTRYPOINTS: &[&str] = &[
     "gdn_prep_slotted_bfloat16",
 ];
 
-/// Eight rows that name a shader, state nothing else, and cannot fire.
-///
-/// Every row here gives a `file`, and the sixteen modules behind them are
-/// compiled into every native build, load on this device and are checked
-/// against the table like any other: `driver-vulkan`'s `PARAM_BLOCKS` carries
-/// `gdn_core_bfloat16` at binding 11 with a 44-byte block, read off the
-/// compiled module by an independent SPIR-V walk. What no row gives is
-/// operands or a launch rule, which makes all eight `LaunchRule::Unstated`,
-/// and `geometry::lanes` returns `Ungeometric::Unstated` before it computes a
-/// grid. They are not "wired but unused"; they cannot be dispatched at all.
-///
-/// # The seam, not the memory
-///
-/// The obvious explanation -- that the local Qwen3.5 hybrids do not fit this
-/// device -- is not the one. `driver-vulkan` fires whole texts on sentinel
-/// weights and needs no checkpoint, so a text could reach these modules on
-/// this machine today. The real obstacle is that the rows do not have the
-/// shape the tracer's GDN vocabulary emits: CUDA traces THREE ops
-/// (`causal_conv1d`, then `gdn_prep` over `(q, k, v, g, beta)`, then a step or
-/// prefill scan) where `gdn_core` here is ONE dispatch with the convolution,
-/// the prep and the recurrence fused. So a `dsl::vulkan::gdn_*` cannot be
-/// added the way a second attention name was; it needs a `TraceBuilder` row, a
-/// lowering and a statement. `gdn_prep` and `gdn_core_recurrent` split the
-/// work one seam further and are the closer pair to start from.
-///
-/// # Why the operand lists are not simply written
-///
-/// An operand list is a claim about what a CALL passes, and nothing calls
-/// these. The signatures are not the hard part -- the modules declare their
-/// bindings densely, with no holes anywhere in the family, and the widths were
-/// read out of the SPIR-V: twelve buffers for `gdn_core`, thirteen for
-/// `gdn_core_slotted` and `gdn_prep`, fourteen for the prefill and slotted
-/// preps, eleven for `gdn_core_recurrent` and seven for each of the nine
-/// prefill shapes. The first two are the same twelve and thirteen
-/// `kernels-metal`'s table names, which is the parity claim actually holding
-/// rather than being assumed.
-///
-/// What is missing is upstream of the count: three of the buffers
-/// (`conv_state`, `rstate`, `new_conv_state`) are recurrent STATE, and state
-/// has no `Source` in this build. Inventing one before a text says how it
-/// carries state across steps would be guessing, and a guessed `Source` is
-/// worse than a blank row -- a blank row refuses, and a wrong one binds.
-pub static KERNELS: &[KernelSig] = &[];
+// Eight entrypoints here name a shader and cannot be reached, and the rows
+// that used to say so are gone. The reason is not the rows and did not leave
+// with them, so it is kept:
+//
+// The sixteen modules behind them are compiled into every native build and
+// load on this device. What is missing is a SEAM, not memory and not a
+// signature. The tracer's GDN vocabulary emits THREE ops -- `causal_conv1d`,
+// then `gdn_prep` over `(q, k, v, g, beta)`, then a step or prefill scan --
+// where `gdn_core` here is ONE dispatch with the convolution, the prep and the
+// recurrence fused. So a `dsl::vulkan::gdn_*` cannot be added the way a second
+// attention name was; it needs a `TraceBuilder` row, a lowering and a
+// statement. `gdn_prep` and `gdn_core_recurrent` split the work one seam
+// further and are the closer pair to start from.
+//
+// The widths were read out of the SPIR-V and are not the obstacle: twelve
+// buffers for `gdn_core`, thirteen for `gdn_core_slotted` and `gdn_prep`,
+// fourteen for the prefill and slotted preps, eleven for
+// `gdn_core_recurrent`, seven for each of the nine prefill shapes. The first
+// two are the same twelve and thirteen `kernels-metal` names.
+//
+// What is upstream of the count is that three of the buffers (`conv_state`,
+// `rstate`, `new_conv_state`) are recurrent STATE, and a guessed `Source` is
+// worse than an absent one -- an absent one refuses, a wrong one binds.
 
 /// The nine `(LANES, VROWS)` shapes the prefill scan is compiled for, in the
 /// order the row's axis names them.
@@ -210,21 +190,21 @@ const WARP: u32 = 32;
 /// See [`gdn_grid`].
 pub fn gdn_core(
     ctx: &Ctx<'_>,
-    mixed: Buf,
-    conv_state: F32s,
-    rstate: F32sMut,
-    core_out: BufMut,
-    conv_w: Buf,
-    conv_b: Buf,
-    a_log: F32s,
-    dt_bias: Buf,
-    a_gate: Buf,
-    b_gate: Buf,
-    new_conv_state: F32sMut,
-    params: Buf,
-    rows: Env<i32>,
-    v_heads: Env<i32>,
-    v_dim: Env<i32>,
+    mixed: InSlot<0, Buf>,
+    conv_state: Held<keys::ConvState, F32s>,
+    rstate: Held<keys::RecurrentState, F32sMut>,
+    core_out: OutSlot<0, BufMut>,
+    conv_w: Weight<0, Buf>,
+    conv_b: Weight<1, Buf>,
+    a_log: Weight<2, F32s>,
+    dt_bias: Weight<3, Buf>,
+    a_gate: InSlot<1, Buf>,
+    b_gate: InSlot<2, Buf>,
+    new_conv_state: Held<keys::NewConvState, F32sMut>,
+    params: Block<Buf>,
+    rows: Ask<keys::Rows, i32>,
+    v_heads: Ask<keys::VHeads, i32>,
+    v_dim: Ask<keys::VDim, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -260,22 +240,22 @@ pub fn gdn_core(
 /// See [`gdn_grid`].
 pub fn gdn_core_slotted(
     ctx: &Ctx<'_>,
-    mixed: Buf,
-    conv_state: F32s,
-    rstate: F32sMut,
-    core_out: BufMut,
-    conv_w: Buf,
-    conv_b: Buf,
-    a_log: F32s,
-    dt_bias: Buf,
-    a_gate: Buf,
-    b_gate: Buf,
-    new_conv_state: F32sMut,
-    params: Buf,
-    slot_ids: U32s,
-    rows: Env<i32>,
-    v_heads: Env<i32>,
-    v_dim: Env<i32>,
+    mixed: InSlot<0, Buf>,
+    conv_state: Ask<keys::ConvState, F32s>,
+    rstate: Ask<keys::RecurrentState, F32sMut>,
+    core_out: OutSlot<0, BufMut>,
+    conv_w: Weight<0, Buf>,
+    conv_b: Weight<1, Buf>,
+    a_log: Weight<2, F32s>,
+    dt_bias: Weight<3, Buf>,
+    a_gate: InSlot<1, Buf>,
+    b_gate: InSlot<2, Buf>,
+    new_conv_state: Ask<keys::NewConvState, F32sMut>,
+    params: Block<Buf>,
+    slot_ids: Ask<keys::RecurrentSlots, U32s>,
+    rows: Ask<keys::Rows, i32>,
+    v_heads: Ask<keys::VHeads, i32>,
+    v_dim: Ask<keys::VDim, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -322,21 +302,21 @@ pub fn gdn_core_slotted(
 /// See [`gdn_grid`].
 pub fn gdn_prep(
     ctx: &Ctx<'_>,
-    mixed: Buf,
-    conv_state: F32s,
-    conv_w: Buf,
-    conv_b: Buf,
-    a_log: F32s,
-    dt_bias: Buf,
-    a_gate: Buf,
-    b_gate: Buf,
-    pre_q: F32sMut,
-    pre_k: F32sMut,
-    pre_gate: F32sMut,
-    new_conv_state: F32sMut,
-    params: Buf,
-    rows: Env<i32>,
-    v_heads: Env<i32>,
+    mixed: InSlot<0, Buf>,
+    conv_state: Held<keys::ConvState, F32s>,
+    conv_w: Weight<0, Buf>,
+    conv_b: Weight<1, Buf>,
+    a_log: Weight<2, F32s>,
+    dt_bias: Weight<3, Buf>,
+    a_gate: InSlot<1, Buf>,
+    b_gate: InSlot<2, Buf>,
+    pre_q: OutSlot<0, F32sMut>,
+    pre_k: OutSlot<1, F32sMut>,
+    pre_gate: OutSlot<2, F32sMut>,
+    new_conv_state: Held<keys::NewConvState, F32sMut>,
+    params: Block<Buf>,
+    rows: Ask<keys::Rows, i32>,
+    v_heads: Ask<keys::VHeads, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -369,22 +349,22 @@ pub fn gdn_prep(
 /// See [`gdn_grid`].
 pub fn gdn_prep_slotted(
     ctx: &Ctx<'_>,
-    mixed: Buf,
-    conv_state: F32s,
-    conv_w: Buf,
-    conv_b: Buf,
-    a_log: F32s,
-    dt_bias: Buf,
-    a_gate: Buf,
-    b_gate: Buf,
-    pre_q: F32sMut,
-    pre_k: F32sMut,
-    pre_gate: F32sMut,
-    new_conv_state: F32sMut,
-    params: Buf,
-    slot_ids: U32s,
-    rows: Env<i32>,
-    v_heads: Env<i32>,
+    mixed: InSlot<0, Buf>,
+    conv_state: Held<keys::ConvState, F32s>,
+    conv_w: Weight<0, Buf>,
+    conv_b: Weight<1, Buf>,
+    a_log: Weight<2, F32s>,
+    dt_bias: Weight<3, Buf>,
+    a_gate: InSlot<1, Buf>,
+    b_gate: InSlot<2, Buf>,
+    pre_q: OutSlot<0, F32sMut>,
+    pre_k: OutSlot<1, F32sMut>,
+    pre_gate: OutSlot<2, F32sMut>,
+    new_conv_state: Held<keys::NewConvState, F32sMut>,
+    params: Block<Buf>,
+    slot_ids: Held<keys::RecurrentSlots, U32s>,
+    rows: Ask<keys::Rows, i32>,
+    v_heads: Ask<keys::VHeads, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -426,24 +406,24 @@ pub fn gdn_prep_slotted(
 /// See [`gdn_grid`].
 pub fn gdn_prep_prefill(
     ctx: &Ctx<'_>,
-    mixed: Buf,
-    conv_state: F32s,
-    conv_w: Buf,
-    conv_b: Buf,
-    a_log: F32s,
-    dt_bias: Buf,
-    a_gate: Buf,
-    b_gate: Buf,
-    pre_q: F32sMut,
-    pre_k: F32sMut,
-    pre_gate: F32sMut,
-    new_conv_state: F32sMut,
-    params: Buf,
-    slot_ids: U32s,
-    row_pitch: i32,
-    n_scan: i32,
+    mixed: InSlot<0, Buf>,
+    conv_state: Ask<keys::ConvState, F32s>,
+    conv_w: Weight<0, Buf>,
+    conv_b: Weight<1, Buf>,
+    a_log: Weight<2, F32s>,
+    dt_bias: Weight<3, Buf>,
+    a_gate: InSlot<1, Buf>,
+    b_gate: InSlot<2, Buf>,
+    pre_q: OutSlot<0, F32sMut>,
+    pre_k: OutSlot<1, F32sMut>,
+    pre_gate: OutSlot<2, F32sMut>,
+    new_conv_state: Ask<keys::NewConvState, F32sMut>,
+    params: Block<Buf>,
+    slot_ids: Ask<keys::RecurrentSlots, U32s>,
+    row_pitch: Ask<keys::InWidth, i32>,
+    n_scan: Ask<keys::Rows, i32>,
     rows: Env<i32>,
-    v_heads: Env<i32>,
+    v_heads: Ask<keys::VHeads, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -485,20 +465,20 @@ pub fn gdn_prep_prefill(
 /// See [`gdn_grid`].
 pub fn gdn_core_recurrent(
     ctx: &Ctx<'_>,
-    mixed: Buf,
-    conv_state: F32s,
-    rstate: F32sMut,
-    core_out: BufMut,
-    conv_w: Buf,
-    conv_b: Buf,
-    pre_q: F32s,
-    pre_k: F32s,
-    pre_gate: F32s,
-    new_conv_state: F32sMut,
-    params: Buf,
-    rows: Env<i32>,
-    v_heads: Env<i32>,
-    v_dim: Env<i32>,
+    mixed: InSlot<0, Buf>,
+    conv_state: Held<keys::ConvState, F32s>,
+    rstate: Held<keys::RecurrentState, F32sMut>,
+    core_out: OutSlot<0, BufMut>,
+    conv_w: Weight<0, Buf>,
+    conv_b: Weight<1, Buf>,
+    pre_q: InSlot<1, F32s>,
+    pre_k: InSlot<2, F32s>,
+    pre_gate: InSlot<3, F32s>,
+    new_conv_state: Held<keys::NewConvState, F32sMut>,
+    params: Block<Buf>,
+    rows: Ask<keys::Rows, i32>,
+    v_heads: Ask<keys::VHeads, i32>,
+    v_dim: Ask<keys::VDim, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -529,21 +509,21 @@ pub fn gdn_core_recurrent(
 /// See [`gdn_grid`].
 pub fn gdn_core_recurrent_slotted(
     ctx: &Ctx<'_>,
-    mixed: Buf,
-    conv_state: F32s,
-    rstate: F32sMut,
-    core_out: BufMut,
-    conv_w: Buf,
-    conv_b: Buf,
-    pre_q: F32s,
-    pre_k: F32s,
-    pre_gate: F32s,
-    new_conv_state: F32sMut,
-    params: Buf,
-    slot_ids: U32s,
-    rows: Env<i32>,
-    v_heads: Env<i32>,
-    v_dim: Env<i32>,
+    mixed: InSlot<0, Buf>,
+    conv_state: Held<keys::ConvState, F32s>,
+    rstate: Held<keys::RecurrentState, F32sMut>,
+    core_out: OutSlot<0, BufMut>,
+    conv_w: Weight<0, Buf>,
+    conv_b: Weight<1, Buf>,
+    pre_q: InSlot<1, F32s>,
+    pre_k: InSlot<2, F32s>,
+    pre_gate: InSlot<3, F32s>,
+    new_conv_state: Held<keys::NewConvState, F32sMut>,
+    params: Block<Buf>,
+    slot_ids: Held<keys::RecurrentSlots, U32s>,
+    rows: Ask<keys::Rows, i32>,
+    v_heads: Ask<keys::VHeads, i32>,
+    v_dim: Ask<keys::VDim, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -597,17 +577,17 @@ pub fn gdn_core_recurrent_slotted(
 /// [`scan_point`]), and [`Refusal::Empty`] for an empty extent.
 pub fn gdn_core_recurrent_prefill(
     ctx: &Ctx<'_>,
-    rstate: F32sMut,
-    core_out: BufMut,
-    pre_q: F32s,
-    pre_k: F32s,
-    pre_gate: F32s,
-    params: Buf,
-    slot_ids: U32s,
-    row_pitch: i32,
-    n_scan: i32,
-    lanes: Env<i32>,
-    vrows: Env<i32>,
+    rstate: Ask<keys::RecurrentState, F32sMut>,
+    core_out: OutSlot<0, BufMut>,
+    pre_q: InSlot<1, F32s>,
+    pre_k: InSlot<2, F32s>,
+    pre_gate: InSlot<3, F32s>,
+    params: Block<Buf>,
+    slot_ids: Ask<keys::RecurrentSlots, U32s>,
+    row_pitch: Ask<keys::InWidth, i32>,
+    n_scan: Ask<keys::Rows, i32>,
+    lanes: Param<11, i32>,
+    vrows: Param<12, i32>,
     dv: Env<i32>,
     hv: Env<i32>,
 ) -> Result<(), Refusal> {
@@ -696,41 +676,41 @@ mod tests {
         let seen = Seen::default();
         gdn_core(
             &seen,
-            Buf(0),
-            F32s(1),
-            F32sMut(2),
-            BufMut(3),
-            Buf(4),
-            Buf(5),
-            F32s(6),
-            Buf(7),
-            Buf(8),
-            Buf(9),
-            F32sMut(10),
-            Buf(11),
-            Env(2),
-            Env(4),
-            Env(64),
+            InSlot::new(Buf(0)),
+            Held::new(F32s(1)),
+            Held::new(F32sMut(2)),
+            OutSlot::new(BufMut(3)),
+            Weight::new(Buf(4)),
+            Weight::new(Buf(5)),
+            Weight::new(F32s(6)),
+            Weight::new(Buf(7)),
+            InSlot::new(Buf(8)),
+            InSlot::new(Buf(9)),
+            Held::new(F32sMut(10)),
+            Block::new(Buf(11)),
+            Ask::new(2),
+            Ask::new(4),
+            Ask::new(64),
         )
         .expect("a launch");
         gdn_core_slotted(
             &seen,
-            Buf(0),
-            F32s(1),
-            F32sMut(2),
-            BufMut(3),
-            Buf(4),
-            Buf(5),
-            F32s(6),
-            Buf(7),
-            Buf(8),
-            Buf(9),
-            F32sMut(10),
-            Buf(11),
-            U32s(12),
-            Env(2),
-            Env(4),
-            Env(64),
+            InSlot::new(Buf(0)),
+            Ask::new(F32s(1)),
+            Ask::new(F32sMut(2)),
+            OutSlot::new(BufMut(3)),
+            Weight::new(Buf(4)),
+            Weight::new(Buf(5)),
+            Weight::new(F32s(6)),
+            Weight::new(Buf(7)),
+            InSlot::new(Buf(8)),
+            InSlot::new(Buf(9)),
+            Ask::new(F32sMut(10)),
+            Block::new(Buf(11)),
+            Ask::new(U32s(12)),
+            Ask::new(2),
+            Ask::new(4),
+            Ask::new(64),
         )
         .expect("a launch");
 
@@ -763,39 +743,39 @@ mod tests {
         let seen = Seen::default();
         gdn_prep(
             &seen,
-            Buf(0),
-            F32s(1),
-            Buf(2),
-            Buf(3),
-            F32s(4),
-            Buf(5),
-            Buf(6),
-            Buf(7),
-            F32sMut(8),
-            F32sMut(9),
-            F32sMut(10),
-            F32sMut(11),
-            Buf(12),
-            Env(2),
-            Env(4),
+            InSlot::new(Buf(0)),
+            Held::new(F32s(1)),
+            Weight::new(Buf(2)),
+            Weight::new(Buf(3)),
+            Weight::new(F32s(4)),
+            Weight::new(Buf(5)),
+            InSlot::new(Buf(6)),
+            InSlot::new(Buf(7)),
+            OutSlot::new(F32sMut(8)),
+            OutSlot::new(F32sMut(9)),
+            OutSlot::new(F32sMut(10)),
+            Held::new(F32sMut(11)),
+            Block::new(Buf(12)),
+            Ask::new(2),
+            Ask::new(4),
         )
         .expect("a launch");
         gdn_core_recurrent(
             &seen,
-            Buf(0),
-            F32s(1),
-            F32sMut(2),
-            BufMut(3),
-            Buf(4),
-            Buf(5),
-            F32s(6),
-            F32s(7),
-            F32s(8),
-            F32sMut(9),
-            Buf(10),
-            Env(2),
-            Env(4),
-            Env(64),
+            InSlot::new(Buf(0)),
+            Held::new(F32s(1)),
+            Held::new(F32sMut(2)),
+            OutSlot::new(BufMut(3)),
+            Weight::new(Buf(4)),
+            Weight::new(Buf(5)),
+            InSlot::new(F32s(6)),
+            InSlot::new(F32s(7)),
+            InSlot::new(F32s(8)),
+            Held::new(F32sMut(9)),
+            Block::new(Buf(10)),
+            Ask::new(2),
+            Ask::new(4),
+            Ask::new(64),
         )
         .expect("a launch");
 
@@ -820,17 +800,17 @@ mod tests {
         for (lanes, vrows) in [(4, 1), (32, 8)] {
             gdn_core_recurrent_prefill(
                 &seen,
-                F32sMut(0),
-                BufMut(1),
-                F32s(2),
-                F32s(3),
-                F32s(4),
-                Buf(5),
-                U32s(6),
-                256,
-                7,
-                Env(lanes),
-                Env(vrows),
+                Ask::new(F32sMut(0)),
+                OutSlot::new(BufMut(1)),
+                InSlot::new(F32s(2)),
+                InSlot::new(F32s(3)),
+                InSlot::new(F32s(4)),
+                Block::new(Buf(5)),
+                Ask::new(U32s(6)),
+                Ask::new(256),
+                Ask::new(7),
+                Param::new(lanes),
+                Param::new(vrows),
                 Env(64),
                 Env(4),
             )
@@ -880,17 +860,17 @@ mod tests {
         for (lanes, vrows, dv) in [(16, 4, 128), (16, 4, 100), (32, 2, 128), (4, 1, 128)] {
             gdn_core_recurrent_prefill(
                 &seen,
-                F32sMut(0),
-                BufMut(1),
-                F32s(2),
-                F32s(3),
-                F32s(4),
-                Buf(5),
-                U32s(6),
-                256,
-                7,
-                Env(lanes),
-                Env(vrows),
+                Ask::new(F32sMut(0)),
+                OutSlot::new(BufMut(1)),
+                InSlot::new(F32s(2)),
+                InSlot::new(F32s(3)),
+                InSlot::new(F32s(4)),
+                Block::new(Buf(5)),
+                Ask::new(U32s(6)),
+                Ask::new(256),
+                Ask::new(7),
+                Param::new(lanes),
+                Param::new(vrows),
                 Env(dv),
                 Env(4),
             )
@@ -933,17 +913,17 @@ mod tests {
         assert!(
             gdn_core_recurrent_prefill(
                 &seen,
-                F32sMut(0),
-                BufMut(1),
-                F32s(2),
-                F32s(3),
-                F32s(4),
-                Buf(5),
-                U32s(6),
-                256,
-                7,
-                Env(16),
-                Env(4),
+                Ask::new(F32sMut(0)),
+                OutSlot::new(BufMut(1)),
+                InSlot::new(F32s(2)),
+                InSlot::new(F32s(3)),
+                InSlot::new(F32s(4)),
+                Block::new(Buf(5)),
+                Ask::new(U32s(6)),
+                Ask::new(256),
+                Ask::new(7),
+                Param::new(16),
+                Param::new(4),
                 Env(0),
                 Env(4),
             )

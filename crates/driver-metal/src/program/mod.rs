@@ -1,27 +1,15 @@
 //! User programs: compile, cache, run.
 //!
-//! This is the PTIR plane — programs the *user* supplies at run time, as
-//! opposed to the model's own fire. Two words used to collide here:
-//! `src/pipeline.rs` was the channel plane and `metal/pipeline.rs` was the
-//! shader compiler, one word at two altitudes. They are
-//! [`crate::channel`] and [`compile`] now.
-//!
-//! The channel plane itself is NOT here. It is
-//! [`crate::channel`] — `pub use driver::*` and nothing else, so it is this
-//! crate's naming of an external ABI rather than a layer of it. Under
-//! `gpu/program/` it made `gpu/device/ring.rs` point up at the shader
-//! compiler it is not related to; see `tests/layering.rs`.
+//! The PTIR plane — programs the *user* supplies at run time, as opposed to
+//! the model's own fire. Distinct from [`crate::channel`]'s external ABI
+//! naming by design: see `tests/layering.rs`.
 //!
 //! * [`compile`] — turning `.metal` text into a compute pipeline state.
-//! * [`cache`] — the program compile and the pipeline cache around it. Was
-//!   `metal/runtime.rs`, named for the C++ `M1Runtime` class.
-//! * [`executable`] — what a compiled program is: the executables the three
-//!   launch paths share.
-//! * [`single`] — one single-lane fire, prepared and executed. The M1 path.
-//! * [`fused`] — a fire's fused regions placed around someone else's
-//!   forward. The M2 path.
-//! * [`grouped`] — up to 64 fires dispatched as one group of lanes. The M3
-//!   path.
+//! * [`cache`] — the program compile and the pipeline cache around it.
+//! * [`executable`] — the executables the three launch paths share.
+//! * [`single`] — one single-lane fire, prepared and executed (M1).
+//! * [`fused`] — a fire's fused regions placed around someone else's forward (M2).
+//! * [`grouped`] — up to 64 fires dispatched as one group of lanes (M3).
 
 pub mod cache;
 pub mod compile;

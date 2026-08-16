@@ -585,3 +585,7 @@ mod tests {
         }
     }
 }
+
+/// This generation's tensor names, in every vocabulary that spells them.
+#[cfg(feature = "contract")]
+pub mod import;

@@ -80,7 +80,7 @@ __global__ void widen_all(unsigned int* out) {
 
 #[test]
 fn every_fp16_pattern_widens_to_the_same_bits() {
-    let Some(arch) = cache::arch() else {
+    let Some(arch) = quietly(cache::arch).flatten() else {
         eprintln!("SKIP every_fp16_pattern_widens_to_the_same_bits: no CUDA device is current");
         return;
     };
@@ -286,7 +286,7 @@ fn run(cubin: &[u8], lowered: &str) -> Vec<u32> {
 /// check that it does.
 #[test]
 fn one_include_of_an_honest_name_is_enough() {
-    let Some(arch) = cache::arch() else {
+    let Some(arch) = quietly(cache::arch).flatten() else {
         eprintln!("SKIP one_include_of_an_honest_name_is_enough: no CUDA device is current");
         return;
     };
@@ -338,4 +338,28 @@ __global__ void probe(float* out, const unsigned int* in) {
             built.lowered
         );
     }
+}
+
+/// Run `f`, turning a panic into `None` and printing nothing.
+///
+/// The two `let Some(arch) = ... else` above read as "ask whether there is a
+/// device", and they answer only half the question. `cudarc` is built
+/// `fallback-dynamic-loading`, so every CUDA symbol is `dlopen`'d on first use
+/// and a MISSING library is a PANIC -- `panic_no_lib_found` -- rather than
+/// `None`. So the skip covered "driver present, no device" and the case it was
+/// actually written for, an ordinary runner with no CUDA installed at all,
+/// unwound straight past it and FAILED. Measured with an `LD_PRELOAD` shim
+/// that refuses to `dlopen` the CUDA libraries: this file went from 2 skips to
+/// 2 failures.
+///
+/// Only the FIRST call needs wrapping. Once one answers, the library is loaded
+/// and everything after it is an ordinary call -- including the
+/// `bind_context().expect(..)` on the line below each, which is reached only
+/// once `arch` has come back `Some`.
+fn quietly<R>(f: impl FnOnce() -> R + std::panic::UnwindSafe) -> Option<R> {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let out = std::panic::catch_unwind(f);
+    std::panic::set_hook(hook);
+    out.ok()
 }

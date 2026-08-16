@@ -22,7 +22,7 @@
 //!    the right reason" to "runs and is correct" when the read path lands.
 //!
 //! `#[ignore]`, driver-cuda. Run:
-//!   cargo test -p pie-gpu-tests --features driver-cuda --test cuda_gdn_foldcommit \
+//!   cargo test -p pie-gpu-tests --features driver-cuda-13 --test cuda_gdn_foldcommit \
 //!     -- --ignored --nocapture
 
 use std::path::Path;

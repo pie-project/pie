@@ -18,26 +18,20 @@
 //! width every module bets on, the parameter blocks it measures, and the
 //! binding holes it calls holes.
 //!
-//! No GPU is involved. The modules are files.
+//! No GPU is involved. The modules are `kernels-vulkan`'s embedded table.
 
 use driver_vulkan::{Declared, spirv};
-
-/// Where a `native` build of `kernels-vulkan` left the modules.
-const SPV_DIR: Option<&str> = option_env!("PIE_KERNELS_VULKAN_SPV_DIR");
 
 /// Skip with a reason when there are no modules, rather than pass silently.
 macro_rules! modules {
     () => {
-        match SPV_DIR {
-            Some(d) => std::path::Path::new(d),
-            None => {
-                eprintln!(
-                    "no modules: build with `-p driver-vulkan --features native` \
-                     (or any profile that pulls kernels-vulkan/native) and have \
-                     `slangc` on PATH"
-                );
-                return;
-            }
+        if !kernels_vulkan::embedded() {
+            eprintln!(
+                "no modules: build with `-p driver-vulkan --features native` \
+                 (or any profile that pulls kernels-vulkan/native) and have \
+                 `slangc` on PATH"
+            );
+            return;
         }
     };
 }
@@ -48,10 +42,9 @@ macro_rules! modules {
 /// bytes is two things to keep right, and the one under test is the one that
 /// matters -- so this calls it, and a defect in it now fails these sweeps
 /// instead of being masked by a copy that happens to agree.
-fn declared(path: &std::path::Path) -> Option<Declared> {
-    let code = std::fs::read(path).ok()?;
-    let words = spirv::words(&code).expect("a built module is whole words");
-    Some(spirv::declared(&words).expect("a built module is well formed"))
+fn declared(code: &[u8]) -> Declared {
+    let words = spirv::words(code).expect("a built module is whole words");
+    spirv::declared(&words).expect("a built module is well formed")
 }
 
 /// Every compiled module, by entrypoint name, with what it declares.
@@ -96,15 +89,11 @@ fn declared(path: &std::path::Path) -> Option<Declared> {
 /// What survives here is what never needed a row: three sweeps that read the
 /// modules and nothing else.
 fn every_module() -> Vec<(String, Declared)> {
-    let dir = match SPV_DIR {
-        Some(d) => std::path::Path::new(d),
-        None => return Vec::new(),
-    };
     kernels_vulkan::entrypoints()
         .into_iter()
         .filter_map(|name| {
-            let d = declared(&dir.join(format!("{name}.spv")))?;
-            Some((name, d))
+            let code = kernels_vulkan::code(&name, kernels_vulkan::Capability::Baseline)?;
+            Some((name, declared(code)))
         })
         .collect()
 }
@@ -117,7 +106,7 @@ fn every_module() -> Vec<(String, Declared)> {
 /// a shader without deciding to.
 #[test]
 fn a_module_wider_than_the_guaranteed_floor_is_a_deliberate_bet() {
-    let _ = modules!();
+    modules!();
     let mut over = std::collections::BTreeMap::new();
     let mut checked = 0usize;
     for (name, d) in every_module() {
@@ -184,6 +173,23 @@ const PARAM_BLOCKS: &[(&str, u32, u32)] = &[
     ("logit_softcap_bfloat16", 2, 8),
     ("mxfp4_dequant_bf16", 3, 8),
     ("ple_combine_bfloat16", 3, 8),
+    // The fused norm+rope: 36 bytes at binding 2, where every other norm has
+    // 20 at binding 3. Both differences are the fusion. The binding moves
+    // because `x` is bound once as read-write where the norm alone binds an
+    // input and an output, so everything after `w` shifts down one; the size
+    // is `RmsParams` with the rotation's four scalars appended, because
+    // `binding::params` places a launch's scalars in a push range OR a
+    // parameter buffer and never both, and a norm needs the buffer.
+    //
+    // Six rows because the family mirrors `neox`'s and this table counts
+    // modules rather than routines -- five of the six have no routine yet and
+    // would otherwise be exactly the unchecked ABI the count exists to catch.
+    ("rms_rope_bfloat16", 2, 36),
+    ("rms_rope_decode_bfloat16", 2, 36),
+    ("rms_rope_freqs_bfloat16", 2, 36),
+    ("rms_rope_freqs_decode_bfloat16", 2, 36),
+    ("rms_rope_prop_bfloat16", 2, 36),
+    ("rms_rope_prop_decode_bfloat16", 2, 36),
     ("rms_residual_bfloat16", 3, 20),
     ("rms_residual_scaled_bfloat16", 3, 20),
     ("rms_single_row_bfloat16", 3, 20),
@@ -200,31 +206,22 @@ const PARAM_BLOCKS: &[(&str, u32, u32)] = &[
 
 /// The block sizes this crate derives are the ones an independent walk read.
 ///
-/// Two claims at once, and the second is the one that would rot. That the 39
-/// sizes agree is the arithmetic being right. That there are exactly 39 -- no
+/// Two claims at once, and the second is the one that would rot. That the 45
+/// sizes agree is the arithmetic being right. That there are exactly 45 -- no
 /// module has grown a parameter block this table does not know about, and none
 /// has lost one -- is what keeps a new kernel from arriving with an unchecked
 /// ABI and this file still passing.
 #[test]
 fn the_parameter_blocks_this_crate_measures_are_the_ones_the_modules_declare() {
-    let dir = modules!();
+    modules!();
     let mut found: Vec<(String, u32, u32)> = Vec::new();
     let mut disagreed = Vec::new();
 
-    for entry in std::fs::read_dir(dir).expect("the module directory is readable") {
-        let path = entry.expect("a directory entry").path();
-        if path.extension().is_none_or(|e| e != "spv") {
-            continue;
-        }
-        let name = path
-            .file_stem()
-            .expect("a name")
-            .to_string_lossy()
-            .into_owned();
-        let Some(d) = declared(&path) else { continue };
+    for &(name, code) in kernels_vulkan::MODULES {
+        let d = declared(code);
         for (binding, size) in d.block_bytes.iter().enumerate() {
             let Some(size) = size else { continue };
-            found.push((name.clone(), binding as u32, *size));
+            found.push((name.to_owned(), binding as u32, *size));
             let want = PARAM_BLOCKS
                 .iter()
                 .find(|(n, b, _)| *n == name && *b == binding as u32);
@@ -281,18 +278,14 @@ fn the_parameter_blocks_this_crate_measures_are_the_ones_the_modules_declare() {
 /// 40 kernel proofs and the on-device rule cross-checks pass.
 #[test]
 fn the_bindings_a_module_skips_are_the_ones_this_crate_calls_holes() {
-    let dir = modules!();
+    modules!();
     let mut modules = 0u32;
     let mut holed = 0u32;
     let mut holes = 0usize;
     let mut widest = 0usize;
 
-    for entry in std::fs::read_dir(dir).expect("the module directory reads") {
-        let path = entry.expect("an entry").path();
-        if path.extension().is_none_or(|e| e != "spv") {
-            continue;
-        }
-        let Some(d) = declared(&path) else { continue };
+    for &(name, code) in kernels_vulkan::MODULES {
+        let d = declared(code);
         modules += 1;
         // The invariant that makes `holes()` meaningful at all: `used` is
         // indexed by binding number, so it has to be as long as the layout or
@@ -300,8 +293,7 @@ fn the_bindings_a_module_skips_are_the_ones_this_crate_calls_holes() {
         assert_eq!(
             d.used.len(),
             d.bindings as usize,
-            "{}: {} slots and {} of them accounted for",
-            path.display(),
+            "{name}: {} slots and {} of them accounted for",
             d.bindings,
             d.used.len()
         );
@@ -311,9 +303,8 @@ fn the_bindings_a_module_skips_are_the_ones_this_crate_calls_holes() {
         if d.bindings > 0 {
             assert!(
                 *d.used.last().expect("a non-empty set"),
-                "{}: the highest binding is a hole, so `bindings` is not one \
-                 past it",
-                path.display()
+                "{name}: the highest binding is a hole, so `bindings` is not \
+                 one past it"
             );
         }
         if d.holes() > 0 {
@@ -321,14 +312,29 @@ fn the_bindings_a_module_skips_are_the_ones_this_crate_calls_holes() {
             holes += d.holes();
             if d.holes() > widest {
                 widest = d.holes();
-                eprintln!("WIDEST {} {}", path.display(), d.holes());
+                eprintln!("WIDEST {name} {}", d.holes());
             }
         }
     }
 
-    assert_eq!(modules, 666, "a different number of modules is built");
-    assert_eq!(holed, 165, "a different number of modules has a hole");
-    assert_eq!(holes, 406, "a different number of holes in all");
+    // 666/165/406 became 675/173/418 with the flash decode's nine modules.
+    // Twelve of the nine's holes are DELIBERATE, and they are the same shape
+    // twice over: `sdpa_paged_decode_split` inherits the eleven-binding decode
+    // header and writes no `out_` (binding 3) and reads no `sinks` (binding
+    // 10), and the four sinkless `sdpa_paged_decode_combine` modules declare
+    // `sinks` at binding 1 and never read it. Both are a variant sharing a
+    // header with its siblings, which is what most of the 406 already were.
+    // 675 became 681 with the fused norm+rope's six, and 173/418 did NOT
+    // move: not one of the six has a hole. That is worth a line because the
+    // family looked like it should have some -- the `freqs` arms declare an
+    // `inv_freq` at binding 4 that the plain arms do not -- but the extra
+    // binding is the LAST one rather than an interior one, so the plain arms
+    // simply declare four and stop. A family whose optional buffer is
+    // appended costs no holes; one whose optional buffer sits in the middle
+    // costs a hole in every sibling, which is most of the 418.
+    assert_eq!(modules, 681, "a different number of modules is built");
+    assert_eq!(holed, 173, "a different number of modules has a hole");
+    assert_eq!(holes, 418, "a different number of holes in all");
     // `cast_qmm_input_bfloat16_to_float16` is the deepest: it shares a header
     // with the matmul family it feeds, reads two of the thirteen bindings that
     // header declares, and `slangc` drops the other eleven. A driver counting

@@ -2,61 +2,16 @@
 //!
 //! Everything Pie generates *from* the IR tables rather than maintaining by
 //! hand. Each emitter is a pure function of the tables, so its output is
-//! byte-stable and a checked-in artifact can be diffed against it in CI —
-//! that drift test is the whole point: host and device cannot disagree about
-//! the op vocabulary or the RNG formula if both are printed from one source.
+//! byte-stable and CI can diff a checked-in artifact against it: host and
+//! device cannot disagree about the op vocabulary or the RNG formula if both
+//! are printed from one source.
 //!
-//! ## The ABI projections — one declaration, many languages
-//!
-//! A C header (`include/ptir_abi.h`) used to head this list, printing the op
-//! tags, the dtype/stage/port enums and the arity table for the C++ drivers to
-//! `#include`. Those drivers are gone — every backend is Rust now and reads
-//! [`tensor_ir`] directly — and the header went with them: nothing in the tree
-//! had `#include`d it since, and NVRTC is called with no include path at all
-//! (see `driver_cuda::program::compile`), so there was no path by which a
-//! device compile could have reached it.
-//!
-//! * [`rng`] — the MSL projection (`include/ptir_rng.generated.metal`) of the
-//!   canonical RNG contract in [`tensor_ir::rng`], plus the `__device__` CUDA
-//!   text [`cuda`] splices into every emitted source. The C++ header form of
-//!   that same text was deleted for the reason above; the CUDA projection
-//!   survives because the emitter, not a compiler include path, consumes it.
-//! * [`layout`] — the lane-table field list, printed as MSL and as CUDA and
-//!   pinned to the [`crate::codegen::plan`] `#[repr(C)]` structs with `offset_of!`. Adding
-//!   a field to one side without the other is a compile error rather than a
-//!   silent offset shift.
-//! * [`slots`] — the M1 operand-to-slot rule, shared by both region emitters.
-//!
-//! ## The region emitters
-//!
-//! [`cuda`] and [`metal`] take a [`crate::codegen::plan`]-produced [`CompiledStage`] and
-//! return source (or a refusal — see [`EmittedKernel`]). They are pure
-//! `Plan -> String` with no device-architecture inputs, which is what lets a
-//! kernel be emitted, diffed and reviewed on the host without a device in the
-//! loop. Supporting them:
-//!
-//! * [`op_view`] — a decoded, borrow-free view of a normalized op.
-//! * [`wellformed`] — what a plan must satisfy before *either* backend emits
-//!   from it, so that "well formed" cannot mean two things.
-//! * [`alias`] — when a reshape may be elided and its consumers pointed at its
-//!   source, and the table that carries that decision.
-//! * [`launch`] — the launch descriptors the drivers execute.
-//! * [`program`] — the whole-program bundle handed across the C ABI.
-//!
-//! Anything only one backend's driver reads lives under that backend, not here
-//! — see [`cuda::region_analysis`].
-//!
-//! Those last two are built out of [`driver`], which is why this crate
-//! is the one that reaches outside `compiler/`. That crate is the contract, not
-//! a driver: the compiler writes a `LaunchPackage` and the driver reads one out
-//! of the same declarations, so there is no second copy to keep in step.
-//!
-//! [`crate::codegen::plan`]: https://github.com/pie-project/pie/tree/dev/tensor-compiler's plan
-//! [`CompiledStage`]: https://github.com/pie-project/pie/tree/dev/tensor-compiler's plan
-//! [`EmittedKernel`]: program::EmittedKernel
-
-// The emitters were authored against `alloc` paths in the `no_std` IR crate and
-// still use them; `alloc` is available here through `std`.
+//! [`rng`], [`layout`] and [`slots`] project one declaration into several
+//! languages. [`cuda`] and [`metal`] turn a compiled stage into source and are
+//! pure `Plan -> String` with no device-architecture inputs, so a kernel can be
+//! emitted, diffed and reviewed without a device; [`op_view`], [`wellformed`],
+//! [`alias`], [`launch`] and [`program`] support them. Anything only one
+//! backend's driver reads lives under that backend — [`cuda::region_analysis`].
 
 pub mod alias;
 pub mod cuda;

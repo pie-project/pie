@@ -4,10 +4,10 @@
 //! (`.wiki/kernel-x/vulkan-refactor.md` §6 step 1), chosen because it is one
 //! kernel and so is the smallest thing that can prove the whole surface.
 
-use kernels::KernelSig;
 use kernels::routine::Refusal;
 
-use crate::routine::{Bind, Buf, BufMut, Ctx, Env, Fire, Routine};
+use crate::routine::{keys, Ask, Bind, Buf, BufMut, Ctx, Fire, Routine};
+use crate::routine::{InSlot, OutSlot};
 
 /// `sample/argmax.slang:11` — `#define PIE_GROUP_X 1024`.
 ///
@@ -37,11 +37,11 @@ const GROUP_X: u32 = 1024;
 /// Vulkan that runs nothing and reports success.
 pub fn argmax_logits(
     ctx: &Ctx<'_>,
-    logits: Buf,
-    next_token: BufMut,
-    params: Buf,
-    eos_flag: BufMut,
-    rows: Env<u32>,
+    logits: InSlot<0, Buf>,
+    next_token: OutSlot<0, BufMut>,
+    params: InSlot<1, Buf>,
+    eos_flag: OutSlot<1, BufMut>,
+    rows: Ask<keys::Rows, u32>,
 ) -> Result<(), Refusal> {
     if *rows == 0 {
         return Err(Refusal::Empty { what: "rows" });
@@ -58,20 +58,6 @@ pub fn argmax_logits(
 
 /// This family's routines.
 pub static ROUTINES: &[Routine] = &[crate::routine!(argmax_logits)];
-
-/// This family states no `kernel!` rows.
-///
-/// The first family to retire them, and the point of the whole refactor: the
-/// row and the body said the same thing about `argmax_logits` in two places,
-/// in two languages, compared by nothing. `driver-vulkan/src/arm.rs` now
-/// resolves `argmax_logits_bfloat16` to the routine above through the stem it
-/// states, so the row had no reader left.
-///
-/// `KERNELS` stays as an empty slice rather than being deleted outright
-/// because `crate::KERNELS` concatenates the families and `tests/entrypoints.rs`
-/// walks that concatenation; a family that vanished from the list would be
-/// indistinguishable from one that was never there.
-pub static KERNELS: &[KernelSig] = &[];
 
 /// The entrypoints this family's routines spell, now that its rows are gone.
 ///
@@ -124,7 +110,7 @@ mod tests {
     #[test]
     fn the_body_asks_for_the_entrypoint_and_the_order_the_shader_declares() {
         let seen = Seen::default();
-        argmax_logits(&seen, Buf(10), BufMut(11), Buf(12), BufMut(13), Env(7))
+        argmax_logits(&seen, InSlot::new(Buf(10)), OutSlot::new(BufMut(11)), InSlot::new(Buf(12)), OutSlot::new(BufMut(13)), Ask::new(7))
             .expect("seven rows is a launch");
 
         let calls = seen.0.borrow();
@@ -175,7 +161,7 @@ mod tests {
     fn an_empty_batch_is_refused_rather_than_dispatched() {
         let seen = Seen::default();
         assert_eq!(
-            argmax_logits(&seen, Buf(0), BufMut(1), Buf(2), BufMut(3), Env(0)),
+            argmax_logits(&seen, InSlot::new(Buf(0)), OutSlot::new(BufMut(1)), InSlot::new(Buf(2)), OutSlot::new(BufMut(3)), Ask::new(0)),
             Err(Refusal::Empty { what: "rows" })
         );
         assert!(

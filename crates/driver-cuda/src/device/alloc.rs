@@ -1,40 +1,8 @@
-//! Device allocation, and the capture discipline that makes it safe.
-//!
-//! # The problem this module exists to solve
-//!
-//! CUDA forbids synchronous allocation and free while a stream capture is
-//! open. Break the rule and the capture is invalidated -- but the diagnostic
-//! does not arrive at the offending call. It arrives later, on some unrelated
-//! operation, as a context-wide error. cudarc has this bug today (#590): its
-//! `Drop for CudaSlice` frees without consulting the capture state, so a
-//! buffer that goes out of scope inside a captured region poisons everything
-//! after it.
-//!
-//! The C++ shell obeys the rule by convention -- a comment, and reviewers who
-//! remember. That is exactly the class of invariant a rewrite should be
-//! cashing in, so this module encodes it twice, once for each half of the
-//! problem:
-//!
-//! * **Allocation** is prevented at compile time. [`Allocator::alloc`] takes
-//!   `&self`, [`Allocator::begin_capture`] takes `&mut self`, and the returned
-//!   [`CaptureScope`] holds that exclusive borrow for its whole life. An
-//!   `alloc` inside a capture does not fail at runtime; it does not build.
-//!   [`Allocator`] is deliberately **not** `Clone`, because a clone would be a
-//!   second handle the borrow does not cover.
-//!
-//! * **Freeing** cannot be prevented that way, because `Drop` is implicit and
-//!   runs wherever a value happens to die. So it is made harmless instead:
-//!   [`DeviceBuffer`]'s drop consults [`DeferState`] and, if a capture is
-//!   open, hands the pointer to a queue that is drained when the capture
-//!   closes. The pointer is still freed, just not at a moment CUDA forbids.
-//!
-//! # A note on testing
-//!
-//! [`DeferState`] is a pure state machine: it decides, and its caller acts.
-//! That split is what lets the interesting half of this module be tested on a
-//! machine with no CUDA -- the tests at the bottom drive real capture/free
-//! interleavings, including the cross-thread one that makes the naive
-//! "check an atomic, then free" version racy.
+//! Device allocation, and the capture discipline that makes it safe. CUDA
+//! forbids synchronous alloc/free during a stream capture (cudarc #590).
+//! Alloc is compile-time blocked (`&self` vs `begin_capture`'s `&mut self`,
+//! `Allocator: !Clone`); free can't be, so a dropped [`DeviceBuffer`] defers
+//! its pointer via [`DeferState`] until capture ends.
 
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
@@ -48,12 +16,8 @@ use crate::device::graph::Graph;
 use crate::device::stream::StreamRef;
 use crate::error::{Error, Result, check_rt, ignore_in_drop};
 
-/// A device address, held as an integer.
-///
-/// Not a `*mut c_void`, on purpose: the deferred queue is shared across
-/// threads, and an integer is `Send`/`Sync` without an `unsafe impl` that
-/// would have to be justified separately. It is converted back to a pointer at
-/// the single point where it is actually freed.
+/// A device address, held as an integer so the shared deferred queue is
+/// `Send`/`Sync` without an `unsafe impl`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct DevPtr(usize);
 
@@ -65,34 +29,19 @@ impl DevPtr {
 
 /// The capture-vs-free state machine, with no CUDA in it.
 ///
-/// Deciding and acting are split so the decision can be tested directly, and
-/// so the decision can be made under one lock -- which is the part that has to
-/// be atomic. Reading a capture flag and then freeing as two steps is racy: a
-/// capture can open in between, on another thread, and the free lands inside
-/// it.
+/// Deciding and acting are split under one lock: reading a capture flag then
+/// freeing is racy, since a capture can open on another thread in between.
 #[derive(Debug, Default)]
 struct DeferState {
-    /// Whether a capture is open. `bool` rather than a depth counter because
-    /// `begin_capture` takes `&mut Allocator`, so at most one scope can exist
-    /// at a time and a second one cannot be asked for.
+    /// Whether a capture is open — a `bool`, not a counter, since only one
+    /// scope can exist at a time.
     capturing: bool,
     /// Pointers whose free was deferred, in the order they died.
     pending: Vec<DevPtr>,
-    /// Bytes this allocator has handed out and not yet freed.
-    ///
-    /// A LEAK IS A CLAIM ABOUT THE DRIVER, not about the device. Reading
-    /// `cudaMemGetInfo` answers "how much does this GPU have left", which
-    /// is a different question and not one this process can answer alone:
-    /// a second consumer allocating during the measurement looks exactly
-    /// like a leak here, and did (`serve.rs`'s fifty-step soak, against a
-    /// concurrent agent on the same L40S).
-    ///
-    /// This counts what the shell OWNS. It falls to zero when the shell
-    /// is destroyed, whatever else is on the card.
+    /// Bytes handed out and not yet freed — what the shell owns, not device
+    /// free memory (`cudaMemGetInfo` can't tell a leak from another consumer).
     live: usize,
-    /// Bytes freed while a capture was open and not yet reclaimed. Counted
-    /// out of `live` at release, so a deferred free is not a leak — but
-    /// named, because a deferral that is never drained IS one.
+    /// Bytes freed during a capture, not yet reclaimed; never draining this is a leak.
     deferred: usize,
 }
 
@@ -129,14 +78,8 @@ impl DeferState {
     }
 }
 
-/// The shared half of an [`Allocator`] -- what a [`DeviceBuffer`] keeps a
-/// handle on so it can release itself.
-///
-/// Note what is NOT here: any way to allocate. That is what makes the
-/// compile-time half of the discipline hold. A `DeviceBuffer` can reach its
-/// allocator's *release* path from anywhere, including another thread, but
-/// nothing can reach `alloc` except through the `&self` borrow of the
-/// `Allocator` itself.
+/// The shared half of an [`Allocator`], the handle a [`DeviceBuffer`] keeps so
+/// it can release itself from any thread. No `alloc` here: that stays behind `&self`.
 #[derive(Debug, Default)]
 struct AllocatorInner {
     state: Mutex<DeferState>,
@@ -166,16 +109,8 @@ impl AllocatorInner {
 
 /// The owner of device memory, and the gate on stream capture.
 ///
-/// Not `Clone`, and not by omission: a second handle would be a second way to
-/// call [`Allocator::alloc`] that the `&mut self` borrow in
-/// [`Allocator::begin_capture`] does not cover, which is the entire mechanism.
-/// That absence is load-bearing, so it is checked rather than asserted:
-///
-/// ```compile_fail
-/// use driver_cuda::device::Allocator;
-/// let a = Allocator::new();
-/// let b = a.clone();
-/// ```
+/// Not `Clone`: a second handle would be an uncovered path to
+/// [`Allocator::alloc`] around `begin_capture`'s `&mut self` borrow.
 #[derive(Debug, Default)]
 pub struct Allocator {
     inner: Arc<AllocatorInner>,
@@ -187,13 +122,8 @@ impl Allocator {
         Self::default()
     }
 
-    /// Allocate `bytes` of device memory.
-    ///
-    /// Takes `&self`, which is what makes this uncallable while a
-    /// [`CaptureScope`] is alive: the scope holds `&mut self`.
-    ///
-    /// A zero-byte request is honoured without calling CUDA and yields a
-    /// null-pointer buffer, matching the C++ `DeviceBuffer(0)`.
+    /// Allocate `bytes` of device memory. Takes `&self`, so it is uncallable
+    /// while a [`CaptureScope`] holds `&mut self`; zero bytes yields a null buffer.
     pub fn alloc(&self, bytes: usize) -> Result<DeviceBuffer> {
         if bytes == 0 {
             return Ok(DeviceBuffer {
@@ -215,20 +145,7 @@ impl Allocator {
         })
     }
 
-    /// Bytes this allocator has handed out and not yet freed.
-    ///
-    /// What a leak test should read. `cudaMemGetInfo` answers a question
-    /// about the DEVICE, which a process sharing a GPU cannot answer for
-    /// itself -- a second consumer allocating during the measurement is
-    /// indistinguishable from a leak, and the fifty-step soak failed that
-    /// way against a concurrent agent. This is a claim about the SHELL,
-    /// and it falls to zero when the shell is destroyed whatever else is
-    /// on the card.
-    ///
-    /// Excludes deferred frees: a buffer released during a capture is
-    /// counted out here and freed when the capture ends. See
-    /// [`Self::deferred_bytes`] for the ones still waiting, which is the
-    /// number that says a deferral was never drained.
+    /// Bytes handed out and not yet freed — what a leak test reads (excludes deferred frees).
     #[must_use]
     pub fn live_bytes(&self) -> usize {
         self.inner
@@ -238,10 +155,8 @@ impl Allocator {
             .live
     }
 
-    /// Bytes freed during an open capture and not yet reclaimed.
-    ///
-    /// Zero everywhere except inside a capture. A non-zero value with no
-    /// capture open is a drain that never ran.
+    /// Bytes freed during an open capture and not yet reclaimed; nonzero with
+    /// no capture open means a drain never ran.
     #[must_use]
     pub fn deferred_bytes(&self) -> usize {
         self.inner
@@ -253,37 +168,12 @@ impl Allocator {
 
     /// Begin capturing `stream` into a graph.
     ///
-    /// The exclusive borrow is the point. For as long as the returned scope
-    /// lives, this allocator cannot allocate, because `alloc` needs `&self`
-    /// and the scope holds `&mut self`.
-    ///
-    /// The mode is `Global`, matching `batch/`'s `cudaStreamCaptureModeGlobal`:
-    /// it is the strictest of the three and the one that actually catches a
-    /// stray synchronous call rather than quietly tolerating it.
-    ///
-    /// # The warm-up, and the stray call it caught
-    ///
-    /// The sentence above was not decoration — Global mode caught one, and it
-    /// was the JIT's. [`fire::supergraph::warm`] compiles the two arming
-    /// kernels HERE, before the capture opens, because they are the only
-    /// device text in the tree launched exclusively from inside a capture:
-    /// their first `jit::cache::resolve` therefore ran with a capture open,
-    /// where its `cudaFree(null)` is a prohibited call, and the capture came
-    /// back `cudaErrorStreamCaptureInvalidated`. Every conditional in the
-    /// engine failed that way.
-    ///
-    /// This is the one door every capture in the crate goes through, which is
-    /// why the warm is here rather than at the eight call sites, any one of
-    /// which could forget it. After the first capture of the process it is
-    /// two `OnceLock` reads.
-    ///
-    /// **A refused warm is not a refused capture.** A graph with no
-    /// conditional in it needs neither kernel, and refusing the whole capture
-    /// because a branch it may never take will not compile would trade a
-    /// working straight-line graph for nothing. `open_cond` refuses on its
-    /// own when the time comes, which is the layer that knows.
-    ///
-    /// [`fire::supergraph::warm`]: crate::fire::supergraph::warm
+    /// The returned scope holds `&mut self`, so no allocation while it lives.
+    /// Mode is `Global`, the strictest, to catch a stray sync call.
+    /// [`warm`](crate::fire::supergraph::warm) JIT-compiles the arming
+    /// kernels before capture opens: their first resolve does an illegal
+    /// `cudaFree(null)` inside a capture. A refused warm isn't a refused
+    /// capture — `open_cond` refuses later for an unbuildable kernel.
     pub fn begin_capture<'a>(&'a mut self, stream: StreamRef<'a>) -> Result<CaptureScope<'a>> {
         let _ = crate::fire::supergraph::warm();
         {
@@ -299,9 +189,7 @@ impl Allocator {
             },
             "cudaStreamBeginCapture",
         ) {
-            // The flag went up before the call, so it has to come back down if
-            // the call refused -- otherwise the allocator is wedged in a
-            // capture that never started.
+            // Undo the flag on refusal, or the allocator wedges in a capture that never started.
             let freed = {
                 let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
                 st.end()
@@ -316,10 +204,8 @@ impl Allocator {
         })
     }
 
-    /// How many frees are currently parked waiting for a capture to close.
-    ///
-    /// Exposed for tests and for a metric: a number that is persistently
-    /// non-zero outside a capture would mean the drain is not running.
+    /// Frees parked waiting for a capture to close; persistently nonzero
+    /// outside a capture means the drain isn't running.
     pub fn deferred_free_count(&self) -> usize {
         self.inner
             .state
@@ -340,12 +226,9 @@ impl Allocator {
 }
 
 /// An open stream capture, holding the allocator shut for its lifetime.
-///
-/// Ending is explicit ([`CaptureScope::end`]) because ending produces a
-/// [`Graph`], and a `Drop` cannot hand one back. Dropping without ending is
-/// still correct -- the capture is closed and the graph discarded -- so a `?`
-/// on some other line in the middle of a capture cannot leave the stream
-/// captured forever.
+/// Ending is explicit ([`CaptureScope::end`]) since `Drop` can't return the
+/// [`Graph`] it makes; dropping without ending still closes the capture, so a
+/// `?` mid-capture can't strand the stream.
 #[derive(Debug)]
 pub struct CaptureScope<'a> {
     alloc: &'a mut Allocator,
@@ -361,11 +244,8 @@ impl<'a> CaptureScope<'a> {
 
     /// Close the capture and take the graph.
     ///
-    /// Draining the deferred frees happens here, after `cudaStreamEndCapture`
-    /// has returned: that is the first instant at which calling `cudaFree` is
-    /// legal again.
-    /// `finish` clears `open`, so the `Drop` that runs on the way out of this
-    /// function is a no-op and does not try to end the capture a second time.
+    /// Deferred frees drain here, once `cudaStreamEndCapture` returns — the
+    /// first instant `cudaFree` is legal again.
     pub fn end(mut self) -> Result<Graph> {
         self.finish()
     }
@@ -386,9 +266,7 @@ impl<'a> CaptureScope<'a> {
             "cudaStreamEndCapture",
         );
 
-        // Drain regardless of whether the capture ended cleanly. A failed
-        // capture is exactly the case where parked pointers would otherwise be
-        // stranded, and by this point the capture is closed either way.
+        // Drain even on failure: a failed capture is exactly when parked pointers strand.
         let freed = {
             let mut st = self
                 .alloc
@@ -408,22 +286,14 @@ impl<'a> CaptureScope<'a> {
 impl Drop for CaptureScope<'_> {
     fn drop(&mut self) {
         if self.open {
-            // Discards the graph and any error: this is the abandonment path
-            // (an early return out of a capture), and what matters is that the
-            // stream does not stay captured and the queue does not stay
-            // parked. Dropping the `Result` drops any `Graph` inside it, which
-            // destroys it -- the discard is complete, not a leak.
+            // Abandonment path: close the stream and drain; the graph and any error are discarded.
             ignore_in_drop(self.finish());
         }
     }
 }
 
-/// An owning region of device memory.
-///
-/// The port of `csrc/src/device_buffer.hpp`, with the C++ class's move-only
-/// discipline replaced by Rust's default one, and with its unconditional
-/// `cudaFree` in the destructor replaced by the capture-aware release that is
-/// the whole point of this module.
+/// An owning region of device memory; `Drop` performs the capture-aware
+/// release this module exists for.
 #[derive(Debug)]
 pub struct DeviceBuffer {
     ptr: DevPtr,
@@ -431,28 +301,13 @@ pub struct DeviceBuffer {
     owner: Arc<AllocatorInner>,
 }
 
-/// A device-to-host read from a RAW span — a base and a length that the
-/// caller knows names live device memory.
-///
-/// The `unsafe` for this sat in `weights/stage::read_span`, which is a
-/// module that only wants the bytes back reaching for `cudaMemcpyAsync`
-/// itself. §7: `device/` is the only place vendor vocabulary is
-/// correct, and the way to hold `#![forbid(unsafe_code)]` elsewhere is
-/// for it to OFFER the operation rather than for callers to spell it.
-///
-/// Prefer [`DeviceBuffer::read_at`], which checks the span against a
-/// length it owns. This exists for the case where the caller holds a
-/// span into a buffer it does not have in hand — a published weight,
-/// whose base came from the load plan.
+/// A device-to-host read from a raw base; prefer [`DeviceBuffer::read_at`]
+/// when the caller owns the buffer (this is for a published weight's base).
 ///
 /// # Safety
 ///
-/// `src` must name at least `dst.len()` readable device bytes for the
-/// duration of the copy, and `stream` must outlive it.
-///
-/// # Errors
-///
-/// The copy faulted.
+/// `src` must name at least `dst.len()` readable device bytes for the copy's
+/// duration, and `stream` must outlive it.
 pub unsafe fn read_raw_span(
     src: *const c_void,
     dst: &mut [u8],
@@ -475,31 +330,14 @@ pub unsafe fn read_raw_span(
     )
 }
 
-/// A host-to-device write into a RAW span — a base the caller knows names
-/// live device memory.
-///
-/// [`read_raw_span`]'s opposite, added for north-star §5 step 7: FlashInfer's
-/// planner used to write its descriptor into the workspace's page-locked
-/// mirror and issue its own `cudaMemcpyAsync` (`attention_flashinfer.cu:193`),
-/// and the Rust planner returns the bytes instead —
-/// `kernels_cuda::attn::plan::Plan::int_upload` — precisely so that the copy
-/// lands beside the launch that reads it. This is the copy.
-///
-/// Prefer [`DeviceBuffer::write_at`], which checks the span against a length
-/// it owns. This exists for the case the plan is in: the destination is
-/// `AttentionWorkspaceView::int_buffer`, a base that arrives from the fire
-/// with only a byte count beside it and no [`DeviceBuffer`] in hand.
+/// A host-to-device write into a raw base; prefer [`DeviceBuffer::write_at`]
+/// when the caller owns the buffer (this is for a fire destination by byte count).
 ///
 /// # Safety
 ///
-/// `dst` must name at least `src.len()` writable device bytes for the duration
-/// of the copy, and `stream` must outlive it. `src` is read before this
-/// returns only if it is page-locked; for pageable memory the runtime stages
-/// it, so the caller must keep `src` alive until the stream is synchronised.
-///
-/// # Errors
-///
-/// The copy faulted.
+/// `dst` must name at least `src.len()` writable device bytes for the copy's
+/// duration; pageable `src` is staged asynchronously, so keep it alive until
+/// the stream is synchronised.
 pub unsafe fn write_raw_span(dst: *mut c_void, src: &[u8], stream: StreamRef<'_>) -> Result<()> {
     if src.is_empty() {
         return Ok(());
@@ -518,31 +356,14 @@ pub unsafe fn write_raw_span(dst: *mut c_void, src: &[u8], stream: StreamRef<'_>
     )
 }
 
-/// A device-to-device copy between two RAW spans.
-///
-/// [`read_raw_span`]'s sibling, added for the same reason and by the same
-/// rule: `tower::qwen3_vl`'s scatter writes each image's merged tokens into
-/// the fire's hidden rows at `hidden + anchor * out_hidden`, and into the
-/// deepstack scratch at `scratch + d * n_rows * out_hidden + anchor *
-/// out_hidden`. Neither destination is a [`DeviceBuffer`] this crate holds —
-/// both arrive as a base pointer from the fire — so [`DeviceBuffer::write_at`]
-/// cannot express the copy, and §7's *"`device/` is the only place vendor
-/// vocabulary is correct"* says the operation is OFFERED here rather than
-/// spelled with a `cudaMemcpyAsync` in a `tower/` module.
-///
-/// The C++ this replaces is `qwen3_vl_tower.cu:505-509`'s two
-/// `cudaMemcpyAsync(..., cudaMemcpyDeviceToDevice, S)`.
+/// A device-to-device copy between two raw bases, which
+/// [`DeviceBuffer::write_at`] cannot express.
 ///
 /// # Safety
 ///
-/// `src` must name at least `bytes` readable device bytes and `dst` at least
-/// `bytes` writable ones, both for the duration of the copy, and `stream`
-/// must outlive it. The two spans must not overlap — `cudaMemcpyAsync` is not
-/// a `memmove`.
-///
-/// # Errors
-///
-/// The copy faulted.
+/// `src`/`dst` must each name `bytes` valid device memory (read/write
+/// respectively) for the copy's duration, and `stream` must outlive it. The
+/// spans must not overlap — `cudaMemcpyAsync` is not a `memmove`.
 pub unsafe fn copy_raw_span(
     dst: *mut c_void,
     src: *const c_void,
@@ -566,25 +387,13 @@ pub unsafe fn copy_raw_span(
     )
 }
 
-/// A byte fill over a RAW span.
-///
-/// [`copy_raw_span`]'s reason, on the other side of the same call:
-/// `tower::qwen3_vl`'s scatter zeroes the WHOLE deepstack scratch
-/// (`qwen3_vl_tower.cu:397`) so the decoder can add it into the hidden rows
-/// as a plain whole-tensor residual — non-image rows contribute zero — and
-/// that buffer is the fire's, not one of ours.
-///
-/// Prefer [`DeviceBuffer::memset`] and [`DeviceBuffer::memset_at`], which
-/// check the span against a length they own.
+/// A byte fill over a raw base that is the fire's, not one of ours; prefer
+/// [`DeviceBuffer::memset`]/[`DeviceBuffer::memset_at`] when owned.
 ///
 /// # Safety
 ///
-/// `dst` must name at least `bytes` writable device bytes for the duration of
-/// the fill, and `stream` must outlive it.
-///
-/// # Errors
-///
-/// The fill faulted.
+/// `dst` must name at least `bytes` writable device bytes for the fill's
+/// duration, and `stream` must outlive it.
 pub unsafe fn fill_raw_span(
     dst: *mut c_void,
     value: u8,
@@ -616,29 +425,15 @@ impl DeviceBuffer {
         self.bytes == 0
     }
 
-    /// The address `offset` bytes in, or `None` if that leaves the
-    /// allocation.
-    ///
-    /// The safe form of `base.byte_add(offset)`, which `weights/stage`
-    /// wrote by hand with a SAFETY comment arguing that "the offset is
-    /// the plan's own and the arena was sized from `persistent_bytes`".
-    /// That argument is true and it is also unavailable to the compiler;
-    /// the buffer knows its own length, so it can just check.
-    ///
-    /// A span is a base and a count, so this takes the count too — an
-    /// offset that is in bounds for a zero-length read and out for the
-    /// read that follows is the interesting case, and answering only the
-    /// first question would miss it.
+    /// The address `offset` bytes in, or `None` if `offset + len` leaves the
+    /// allocation — checks `len` too, since in-bounds for an empty read can be
+    /// out-of-bounds for the read that follows.
     pub fn ptr_at(&self, offset: usize, len: usize) -> Option<*mut c_void> {
         let end = offset.checked_add(len)?;
         (end <= self.bytes).then(|| self.ptr.as_raw().wrapping_byte_add(offset))
     }
 
-    /// Copy host bytes in, ordered on `stream`.
-    ///
-    /// Refuses a source that does not fit rather than truncating, because the
-    /// CUDA call would happily write past the allocation if the length were
-    /// computed rather than checked.
+    /// Copy host bytes in, ordered on `stream`; refuses an oversized source rather than truncating.
     pub fn copy_from_host(&mut self, src: &[u8], stream: StreamRef<'_>) -> Result<()> {
         if src.len() > self.bytes {
             return Err(Error::invalid(
@@ -663,10 +458,7 @@ impl DeviceBuffer {
         )
     }
 
-    /// Copy device bytes out, ordered on `stream`.
-    ///
-    /// Asynchronous: the caller must synchronize `stream` before reading
-    /// `dst`, exactly as with the C++ original.
+    /// Copy device bytes out, ordered on `stream` (async — synchronize before reading `dst`).
     pub fn copy_to_host(&self, dst: &mut [u8], stream: StreamRef<'_>) -> Result<()> {
         if dst.len() > self.bytes {
             return Err(Error::invalid(
@@ -713,11 +505,7 @@ impl DeviceBuffer {
         )
     }
 
-    /// Fill a SPAN of this buffer with a byte value, ordered on `stream`.
-    ///
-    /// # Errors
-    ///
-    /// If the span leaves the allocation.
+    /// Fill a span of this buffer with a byte value, ordered on `stream`.
     pub fn memset_at(
         &mut self,
         offset: usize,
@@ -742,20 +530,9 @@ impl DeviceBuffer {
         )
     }
 
-    /// Copy host bytes into a SPAN of this buffer, ordered on `stream`.
-    ///
-    /// The offset form exists because the PTIR plane's buffers are arrays of
-    /// records rather than single values: one channel's cell inside an
-    /// instance's ring, one lane's record inside a lane table. Without it a
-    /// caller would either allocate per record — thousands of allocations per
-    /// fire — or rebuild the whole buffer to change one entry.
-    ///
-    /// # Errors
-    ///
-    /// If the span leaves the allocation. Checked as `offset + len` in
-    /// `u64`-widened arithmetic rather than as `offset < bytes`, because the
-    /// second passes for a span that starts inside and ends outside, and CUDA
-    /// would write past the allocation without complaining.
+    /// Copy host bytes into a span of this buffer, ordered on `stream`. Bounds
+    /// are checked as `offset + len` (`u64`-widened), not `offset < bytes` —
+    /// which would let a span starting inside and ending outside write past.
     pub fn write_at(&mut self, offset: usize, src: &[u8], stream: StreamRef<'_>) -> Result<()> {
         self.check_span("cudaMemcpyAsync (write_at)", offset, src.len())?;
         if src.is_empty() {
@@ -775,14 +552,8 @@ impl DeviceBuffer {
         )
     }
 
-    /// Copy a SPAN of this buffer out to the host, ordered on `stream`.
-    ///
-    /// Asynchronous, like [`Self::copy_to_host`]: synchronize before reading
-    /// `dst`.
-    ///
-    /// # Errors
-    ///
-    /// If the span leaves the allocation.
+    /// Copy a span of this buffer to the host, ordered on `stream` (async —
+    /// synchronize before reading `dst`).
     pub fn read_at(&self, offset: usize, dst: &mut [u8], stream: StreamRef<'_>) -> Result<()> {
         self.check_span("cudaMemcpyAsync (read_at)", offset, dst.len())?;
         if dst.is_empty() {
@@ -831,16 +602,9 @@ impl Drop for DeviceBuffer {
 mod tests {
     use super::*;
 
-    // Everything below drives `DeferState` directly. That is the half of this
-    // module with a decision in it, and it runs with no CUDA present.
+    // Everything below drives `DeferState` directly, with no CUDA present.
 
-    /// The accounting a leak test reads, driven where no GPU is needed.
-    ///
-    /// It exists because `cudaMemGetInfo` answers a question about the
-    /// DEVICE and a process sharing a GPU cannot answer that for itself.
-    /// This is the SHELL's number, so it is a pure function of what the
-    /// shell asked for and gave back — which is exactly what makes it
-    /// checkable here.
+    /// A pure function of what the shell asked for and gave back, checkable with no GPU.
     #[test]
     fn the_live_count_follows_the_buffers_and_not_the_device() {
         let mut st = DeferState::default();
@@ -850,10 +614,7 @@ mod tests {
         assert_eq!(st.live, 3072);
         assert_eq!(st.deferred, 0, "no capture, nothing deferred");
 
-        // A free DURING a capture is still not live — it is the caller's
-        // no more — but it is not reclaimed either, and the two facts are
-        // different numbers because a deferral that never drains is a
-        // leak while a deferral that does is not.
+        // During a capture, `live` drops but nothing is reclaimed yet.
         st.begin().unwrap();
         assert_eq!(st.release(DevPtr(2), 2048), None, "parked, not freed");
         assert_eq!(st.live, 1024, "the caller gave it back");
@@ -889,8 +650,7 @@ mod tests {
         let _ = st.release(DevPtr(2), 0);
         let _ = st.release(DevPtr(3), 0);
         assert_eq!(st.end(), vec![DevPtr(1), DevPtr(2), DevPtr(3)]);
-        // and the queue is empty afterwards, so a second capture does not
-        // re-free what the first one already released.
+        // Empty afterward: a second capture can't re-free what the first released.
         assert!(st.pending.is_empty());
         st.begin().unwrap();
         assert!(st.end().is_empty());
@@ -914,14 +674,8 @@ mod tests {
 
     #[test]
     fn the_decision_and_the_queue_move_under_one_lock() {
-        // The race the split exists to close: a buffer dying on another thread
-        // while a capture opens here. Because `release` takes the same lock
-        // that `begin` does, every pointer is either freed before the capture
-        // or parked by it -- never freed inside it.
-        //
-        // Driven through `AllocatorInner`'s decision path with the actual
-        // `cudaFree` replaced by counting, which is what the pure state
-        // machine makes possible.
+        // The race this closes: a buffer dying on one thread while a capture
+        // opens on another. `cudaFree` is replaced here by counting.
         use std::sync::Barrier;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -952,8 +706,7 @@ mod tests {
         }
         releaser.join().unwrap();
 
-        // Whatever the interleaving, every pointer is accounted for exactly
-        // once: freed outside a capture, or parked and drained by one.
+        // Every pointer is accounted for exactly once, whatever the interleaving.
         let leftover = state.lock().unwrap().end().len();
         assert_eq!(
             freed_outside.load(Ordering::Relaxed) + parked_total + leftover,
@@ -963,10 +716,7 @@ mod tests {
 
     #[test]
     fn a_failed_capture_still_drains_what_was_parked() {
-        // The `finish` path drains even when `cudaStreamEndCapture` errors,
-        // because a failed capture is precisely when parked pointers would
-        // otherwise be stranded. Driven at the state-machine level, since the
-        // CUDA call itself is not what is under test.
+        // `finish` must drain even when `cudaStreamEndCapture` errors, or parked pointers strand.
         let mut st = DeferState::default();
         st.begin().unwrap();
         let _ = st.release(DevPtr(0xdead), 0);

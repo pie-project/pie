@@ -127,8 +127,6 @@
 //! produces fluent, wrong text, which is the failure this crate is built
 //! against.
 
-use std::collections::BTreeMap;
-
 use anyhow::{Result, anyhow, bail};
 
 use ::driver_api::{
@@ -156,14 +154,6 @@ const DEFAULT_KV_PAGES: u32 = 1024;
 pub struct VulkanDriver {
     shell: Option<driver_vulkan::shell::Shell>,
     facts: ::driver_api::DeviceFacts,
-    /// The compiled SPIR-V, by entrypoint. Read once at `create`, because a
-    /// module set is a property of the build rather than of a model, and
-    /// re-reading it per load would let two models on one device disagree
-    /// about which kernels exist.
-    modules: BTreeMap<String, Vec<u8>>,
-    /// Where the boot config pointed, kept for the message a failed load
-    /// gives: "no kernel named X" is unhelpful without saying where it looked.
-    module_dir: std::path::PathBuf,
     kv_pages: u32,
     broker: CompletionBroker,
     /// The PTIR channel plane: programs, channels and their instances.
@@ -179,23 +169,25 @@ pub struct VulkanDriver {
 }
 
 impl VulkanDriver {
-    /// Open the default Vulkan device and read the kernel modules.
+    /// Open the default Vulkan device.
+    ///
+    /// The kernels are not looked for. `kernels-vulkan` compiles them into its
+    /// rlib and `driver-vulkan` serves them from there, so a build either has
+    /// them or does not and no configuration can change the answer. This used
+    /// to read a directory named by `[model] kernels`, which named an `OUT_DIR`
+    /// -- a build rather than a deployment -- so a `pie` that was moved off the
+    /// machine that built it failed at its first fire.
     ///
     /// # Errors
     ///
-    /// No Vulkan device, or no readable module directory. Both are boot
-    /// conditions rather than runtime ones, and both are worth failing at
-    /// boot: a server that started without kernels would refuse its first
-    /// request instead of its first configuration.
+    /// No Vulkan device. A boot condition rather than a runtime one, and worth
+    /// failing at boot: a server that started without a device would refuse its
+    /// first request instead of its first configuration.
     pub fn create(config_bytes: &[u8]) -> Result<Self> {
         // The boot TOML is the ENGINE's format, read here for the same reason
         // the Metal seam reads it here: a driver that parsed it would be the
         // second thing entitled to an opinion about the file's shape.
-        let Boot {
-            module_dir,
-            kv_pages,
-        } = boot_of(config_bytes)?;
-        let modules = read_modules(&module_dir)?;
+        let Boot { kv_pages } = boot_of(config_bytes)?;
 
         // Opened and dropped: the facts are all `create` owes, and holding a
         // device open until `load_model` would hold the whole GPU against a
@@ -208,8 +200,6 @@ impl VulkanDriver {
         Ok(Self {
             shell: None,
             facts,
-            modules,
-            module_dir,
             kv_pages,
             broker: CompletionBroker::new(),
             programs: driver_vulkan::programs::Programs::new(),
@@ -232,12 +222,10 @@ impl VulkanDriver {
     /// This is the state a real driver is in between `create` and
     /// `load_model` -- no shell, an empty registry -- with two differences:
     /// its facts were never measured, so they are the specification's floor
-    /// rather than a device's answer, and it holds no modules, because a
-    /// module set is read from a directory and CI has no reason to have one.
+    /// rather than a device's answer.
     ///
     /// It exists because CI has no GPU, and this seam's seven existing tests
-    /// all SHORT-CIRCUIT when `PIE_KERNELS_VULKAN_SPV_DIR` is unset or no
-    /// device answers -- so on a machine without a card, not one verb of the
+    /// all SHORT-CIRCUIT when no device answers -- so on a machine without a card, not one verb of the
     /// fourteen was ever called. An `impl` that compiles proves only that a
     /// method exists; `todo!()`, `unimplemented!()` and a silent `Ok(())` all
     /// compile too, and the last would take a KV copy the scheduler then
@@ -249,8 +237,6 @@ impl VulkanDriver {
         Self {
             shell: None,
             facts: driver_vulkan::facts::floor(),
-            modules: BTreeMap::new(),
-            module_dir: std::path::PathBuf::from("<none: this driver read no modules>"),
             kv_pages: 0,
             broker: CompletionBroker::new(),
             programs: driver_vulkan::programs::Programs::new(),
@@ -318,14 +304,8 @@ impl Driver for VulkanDriver {
                 pages: self.kv_pages,
                 ..driver_vulkan::shell::Deployment::default()
             },
-            self.modules.clone(),
         )
-        .map_err(|e| {
-            anyhow!(
-                "driver-vulkan: the shell would not open with the modules in {:?}: {e}",
-                self.module_dir
-            )
-        })?;
+        .map_err(|e| anyhow!("driver-vulkan: the shell would not open: {e}"))?;
 
         for (name, bytes) in stage(path, &meta, row, &wanted)? {
             shell
@@ -771,8 +751,6 @@ impl Driver for VulkanDriver {
 /// reader and no test is one that gets discovered broken by a server booting
 /// with the wrong pool size and saying nothing about it.
 struct Boot {
-    /// Where the compiled SPIR-V modules are.
-    module_dir: std::path::PathBuf,
     /// How many KV pages the shell allocates.
     kv_pages: u32,
 }
@@ -781,7 +759,10 @@ struct Boot {
 ///
 /// # Errors
 ///
-/// No module directory, from either the file or the environment.
+/// None today. The signature keeps its `Result` because this is the engine's
+/// half of a contract with the worker and the next key added here is as likely
+/// to be required as not; a caller that had to be taught to handle a failure
+/// later is a caller that stops checking in the meantime.
 fn boot_of(config_bytes: &[u8]) -> Result<Boot> {
     // The boot TOML is the ENGINE's format, read here for the same reason
     // the Metal seam reads it here: a driver that parsed it would be the
@@ -789,61 +770,16 @@ fn boot_of(config_bytes: &[u8]) -> Result<Boot> {
     let boot = std::str::from_utf8(config_bytes)
         .ok()
         .and_then(|text| text.parse::<toml::Table>().ok());
-    // The directory `kernels-vulkan`'s build script wrote, which reaches
-    // this crate only if it is asked for. It is NOT a dependency of this
-    // one: the engine linking a shader compiler to run a driver would be
-    // the build-time equivalent of loading a checkpoint format, and a
-    // driver consumes modules rather than producing them.
-    let module_dir = boot
-        .as_ref()
-        .and_then(|v| Some(v.get("model")?.get("kernels")?.as_str()?.to_string()))
-        .or_else(|| std::env::var("PIE_KERNELS_VULKAN_SPV_DIR").ok())
-        .map(std::path::PathBuf::from)
-        .ok_or_else(|| {
-            anyhow!(
-                "driver-vulkan: no SPIR-V module directory. Set `[model] kernels` in the \
-                 boot config or PIE_KERNELS_VULKAN_SPV_DIR to the directory \
-                 `kernels-vulkan` built."
-            )
-        })?;
+    // `[model] kernels` STOOD HERE, naming the directory `kernels-vulkan`'s
+    // build script wrote, with `PIE_KERNELS_VULKAN_SPV_DIR` behind it. Both
+    // are gone: the modules are in `driver-vulkan`'s rlib, so there is no
+    // path to state and no way for a deployment to state a wrong one.
     let kv_pages = boot
         .as_ref()
         .and_then(|v| v.get("model")?.get("kv_pages")?.as_integer())
         .and_then(|n| u32::try_from(n).ok())
         .unwrap_or(DEFAULT_KV_PAGES);
-    Ok(Boot {
-        module_dir,
-        kv_pages,
-    })
-}
-
-/// Every `.spv` in `dir`, by file stem.
-///
-/// The stem is the entrypoint name, which is the key `Shell` looks a module up
-/// under. A directory with none is an error and not an empty map: a shell
-/// opened with no modules fails at its first fire with a message about a
-/// missing kernel, which is a long way from the configuration that caused it.
-fn read_modules(dir: &std::path::Path) -> Result<BTreeMap<String, Vec<u8>>> {
-    let mut modules = BTreeMap::new();
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| anyhow!("driver-vulkan: cannot read the module directory {dir:?}: {e}"))?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "spv")
-            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-        {
-            let bytes = std::fs::read(&path)
-                .map_err(|e| anyhow!("driver-vulkan: cannot read {path:?}: {e}"))?;
-            modules.insert(stem.to_string(), bytes);
-        }
-    }
-    if modules.is_empty() {
-        bail!(
-            "driver-vulkan: no `.spv` modules in {dir:?}. A shell opened with none fails at \
-             its first fire, a long way from the configuration that caused it."
-        );
-    }
-    Ok(modules)
+    Ok(Boot { kv_pages })
 }
 
 /// Every weight the decode plan binds, under the name that plan uses.
@@ -1104,6 +1040,15 @@ fn text_of(
         // `false` here does not get an error -- it gets a text with no bias
         // in it, which is fluent and wrong, and is why the fact exists.
         add_bias: true,
+        // The second line where this seam disagrees with `driver-metal`'s
+        // constant, and the first where the disagreement is a whole kernel
+        // rather than a resolved source: only this backend has
+        // `norm::rms_rope`, so only this backend may state the per-head q/k
+        // norm and its rotation as one dispatch. A backend that says `false`
+        // here gets the same arithmetic in two dispatches instead of one --
+        // slower, not wrong, which is the difference between this fact and
+        // `add_bias` above.
+        fused_qk_rope: true,
     };
     let decode = row
         .trace(FireClass::Decode, Deployed::metal(&binding))
@@ -1295,8 +1240,8 @@ mod tests {
     /// The boot file the worker writes is the boot file this seam reads.
     ///
     /// Two crates, one file, and no shared type between them: `worker`'s
-    /// `write_vulkan_startup_toml` puts `kernels` and `kv_pages` under
-    /// `[model]`, and this reads them from there. Nothing in the compiler
+    /// `write_vulkan_startup_toml` puts `kv_pages` under `[model]`, and this
+    /// reads it from there. Nothing in the compiler
     /// connects the two -- a key moved to `[batching]`, which is where the
     /// Metal writer keeps its page geometry and so the obvious thing to
     /// copy, would boot with this driver's own defaults and no complaint.
@@ -1312,26 +1257,32 @@ mod tests {
         let boot = r#"
 [model]
 hf_path = "/tmp/snap"
-kernels = "/tmp/spv"
 kv_pages = 4096
 "#;
         let read = super::boot_of(boot.as_bytes()).expect("the boot config reads");
-        assert_eq!(read.module_dir, std::path::PathBuf::from("/tmp/spv"));
         assert_eq!(read.kv_pages, 4096);
 
-        // And the default, which is the other half of the contract: the
-        // worker omits `kernels` when the operator did not set one, and this
-        // seam is then entitled to the environment. `kv_pages` is always
-        // written, so an absent one is a file this driver did not get from
-        // the worker at all -- a hand-written config, or an older one -- and
-        // it gets the driver's own number rather than zero pages.
+        // And the default, which is the other half of the contract.
+        // `kv_pages` is always written by the worker, so an absent one is a
+        // file this driver did not get from the worker at all -- a
+        // hand-written config, or an older one -- and it gets the driver's own
+        // number rather than zero pages.
+        let read = super::boot_of(b"[model]\n").expect("the boot config reads");
+        assert_eq!(read.kv_pages, super::DEFAULT_KV_PAGES);
+
+        // A `kernels` key is IGNORED rather than refused. It named a
+        // directory of `.spv` files, the modules now ride in the rlib, and an
+        // operator upgrading past that change has an old config on disk; a
+        // boot that failed on a key that no longer does anything would be a
+        // server refusing to start over a line it does not need.
         let read = super::boot_of(
             br#"[model]
 kernels = "/tmp/spv"
+kv_pages = 64
 "#,
         )
-        .expect("the boot config reads");
-        assert_eq!(read.kv_pages, super::DEFAULT_KV_PAGES);
+        .expect("a stale `kernels` key does not stop the boot");
+        assert_eq!(read.kv_pages, 64);
     }
 
     /// Every hybrid stack in the catalog is refused, and by the ROW.
@@ -1698,17 +1649,14 @@ kernels = "/tmp/spv"
     /// the same four, and a model that had lost a weight would still answer
     /// something.
     ///
-    /// Skips without `PIE_VULKAN_ARTIFACT` and `PIE_KERNELS_VULKAN_SPV_DIR`.
+    /// Skips without `PIE_VULKAN_ARTIFACT`.
     #[test]
     fn the_artifact_this_seam_stages_answers_what_the_checkpoint_answers() {
-        let (Ok(modules), Ok(artifacts)) = (
-            std::env::var("PIE_KERNELS_VULKAN_SPV_DIR"),
-            std::env::var("PIE_VULKAN_ARTIFACT"),
-        ) else {
-            eprintln!("SKIP: PIE_KERNELS_VULKAN_SPV_DIR and PIE_VULKAN_ARTIFACT name the inputs");
+        let Ok(artifacts) = std::env::var("PIE_VULKAN_ARTIFACT") else {
+            eprintln!("SKIP: PIE_VULKAN_ARTIFACT names the inputs");
             return;
         };
-        let boot = format!("[model]\nkernels = \"{modules}\"\nkv_pages = 64\n");
+        let boot = "[model]\nkv_pages = 64\n";
         // Every artifact named, because one model cannot tell a conversion
         // from a table that happens to spell one model's names -- the same
         // reason `driver-vulkan/tests/checkpoint.rs` takes a list.

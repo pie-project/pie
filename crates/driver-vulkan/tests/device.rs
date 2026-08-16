@@ -54,9 +54,6 @@ use driver_vulkan::{Dims, Rule};
 use kernels_vulkan::Capability;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-/// Where a `native` build of `kernels-vulkan` left the modules.
-const SPV_DIR: Option<&str> = option_env!("PIE_KERNELS_VULKAN_SPV_DIR");
-
 /// The one device this suite opens, and the lock that serialises it.
 ///
 /// `None` when there is no device to open or no modules to run on it, so
@@ -70,6 +67,12 @@ static GPU: OnceLock<Option<Mutex<Device>>> = OnceLock::new();
 /// given there. `false` before the first open, which is the right answer for
 /// a suite that has not got a device yet: nothing has been timed either.
 static SOFTWARE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Why `Device::open` refused, kept for the one test that reports it.
+///
+/// `gpu()` printed this and dropped it, which is fine for a skip message and
+/// no use to a test whose whole subject is whether the suite ran at all.
+static NO_DEVICE: OnceLock<String> = OnceLock::new();
 
 fn on_software() -> bool {
     *SOFTWARE.get().unwrap_or(&false)
@@ -86,6 +89,7 @@ fn gpu() -> Option<MutexGuard<'static, Device>> {
         }
         Err(e) => {
             eprintln!("skipped: {e}");
+            let _ = NO_DEVICE.set(e.to_string());
             None
         }
     });
@@ -98,18 +102,91 @@ fn gpu() -> Option<MutexGuard<'static, Device>> {
         .map(|m| m.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
 }
 
-/// Borrow the shared device and the module directory, or skip saying why.
+/// Borrow the shared device, or skip saying why.
+///
+/// This used to hand back a module DIRECTORY beside the device, from
+/// `option_env!("PIE_KERNELS_VULKAN_SPV_DIR")`. The modules are in the rlib
+/// now, so what is left of that check is whether this build compiled any --
+/// which is the same question, asked of the thing that has the answer.
 macro_rules! gpu {
     () => {{
-        let Some(dir) = SPV_DIR else {
+        if !kernels_vulkan::embedded() {
             eprintln!("skipped: built without kernels-vulkan/native, so there are no modules");
             return;
-        };
+        }
         let Some(device) = gpu() else {
             return;
         };
-        (device, std::path::Path::new(dir))
+        device
     }};
+}
+
+/// Whether this run measured anything at all, said out loud.
+///
+/// The 69 `gpu!()` tests in this file print `skipped:` and return when there
+/// is no device, which is the right shape for a suite that has to stay green
+/// on the machines that build `model-ir`. It has one bad property: a run that
+/// exercised the whole driver and a run that touched no GPU whatsoever both
+/// print
+///
+/// ```text
+/// test result: ok. 70 passed
+/// ```
+///
+/// and `cargo test` hides a passing test's stdout, so the `skipped:` lines
+/// that would have said which are not shown either. The sibling
+/// `kernels-vulkan` suite was caught reporting 48 passed in 0.06 seconds on a
+/// box whose Vulkan ICD is a stub; nothing but the clock said so.
+///
+/// This test is not gated, because its whole job is to run everywhere.
+/// `PIE_VULKAN_REQUIRE_DEVICE=1` turns the absence into a failure -- the same
+/// spelling `kernels-vulkan` uses, so one variable covers both suites, and
+/// what any job that installs a driver ON PURPOSE should set.
+///
+/// Both this suite's ways of measuring nothing would produce the same vacuous
+/// green, but only one of them is reachable. A build with no modules is the
+/// other, and it cannot happen HERE: this target carries
+/// `required-features = ["native"]`, `native` pulls in `kernels-vulkan/native`,
+/// and that crate's `build.rs` PANICS when it cannot run `slangc` rather than
+/// emitting an empty set. So `kernels_vulkan::embedded()` is always true in
+/// this binary -- the check `gpu!()` makes above it is belt and braces -- and
+/// a test asserting on it here would be one more guard that cannot fire.
+/// `kernels-vulkan`'s own suite has no `required-features`, so it checks both.
+#[test]
+fn the_runner_states_whether_it_has_a_device() {
+    let required = std::env::var_os("PIE_VULKAN_REQUIRE_DEVICE").is_some_and(|v| v != "0");
+    // Counted off this file rather than written down, so the number cannot
+    // become a lie the next time a test is added. The needle is split because
+    // an undivided one MATCHES ITSELF: this literal is in the text
+    // `include_str!` reads.
+    let needle = concat!("= gpu", "!();");
+    let gated = include_str!("device.rs").matches(needle).count();
+    assert!(
+        gated >= 60,
+        "found {gated} device-gated tests by reading this file, which is not what it contains"
+    );
+
+    match gpu() {
+        Some(device) => {
+            let name = device.name().to_string();
+            let kind = if on_software() { " (software)" } else { "" };
+            drop(device);
+            println!(
+                "VULKAN DEVICE: PRESENT ({name}){kind}. The {gated} device-gated tests here ran against it."
+            );
+        }
+        None => {
+            let why = NO_DEVICE.get().map_or("no reason recorded", String::as_str);
+            println!("VULKAN DEVICE: ABSENT ({why}).");
+            println!(
+                "All {gated} device-gated tests in this file skipped, so a green `--test device` here measured NOTHING."
+            );
+            assert!(
+                !required,
+                "PIE_VULKAN_REQUIRE_DEVICE is set and no device opened: {why}. A suite that silently skips is what this test exists to prevent"
+            );
+        }
+    }
 }
 
 /// A wall-clock ceiling, and what it means on a device that has no clock worth
@@ -182,10 +259,10 @@ fn bf16_read(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// Read a module by entrypoint name.
-fn module(dir: &std::path::Path, entrypoint: &str) -> Vec<u8> {
-    let path = dir.join(format!("{entrypoint}.spv"));
-    std::fs::read(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+/// The baseline module for an entrypoint, out of the rlib.
+fn module(entrypoint: &str) -> &'static [u8] {
+    kernels_vulkan::code(entrypoint, Capability::Baseline)
+        .unwrap_or_else(|| panic!("`{entrypoint}` has no baseline module in this build"))
 }
 
 /// A device opens, and says whether anything is checking it.
@@ -196,7 +273,7 @@ fn module(dir: &std::path::Path, entrypoint: &str) -> Vec<u8> {
 /// rather than in someone's memory of how they ran it.
 #[test]
 fn a_device_opens_and_says_whether_a_layer_is_watching() {
-    let (device, _) = gpu!();
+    let device = gpu!();
     assert!(!device.name().is_empty());
     assert!(device.max_push() >= 128, "Vulkan guarantees at least 128");
     if device.validated() {
@@ -224,7 +301,7 @@ fn a_device_opens_and_says_whether_a_layer_is_watching() {
 /// would be reported.
 #[test]
 fn a_buffer_of_no_bytes_is_still_a_buffer_the_card_accepts() {
-    let (device, _) = gpu!();
+    let device = gpu!();
     let empty = device.buffer(&[]).expect("an empty upload allocates");
     // Four and not zero, and read back through the same path everything else
     // here uses, so the size is the driver's answer and not this crate's.
@@ -257,7 +334,7 @@ fn a_buffer_of_no_bytes_is_still_a_buffer_the_card_accepts() {
 /// arithmetic except the reference.
 #[test]
 fn a_row_norm_computes_what_a_host_reference_computes() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
 
     let mut cache = Pipelines::new();
     let entrypoint = "rms_single_row_bfloat16";
@@ -288,9 +365,9 @@ fn a_row_norm_computes_what_a_host_reference_computes() {
         device.buffer(&params).expect("params"),
     ];
 
-    let code = module(dir, entrypoint);
+    let code = module(entrypoint);
     let pipeline = cache
-        .get(&device, entrypoint, &code, 0, 0, Capability::Baseline)
+        .get(&device, entrypoint, code, 0, 0, Capability::Baseline)
         .expect("the pipeline builds");
 
     // The grid this crate computes, from the module this crate loaded. One
@@ -340,7 +417,7 @@ fn a_row_norm_computes_what_a_host_reference_computes() {
 /// success from every call, and reports nothing.
 #[test]
 fn a_grid_one_workgroup_short_leaves_the_tail_as_it_found_it() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let mut cache = Pipelines::new();
     let entrypoint = "rms_single_row_bfloat16";
 
@@ -356,7 +433,7 @@ fn a_grid_one_workgroup_short_leaves_the_tail_as_it_found_it() {
     params.extend_from_slice(&0u32.to_le_bytes());
     params.extend_from_slice(&1.0f32.to_le_bytes());
 
-    let code = module(dir, entrypoint);
+    let code = module(entrypoint);
     let dims = Dims {
         rows: rows as u32,
         width: axis as u32,
@@ -367,7 +444,7 @@ fn a_grid_one_workgroup_short_leaves_the_tail_as_it_found_it() {
     // Built once, up front: the cache hands out a borrow, so a closure that
     // both builds and dispatches would hold it across two calls.
     let pipeline = cache
-        .get(&device, entrypoint, &code, 0, 0, Capability::Baseline)
+        .get(&device, entrypoint, code, 0, 0, Capability::Baseline)
         .expect("the pipeline builds");
     let whole = groups_for(entrypoint, Rule::Rms, dims, pipeline).expect("a geometry");
     assert_eq!(whole, [4, 1, 1], "one workgroup per row");
@@ -435,22 +512,20 @@ fn a_grid_one_workgroup_short_leaves_the_tail_as_it_found_it() {
 /// none — the category was a column.
 #[test]
 fn an_entrypoint_whose_row_names_no_operands_still_builds_a_pipeline() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let mut cache = Pipelines::new();
 
     let mut unstated = 0;
     for name in kernels_vulkan::entrypoints() {
-        let path = dir.join(format!("{name}.spv"));
-        if !path.exists() {
+        let Some(code) = kernels_vulkan::code(&name, Capability::Baseline) else {
             continue;
-        }
-        let code = std::fs::read(&path).expect("readable");
+        };
         // Nothing here states the scalars, so the widest legal range is the
         // only safe one: any block the module declares fits inside it, and a
         // range narrower than what the shader reads is rejected.
         let push = device.max_push();
         let pipeline = cache
-            .get(&device, &name, &code, push, 0, Capability::Baseline)
+            .get(&device, &name, code, push, 0, Capability::Baseline)
             .unwrap_or_else(|e| panic!("`{name}` has no pipeline: {e}"));
         assert_eq!(
             pipeline.bindings(),
@@ -475,12 +550,12 @@ fn an_entrypoint_whose_row_names_no_operands_still_builds_a_pipeline() {
 /// returns success.
 #[test]
 fn a_call_that_does_not_match_the_module_is_refused() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let mut cache = Pipelines::new();
     let entrypoint = "rms_single_row_bfloat16";
-    let code = module(dir, entrypoint);
+    let code = module(entrypoint);
     let pipeline = cache
-        .get(&device, entrypoint, &code, 0, 0, Capability::Baseline)
+        .get(&device, entrypoint, code, 0, 0, Capability::Baseline)
         .expect("the pipeline builds");
 
     let b = device.buffer(&[0u8; 64]).expect("a buffer");
@@ -542,12 +617,12 @@ fn a_call_that_does_not_match_the_module_is_refused() {
 /// -- the same behaviour the overrun test measures.
 #[test]
 fn a_grid_past_what_this_device_dispatches_is_refused_and_one_at_the_limit_is_not() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let mut cache = Pipelines::new();
     let entrypoint = "rms_single_row_bfloat16";
-    let code = module(dir, entrypoint);
+    let code = module(entrypoint);
     let pipeline = cache
-        .get(&device, entrypoint, &code, 0, 0, Capability::Baseline)
+        .get(&device, entrypoint, code, 0, 0, Capability::Baseline)
         .expect("the pipeline builds");
 
     let axis = 256usize;
@@ -629,25 +704,40 @@ fn a_grid_past_what_this_device_dispatches_is_refused_and_one_at_the_limit_is_no
 /// for, holding just the entrypoints the routine might name. A routine may
 /// dispatch an entrypoint the plan does not carry, so the whole build
 /// directory is offered rather than the one symbol.
+/// Where a plan's operands come from and how they are laid out.
+///
+/// Four arguments that travel together at every call site, grouped the way
+/// `serve::Fire` groups the first three of them -- which is the shape the
+/// driver itself uses for exactly this list.
+struct Binding<'a, R> {
+    arena: driver_vulkan::binding::Arena<'a>,
+    resolver: &'a R,
+    geometry: driver_vulkan::dispatch::Geometry,
+    min_offset: u64,
+}
+
 fn plan_by_routine<'a, R: driver_vulkan::binding::Resolve>(
     symbol: &str,
     low: &model_compiler::lower::Lowered,
     launch: &model_compiler::lower::Launch,
     modules: &std::collections::BTreeMap<String, Vec<u8>>,
-    arena: driver_vulkan::binding::Arena<'a>,
-    resolver: &'a R,
-    geometry: driver_vulkan::dispatch::Geometry,
-    min_offset: u64,
+    binding: Binding<'a, R>,
 ) -> Result<Vec<driver_vulkan::dispatch::Dispatch<'a>>, driver_vulkan::dispatch::Undispatchable> {
-    let (routine, arm) = driver_vulkan::arm::arm_for(symbol)
-        .unwrap_or_else(|| panic!("`{symbol}` reaches no arm, so no plan can be made for it"));
+    let Binding {
+        arena,
+        resolver,
+        geometry,
+        min_offset,
+    } = binding;
+    let routine = driver_vulkan::hold::routine_for(symbol).unwrap_or_else(|| {
+        panic!("`{symbol}` reaches no routine, so no plan can be made for it")
+    });
     let reflection = driver_vulkan::serve::Reflection::new(modules, Capability::Baseline);
     driver_vulkan::serve::plan_routine(
         low,
         launch,
         symbol,
         routine,
-        arm,
         arena,
         resolver,
         geometry,
@@ -656,22 +746,17 @@ fn plan_by_routine<'a, R: driver_vulkan::binding::Resolve>(
     )
 }
 
-/// Every `.spv` in a build directory, keyed the way `Modules` keys them.
-fn store_of(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
-    let mut out = std::collections::BTreeMap::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return out;
-    };
-    for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        let Some(stem) = name.strip_suffix(".spv") else {
-            continue;
-        };
-        if let Ok(code) = std::fs::read(e.path()) {
-            out.insert(stem.to_owned(), code);
-        }
-    }
-    out
+/// The embedded modules, as an owned map.
+///
+/// A `BTreeMap` and not `serve::Embedded`, even though the contents are now
+/// identical, because the callers below MUTATE it -- removing a symbol to
+/// check what a missing module does. The copy is what makes that possible,
+/// and it is the reason `Modules` is a trait rather than a type.
+fn store_of() -> std::collections::BTreeMap<String, Vec<u8>> {
+    kernels_vulkan::MODULES
+        .iter()
+        .map(|(stem, code)| ((*stem).to_string(), code.to_vec()))
+        .collect()
 }
 
 // `mod rows` STOOD HERE: two `KernelSig` values written down verbatim,
@@ -708,25 +793,23 @@ fn store_of(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>
 /// of the two rather than trusting either.
 #[test]
 fn a_buffer_the_shader_never_reads_is_still_given_a_descriptor() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let name = "layer_scalar_mul_bfloat16";
-    let path = dir.join(format!("{name}.spv"));
-    if !path.exists() {
+    let Some(code) = kernels_vulkan::code(name, Capability::Baseline) else {
         eprintln!("skipped: `{name}` was not built");
         return;
-    }
+    };
     // Four, from the row this entrypoint was stated with:
     // `x <- In(0)`, `scalar <- Weight(0)`, `out <- Out(0)`, `params <-
     // Param(0)`. The module decorates three, which is the whole point.
     let stated = 4u32;
-    let code = std::fs::read(&path).expect("readable");
 
     let mut cache = Pipelines::new();
     let pipeline = cache
         .get(
             &device,
             name,
-            &code,
+            code,
             // `norm/layer_scalar.slang` declares no push block; every
             // scalar rides the `params` buffer.
             0,
@@ -778,7 +861,7 @@ fn a_buffer_the_shader_never_reads_is_still_given_a_descriptor() {
 /// whole tier mechanism doing nothing.
 #[test]
 fn every_entrypoint_resolves_to_a_module_this_device_can_load() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let tiers = device.tiers();
     assert!(
         tiers.contains(&Capability::Baseline),
@@ -793,7 +876,7 @@ fn every_entrypoint_resolves_to_a_module_this_device_can_load() {
     let mut by_tier: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     let mut missing: Vec<String> = Vec::new();
     for name in kernels_vulkan::entrypoints() {
-        match device.module_for(dir, &name) {
+        match device.module_for(&name) {
             Some((_, tier)) => {
                 *by_tier.entry(tier.tag().to_string()).or_default() += 1;
                 resolved += 1;
@@ -826,16 +909,15 @@ fn every_entrypoint_resolves_to_a_module_this_device_can_load() {
 /// it_can_load_builds_a_pipeline` in `kernels-vulkan` is that one.
 #[test]
 fn the_tier_this_device_selects_is_one_it_can_actually_load() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let mut cache = Pipelines::new();
     let mut built = 0;
     let mut failures: Vec<String> = Vec::new();
 
     for name in kernels_vulkan::entrypoints().into_iter().take(40) {
-        let Some((path, tier)) = device.module_for(dir, &name) else {
+        let Some((code, tier)) = device.module_for(&name) else {
             continue;
         };
-        let code = std::fs::read(&path).expect("readable");
         // Nothing outside the module states a layout for these forty.
         //
         // This asked each entrypoint's row for a push size and a buffer count
@@ -852,7 +934,7 @@ fn the_tier_this_device_selects_is_one_it_can_actually_load() {
         // own declarations, which is the path a crossed symbol takes in
         // production too.
         let (push, descriptors) = (device.max_push(), 0);
-        match cache.get(&device, &name, &code, push, descriptors, tier) {
+        match cache.get(&device, &name, code, push, descriptors, tier) {
             Ok(_) => built += 1,
             Err(e) => failures.push(format!("`{name}` at {}: {e}", tier.tag())),
         }
@@ -877,13 +959,12 @@ fn the_tier_this_device_selects_is_one_it_can_actually_load() {
 /// somewhere else entirely, so the check is exact and the tolerance is zero.
 #[test]
 fn the_scalars_this_crate_packs_are_the_ones_the_shader_addresses_with() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let entrypoint = "kv_append_bfloat16";
-    let path = dir.join(format!("{entrypoint}.spv"));
-    if !path.exists() {
+    let Some(code) = kernels_vulkan::code(entrypoint, Capability::Baseline) else {
         eprintln!("skipped: `{entrypoint}` was not built");
         return;
-    }
+    };
     // A cache of `kv_heads` heads, each `seq` slots of `head_dim`. The append
     // writes ONE position, which is what this kernel is: `pos[0]` is a scalar
     // slot and not a per-row table.
@@ -938,13 +1019,12 @@ fn the_scalars_this_crate_packs_are_the_ones_the_shader_addresses_with() {
     assert_eq!(push.len(), 24, "`Push` is an int, a pad, and two `uint2`");
     let call_buffers: [u32; 5] = [0, 1, 2, 3, 4];
 
-    let code = std::fs::read(&path).expect("readable");
     let mut cache = Pipelines::new();
     let pipeline = cache
         .get(
             &device,
             entrypoint,
-            &code,
+            code,
             push.len() as u32,
             call_buffers.len() as u32,
             Capability::Baseline,
@@ -1019,7 +1099,7 @@ fn the_scalars_this_crate_packs_are_the_ones_the_shader_addresses_with() {
 /// cannot see it.
 #[test]
 fn an_operand_at_an_offset_in_one_arena_is_addressed_from_that_offset() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let mut cache = Pipelines::new();
     let entrypoint = "rms_single_row_bfloat16";
 
@@ -1098,9 +1178,9 @@ fn an_operand_at_an_offset_in_one_arena_is_addressed_from_that_offset() {
         "a test that binds offset zero cannot see a dropped base"
     );
 
-    let code = module(dir, entrypoint);
+    let code = module(entrypoint);
     let pipeline = cache
-        .get(&device, entrypoint, &code, 0, 0, Capability::Baseline)
+        .get(&device, entrypoint, code, 0, 0, Capability::Baseline)
         .expect("the pipeline builds");
     let dims = Dims {
         rows: 1,
@@ -1156,7 +1236,7 @@ fn an_operand_at_an_offset_in_one_arena_is_addressed_from_that_offset() {
 /// the model does.
 #[test]
 fn a_range_the_device_cannot_address_from_is_refused_by_this_crate() {
-    let (device, _) = gpu!();
+    let device = gpu!();
     let align = device.min_storage_offset();
     let buffer = device.buffer(&vec![0u8; 4096]).expect("an arena");
 
@@ -1230,7 +1310,7 @@ fn a_range_the_device_cannot_address_from_is_refused_by_this_crate() {
 /// overwritten.
 #[test]
 fn an_operand_overrunning_its_range_is_discarded_rather_than_given_to_its_neighbour() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let mut cache = Pipelines::new();
     let entrypoint = "rms_single_row_bfloat16";
 
@@ -1281,9 +1361,9 @@ fn an_operand_overrunning_its_range_is_discarded_rather_than_given_to_its_neighb
         Bound::at(&device, &buffer, p_at, params.len() as u64).expect("params"),
     ];
 
-    let code = module(dir, entrypoint);
+    let code = module(entrypoint);
     let pipeline = cache
-        .get(&device, entrypoint, &code, 0, 0, Capability::Baseline)
+        .get(&device, entrypoint, code, 0, 0, Capability::Baseline)
         .expect("the pipeline builds");
     let dims = Dims {
         rows: 1,
@@ -1330,7 +1410,7 @@ fn an_operand_overrunning_its_range_is_discarded_rather_than_given_to_its_neighb
 /// reads is not illegal. Nothing but this check is looking.
 #[test]
 fn a_parameter_block_short_of_what_the_shader_reads_is_refused() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let mut cache = Pipelines::new();
     let entrypoint = "rms_single_row_bfloat16";
 
@@ -1351,9 +1431,9 @@ fn a_parameter_block_short_of_what_the_shader_reads_is_refused() {
     params.extend_from_slice(&1.0f32.to_le_bytes());
     assert_eq!(params.len(), 20, "the block this test is built around");
 
-    let code = module(dir, entrypoint);
+    let code = module(entrypoint);
     let pipeline = cache
-        .get(&device, entrypoint, &code, 0, 0, Capability::Baseline)
+        .get(&device, entrypoint, code, 0, 0, Capability::Baseline)
         .expect("the pipeline builds");
     assert_eq!(
         pipeline.declared().block_bytes.get(3),
@@ -1453,7 +1533,7 @@ fn a_parameter_block_short_of_what_the_shader_reads_is_refused() {
 /// arithmetic and completely different facts.
 #[test]
 fn a_module_with_a_descriptor_hole_binds_only_what_it_declares() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let mut cache = Pipelines::new();
 
     for entrypoint in [
@@ -1463,8 +1543,8 @@ fn a_module_with_a_descriptor_hole_binds_only_what_it_declares() {
         // not one shader's quirk.
         "affine_qmm_t_splitk_bfloat16_gs_128_b_4_bm_64_bn_32",
     ] {
-        let code = module(dir, entrypoint);
-        let words = driver_vulkan::spirv::words(&code).expect("whole words");
+        let code = module(entrypoint);
+        let words = driver_vulkan::spirv::words(code).expect("whole words");
         let declared = driver_vulkan::spirv::declared(&words).expect("well formed");
         let real = declared.bindings as usize - declared.holes();
         assert!(
@@ -1481,7 +1561,7 @@ fn a_module_with_a_descriptor_hole_binds_only_what_it_declares() {
         let Ok(pipeline) = cache.get(
             &device,
             entrypoint,
-            &code,
+            code,
             push as u32,
             declared.bindings,
             Capability::Baseline,
@@ -1524,11 +1604,11 @@ fn a_module_with_a_descriptor_hole_binds_only_what_it_declares() {
 /// where its weights belong and return a plausible number.
 #[test]
 fn a_holed_module_refuses_a_buffer_for_every_slot() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let mut cache = Pipelines::new();
     let entrypoint = "affine_qmv_routed_bfloat16_gs_64_b_4";
-    let code = module(dir, entrypoint);
-    let words = driver_vulkan::spirv::words(&code).expect("whole words");
+    let code = module(entrypoint);
+    let words = driver_vulkan::spirv::words(code).expect("whole words");
     let declared = driver_vulkan::spirv::declared(&words).expect("well formed");
     let real = declared.bindings as usize - declared.holes();
     let push = declared
@@ -1540,7 +1620,7 @@ fn a_holed_module_refuses_a_buffer_for_every_slot() {
     let Ok(pipeline) = cache.get(
         &device,
         entrypoint,
-        &code,
+        code,
         push as u32,
         declared.bindings,
         Capability::Baseline,
@@ -1604,7 +1684,7 @@ fn a_rectangle_a_real_plan_states_records_and_submits() {
     use model_compiler::lower::{Fire, Row, lower};
     use model_ir::trace::FireClass;
 
-    let (device, dir) = gpu!();
+    let device = gpu!();
 
     // One stand-in for every weight and seam value. Zeros, because nothing
     // here reads a result back.
@@ -1631,7 +1711,7 @@ fn a_rectangle_a_real_plan_states_records_and_submits() {
         }
     }
     let store = Zeros(&weights);
-    let spv = store_of(dir);
+    let spv = store_of();
 
     let mut cache = Pipelines::new();
     let mut ran = 0u32;
@@ -1729,7 +1809,7 @@ fn a_rectangle_a_real_plan_states_records_and_submits() {
                 // submit below is real again. What it is about is unchanged:
                 // a rectangle a real plan states becomes a dispatch this card
                 // accepts.
-                let Ok(code) = std::fs::read(dir.join(format!("{symbol}.spv"))) else {
+                let Some(code) = kernels_vulkan::code(symbol, Capability::Baseline) else {
                     continue;
                 };
                 let planned = plan_by_routine(
@@ -1737,17 +1817,20 @@ fn a_rectangle_a_real_plan_states_records_and_submits() {
                     &low,
                     launch,
                     &spv,
-                    arena,
-                    &store,
-                    driver_vulkan::dispatch::Geometry {
-                        q_heads: facts.q_heads,
-                        kv_heads: facts.kv_heads,
-                        head_dim: facts.head_dim,
-                        rotary_dims: facts.head_dim,
-                        n_experts: facts.n_experts,
-                        experts_per_token: facts.experts_per_token,
+                    Binding {
+                        arena,
+                        resolver: &store,
+                        geometry: driver_vulkan::dispatch::Geometry {
+                            q_heads: facts.q_heads,
+                            kv_heads: facts.kv_heads,
+                            head_dim: facts.head_dim,
+                            rotary_dims: facts.head_dim,
+                            n_experts: facts.n_experts,
+                            experts_per_token: facts.experts_per_token,
+            ..Default::default()
+                        },
+                        min_offset: device.min_storage_offset(),
                     },
-                    device.min_storage_offset(),
                 );
                 // The symbols the GPU-free walk already names as short of a
                 // driver-owned resource. Skipped rather than asserted about, because
@@ -1789,9 +1872,7 @@ fn a_rectangle_a_real_plan_states_records_and_submits() {
                     // The module the ROUTINE named, which need not be the plan's
                     // symbol: a body composes its own entrypoint out of the axes
                     // it was handed. `d.symbol` is what was dispatched.
-                    let fired = spv
-                        .get(d.symbol.as_ref())
-                        .map_or(code.as_slice(), Vec::as_slice);
+                    let fired = spv.get(&*d.symbol).map_or(code, Vec::as_slice);
                     let pipeline = cache
                         .get(
                             &device,
@@ -1878,8 +1959,29 @@ fn a_rectangle_a_real_plan_states_records_and_submits() {
     // bare axes and started stating their operands: a prefill reaches the
     // tile, a decode reaches the decode kernel, and both are in these texts.
     //
-    // Equality rather than a floor: twenty-six is all of them, so this
-    // number moving in either direction is news.
+    // Then twenty-eight, when the routed expert GEMM was wired upstream. A
+    // mixture of experts used to take the MATVEC whatever its rectangle:
+    // `routed_qmm` did not exist, so a prefill of many tokens fired one row
+    // at a time. The shared forward now picks the GEMM whenever `moe_tile`
+    // is `Some`, and the two symbols that arrive are the tiled forms of the
+    // two routed matvecs already here -- `affine_qmm_t_routed` and
+    // `mxfp4_qmm_t_routed_bias`.
+    //
+    // Both reached a dispatch on this device without a line of driver code,
+    // which is the same property the twentieth row demonstrated and the
+    // reason to keep counting: nothing here was taught the routed GEMM, and
+    // the statement carried enough to bind and launch it.
+    //
+    // Equality rather than a floor: this is ALL of them, so the number moving
+    // in either direction is news.
+    //
+    // It was 28 and is 29. `rms_residual_bfloat16` is the new one, and it
+    // arrived by the same fold that took 64 rectangles out of the count in
+    // this file's whole-plan test: a post-norm landing that used to be
+    // `rms_norm` plus `residual_add` is now one statement. Vulkan already had
+    // the arm and the entrypoint -- `hold::rms_residual` -- so nothing here
+    // gained a kernel; a kernel this backend had built and nothing had ever
+    // named finally reached the card.
     //
     // Counted off `crossed`, which is now "the symbol planned", where it used
     // to be `ran + crossed` -- `ran` for the ones this loop submitted through
@@ -1887,9 +1989,37 @@ fn a_rectangle_a_real_plan_states_records_and_submits() {
     // family had landed. Every family has landed, so `crossed` is all of them
     // and it means something stronger than it did: not "this symbol has an
     // arm" but "this symbol's rectangle became a dispatch".
+    //
+    // AND IS NOW 30. `cast_qmm_input_strided_bfloat16_to_float16` is the
+    // thirtieth, and like `rms_residual` before it, this backend already had
+    // the arm and the entrypoint. What kept it off the card was not the
+    // driver: the metal signature table had stopped saying which of its
+    // operands the environment supplies, so every plan that staged an
+    // activation in `half` was refused before it was recorded. It is a cast
+    // and not a multiply, which is why the GEMM counts elsewhere in this file
+    // ask `is_tiled_gemm` rather than for the substring.
+    //
+    // AND IS NOW 28, WHICH IS THE FIRST TIME THIS NUMBER HAS GONE DOWN.
+    // `sdpa_paged_tiled_bfloat16_d_128` and `sdpa_paged_mma_sink_bfloat16_d_64`
+    // left, and they left because `GuardPred::WindowOne` now stands in front
+    // of the attention: every fire this walk builds is a window of one token
+    // per row, so every one of them takes the decode arm and the tiled arm is
+    // never walked. A walk plans the arm a fire TAKES, not both arms of a
+    // guard -- which is also why `affine_qmm_t` and `affine_qmv_fast` both
+    // appear above, from different fires rather than from one guard.
+    //
+    // A count going down is normally the alarm this equality exists to
+    // raise, so it is worth being explicit about why it is not one here. The
+    // two symbols did not stop being reachable; this walk stopped ASKING for
+    // them, because none of its fires is a multi-token window and a
+    // multi-token window is the only thing the tiled attention is for. The
+    // test that still holds them to the card is
+    // `a_deployment_fires_step_after_step_and_stops_building_pipelines`,
+    // whose tile-wide prefill has multi-token rows and builds
+    // `sdpa_paged_tiled` as one of its four pipelines.
     assert_eq!(
         seen.len(),
-        26,
+        28,
         "a different number of distinct symbols reached the walk: {}",
         seen.iter().cloned().collect::<Vec<_>>().join(", ")
     );
@@ -1916,15 +2046,25 @@ fn a_rectangle_a_real_plan_states_records_and_submits() {
             "kv_append_paged_bfloat16",
             "sdpa_paged_decode_bfloat16_d_128",
             "sdpa_paged_decode_sink_bfloat16_d_64",
-            "sdpa_paged_mma_sink_bfloat16_d_64",
-            "sdpa_paged_tiled_bfloat16_d_128",
         ],
         "a different set of symbols would not plan:\n  {}",
         short.join("\n  ")
     );
+    // WAS FIVE AND IS THREE. `sdpa_paged_mma_sink_bfloat16_d_64` and
+    // `sdpa_paged_tiled_bfloat16_d_128` are not here because they are no
+    // longer REACHED -- see `seen.len()` above -- and a symbol the walk never
+    // asks for cannot be short of a pool. The three that remain are short for
+    // the reason this comment has always given, and that reason is unchanged.
+    //
+    // The distinction matters because these two lists fail differently. A
+    // symbol leaving THIS list because it started planning is progress; one
+    // leaving because nothing asks for it any more is a routing change, and
+    // it has to show up in `seen` as well or one of the two lists is lying.
+    // Both moved by the same two names in the same diff.
+    // 28, and it moves with `seen.len()` above.
     assert_eq!(
         crossed as usize + short.len(),
-        26,
+        28,
         "every symbol the walk saw either planned or is named above"
     );
     // And every one of those dispatches was SUBMITTED. Separate from the count
@@ -1967,7 +2107,7 @@ fn a_norm_a_real_plan_states_computes_what_a_host_reference_computes() {
     use model_compiler::lower::{Fire, Row, lower};
     use model_ir::trace::FireClass;
 
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let symbol = "rms_single_row_bfloat16";
 
     let plan = llama_like_metal(
@@ -2041,16 +2181,18 @@ fn a_norm_a_real_plan_states_computes_what_a_host_reference_computes() {
     }
     weights.seam(&device, 1 << 16).expect("the seam");
 
-    let store = store_of(dir);
+    let store = store_of();
     let made = plan_by_routine(
         symbol,
         &low,
         launch,
         &store,
-        arena,
-        &weights,
-        driver_vulkan::dispatch::Geometry::default(),
-        device.min_storage_offset(),
+        Binding {
+            arena,
+            resolver: &weights,
+            geometry: driver_vulkan::dispatch::Geometry::default(),
+            min_offset: device.min_storage_offset(),
+        },
     )
     .expect("the rectangle plans");
     // One rectangle, one dispatch: a routine that split this one would be a
@@ -2188,7 +2330,7 @@ fn a_norm_a_real_plan_states_computes_what_a_host_reference_computes() {
 /// the same way.
 #[test]
 fn a_chain_recorded_once_says_what_the_chain_submitted_one_at_a_time_says() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let entrypoint = "rms_single_row_bfloat16";
     let axis = 512usize;
     let links = 8usize;
@@ -2206,10 +2348,10 @@ fn a_chain_recorded_once_says_what_the_chain_submitted_one_at_a_time_says() {
     params.extend_from_slice(&0u32.to_le_bytes());
     params.extend_from_slice(&1.0f32.to_le_bytes());
 
-    let code = module(dir, entrypoint);
+    let code = module(entrypoint);
     let mut cache = Pipelines::new();
     let pipeline = cache
-        .get(&device, entrypoint, &code, 0, 0, Capability::Baseline)
+        .get(&device, entrypoint, code, 0, 0, Capability::Baseline)
         .expect("the pipeline builds");
     let groups = groups_for(
         entrypoint,
@@ -2317,7 +2459,7 @@ fn a_chain_recorded_once_says_what_the_chain_submitted_one_at_a_time_says() {
 /// by accident.
 #[test]
 fn fires_of_different_sizes_in_a_row_reuse_the_scratch_and_still_agree() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let entrypoint = "rms_single_row_bfloat16";
     let axis = 512usize;
 
@@ -2332,10 +2474,10 @@ fn fires_of_different_sizes_in_a_row_reuse_the_scratch_and_still_agree() {
     params.extend_from_slice(&0u32.to_le_bytes());
     params.extend_from_slice(&1.0f32.to_le_bytes());
 
-    let code = module(dir, entrypoint);
+    let code = module(entrypoint);
     let mut cache = Pipelines::new();
     let pipeline = cache
-        .get(&device, entrypoint, &code, 0, 0, Capability::Baseline)
+        .get(&device, entrypoint, code, 0, 0, Capability::Baseline)
         .expect("the pipeline builds");
     let groups = groups_for(
         entrypoint,
@@ -2465,7 +2607,7 @@ fn fires_of_different_sizes_in_a_row_reuse_the_scratch_and_still_agree() {
 fn a_whole_real_plan_records_into_one_command_buffer_and_submits() {
     use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
 
-    let (device, dir) = gpu!();
+    let device = gpu!();
 
     // SIX texts and not one. This test was written against qwen3-0.6B because
     // that was the text to hand, and every claim below -- that a whole plan
@@ -2523,7 +2665,6 @@ fn a_whole_real_plan_records_into_one_command_buffer_and_submits() {
         ] {
             fired += whole_plan(
                 &device,
-                dir,
                 name,
                 &facts,
                 &metal,
@@ -2545,13 +2686,28 @@ fn a_whole_real_plan_records_into_one_command_buffer_and_submits() {
     // fire classes, every one of them recorded and submitted on this card, and
     // it moves when a text does.
     //
-    // It is also, exactly, the 6680 the arena walk in `tests/arena.rs` counts
-    // over the same six texts and the same two classes -- which is the point
-    // of firing the prefills. Until they were added this test ran half of what
-    // that walk measures, so the tiled `Qmm` GEMMs, the largest kernel family
-    // in the tree, had never reached the card inside a real plan.
+    // It is also, exactly, the number the arena walk in `tests/arena.rs`
+    // counts over the same six texts and the same two classes -- which is the
+    // point of firing the prefills. Until they were added this test ran half
+    // of what that walk measures, so the tiled `Qmm` GEMMs, the largest kernel
+    // family in the tree, had never reached the card inside a real plan.
+    //
+    // 6680 UNTIL A FOLD TOOK 64 OF THEM AWAY. The shared forward text used to
+    // spell a post-norm landing as `rms_norm` followed by `residual_add`, and
+    // every one of those norms was read by exactly one add and nothing else,
+    // which is the pair `norm::rms_residual` already existed to be: the group
+    // that computed the row's inverse RMS still holds the row, so the add is
+    // one more load and no synchronisation. Three of the four post-norm texts
+    // here land that way. This number FELL, which is the direction worth
+    // having, and it fell by the same 64 in `tests/arena.rs`.
+    //
+    // AND ROSE BY 608 TO 7224, which is the staging cast the count above
+    // gained as its thirtieth symbol reaching the card once per dense
+    // projection of every text that precasts. A rectangle more per GEMM is
+    // exactly the trade `qmm_t.metal` describes: one conversion of `x`
+    // instead of `N/BN` of them inside the multiply.
     assert_eq!(
-        fired, 6680,
+        fired, 7224,
         "the six texts fired a different number of rectangles"
     );
 }
@@ -2562,7 +2718,6 @@ fn a_whole_real_plan_records_into_one_command_buffer_and_submits() {
 /// individual text's pass would notice going missing.
 fn whole_plan(
     device: &Device,
-    dir: &std::path::Path,
     name: &str,
     facts: &model::shared::llama_like::forward::facts::LlamaLikeFacts,
     metal: &model::shared::llama_like::forward::facts::LlamaLikeMetalFacts,
@@ -2774,6 +2929,7 @@ fn whole_plan(
         rotary_dims: facts.head_dim,
         n_experts: facts.n_experts,
         experts_per_token: facts.experts_per_token,
+            ..Default::default()
     };
 
     // Through `serve::fire`, which is the call. This test used to assemble
@@ -2788,8 +2944,7 @@ fn whole_plan(
         .kernels
         .iter()
         .map(|symbol| {
-            let code =
-                std::fs::read(dir.join(format!("{symbol}.spv"))).expect("the module is built");
+            let code = module(symbol).to_vec();
             (symbol.clone(), code)
         })
         .collect();
@@ -3235,7 +3390,7 @@ struct Ran {
 fn the_tiled_gemm_answers_the_way_the_vector_kernel_does() {
     use model::shared::llama_like::forward::facts::LlamaLikeFacts;
 
-    let (device, dir) = gpu!();
+    let device = gpu!();
     for (text, facts, embed, moe) in [
         ("qwen3_0_6b", LlamaLikeFacts::qwen3_0_6b(), 96 << 20, false),
         // A mixture of experts as well, so the comparison runs with a router,
@@ -3260,14 +3415,26 @@ fn the_tiled_gemm_answers_the_way_the_vector_kernel_does() {
             true,
         ),
     ] {
-        gemm_agrees(&device, dir, text, &facts, embed, moe);
+        gemm_agrees(&device, text, &facts, embed, moe);
     }
 }
 
 /// One text's two matmul kernels, fired and compared.
+/// Whether a stated symbol is a tiled GEMM, which is not the same question
+/// as whether its name contains `qmm`.
+///
+/// `cast_qmm_input_strided_bfloat16_to_float16` is named for the GEMM it
+/// stages activations FOR, not for a multiply it performs -- it casts
+/// `bfloat` to `half` and does nothing else. Every count below was written
+/// as `k.contains("qmm")` when the precast path did not exist; the day
+/// upstream staged qwen3.6's GEMMs in half, a dense prefill grew a third
+/// `qmm`-named symbol and the "dense pair" count read three.
+fn is_tiled_gemm(k: &str) -> bool {
+    k.contains("qmm") && !k.starts_with("cast_qmm_input")
+}
+
 fn gemm_agrees(
     device: &Device,
-    dir: &std::path::Path,
     text: &str,
     facts: &model::shared::llama_like::forward::facts::LlamaLikeFacts,
     embed: usize,
@@ -3276,7 +3443,40 @@ fn gemm_agrees(
     use model::shared::llama_like::forward::facts::LlamaLikeMetalFacts;
     use model_ir::trace::FireClass;
 
-    let metal = LlamaLikeMetalFacts::synthetic();
+    // PRECAST OFF, and this is the one test in the file that turns it off.
+    //
+    // The claim here is that the tiled GEMM and the vector GEMM reduce the
+    // same products to the same numbers. `qmm_fp16_precast` breaks the
+    // premise rather than the kernel: it stages the activation into `half`
+    // before the tile reads it, so the two sides no longer multiply the same
+    // operands, and `half` tops out at 65504 where `bfloat16` reaches 3e38.
+    //
+    // That ceiling is reached HERE and would not be in a deployment. The
+    // fill above is a multiplicative hash for the packed weights and a flat
+    // `0x3f3f` for every scale and zero point, so a dequantised weight is
+    // roughly `code * 0.75 + 0.75` and a 1024-wide row sums a thousand of
+    // them against an arena whose exponents were clamped to a decade around
+    // one. Nothing normalises that back down across the residual stream, so
+    // the activations grow by about a decade a layer: measured by clamping
+    // the tile's accumulator in the shader, this text stays exact at a
+    // clamp of 1e6 and produces an all-zero readout at 1e20. A real
+    // checkpoint's activations sit near one and stage into `half` losslessly
+    // enough for the five percent below; these do not, and the first cast
+    // that overflows writes an infinity that reaches every later rectangle
+    // and lands as a readout of exactly zero.
+    //
+    // So the choice is between a fill that cannot exercise the precast path
+    // and a comparison that cannot mean anything, and the comparison is what
+    // this test is named for. THE GAP IS REAL AND IS RECORDED: with this
+    // false, `affine_qmm_t_fp16_precast` and the strided cast that feeds it
+    // get no numerical check on this backend -- only the plan-shape ledgers
+    // elsewhere in this file, which count the symbols without reading what
+    // they wrote. Closing it needs a fixture whose activations stay inside
+    // `half`, not a wider tolerance here.
+    let metal = LlamaLikeMetalFacts {
+        qmm_fp16_precast: false,
+        ..LlamaLikeMetalFacts::synthetic()
+    };
     // THE TILE, and not four and not a round number. Measured over 1, 2, 3,
     // 4, 5, 8, 16, 17, 32 and 64 rows: the prefill plan lowers to zero `qmm`
     // symbols below the tile and two at the tile and above. At four rows this
@@ -3289,7 +3489,6 @@ fn gemm_agrees(
     for class in [FireClass::Decode, FireClass::Prefill] {
         answers.push(whole_plan(
             device,
-            dir,
             text,
             facts,
             &metal,
@@ -3309,36 +3508,66 @@ fn gemm_agrees(
     // its class would fire the same lowering twice and every claim below would
     // hold vacuously.
     assert!(
-        !answers[0].kernels.iter().any(|k| k.contains("qmm")),
+        !answers[0].kernels.iter().any(|k| is_tiled_gemm(k)),
         "{text}: the decode plan stated a tiled GEMM, so there is nothing here to compare"
     );
     assert_eq!(
         answers[1]
             .kernels
             .iter()
-            .filter(|k| k.contains("qmm"))
+            .filter(|k| is_tiled_gemm(k))
             .count(),
-        2,
-        "{text}: the prefill plan stated {:?}, which is not two tiled GEMMs",
+        // The dense pair, and a THIRD when the text routes.
+        //
+        // This read `2` for every text, and the note below recorded that a
+        // mixture of experts reached the dense pair rather than a routed
+        // symbol -- the expert GEMM was not wired, so a routed prefill took
+        // the matvec and tiled nothing. Upstream wired it (`routed_qmm`,
+        // chosen whenever `moe_tile` is `Some`), so a routing prefill now
+        // states `affine_qmm_t_routed` beside the two dense GEMMs.
+        //
+        // Written as an arithmetic on `moe` rather than as a second constant,
+        // because the two facts are not independent: the third GEMM is
+        // present exactly when `route_sort` is, which the next assertion
+        // pins separately.
+        2 + usize::from(moe),
+        "{text}: the prefill plan stated {:?}, which is not the dense pair \
+         plus a routed GEMM if it routes",
         answers[1].kernels
     );
-    // WHICH pair, and not just how many. This assertion is why the note above
-    // says the routed GEMM is not reached: it was written expecting two routed
-    // symbols from the mixture of experts and got the dense pair instead.
+    // WHICH pair, and not just how many. This assertion used to be why the
+    // note above said the routed GEMM is not reached: it was written
+    // expecting two routed symbols from the mixture of experts and got the
+    // dense pair instead. The routed GEMM is reached now, and it is the
+    // third symbol the count above allows.
     assert_eq!(
         answers[1].kernels.iter().any(|k| k.contains("route_sort")),
         moe,
         "{text}: whether it routes is not what this test was told"
     );
+    // And that the routed GEMM is present exactly when it routes.
+    //
+    // This read `0`, and its message said a routed GEMM would mean "this
+    // comparison is covering a kernel it was written to say it does not".
+    // That was the right tripwire and it has now fired for the right reason:
+    // upstream wired `routed_qmm`, so a routing prefill tiles its experts
+    // where it used to fire the matvec a row at a time.
+    //
+    // The comparison covering it is a STRENGTHENING rather than a leak. What
+    // this test claims is that a tiled GEMM answers the way the vector kernel
+    // does, and with the routed pair in the plan it now claims that of the
+    // routed pair too -- `affine_qmm_t_routed` against the `routed_qmv` the
+    // decode fires. The bit-for-bit agreement asserted below is what holds it
+    // to that, and it is measured, not assumed.
     assert_eq!(
         answers[1]
             .kernels
             .iter()
-            .filter(|k| k.contains("qmm") && k.contains("routed"))
+            .filter(|k| is_tiled_gemm(k) && k.contains("routed"))
             .count(),
-        0,
-        "{text}: it states a routed GEMM after all, so the note above is wrong and \
-         this comparison is covering a kernel it was written to say it does not"
+        usize::from(moe),
+        "{text}: a routed GEMM is stated exactly when the text routes, and \
+         this plan disagrees"
     );
     let (vector, tiled) = (&answers[0].answer, &answers[1].answer);
 
@@ -3361,7 +3590,6 @@ fn gemm_agrees(
         vector.values.iter().all(|v| v.is_finite()),
         "{text}: the reference run produced a non-finite logit, so nothing below means anything"
     );
-
     // RELATIVE, and not byte equality. The two kernels reduce the same
     // products in different orders -- the tile accumulates sixteen rows at a
     // time -- and every intermediate here is bfloat16, which has eight bits of
@@ -3385,6 +3613,24 @@ fn gemm_agrees(
     // stronger than this test asks for and because a future card where it
     // stops being exactly zero should not be read as a defect. The tolerance
     // stays at five percent for that reason.
+    //
+    // AND IT IS NOT ALWAYS ZERO, WHICH IS UNEXPLAINED. This assertion has
+    // fired three times, always with `--test-threads=2` and never below
+    // this line in isolation: the same binary, the same weights and the same
+    // two kernels pass on a rerun and pass alone, ten times over. So the
+    // difference is not the arithmetic -- it is something about two tests
+    // holding this card at once. What is NOT known is which: this suite
+    // shares one `Device`, and a second test firing its own plan into its own
+    // arena should not be visible here at all. Either it is (a real hazard
+    // this file's own ordering assertions cannot see, since they are about
+    // one command buffer and this is about two), or the card is returning
+    // something else under contention.
+    //
+    // Left as a bounded, named failure rather than a widened tolerance,
+    // because widening it is exactly how a real hazard becomes permanent:
+    // the tolerance is not what is wrong. Anyone who reproduces it should
+    // dump the two logit vectors and see whether the disagreement is one row,
+    // which would name an arena range, or scattered, which would not.
     assert!(
         worst < 0.05,
         "{text}: the two kernels disagree by {worst} at logit {at}: the vector kernel says {} and \
@@ -3400,7 +3646,6 @@ fn gemm_agrees(
     // zero because both sides were zero reads exactly the same.
     let vacuous = whole_plan(
         device,
-        dir,
         text,
         facts,
         &metal,
@@ -3492,7 +3737,7 @@ fn a_routed_prefill_answers_the_same_twice() {
     use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
     use model_ir::trace::FireClass;
 
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let facts = LlamaLikeFacts::qwen3_30b_a3b();
     let metal = LlamaLikeMetalFacts::synthetic();
     let want = Wanted {
@@ -3503,8 +3748,8 @@ fn a_routed_prefill_answers_the_same_twice() {
         compare: false,
         real: None,
     };
-    let once = whole_plan(&device, dir, "qwen3_30b_a3b", &facts, &metal, want);
-    let twice = whole_plan(&device, dir, "qwen3_30b_a3b", &facts, &metal, want);
+    let once = whole_plan(&device, "qwen3_30b_a3b", &facts, &metal, want);
+    let twice = whole_plan(&device, "qwen3_30b_a3b", &facts, &metal, want);
 
     // The precondition: this text really does route. Without it the claim
     // below is about a dense model and says nothing.
@@ -3614,7 +3859,7 @@ fn a_real_plans_kv_append_puts_the_row_where_the_page_table_says() {
     use model_compiler::lower::{Fire, Row, lower};
     use model_ir::trace::FireClass;
 
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let symbol = "kv_append_paged_bfloat16";
 
     let facts = LlamaLikeFacts::qwen3_0_6b();
@@ -3671,23 +3916,26 @@ fn a_real_plans_kv_append_puts_the_row_where_the_page_table_says() {
         .expect("the text appends to a paged cache");
     let layer = launch.layers.start;
 
-    let store = store_of(dir);
+    let store = store_of();
     let made = plan_by_routine(
         symbol,
         &low,
         launch,
         &store,
-        arena,
-        &pool,
-        driver_vulkan::dispatch::Geometry {
-            q_heads: facts.q_heads,
-            kv_heads: facts.kv_heads,
-            head_dim: facts.head_dim,
-            rotary_dims: facts.head_dim,
-            n_experts: facts.n_experts,
-            experts_per_token: facts.experts_per_token,
+        Binding {
+            arena,
+            resolver: &pool,
+            geometry: driver_vulkan::dispatch::Geometry {
+                q_heads: facts.q_heads,
+                kv_heads: facts.kv_heads,
+                head_dim: facts.head_dim,
+                rotary_dims: facts.head_dim,
+                n_experts: facts.n_experts,
+                experts_per_token: facts.experts_per_token,
+            ..Default::default()
+            },
+            min_offset: device.min_storage_offset(),
         },
-        device.min_storage_offset(),
     )
     .expect("the rectangle plans");
     assert_eq!(made.len(), 1, "the append is one dispatch");
@@ -3810,7 +4058,7 @@ fn what_the_append_writes_through_the_page_table_is_what_the_attention_reads() {
     use driver_vulkan::binding::FireTable;
     use driver_vulkan::resources::{Pool, Shape};
 
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let head_dim = 128usize;
     let shape = Shape {
         layers: 1,
@@ -3840,7 +4088,7 @@ fn what_the_append_writes_through_the_page_table_is_what_the_attention_reads() {
 
     // The write half, one position at a time, because a decode appends one
     // row per fire and the tables it reads are one entry long.
-    let append = module(dir, "kv_append_paged_bfloat16");
+    let append = module("kv_append_paged_bfloat16");
     let mut push = Vec::new();
     push.extend_from_slice(&(head_dim as i32).to_le_bytes());
     push.extend_from_slice(&(shape.page_size as i32).to_le_bytes());
@@ -3874,7 +4122,7 @@ fn what_the_append_writes_through_the_page_table_is_what_the_attention_reads() {
                 .get(
                     &device,
                     "kv_append_paged_bfloat16",
-                    &append,
+                    append,
                     push.len() as u32,
                     bound.len() as u32,
                     Capability::Baseline,
@@ -3921,7 +4169,7 @@ fn what_the_append_writes_through_the_page_table_is_what_the_attention_reads() {
     let qb = device.buffer(&bf16_bytes(&q)).expect("queries");
     let ob = device.buffer(&vec![0u8; head_dim * 2]).expect("out");
     let symbol = "sdpa_paged_decode_bfloat16_d_128";
-    let code = module(dir, symbol);
+    let code = module(symbol);
     {
         use driver_vulkan::binding::Resolve;
         let bound = [
@@ -3943,7 +4191,7 @@ fn what_the_append_writes_through_the_page_table_is_what_the_attention_reads() {
             .get(
                 &device,
                 symbol,
-                &code,
+                code,
                 spush.len() as u32,
                 bound.len() as u32,
                 Capability::Baseline,
@@ -4028,7 +4276,7 @@ fn the_two_appends_put_a_row_in_the_same_place_and_the_pool_says_where() {
     use driver_vulkan::binding::{FireNumber, FireTable, Resolve};
     use driver_vulkan::resources::{Pool, Shape};
 
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let head_dim = 128usize;
     let shape = Shape {
         layers: 1,
@@ -4070,7 +4318,7 @@ fn the_two_appends_put_a_row_in_the_same_place_and_the_pool_says_where() {
     let seq_stride = straight
         .number(FireNumber::KvSeqStride)
         .expect("a sequence stride");
-    let plain = module(dir, "kv_append_bfloat16");
+    let plain = module("kv_append_bfloat16");
     // Four bytes of padding at offset 4, then two 64-bit strides of which the
     // shader reads the low half.
     let mut push = vec![0u8; 24];
@@ -4094,7 +4342,7 @@ fn the_two_appends_put_a_row_in_the_same_place_and_the_pool_says_where() {
             .get(
                 &device,
                 "kv_append_bfloat16",
-                &plain,
+                plain,
                 push.len() as u32,
                 bound.len() as u32,
                 Capability::Baseline,
@@ -4110,7 +4358,7 @@ fn the_two_appends_put_a_row_in_the_same_place_and_the_pool_says_where() {
     // The paged half, through the identity table -- the one arrangement under
     // which the two shaders are supposed to agree.
     let mut paged = Pool::open(&device, shape).expect("the paged pool");
-    let scatter = module(dir, "kv_append_paged_bfloat16");
+    let scatter = module("kv_append_paged_bfloat16");
     let mut ppush = Vec::new();
     ppush.extend_from_slice(&(head_dim as i32).to_le_bytes());
     ppush.extend_from_slice(&(shape.page_size as i32).to_le_bytes());
@@ -4144,7 +4392,7 @@ fn the_two_appends_put_a_row_in_the_same_place_and_the_pool_says_where() {
             .get(
                 &device,
                 "kv_append_paged_bfloat16",
-                &scatter,
+                scatter,
                 ppush.len() as u32,
                 bound.len() as u32,
                 Capability::Baseline,
@@ -4231,7 +4479,7 @@ fn the_contiguous_decode_reads_the_pool_the_paged_append_wrote() {
     use driver_vulkan::binding::{FireNumber, FireTable, Resolve};
     use driver_vulkan::resources::{Pool, Shape};
 
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let head_dim = 128usize;
     let shape = Shape {
         layers: 1,
@@ -4260,7 +4508,7 @@ fn the_contiguous_decode_reads_the_pool_the_paged_append_wrote() {
     let mut pool = Pool::open(&device, shape).expect("the pool");
     let mut cache = Pipelines::new();
 
-    let scatter = module(dir, "kv_append_paged_bfloat16");
+    let scatter = module("kv_append_paged_bfloat16");
     let mut ppush = Vec::new();
     ppush.extend_from_slice(&(head_dim as i32).to_le_bytes());
     ppush.extend_from_slice(&(shape.page_size as i32).to_le_bytes());
@@ -4292,7 +4540,7 @@ fn the_contiguous_decode_reads_the_pool_the_paged_append_wrote() {
             .get(
                 &device,
                 "kv_append_paged_bfloat16",
-                &scatter,
+                scatter,
                 ppush.len() as u32,
                 bound.len() as u32,
                 Capability::Baseline,
@@ -4326,7 +4574,7 @@ fn the_contiguous_decode_reads_the_pool_the_paged_append_wrote() {
         .buffer(&vec![0u8; q_heads * head_dim * 2])
         .expect("out");
     let symbol = "sdpa_vector_decode_bfloat16_d_128";
-    let code = module(dir, symbol);
+    let code = module(symbol);
     {
         let bound = [
             Bound::whole(&qb),
@@ -4338,7 +4586,7 @@ fn the_contiguous_decode_reads_the_pool_the_paged_append_wrote() {
             .get(
                 &device,
                 symbol,
-                &code,
+                code,
                 push.len() as u32,
                 bound.len() as u32,
                 Capability::Baseline,
@@ -4415,7 +4663,7 @@ fn two_requests_in_one_fire_do_not_read_each_others_history() {
     use driver_vulkan::binding::{FireTable, Resolve};
     use driver_vulkan::resources::{Frame, Pool, Request, Shape};
 
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let head_dim = 128usize;
     let shape = Shape {
         layers: 1,
@@ -4470,7 +4718,7 @@ fn two_requests_in_one_fire_do_not_read_each_others_history() {
 
     // The append, one row at a time, each with the page and offset the frame
     // worked out for it.
-    let scatter = module(dir, "kv_append_paged_bfloat16");
+    let scatter = module("kv_append_paged_bfloat16");
     let mut ppush = Vec::new();
     ppush.extend_from_slice(&(head_dim as i32).to_le_bytes());
     ppush.extend_from_slice(&(shape.page_size as i32).to_le_bytes());
@@ -4498,7 +4746,7 @@ fn two_requests_in_one_fire_do_not_read_each_others_history() {
             .get(
                 &device,
                 "kv_append_paged_bfloat16",
-                &scatter,
+                scatter,
                 ppush.len() as u32,
                 bound.len() as u32,
                 Capability::Baseline,
@@ -4544,7 +4792,7 @@ fn two_requests_in_one_fire_do_not_read_each_others_history() {
         .buffer(&vec![0u8; requests.len() * head_dim * 2])
         .expect("out");
     let symbol = "sdpa_paged_decode_bfloat16_d_128";
-    let code = module(dir, symbol);
+    let code = module(symbol);
     {
         let bound = [
             Bound::whole(&qb),
@@ -4565,7 +4813,7 @@ fn two_requests_in_one_fire_do_not_read_each_others_history() {
             .get(
                 &device,
                 symbol,
-                &code,
+                code,
                 spush.len() as u32,
                 bound.len() as u32,
                 Capability::Baseline,
@@ -4661,7 +4909,7 @@ fn the_ladder_this_driver_builds_is_the_one_the_shader_raises() {
     use driver_vulkan::binding::FireTable;
     use driver_vulkan::resources::{Pool, Shape};
 
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let head_dim = 128usize;
     let heads = 2usize;
     let rows = 3usize;
@@ -4701,7 +4949,7 @@ fn the_ladder_this_driver_builds_is_the_one_the_shader_raises() {
 
     let mut cache = Pipelines::new();
     let turn = |cache: &mut Pipelines, symbol: &str, push: &[u8], freqs: bool| -> Vec<f32> {
-        let code = module(dir, symbol);
+        let code = module(symbol);
         let xb = device.buffer(&bf16_bytes(&x)).expect("the tensor");
         {
             use driver_vulkan::binding::Resolve;
@@ -4718,7 +4966,7 @@ fn the_ladder_this_driver_builds_is_the_one_the_shader_raises() {
                 .get(
                     &device,
                     symbol,
-                    &code,
+                    code,
                     push.len() as u32,
                     bound.len() as u32,
                     Capability::Baseline,
@@ -4833,7 +5081,7 @@ fn the_rows_the_frame_reads_out_are_the_rows_the_gather_moves() {
     use model_compiler::lower::{Fire, lower};
     use model_ir::trace::FireClass;
 
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let symbol = "row_gather_bfloat16";
 
     let shape = Shape {
@@ -4911,16 +5159,18 @@ fn the_rows_the_frame_reads_out_are_the_rows_the_gather_moves() {
         .find(|l| low.kernels[l.kernel as usize] == symbol)
         .expect("the text gathers");
 
-    let store = store_of(dir);
+    let store = store_of();
     let made = plan_by_routine(
         symbol,
         &low,
         launch,
         &store,
-        arena,
-        &pool,
-        driver_vulkan::dispatch::Geometry::default(),
-        device.min_storage_offset(),
+        Binding {
+            arena,
+            resolver: &pool,
+            geometry: driver_vulkan::dispatch::Geometry::default(),
+            min_offset: device.min_storage_offset(),
+        },
     )
     .expect("the rectangle plans");
     assert_eq!(made.len(), 1, "the gather is one dispatch");
@@ -5076,7 +5326,7 @@ fn a_fire_that_cannot_run_says_which_launch() {
     use model_compiler::lower::{Fire as LowerFire, Row, lower};
     use model_ir::trace::FireClass;
 
-    let (device, dir) = gpu!();
+    let device = gpu!();
 
     let plan = llama_like_metal(
         &LlamaLikeFacts::qwen3_0_6b(),
@@ -5132,8 +5382,7 @@ fn a_fire_that_cannot_run_says_which_launch() {
         .kernels
         .iter()
         .map(|symbol| {
-            let code =
-                std::fs::read(dir.join(format!("{symbol}.spv"))).expect("the module is built");
+            let code = module(symbol).to_vec();
             (symbol.clone(), code)
         })
         .collect();
@@ -5178,6 +5427,7 @@ fn a_fire_that_cannot_run_says_which_launch() {
             rotary_dims: 128,
             n_experts: 0,
             experts_per_token: 0,
+            ..Default::default()
         },
         tier: Capability::Baseline,
         one_at_a_time: false,
@@ -5214,25 +5464,39 @@ fn a_fire_that_cannot_run_says_which_launch() {
     assert_eq!(fired.dispatches, low.launches.len());
 
     // Two refusals deep in the plan and one whole fire, and the device is
-    // holding exactly what it held before them. A `fire` that kept its block
-    // buffer would pass every assertion above -- this card has twenty-four
-    // gigabytes and the block is tens of kilobytes, so nothing downstream
-    // would ever notice. Measured: `std::mem::forget` in place of the free
-    // fails this line by one buffer.
+    // holding what it held before them PLUS the fire's scalar block, which
+    // the pipeline cache now keeps for the next fire instead of freeing.
+    //
+    // THIS LINE USED TO READ `held` AND IT CHANGED WITH THE THING IT WATCHES.
+    // `fire` allocated a block buffer per fire and freed it before returning,
+    // and that free was worth watching: measured, release, `tests/hostprof.rs`,
+    // the allocation alone was 0.18 ms of a 1.4 ms host step. It is
+    // `Pipelines::block` and `Pipelines::keep` now -- the buffer outlives the
+    // fire on purpose -- so "gave back what it took" is asked of the pair
+    // rather than of `fire` alone, and it is asked HARDER: the count is exact
+    // in both directions, so a fire that took two blocks, or one that kept
+    // its block WITHOUT handing it to the cache, fails the first line, and a
+    // cache that leaks what it was given fails the second. `std::mem::forget`
+    // in place of either free still fails one of them.
     //
     // The two refusals here are pass-one refusals, which return before the
     // allocation happens and so have nothing to give back; it is the
-    // successful fire that takes and returns. Both are under the same claim
-    // on purpose, because which refusals come before the allocation is a
-    // property of the code and not of the plan, and this line does not have
+    // successful fire that takes and hands over. Both are under the same
+    // claim on purpose, because which refusals come before the allocation is
+    // a property of the code and not of the plan, and this line does not have
     // to be revisited when that moves.
     assert_eq!(
         device.live_buffers(),
-        held,
-        "two refusals and a fire left buffers behind"
+        held + 1,
+        "a fire and two refusals left something other than the kept block behind"
     );
 
     cache.clear(&device);
+    assert_eq!(
+        device.live_buffers(),
+        held,
+        "the pipeline cache kept the fire's block buffer and did not give it back"
+    );
     device.free(arena_buffer);
     store.close(&device);
 }
@@ -5266,7 +5530,7 @@ fn the_logits_a_fire_leaves_are_one_row_per_readout_and_are_not_f32() {
     use model_compiler::lower::{Fire as LowerFire, lower};
     use model_ir::trace::FireClass;
 
-    let (device, dir) = gpu!();
+    let device = gpu!();
 
     let shape = Shape {
         layers: 28,
@@ -5343,8 +5607,7 @@ fn the_logits_a_fire_leaves_are_one_row_per_readout_and_are_not_f32() {
         .kernels
         .iter()
         .map(|symbol| {
-            let code =
-                std::fs::read(dir.join(format!("{symbol}.spv"))).expect("the module is built");
+            let code = module(symbol).to_vec();
             (symbol.clone(), code)
         })
         .collect();
@@ -5368,6 +5631,7 @@ fn the_logits_a_fire_leaves_are_one_row_per_readout_and_are_not_f32() {
                 rotary_dims: 128,
                 n_experts: 0,
                 experts_per_token: 0,
+            ..Default::default()
             },
             tier: Capability::Baseline,
             one_at_a_time: false,
@@ -5531,7 +5795,7 @@ fn a_conversation_keeps_its_pages_while_another_is_seated_between_its_fires() {
     use driver_vulkan::pages::Book;
     use driver_vulkan::resources::{Frame, Pool, Request, Shape};
 
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let head_dim = 128usize;
     let shape = Shape {
         layers: 1,
@@ -5565,7 +5829,7 @@ fn a_conversation_keeps_its_pages_while_another_is_seated_between_its_fires() {
 
     let mut pool = Pool::open(&device, shape).expect("the pool");
     let mut cache = Pipelines::new();
-    let scatter = module(dir, "kv_append_paged_bfloat16");
+    let scatter = module("kv_append_paged_bfloat16");
     let mut ppush = Vec::new();
     ppush.extend_from_slice(&(head_dim as i32).to_le_bytes());
     ppush.extend_from_slice(&(shape.page_size as i32).to_le_bytes());
@@ -5601,7 +5865,7 @@ fn a_conversation_keeps_its_pages_while_another_is_seated_between_its_fires() {
                 .get(
                     &device,
                     "kv_append_paged_bfloat16",
-                    &scatter,
+                    scatter,
                     ppush.len() as u32,
                     bound.len() as u32,
                     Capability::Baseline,
@@ -5648,7 +5912,7 @@ fn a_conversation_keeps_its_pages_while_another_is_seated_between_its_fires() {
     let qb = device.buffer(&bf16_bytes(&queries)).expect("queries");
     let ob = device.buffer(&vec![0u8; head_dim * 2]).expect("out");
     let symbol = "sdpa_paged_decode_bfloat16_d_128";
-    let code = module(dir, symbol);
+    let code = module(symbol);
     {
         let bound = [
             Bound::whole(&qb),
@@ -5669,7 +5933,7 @@ fn a_conversation_keeps_its_pages_while_another_is_seated_between_its_fires() {
             .get(
                 &device,
                 symbol,
-                &code,
+                code,
                 spush.len() as u32,
                 bound.len() as u32,
                 Capability::Baseline,
@@ -5765,7 +6029,7 @@ fn a_deployment_fires_step_after_step_and_stops_building_pipelines() {
     use model::shared::llama_like::forward::llama_like_metal;
     use model_ir::trace::FireClass;
 
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let shape = Shape {
         layers: 28,
         kv_heads: 8,
@@ -5800,6 +6064,7 @@ fn a_deployment_fires_step_after_step_and_stops_building_pipelines() {
             rotary_dims: 128,
             n_experts: 0,
             experts_per_token: 0,
+            ..Default::default()
         },
         tier: Capability::Baseline,
     };
@@ -5868,26 +6133,25 @@ fn a_deployment_fires_step_after_step_and_stops_building_pipelines() {
 
     // Loaded from the first step's kernels and never reloaded, which is also
     // what a server does: the module set is the plan's, not the fire's.
-    let mut modules: std::collections::BTreeMap<String, Vec<u8>> =
-        std::collections::BTreeMap::new();
-    let load = |modules: &mut std::collections::BTreeMap<String, Vec<u8>>| {
-        for name in std::fs::read_dir(dir).expect("the spirv dir").flatten() {
-            let path = name.path();
-            if path.extension().is_some_and(|e| e == "spv")
-                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-            {
-                modules.insert(stem.to_string(), std::fs::read(&path).expect("a module"));
-            }
-        }
-    };
-    load(&mut modules);
+    let modules = store_of();
 
     let mut lowerings = driver_vulkan::turns::Lowerings::default();
+    // The arena buffer, kept between steps rather than reallocated per step.
+    // Released at the end of the test: this suite shares one device that
+    // outlives the process, so a buffer nobody frees is a buffer the
+    // validation layer reports against every later test.
+    let mut arenas = driver_vulkan::turns::Arenas::default();
+    // The plan cache, which a step needs somewhere to keep. Empty here, and
+    // a fresh one per test, so nothing in this file is served a fire another
+    // test recorded.
+    let mut plans = driver_vulkan::replay::Plans::new();
     let mut held = Held {
         book: &mut book,
         pool: &mut pool,
         weights: &weights,
         lowerings: &mut lowerings,
+        arenas: &mut arenas,
+        plans: &mut plans,
     };
 
     // A prefill of four tokens for one conversation.
@@ -5970,23 +6234,62 @@ fn a_deployment_fires_step_after_step_and_stops_building_pipelines() {
             .any(|p| a_pages.contains(p)),
         "B was given a page A still holds"
     );
-    // ONE more, and exactly one: `sdpa_paged_tiled`. This step lowers the
-    // PREFILL plan and the first lowered the decode plan, and the only thing
-    // the two disagree about at two rows is which attention kernel they
-    // reach. The projections do NOT diverge here -- the tiled GEMM has
-    // `bm = 16`, so a prefill at fewer than sixteen rows lowers to exactly
-    // the matrix-vector products a decode does. Two rows, three, eight -- all
-    // `affine_qmv_fast`; at sixteen two `affine_qmm_t` symbols appear and
-    // stay, which is what the sixteen-row step below is for.
+    // NONE, and the zero is the point. This step lowers the PREFILL plan and
+    // the first lowered the decode plan, and the only thing the two disagree
+    // about at two rows is which attention kernel they reach. The projections
+    // do NOT diverge here -- the tiled GEMM has `bm = 16`, so a prefill at
+    // fewer than sixteen rows lowers to exactly the matrix-vector products a
+    // decode does. Two rows, three, eight -- all `affine_qmv_fast`; at
+    // sixteen two `affine_qmm_t` symbols appear and stay, which is what the
+    // sixteen-row step below is for.
     //
-    // This was `second.pipelines == first.pipelines` while the two
-    // `sdpa_paged_tiled` rows stated nothing but their axes and `dsl::sdpa`
-    // could only reach the decode kernel. The count going up by one is the
-    // evidence the tiled kernel is now actually selected for a prefill.
+    // THE COUNT HAS BEEN 0, 1 AND 2, AND EACH MOVE WAS A REAL CHANGE.
+    //
+    // It began at 0 -- `second.pipelines == first.pipelines` -- because the
+    // two `sdpa_paged_tiled` rows stated nothing but their axes and
+    // `dsl::sdpa` could only reach the decode kernel. That zero was true and
+    // it was the wrong zero: the prefill was being answered by the decode
+    // kernel because nothing else had been wired, not because anything had
+    // asked whether it should be.
+    //
+    // It went to 1 when the tiled kernel was actually selected for a prefill,
+    // and briefly to 2, where the second was a DEFECT:
+    // `cast_qmm_input_strided`, which the prefill text used to state
+    // unconditionally beside its precast GEMMs -- per plan and not per row --
+    // so a two-row prefill recorded the cast and then lowered the projection
+    // to `affine_qmv_fast`, which reads the `bfloat` activation and never
+    // looks at the `half` one the cast just wrote. Dead work below the tile.
+    // Measuring it is what got it fixed: at a batch of eight the same dead
+    // cast is 112 fires, because `TokensMultipleOf` refuses every batch a
+    // scheduler gathers and so `affine_qmm_t` fires zero times while the cast
+    // fires anyway. `dsl::metal::cast_qmm_input_when` now gives the cast a
+    // guard of its own carrying the same predicate, with an empty
+    // `otherwise`.
+    //
+    // AND IT IS BACK TO 0, FOR THE OPPOSITE REASON IT STARTED THERE. Both
+    // rows of this step are ONE-TOKEN windows -- B was seated with a single
+    // token and A is decoding -- and `GuardPred::WindowOne` now asks exactly
+    // that question in front of the attention. A step of one-token rows takes
+    // the decode pair whatever class the fire was given, so it reaches the
+    // same two kernels `first` did and builds nothing new. That is the whole
+    // batched-decode lane in one number: eight sequences each advancing by
+    // one token were being planned as a prefill and handed to
+    // `sdpa_paged_tiled`, where a 32-row query tile held rows belonging to
+    // eight different sequences with eight different key runs and shared
+    // nothing -- 50.63us a fire against the decode pair's 15.09, and 645us a
+    // fire at long context. Routing them back is ~2ms a step at every batch
+    // of two or more.
+    //
+    // The evidence that a prefill really does reach the tiled kernel did not
+    // disappear with this zero; it MOVED, to the tile-wide prefill below,
+    // whose rows are multi-token and which therefore still builds
+    // `sdpa_paged_tiled` as one of its four. That is the better home for it:
+    // a two-row step of single tokens was never a good witness for "a prefill
+    // selects the tiled attention", because it is not one.
     assert_eq!(
-        second.pipelines,
-        first.pipelines + 1,
-        "the second step built {} pipelines the first did not",
+        second.pipelines, first.pipelines,
+        "the second step built {} pipelines the first did not, but every row \
+         of it is a one-token window and so takes the same decode attention",
         second.pipelines - first.pipelines
     );
 
@@ -6126,12 +6429,19 @@ fn a_deployment_fires_step_after_step_and_stops_building_pipelines() {
     // and it was passing because `Serving` held one plan: the prefill was
     // being answered with sixteen matrix-VECTOR products. The claim was true
     // and it was the wrong claim.
-    // Three, not two: the tiled GEMM's two plus `sdpa_paged_tiled`, which the
-    // two-row prefill above already built and the one-row decode `first`
-    // never does.
+    // Four, not three: the tiled GEMM's two, plus `sdpa_paged_tiled`, which
+    // the two-row prefill above already built and the one-row decode `first`
+    // never does, plus `cast_qmm_input_strided_bfloat16_to_float16` -- the
+    // staging pass that `qmm_fp16_precast` puts in front of each of those two
+    // GEMMs. The cast is ONE pipeline for two GEMMs because q/k/v share a
+    // staged activation and gate/up share another, and it is a pipeline the
+    // sub-tile steps never build even though they record the cast's
+    // statement: `stage(x)` sits outside the `TokensMultipleOf` guard, so a
+    // short step stages nothing and lowers to `affine_qmv_fast`, which reads
+    // the bfloat activation.
     assert_eq!(
         prefill.pipelines,
-        first.pipelines + 3,
+        first.pipelines + 4,
         "a {tile}-row step built {} pipelines a one-row step had not, and the tiled \
          GEMM is two of them",
         prefill.pipelines - first.pipelines
@@ -6290,6 +6600,7 @@ fn a_deployment_fires_step_after_step_and_stops_building_pipelines() {
     cache.clear(&device);
     pool.close(&device);
     weights.close(&device);
+    arenas.release(&device);
 }
 
 /// The weight store answers by name, replaces without leaking, and never
@@ -6316,7 +6627,7 @@ fn a_weight_store_answers_by_name_and_refuses_a_name_it_was_never_given() {
     use driver_vulkan::binding::Resolve;
     use driver_vulkan::resources::Weights;
 
-    let (device, _) = gpu!();
+    let device = gpu!();
     let mut weights = Weights::new();
     assert!(weights.is_empty());
     assert_eq!(weights.len(), 0);
@@ -6703,7 +7014,7 @@ fn a_whole_plan_fires_with_the_weights_a_real_checkpoint_holds() {
     use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
     use model_ir::trace::FireClass;
 
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let Some(real) = checkpoint_weights() else {
         eprintln!("no readable 4-bit qwen3-0.6b, so a real weight load is unmeasured");
         return;
@@ -6726,7 +7037,6 @@ fn a_whole_plan_fires_with_the_weights_a_real_checkpoint_holds() {
     for class in [FireClass::Decode, FireClass::Prefill] {
         answers.push(whole_plan(
             &device,
-            dir,
             "qwen3_0_6b",
             &facts,
             &metal,
@@ -6744,11 +7054,11 @@ fn a_whole_plan_fires_with_the_weights_a_real_checkpoint_holds() {
     // The premise, same as `gemm_agrees`: two plans, or there is nothing to
     // compare.
     assert!(
-        !answers[0].kernels.iter().any(|k| k.contains("qmm")),
+        !answers[0].kernels.iter().any(|k| is_tiled_gemm(k)),
         "the decode plan stated a tiled GEMM"
     );
     assert!(
-        answers[1].kernels.iter().any(|k| k.contains("qmm")),
+        answers[1].kernels.iter().any(|k| is_tiled_gemm(k)),
         "the prefill plan stated no tiled GEMM"
     );
 
@@ -6896,13 +7206,13 @@ fn a_whole_plan_fires_with_the_weights_a_real_checkpoint_holds() {
 /// indexed by the wrong position, but not one merely tuned wrongly.
 #[test]
 fn a_real_model_continues_a_pattern_it_was_shown() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let Some(real) = checkpoint_weights() else {
         eprintln!("no readable 4-bit qwen3-0.6b, so induction is unmeasured");
         return;
     };
     assert_eq!(
-        continued(&device, dir, &REALS[0], real, Feeding::Prefilled).tokens,
+        continued(&device, &REALS[0], real, Feeding::Prefilled).tokens,
         PERIOD[2..].to_vec(),
         "the model was shown {PERIOD:?} five times and did not continue it"
     );
@@ -6961,12 +7271,11 @@ struct Continuation {
 /// setup steps: one place that knows how a text is assembled means a caller
 /// cannot get the cache shape from qwen3 while serving qwen2.5.
 fn shelled(
-    dir: &std::path::Path,
     model: &Real,
     real: &'static std::collections::BTreeMap<String, Vec<u8>>,
     pages: u32,
 ) -> driver_vulkan::shell::Shell {
-    shelled_at_tile(dir, model, real, pages, None, true)
+    shelled_at_tile(model, real, pages, None, true)
 }
 
 /// [`shelled`], with the GEMM's instantiation point overridden.
@@ -6986,7 +7295,6 @@ fn shelled(
 /// not built at it at all. `the_default_tile_reaches_the_tier_in_production`
 /// is that measurement kept.
 fn shelled_at_tile(
-    dir: &std::path::Path,
     model: &Real,
     real: &'static std::collections::BTreeMap<String, Vec<u8>>,
     pages: u32,
@@ -7030,36 +7338,34 @@ fn shelled_at_tile(
             rotary_dims: facts.head_dim,
             n_experts: 0,
             experts_per_token: 0,
+            ..Default::default()
         },
         layers: facts.layers as u16,
     };
 
-    let mut modules: std::collections::BTreeMap<String, Vec<u8>> =
-        std::collections::BTreeMap::new();
-    for entry in std::fs::read_dir(dir).expect("the spirv dir").flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "spv")
-            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-        {
-            // `tiered` false drops every `<symbol>.<tag>` key, which is how
-            // a caller asks for the scalar answer on a device that would
-            // otherwise load a tiered module. Nothing else can express it:
-            // the tier comes from the DEVICE, and a store cannot be asked to
-            // pretend the hardware is smaller than it is.
-            if tiered || !stem.contains('.') {
-                modules.insert(stem.to_string(), std::fs::read(&path).expect("a module"));
-            }
-        }
+    let deployment = Deployment {
+        pages,
+        ..Deployment::default()
+    };
+    // `tiered` true is the PRODUCTION path and takes it literally: `Shell::open`
+    // serves from the embedded table, which is what a server does, so the
+    // ordinary case here exercises the ordinary case there.
+    //
+    // `tiered` false narrows the store instead, dropping every `<symbol>.<tag>`
+    // key. That is how a caller asks for the scalar answer on a device that
+    // would otherwise load a tiered module, and nothing else can express it:
+    // the tier comes from the DEVICE, and a store cannot be asked to pretend
+    // the hardware is smaller than it is.
+    let mut shell = if tiered {
+        Shell::open(text, deployment)
+    } else {
+        let baseline: std::collections::BTreeMap<String, Vec<u8>> = kernels_vulkan::MODULES
+            .iter()
+            .filter(|(stem, _)| !stem.contains('.'))
+            .map(|(stem, code)| ((*stem).to_string(), code.to_vec()))
+            .collect();
+        Shell::open_with(text, deployment, Box::new(baseline))
     }
-
-    let mut shell = Shell::open(
-        text,
-        Deployment {
-            pages,
-            ..Deployment::default()
-        },
-        modules,
-    )
     .unwrap_or_else(|e| panic!("the shell: {e}"));
     for (name, bytes) in real {
         shell.hold(name, bytes).expect("a weight");
@@ -7077,14 +7383,13 @@ fn continued(
     // Not used: `Shell` opens its own device. Held anyway, because it is this
     // suite's lock and dropping it here would let two tests fire at once.
     _device: &Device,
-    dir: &std::path::Path,
     model: &Real,
     real: &'static std::collections::BTreeMap<String, Vec<u8>>,
     how: Feeding,
 ) -> Continuation {
     use driver_vulkan::turns::Turn;
 
-    let mut shell = shelled(dir, model, real, 8);
+    let mut shell = shelled(model, real, 8);
 
     let mut prompt: Vec<u32> = Vec::new();
     for _ in 0..5 {
@@ -7322,23 +7627,23 @@ fn continued(
 /// working, so it is recorded rather than reworked into a numeric failure.
 #[test]
 fn a_conversation_is_answered_the_same_however_it_reaches_the_driver() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let Some(real) = checkpoint_weights() else {
         eprintln!("no readable 4-bit qwen3-0.6b, so batch independence is unmeasured");
         return;
     };
     let want = PERIOD[2..].to_vec();
 
-    let alone = continued(&device, dir, &REALS[0], real, Feeding::Prefilled).tokens;
+    let alone = continued(&device, &REALS[0], real, Feeding::Prefilled).tokens;
     assert_eq!(alone, want, "prefilled");
 
-    let stepped = continued(&device, dir, &REALS[0], real, Feeding::OneAtATime).tokens;
+    let stepped = continued(&device, &REALS[0], real, Feeding::OneAtATime).tokens;
     assert_eq!(
         stepped, alone,
         "the decode plan answers differently than the prefill plan"
     );
 
-    let batched = continued(&device, dir, &REALS[0], real, Feeding::Alongside).tokens;
+    let batched = continued(&device, &REALS[0], real, Feeding::Alongside).tokens;
     assert_eq!(
         batched, alone,
         "a second conversation in the batch changed this one's answer"
@@ -7381,7 +7686,7 @@ fn a_conversation_is_answered_the_same_however_it_reaches_the_driver() {
 fn a_prompt_that_is_not_whole_tiles_is_answered_the_way_the_decode_answers_it() {
     use driver_vulkan::turns::Turn;
 
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let _ = &device;
     let Some(real) = checkpoint_weights() else {
         eprintln!("no readable 4-bit qwen3-0.6b, so the partial tile is unmeasured");
@@ -7405,7 +7710,7 @@ fn a_prompt_that_is_not_whole_tiles_is_answered_the_way_the_decode_answers_it() 
             .0 as u32
     };
 
-    let mut shell = shelled(dir, &REALS[0], real, 8);
+    let mut shell = shelled(&REALS[0], real, 8);
     let step = shell
         .step(&[Turn {
             who: 1,
@@ -7420,7 +7725,7 @@ fn a_prompt_that_is_not_whole_tiles_is_answered_the_way_the_decode_answers_it() 
     let split = step.logits.row(28).expect("the prompt's last row").to_vec();
 
     // The same tokens, one fire each, on a cache of its own.
-    let mut apart = shelled(dir, &REALS[0], real, 8);
+    let mut apart = shelled(&REALS[0], real, 8);
     let mut row: Vec<f32> = Vec::new();
     for t in &prompt {
         let one = apart
@@ -7530,7 +7835,7 @@ fn a_prompt_that_is_not_whole_tiles_is_answered_the_way_the_decode_answers_it() 
 /// handed the card three separate projections.
 #[test]
 fn a_second_real_model_is_served_the_way_the_text_states_it() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let model = &REALS[1];
     let Some(real) = weights_of(model) else {
         eprintln!("no readable 4-bit qwen2.5-1.5b, so the second model is unmeasured");
@@ -7549,7 +7854,7 @@ fn a_second_real_model_is_served_the_way_the_text_states_it() {
         "the reference did not distinguish the two"
     );
 
-    let prefilled = continued(&device, dir, model, real, Feeding::Prefilled).tokens;
+    let prefilled = continued(&device, model, real, Feeding::Prefilled).tokens;
     assert_ne!(
         prefilled, biasless,
         "{} answers what a numpy forward of the SAME text answers with the qkv biases \
@@ -7565,7 +7870,7 @@ fn a_second_real_model_is_served_the_way_the_text_states_it() {
     // the wrong width, or a cache shaped for the wrong head count, breaks this
     // before it breaks the prefill.
     assert_eq!(
-        continued(&device, dir, model, real, Feeding::OneAtATime).tokens,
+        continued(&device, model, real, Feeding::OneAtATime).tokens,
         prefilled,
         "{}'s decode plan answers differently than its prefill plan",
         model.id
@@ -7625,7 +7930,7 @@ fn a_second_real_model_is_served_the_way_the_text_states_it() {
 /// without which tolerances this wide could be passing any plausible row.
 #[test]
 fn both_real_models_agree_with_an_independent_implementation() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     const PROBE: [usize; 5] = [0, 1_000, 50_000, 100_000, 151_935];
     const SLACK: f32 = 0.5;
 
@@ -7641,7 +7946,7 @@ fn both_real_models_agree_with_an_independent_implementation() {
             );
             continue;
         };
-        let run = continued(&device, dir, model, real, Feeding::Prefilled);
+        let run = continued(&device, model, real, Feeding::Prefilled);
         for (what, row, oracle) in [
             ("prefill", &run.first, &model.oracle),
             ("decode", &run.second, &model.decoded),
@@ -7806,7 +8111,7 @@ fn agrees(id: &str, oracle: &Oracle, row: &[f32], slack: f32, probe: &[usize]) {
 /// * `abi_version` and `backend` against the constants the seam matches on.
 #[test]
 fn the_facts_the_engine_is_given_are_the_ones_this_driver_keeps() {
-    let (device, _dir) = gpu!();
+    let device = gpu!();
     let facts = driver_vulkan::facts::of(&device);
 
     assert_eq!(
@@ -7909,6 +8214,7 @@ fn a_shell_refuses_a_model_assembled_out_of_two() {
         rotary_dims: f.head_dim,
         n_experts: 0,
         experts_per_token: 0,
+            ..Default::default()
     };
     let whole = || Text {
         decode: llama_like_metal(&facts, &metal, FireClass::Decode),
@@ -8055,7 +8361,7 @@ fn a_shell_refuses_a_model_assembled_out_of_two() {
 /// Nothing here is a survivor.
 #[test]
 fn a_forked_conversation_carries_the_history_it_was_forked_from() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let _ = &device;
     let Some(real) = checkpoint_weights() else {
         eprintln!("no readable 4-bit qwen3-0.6b, so forking is unmeasured");
@@ -8063,7 +8369,7 @@ fn a_forked_conversation_carries_the_history_it_was_forked_from() {
     };
     // Four conversations of two pages each at most, and the fork needs the
     // source's pages free a second time.
-    let mut shell = shelled(dir, &REALS[0], real, 16);
+    let mut shell = shelled(&REALS[0], real, 16);
 
     let mut prompt: Vec<u32> = Vec::new();
     for _ in 0..5 {
@@ -8238,7 +8544,7 @@ fn a_forked_conversation_carries_the_history_it_was_forked_from() {
 /// 5. The page-pairing check removed.
 #[test]
 fn the_engine_s_copy_plan_moves_what_it_names_and_nothing_when_it_is_refused() {
-    let (device, _dir) = gpu!();
+    let device = gpu!();
     use driver_vulkan::resources::{Pool, Shape};
 
     fn as_bytes(v: &[f32]) -> Vec<u8> {
@@ -8462,7 +8768,7 @@ fn the_engine_s_copy_plan_moves_what_it_names_and_nothing_when_it_is_refused() {
 /// caught by control 2.
 #[test]
 fn a_cache_resized_under_a_conversation_does_not_change_its_answer() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let _ = &device;
     let Some(real) = checkpoint_weights() else {
         eprintln!("no readable 4-bit qwen3-0.6b, so resizing is unmeasured");
@@ -8470,7 +8776,7 @@ fn a_cache_resized_under_a_conversation_does_not_change_its_answer() {
     };
     // Two runs of the same conversation live at once, and the pool is then
     // grown past this and shrunk under it.
-    let mut shell = shelled(dir, &REALS[0], real, 10);
+    let mut shell = shelled(&REALS[0], real, 10);
 
     let mut prompt: Vec<u32> = Vec::new();
     for _ in 0..5 {
@@ -8740,13 +9046,13 @@ fn a_cache_resized_under_a_conversation_does_not_change_its_answer() {
 /// slowest run observed, which is as tight as that spread allows.
 #[test]
 fn a_decode_step_does_not_stall() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let _ = &device;
     let Some(real) = checkpoint_weights() else {
         eprintln!("no readable 4-bit qwen3-0.6b, so the step cost is unmeasured");
         return;
     };
-    let mut shell = shelled(dir, &REALS[0], real, 64);
+    let mut shell = shelled(&REALS[0], real, 64);
 
     let mut prompt: Vec<u32> = Vec::new();
     for _ in 0..4 {
@@ -8833,25 +9139,97 @@ fn a_decode_step_does_not_stall() {
 /// upper bound. The shares survive because the effect they describe, a fifth
 /// against three quarters, is far larger than two thirds of overhead.
 ///
-/// The host was measured separately, with timing OFF and the phases of
-/// `run_all` timed against the wall, which is the only way to get it
-/// unperturbed. Release, per decode step:
+/// The host is measured separately, with the device tool OFF, by
+/// `tests/hostprof.rs` -- which is `driver_vulkan::phase` turned on around
+/// every phase of a step, over fifty decodes, reported as a median. This
+/// table used to be four numbers timed by hand in a working copy; it is
+/// reproducible now, and the command is in that file's module doc.
 ///
-/// | phase | short (24 tok) | long (384 tok) |
-/// | --- | --- | --- |
-/// | argument checks | 0.007 ms | 0.010 ms |
-/// | descriptor sets | 0.134 ms | 0.113 ms |
-/// | command recording | 0.421 ms | 0.349 ms |
-/// | submit and wait | 3.469 ms | 12.961 ms |
-/// | everything outside `run_all` | 1.917 ms | 1.867 ms |
-/// | wall | 5.949 ms | 15.300 ms |
+/// Release, per decode step, on this card. The three columns are the tree as
+/// it stood when this table was first written, the same tree measured again
+/// with the repeatable tool, and after the per-step work that turned out to
+/// be loop-invariant was cached:
 ///
-/// The host is **2.48 ms and it does not move with context** -- 42% of a
-/// short step and 15% of a long one -- and three quarters of it is outside
-/// `run_all` entirely, in the lowering, the plan and the scalar blocks. That
-/// is not a defect, it is what a driver costs; it is written down because at
-/// short context it is nearly three times the whole attention kernel, and it
-/// had never appeared in any measurement here.
+/// | phase | first record | before | after (short) | after (long) |
+/// | --- | --- | --- | --- | --- |
+/// | frame and state tables | -- | 0.018 ms | 0.021 ms | 0.022 ms |
+/// | lowering (cached since) | -- | 0.000 ms | 0.000 ms | 0.000 ms |
+/// | arena allocate, zero, free | -- | 0.317 ms | 0.038 ms | 0.031 ms |
+/// | module readable? | -- | 3.179 ms | 0.076 ms | 0.073 ms |
+/// | arm lookup | -- | 0.145 ms | 0.029 ms | 0.028 ms |
+/// | plan the rectangles | -- | 0.714 ms | 0.675 ms | 0.667 ms |
+/// | scalar block allocation | -- | 0.244 ms | 0.190 ms | 0.190 ms |
+/// | pipelines and recording | -- | 0.347 ms | 0.076 ms | 0.075 ms |
+/// | logits readback | -- | 0.212 ms | 0.157 ms | 0.152 ms |
+/// | argument checks | 0.007 ms | -- | 0.007 ms | 0.006 ms |
+/// | descriptor sets | 0.134 ms | -- | 0.123 ms | 0.121 ms |
+/// | command recording | 0.421 ms | -- | 0.383 ms | 0.383 ms |
+/// | submit and wait | 3.469 ms | 3.437 ms | 2.870 ms | 12.070 ms |
+/// | everything outside `run_all` | 1.917 ms | 4.94 ms | 1.44 ms | 1.39 ms |
+/// | wall | 5.949 ms | 8.377 ms | 4.803 ms | 14.150 ms |
+///
+/// The "before" and "after" columns include the tool's own 0.58 ms and 0.22
+/// ms respectively -- 3616 and 1400 `Instant` pairs a step -- and the two
+/// summary rows have it subtracted, which is why they do not add up to the
+/// rows above them. The wall row is the tool OFF in every column.
+///
+/// # What that middle column is, and why it is not the first one
+///
+/// The first record was taken before the kernel families crossed to
+/// `hold::arm_for`, and the crossing put a whole SPIR-V parse per RECTANGLE
+/// into `serve::fire` -- a readability check whose result is discarded, over
+/// nine distinct symbols and 452 rectangles. Nothing failed and nothing in
+/// this file could see it: the number it moved was the wall, and the wall was
+/// asserted nowhere. It was 3.18 ms of a 4.94 ms host step by the time it was
+/// found, which is 38% of a whole short decode.
+///
+/// # What the host costs now
+///
+/// **0.09 to 0.10 ms, and it does not move with context** -- around six
+/// percent of a step at either end.
+///
+/// This section used to say 1.4 ms, thirty percent of a short step, and that
+/// was an artefact of how it was measured rather than a measurement. The
+/// figure was `median - run_all`, and since `replay` landed, ninety-four
+/// percent of steps never enter `run_all` at all -- they submit a recorded
+/// command buffer and wait on a fence. The subtraction was crediting the
+/// whole fence wait to the host. `tests/hostprof.rs` now subtracts the
+/// `fire/replay/submit` span as well, and the host is what is left. The
+/// "everything outside `run_all`" row of the table above has the same defect
+/// and is kept only because the columns beside it are a historical record.
+///
+/// So the plan's 452 rectangles are NOT the floor of this design from the
+/// host side; binding and encoding them is a tenth of a millisecond. They are
+/// the floor from the DEVICE side, and for a different reason: 311 of the 451
+/// gaps between them take a barrier, and the ordering those barriers impose
+/// is 1.06 ms of the 1.62 ms step -- see `driver_vulkan`'s `hazards`, which
+/// now carries the no-barrier measurement. Both roads still end at "state
+/// fewer rectangles", which is what `kernels-vulkan`'s `qmv_bench` concludes
+/// from the device side too. The host was simply never the reason.
+///
+/// # THIS TEST WAS `attention_is_a_fifth_of_a_short_step_and_three_quarters
+/// # _of_a_long_one`, AND THE THREE QUARTERS ARE GONE
+///
+/// It asserted `long_attn > 0.55` and measured 75%, and that was the whole
+/// case for the occupancy work: at 384 tokens attention was the step. The
+/// flash decode -- `attn::decode_splits`, `sdpa_paged_decode_split` and
+/// `sdpa_paged_decode_combine` -- cut the key range across workgroups and
+/// took the 384-key dispatch from 67.7 us to 11.2 us, and the share with it:
+///
+/// | | attention | projections |
+/// |---|---|---|
+/// | 24 tokens, before | 19% | 69% |
+/// | 24 tokens, now | 8% | 68% |
+/// | 384 tokens, before | **75%** | 22% |
+/// | 384 tokens, now | **14%** | 64% |
+///
+/// The bound MOVED DOWN, and that is not a tolerance being relaxed to make
+/// something pass -- the old assertion failed because the thing it was
+/// watching for happened. What is asserted now is the shape that replaced it:
+/// the projections dominate at BOTH ends, and attention still grows with
+/// context, just from a much lower floor. The end-to-end number is 4.07 ms a
+/// token to 1.66 at 384 tokens, measured with `tests/hostprof.rs` against
+/// `PIE_NO_FLASH_DECODE=1` on the same binary.
 ///
 /// # What is asserted, and why they are ratios
 ///
@@ -8862,8 +9240,8 @@ fn a_decode_step_does_not_stall() {
 /// enough to fail if an end inverts -- which is the event worth catching,
 /// since it would mean the next optimisation belongs somewhere else.
 #[test]
-fn attention_is_a_fifth_of_a_short_step_and_three_quarters_of_a_long_one() {
-    let (device, dir) = gpu!();
+fn the_projections_dominate_both_steps_now_that_the_decode_splits_its_keys() {
+    let device = gpu!();
     let _ = &device;
     let Some(real) = checkpoint_weights() else {
         eprintln!("no readable 4-bit qwen3-0.6b, so the step's shape is unmeasured");
@@ -8879,7 +9257,7 @@ fn attention_is_a_fifth_of_a_short_step_and_three_quarters_of_a_long_one() {
 
     // `repeats` copies of PERIOD is the history; `pages` has to hold it.
     let shape = |repeats: usize, pages: u32| -> (f64, f64, f64, std::time::Duration) {
-        let mut shell = shelled(dir, &REALS[0], real, pages);
+        let mut shell = shelled(&REALS[0], real, pages);
         let mut prompt: Vec<u32> = Vec::new();
         for _ in 0..repeats {
             prompt.extend_from_slice(&PERIOD);
@@ -8938,6 +9316,14 @@ fn attention_is_a_fifth_of_a_short_step_and_three_quarters_of_a_long_one() {
 
     let (short_attn, short_proj, short_gpu, short_wall) = shape(4, 64);
     let (long_attn, long_proj, long_gpu, long_wall) = shape(64, 512);
+    // The off-device share is A PROPERTY OF THE BUILD, not of the driver, and
+    // it is printed rather than asserted for that reason. The host side of
+    // this subtraction is ordinary Rust and the device side is not, so an
+    // unoptimised build inflates it out of all recognition: 60% here under
+    // `cargo test` against 2% under `cargo test --release`, almost entirely
+    // the bf16 widening in `serve::logits_of`. Read this column only from a
+    // release run. `tests/hostprof.rs` carries the measurement and the
+    // factor.
     eprintln!(
         "short: attention {:.0}%, projections {:.0}%, {:.0}% of the wall step off-device\n\
          long:  attention {:.0}%, projections {:.0}%, {:.0}% of the wall step off-device",
@@ -8951,35 +9337,201 @@ fn attention_is_a_fifth_of_a_short_step_and_three_quarters_of_a_long_one() {
 
     // Short context: the fixed cost is the whole cost.
     assert!(
-        short_attn < 0.35,
-        "at 24 tokens attention is {:.0}% of device time, measured at 19%",
+        short_attn < 0.20,
+        "at 24 tokens attention is {:.0}% of device time, measured at 8%",
         short_attn * 100.0
     );
     assert!(
         short_proj > 0.45,
-        "at 24 tokens the projections are {:.0}% of device time, measured at 69%",
+        "at 24 tokens the projections are {:.0}% of device time, measured at 68%",
         short_proj * 100.0
     );
-    // Long context: attention has overtaken everything, which is what makes
-    // its occupancy the target it is written down as.
+    // Long context: the projections still dominate, which is the whole point
+    // of the flash decode and the reason the bound below points the other way
+    // from the one it replaced.
     assert!(
-        long_attn > 0.55,
-        "at 384 tokens attention is {:.0}% of device time, measured at 75%: if it \
-         really has fallen this far the occupancy work is no longer the next target",
+        long_attn < 0.35,
+        "at 384 tokens attention is {:.0}% of device time, measured at 14%: above \
+         a third means the decode stopped splitting its keys -- check that \
+         `FireNumber::KvHistoryBucket` still reaches the arm and that \
+         `PIE_NO_FLASH_DECODE` is not set",
         long_attn * 100.0
     );
     assert!(
-        long_proj < 0.40,
-        "at 384 tokens the projections are {:.0}% of device time, measured at 22%",
+        long_proj > 0.45,
+        "at 384 tokens the projections are {:.0}% of device time, measured at 64%",
         long_proj * 100.0
     );
     // And the crossover itself, which is the claim neither end makes alone.
+    // Sixteen times the history buys attention a bigger share -- it is still
+    // the part that grows with context -- but no longer a dominant one.
     assert!(
-        long_attn > short_attn * 2.0,
+        long_attn > short_attn,
         "attention went from {:.0}% to {:.0}% of device time over 16x the history; \
          it is supposed to be the part that grows with context",
         short_attn * 100.0,
         long_attn * 100.0
+    );
+}
+
+/// A decode layer is ELEVEN ordered stages -- twelve once it splits its keys
+/// -- and that ordering, not arithmetic, is what a step costs.
+///
+/// # Why a barrier count is a performance assertion
+///
+/// Because the step is bounded by ordering. Patch out every pipeline barrier
+/// in `Device::run_all` -- which gives wrong answers, so it is a patch to
+/// make and throw away and not a knob to check in -- and the same 452
+/// dispatches of a qwen3-0.6b decode finish in **0.460 ms instead of
+/// 1.517**. Ordering is 1.06 of the 1.62 milliseconds a step costs: more
+/// than every kernel in it added together, and flat in context, so it is a
+/// floor and not a slope.
+///
+/// The reading that a barrier "costs 3.4 microseconds" is wrong. A
+/// compute-to-compute barrier adds no work; it costs whatever it stops from
+/// overlapping. These dispatches are single rows of a 0.6b model -- nearly
+/// all launch latency, almost no arithmetic -- so when they may overlap the
+/// card hides one behind another, and the barrier ends the hiding. The unit
+/// that costs is therefore neither the dispatch nor the barrier but the
+/// STAGE: a maximal run of dispatches with no barrier inside it, whose price
+/// is one kernel's full launch-to-retire latency however many dispatches
+/// share it. 1.517 ms over 311 stages is 4.9 us apiece; 0.460 ms over 452
+/// dispatches is 1.0 us apiece. That is the same statement twice.
+///
+/// # The eleven, for a pre-norm stack with qk-norm
+///
+/// Read off `llama_like`'s forward text, with the dispatch count in brackets
+/// where a stage holds more than one:
+///
+/// | # | stage | can it merge into a neighbour? |
+/// | --- | --- | --- |
+/// | 1 | attention rmsnorm | into the projection's prologue |
+/// | 2 | q, k, v projections (3) | ALREADY ONE STAGE -- see below |
+/// | 3 | q-norm, k-norm (2) | into rope's prologue |
+/// | 4 | rope | -- |
+/// | 5 | kv append | into rope's epilogue, which already writes k |
+/// | 6 | sdpa decode | -- |
+/// | 7 | o_proj, residual folded | already folded, `affine_qmv_fast_residual` |
+/// | 8 | mlp rmsnorm | into the gate/up prologue |
+/// | 9 | gate/up, already one weight | -- |
+/// | 10 | swiglu | into the gate/up epilogue |
+/// | 11 | down, residual folded | already folded |
+///
+/// Eleven times twenty-eight layers is 308, and the embedding gather, the
+/// final norm and the logits are the other three: **311**, which is what
+/// this measures. It is arithmetic, not a fit -- and the same arithmetic
+/// predicts the other number this test sees. Once the history passes the
+/// twenty-four-key crossover, `attn::decode_splits` cuts stage 6 into a
+/// split and a combine, so a layer is twelve and a step is 28 * 12 + 3 =
+/// **339**. Both are measured here, in one conversation, because the second
+/// only appears after the first.
+///
+/// # What that makes the remaining work, and what it is worth
+///
+/// At 4.9 us a stage, one stage off a layer is **0.14 ms off the step**,
+/// which is nine percent of it. The four merges marked above are 0.55 ms.
+/// llama.cpp's Vulkan backend runs this model on this card in 1.39 ms
+/// against our 1.61, so the ENTIRE remaining gap is under two stages a
+/// layer, and each one is a kernel epilogue in `crates/kernels-vulkan` plus
+/// a sentence in the SHARED forward text. That is why this test states the
+/// target instead of reaching it: none of it is a Vulkan-local change.
+///
+/// # The mistake this table exists to prevent
+///
+/// "Fuse q, k and v into one weight" is the standard advice and it is worth
+/// almost nothing here. They ALREADY share a stage: they read the same
+/// normed rows and write three disjoint places, and `hazards` sees that, so
+/// no barrier separates them. Fusing the weights removes two dispatches at
+/// 1.0 us and no ordering at all -- a fortieth of what merging one rmsnorm
+/// into the projection that follows it is worth. "Fewer dispatches" is the
+/// right slogan attached to the wrong metric; the metric is stages.
+///
+/// # What is asserted
+///
+/// The two stage counts exactly, and that the steps between them replay.
+/// Exact is right where a ratio would not be, because the number is a
+/// property of the forward TEXT rather than of the card or the load: it
+/// moves when somebody changes what a layer says, which is exactly the event
+/// worth a signature. If it FALLS, someone did the work above, and the win
+/// belongs here in milliseconds.
+#[test]
+fn a_decode_layer_is_eleven_ordered_stages_and_the_ordering_is_the_cost() {
+    let device = gpu!();
+    let _ = &device;
+    let Some(real) = checkpoint_weights() else {
+        eprintln!("no readable 4-bit qwen3-0.6b, so the stage count is unmeasured");
+        return;
+    };
+    let layers = (REALS[0].facts)().layers;
+    let mut shell = shelled(&REALS[0], real, 64);
+    let step = |shell: &mut driver_vulkan::shell::Shell, tokens: Vec<u32>| {
+        shell
+            .step(&[driver_vulkan::turns::Turn { who: 1, tokens }])
+            .unwrap_or_else(|e| panic!("{e}"));
+    };
+    step(&mut shell, PERIOD.to_vec());
+
+    // Barriers are counted where they are RECORDED, so a replayed step adds
+    // none. Twenty decodes and read them apart: a step records when the
+    // history crosses a `FireNumber::KvHistoryBucket` breakpoint and the grid
+    // baked into the command buffer stops being the right one, and it
+    // replays every other time.
+    let mut per_step = Vec::new();
+    for _ in 0..20 {
+        let before = shell.device().barriers();
+        step(&mut shell, vec![PERIOD[0]]);
+        let after = shell.device().barriers();
+        per_step.push(after - before);
+    }
+    eprintln!("barriers recorded per decode step: {per_step:?}");
+
+    // Both halves are load-bearing. A driver that re-recorded every step
+    // would still show the right stage count and would be paying the whole
+    // recording cost `replay` exists to remove; one that never re-recorded
+    // would be replaying a grid sized for a shorter history.
+    let recorded = per_step.iter().filter(|&&n| n > 0).count();
+    assert!(
+        (2..=6).contains(&recorded),
+        "{recorded} of 20 decode steps re-recorded ({per_step:?}). A handful is \
+         the history crossing power-of-two buckets; all of them means these \
+         steps are not replaying at all, and none means the bucket stopped \
+         reaching `replay::Key`."
+    );
+
+    let mut seen: Vec<u32> = per_step.iter().copied().filter(|&n| n > 0).collect();
+    seen.sort_unstable();
+    seen.dedup();
+    let unsplit = seen[0];
+    let split = *seen.last().expect("some step recorded");
+    let stages = |n: u32| -> String {
+        format!(
+            "{n} barriers over {layers} layers is {:.2} stages a layer",
+            f64::from(n - 3) / f64::from(layers)
+        )
+    };
+    assert_eq!(
+        unsplit,
+        layers * 11 + 3,
+        "the unsplit decode: {}, not the eleven measured. If this FELL, a \
+         stage was fused: each one is 0.14 ms of a 1.61 ms step, so say which \
+         stage and what the step measures now -- this test's doc lists the \
+         eleven and which of them can merge.",
+        stages(unsplit)
+    );
+    assert_eq!(
+        split,
+        layers * 12 + 3,
+        "the split decode: {}, and it should be exactly one stage a layer more \
+         than the unsplit {unsplit} -- `attn::decode_splits` cutting the sdpa \
+         into a split and a combine. More than one means the split cost \
+         ordering nobody costed.",
+        stages(split)
+    );
+    assert!(
+        seen.len() == 2,
+        "a decode recorded {} distinct barrier counts, {seen:?}, where the only \
+         two shapes this model has are split and unsplit",
+        seen.len()
     );
 }
 
@@ -8991,7 +9543,7 @@ fn attention_is_a_fifth_of_a_short_step_and_three_quarters_of_a_long_one() {
 /// of claim that is true when written and quietly false a year later.
 #[test]
 fn timing_costs_nothing_when_it_was_not_asked_for() {
-    let (device, _dir) = gpu!();
+    let device = gpu!();
     if std::env::var_os("PIE_VULKAN_TIMING").is_some() {
         eprintln!("PIE_VULKAN_TIMING is set, so there is nothing to say about it unset");
         return;
@@ -9072,13 +9624,13 @@ fn timing_costs_nothing_when_it_was_not_asked_for() {
 /// for the device to go idle before a failed fire returns.
 #[test]
 fn a_long_conversations_decode_step_does_not_stall() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let _ = &device;
     let Some(real) = checkpoint_weights() else {
         eprintln!("no readable 4-bit qwen3-0.6b, so the step cost is unmeasured");
         return;
     };
-    let mut shell = shelled(dir, &REALS[0], real, 512);
+    let mut shell = shelled(&REALS[0], real, 512);
 
     let mut prompt: Vec<u32> = Vec::new();
     for _ in 0..64 {
@@ -9151,12 +9703,12 @@ fn a_long_conversations_decode_step_does_not_stall() {
 /// unfalsifiable on the box it runs on is worth having and worth labelling.
 #[test]
 fn the_pages_a_grow_adds_are_zero() {
-    let (_device, dir) = gpu!();
+    let _device = gpu!();
     let Some(real) = checkpoint_weights() else {
         eprintln!("no readable 4-bit qwen3-0.6b, so a grown page is unread");
         return;
     };
-    let mut shell = shelled(dir, &REALS[0], real, 4);
+    let mut shell = shelled(&REALS[0], real, 4);
 
     // Dirty the pool first, so "zero" cannot be satisfied by an allocator
     // that happened to hand back fresh pages. A conversation writes real KV
@@ -9225,7 +9777,7 @@ fn the_pages_a_grow_adds_are_zero() {
 /// exists to remove.
 #[test]
 fn zero_writes_only_the_range_it_names() {
-    let (device, _dir) = gpu!();
+    let device = gpu!();
     const N: usize = 4096;
     let dirty = vec![0xABu8; N];
     let buffer = device.buffer(&dirty).expect("a buffer");
@@ -9332,7 +9884,7 @@ fn zero_writes_only_the_range_it_names() {
 /// instead of for what it keeps.
 #[test]
 fn giving_back_one_page_costs_what_giving_back_half_the_pool_costs() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let _ = &device;
     let Some(real) = checkpoint_weights() else {
         eprintln!("no readable 4-bit qwen3-0.6b, so the resize cost is unmeasured");
@@ -9342,7 +9894,7 @@ fn giving_back_one_page_costs_what_giving_back_half_the_pool_costs() {
     // enough to leave the box to its other tenant: 256 pages of qwen3-0.6b is
     // about 460 MB of cache.
     const FULL: u64 = 256;
-    let mut shell = shelled(dir, &REALS[0], real, FULL as u32);
+    let mut shell = shelled(&REALS[0], real, FULL as u32);
 
     let cost = |shell: &mut driver_vulkan::shell::Shell, to: u64| {
         let at = std::time::Instant::now();
@@ -9427,13 +9979,13 @@ fn giving_back_one_page_costs_what_giving_back_half_the_pool_costs() {
 /// be allocated aborts the process rather than returning.
 #[test]
 fn a_pool_growth_the_host_cannot_stage_is_retryable_rather_than_fatal() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let _ = &device;
     let Some(real) = checkpoint_weights() else {
         eprintln!("no readable 4-bit qwen3-0.6b, so the growth refusal is unmeasured");
         return;
     };
-    let mut shell = shelled(dir, &REALS[0], real, 24);
+    let mut shell = shelled(&REALS[0], real, 24);
 
     // A conversation in the pool, so "changed nothing" is a claim about
     // contents and not only about a number.
@@ -9552,7 +10104,7 @@ fn a_pool_growth_the_host_cannot_stage_is_retryable_rather_than_fatal() {
 ///   bytes read back are zeros rather than the source page's.
 #[test]
 fn a_copy_plan_that_names_a_page_past_the_pool_grows_it_instead_of_refusing() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let _ = &device;
     let Some(real) = checkpoint_weights() else {
         eprintln!("no readable 4-bit qwen3-0.6b, so the copy growth is unmeasured");
@@ -9560,7 +10112,7 @@ fn a_copy_plan_that_names_a_page_past_the_pool_grows_it_instead_of_refusing() {
     };
     // Small on purpose: the sweep's pool was three pages because three was
     // all its prefills had asked for.
-    let mut shell = shelled(dir, &REALS[0], real, 3);
+    let mut shell = shelled(&REALS[0], real, 3);
 
     // Real history in page 0, so "the bytes land" is about a cache and not
     // about a buffer someone wrote a pattern into.
@@ -9665,13 +10217,13 @@ fn a_copy_plan_that_names_a_page_past_the_pool_grows_it_instead_of_refusing() {
 ///    getting the same answer as before.
 #[test]
 fn a_frame_the_engine_built_answers_what_the_driver_s_own_turns_do() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let _ = &device;
     let Some(real) = checkpoint_weights() else {
         eprintln!("no readable 4-bit qwen3-0.6b, so the frame seam is unmeasured");
         return;
     };
-    let mut shell = shelled(dir, &REALS[0], real, 24);
+    let mut shell = shelled(&REALS[0], real, 24);
 
     // ── The driver's own path, so the number compared against was not made
     //    by the machinery under test. ──
@@ -10038,13 +10590,13 @@ fn a_frame_the_engine_built_answers_what_the_driver_s_own_turns_do() {
 /// `Arc`, and this is the end of that chain.
 #[test]
 fn a_serving_shell_can_be_moved_to_another_thread_and_still_fires() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     drop(device);
     let model = &REALS[0];
     let Some(real) = weights_of(model) else {
         return;
     };
-    let shell = shelled(dir, model, real, 8);
+    let shell = shelled(model, real, 8);
 
     // The move. If any field of the shell were `!Send` this would not
     // compile, and that is half the assertion; the other half is that it
@@ -10172,12 +10724,12 @@ fn the_channel_plane_can_be_moved_to_another_thread_and_used_there() {
 /// of those pages would differ.
 #[test]
 fn a_frame_naming_an_unserved_feature_is_refused_before_the_cache_moves() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     drop(device);
     let Some(real) = weights_of(&REALS[0]) else {
         return;
     };
-    let mut shell = shelled(dir, &REALS[0], real, 24);
+    let mut shell = shelled(&REALS[0], real, 24);
 
     let prompt: Vec<u32> = PERIOD.to_vec();
     let pages: Vec<u32> = vec![17, 18];
@@ -10278,7 +10830,7 @@ fn a_frame_naming_an_unserved_feature_is_refused_before_the_cache_moves() {
 /// than just "more than zero", because the interesting failure is a DROP.
 #[test]
 fn the_default_tile_reaches_the_tier_in_production() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     if !device
         .tiers()
         .contains(&kernels_vulkan::Capability::Coopmat)
@@ -10312,7 +10864,7 @@ fn the_default_tile_reaches_the_tier_in_production() {
     }
     assert_eq!(prompt.len() % tile, 0);
 
-    let mut shell = shelled(dir, &REALS[0], real, 256);
+    let mut shell = shelled(&REALS[0], real, 256);
     let prefill = shell
         .step(&[driver_vulkan::turns::Turn {
             who: 1,
@@ -10413,7 +10965,7 @@ fn the_default_tile_reaches_the_tier_in_production() {
 /// model however small its residuals looked.
 #[test]
 fn the_cooperative_matrix_gemm_answers_what_the_baseline_one_does() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     if !device
         .tiers()
         .contains(&kernels_vulkan::Capability::Coopmat)
@@ -10447,7 +10999,7 @@ fn the_cooperative_matrix_gemm_answers_what_the_baseline_one_does() {
     );
 
     let answer = |tile: u32, tiered: bool| {
-        let mut shell = shelled_at_tile(dir, &REALS[0], real, 256, Some((tile, 32)), tiered);
+        let mut shell = shelled_at_tile(&REALS[0], real, 256, Some((tile, 32)), tiered);
         let step = shell
             .step(&[driver_vulkan::turns::Turn {
                 who: 1,
@@ -10559,7 +11111,7 @@ fn the_cooperative_matrix_gemm_answers_what_the_baseline_one_does() {
 /// being turned on: every other test here runs at this point.
 #[test]
 fn at_the_default_tile_the_tier_has_nothing_to_reach() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     if !device
         .tiers()
         .contains(&kernels_vulkan::Capability::Coopmat)
@@ -10580,7 +11132,7 @@ fn at_the_default_tile_the_tier_has_nothing_to_reach() {
     }
 
     let answer = |tiered: bool| {
-        let mut shell = shelled_at_tile(dir, &REALS[0], real, 256, Some((16, 32)), tiered);
+        let mut shell = shelled_at_tile(&REALS[0], real, 256, Some((16, 32)), tiered);
         let step = shell
             .step(&[driver_vulkan::turns::Turn {
                 who: 1,
@@ -10647,20 +11199,15 @@ fn at_the_default_tile_the_tier_has_nothing_to_reach() {
 fn the_tiered_builds_this_driver_can_actually_reach() {
     use model_dsl as dsl;
 
-    let Some(dir) = SPV_DIR else {
+    if !kernels_vulkan::embedded() {
         eprintln!("skipped: built without kernels-vulkan/native, so there are no modules");
         return;
-    };
-    let mut tiered: Vec<String> = Vec::new();
-    for entry in std::fs::read_dir(dir).expect("the spirv dir").flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "spv")
-            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-            && stem.contains('.')
-        {
-            tiered.push(stem.to_string());
-        }
     }
+    let tiered: Vec<&str> = kernels_vulkan::MODULES
+        .iter()
+        .map(|&(stem, _)| stem)
+        .filter(|stem| stem.contains('.'))
+        .collect();
     let at = |tag: &str| tiered.iter().filter(|s| s.ends_with(tag)).count();
     assert_eq!(at(".coopmat"), 146, "a different number of coopmat builds");
     assert_eq!(at(".fp16"), 39, "a different number of fp16 builds");
@@ -10776,7 +11323,7 @@ fn the_tiered_builds_this_driver_can_actually_reach() {
 /// actually went through the copy engine rather than through a mapping.
 #[test]
 fn a_read_of_device_memory_goes_through_the_copy_engine() {
-    let (device, _) = gpu!();
+    let device = gpu!();
 
     // Big enough that the two paths are not the same number. At the measured
     // ten megabytes a second the mapped path would need six seconds for this
@@ -10865,7 +11412,7 @@ fn every_row_a_request_names_is_in_the_read_out() {
     use model::shared::llama_like::forward::llama_like_metal;
     use model_ir::trace::FireClass;
 
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let shape = Shape {
         layers: 28,
         kv_heads: 8,
@@ -10894,6 +11441,7 @@ fn every_row_a_request_names_is_in_the_read_out() {
             rotary_dims: 128,
             n_experts: 0,
             experts_per_token: 0,
+            ..Default::default()
         },
         tier: Capability::Baseline,
     };
@@ -10929,22 +11477,24 @@ fn every_row_a_request_names_is_in_the_read_out() {
         }
     }
     let mut cache = Pipelines::new();
-    let mut modules: std::collections::BTreeMap<String, Vec<u8>> =
-        std::collections::BTreeMap::new();
-    for name in std::fs::read_dir(dir).expect("the spirv dir").flatten() {
-        let path = name.path();
-        if path.extension().is_some_and(|e| e == "spv")
-            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-        {
-            modules.insert(stem.to_string(), std::fs::read(&path).expect("a module"));
-        }
-    }
+    let modules = store_of();
     let mut lowerings = driver_vulkan::turns::Lowerings::default();
+    // The arena buffer, kept between steps rather than reallocated per step.
+    // Released at the end of the test: this suite shares one device that
+    // outlives the process, so a buffer nobody frees is a buffer the
+    // validation layer reports against every later test.
+    let mut arenas = driver_vulkan::turns::Arenas::default();
+    // The plan cache, which a step needs somewhere to keep. Empty here, and
+    // a fresh one per test, so nothing in this file is served a fire another
+    // test recorded.
+    let mut plans = driver_vulkan::replay::Plans::new();
     let mut held = Held {
         book: &mut book,
         pool: &mut pool,
         weights: &weights,
         lowerings: &mut lowerings,
+        arenas: &mut arenas,
+        plans: &mut plans,
     };
 
     // Sixteen rows over two eight-row pages, reading out three of them --
@@ -10983,6 +11533,7 @@ fn every_row_a_request_names_is_in_the_read_out() {
         "row 0 was not named and came back anyway, so this test cannot see \
          what it is for"
     );
+    arenas.release(&device);
 }
 
 /// `Device::copy_within` moves the same bytes whichever route it takes, and a
@@ -11025,7 +11576,7 @@ fn every_row_a_request_names_is_in_the_read_out() {
 /// copy corrupts, and `std::ptr::copy` is the reason it does not.
 #[test]
 fn a_copy_within_a_buffer_moves_the_same_bytes_by_either_route() {
-    let (device, _dir) = gpu!();
+    let device = gpu!();
     const N: usize = 1 << 20;
     // A pattern where every byte says which position it came from, so a copy
     // that lands at the wrong offset is caught rather than a copy that lands
@@ -11109,12 +11660,12 @@ fn a_copy_within_a_buffer_moves_the_same_bytes_by_either_route() {
 /// does. Reverting `copy_within` to the mapping fails it by 3.4x.
 #[test]
 fn moving_a_page_costs_milliseconds_rather_than_tens_of_them() {
-    let (_device, dir) = gpu!();
+    let _device = gpu!();
     let Some(real) = checkpoint_weights() else {
         eprintln!("no readable 4-bit qwen3-0.6b, so a page move is unmeasured");
         return;
     };
-    let shell = shelled(dir, &REALS[0], real, 32);
+    let shell = shelled(&REALS[0], real, 32);
     let pool = shell.pool();
 
     // The first move of a fresh pool is the pool's first touch, on either
@@ -11181,13 +11732,13 @@ fn moving_a_page_costs_milliseconds_rather_than_tens_of_them() {
 /// magnitude.
 #[test]
 fn a_prefills_arena_does_not_cross_the_bus() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let _ = &device;
     let Some(real) = checkpoint_weights() else {
         eprintln!("no readable 4-bit qwen3-0.6b, so the arena's route is unmeasured");
         return;
     };
-    let mut shell = shelled(dir, &REALS[0], real, 512);
+    let mut shell = shelled(&REALS[0], real, 512);
 
     // Warm first, so that the weights' own upload -- which IS a legitimate
     // host write, and is hundreds of megabytes -- is not counted against the
@@ -11261,7 +11812,7 @@ fn a_prefills_arena_does_not_cross_the_bus() {
 /// flaky, and restoring the host route fails it by 939 megabytes.
 #[test]
 fn opening_a_cache_uploads_nothing() {
-    let (device, _dir) = gpu!();
+    let device = gpu!();
     let shape = driver_vulkan::resources::Shape {
         layers: 28,
         kv_heads: 8,
@@ -11326,7 +11877,7 @@ fn opening_a_cache_uploads_nothing() {
 /// a different row.
 #[test]
 fn a_frame_binding_a_page_above_the_pool_grows_it_rather_than_dying() {
-    let (device, dir) = gpu!();
+    let device = gpu!();
     let _ = &device;
     let Some(real) = checkpoint_weights() else {
         eprintln!("no readable 4-bit qwen3-0.6b, so the frame growth is unmeasured");
@@ -11369,7 +11920,7 @@ fn a_frame_binding_a_page_above_the_pool_grows_it_rather_than_dying() {
     };
 
     let fired = |pages: u32| -> (Vec<f32>, u32) {
-        let mut shell = shelled(dir, &REALS[0], real, pages);
+        let mut shell = shelled(&REALS[0], real, pages);
         let ran = shell
             .launch(&frame)
             .expect("a frame naming page 7 is servable from any pool that can hold it");
@@ -11410,8 +11961,41 @@ fn a_frame_binding_a_page_above_the_pool_grows_it_rather_than_dying() {
 #[test]
 #[ignore = "the child half of the device-choice proof"]
 fn report_which_device_opened() {
-    let (device, _) = gpu!();
+    let device = gpu!();
     eprintln!("OPENED: {}", device.name());
+}
+
+/// Does the loader offer any device that is not a CPU implementation?
+///
+/// Asked of `ash` directly rather than of [`Device`], and that is the whole
+/// point: the caller is checking that the ranking declined a software adapter,
+/// so a premise taken from the ranking would make the check circular. This
+/// reads `deviceType` off the loader, which is the one signal the crate under
+/// test has no hand in.
+///
+/// `false` when there is no loader, no instance or no device -- a machine that
+/// cannot enumerate has no hardware device for the caller's purposes, and the
+/// caller's other arm already handles having nothing to open.
+fn any_hardware_device() -> bool {
+    let Ok(entry) = (unsafe { ash::Entry::load() }) else {
+        return false;
+    };
+    // Vulkan 1.0 is deliberate: this asks only for the device list and one
+    // property struct, both core since 1.0, so an ICD that refuses a newer
+    // version still answers.
+    let app = ash::vk::ApplicationInfo::default().api_version(ash::vk::API_VERSION_1_0);
+    let info = ash::vk::InstanceCreateInfo::default().application_info(&app);
+    let Ok(instance) = (unsafe { entry.create_instance(&info, None) }) else {
+        return false;
+    };
+    let found = unsafe { instance.enumerate_physical_devices() }.is_ok_and(|devices| {
+        devices.iter().any(|&d| {
+            unsafe { instance.get_physical_device_properties(d) }.device_type
+                != ash::vk::PhysicalDeviceType::CPU
+        })
+    });
+    unsafe { instance.destroy_instance(None) };
+    found
 }
 
 /// The device that opens is the one that was chosen, and the choice is not
@@ -11429,6 +12013,20 @@ fn report_which_device_opened() {
 /// must land on the ranked best; naming a device must land on THAT one. On a
 /// box with one device the two answers are the same and the test still holds,
 /// which is why it asserts a relation rather than a name.
+///
+/// One relation it asserted did NOT hold there, and the first machine to say
+/// so was a container whose only Vulkan device is Mesa's `llvmpipe`: "a
+/// software adapter must never be the default" is true only while something
+/// else can compute, and this test read the two cases as one. It failed, with
+/// a message blaming enumeration order, on a box behaving correctly -- the
+/// software adapter was the default because it was the ONLY device, which is
+/// the one time picking it is right.
+///
+/// The condition it was missing cannot be asked of `Device`: whether a
+/// hardware device exists is the premise of the ranking under test, so taking
+/// the answer from the ranking would make the check circular and it would
+/// pass by construction. [`any_hardware_device`] asks the LOADER instead, by
+/// `deviceType`, which is the independent signal.
 #[test]
 fn the_device_that_opens_is_the_one_that_was_chosen() {
     fn open_with(pin: Option<&str>) -> Option<String> {
@@ -11454,6 +12052,7 @@ fn the_device_that_opens_is_the_one_that_was_chosen() {
         return;
     };
     eprintln!("default: {default}");
+    let hardware = any_hardware_device();
 
     // A software adapter must never be the DEFAULT choice while anything else
     // can compute. Asked by pinning it: if it opens when named, it was there
@@ -11469,11 +12068,23 @@ fn the_device_that_opens_is_the_one_that_was_chosen() {
              turns a deliberate cross-check into a measurement of the wrong \
              thing"
         );
+        // "While anything else can compute" is the half of the rule that was
+        // unwritten. With no hardware device on the machine there is nothing
+        // to prefer, so the software adapter opening by default is correct
+        // and this relation has nothing to say.
+        if !hardware {
+            eprintln!(
+                "the only Vulkan device here is a software adapter ({got}), so \
+                 the default HAS to be it -- the ranking is not cross-checked \
+                 on this machine"
+            );
+            continue;
+        }
         assert_ne!(
             got, default,
-            "this machine offers a software adapter ({got}) and it is ALSO \
-             what opens by default. Something is picking by enumeration order \
-             again"
+            "this machine offers a software adapter ({got}) and a hardware \
+             device, and the software one is ALSO what opens by default. \
+             Something is picking by enumeration order again"
         );
         eprintln!("software adapter present and declined by default: {got}");
     }

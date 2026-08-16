@@ -1,30 +1,12 @@
-//! Slot addressing for the recurrent (Mamba / linear-attention) state cache.
-//!
-//! Port of the stride and offset arithmetic in
-//! `driver-cuda/csrc/src/store/recurrent_state_cache.{hpp,cpp}`.
-//!
-//! A hybrid model interleaves linear-attention layers with full-attention
-//! ones. Only the linear layers have recurrent state, and they are packed
-//! **densely**: layer 7 of a stack whose layers 0, 3, 7 are linear is stored
-//! at linear index 2, not at 7. Every address in this file is
-//! `linear_index * layer_stride + slot * slot_stride`, and getting the
-//! compaction wrong reads another layer's state -- which does not crash, it
-//! silently produces wrong tokens.
-//!
-//! Two tensors per linear layer:
-//!
-//! * `conv_state`, `conv_kernel * conv_dim` elements, always `u16`.
-//! * `recurrent_state`, `v_heads * head_k_dim * head_v_dim` elements, either
-//!   `f32` or `u16` depending on [`RecurrentStateLayout::recurrent_is_bf16`].
-//!
-//! The dtype of the second one is a runtime switch, not a compile-time one,
-//! so every byte offset that touches it has to ask.
+//! Slot addressing for recurrent-state cache.
+//! Linear-attention layers are packed densely among full-attention layers.
+//! Addresses use `linear_index * layer_stride + slot * slot_stride`.
+//! `conv_state` is u16; `recurrent_state` is f32 or bf16 at runtime.
 
 /// The per-slot geometry of one recurrent state cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecurrentStateLayout {
-    /// `linear_layer_index[i]` is the dense index of layer `i`, or `None` for
-    /// a full-attention layer.
+    /// Dense index of layer `i`, or `None` for a full-attention layer.
     linear_layer_index: Vec<Option<u32>>,
     num_linear_layers: u32,
     max_slots: u32,
@@ -37,13 +19,7 @@ pub struct RecurrentStateLayout {
     recurrent_is_bf16: bool,
 }
 
-/// The shape numbers a [`RecurrentStateLayout`] is built from.
-///
-/// A struct rather than nine positional arguments: six of them are `u32` and
-/// several are adjacent and interchangeable at the call site --
-/// `head_k_dim`/`head_v_dim` and `conv_dim`/`conv_kernel` transpose silently,
-/// and the resulting layout is wrong in a way that only shows up as corrupted
-/// state many tokens later.
+/// Shape numbers used to build a [`RecurrentStateLayout`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecurrentShape {
     /// Channels in the causal-conv state.
@@ -74,12 +50,7 @@ pub struct SlotAddr {
 }
 
 impl RecurrentStateLayout {
-    /// Build a layout.
-    ///
-    /// `max_slots` is clamped up to 1, matching the C++'s
-    /// `if (max_slots < 1) max_slots = 1;` -- a zero-slot cache is treated as
-    /// a one-slot cache rather than rejected, because the legacy
-    /// single-request call sites pass no slot count at all.
+    /// Build a layout; `max_slots` is clamped up to 1.
     #[must_use]
     pub fn new(layer_is_linear: &[bool], shape: RecurrentShape) -> Self {
         let mut next = 0u32;
@@ -109,12 +80,7 @@ impl RecurrentStateLayout {
         }
     }
 
-    /// Force `bf16` recurrent storage regardless of what the shape asked for.
-    ///
-    /// Only `allocate_bf16_recurrent` uses this. It mutates rather than
-    /// rebuilding because the C++ mutates too -- it swaps the slab on an
-    /// already-constructed cache -- and because the compaction table has
-    /// already been computed and does not depend on the dtype.
+    /// Force `bf16` recurrent storage; layer compaction is dtype-independent.
     pub const fn force_recurrent_bf16(&mut self) {
         self.recurrent_is_bf16 = true;
     }
@@ -177,13 +143,11 @@ impl RecurrentStateLayout {
     }
 
     /// Is this layer a linear-attention layer?
-    /// Is this layer a linear-attention layer?
     #[must_use]
     pub fn is_linear(&self, layer: u32) -> bool {
         self.linear_index(layer).is_some()
     }
 
-    /// The dense index of a layer among the linear ones.
     /// The dense index of a layer among the linear ones.
     #[must_use]
     pub fn linear_index(&self, layer: u32) -> Option<u32> {
@@ -205,24 +169,14 @@ impl RecurrentStateLayout {
         self.v_heads as u64 * self.head_k_dim as u64 * self.head_v_dim as u64
     }
 
-    /// Bytes between consecutive slots of `recurrent_state`, which depends on
-    /// whether the state is stored as `f32` or `bf16`.
+    /// Bytes between `recurrent_state` slots, using f32 or bf16 width.
     #[must_use]
     pub const fn recurrent_slot_stride_bytes(&self) -> u64 {
         self.recurrent_slot_stride_elems() * if self.recurrent_is_bf16 { 2 } else { 4 }
     }
 
-    /// Address of one layer/slot's convolution state.
-    ///
-    /// `None` means this is a full-attention layer and has no state -- an
-    /// expected answer every caller acts on, matching the C++'s `nullptr`
-    /// return.
-    ///
-    /// # Panics
-    ///
-    /// If `layer` or `slot` is out of range. The C++ throws
-    /// `std::out_of_range` for exactly these, and the distinction from `None`
-    /// is the point: one is a shape the model has, the other is a caller bug.
+    /// Address of one layer/slot's convolution state; `None` for full-attention, panics
+    /// if out of range.
     #[must_use]
     pub fn conv_state(&self, layer: u32, slot: u32) -> Option<SlotAddr> {
         let idx = self.checked_index(layer, slot)?;
@@ -233,13 +187,8 @@ impl RecurrentStateLayout {
         })
     }
 
-    /// Address of one layer/slot's recurrent state.
-    ///
-    /// `None` for a full-attention layer.
-    ///
-    /// # Panics
-    ///
-    /// If `layer` or `slot` is out of range.
+    /// Address of one layer/slot's recurrent state; `None` for full-attention, panics
+    /// if out of range.
     #[must_use]
     pub fn recurrent_state(&self, layer: u32, slot: u32) -> Option<SlotAddr> {
         let idx = self.checked_index(layer, slot)?;
@@ -250,15 +199,7 @@ impl RecurrentStateLayout {
         })
     }
 
-    /// Address of one slot's pending MTP hidden state.
-    ///
-    /// Not per-layer: there is one row per slot, `hidden_size` `u16`s wide.
-    /// `None` when the model has no hidden state configured, matching the
-    /// C++'s null return for `hidden_size_ <= 0`.
-    ///
-    /// # Panics
-    ///
-    /// If `slot` is out of range.
+    /// Address of one pending-MTP hidden row; `None` when unconfigured, panics if out of range.
     #[must_use]
     pub fn mtp_pending_hidden(&self, slot: u32) -> Option<SlotAddr> {
         assert!(
@@ -300,8 +241,7 @@ impl RecurrentStateLayout {
         self.conv_total_bytes() + self.recurrent_total_bytes() + self.mtp_total_bytes()
     }
 
-    /// Bytes one request occupies across all linear layers -- the number that
-    /// decides how many concurrent sequences a hybrid model can hold.
+    /// Bytes one request occupies across all linear layers.
     #[must_use]
     pub const fn bytes_per_slot(&self) -> u64 {
         (self.conv_slot_stride_bytes() + self.recurrent_slot_stride_bytes())
@@ -309,8 +249,7 @@ impl RecurrentStateLayout {
             + self.hidden_size as u64 * 2
     }
 
-    /// Bounds-check, then resolve. Panics where the C++ throws; returns
-    /// `None` only where the C++ returns `nullptr`.
+    /// Bounds-check, then resolve; `None` only means a full-attention layer.
     fn checked_index(&self, layer: u32, slot: u32) -> Option<u32> {
         assert!(
             slot < self.max_slots,
@@ -330,8 +269,7 @@ impl RecurrentStateLayout {
 mod tests {
     use super::*;
 
-    /// Layers 0, 3, 7 linear out of 8 -- a shape where dense index and layer
-    /// number disagree everywhere they can.
+    /// Hybrid shape where dense index and layer number diverge.
     fn hybrid() -> RecurrentStateLayout {
         let linear = [true, false, false, true, false, false, false, true];
         RecurrentStateLayout::new(
@@ -363,8 +301,7 @@ mod tests {
 
     #[test]
     fn the_last_linear_layer_addresses_by_its_dense_index() {
-        // The bug this pins: using the layer number would put layer 7 at
-        // offset 7 * layer_stride, past the end of a 3-layer allocation.
+        // Pins dense linear-index addressing, not raw layer-number addressing.
         let l = hybrid();
         let stride = l.conv_slot_stride_bytes();
         let layer_stride = stride * u64::from(l.max_slots());
@@ -450,7 +387,7 @@ mod tests {
             bf16_layout.recurrent_slot_stride_elems(),
             "the element count is the same either way; only the width moves"
         );
-        // The conv state is u16 regardless, so it must not follow the switch.
+        // Conv state is always u16, independent of the recurrent dtype.
         assert_eq!(
             f32_layout.conv_slot_stride_bytes(),
             bf16_layout.conv_slot_stride_bytes()

@@ -141,6 +141,15 @@ members = [
     # under the prefixed backends, holding what all of their tables are
     # written in rather than anything any one of them does.
     "crates/kernels",
+    # `#[routine]`: the operand table, derived from a launcher's own Rust
+    # signature. Separate from `kernels` for two reasons, and both are hard.
+    # A `proc-macro = true` crate can export NOTHING but macros, so it could
+    # not have been a module; and `kernels` declares "no dependencies, and
+    # none is wanted", which a `syn`/`quote` edge would end. So the backends
+    # depend on this crate directly and `kernels` stays the bare floor it
+    # says it is -- the macro names `::kernels::Derived` in its output, which
+    # costs the macro crate no edge at all.
+    "crates/kernels-macros",
     # The JIT-native shape of the CUDA half: the table, the device sources
     # carried in the binary, and the runtime that NVRTC-compiles and fires
     # them. No CMake, no archive, no `links` key -- a kernel is text, so
@@ -311,10 +320,17 @@ path = "src/bin/pie-worker.rs"
 
 [features]
 # This package selects the driver backend; it forwards the flavors to the
-# embedded worker. Default = none (dummy fallback); enable driver-cuda or
-# driver-metal for real inference.
+# embedded worker. Default = none (dummy fallback); enable driver-cuda-12 /
+# driver-cuda-13 or driver-metal for real inference.
 default = []
-driver-cuda = ["worker/driver-cuda"]
+# NVIDIA. The number is the CUDA runtime ABI the binary will LOAD, and it is
+# in the name because this is the last package in the chain -- the one that
+# actually produces a binary, and so the one where guessing is unrecoverable.
+# `driver-cuda` STOOD HERE and meant `cuda-13` silently; the release workflow
+# built six `cuda12.8`-labelled artifacts through it. See `crates/engine`.
+_driver-cuda = ["worker/_driver-cuda"]
+driver-cuda-12 = ["_driver-cuda", "worker/driver-cuda-12"]
+driver-cuda-13 = ["_driver-cuda", "worker/driver-cuda-13"]
 # macOS/Apple Silicon. Without this the `pie` binary has no way to reach the
 # Metal driver at all: `worker`'s `driver-metal` is what links the archive,
 # and this is the only package that builds a binary.

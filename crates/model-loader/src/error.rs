@@ -1,13 +1,6 @@
 //! What can go wrong, by whose fault it is.
 //!
-//! The compiler used to answer every question with `InvalidInput(String)` — two
-//! variants and 284 construction sites, so the type carried no information and
-//! the string carried all of it. A C caller could not match on it, a test could
-//! not assert on it without matching prose, and nothing distinguished "your
-//! contract asks for something impossible" from "this checkpoint is corrupt"
-//! from "the compiler broke".
-//!
-//! Each variant below names a *place* the fault lives, which is the only
+//! Each variant names a *place* the fault lives, which is the only
 //! distinction a caller can act on:
 //!
 //! | Variant | Whose fault | What the caller should do |
@@ -21,6 +14,7 @@
 
 use thiserror::Error;
 
+/// What the loader refuses on, one variant per recovery the table above names.
 #[derive(Debug, Error)]
 pub enum Error {
     /// The contract asks for something the algebra or the checkpoint cannot
@@ -29,12 +23,7 @@ pub enum Error {
     #[error("contract: {0}")]
     Contract(String),
 
-    /// The contract is well-formed but does not survive this tensor-parallel
-    /// degree — an axis that does not divide, or a rank out of range.
-    ///
-    /// Separate from [`Error::Contract`] because it is the one failure that
-    /// depends on a *target* number rather than on the declaration alone, and
-    /// the driver's recovery is different: change `tp_size`, not the model.
+    /// The contract is well-formed but does not survive this tensor-parallel degree (an axis that does not divide, or a rank out of range) -- separate from [`Error::Contract`] because the recovery differs: change `tp_size`, not the model.
     #[error("shard: {0}")]
     Shard(String),
 
@@ -58,10 +47,7 @@ pub enum Error {
 }
 
 impl Error {
-    /// The stable code this error crosses the C ABI as.
-    ///
-    /// A caller that cannot read the message can still tell a bad contract from
-    /// a bad checkpoint, which is the whole reason the variants exist.
+    /// The stable code this error crosses the C ABI as -- a caller that cannot read the message can still tell a bad contract from a bad checkpoint.
     pub const fn code(&self) -> u32 {
         match self {
             Self::Contract(_) => 1,
@@ -74,14 +60,9 @@ impl Error {
     }
 }
 
-/// zTensor's failures, mapped onto the loader's — in one place, because the
-/// distinction is load-bearing and easy to lose.
+/// zTensor's failures, mapped onto the loader's, in one place since the distinction is load-bearing and easy to lose.
 ///
-/// `Unsupported` is the one that matters: a file that is perfectly valid but
-/// uses a layout, encoding or capability this build does not implement is not
-/// a malformed checkpoint, and it crosses the C ABI as a different
-/// [`code`](Error::code). Flattening every zTensor error to `Checkpoint` would
-/// tell a caller its file was broken when it was only unfamiliar.
+/// `Unsupported` is the one that matters: a file using a layout this build does not implement is not a malformed checkpoint, and it crosses the C ABI as a different [`code`](Error::code).
 impl From<ztensor::Error> for Error {
     fn from(err: ztensor::Error) -> Self {
         match err {
@@ -97,15 +78,7 @@ impl From<ztensor::Error> for Error {
 /// Every fallible step in the loader answers with this.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Name what overflowed, without spelling out the `ok_or_else` each time.
-///
-/// The loader's arithmetic is all checked, which is right, but written out in
-/// full it reads as ceremony rather than as the calculation: three lines of
-/// `.checked_add(b).ok_or_else(|| Error::Overflow("…".to_string()))?` for one
-/// addition. `plan/passes/memory.rs` was a fifth error handling by line count.
-///
-/// The `checked_*` call stays visible on purpose — this shortens the failure
-/// arm, not the operation:
+/// Name what overflowed, without spelling out the `ok_or_else` each time: the loader's arithmetic is all checked, but written in full it reads as ceremony. The `checked_*` call stays visible on purpose; this only shortens the failure arm:
 ///
 /// ```ignore
 /// let end = offset.checked_add(bytes).or_overflow("persistent byte overflow")?;
@@ -122,11 +95,7 @@ impl<T> OrOverflow<T> for Option<T> {
     }
 }
 
-/// Narrowing conversions answer with [`std::num::TryFromIntError`], not `None`.
-///
-/// Deliberately not implemented for every `Result`: [`Result<T>`] is the
-/// loader's own, and letting `or_overflow` swallow one would relabel a contract
-/// error as an overflow.
+/// Narrowing conversions answer with [`std::num::TryFromIntError`], not `None`. Deliberately not implemented for every `Result`: letting `or_overflow` swallow the loader's own [`Result<T>`] would relabel a contract error as an overflow.
 impl<T> OrOverflow<T> for std::result::Result<T, std::num::TryFromIntError> {
     fn or_overflow(self, message: impl Into<String>) -> Result<T> {
         self.map_err(|_| Error::Overflow(message.into()))

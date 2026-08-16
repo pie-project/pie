@@ -96,7 +96,7 @@ fn echo(root: &Root, wanted: &[String]) -> BTreeMap<String, Option<u32>> {
 
 /// A context, or a stated reason there is none.
 fn ready(what: &str) -> bool {
-    if cache::arch().is_none() {
+    if quietly(cache::arch).flatten().is_none() {
         eprintln!("SKIP {what}: no CUDA device is current");
         return false;
     }
@@ -107,6 +107,28 @@ fn ready(what: &str) -> bool {
             false
         }
     }
+}
+
+/// Run `f`, turning a panic into `None` and printing nothing.
+///
+/// `is_none()` above reads as "ask whether there is a device", and it answers
+/// only half the question. `cudarc` is built `fallback-dynamic-loading`, so
+/// every CUDA symbol is `dlopen`'d on first use and a MISSING library is a
+/// PANIC -- `panic_no_lib_found` -- rather than `None`. So the skip covered
+/// "driver present, no device" and the case it was actually written for, an
+/// ordinary runner with no CUDA installed at all, unwound straight past it and
+/// FAILED. Measured with an `LD_PRELOAD` shim that refuses to `dlopen` the
+/// CUDA libraries: this file went from 3 skips to 3 failures.
+///
+/// Only the FIRST call needs wrapping. Once one answers, the library is
+/// loaded and everything after it is an ordinary call -- including `echo`'s
+/// `expect("a device")`, which every caller reaches through this function.
+fn quietly<R>(f: impl FnOnce() -> R + std::panic::UnwindSafe) -> Option<R> {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let out = std::panic::catch_unwind(f);
+    std::panic::set_hook(hook);
+    out.ok()
 }
 
 /// XQA's `sizeof(SharedMem)`, in all five lattice members.

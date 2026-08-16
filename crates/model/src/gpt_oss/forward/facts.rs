@@ -1,42 +1,30 @@
 //! `gpt-oss`'s per-backend binding facts.
 //!
-//! The SHAPE moved to `../spec.rs` (ungated: a row is written in it, and
-//! a row must exist under every aspect). What a deployment RESOLVED --
-//! the device's MXFP4 policy, a fused leg's route ceiling, whether the
-//! expert slabs are streamed -- is known only when that backend's aspect
-//! is compiled, so it stays here.
+//! The SHAPE lives in `../spec.rs`, ungated, because a row must exist under
+//! every aspect. What a deployment RESOLVED is known only once that backend's
+//! aspect is compiled.
 
-/// The shape, re-exported so a declaration reaches its facts and the
-/// words they are stated in from one place.
+/// The shape, re-exported so a declaration reaches its facts from one place.
 pub use super::super::spec::GptOssFacts;
 
-/// The CUDA backend's answers for a gpt-oss deployment — the bindings
-/// and the admission thresholds, all resolved at load.
+/// The CUDA backend's answers for a gpt-oss deployment, resolved at load.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GptOssCudaFacts {
-    /// Whether the layer bank carries the per-expert POINTER ARRAYS the
-    /// fused decode GEMV indexes (`expert_gate_up_packed_ptrs`). Built
-    /// by the `RoutedDecode` MXFP4 policy, which is the engine default;
-    /// the `NativeGemm` policy binds marlin views instead and reaches
-    /// the experts through a per-expert loop no rectangle spells.
+    /// Whether the layer bank carries the per-expert POINTER ARRAYS the fused
+    /// decode GEMV indexes — built by the default `RoutedDecode` MXFP4 policy,
+    /// where `NativeGemm` binds marlin views instead.
     pub mxfp4_decode_gemv: bool,
-    /// `mxfp4_decode_max_routes` — the fused leg's admission threshold
-    /// in ROUTES (`N * top_k`), default `32 * experts`. A fire past it
-    /// takes the host-routed walk, which this declaration refuses by
-    /// name rather than states.
+    /// The fused leg's admission threshold in ROUTES (`N * top_k`), default
+    /// `32 * experts`; a fire past it takes the host-routed walk, which this
+    /// declaration refuses by name.
     pub mxfp4_decode_max_routes: u32,
-    /// Whether the experts are STREAMED through a slab cache. A streamed
-    /// layer reaches the same fused kernels, but only after a host
-    /// round-trip that decides what to page in — so a streamed
-    /// deployment is outside the flat list until that is stated.
+    /// Whether the experts are STREAMED through a slab cache: the same fused
+    /// kernels, but only after a host round-trip deciding what to page in.
     pub streamed_experts: bool,
 }
 
 impl GptOssCudaFacts {
-    /// The L40S deployment's set, as the driver derives it: no
-    /// streaming, the default policy's pointer arrays, and the default
-    /// cap. SYNTHETIC until a live digest judges it — the standing
-    /// contract for every `*_synthetic` fixture in this file.
+    /// The L40S deployment's set. SYNTHETIC until a live digest judges it.
     pub fn gpt_oss_20b_synthetic() -> Self {
         Self {
             mxfp4_decode_gemv: true,

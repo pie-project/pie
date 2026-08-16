@@ -23,7 +23,7 @@
 //! beam-designb e2e proved (explicit write + dense mask), at B=1 with an
 //! in-graph sliding window instead of the beam ancestry mask.
 //!
-//!   cargo test -p pie-gpu-tests --features driver-cuda \
+//!   cargo test -p pie-gpu-tests --features driver-cuda-13 \
 //!     --test cuda_sliding_window_attention_e2e -- --ignored --nocapture
 
 mod common;

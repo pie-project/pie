@@ -1,33 +1,11 @@
 //! The pinned host pool that backs KV swap-out and swap-in.
 //!
-//! Port of the allocation half of `driver-cuda/csrc/src/store/swap_pool.cpp`.
-//! The copy planning it feeds lives in [`crate::layout::swap_plan`].
-//!
-//! One host pool mirrors one device buffer: for each layer, and for each page
-//! buffer that layer's device cache exposes, a `cudaMallocHost` region of
-//! `page_bytes * num_pages`. Pages are addressed by index on both sides, so a
-//! swap is a scatter of fixed-size contiguous copies and never a reshape.
-//!
-//! Pinned rather than pageable because these are the DMA endpoints: a pageable
-//! source forces the driver to stage through an internal pinned buffer, which
-//! halves the achievable bandwidth on exactly the transfers that sit on the
-//! critical path of un-evicting a process.
-//!
-//! # Two constructors that do not agree
-//!
-//! [`SwapPoolLayout::for_cache`] asks the device cache what buffers it has.
-//! [`SwapPoolLayout::uniform`] assumes **two** buffers of equal width. For a
-//! plain BF16/FP16 cache those coincide. For a quantised cache they do not:
-//! the device side has four buffers (K, V, and their scale planes) and the
-//! uniform constructor builds only two, so a copy plan built from the device
-//! geometry would address a host buffer that was never allocated.
-//!
-//! In the C++ that is an out-of-bounds `std::vector::operator[]` inside
-//! `copy_d2h_async`, silently, with no bounds check. Here it cannot happen:
-//! [`SwapPoolLayout::geometry`] is the *only* way to get a
-//! [`PoolGeometry`], so a plan is always built against the buffers that were
-//! actually allocated, and [`SwapPoolLayout::check_against`] turns the
-//! mismatch into a value the caller has to look at.
+//! One `cudaMallocHost` region per layer per page buffer, index-addressed so a
+//! swap is fixed-size copies, not a reshape; pinned because these are the DMA
+//! endpoints. The two constructors diverge: `uniform` assumes two equal buffers
+//! while `for_cache` picks up a quantised cache's scale planes, so only its
+//! geometry matches — `check_against` catches what the C++ hits as unchecked
+//! OOB.
 
 use crate::dtype::DType;
 use crate::layout::swap_plan::PoolGeometry;
@@ -45,13 +23,8 @@ pub struct HostBuffer {
     pub nbytes: u64,
 }
 
-/// The two streams a pool owns.
-///
-/// Restores (H2D) are on the critical path -- an evicted process cannot run
-/// until its pages are back -- while evictions (D2H) are background work.
-/// Sharing one stream made every restore queue behind every pending eviction;
-/// PCIe is full duplex, so separating them lets both directions proceed at
-/// once instead of FIFO.
+/// The two streams a pool owns: separate because PCIe is full duplex, so
+/// critical-path restores (H2D) need not queue behind background evictions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamPlan {
     /// Carries eviction (D2H) and graft (D2D) traffic.
@@ -74,12 +47,8 @@ pub struct SwapPoolLayout {
     geometry: PoolGeometry,
 }
 
-/// `static_cast<std::size_t>(int)`.
-///
-/// Sign-extends, then reinterprets -- so `-1` becomes `2^64 - 1` rather than
-/// `1` or a compile error. Spelled out because it is the difference between
-/// the two arithmetics on this page: every dimension the C++ multiplies goes
-/// through this cast, and nothing checks the sign first.
+/// `static_cast<std::size_t>(int)`: sign-extends, so `-1` becomes `2^64 - 1`.
+/// Every dimension the C++ multiplies goes through this cast unchecked.
 const fn as_size_t(v: i32) -> u64 {
     v as i64 as u64
 }
@@ -87,22 +56,10 @@ const fn as_size_t(v: i32) -> u64 {
 impl SwapPoolLayout {
     /// Plan a pool of `num_pages` pages against a uniform K/V stack.
     ///
-    /// Two things here are inherited deliberately rather than fixed.
-    ///
-    /// `bytes_per_page` is `2 * num_layers * one_page_bytes` and is computed
-    /// **before** the degenerate-input check, so a pool that allocated
-    /// nothing still reports a non-zero figure whenever `num_layers > 0`.
-    /// The memory planner reads `bytes_per_page()` to size the host budget and
-    /// would otherwise see the number change under it depending on whether
-    /// pages happened to be requested.
-    ///
-    /// Every dimension is multiplied as `size_t`, so a negative one does not
-    /// clamp: it sign-extends and the product wraps. A `head_dim` of `-1`
-    /// produces a per-buffer request of `2^64 - 2` bytes, which
-    /// `cudaMallocHost` refuses with an error about a size nobody asked for.
-    /// Reproduced rather than corrected because the planner's budget
-    /// arithmetic is downstream of this number, and clamping here would move
-    /// the failure to a place with less context.
+    /// `bytes_per_page` is computed before the degenerate check, so it is
+    /// non-zero when `num_layers > 0` even if nothing was allocated (the planner
+    /// reads it to size the host budget). Dimensions multiply as `size_t`, so a
+    /// negative one wraps not clamps (`head_dim == -1` → `2^64 - 2` bytes).
     #[must_use]
     pub fn uniform(
         num_layers: i32,
@@ -155,13 +112,9 @@ impl SwapPoolLayout {
         out
     }
 
-    /// Plan a pool that mirrors a device cache exactly.
-    ///
-    /// `device_buffers[layer]` is that layer's page widths, i.e. what
-    /// `KvCache::page_buffers` returns. Unlike [`Self::uniform`] this picks up
-    /// a scale tier, and unlike it `bytes_per_page` is left at zero on the
-    /// degenerate path because the C++ accumulates it inside the loop it never
-    /// enters.
+    /// Plan a pool that mirrors a device cache exactly. `device_buffers[layer]`
+    /// is that layer's page widths, so unlike [`Self::uniform`] this picks up a
+    /// scale tier; `bytes_per_page` stays zero on the degenerate path.
     #[must_use]
     pub fn for_cache(
         device_buffers: &[Vec<u64>],
@@ -208,8 +161,7 @@ impl SwapPoolLayout {
         out
     }
 
-    /// Layers mirrored. Reported verbatim, so a negative argument comes back
-    /// negative -- the C++ stores the `int` it was given.
+    /// Layers mirrored, verbatim: a negative argument comes back negative.
     #[must_use]
     pub const fn num_layers(&self) -> i32 {
         self.num_layers
@@ -274,13 +226,9 @@ impl SwapPoolLayout {
 
     /// Whether a device cache's buffer table can be swapped through this pool.
     ///
-    /// Returns the first layer whose device side has more buffers, or wider
-    /// ones, than the host side allocated. `None` means every copy the planner
-    /// can emit lands inside a region that exists.
-    ///
-    /// This is the check the C++ does not have. `SwapPool::allocate` sizes the
-    /// host side from its own arguments while the copy loops size it from
-    /// `cache.page_buffers(layer)`, and nothing reconciles the two.
+    /// Returns the first layer whose device side has more, or wider, buffers
+    /// than the host allocated; `None` means every copy fits. The reconciliation
+    /// the C++ lacks.
     #[must_use]
     pub fn check_against(&self, device_buffers: &[Vec<u64>]) -> Option<BufferMismatch> {
         for (layer, widths) in device_buffers.iter().enumerate() {

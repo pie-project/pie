@@ -1,2 +1,3 @@
-//! PLACEHOLDER-REFACTOR-SCAFFOLD: created only so the workspace manifest
-//! parses while an unrelated in-flight change lands the real target.
+//! JIT parity gate for `driver-cuda`.
+//!
+//! Empty: this target holds no cases yet.

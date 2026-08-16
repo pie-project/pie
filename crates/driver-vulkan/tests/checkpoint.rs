@@ -46,14 +46,17 @@
 //!
 //! # Two facts about real artifacts, found on the way
 //!
-//! **A stock `Qwen/Qwen3-0.6B` cannot be identified by this build.**
-//! `catalog::identify` answers `qwen3-0.6b: unexpected lm_head`. That
+//! **A stock `Qwen/Qwen3-0.6B` could not be identified by this build.**
+//! `catalog::identify` answered `qwen3-0.6b: unexpected lm_head`. That
 //! snapshot's `config.json` says `tie_word_embeddings: true` and its
 //! `model.safetensors` publishes `lm_head.weight` *and*
 //! `model.embed_tokens.weight` -- tied and exported anyway, which is ordinary
-//! for an HF export and which the manifest treats as a contradiction. Left
-//! where it was found: loosening another crate's manifest from a driver's
-//! test is how a refusal that meant something becomes one nobody remembers.
+//! for an HF export and which the manifest treated as a contradiction. Left
+//! where it was found, because loosening another crate's manifest from a
+//! driver's test is how a refusal that meant something becomes one nobody
+//! remembers -- and since FIXED in the crate that owns it, by
+//! `TensorSpec::tied`: a tie is an absence that tolerates a copy at the tied
+//! quantity's own extents, and at no others.
 //!
 //! **An unquantised checkpoint cannot reach this path at all.** The contract
 //! answers `Metal llama needs quantized weights: this checkpoint carries no
@@ -390,21 +393,29 @@ fn compiled_plan_for(dir: &str) -> Option<(model_loader::plan::LoadPlan, &'stati
     // THE ROW BY NAME, NOT BY `catalog::identify`, and the reason is a finding
     // rather than a shortcut.
     //
-    // `identify` REFUSES this snapshot. Measured, on a stock
+    // `identify` USED TO REFUSE this snapshot. Measured, on a stock
     // `Qwen/Qwen3-0.6B` HuggingFace snapshot: "qwen3-0.6b: unexpected
     // lm_head". Its `config.json` says `tie_word_embeddings: true` and its
     // `model.safetensors` publishes `lm_head.weight` AND
     // `model.embed_tokens.weight` -- the head is tied and exported anyway,
     // which is ordinary for an HF export and which the catalog's manifest
-    // treats as a contradiction. So this build serves no row for the most
+    // treated as a contradiction. So that build served no row for the most
     // widely downloaded qwen3 artifact there is.
     //
-    // That is a fact about `crates/model`'s catalog and not about this
-    // driver, and it is left where it was found rather than worked around
-    // from here: a driver crate quietly loosening another crate's manifest is
-    // how a refusal that meant something becomes a refusal nobody remembers.
-    // What it costs HERE is only the identification, and this test is about
-    // the NAMES, so the row is taken by id and the shape is checked below.
+    // That was left where it was found rather than worked around from here,
+    // on the grounds that a driver crate quietly loosening another crate's
+    // manifest is how a refusal that meant something becomes a refusal nobody
+    // remembers. IT IS NOW FIXED IN THE CRATE THAT OWNS IT: `TensorSpec::tied`
+    // states a tie as an absence that tolerates a REDUNDANT copy -- one at the
+    // tied quantity's own extents, so a head that disagrees with the table it
+    // ties is still `unexpected` and the untied rows still discriminate. See
+    // `model::manifest` and `catalog::identify_tests`.
+    //
+    // Taking the row by id is therefore no longer forced. It is kept because
+    // this test is about the NAMES and an id is the more direct statement of
+    // which row's names are meant; rewiring it to `identify` would be a real
+    // change to what it measures, and on this machine it measures nothing to
+    // compare against (see the 0 snapshots note above).
     let Some(row) = model::catalog::find(fixture.id) else {
         eprintln!(
             "this build has no `{}` row, so the names are unmeasured",

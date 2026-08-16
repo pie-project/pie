@@ -9,9 +9,8 @@
 
 use kernels::routine::Refusal;
 
-use crate::routine::{
-    Bind, Buf, BufMut, Ctx, Env, Fire, I32s, InPacked, Routine, U32s, elementwise, elementwise_rows,
-};
+use crate::routine::{elementwise, elementwise_rows, keys, Ask, Bind, Block, Buf, BufMut, Ctx, Fire, I32s, InPacked, Param, ParamF32, Routine, U32s};
+use crate::routine::{InSlot, OutSlot, Weight};
 
 /// Threads per threadgroup for every body in this file.
 ///
@@ -236,20 +235,23 @@ const EMBED_GATHER_FILE: &str = "layout/embed_gather.metal";
 /// affine point the shader tree does not carry.
 pub fn embed_gather_4bit(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    id: I32s,
-    out: BufMut,
-    hidden: i32,
-    group: Env<i32>,
-    bits: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    // THE TOKEN IDS ARE THE FIRE'S. An embedding gather at the top of a
+    // graph has no traced operand -- the ids come off the fire's frame --
+    // which is why the statement places three weights and no input.
+    id: Ask<keys::TokenIds, I32s>,
+    out: OutSlot<0, BufMut>,
+    hidden: Param<0, i32>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: EMBED_GATHER[affine_point(*group, *bits)?],
             file: EMBED_GATHER_FILE,
-            lanes: elementwise(hidden, 1)?,
+            lanes: elementwise(*hidden, 1)?,
             group: [GROUP_X, 1, 1],
         },
         &[w.v(), scales.v(), biases.v(), id.v(), out.v(), hidden.v()],
@@ -269,21 +271,24 @@ pub fn embed_gather_4bit(
 /// As [`embed_gather_4bit`].
 pub fn embed_gather_mb_4bit(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    id: I32s,
-    out: BufMut,
-    hidden: i32,
-    rows: Env<i32>,
-    group: Env<i32>,
-    bits: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    // THE TOKEN IDS ARE THE FIRE'S. An embedding gather at the top of a
+    // graph has no traced operand -- the ids come off the fire's frame --
+    // which is why the statement places three weights and no input.
+    id: Ask<keys::TokenIds, I32s>,
+    out: OutSlot<0, BufMut>,
+    hidden: Param<0, i32>,
+    rows: Ask<keys::Rows, i32>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: EMBED_GATHER_MB[affine_point(*group, *bits)?],
             file: EMBED_GATHER_FILE,
-            lanes: elementwise_rows(hidden, *rows)?,
+            lanes: elementwise_rows(*hidden, *rows)?,
             group: [GROUP_X, 1, 1],
         },
         &[w.v(), scales.v(), biases.v(), id.v(), out.v(), hidden.v()],
@@ -302,21 +307,24 @@ pub fn embed_gather_mb_4bit(
 /// As [`embed_gather_4bit`].
 pub fn embed_gather_scaled_4bit(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    id: I32s,
-    out: BufMut,
-    hidden: i32,
-    embed_scale: f32,
-    group: Env<i32>,
-    bits: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    // THE TOKEN IDS ARE THE FIRE'S. An embedding gather at the top of a
+    // graph has no traced operand -- the ids come off the fire's frame --
+    // which is why the statement places three weights and no input.
+    id: Ask<keys::TokenIds, I32s>,
+    out: OutSlot<0, BufMut>,
+    hidden: Param<0, i32>,
+    embed_scale: ParamF32<1>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: EMBED_GATHER_SCALED[affine_point(*group, *bits)?],
             file: EMBED_GATHER_FILE,
-            lanes: elementwise(hidden, 1)?,
+            lanes: elementwise(*hidden, 1)?,
             group: [GROUP_X, 1, 1],
         },
         &[
@@ -339,22 +347,25 @@ pub fn embed_gather_scaled_4bit(
 /// As [`embed_gather_4bit`].
 pub fn embed_gather_scaled_mb_4bit(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    id: I32s,
-    out: BufMut,
-    hidden: i32,
-    embed_scale: f32,
-    rows: Env<i32>,
-    group: Env<i32>,
-    bits: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    // THE TOKEN IDS ARE THE FIRE'S. An embedding gather at the top of a
+    // graph has no traced operand -- the ids come off the fire's frame --
+    // which is why the statement places three weights and no input.
+    id: Ask<keys::TokenIds, I32s>,
+    out: OutSlot<0, BufMut>,
+    hidden: Param<0, i32>,
+    embed_scale: ParamF32<1>,
+    rows: Ask<keys::Rows, i32>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: EMBED_GATHER_SCALED_MB[affine_point(*group, *bits)?],
             file: EMBED_GATHER_FILE,
-            lanes: elementwise_rows(hidden, *rows)?,
+            lanes: elementwise_rows(*hidden, *rows)?,
             group: [GROUP_X, 1, 1],
         },
         &[
@@ -386,12 +397,12 @@ pub fn embed_gather_scaled_mb_4bit(
 /// [`Refusal::Empty`] when the block is empty.
 pub fn ple_combine(
     ctx: &Ctx<'_>,
-    proj: Buf,
-    token: Buf,
-    out: BufMut,
-    params: Buf,
-    width: Env<i32>,
-    rows: Env<i32>,
+    proj: InSlot<0, Buf>,
+    token: InSlot<1, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -425,13 +436,13 @@ pub fn ple_combine(
 /// [`Refusal::Empty`] for an empty rectangle.
 pub fn row_gather(
     ctx: &Ctx<'_>,
-    input: Buf,
-    out: BufMut,
-    rows: U32s,
-    params: Buf,
-    count: InPacked,
-    width: Env<i32>,
-    row_count: Env<i32>,
+    input: InSlot<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    rows: Ask<keys::SamplingIndices, U32s>,
+    params: Block<Buf>,
+    count: Ask<keys::RequestCount, InPacked>,
+    width: Ask<keys::Width, i32>,
+    row_count: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -485,14 +496,14 @@ mod tests {
         let seen = Seen::default();
         embed_gather_4bit(
             &seen,
-            Buf(1),
-            Buf(2),
-            Buf(3),
-            I32s(4),
-            BufMut(5),
-            2048,
-            Env(64),
-            Env(4),
+            Weight::new(Buf(1)),
+            Weight::new(Buf(2)),
+            Weight::new(Buf(3)),
+            Ask::new(I32s(4)),
+            OutSlot::new(BufMut(5)),
+            Param::new(2048),
+            Ask::new(64),
+            Ask::new(4),
         )
         .expect("a 64/4 checkpoint is one of the six");
 
@@ -503,14 +514,14 @@ mod tests {
 
         let narrow = embed_gather_4bit(
             &seen,
-            Buf(1),
-            Buf(2),
-            Buf(3),
-            I32s(4),
-            BufMut(5),
-            2048,
-            Env(96),
-            Env(4),
+            Weight::new(Buf(1)),
+            Weight::new(Buf(2)),
+            Weight::new(Buf(3)),
+            Ask::new(I32s(4)),
+            OutSlot::new(BufMut(5)),
+            Param::new(2048),
+            Ask::new(96),
+            Ask::new(4),
         )
         .expect_err("96 is not a group size this tree carries");
         assert!(
@@ -544,27 +555,27 @@ mod tests {
         let seen = Seen::default();
         embed_gather_4bit(
             &seen,
-            Buf(1),
-            Buf(2),
-            Buf(3),
-            I32s(4),
-            BufMut(5),
-            2048,
-            Env(32),
-            Env(4),
+            Weight::new(Buf(1)),
+            Weight::new(Buf(2)),
+            Weight::new(Buf(3)),
+            Ask::new(I32s(4)),
+            OutSlot::new(BufMut(5)),
+            Param::new(2048),
+            Ask::new(32),
+            Ask::new(4),
         )
         .expect("a launch");
         embed_gather_mb_4bit(
             &seen,
-            Buf(1),
-            Buf(2),
-            Buf(3),
-            I32s(4),
-            BufMut(5),
-            2048,
-            Env(7),
-            Env(32),
-            Env(4),
+            Weight::new(Buf(1)),
+            Weight::new(Buf(2)),
+            Weight::new(Buf(3)),
+            Ask::new(I32s(4)),
+            OutSlot::new(BufMut(5)),
+            Param::new(2048),
+            Ask::new(7),
+            Ask::new(32),
+            Ask::new(4),
         )
         .expect("a launch");
 
@@ -596,16 +607,16 @@ mod tests {
         let seen = Seen::default();
         embed_gather_scaled_mb_4bit(
             &seen,
-            Buf(1),
-            Buf(2),
-            Buf(3),
-            I32s(4),
-            BufMut(5),
-            2048,
-            45.254_834,
-            Env(7),
-            Env(128),
-            Env(8),
+            Weight::new(Buf(1)),
+            Weight::new(Buf(2)),
+            Weight::new(Buf(3)),
+            Ask::new(I32s(4)),
+            OutSlot::new(BufMut(5)),
+            Param::new(2048),
+            ParamF32::new(45.254_834),
+            Ask::new(7),
+            Ask::new(128),
+            Ask::new(8),
         )
         .expect("a launch");
 
@@ -640,13 +651,13 @@ mod tests {
         let seen = Seen::default();
         row_gather(
             &seen,
-            Buf(1),
-            BufMut(2),
-            U32s(3),
-            Buf(4),
-            InPacked(3),
-            Env(2048),
-            Env(3),
+            InSlot::new(Buf(1)),
+            OutSlot::new(BufMut(2)),
+            Ask::new(U32s(3)),
+            Block::new(Buf(4)),
+            Ask::new(InPacked(3)),
+            Ask::new(2048),
+            Ask::new(3),
         )
         .expect("three requests is a launch");
 

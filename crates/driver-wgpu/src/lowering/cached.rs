@@ -215,6 +215,7 @@ mod tests {
                     },
                     inputs: Vec::new(),
                     outputs: vec![u32::try_from(i).expect("a small fixture")],
+                    dest: Vec::new(),
                     layer: None,
                 })
                 .collect(),
@@ -263,6 +264,7 @@ mod tests {
                 },
                 inputs: Vec::new(),
                 outputs: vec![0],
+                dest: Vec::new(),
                 layer: None,
             }],
             depth_window: false,

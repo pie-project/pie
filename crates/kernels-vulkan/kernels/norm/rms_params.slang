@@ -25,6 +25,41 @@ struct RmsParams {
     float gain;
 };
 
+// `RmsParams` with the rotation's four scalars appended, for the fused
+// `rms_rope`. Appended and not interleaved, and that order is an ABI rather
+// than a preference: `driver-vulkan`'s `encode` mints this block as THE
+// STATEMENT'S PARAMS RUN followed by whatever the routine packed in after it,
+// which is the same shape `row_gather`'s `{ width, count }` has. The first
+// five fields are therefore the five a norm statement already states, field
+// for field, and the last four are the routine's own.
+//
+// It is one block and not a block plus a push range because `binding::params`
+// can place a launch's scalars in one shape or the other and not both -- it
+// asks push first, and a module answering with the right push size "is not
+// also hiding a parameter buffer". A kernel needing both would be a kernel
+// that cannot be given its scalars.
+//
+// There is no Metal or GLSL sibling for this one, because there is no Metal
+// `rms_rope`. When there is, it goes beside the others here.
+struct RmsRopeParams {
+    float eps;
+    uint axis_size;
+    uint w_stride;
+    uint plus_one;
+    float gain;
+    // The distance between two tokens' rows, which is the whole token and not
+    // the head: the base this kernel builds is two-level.
+    uint row_pitch;
+    // The channels that rotate, counted from zero. Not always the head --
+    // gemma-4 rotates a quarter of each full-attention head.
+    uint rotary;
+    float scale;
+    // `log2(theta)`, because the body raises two to it. Under `PIE_FREQS`
+    // this field carries YaRN's `mscale` instead, which is the same
+    // substitution `neox.slang` makes in its push block.
+    float base_or_mscale;
+};
+
 struct VNormParams {
     float eps;
     uint axis_size;

@@ -9,6 +9,29 @@
 
 use kernels::KernelSig;
 
+// ── R4, THE NOTATION NO CENSUS IN THIS REFACTOR HAS MEASURED ──
+//
+// This table and `kernels-vulkan/src/attn.rs` are mirrors, operand for
+// operand, and between the two crates they author `kernels::Source` values
+// 637 times through `kernels::operands!`'s `$src:expr` -- ten times the whole
+// `#[source(..)]` surface in `kernels-cuda` that every census in this refactor
+// was counting. The argument for the thirty conversions in this file, the
+// reason `.wiki/kilimanjaro2.md` §3.11 is unsafe here until they happen, the
+// count that came in at 88 and is 60, and the type evidence for all seven
+// keys are written ONCE, in the vulkan mirror's header. It is not repeated
+// here because a mirror that argues with itself in two places drifts.
+//
+// The two paragraphs below that name `keys::AttentionMaskStride` in prose are
+// the entire difference between a naive census of this file and a true one,
+// and they are left standing: the sentence they carry is load-bearing and the
+// miscount is the instrument's problem, not theirs.
+//
+// What those paragraphs say has changed. They called the mask's pitch this
+// table's DIVERGENCE from `kernels-metal`; it is now the agreement. All three
+// planes ask the fire, and metal's fire answers zero because metal stages no
+// mask -- which is a fact about that driver, stated in that driver, rather
+// than a literal frozen into six signature rows.
+
 pub static KERNELS: &[KernelSig] = &[
     // 1 in split_qkv.wgsl
     // Three results, which is what makes the row's `Out` indices load-bearing:
@@ -22,7 +45,7 @@ pub static KERNELS: &[KernelSig] = &[
     // 1 in kv_append_paged.wgsl
     // Sparse indices, and the gaps are stated. Buffers 4, 6-9 and 11 belong to
     // a shared ring ABI this kernel does not read; a row is positional, so it
-    // lists them as `Unbound` rather than closing the gap and shifting
+    // lists them with no source rather than closing the gap and shifting
     // everything after.
     // 1 in logit_softcap.wgsl
     // gemma's logit softcap: `cap * tanh(x / cap)`, applied to the readout so
@@ -67,10 +90,10 @@ pub static KERNELS: &[KernelSig] = &[
     // into a uniform block the shader reads SEVEN fields of --
     // `every_launchs_scalars_land_where_its_module_reads_them` says so by name.
     //
-    // The pitch stays `Source::AttentionMaskStride` where `kernels-metal`
-    // states `Param(3)`: this table's documented divergence, and the reason a
-    // user mask works on this backend. See `DELIBERATE` in
-    // `tests/entrypoints.rs`.
+    // The pitch is `Ask<keys::AttentionMaskStride, _>`, which is the reason a
+    // user mask works on this backend: the driver staged the rectangle and
+    // knows how wide it made each row. `kernels-metal` said `Param(3)` here
+    // until all three planes were unified on the fire's answer.
     // 1 in sdpa_paged_mma.wgsl
     // The same template at `sinks = true`, exactly as `sdpa_paged_tiled_sink`
     // is to `sdpa_paged_tiled`.
@@ -80,10 +103,10 @@ pub static KERNELS: &[KernelSig] = &[
     // whole tiles -- see `kernels::LaunchRule::SdpaTiled` -- so the threads of
     // a partial last tile are past the end and this is what tells them.
     //
-    // The pitch stays `Source::AttentionMaskStride` where `kernels-metal`
-    // states `Param(3)`, which is this table's documented divergence and the
-    // reason a user mask works on this backend at all. See `DELIBERATE` in
-    // `tests/entrypoints.rs`.
+    // The pitch is `Ask<keys::AttentionMaskStride, _>`, which is the reason a
+    // user mask works on this backend at all: the driver staged the rectangle
+    // and knows how wide it made each row. `kernels-metal` said `Param(3)`
+    // here until all three planes were unified on the fire's answer.
     // 1 in sdpa_paged.wgsl
     // The same template at `sinks = true`, exactly as `sdpa_paged_decode_sink`
     // is to `sdpa_paged_decode`.
@@ -144,7 +167,8 @@ pub static ENTRYPOINTS: &[&str] = &[
     "split_qkv_bf16",
 ];
 
-use crate::routine::{Bind, Buf, BufMut, Ctx, Env, Fire, I32s, Routine, U8s, U32s, Usize};
+use crate::routine::{Reckoned, Say, Times, keys, Ask, Bind, Block, Buf, BufMut, Ctx, Env, Fire, Held, I32s, Null, Param, ParamF32, ParamOr, ParamOrLit, Routine, U32s, U8s, Usize};
+use crate::routine::{InSlot, OutSlot, Weight};
 use kernels::routine::Refusal;
 use kernels::shader::{elementwise, elementwise_rows};
 
@@ -367,13 +391,13 @@ fn head_grid(head_dim: i32, heads: i32, depth: i32) -> Result<[u32; 3], Refusal>
 /// [`Refusal::Empty`] for an empty row or an empty rectangle.
 pub fn split_qkv_bf16(
     ctx: &Ctx<'_>,
-    packed: Buf,
-    q: BufMut,
-    k: BufMut,
-    v: BufMut,
-    params: Buf,
-    packed_width: Env<i32>,
-    rows: Env<i32>,
+    packed: InSlot<0, Buf>,
+    q: OutSlot<0, BufMut>,
+    k: OutSlot<1, BufMut>,
+    v: OutSlot<2, BufMut>,
+    params: Block<Buf>,
+    packed_width: Ask<keys::InWidth, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -402,11 +426,11 @@ pub fn split_qkv_bf16(
 /// [`Refusal::Empty`] for an empty rectangle.
 pub fn gate(
     ctx: &Ctx<'_>,
-    attn: BufMut,
-    gate: Buf,
-    row_stride: i32,
-    width: Env<i32>,
-    rows: Env<i32>,
+    attn: OutSlot<0, BufMut>,
+    gate: InSlot<1, Buf>,
+    row_stride: Param<0, i32>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -431,20 +455,20 @@ pub fn gate(
 /// than a token depth.
 pub fn q_gate_split(
     ctx: &Ctx<'_>,
-    qg: Buf,
-    q_out: BufMut,
-    gate_out: BufMut,
-    head_dim: i32,
-    qg_row_stride: i32,
-    out_row_stride: i32,
-    q_heads: Env<i32>,
-    rows: Env<i32>,
+    qg: InSlot<0, Buf>,
+    q_out: OutSlot<0, BufMut>,
+    gate_out: OutSlot<1, BufMut>,
+    head_dim: ParamOr<0, keys::HeadDim, i32>,
+    qg_row_stride: Param<1, i32>,
+    out_row_stride: Param<2, i32>,
+    q_heads: Ask<keys::NumQHeads, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "attn/gate.wgsl",
             entrypoint: "q_gate_split_bfloat16",
-            lanes: head_grid(head_dim, *q_heads, *rows)?,
+            lanes: head_grid(*head_dim, *q_heads, *rows)?,
         },
         &[
             qg.v(),
@@ -475,21 +499,21 @@ pub fn q_gate_split(
 /// See `head_grid`.
 pub fn kv_append(
     ctx: &Ctx<'_>,
-    k_new: Buf,
-    v_new: Buf,
-    k_cache: BufMut,
-    v_cache: BufMut,
-    pos: I32s,
-    head_dim: i32,
-    k_head_stride: Usize,
-    k_seq_stride: Usize,
-    heads: Env<i32>,
+    k_new: InSlot<0, Buf>,
+    v_new: InSlot<1, Buf>,
+    k_cache: Held<keys::KvKeys, BufMut>,
+    v_cache: Held<keys::KvValues, BufMut>,
+    pos: Held<keys::Positions, I32s>,
+    head_dim: ParamOr<0, keys::HeadDim, i32>,
+    k_head_stride: Held<keys::KvHeadStride, Usize>,
+    k_seq_stride: Held<keys::KvSeqStride, Usize>,
+    heads: Ask<keys::NumKvHeads, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "attn/kv_write.wgsl",
             entrypoint: "kv_append_bfloat16",
-            lanes: head_grid(head_dim, *heads, 1)?,
+            lanes: head_grid(*head_dim, *heads, 1)?,
         },
         &[
             k_new.v(),
@@ -534,29 +558,29 @@ pub fn kv_append(
 /// See `head_grid`.
 pub fn kv_append_paged(
     ctx: &Ctx<'_>,
-    k_new: Buf,
-    v_new: Buf,
-    k_pages: BufMut,
-    v_pages: BufMut,
-    _ring_4: Buf,
-    head_dim: i32,
-    _ring_6: Buf,
-    _ring_7: Buf,
-    _ring_8: Buf,
-    _ring_9: Buf,
-    page_size: i32,
-    _ring_11: Buf,
-    n_kv_heads: i32,
-    w_page: U32s,
-    w_off: U32s,
-    _ring_15: Buf,
-    tokens: Env<i32>,
+    k_new: InSlot<0, Buf>,
+    v_new: InSlot<1, Buf>,
+    k_pages: Ask<keys::KvKeys, BufMut>,
+    v_pages: Ask<keys::KvValues, BufMut>,
+    _ring_4: Null<Env<Buf>>,
+    head_dim: ParamOr<0, keys::HeadDim, i32>,
+    _ring_6: Null<Env<Buf>>,
+    _ring_7: Null<Env<Buf>>,
+    _ring_8: Null<Env<Buf>>,
+    _ring_9: Null<Env<Buf>>,
+    page_size: Held<keys::KvPageSize, i32>,
+    _ring_11: Null<Env<Buf>>,
+    n_kv_heads: ParamOr<1, keys::NumKvHeads, i32>,
+    w_page: Ask<keys::KvWritePage, U32s>,
+    w_off: Ask<keys::KvWriteOffset, U32s>,
+    _ring_15: Null<Env<Buf>>,
+    tokens: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "attn/kv_write.wgsl",
             entrypoint: "kv_append_paged_bfloat16",
-            lanes: head_grid(head_dim, n_kv_heads, *tokens)?,
+            lanes: head_grid(*head_dim, *n_kv_heads, *tokens)?,
         },
         &[
             k_new.v(),
@@ -582,16 +606,16 @@ pub fn kv_append_paged(
 /// [`Refusal::Empty`] for an empty readout.
 pub fn logit_softcap(
     ctx: &Ctx<'_>,
-    logits: Buf,
-    out: BufMut,
-    params: Buf,
-    n: Env<i32>,
+    logits: InSlot<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    n: Reckoned<Times<Say<keys::Width>, Say<keys::Rows>>, Env<i32>>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "attn/logit_softcap.wgsl",
             entrypoint: "logit_softcap_bfloat16",
-            lanes: elementwise(*n, 1)?,
+            lanes: elementwise(**n, 1)?,
         },
         &[logits.v(), out.v(), params.v()],
     )
@@ -615,32 +639,32 @@ pub fn logit_softcap(
 /// `vector_grid` refuses.
 pub fn sdpa_paged_decode(
     ctx: &Ctx<'_>,
-    queries: Buf,
-    k_pages: Buf,
-    v_pages: Buf,
-    out: BufMut,
-    gqa_factor: i32,
-    position_ids: I32s,
-    req_of_token: I32s,
-    kv_page_indices: U32s,
-    kv_page_indptr: U32s,
-    page_size: i32,
-    n_kv_heads: i32,
-    scale: f32,
-    attention_mask: U8s,
-    attention_mask_stride: u32,
-    attention_mask_enabled: U8s,
-    window: i32,
+    queries: InSlot<0, Buf>,
+    k_pages: Ask<keys::KvKeys, Buf>,
+    v_pages: Ask<keys::KvValues, Buf>,
+    out: OutSlot<0, BufMut>,
+    gqa_factor: Param<0, i32>,
+    position_ids: Ask<keys::Positions, I32s>,
+    req_of_token: Ask<keys::RequestOfToken, I32s>,
+    kv_page_indices: Ask<keys::KvPageIndices, U32s>,
+    kv_page_indptr: Ask<keys::KvPageIndptr, U32s>,
+    page_size: Held<keys::KvPageSize, i32>,
+    n_kv_heads: Param<1, i32>,
+    scale: ParamF32<2>,
+    attention_mask: Ask<keys::AttentionMask, U8s>,
+    attention_mask_stride: Ask<keys::AttentionMaskStride, u32>,
+    attention_mask_enabled: Ask<keys::AttentionMaskEnabled, U8s>,
+    window: ParamOrLit<4, -1, i32>,
     // FORWARDED HERE, where `kernels-vulkan` takes it as `_sinks` and drops
     // it. `slangc` emits no binding for a global the un-sinked variant never
     // reads; WGSL declares it in source and `naga` keeps it, so this module
     // declares eleven `@group(0)` bindings and the layout is built from that.
     // Skipping the slot binds the window scalar's block where the sink plane
     // belongs. §8c, in the direction it was written for.
-    sinks: Buf,
-    head_dim: Env<i32>,
-    q_heads: Env<i32>,
-    rows: Env<i32>,
+    sinks: Null<Env<Buf>>,
+    head_dim: Ask<keys::HeadDim, i32>,
+    q_heads: Ask<keys::NumQHeads, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -683,26 +707,26 @@ pub fn sdpa_paged_decode(
 /// `vector_grid` refuses.
 pub fn sdpa_paged_decode_sink(
     ctx: &Ctx<'_>,
-    queries: Buf,
-    k_pages: Buf,
-    v_pages: Buf,
-    out: BufMut,
-    gqa_factor: i32,
-    position_ids: I32s,
-    req_of_token: I32s,
-    kv_page_indices: U32s,
-    kv_page_indptr: U32s,
-    page_size: i32,
-    n_kv_heads: i32,
-    scale: f32,
-    attention_mask: U8s,
-    attention_mask_stride: u32,
-    attention_mask_enabled: U8s,
-    window: i32,
-    sinks: Buf,
-    head_dim: Env<i32>,
-    q_heads: Env<i32>,
-    rows: Env<i32>,
+    queries: InSlot<0, Buf>,
+    k_pages: Ask<keys::KvKeys, Buf>,
+    v_pages: Ask<keys::KvValues, Buf>,
+    out: OutSlot<0, BufMut>,
+    gqa_factor: Param<0, i32>,
+    position_ids: Ask<keys::Positions, I32s>,
+    req_of_token: Ask<keys::RequestOfToken, I32s>,
+    kv_page_indices: Ask<keys::KvPageIndices, U32s>,
+    kv_page_indptr: Ask<keys::KvPageIndptr, U32s>,
+    page_size: Held<keys::KvPageSize, i32>,
+    n_kv_heads: Param<1, i32>,
+    scale: ParamF32<2>,
+    attention_mask: Ask<keys::AttentionMask, U8s>,
+    attention_mask_stride: Ask<keys::AttentionMaskStride, u32>,
+    attention_mask_enabled: Ask<keys::AttentionMaskEnabled, U8s>,
+    window: ParamOrLit<4, -1, i32>,
+    sinks: Weight<0, Buf>,
+    head_dim: Ask<keys::HeadDim, i32>,
+    q_heads: Ask<keys::NumQHeads, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     head_point(*head_dim, &[64])?;
     ctx.dispatch(
@@ -749,38 +773,38 @@ pub fn sdpa_paged_decode_sink(
 /// `tiled_grid` refuses.
 pub fn sdpa_paged_tiled(
     ctx: &Ctx<'_>,
-    queries: Buf,
-    k_pages: Buf,
-    v_pages: Buf,
-    out: BufMut,
-    gqa_factor: i32,
-    position_ids: I32s,
-    req_of_token: I32s,
-    kv_page_indices: U32s,
-    kv_page_indptr: U32s,
-    page_size: i32,
-    n_kv_heads: i32,
-    scale: f32,
-    attention_mask: U8s,
-    attention_mask_stride: u32,
-    attention_mask_enabled: U8s,
-    window: i32,
+    queries: InSlot<0, Buf>,
+    k_pages: Ask<keys::KvKeys, Buf>,
+    v_pages: Ask<keys::KvValues, Buf>,
+    out: OutSlot<0, BufMut>,
+    gqa_factor: Param<0, i32>,
+    position_ids: Ask<keys::Positions, I32s>,
+    req_of_token: Ask<keys::RequestOfToken, I32s>,
+    kv_page_indices: Ask<keys::KvPageIndices, U32s>,
+    kv_page_indptr: Ask<keys::KvPageIndptr, U32s>,
+    page_size: Held<keys::KvPageSize, i32>,
+    n_kv_heads: Param<1, i32>,
+    scale: ParamF32<2>,
+    attention_mask: Ask<keys::AttentionMask, U8s>,
+    attention_mask_stride: Ask<keys::AttentionMaskStride, u32>,
+    attention_mask_enabled: Ask<keys::AttentionMaskEnabled, U8s>,
+    window: ParamOrLit<4, -1, i32>,
     // FORWARDED HERE, where `kernels-vulkan` takes it as `_sinks` and drops
     // it. `slangc` emits no binding for a global the un-sinked variant never
     // reads; WGSL declares it in source and `naga` keeps it, so this module
     // declares eleven `@group(0)` bindings and the layout is built from that.
     // Skipping the slot binds the window scalar's block where the sink plane
     // belongs. §8c, in the direction it was written for.
-    sinks: Buf,
-    n_rows: i32,
-    head_dim: Env<i32>,
-    q_heads: Env<i32>,
+    sinks: Null<Env<Buf>>,
+    n_rows: Ask<keys::Rows, i32>,
+    head_dim: Ask<keys::HeadDim, i32>,
+    q_heads: Ask<keys::NumQHeads, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "attn/sdpa_paged.wgsl",
             entrypoint: PAGED_TILED[head_point(*head_dim, &PAGED_DIMS)?],
-            lanes: tiled_grid(*q_heads, n_rows)?,
+            lanes: tiled_grid(*q_heads, *n_rows)?,
         },
         &[
             queries.v(),
@@ -813,33 +837,33 @@ pub fn sdpa_paged_tiled(
 /// refuses.
 pub fn sdpa_paged_tiled_sink(
     ctx: &Ctx<'_>,
-    queries: Buf,
-    k_pages: Buf,
-    v_pages: Buf,
-    out: BufMut,
-    gqa_factor: i32,
-    position_ids: I32s,
-    req_of_token: I32s,
-    kv_page_indices: U32s,
-    kv_page_indptr: U32s,
-    page_size: i32,
-    n_kv_heads: i32,
-    scale: f32,
-    attention_mask: U8s,
-    attention_mask_stride: u32,
-    attention_mask_enabled: U8s,
-    window: i32,
-    sinks: Buf,
-    n_rows: i32,
-    head_dim: Env<i32>,
-    q_heads: Env<i32>,
+    queries: InSlot<0, Buf>,
+    k_pages: Ask<keys::KvKeys, Buf>,
+    v_pages: Ask<keys::KvValues, Buf>,
+    out: OutSlot<0, BufMut>,
+    gqa_factor: Param<0, i32>,
+    position_ids: Ask<keys::Positions, I32s>,
+    req_of_token: Ask<keys::RequestOfToken, I32s>,
+    kv_page_indices: Ask<keys::KvPageIndices, U32s>,
+    kv_page_indptr: Ask<keys::KvPageIndptr, U32s>,
+    page_size: Held<keys::KvPageSize, i32>,
+    n_kv_heads: Param<1, i32>,
+    scale: ParamF32<2>,
+    attention_mask: Ask<keys::AttentionMask, U8s>,
+    attention_mask_stride: Ask<keys::AttentionMaskStride, u32>,
+    attention_mask_enabled: Ask<keys::AttentionMaskEnabled, U8s>,
+    window: ParamOrLit<4, -1, i32>,
+    sinks: Weight<0, Buf>,
+    n_rows: Ask<keys::Rows, i32>,
+    head_dim: Ask<keys::HeadDim, i32>,
+    q_heads: Ask<keys::NumQHeads, i32>,
 ) -> Result<(), Refusal> {
     head_point(*head_dim, &[64])?;
     ctx.dispatch(
         Fire {
             module: "attn/sdpa_paged.wgsl",
             entrypoint: "sdpa_paged_tiled_sink_bfloat16_d_64",
-            lanes: tiled_grid(*q_heads, n_rows)?,
+            lanes: tiled_grid(*q_heads, *n_rows)?,
         },
         &[
             queries.v(),
@@ -878,41 +902,41 @@ pub fn sdpa_paged_tiled_sink(
 /// `tiled_grid` refuses.
 pub fn sdpa_paged_tiled_strided(
     ctx: &Ctx<'_>,
-    queries: Buf,
-    k_pages: Buf,
-    v_pages: Buf,
-    out: BufMut,
-    gqa_factor: i32,
-    position_ids: I32s,
-    req_of_token: I32s,
-    kv_page_indices: U32s,
-    kv_page_indptr: U32s,
-    page_size: i32,
-    n_kv_heads: i32,
-    scale: f32,
-    attention_mask: U8s,
-    attention_mask_stride: u32,
-    attention_mask_enabled: U8s,
-    window: i32,
+    queries: InSlot<0, Buf>,
+    k_pages: Ask<keys::KvKeys, Buf>,
+    v_pages: Ask<keys::KvValues, Buf>,
+    out: OutSlot<0, BufMut>,
+    gqa_factor: Param<0, i32>,
+    position_ids: Ask<keys::Positions, I32s>,
+    req_of_token: Ask<keys::RequestOfToken, I32s>,
+    kv_page_indices: Ask<keys::KvPageIndices, U32s>,
+    kv_page_indptr: Ask<keys::KvPageIndptr, U32s>,
+    page_size: Held<keys::KvPageSize, i32>,
+    n_kv_heads: Param<1, i32>,
+    scale: ParamF32<2>,
+    attention_mask: Ask<keys::AttentionMask, U8s>,
+    attention_mask_stride: Ask<keys::AttentionMaskStride, u32>,
+    attention_mask_enabled: Ask<keys::AttentionMaskEnabled, U8s>,
+    window: ParamOrLit<4, -1, i32>,
     // FORWARDED HERE, where `kernels-vulkan` takes it as `_sinks` and drops
     // it. `slangc` emits no binding for a global the un-sinked variant never
     // reads; WGSL declares it in source and `naga` keeps it, so this module
     // declares eleven `@group(0)` bindings and the layout is built from that.
     // Skipping the slot binds the window scalar's block where the sink plane
     // belongs. §8c, in the direction it was written for.
-    sinks: Buf,
-    n_rows: i32,
-    q_row_pitch: i32,
-    o_row_pitch: i32,
-    head_dim: Env<i32>,
-    q_heads: Env<i32>,
+    sinks: Null<Env<Buf>>,
+    n_rows: Ask<keys::Rows, i32>,
+    q_row_pitch: Param<5, i32>,
+    o_row_pitch: Param<6, i32>,
+    head_dim: Ask<keys::HeadDim, i32>,
+    q_heads: Ask<keys::NumQHeads, i32>,
 ) -> Result<(), Refusal> {
     head_point(*head_dim, &[256])?;
     ctx.dispatch(
         Fire {
             module: "attn/sdpa_paged.wgsl",
             entrypoint: "sdpa_paged_tiled_strided_bfloat16_d_256",
-            lanes: tiled_grid(*q_heads, n_rows)?,
+            lanes: tiled_grid(*q_heads, *n_rows)?,
         },
         &[
             queries.v(),
@@ -958,39 +982,39 @@ pub fn sdpa_paged_tiled_strided(
 /// refuses.
 pub fn sdpa_paged_mma(
     ctx: &Ctx<'_>,
-    queries: Buf,
-    k_pages: Buf,
-    v_pages: Buf,
-    out: BufMut,
-    gqa_factor: i32,
-    position_ids: I32s,
-    req_of_token: I32s,
-    kv_page_indices: U32s,
-    kv_page_indptr: U32s,
-    page_size: i32,
-    n_kv_heads: i32,
-    scale: f32,
-    attention_mask: U8s,
-    attention_mask_stride: u32,
-    attention_mask_enabled: U8s,
-    window: i32,
+    queries: InSlot<0, Buf>,
+    k_pages: Ask<keys::KvKeys, Buf>,
+    v_pages: Ask<keys::KvValues, Buf>,
+    out: OutSlot<0, BufMut>,
+    gqa_factor: Param<0, i32>,
+    position_ids: Ask<keys::Positions, I32s>,
+    req_of_token: Ask<keys::RequestOfToken, I32s>,
+    kv_page_indices: Ask<keys::KvPageIndices, U32s>,
+    kv_page_indptr: Ask<keys::KvPageIndptr, U32s>,
+    page_size: Held<keys::KvPageSize, i32>,
+    n_kv_heads: Param<1, i32>,
+    scale: ParamF32<2>,
+    attention_mask: Ask<keys::AttentionMask, U8s>,
+    attention_mask_stride: Ask<keys::AttentionMaskStride, u32>,
+    attention_mask_enabled: Ask<keys::AttentionMaskEnabled, U8s>,
+    window: ParamOrLit<4, -1, i32>,
     // FORWARDED HERE, where `kernels-vulkan` takes it as `_sinks` and drops
     // it. `slangc` emits no binding for a global the un-sinked variant never
     // reads; WGSL declares it in source and `naga` keeps it, so this module
     // declares eleven `@group(0)` bindings and the layout is built from that.
     // Skipping the slot binds the window scalar's block where the sink plane
     // belongs. §8c, in the direction it was written for.
-    sinks: Buf,
-    n_rows: i32,
-    head_dim: Env<i32>,
-    q_heads: Env<i32>,
+    sinks: Null<Env<Buf>>,
+    n_rows: Ask<keys::Rows, i32>,
+    head_dim: Ask<keys::HeadDim, i32>,
+    q_heads: Ask<keys::NumQHeads, i32>,
 ) -> Result<(), Refusal> {
     head_point(*head_dim, &[64])?;
     ctx.dispatch(
         Fire {
             module: "attn/sdpa_paged_mma.wgsl",
             entrypoint: "sdpa_paged_mma_bfloat16_d_64",
-            lanes: tiled_grid(*q_heads, n_rows)?,
+            lanes: tiled_grid(*q_heads, *n_rows)?,
         },
         &[
             queries.v(),
@@ -1023,33 +1047,33 @@ pub fn sdpa_paged_mma(
 /// refuses.
 pub fn sdpa_paged_mma_sink(
     ctx: &Ctx<'_>,
-    queries: Buf,
-    k_pages: Buf,
-    v_pages: Buf,
-    out: BufMut,
-    gqa_factor: i32,
-    position_ids: I32s,
-    req_of_token: I32s,
-    kv_page_indices: U32s,
-    kv_page_indptr: U32s,
-    page_size: i32,
-    n_kv_heads: i32,
-    scale: f32,
-    attention_mask: U8s,
-    attention_mask_stride: u32,
-    attention_mask_enabled: U8s,
-    window: i32,
-    sinks: Buf,
-    n_rows: i32,
-    head_dim: Env<i32>,
-    q_heads: Env<i32>,
+    queries: InSlot<0, Buf>,
+    k_pages: Ask<keys::KvKeys, Buf>,
+    v_pages: Ask<keys::KvValues, Buf>,
+    out: OutSlot<0, BufMut>,
+    gqa_factor: Param<0, i32>,
+    position_ids: Ask<keys::Positions, I32s>,
+    req_of_token: Ask<keys::RequestOfToken, I32s>,
+    kv_page_indices: Ask<keys::KvPageIndices, U32s>,
+    kv_page_indptr: Ask<keys::KvPageIndptr, U32s>,
+    page_size: Held<keys::KvPageSize, i32>,
+    n_kv_heads: Param<1, i32>,
+    scale: ParamF32<2>,
+    attention_mask: Ask<keys::AttentionMask, U8s>,
+    attention_mask_stride: Ask<keys::AttentionMaskStride, u32>,
+    attention_mask_enabled: Ask<keys::AttentionMaskEnabled, U8s>,
+    window: ParamOrLit<4, -1, i32>,
+    sinks: Weight<0, Buf>,
+    n_rows: Ask<keys::Rows, i32>,
+    head_dim: Ask<keys::HeadDim, i32>,
+    q_heads: Ask<keys::NumQHeads, i32>,
 ) -> Result<(), Refusal> {
     head_point(*head_dim, &[64])?;
     ctx.dispatch(
         Fire {
             module: "attn/sdpa_paged_mma.wgsl",
             entrypoint: "sdpa_paged_mma_sink_bfloat16_d_64",
-            lanes: tiled_grid(*q_heads, n_rows)?,
+            lanes: tiled_grid(*q_heads, *n_rows)?,
         },
         &[
             queries.v(),
@@ -1087,20 +1111,20 @@ pub fn sdpa_paged_mma_sink(
 /// `vector_grid` refuses.
 pub fn sdpa_vector_decode(
     ctx: &Ctx<'_>,
-    queries: Buf,
-    keys: Buf,
-    values: Buf,
-    out: BufMut,
-    gqa_factor: i32,
-    n: i32,
-    k_head_stride: Usize,
-    k_seq_stride: Usize,
-    v_head_stride: Usize,
-    v_seq_stride: Usize,
-    scale: f32,
-    head_dim: Env<i32>,
-    q_heads: Env<i32>,
-    rows: Env<i32>,
+    queries: InSlot<0, Buf>,
+    keys: Held<keys::KvKeys, Buf>,
+    values: Held<keys::KvValues, Buf>,
+    out: OutSlot<0, BufMut>,
+    gqa_factor: Param<0, i32>,
+    n: Param<1, i32>,
+    k_head_stride: Held<keys::KvHeadStride, Usize>,
+    k_seq_stride: Held<keys::KvSeqStride, Usize>,
+    v_head_stride: Held<keys::KvHeadStride, Usize>,
+    v_seq_stride: Held<keys::KvSeqStride, Usize>,
+    scale: ParamF32<2>,
+    head_dim: Ask<keys::HeadDim, i32>,
+    q_heads: Ask<keys::NumQHeads, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -1137,23 +1161,23 @@ pub fn sdpa_vector_decode(
 /// `vector_grid` refuses.
 pub fn sdpa_vector_decode_swa(
     ctx: &Ctx<'_>,
-    queries: Buf,
-    keys: Buf,
-    values: Buf,
-    out: BufMut,
-    gqa_factor: i32,
-    n: i32,
-    k_head_stride: Usize,
-    k_seq_stride: Usize,
-    v_head_stride: Usize,
-    v_seq_stride: Usize,
-    scale: f32,
-    window: i32,
-    q_row_stride: i32,
-    o_row_stride: i32,
-    head_dim: Env<i32>,
-    q_heads: Env<i32>,
-    rows: Env<i32>,
+    queries: InSlot<0, Buf>,
+    keys: Held<keys::KvKeys, Buf>,
+    values: Held<keys::KvValues, Buf>,
+    out: OutSlot<0, BufMut>,
+    gqa_factor: Param<0, i32>,
+    n: Param<1, i32>,
+    k_head_stride: Held<keys::KvHeadStride, Usize>,
+    k_seq_stride: Held<keys::KvSeqStride, Usize>,
+    v_head_stride: Held<keys::KvHeadStride, Usize>,
+    v_seq_stride: Held<keys::KvSeqStride, Usize>,
+    scale: ParamF32<2>,
+    window: Param<3, i32>,
+    q_row_stride: Param<4, i32>,
+    o_row_stride: Param<5, i32>,
+    head_dim: Ask<keys::HeadDim, i32>,
+    q_heads: Ask<keys::NumQHeads, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -1195,24 +1219,24 @@ pub fn sdpa_vector_decode_swa(
 /// `vector_grid` refuses.
 pub fn sdpa_vector_decode_sink(
     ctx: &Ctx<'_>,
-    queries: Buf,
-    keys: Buf,
-    values: Buf,
-    out: BufMut,
-    sinks: Buf,
-    gqa_factor: i32,
-    n: i32,
-    k_head_stride: Usize,
-    k_seq_stride: Usize,
-    v_head_stride: Usize,
-    v_seq_stride: Usize,
-    scale: f32,
-    window: i32,
-    q_row_stride: i32,
-    o_row_stride: i32,
-    head_dim: Env<i32>,
-    q_heads: Env<i32>,
-    rows: Env<i32>,
+    queries: InSlot<0, Buf>,
+    keys: Held<keys::KvKeys, Buf>,
+    values: Held<keys::KvValues, Buf>,
+    out: OutSlot<0, BufMut>,
+    sinks: Weight<0, Buf>,
+    gqa_factor: Param<0, i32>,
+    n: Param<1, i32>,
+    k_head_stride: Held<keys::KvHeadStride, Usize>,
+    k_seq_stride: Held<keys::KvSeqStride, Usize>,
+    v_head_stride: Held<keys::KvHeadStride, Usize>,
+    v_seq_stride: Held<keys::KvSeqStride, Usize>,
+    scale: ParamF32<2>,
+    window: Param<3, i32>,
+    q_row_stride: Param<4, i32>,
+    o_row_stride: Param<5, i32>,
+    head_dim: Ask<keys::HeadDim, i32>,
+    q_heads: Ask<keys::NumQHeads, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     head_point(*head_dim, &[64])?;
     ctx.dispatch(

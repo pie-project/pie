@@ -9,14 +9,14 @@
 //!
 //! # What left, and where it went
 //!
-//! * `plan_one` -- TAKEN OVER BY [`crate::arm`]. A routine's body states its
+//! * `plan_one` -- TAKEN OVER BY [`crate::hold`]. A routine's body states its
 //!   own operands and its own grid in ordinary Rust, so there is no row to
 //!   join against and nothing to join.
 //! * `dims_of` -- the `grid_param` / `head_param` / `heads_param` override,
 //!   the one that made gemma-4 work: a statement's own scalar beating the
 //!   fire-wide number, because gemma-4's full-attention layers rotate a
 //!   quarter of each head where its sliding layers rotate all of one. THAT
-//!   READING IS NOT RETIRED. It is `arm::Facts`, which an arm builds from the
+//!   READING IS NOT RETIRED. It is `hold::Facts`, which an arm builds from the
 //!   statement first and the fire second, and `arm.rs`'s `affine_of` states
 //!   the same "zero is absent" rule this function's `stated` did.
 //! * `Built` and `Sources` -- the two argument bundles `plan_one` took.
@@ -39,7 +39,7 @@ use crate::geometry::Ungeometric;
 ///
 /// Everything a [`Rule`](crate::geometry::Rule) needs that a single statement
 /// does not state. A statement may override three of these -- see
-/// [`crate::arm::Facts`], which is where that override lives now.
+/// [`crate::hold::Facts`], which is where that override lives now.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Geometry {
     /// Query heads.
@@ -54,52 +54,66 @@ pub struct Geometry {
     pub n_experts: u32,
     /// Experts each token routes to.
     pub experts_per_token: u32,
+    /// RECURRENT heads, where a stack has them beside its attention ones.
+    ///
+    /// A GDN block's value heads are not its key/value heads: qwen3-next
+    /// states sixteen of the first and two of the second, and a signature
+    /// asking `keys::VHeads` was being handed the wrong one until this pair
+    /// existed. Zero means "not stated" -- see [`Geometry::recurrent`].
+    pub v_heads: u32,
+    /// Elements per recurrent head. See [`Geometry::v_heads`].
+    pub v_dim: u32,
+}
+
+impl Geometry {
+    /// This stack's RECURRENT head count and width.
+    ///
+    /// Falls back to the attention pair when no recurrent one is stated,
+    /// character-for-character `driver_metal`'s `recurrent_at` and
+    /// `driver_wgpu`'s twin. A fire whose only shape IS the recurrent shape
+    /// -- which is every GDN fixture that predates the pair -- keeps reading
+    /// the numbers it always did.
+    #[must_use]
+    pub const fn recurrent(&self) -> (u32, u32) {
+        if self.v_heads > 0 && self.v_dim > 0 {
+            (self.v_heads, self.v_dim)
+        } else {
+            (self.kv_heads, self.head_dim)
+        }
+    }
 }
 
 /// One recordable dispatch: everything a command buffer needs, and nothing
 /// that needs a command buffer to compute.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Dispatch<'a> {
-    /// The entrypoint to run.
-    ///
-    /// Borrowed from [`Lowered::kernels`] on the plan-ordered path, which
-    /// costs nothing and is what it has always been. Owned when a ROUTINE
-    /// composed it: a body that varies over an instantiation axis builds the
-    /// whole spelling itself — `affine_qmm_t_bf16_gs_128_b_4` — and the
-    /// `String` it built lives in the body's frame, which ends before the
-    /// dispatch is recorded. `Cow` is the smaller of the two prices; the
-    /// other was making every body's entrypoint `&'static str`, which forbids
-    /// exactly the axis instantiation half this table needs.
+    /// The entrypoint to run: borrowed from [`Lowered::kernels`] on the
+    /// plan-ordered path, or owned when a routine composes its own spelling
+    /// (e.g. `affine_qmm_t_bf16_gs_128_b_4`) whose `String` must outlive the
+    /// frame that built it.
     pub symbol: std::borrow::Cow<'a, str>,
     /// The operands, in binding order over the module's non-hole slots.
     pub buffers: Vec<Bound<'a>>,
     /// Which of [`Self::buffers`] the shader may WRITE through, in the same
     /// order and of the same length.
     ///
-    /// Read off the kernel row's operand types -- [`kernels::Ty::BufMut`] is
-    /// "the launcher may write through this" and everything else is a read --
-    /// which is the only place the distinction exists. SPIR-V does not carry
-    /// it usefully: `slangc` decorates a buffer `NonWritable` only when the
-    /// shader said `readonly`, and this tree's shaders mostly do not.
+    /// Read off the kernel row's operand types — [`kernels::Ty::BufMut`] is
+    /// "the launcher may write through this" and everything else is a read;
+    /// SPIR-V does not carry this usefully since most of this tree's shaders
+    /// omit the `readonly` qualifier `slangc` needs to decorate it.
     ///
-    /// What it is FOR is the barrier between two dispatches. A fire is a few
-    /// hundred rectangles over one arena and the recording used to put a
-    /// full pipeline barrier between every pair of them, which on this card
-    /// is 8 microseconds each -- measured, 3.8 milliseconds of a 7.2
-    /// millisecond decode. Most neighbouring pairs do not touch the same
-    /// bytes, and this is what lets the recorder tell which ones do.
-    ///
-    /// A row that states no operands has no answer here, so every slot is
-    /// marked written: the coarse reading is the safe one, and it is what
-    /// this driver did for every slot of every launch before this existed.
+    /// Lets the recorder skip a pipeline barrier between two dispatches that
+    /// do not touch the same bytes — most neighbouring pairs — rather than
+    /// insert one unconditionally between every pair, which is measurably
+    /// expensive over a fire of a few hundred rectangles. A row that states
+    /// no operands marks every slot written, the safe fallback.
     pub writes: Vec<bool>,
     /// Where this launch's scalars go, and the bytes to put there.
     ///
-    /// Not a `Vec<u8>`, because "the bytes to push" is only half the answer:
-    /// the module decides whether they ride push constants or a struct in a
-    /// storage buffer, and the reachable symbols split almost evenly on it.
-    /// A dispatch that flattened both into one byte run would be a dispatch
-    /// whose caller has to ask the shader the same question again.
+    /// Not a `Vec<u8>`: the module decides whether they ride push constants
+    /// or a struct in a storage buffer, and the reachable symbols split
+    /// almost evenly on it, so flattening both into one byte run would make
+    /// the caller ask the shader the same question again.
     pub params: Params,
     /// Where in [`Self::buffers`] the caller's scalar block goes.
     ///

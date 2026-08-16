@@ -44,9 +44,9 @@
 //!   Then run K=0 and K=2 and report T1/T2/T4.
 //!
 //! `#[ignore]`, driver-cuda. Run (both K, second run cross-checks):
-//!   PIE_MTP_DRAFT_TOKENS=0 cargo test -p pie-gpu-tests --features driver-cuda \
+//!   PIE_MTP_DRAFT_TOKENS=0 cargo test -p pie-gpu-tests --features driver-cuda-13 \
 //!     --test cuda_mtp_stage1 -- --ignored --nocapture
-//!   PIE_MTP_DRAFT_TOKENS=2 cargo test -p pie-gpu-tests --features driver-cuda \
+//!   PIE_MTP_DRAFT_TOKENS=2 cargo test -p pie-gpu-tests --features driver-cuda-13 \
 //!     --test cuda_mtp_stage1 -- --ignored --nocapture
 
 mod common;

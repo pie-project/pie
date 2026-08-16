@@ -1,29 +1,11 @@
-//! Llama 2.
+//! Llama 2 — the `[INST] <<SYS>>` chat template, and nothing else. Listed in
+//! [`crate::catalog`]'s `NO_ROWS_YET`, so nothing here is reachable yet.
 //!
-//! One generation, one directory. What this holds is what this
-//! generation implements: the `[INST] <<SYS>>` chat template, and
-//! nothing else.
-//!
-//! # No row, and what that means
-//!
-//! This generation is in [`crate::catalog`]'s `NO_ROWS_YET` list, so
-//! nothing here is reachable — the only door into a generation is a row
-//! id. The template is kept rather than deleted because it is the
-//! expensive half and it is tested; a row is five numbers and a
-//! `manifest()`.
-//!
-//! The paragraph that used to sit here said what a generation shares
-//! with a sibling is *"a row in `contract::HF_ROWS` or an arm of
-//! `instruct::create`"*. Both of those are gone: `HF_ROWS` was one of
-//! the three tables the catalog collapsed, and `instruct::create` no
-//! longer matches on anything — it asks [`crate::catalog::find`] for a
-//! row and calls `row.chat`. Sharing is a `use` of [`crate::shared`]
-//! now, and a generation that reaches a sibling instead fails
-//! `tests/sibling_isolation.rs`.
+//! There is no `import` here, and that is the point of the module it left
+//! for. A naming table belongs to whoever PUBLISHES the names, and this
+//! generation publishes none — the `llama` architecture's table now sits in
+//! [`crate::shared::llama_like::import`], beside the five generations whose
+//! rows it actually feeds.
 
 #[cfg(feature = "chat")]
 pub mod chat;
-
-/// This architecture as llama.cpp spells it.
-#[cfg(feature = "contract")]
-pub mod import;

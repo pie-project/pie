@@ -191,7 +191,7 @@ fn routine_sources() -> Vec<std::path::PathBuf> {
 /// Two shapes, and only two. A literal names itself. `TABLE[point(..)]` names
 /// every string in `TABLE`, because the index picks an affine or head point
 /// and every point on the axis is a real entrypoint — which is the same claim
-/// `every_stated_file_carries_the_rows_own_entrypoints` makes about rows.
+/// `every_entrypoint_a_body_names_is_one_the_tree_carries` makes about bodies.
 fn resolve(value: &str, tables: &BTreeMap<String, Vec<String>>) -> Option<Vec<String>> {
     if let Some(rest) = value.strip_prefix('"') {
         let name = rest.split('"').next()?;
@@ -308,10 +308,17 @@ fn a_retired_familys_stated_entrypoints_are_what_its_bodies_fire() {
                 ),
             }
         }
-        // The RETIRED subset, not everything the module fires. A family part
-        // way through Stage 3 still states rows for the kernels whose arms
-        // have not landed, and `entrypoints()` already reaches those through
-        // the table — listing them here would name them twice.
+        // AN IDENTITY NOW, and kept as one deliberately. It filtered out the
+        // entrypoints a row still stated, because a family part way through
+        // Stage 3 held rows for the kernels whose arms had not landed and
+        // `entrypoints()` already reached those through the table -- listing
+        // them here would have named them twice. Every family has crossed, so
+        // `sig` answers `None` for all of them and nothing is dropped.
+        //
+        // Left in rather than deleted because it is the line that would fail
+        // if a row came back: the comparison below would then see a name from
+        // both directions and disagree with itself, which is a worse failure
+        // to read than this filter quietly doing nothing.
         let fired: BTreeSet<String> = fired
             .into_iter()
             .filter(|e| kernels_wgpu::sig(e).is_none())
@@ -372,34 +379,26 @@ fn the_table_names_exactly_what_the_shaders_instantiate() {
     );
 }
 
-/// The census `entrypoints.generated.txt` recorded, and the `write_census`
-/// example that produced it, are both gone.
-///
-/// It was only ever a reviewer's convenience — the test module header said as
-/// much — and the two things it enabled have gone different ways. The table's
-/// product against THIS crate's shaders is checked above and loses nothing: the
-/// shader tree is embedded in the rlib, so `source::declared()` reads it
-/// directly. The set difference against `kernels-metal` is what is actually
-/// lost, and it has no in-process replacement, since that crate does not build
-/// off macOS and its census needs a C preprocessor to expand at all.
+// RETIRED: THE TABLE IS EMPTY, so the walk has no rows to find a clash among.
 //
-/// Two rows claiming one entrypoint would make `sig_in` order-dependent, and
-/// the set comparison above cannot see it: a duplicate is absorbed by the set.
-///
-/// The shader side of the same question is caught earlier and harder — a
-/// duplicate `pie:instantiate` is two variants under one name, so `build.rs`
-/// refuses it rather than let whichever the tree walk reached second win.
-#[test]
-fn no_two_rows_claim_the_same_entrypoint() {
-    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
-    for row in kernels_wgpu::KERNELS {
-        for name in row.entrypoints() {
-            if let Some(other) = seen.insert(name.clone(), row.name) {
-                panic!("`{name}` is claimed by both `{other}` and `{}`", row.name);
-            }
-        }
-    }
-}
+// It asserted that no two rows generate the same entrypoint name -- two rows
+// whose `axes` cross to the same string, where whichever the tree walk reached
+// second would silently win. The shader side of the same question is caught
+// earlier and harder: a duplicate `pie:instantiate` is two variants under one
+// name, and `build.rs` refuses it.
+//
+// It BECAME BLIND, and with no floor it could not say so: an empty iteration
+// passes.
+//
+// The claim is LIVE on the routine plane and is asserted twice there, because
+// a duplicate has no correct resolution:
+// `driver-wgpu::lowering::arm::no_stem_is_registered_twice` refuses two
+// `Crossed` rows with the same stem -- which had actually HAPPENED, for
+// `affine_qmm_t_routed` and `affine_qmm_t_routed_fp16`, where which one
+// answered was decided by `max_by_key`'s last-maximum tie-break rather than by
+// anything the file said -- and
+// `every_entrypoint_is_claimed_by_the_stem_that_owns_it` asserts that the stem
+// each of the 481 resolves to is the longest one that names it.
 
 /// The row count is `kernels-metal`'s, and that is the point rather than a
 /// coincidence: this backend's coverage is DEFINED as its sibling's, so the two
@@ -422,126 +421,63 @@ fn the_table_is_one_hundred_kernels_over_four_hundred_and_eighty_one_entrypoints
     assert_eq!(kernels_wgpu::entrypoints().len(), 481);
 }
 
-/// The parity with `kernels-metal` above was checked here, entrypoint for
-/// entrypoint, by diffing the two crates' committed censuses.
-///
-/// Both are deleted, and this comparison has no in-process replacement:
-/// `kernels-metal` does not build off macOS, so a dev-dependency is not
-/// available, and its census cannot be parsed the way this crate's is — the
-/// Metal axis product is written as `instantiate_*` macros that only a C
-/// preprocessor expands. The count above is what remains of the claim, and it
-/// is strictly weaker: two tables can agree on 481 while disagreeing about
-/// which 481.
+// RETIRED: THE TABLE IS EMPTY, so every entrypoint is skipped before it is
+// asked about.
 //
-/// Every entrypoint resolves through the public lookup `model-ir` uses,
-/// at every point of every axis.
-///
-/// `sig_in` tries exact matches first and axis matches second, so a base that
-/// shadows a sibling's point surfaces here and nowhere else.
-#[test]
-fn every_entrypoint_resolves_through_sig_in() {
-    let retired = kernels_wgpu::retired();
-    for name in kernels_wgpu::entrypoints() {
-        // A crossed family resolves through `driver-wgpu`'s `arm_for` instead.
-        // What must hold is that the entrypoint has SOME owner, not that the
-        // owner is a row.
-        if retired.contains(&name.as_str()) {
-            continue;
-        }
-        assert!(
-            kernels::sig_in(kernels_wgpu::KERNELS, &name).is_some(),
-            "`{name}` resolves to no row",
-        );
-    }
-}
+// It walked all 481 entrypoints and required each to resolve to a row through
+// `sig_in` -- exact match first, then axis-point matching, so
+// `sdpa_paged_decode_bfloat16_d_128_p32` finds the `sdpa_paged_decode` row.
+// A family that had crossed was skipped, on the correct argument that such an
+// entrypoint resolves through `driver-wgpu`'s `arm_for` instead and what must
+// hold is that it has SOME owner.
+//
+// It BECAME BLIND, not true, and it did so ONE FAMILY AT A TIME: each
+// retirement moved names into `retired()` and out of the loop, so the check
+// shrank silently until the skip covered everything. Nothing in it could have
+// said so -- there is no floor, and an empty walk passes.
+//
+// The successor is the one that check was deferring to, and it is stronger:
+// `driver-wgpu::lowering::arm::the_armed_stems_are_the_ones_registered_and
+// _nothing_else` asserts that NO entrypoint is unclaimed, over the same 481,
+// and it is not a courtesy -- with no table to fall back to, an entrypoint no
+// stem claims cannot be planned by any path.
 
-/// A row that names a FILE names one that exists.
-///
-/// Metal can leave this to the runtime shader compiler, which fails at model
-/// load with the path in hand. So could this backend — `naga` is a runtime
-/// compiler too. But a row pointing at a shader nobody wrote is a pipeline the
-/// shell asks for and cannot create, one layer away from the row that named it,
-/// and the file list is right here.
-#[test]
-fn every_stated_file_exists() {
-    for row in kernels_wgpu::KERNELS {
-        let Some(file) = row.file else { continue };
-        assert!(
-            kernels_wgpu::source(file).is_some(),
-            "`{}` names `kernels/{file}`, which the embedded tree does not have",
-            row.name,
-        );
-    }
-}
-
-/// A row's stated file CARRIES the entrypoints that row generates.
-///
-/// # One word short
-///
-/// `every_stated_file_exists` checks the path resolves and stops there, so a
-/// row may name a real shader that has nothing to do with it. `moe`'s
-/// `qmv_routed` and `qmv_routed_bias` named `quant/qmv.wgsl`, which exists and
-/// contains the string `qmv_routed` exactly zero times — every one of their
-/// entrypoints is instantiated in `moe/qmv_routed.wgsl`.
-///
-/// `kernels-metal` shipped the same mistake one plane up and had to fix it:
-/// *"three attention shaders were named after their routines, not their
-/// files"*. There the module name is what a `Fire` DISPATCHES, so it is a
-/// pipeline that cannot be created; here `file` is documentation today,
-/// because `source::entrypoint_source` resolves by ENTRYPOINT and never asks
-/// a row where its shader lives.
-///
-/// **Which is exactly why it has to be checked now.** A routine states its
-/// module, and the obvious way to write one is to copy the row's `file`. A
-/// wrong `file` that costs nothing today is a wrong `module` at the moment
-/// the family crosses.
-///
-/// Rows that state no file are skipped, as above: an unfilled row names no
-/// shader and claims nothing.
-#[test]
-fn every_stated_file_carries_the_rows_own_entrypoints() {
-    let mut checked = 0usize;
-    let mut wrong: Vec<String> = Vec::new();
-    for row in kernels_wgpu::KERNELS {
-        let Some(file) = row.file else { continue };
-        let Some(text) = kernels_wgpu::source(file) else {
-            continue; // `every_stated_file_exists` is what reports this.
-        };
-        for name in row.entrypoints() {
-            checked += 1;
-            if !text.contains(&format!("pie:instantiate {name}")) {
-                wrong.push(format!(
-                    "`{}` states `{file}`, which does not instantiate `{name}`",
-                    row.name
-                ));
-            }
-        }
-    }
-    // ASSERTED, not bounded. The first version said `> 200` because I
-    // guessed; the truth was 196, and a guessed bound is a number that stops
-    // meaning anything the moment it is satisfied. A row gaining or losing a
-    // `file` moves this, and so does a family retiring: 196 -> 192 -> 185 ->
-    // 159 -> 154 -> 24 as `mlp`, `norm`, `layout`, `rope` and then fifty rows
-    // across `quant`, `moe`, `ssm` and `attn` came off. What is left is the
-    // handful whose arms have not landed. Moving it should be a deliberate
-    // edit either way.
-    assert_eq!(
-        checked, 0,
-        "the rows that state a file generate {checked} entrypoints, not 0. \
-         ZERO because the four rows this table has left state no `file` -- \
-         they are the ones whose arms have not landed and none of them names \
-         a shader. When the last row goes this test goes with it; until then \
-         a row REGAINING a file is a real event and this says so"
-    );
-    assert!(
-        wrong.is_empty(),
-        "a row names a shader that does not carry its entrypoints. Harmless \
-         while `file` is documentation, and a wrong `module` the moment the \
-         family crosses -- see this test's own docs. {} of {checked}:\n  {}",
-        wrong.len(),
-        wrong.join("\n  ")
-    );
-}
+// RETIRED: `KernelSig::file` is gone from `kernels`, and there is no row left
+// to have carried one.
+//
+// Two tests stood here and both read that column.
+//
+// `every_stated_file_exists` asserted that a row naming a shader named one
+// `kernels_wgpu::source` could resolve. A path pointing at a file nobody
+// wrote is a pipeline the shell asks for and cannot create, one layer away
+// from the row that named it, and the runtime compiler is the only thing that
+// would ever have said so.
+//
+// `every_stated_file_carries_the_rows_own_entrypoints` was the word the first
+// one was short: a row may name a real shader that has nothing to do with it,
+// and `moe`'s `qmv_routed` named `quant/qmv.wgsl`, which exists and contains
+// the string `qmv_routed` exactly zero times. So it read the file's text and
+// required a `pie:instantiate` line for every entrypoint the row generates.
+// Its count was ASSERTED and not bounded -- 196, then 192, 185, 159, 154, 24
+// as families came off -- and its last message said the quiet part: *"when
+// the last row goes this test goes with it"*.
+//
+// Neither became TRUE. Both went BLIND, and each in two ways at once: the
+// column they read was deleted, and the `for row in kernels_wgpu::KERNELS`
+// they read it in walks an empty slice. A sweep with nothing to sweep reads
+// exactly like a sweep that found nothing wrong, which is why the second one
+// had already been retuned to `checked == 0` before the column went.
+//
+// The claim crossed with the column. A ROUTINE states its shader as the
+// `module` of the `Fire` its body returns, and `kernels-wgpu`'s
+// `every_entrypoint_a_body_names_is_one_the_tree_carries` resolves every
+// entrypoint every body can name through `source::entrypoint_source`. That is
+// the two questions answered as one and per ENTRYPOINT rather than per file:
+// a name the tree has not got fails whether the module is missing or merely
+// does not instantiate it, which is precisely the gap the second test existed
+// to close. `driver-wgpu`'s
+// `every_entrypoint_in_the_tree_builds_a_pipeline_on_this_adapter` asks it of
+// a device.
 
 /// Every `@tier` directive names an entrypoint that also has a baseline.
 ///
@@ -651,58 +587,25 @@ fn every_instantiated_variant_is_one_the_table_declares() {
     }
 }
 
-/// A shader that calls a row UNSTATED is making a claim about the TABLE.
-///
-/// These files carry a lot of prose about binding order, and the reason is
-/// always the same: an UNSTATED row (`kernels::KernelSig::operands` empty)
-/// gives `bindings()` nothing to answer with, so the slot placement in the
-/// shader is a convention agreed with the sibling backends rather than a
-/// consequence of the row. That comment is load-bearing — it is the only place
-/// the convention is written down — and it goes silently false the day someone
-/// STATES the row, which is exactly what happened to `sdpa_paged_tiled`.
-///
-/// So the prose is held against the table. Every backticked identifier in a
-/// sentence containing "UNSTATED" that names a row must name an unstated one.
-/// Nothing here checks the converse: a shader is free not to mention that a row
-/// is stated, because a stated row's layout is `bindings()`'s answer and the
-/// tests that read it are elsewhere in this file.
-#[test]
-fn no_shader_calls_a_stated_row_unstated() {
-    // Prose wraps, and the row name is usually on the line after the word.
-    const WRAP: usize = 2;
-    let mut wrong = Vec::new();
-    for (file, text) in kernels_wgpu::SOURCES {
-        let lines: Vec<&str> = text.lines().collect();
-        for (n, line) in lines.iter().enumerate() {
-            if !line.contains("UNSTATED") {
-                continue;
-            }
-            let end = (n + WRAP + 1).min(lines.len());
-            for named in lines[n..end].iter().flat_map(|l| backticked(l)) {
-                let Some(sig) = kernels_wgpu::sig(&named) else {
-                    continue;
-                };
-                if !sig.operands.is_empty() {
-                    wrong.push(format!(
-                        "kernels/{file}:{}: `{named}` is called UNSTATED, but the \
-                         table states {} operands for it",
-                        n + 1,
-                        sig.operands.len(),
-                    ));
-                }
-            }
-        }
-    }
-    assert!(
-        wrong.is_empty(),
-        "{} shader comment(s) describe a row the table has since stated. The \
-         binding order they explain is now `kernels_wgpu::bindings()`'s answer, \
-         so the comment should say so — or, if the sentence names a stated row \
-         only in passing, move that mention out of the UNSTATED sentence.\n{}",
-        wrong.len(),
-        wrong.join("\n"),
-    );
-}
+// RETIRED: THE TABLE IS EMPTY, so `sig` answers `None` and every candidate is
+// skipped.
+//
+// It read the SHADERS' prose. Seven of them justified their binding order with
+// a sentence beginning "the row is UNSTATED in the table" -- meaning no row
+// named the operands, so the order was taken from the sibling backends rather
+// than derived -- and this test caught the case where such a sentence outlived
+// its premise, because the table had since stated that kernel.
+//
+// It BECAME BLIND. `sig` cannot return a row, so the inner test never ran.
+//
+// AND ITS PREMISE OUTLIVED IT, which is the part worth recording: with the
+// tables deleted, all seven sentences described a table that does not exist,
+// and one of them named `kernels_wgpu::bindings` and
+// `kernels_wgpu::uniform_layout`, which are deleted too. Every one has been
+// rewritten to point at the ROUTINE whose signature states the order --
+// the same order, differently written down. The word does not appear in
+// `kernels/` any more except in one deliberate quotation of what it used to
+// say, so there is nothing left for this test to find.
 
 /// A `pie_*` helper named in shader prose either exists or is one of three that
 /// deliberately does not.
@@ -963,269 +866,105 @@ fn the_embedded_tree_is_every_file_on_disk() {
 // stated the operands, this table went on stating none, and nothing said so
 // until THIS file was next run — which is a parity gate that lives in one of
 // three crates being only as good as the habit of running that crate.
-// EMPTY, and the six entries that stood here did not go because they were
-// settled.
+// EMPTY, and the six entries that stood here are now settled -- which took
+// three moves, only the last of which was a fix.
 //
-// They recorded operand 13 of the six `sdpa_paged_*` rows: metal reads the
-// TEXT's scalar there and this backend reads `Source::AttentionMaskStride`,
-// the pitch the driver actually staged. Then metal finished Stage 4, its
-// `KERNELS` emptied, and the scrape above had no rows to read at all — so
-// this comparison was repointed at `kernels-vulkan`, which still has 94, and
-// wgpu and vulkan AGREE at operand 13. The exceptions became unobservable
-// rather than resolved.
+// They recorded operand 13 of the six `sdpa_paged_*` rows: metal read the
+// TEXT's scalar there and this backend read the pitch the driver staged.
+// Then metal finished Stage 4, its `KERNELS` emptied, this comparison was
+// repointed at `kernels-vulkan`, and wgpu and vulkan AGREED at operand 13 --
+// so the exceptions became unobservable rather than resolved, and this file
+// said so rather than closing them.
 //
-// The record did not move with them, and that is the point of writing this
-// down: `kernels/tests/shader_backends_agree.rs`'s `DRIFTED` still carries
-// all six with the sentence explaining which backend is wrong, and
-// `kernels`'s `the_two_settled_drifts_are_still_true_of_the_drivers_they_name`
-// still reports `AttentionMaskStride` in ZERO places in `driver-metal`. The
-// defect is live; only this crate's view of it is gone.
+// The fix came from the other side. All three planes now spell operand 13
+// `Ask<keys::AttentionMaskStride, u32>` and each DRIVER answers it: wgpu and
+// vulkan with the pitch of the rectangle they staged, metal with zero,
+// because the mask metal stages is one enable word per token and no mask
+// beside it. Metal's number is what it always was; the sentence is now true,
+// and `DRIFTED` is empty.
 
-/// The two runs of the launch ABI never collide, on any row.
-///
-/// A row's storage bindings and its uniform fields are two independent
-/// numberings, and the property worth asserting over all 100 rows is the one a
-/// single hand-picked example cannot give: that every operand lands somewhere,
-/// exactly once, and that the two runs together account for the row.
-#[test]
-fn every_row_places_every_operand_exactly_once() {
-    for sig in kernels_wgpu::KERNELS {
-        let bindings = kernels_wgpu::bindings(sig);
-        assert_eq!(
-            bindings.len(),
-            sig.operands.len(),
-            "`{}` has {} operands and {} placements",
-            sig.symbol,
-            sig.operands.len(),
-            bindings.len(),
-        );
+// RETIRED: THE TABLE IS EMPTY, so neither sweep has a row to walk, and
+// `bindings`, `storage_count`, `uniform_layout` and `uniform_size` -- every
+// function the two were written in -- have gone with it.
+//
+// `every_row_places_every_operand_exactly_once` was the launch ABI's central
+// claim, made over the whole table instead of over one example: a row's
+// STORAGE bindings and its UNIFORM fields are two independent numberings, so
+// every operand lands in exactly one of them, no slot and no field is taken
+// twice, and both runs are contiguous from zero. A hole in either numbering
+// is a descriptor the shell never writes and the shader may still read. It
+// closed by holding the two runs it had counted against `storage_count` and
+// `uniform_layout`, so the placements and the sizes could not disagree.
+//
+// `every_uniform_block_is_laid_out_the_way_wgsl_reads_it` was WGSL's uniform
+// address space, asked of every row: a member is aligned to its own size, so
+// a `Usize` after a `u32` starts at 8 and not at 4, an eight-byte field is
+// exactly the one declared `vec2<u32>`, no field overlaps the one before it,
+// and the block rounds up to a multiple of 16 no smaller than the fields it
+// holds. A shell packing by concatenation where the language pads writes
+// every value after the first wide one four bytes low, and nothing at runtime
+// reports it: a uniform buffer is bytes.
+//
+// Neither became TRUE. Both went BLIND -- `for sig in kernels_wgpu::KERNELS`
+// over an empty slice asserts nothing at all, and an empty sweep is
+// indistinguishable from a clean one in a test log.
+//
+// Both claims are alive on the other side of the crossing, and against the
+// shader rather than against a description of it. `driver-wgpu`'s
+// `reflect::Declared` is `naga`'s reading of the real module: `bindings` and
+// `used` are the `@group(0)` run with its holes, `uniform_offsets` is where
+// the module reads each member of its `@group(1)` block, and `uniform_bytes`
+// is the span it needs. `driver-wgpu/tests/arena.rs`'s
+// `every_launchs_scalars_land_where_its_module_reads_them` holds the offsets
+// a body PACKS to against `Declared::uniform_offsets` field for field, over
+// every rectangle of every real lowering -- two independent readings of one
+// layout, neither of them a table. `tests/gpu.rs`'s `block_of_shader` applies
+// the same alignment rule to the parsed struct when this suite fills a block
+// by name, and `kernels-wgpu`'s
+// `every_routine_binds_a_buffer_for_every_binding_its_module_declares` is the
+// buffer run's half: a body passes one buffer per declared `@group(0)`
+// binding, including the ones its entrypoint never reads.
 
-        let mut storages = BTreeSet::new();
-        let mut uniforms = BTreeSet::new();
-        for binding in &bindings {
-            match binding {
-                kernels_wgpu::Binding::Storage(n) => assert!(
-                    storages.insert(*n),
-                    "`{}` binds storage {n} twice",
-                    sig.symbol,
-                ),
-                kernels_wgpu::Binding::Uniform(n) => assert!(
-                    uniforms.insert(*n),
-                    "`{}` fills uniform field {n} twice",
-                    sig.symbol,
-                ),
-                kernels_wgpu::Binding::Packed => {}
-            }
-        }
-
-        // Contiguous from zero, both runs. A hole in the ROW's numbering would
-        // be a descriptor the shell never writes and the shader may still read.
-        // (A hole in the SHADER's declarations is a different and legitimate
-        // thing: a variant that never reads a buffer has it eliminated.)
-        for (at, n) in storages.iter().enumerate() {
-            assert_eq!(*n as usize, at, "`{}`'s storage run has a hole", sig.symbol);
-        }
-        for (at, n) in uniforms.iter().enumerate() {
-            assert_eq!(*n as usize, at, "`{}`'s uniform run has a hole", sig.symbol);
-        }
-
-        assert_eq!(storages.len() as u32, kernels_wgpu::storage_count(sig));
-        assert_eq!(uniforms.len(), kernels_wgpu::uniform_layout(sig).len());
-    }
-}
-
-/// Every uniform field is aligned the way WGSL's uniform address space wants.
-///
-/// Checked over all 100 rows rather than on the one example the unit test picks,
-/// because the failure — a shell packing by concatenation where the language
-/// pads — is per-row and silent. A four-byte scalar before an eight-byte one is
-/// the only shape that shows it, and only some rows have it.
-#[test]
-fn every_uniform_block_is_laid_out_the_way_wgsl_reads_it() {
-    for sig in kernels_wgpu::KERNELS {
-        let fields = kernels_wgpu::uniform_layout(sig);
-        let mut at = 0u32;
-        for field in &fields {
-            assert_eq!(
-                field.offset % field.size,
-                0,
-                "`{}`'s `{}` sits at {} with a size of {}",
-                sig.symbol,
-                field.name,
-                field.offset,
-                field.size,
-            );
-            assert!(
-                field.offset >= at,
-                "`{}`'s `{}` overlaps the field before it",
-                sig.symbol,
-                field.name,
-            );
-            assert_eq!(
-                field.split,
-                field.size == 8,
-                "`{}`'s `{}` is eight bytes iff it crosses as a vec2<u32>",
-                sig.symbol,
-                field.name,
-            );
-            at = field.offset + field.size;
-        }
-
-        let size = kernels_wgpu::uniform_size(sig);
-        if fields.is_empty() {
-            assert_eq!(
-                size, 0,
-                "`{}` states no scalars and asks for a block",
-                sig.symbol
-            );
-        } else {
-            assert_eq!(
-                size % 16,
-                0,
-                "`{}`'s block is not a multiple of 16",
-                sig.symbol
-            );
-            assert!(
-                size >= at,
-                "`{}`'s block does not cover its own fields",
-                sig.symbol
-            );
-        }
-    }
-}
-
-/// The parity scrape reads every field a row can carry.
-///
-/// The retired row-parity pair compared a NAMED list
-/// of fields, and a named list rots: a field added to `kernels::KernelSig`
-/// upstream and not added to [`FIELDS`] is a field the parity check silently
-/// stops comparing. That is the direction that matters, because the whole
-/// purpose of that check is to notice that somebody edited one table only.
-///
-/// It is not hypothetical. `publishes_aux` was added to `KernelSig` while this
-/// crate was being written, and the scrape went on passing without it.
-/// (That field has since left `KernelSig` altogether — step 9 measured it
-/// CUDA-only and consolidated it onto `kernels_cuda::x::Contract`. The
-/// anecdote is history, and it is the reason this test exists; the check
-/// below is what caught the departure too, from the other direction.)
-///
-/// So the list is held against the struct itself: `kernels/src/lib.rs` is read,
-/// its `pub struct KernelSig` fields are counted, and [`FIELDS`] together with
-/// [`UNCOMPARED`] must account for exactly all of them.
-///
-/// Reading a struct out of a sibling crate's source rather than deriving it is
-/// coarse. It is also the only option — a field list is not reflectable in Rust
-/// — and the alternative, which is nothing, is what let `publishes_aux`
-/// through.
-#[test]
-fn the_parity_check_reads_every_field_a_row_can_carry() {
-    let source = manifest().join("../kernels/src/lib.rs");
-    let text = std::fs::read_to_string(&source)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", source.display()));
-
-    let open = text
-        .find("pub struct KernelSig {")
-        .expect("`kernels` declares `KernelSig`");
-    let body = &text[open..];
-    let close = body.find("\n}").expect("the struct is closed");
-
-    let mut declared: BTreeSet<&str> = BTreeSet::new();
-    for line in body[..close].lines() {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix("pub ") else {
-            continue;
-        };
-        let Some((field, _)) = rest.split_once(':') else {
-            continue;
-        };
-        let field = field.trim();
-        if !field.is_empty() && field.chars().all(|c| c.is_alphanumeric() || c == '_') {
-            declared.insert(field);
-        }
-    }
-
-    assert!(
-        declared.len() > 10,
-        "the scrape of `KernelSig` read {} fields, which means it stopped \
-         reading rather than that the struct shrank",
-        declared.len(),
-    );
-
-    for (excluded, why) in UNCOMPARED {
-        assert!(
-            declared.remove(excluded),
-            "`{excluded}` is excluded from the parity comparison ({why}) but is \
-             no longer a field of `KernelSig`; the exclusion now hides nothing \
-             and should go",
-        );
-    }
-
-    let compared: BTreeSet<&str> = FIELDS.into_iter().collect();
-
-    let unchecked: Vec<&&str> = declared.iter().filter(|f| !compared.contains(*f)).collect();
-    assert!(
-        unchecked.is_empty(),
-        "`KernelSig` carries {unchecked:?}, which \
-         the retired row-parity pair did not compare. \
-         Add them to `FIELDS`, or to `UNCOMPARED` with a reason. A field nobody \
-         compares is a field the two tables may already disagree about.",
-    );
-
-    let phantom: Vec<&&str> = compared.iter().filter(|f| !declared.contains(*f)).collect();
-    assert!(
-        phantom.is_empty(),
-        "the parity check looks for {phantom:?}, which `KernelSig` no longer \
-         has. A field that cannot appear is a comparison that always agrees.",
-    );
-}
-
-/// Every scalar `KernelSig` field the parity check compares.
-///
-/// Held against the struct itself by
-/// [`the_parity_check_reads_every_field_a_row_can_carry`], because a named list
-/// rots: a field added upstream and not added here is a field the comparison
-/// silently stops making. `publishes_aux` arrived exactly that way, and left
-/// the same list in step 9 — the `phantom` half of that test is what made the
-/// departure visible.
-const FIELDS: [&str; 11] = [
-    "grid_param",
-    "rows_param",
-    "head_param",
-    "heads_param",
-    "launch",
-    "lacks",
-    "sink",
-    "in_place",
-    "whole",
-    "depth_prefix_plan",
-    "axes",
-];
-
-/// The `KernelSig` fields the parity check deliberately does NOT compare.
-///
-/// Each for its own reason, and each asserted still to BE a field — an
-/// exclusion that outlives its subject hides nothing and should go.
-const UNCOMPARED: [(&str, &str); 5] = [
-    ("name", "the key this map is built on"),
-    ("symbol", "the key this map is built on"),
-    (
-        "args",
-        "DERIVED from a routine's `fn` signature, so no table states it in \
-         source and a scrape of these files would find nothing to compare; \
-         empty in all three of these tables, and only CUDA's fills it",
-    ),
-    (
-        "file",
-        "the one thing the three tables are SUPPOSED to disagree about: \
-         `.metal` against `.comp` against `.wgsl`",
-    ),
-    (
-        "operands",
-        "compared per index by \
-         `every_row_asks_for_the_same_operands_kernels_metal_does`, which is a \
-         stronger check than a line-fragment comparison could be",
-    ),
-];
+// RETIRED: `the_parity_check_reads_every_field_a_row_can_carry`, with
+// `FIELDS` and `UNCOMPARED`, because the comparison they were the manifest
+// for has itself retired and `KernelSig` has since shed eight of the eleven
+// columns they named.
+//
+// It read `kernels/src/lib.rs` as TEXT, scraped the field names out of `pub
+// struct KernelSig`, and required `FIELDS` and `UNCOMPARED` together to
+// account for exactly all of them -- in both directions. A field upstream
+// that neither list named was a field the row-parity pair had silently
+// stopped comparing; a name in either list that was no longer a field was a
+// comparison that always agreed. `publishes_aux` is why it existed: it was
+// added to `KernelSig` while this crate was being written and the parity
+// scrape went on passing without it, and the `phantom` half is what noticed
+// when it left again.
+//
+// `FIELDS` named `grid_param`, `rows_param`, `head_param`, `heads_param`,
+// `launch`, `lacks`, `sink`, `in_place`, `whole`, `depth_prefix_plan` and
+// `axes`; `UNCOMPARED` excused `name` and `symbol` as the key the comparison
+// was built on, `args` as derived from a routine signature and stated by no
+// table in source, `file` as the one column three backends are SUPPOSED to
+// disagree about, and `operands` as compared per index by a stronger check.
+// Seven of those eighteen are gone from the struct.
+//
+// It did not become TRUE and it did not go blind either -- it went RED, which
+// is what it was built to do. `declared.len() > 10` is the floor it kept so a
+// scrape that stopped READING could not read as a struct that had shrunk, and
+// `KernelSig` is down to eight fields; the `UNCOMPARED` loop then refuses an
+// exclusion whose field has left, and `phantom` refuses a compared name that
+// cannot appear. Every one of those fires. What has no answer is the repair:
+// the pair it was the manifest for compared this crate's rows against a
+// sibling table's, and there are no rows on either side to compare.
+//
+// A routine states what these columns stated, in a form nothing has to scrape:
+// `whole`, `depth_prefix_plan` and `in_place` are fields of
+// `kernels::routine::Routine`, `args` is derived from the body's own `fn`
+// signature, and the four `*_param` indices -- a row pointing into a
+// statement's argument list -- are arguments the body simply takes, which
+// `kernels-wgpu`'s `a_body_passes_the_arguments_its_signature_takes_in_order`
+// holds to the module. Divergence between backends is asked where it can
+// still be asked: `kernels/tests/shader_backends_agree.rs`.
 
 /// The tile in an entrypoint's NAME is the tile its shader was compiled with.
 ///
@@ -1335,10 +1074,12 @@ fn the_tile_in_an_entrypoints_name_is_the_tile_its_defines_compile() {
 
 /// A flat grid's shader does not read the row off the y axis.
 ///
-/// `LaunchRule::Elementwise` is `[width * rows, 1, 1]`. The y extent is ONE,
-/// so `gid.y` and `workgroup_id.y` are structurally zero for every invocation
-/// — and a body that takes its row from either writes row 0 and returns for
-/// the rest, while the dispatch succeeds.
+/// A FLAT grid is `[width * rows, 1, 1]` — what a row said with
+/// `LaunchRule::Elementwise` and what a body says by calling
+/// `kernels::shader::elementwise`. The y extent is ONE, so `gid.y` and
+/// `workgroup_id.y` are structurally zero for every invocation — and a body
+/// that takes its row from either writes row 0 and returns for the rest,
+/// while the dispatch succeeds.
 ///
 /// This tree has paid for it once. `geglu_tanh_strided` was `@workgroup_size(16,
 /// 16)` reading `gid.y` as the row, and its own header now records the
@@ -1348,15 +1089,15 @@ fn the_tile_in_an_entrypoints_name_is_the_tile_its_defines_compile() {
 /// defect in the same kernel independently, which is what makes it a class
 /// rather than an incident.
 ///
-/// So it is asked of every entrypoint of every flat row, over the EXPANDED
+/// So it is asked of every entrypoint of every flat FIRE, over the EXPANDED
 /// source — the variant the driver will actually build, with its `//#if` arms
 /// resolved — because the y read can live under a define that only one point
 /// takes.
 ///
-/// Only `Elementwise` is checked. Other rules put real extents on y and z, and
-/// a rule-by-rule table of which axes are live would be the `LaunchRule` enum
-/// written down twice; the flat one is the case where the answer is the same
-/// for every row that states it.
+/// Only the flat grid is checked. `elementwise_rows` and the shaped rules put
+/// real extents on y and z, and a rule-by-rule table of which axes are live
+/// would be the `LaunchRule` enum written down twice; the flat one is the case
+/// where the answer is the same for every kernel that asks for it.
 #[test]
 fn a_flat_rows_shader_does_not_read_its_row_off_the_y_axis() {
     /// The parameter names bound to the two id builtins in `source`.
@@ -1394,27 +1135,27 @@ fn a_flat_rows_shader_does_not_read_its_row_off_the_y_axis() {
             .join("\n")
     }
 
-    // The FLAT kernels, from the rows AND from the crossed bodies.
+    // The FLAT kernels, from the crossed bodies.
     //
-    // A row says so with `LaunchRule::Elementwise`. A routine says so by
-    // calling `kernels::shader::elementwise`, which returns the same
-    // `[width * rows, 1, 1]` — so once a family crosses, the property moves
-    // from the row to the body and a check reading only rows stops covering
-    // it. `mlp` was four of them, every one an `elementwise` body, and
-    // `geglu_tanh_strided`'s header is where this defect was measured at 21
-    // rows in the first place.
+    // RETIRED: the ROW half of this sweep -- `KernelSig::launch` is gone from
+    // `kernels` and `KERNELS` is empty, so there is neither a column to read
+    // nor a row to read it on.
+    //
+    // It counted every row whose `LaunchRule` was `Elementwise` and added
+    // that row's entrypoints to the set the y-axis scan below runs over. It
+    // did not become TRUE, it went BLIND -- and it had been contributing zero
+    // for as long as the table has been empty, which is why the count below
+    // does not move.
+    //
+    // A routine says FLAT by calling `kernels::shader::elementwise`, which
+    // returns the same `[width * rows, 1, 1]` the rule did, so the property
+    // moved from the row to the body as each family crossed and the body
+    // half read below is now the whole of it. `mlp` was four of them, every
+    // one an `elementwise` body, and `geglu_tanh_strided`'s header is where
+    // this defect was measured at 21 rows in the first place.
     let mut flat_points: Vec<String> = Vec::new();
     let mut flat = 0usize;
-    for row in kernels_wgpu::KERNELS {
-        if row.launch == kernels::LaunchRule::Elementwise {
-            flat += 1;
-            flat_points.extend(row.entrypoints());
-        }
-    }
-    // The crossed bodies, whose rows are gone. A body says FLAT by calling
-    // `elementwise`, which returns the same `[width * rows, 1, 1]` a row's
-    // `LaunchRule::Elementwise` did — so the property moves from the row to
-    // the body when a family crosses, and this reads both.
+    // The crossed bodies, whose rows are gone.
     //
     // Per FIRE rather than per module, because a module holds both kinds:
     // `norm/residual_add.wgsl` has a flat variant and a strided one, and the
@@ -1472,8 +1213,8 @@ fn a_flat_rows_shader_does_not_read_its_row_off_the_y_axis() {
             for name in id_names(&body) {
                 assert!(
                     !body.contains(&format!("{name}.y")),
-                    "`{entrypoint}` states `LaunchRule::Elementwise`, whose \
-                     grid is `[width * rows, 1, 1]`, and its body reads \
+                    "`{entrypoint}` is fired by a body calling `elementwise`, \
+                     whose grid is `[width * rows, 1, 1]`, and its body reads \
                      `{name}.y`. That is structurally zero, so it writes row 0 \
                      and returns for every other row while the dispatch \
                      succeeds — the defect `geglu_tanh_strided`'s header \
@@ -1485,15 +1226,17 @@ fn a_flat_rows_shader_does_not_read_its_row_off_the_y_axis() {
     }
     assert!(
         flat == 10 && checked >= 10,
-        "{flat} flat kernels over {checked} entrypoints is not this table. \
-         Some state a row and the rest state an `elementwise` body; a family \
-         crossing moves one from the first count to the second and must not \
-         drop it. It was 10 while this read only rows and `mlp`'s bodies -- \
-         reading every crossed body found four more, in families whose rows \
-         state no launch rule at all and which this check had therefore never \
-         covered. `layout` retiring moved three of its six from the row side \
-         to the body side and dropped the three that are `elementwise_rows`, \
-         which were never flat"
+        "{flat} flat kernels over {checked} entrypoints is not this tree. \
+         Every one of them now states an `elementwise` body; a family \
+         crossing used to move one from the row count to the body count and \
+         must not drop it. It was 10 while this read only rows and `mlp`'s \
+         bodies -- reading every crossed body found four more, in families \
+         whose rows stated no launch rule at all and which this check had \
+         therefore never covered. `layout` retiring moved three of its six \
+         from the row side to the body side and dropped the three that are \
+         `elementwise_rows`, which were never flat. The rows contributed zero \
+         for as long as the table has been empty, so their sweep retiring \
+         does not move this"
     );
 }
 

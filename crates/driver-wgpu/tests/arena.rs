@@ -5,7 +5,7 @@
 //! TEST invented, and says nothing about whether they agree with the plan
 //! `model-compiler` produces for an architecture somebody serves. This file is
 //! the other question: six real texts, both fire classes, twelve lowerings,
-//! 6680 rectangles, put through the code this crate ships.
+//! 7224 rectangles, put through the code this crate ships.
 //!
 //! It is `driver-vulkan/tests/arena.rs`'s question asked of this backend, and
 //! the interesting part is where the two answers differ. Three places, and
@@ -13,8 +13,8 @@
 //!
 //! # Why every count in this file is pinned, and what that costs
 //!
-//! Each check asserts the SIZE of what it walked — 15140 arena operands, 6680
-//! rectangles, 24576 operands bound — because the failure these checks exist
+//! Each check asserts the SIZE of what it walked — 17148 arena operands, 7224
+//! rectangles, 26584 operands bound — because the failure these checks exist
 //! to prevent has a silent twin: a sweep that iterated nothing passes exactly
 //! as loudly as one that iterated everything and agreed. A `> 0` floor would
 //! let the coverage shrink to one text without saying so.
@@ -23,7 +23,27 @@
 //! numbers move whenever `crates/model` changes a text.** Rebasing onto
 //! upstream moved every one of them in a single afternoon — 14660 became
 //! 15140, 6440 became 6680 — and eight tests went red at once for no reason
-//! anybody would call a defect.
+//! anybody would call a defect. It happened again when `moe_tile` arrived:
+//! 15140 became 15356, 24576 became 24792, and the dispatched work FELL by
+//! fourteen million workgroups, which is the tile doing its job.
+//!
+//! And again when upstream landed *"the kernel written for gemma-4 was never
+//! called by gemma-4"*: that family's norm now folds its residual, so
+//! `rms_residual_bfloat16` joins the launched symbols (28 -> 29) and the
+//! separate `residual_add` rectangles it replaces go away -- 6680 -> 6616
+//! rectangles, 24792 -> 24664 operands, 15356 -> 15228 arena operands. Two
+//! rectangles per gemma layer become one, which is what a fold is, and the
+//! count FALLING while a symbol is ADDED is the shape that says so.
+//!
+//! And again when the dense projections moved to the fp16 PRECAST path
+//! ("metal: run the GEMM in half where the device has no bfloat matrix
+//! unit"). That path stages each activation to fp16 in a dispatch of its own
+//! instead of converting it once per output tile, so a rectangle APPEARS
+//! beside every projection it touches: 6616 -> 7224 rectangles (+608),
+//! 17148 -> 17148 arena operands, 26584 -> 26584 bound, and 29 -> 30 symbols
+//! -- two replaced by their precast twins and `cast_qmm_input_strided` added,
+//! which no text had ever launched. A count that rises because work was
+//! HOISTED out of a loop is the direction to want.
 //!
 //! That is the right trade anyway, and it is worth saying why rather than
 //! leaving the next person to re-derive it. A number that moves says *the
@@ -77,10 +97,11 @@
 //!
 //! # The modules: unconditional here, conditional there
 //!
-//! `driver-vulkan` reads `.spv` files out of `PIE_KERNELS_VULKAN_SPV_DIR`, and
-//! THREE of its eight checks return early with a printed reason when `glslc`
-//! did not run -- the three that need a module. There is no such condition
-//! here. `kernels_wgpu::entrypoint_source` hands back compile-ready WGSL for
+//! `driver-vulkan` reads its `.spv` out of `kernels-vulkan`'s rlib, and three
+//! of its eight checks still return early with a printed reason when `slangc`
+//! did not run -- the three that need a module, because `kernels-vulkan/native`
+//! is off by default and an empty module table is what that means. There is no
+//! such condition here. `kernels_wgpu::entrypoint_source` hands back compile-ready WGSL for
 //! all 481 entrypoints out of the rlib, `naga` is a WGSL front end written in
 //! Rust, and [`driver_wgpu::reflect::entrypoint`] turns a name into a
 //! [`Declared`] with nothing on disk and no adapter.
@@ -199,9 +220,24 @@ fn lowered(
     rows: usize,
 ) -> Option<Lowered> {
     let plan = llama_like_metal(facts, metal, class);
+    // `multi_token` ON A PREFILL, and it was missing. Without it a
+    // "prefill at 64" is sixty-four SINGLE-TOKEN rows through the prefill
+    // text -- a batched decode wearing a prefill's name -- and when upstream
+    // gave a batched decode its own attention lane those rows stopped
+    // reaching `sdpa_paged_tiled_bfloat16_d_128` and `sdpa_paged_mma_sink_
+    // bfloat16_d_64`. Two symbols left `REACHES` and read exactly like a
+    // stale table.
+    //
+    // Three readings were measured and refuted before this one: that the
+    // lane had a row threshold (a 64-row multi-token prefill still reaches
+    // the tiled attention), that the facts differed (`wgpu_facts` is
+    // `serving.rs`'s `backend_facts` line for line), and that a family had
+    // silently dropped out of the sweep (the `if let Some(..)` above is now
+    // an unwrap and none of the eight fires it).
     let rows: Vec<Row> = vec![
         Row {
             samples: true,
+            multi_token: matches!(class, FireClass::Prefill),
             ..Row::default()
         };
         rows
@@ -274,7 +310,22 @@ fn geometric() -> Vec<(String, Lowered, Geometry)> {
         ("olmo2_1b", LlamaLikeFacts::olmo2_1b(), wgpu_facts()),
     ] {
         for (class, rows) in [(FireClass::Decode, 1), (FireClass::Prefill, 64)] {
-            if let Some(low) = lowered(&facts, &metal, class, rows) {
+            // UNWRAPPED, not skipped, for the reason `modules()` states forty
+            // lines below about `driver-vulkan`: a walk that drops what it
+            // cannot build reports a denominator it did not measure. This was
+            // an `if let Some(..)` and it cost a whole afternoon — two symbols
+            // vanished from `REACHES`, and the obvious readings (a stale pin, a
+            // changed attention lane, a row-count threshold) were each measured
+            // and refuted, because the actual event was a FAMILY dropping out
+            // of the sweep without saying so.
+            let low = lowered(&facts, &metal, class, rows).unwrap_or_else(|| {
+                panic!(
+                    "`{name}` no longer lowers at {class:?}/{rows}. Every symbol \
+                     only it reaches leaves `REACHES` when this happens, which \
+                     reads exactly like a stale table and is not one."
+                )
+            });
+            {
                 out.push((
                     format!("{name}/{class:?}/{rows}"),
                     low,
@@ -285,6 +336,7 @@ fn geometric() -> Vec<(String, Lowered, Geometry)> {
                         rotary_dims: facts.head_dim,
                         n_experts: facts.n_experts,
                         experts_per_token: facts.experts_per_token,
+                        ..Default::default()
                     },
                 ));
             }
@@ -310,7 +362,7 @@ fn geometric() -> Vec<(String, Lowered, Geometry)> {
 ///
 /// A `Declared` is a `naga` parse and a walk, which is a few hundred
 /// microseconds, and the walks below would ask for the same twenty-one modules
-/// 6680 times. Cached here for the same reason a driver caches a PIPELINE and
+/// 7224 times. Cached here for the same reason a driver caches a PIPELINE and
 /// not a reflection: the answer is a property of the name.
 fn modules<'a>(lows: impl IntoIterator<Item = &'a Lowered>) -> BTreeMap<String, Declared> {
     let mut out: BTreeMap<String, Declared> = BTreeMap::new();
@@ -398,7 +450,6 @@ const fn sentinel(which: FireNumber) -> u32 {
         FireNumber::KvHeadStride => 0x0022_2222,
         FireNumber::KvSeqStride => 0x0033_3333,
         FireNumber::AttentionMaskStride => 0x0044_4444,
-        FireNumber::Rows => 0x0055_5555,
     }
 }
 
@@ -421,7 +472,7 @@ fn carries(params: &Params, word: u32) -> bool {
 ///
 /// `plan_one` finds the arm, builds the handles, runs the body and binds; a
 /// `Dispatch` is the far end of that and cannot say what the body PASSED. This
-/// repeats the two public calls in the middle -- `arm::Handles` and
+/// repeats the two public calls in the middle -- `hold::Handles` and
 /// `routine::state` -- because the argument list a body passes is the thing a
 /// row's `operands` column used to state, and the walks below are about it.
 ///
@@ -436,7 +487,7 @@ fn stated_by(
     numbers: &BTreeMap<FireNumber, u32>,
 ) -> Option<Vec<Stated>> {
     let symbol = low.kernels[launch.kernel as usize].as_str();
-    let (body, run) = driver_wgpu::lowering::routine::armed(symbol)?;
+    let body = driver_wgpu::lowering::routine::armed(symbol)?;
     let args = &low.args[launch.args.start as usize..launch.args.end as usize];
     let scalars = &low.params[launch.params.start as usize..launch.params.end as usize];
     // The two widths `dispatch::widths` feeds the arm: the LAST widthed
@@ -448,7 +499,7 @@ fn stated_by(
             Arg::Weight(_) => None,
         })
     };
-    let facts = driver_wgpu::lowering::arm::facts(
+    let facts = driver_wgpu::lowering::hold::facts(
         symbol,
         launch.rows.end - launch.rows.start,
         geometry,
@@ -456,13 +507,14 @@ fn stated_by(
         widths().next_back().unwrap_or(0),
         widths().next().unwrap_or(0),
     );
-    let mut handles = driver_wgpu::lowering::arm::Handles::with_numbers(
+    let mut handles = driver_wgpu::lowering::hold::Handles::with_numbers(
         args,
         driver_wgpu::lowering::routine::results(body),
         scalars,
         numbers,
     );
-    let taken = run(&mut handles, facts).ok()?;
+    let taken =
+        driver_wgpu::lowering::bind::bind(body.args, body.sources, &mut handles, facts).ok()?;
     driver_wgpu::lowering::routine::state(body, &taken).ok()
 }
 
@@ -566,7 +618,7 @@ fn every_arena_offset_a_real_lowering_assigns_is_bindable() {
     // plan that stopped placing activations in the arena would refuse nothing
     // and prove nothing.
     assert_eq!(
-        operands, 15140,
+        operands, 17148,
         "the texts placed a different number of arena operands than when this \
          was measured, so the zero above is about a different plan"
     );
@@ -636,12 +688,7 @@ fn every_arena_offset_a_real_lowering_assigns_is_bindable() {
             let planned = driver_wgpu::dispatch::plan_one(
                 low,
                 launch,
-                kernels_wgpu::KERNELS,
-                Built {
-                    module,
-                    declared,
-                    sig: None,
-                },
+                Built { module, declared },
                 Sources {
                     arena,
                     resolver: &store,
@@ -688,7 +735,7 @@ fn every_arena_offset_a_real_lowering_assigns_is_bindable() {
         silent.join("\n  ")
     );
     assert_eq!(
-        rectangles, 6680,
+        rectangles, 7224,
         "the texts planned a different number of rectangles than when this was \
          measured, so the census below is about a different corpus"
     );
@@ -813,10 +860,21 @@ fn every_symbol_a_real_text_launches_has_a_module() {
         unreadable.len(),
         unreadable.join("\n  ")
     );
+    let undescribed: Vec<&str> = launched
+        .iter()
+        .filter(|s| !REACHES.iter().any(|(n, _)| n == *s))
+        .map(std::string::String::as_str)
+        .collect();
+    let stale: Vec<&str> = REACHES
+        .iter()
+        .map(|(n, _)| *n)
+        .filter(|n| !launched.iter().any(|s| s == n))
+        .collect();
     assert_eq!(
         launched.len(),
         REACHES.len(),
-        "the texts launch {} distinct symbols and this file describes {}",
+        "the texts launch {} distinct symbols and this file describes {}; \
+         launched but undescribed: {undescribed:?}; described but never launched: {stale:?}",
         launched.len(),
         REACHES.len()
     );
@@ -849,7 +907,11 @@ fn every_symbol_a_real_text_launches_has_a_module() {
     // 24 became 26 when upstream's texts started launching the TILED paged
     // attention beside the decode one. The texts changed, not this file: the
     // symbols were always launchable, and the corpus began naming them.
-    assert_eq!(tiers, 26, "a different number of symbols was launched");
+    //
+    // 28 became 29 with `rms_residual_bfloat16`: upstream pointed gemma-4's
+    // norm at the residual-folding form it had always had a kernel for. One
+    // symbol ADDED while the rectangle count FELL, which is what a fold is.
+    assert_eq!(tiers, 30, "a different number of symbols was launched");
 }
 
 /// How a symbol's launch reaches its module: what the plan states, what the
@@ -879,12 +941,33 @@ enum Reaches {
     /// `route_sort` puts its 28-byte block at 4 of 6 with an operand after it.
     /// Where a parameter struct sits is the kernel's own ABI.
     Storage(u32),
+    /// The plan states this many operands the BODY does not bind, on purpose.
+    ///
+    /// The mirror of [`Self::DriverSupplies`], and it needed its own variant
+    /// because the subtraction that produced that one was SATURATING: an
+    /// over-count came out as `DriverSupplies(0)`, which reads as "the driver
+    /// owes nothing" and means the opposite of what happened.
+    ///
+    /// The real case is `moe::qmm_t_routed`, whose arm documents it: the
+    /// statement carries `x`, `pad` and `tile_expert`, where `pad` is the
+    /// sort's padded row count read on the DEVICE. Metal binds `pad` five
+    /// times over to fill its argument table's holes; `moe/qmm_t_routed.wgsl`
+    /// declares six dense bindings and takes its extent through the grid, so
+    /// nothing binds `pad` here.
+    ///
+    /// A declined operand is not a defect and is not a gap: a gap is a slot
+    /// the MODULE declares and nobody fills, and this is an operand the
+    /// STATEMENT carries and this backend has no slot for. The balance check
+    /// below is what proves the fire is still whole -- it counts what the arm
+    /// actually bound, which is why it passed while this classification was
+    /// wrong.
+    BodyDeclines(u32),
     /// The module binds this many `@group(0)` entries the plan does not state,
     /// because they are the DRIVER's own: the paged KV cache, its page table,
     /// the routing scratch.
     ///
     /// The row's own gaps are subtracted first. A slot the row leaves
-    /// `Unbound` is nobody's debt -- nothing fills it and the shader does not
+    /// unsourced is nobody's debt -- nothing fills it and the shader does not
     /// read it -- and counting it here would say a WebGPU executor owes a
     /// resource that does not exist.
     DriverSupplies(u32),
@@ -896,7 +979,7 @@ enum Reaches {
     /// this driver has; `norm::add_bias` is short of a NUMBER the plan already
     /// implies -- the row width of its own output, which an `AddBias`
     /// statement does not carry because the trace said it when it sized the
-    /// output. `Source::OutWidth(0)` is how the row says where to read it and
+    /// output. `Source::Slot(Kind::OutWidth, 0)` is how the row says where to read it and
     /// `binding::scalars` is what reads it, so nothing outside the plan is
     /// needed to fire this kernel.
     RunGrows(u32),
@@ -922,13 +1005,36 @@ const REACHES: &[(&str, Reaches)] = &[
         Reaches::Uniform,
     ),
     ("affine_qmv_fast_bfloat16_gs_64_b_8", Reaches::Uniform),
+    // THE DENSE PROJECTIONS MOVED TO THE PRECAST PATH. Upstream's "metal: run
+    // the GEMM in half where the device has no bfloat matrix unit" points the
+    // qwen3.5 and qwen3.6 texts at `_fp16_precast`, so these two are REPLACED
+    // by their precast twins and a third symbol appears that no text launched
+    // before: the staging pass that rounds an activation to fp16 ONCE instead
+    // of once per output tile.
+    //
+    // On this backend `_fp16_precast` is fp16 STORAGE and an fp32 multiply --
+    // `quant/qmm_t.wgsl`'s header says so at length -- because WebGPU's
+    // matrix-unit feature is deliberately outside this crate's tier list. Same
+    // bindings either way, which is why all three are `Uniform`.
     (
-        "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32",
+        "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
         Reaches::Uniform,
     ),
     (
-        "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_32_bn_32",
+        "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
         Reaches::Uniform,
+    ),
+    // `RunGrows(0)` and not `Uniform`: the statement carries THREE scalars --
+    // `model-dsl::metal::cast_qmm_input` states `[k, k, k]` -- and the body
+    // forwards two, because `qmm_t.wgsl`'s strided cast arm declares
+    // `Params { k, row_stride }` and nothing more. The `n` between them is the
+    // unread slot the packed and strided forms share, and the `count` the
+    // packed form takes is `rows * k`, a fire's number this one derives from
+    // the grid. Both are marked `Env` on the routine so the block is packed
+    // from what the shader actually reads.
+    (
+        "cast_qmm_input_strided_bfloat16_to_float16",
+        Reaches::RunGrows(0),
     ),
     ("affine_qmv_fast_bfloat16_gs_64_b_4", Reaches::Uniform),
     (
@@ -945,6 +1051,32 @@ const REACHES: &[(&str, Reaches)] = &[
     // Now it says where its buffers go, and its unread `biases` slot is the
     // same kind of gap -- the codec has no bias plane, so nothing fills it.
     ("mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4", Reaches::Uniform),
+    // The BATCHED routed pair, which the texts started launching when upstream
+    // added `Qwen35MetalFacts::moe_tile` -- the opt-in that turns a MoE
+    // prefill's expert banks from one matvec per row into a tiled GEMM.
+    //
+    // `BodyDeclines(1)` and not a defect: the statement carries `x`, `pad` and
+    // `tile_expert`, and `pad` is the sort's padded row count read on the
+    // DEVICE because the host cannot know it -- it depends on the routing.
+    // Metal binds `pad` five times over to fill the holes its argument table
+    // leaves between slot 6 and `tile_expert` at 12; these modules declare six
+    // DENSE bindings and take their extent through the grid, so nothing binds
+    // `pad` here. `lowering::hold::qmm_t_routed`'s doc is where that is
+    // written down, and it skips the index rather than renumbering, so
+    // `tile_expert` stays `Input(2)`.
+    //
+    // The `bn_64` in these two names is a TILE and not a signature: the
+    // column axis moved from 32 upstream and `BodyDeclines(1)` is unchanged
+    // by it, because a decomposition does not alter what a body binds. See
+    // the note beside the disagreement assertion for what that drift cost.
+    (
+        "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_32_bn_64",
+        Reaches::BodyDeclines(1),
+    ),
+    (
+        "mxfp4_qmm_t_routed_bias_bfloat16_bm_32_bn_64",
+        Reaches::BodyDeclines(1),
+    ),
     // Two slots, both stated -- the value it biases in place and the bias --
     // and ONE word the statement does not carry.
     ("add_bias_bfloat16", Reaches::RunGrows(1)),
@@ -953,6 +1085,13 @@ const REACHES: &[(&str, Reaches)] = &[
     ("combine_sorted", Reaches::Storage(3)),
     ("gptoss_swiglu_bfloat16", Reaches::Storage(3)),
     ("rms_single_row_bfloat16", Reaches::Storage(3)),
+    // The residual-folding twin, and NEW here: upstream's "the kernel written
+    // for gemma-4 was never called by gemma-4" pointed that family's norm at
+    // this symbol, so a text started launching it. Its block sits at the same
+    // slot 3 as the plain form and the residual it folds is the operand AFTER
+    // it, at 4 -- the same shape `route_sort` is described with, which is why
+    // `Storage` carries a slot rather than an operand count.
+    ("rms_residual_bfloat16", Reaches::Storage(3)),
     ("route_gather", Reaches::Storage(3)),
     // The one with an operand AFTER its block, which is why `Storage` carries
     // the slot instead of being derived from the operand count.
@@ -1089,17 +1228,12 @@ fn what_the_plan_states_and_what_the_module_binds_account_for_each_other() {
             // skip. A symbol that is neither armed nor rowed cannot be planned
             // at all, and a walk that quietly stepped over it would report a
             // full account of a corpus it had thrown part of away.
-            let (routine, _) = driver_wgpu::lowering::routine::armed(symbol)
+            let routine = driver_wgpu::lowering::routine::armed(symbol)
                 .unwrap_or_else(|| panic!("`{symbol}` is armed: nothing plans without a routine"));
             let d = driver_wgpu::dispatch::plan_one(
                 low,
                 launch,
-                kernels_wgpu::KERNELS,
-                Built {
-                    module,
-                    declared,
-                    sig: None,
-                },
+                Built { module, declared },
                 Sources {
                     arena,
                     resolver: &store,
@@ -1140,8 +1274,17 @@ fn what_the_plan_states_and_what_the_module_binds_account_for_each_other() {
             // kernel short of the KV cache is short of the numbers describing
             // it too.
             let accounted = args + gaps + u32::from(block.is_some());
-            let reaches = if accounted != declared.bindings {
-                Reaches::DriverSupplies(declared.bindings.saturating_sub(accounted))
+            if accounted > declared.bindings {
+                println!(
+                    "OVER-ACCOUNTED `{symbol}`: args {args} + gaps {gaps} + block {} = {accounted}, module declares {} bindings, uniform fields {uniform}, params {params}",
+                    u32::from(block.is_some()),
+                    declared.bindings,
+                );
+            }
+            let reaches = if accounted > declared.bindings {
+                Reaches::BodyDeclines(accounted - declared.bindings)
+            } else if accounted != declared.bindings {
+                Reaches::DriverSupplies(declared.bindings - accounted)
             } else if let Some(at) = block {
                 Reaches::Storage(at)
             } else if uniform == params {
@@ -1204,6 +1347,34 @@ fn what_the_plan_states_and_what_the_module_binds_account_for_each_other() {
         }
     }
 
+    // The routed pair's tile is TRANSCRIBED into `REACHES` above, and it has
+    // drifted once already: `ROUTED_QMM_TILE` went (32, 32) -> (32, 64) in
+    // `7bda96b66` and this file kept saying `bn_32`, so the assertion below
+    // reported "4 of 29 symbols disagree" and left the reader to work out that
+    // two of the four were the other two under a new name. `driver-vulkan`'s
+    // `gemm_agrees` reached the same wall over `QMM_TILE` and reads the
+    // constant now instead of transcribing it.
+    //
+    // `REACHES` cannot: it is a `const` and its own header insists it stays an
+    // ENUMERATION -- "a symbol nobody wrote down is a symbol nobody looked
+    // at". So the transcription stays and this says what happened to it.
+    {
+        let (bm, bn) = model::shared::llama_like::project::ROUTED_QMM_TILE;
+        for stem in [
+            "affine_qmm_t_routed_bfloat16_gs_64_b_4",
+            "mxfp4_qmm_t_routed_bias_bfloat16",
+        ] {
+            let want = format!("{stem}_bm_{bm}_bn_{bn}");
+            assert!(
+                REACHES.iter().any(|(symbol, _)| *symbol == want),
+                "`ROUTED_QMM_TILE` is ({bm}, {bn}) and `REACHES` has no \
+                 `{want}`. The tile moved upstream: REPLACE the routed rows' \
+                 suffix rather than adding rows, because these are the same \
+                 two symbols at a new tile and the count must not grow."
+            );
+        }
+    }
+
     assert!(
         wrong.is_empty(),
         "{} of {} symbols disagree:\n  {}",
@@ -1215,7 +1386,7 @@ fn what_the_plan_states_and_what_the_module_binds_account_for_each_other() {
     // pass: every rectangle of every text was classified, not every symbol
     // once.
     assert_eq!(
-        launches, 6680,
+        launches, 7224,
         "a different number of rectangles was walked"
     );
     assert_eq!(
@@ -1237,7 +1408,7 @@ fn what_the_plan_states_and_what_the_module_binds_account_for_each_other() {
 /// # What has to be supplied, and why that is the finding
 ///
 /// A weight and a seam value are not the plan's to place, so [`Everything`]
-/// stands in for the driver's tables. Every arena operand, though -- 15140 of
+/// stands in for the driver's tables. Every arena operand, though -- 17148 of
 /// them across six architectures in both fire classes -- goes through the real
 /// arithmetic: `rows × width × bytes` from the plan, checked against the plan's
 /// arena and then against 256-byte addressing.
@@ -1314,9 +1485,9 @@ fn the_binder_this_crate_ships_resolves_every_operand_of_every_real_launch() {
     );
     // Stated so that a plan which stops producing arena operands -- or starts
     // producing far fewer -- cannot make the zero above true by emptiness.
-    assert_eq!(operands, 24576, "a different number of operands was bound");
+    assert_eq!(operands, 26584, "a different number of operands was bound");
     assert_eq!(
-        arena_operands, 15140,
+        arena_operands, 17148,
         "the texts produced a different number of arena operands than when this \
          was measured, so the zero above is about a different plan"
     );
@@ -1333,8 +1504,24 @@ fn the_binder_this_crate_ships_resolves_every_operand_of_every_real_launch() {
     // extent rather than their rectangle's width. Both are row content this
     // crate had not copied, so the plans this file walks changed shape when
     // they were.
+    // RE-MEASURED again, and by far the largest move: 2,982,826,080 to
+    // 10,518,945,504 when upstream's `moe_tile` turned a MoE prefill's expert
+    // banks from one matvec per row into a tiled GEMM.
+    //
+    // A 3.5x jump is exactly the direction this assertion exists to catch, so
+    // it was checked rather than re-pinned. **It is the rectangle, exactly.**
+    // The batched arm's rectangle is the PADDED SORTED STACK -- 140 tiles of
+    // 32 for qwen3-30b-a3b's 64-token prefill, so `span` is 4480 where the
+    // matvec's grid extent was `out_vec_size` -- and its `x` operand binds
+    // 18,350,080 bytes, which is 4480 x 2048 x 2 to the byte. The binder is
+    // covering the rows the launch states and no more.
+    //
+    // DOWN by 17,039,360 when gemma-4's norm began folding its residual: 64
+    // `residual_add` rectangles went away and each bound 266,240 bytes across
+    // its operands. Fewer rectangles binding fewer bytes is the whole content
+    // of that upstream change.
     assert_eq!(
-        total, 2_982_826_080,
+        total, 11_161_544_416,
         "the arena ranges this binder produces cover a different number of \
          bytes than `rows x width x bytes` over these plans did when it was \
          measured"
@@ -1394,13 +1581,13 @@ fn an_arena_one_byte_short_of_what_the_plan_placed_refuses_what_runs_off_it() {
     }
 
     assert_eq!(
-        launches, 6680,
+        launches, 7224,
         "a different number of rectangles was re-bound"
     );
     // Two more, for the same reason the byte total moved: see the note above
     // it. A wider rectangle is a rectangle with more ways to run off the end.
     assert_eq!(
-        refused, 14,
+        refused, 15,
         "{launches} launches bound against an arena one byte shorter than the \
          one they were placed in, and a different number ran off it"
     );
@@ -1462,7 +1649,7 @@ fn an_arena_one_byte_short_of_what_the_plan_placed_refuses_what_runs_off_it() {
 /// `kernels_wgpu::KERNELS` is empty; there is no row to compare, and the
 /// question moved rather than closed -- the row's `operands` column is now the
 /// argument list a body passes, and `routine::state` is where it is read. The
-/// walk is over ALL 6680 rectangles now instead of the 1136 that had rows.
+/// walk is over ALL 7224 rectangles now instead of the 1136 that had rows.
 #[test]
 fn every_launchs_scalars_land_where_its_module_reads_them() {
     let all = geometric();
@@ -1507,12 +1694,7 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
             let planned = driver_wgpu::dispatch::plan_one(
                 low,
                 launch,
-                kernels_wgpu::KERNELS,
-                Built {
-                    module,
-                    declared,
-                    sig: None,
-                },
+                Built { module, declared },
                 Sources {
                     arena,
                     resolver: &store,
@@ -1669,7 +1851,7 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
     // a rectangle this walk silently dropped.
     assert_eq!(
         uniform + storage + bare,
-        6680,
+        7224,
         "a different number of launches take each parameter shape"
     );
     // And each shape occurs, or a branch that never runs is passing for the
@@ -1685,7 +1867,7 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
     );
     assert_eq!(
         module_alone + body_alone,
-        6680,
+        7224,
         "the module-only placer was asked about a different number of launches"
     );
     // Non-zero on the side that MATTERS: if every launch's run could be placed
@@ -1720,7 +1902,7 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
 /// this crate can parse and an arena, how many of its rectangles can be
 /// recorded?
 ///
-/// All 6680, across six architectures in both fire classes, and nothing is
+/// All 7224, across six architectures in both fire classes, and nothing is
 /// refused. The
 /// Vulkan port reached that number by removing six symbols from its refusal
 /// list one at a time, each removal a defect in that crate rather than a gap in
@@ -1737,7 +1919,7 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
 /// # RETIRED: the unstated-row fallback was exercised here, deliberately
 ///
 /// It asserted that `binding::reorder`, handed a REAL operand-less row out of
-/// the shipped table, produced for every one of these 6680 rectangles exactly
+/// the shipped table, produced for every one of these 7224 rectangles exactly
 /// the slots `binding::bind` produces -- the plan's own args in the plan's own
 /// order. That is `.wiki/new-driver/vulkan.md` §13's claim, and 56 of the
 /// table's 100 rows and 292 of its entrypoints depended on it. The census
@@ -1750,10 +1932,12 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
 /// claim passing, it is the subject being gone. Nor is the claim reachable any
 /// other way from here: `plan_one` consults `routine::armed` first and every
 /// symbol is armed, so no real rectangle falls through to `plan_by_row` and
-/// none reaches `reorder` at all. `binding::reorder`'s own unit tests in
-/// `src/binding.rs` are what still hold it, and the routine plane's equivalent
-/// -- a body that asks for the statement's operands in the statement's order
-/// -- is `Handles::input`/`output` and is exercised by every arm.
+/// none reaches `reorder` at all -- and `reorder` has since been deleted with
+/// the rest of the row path, so the claim has no subject on either plane. The
+/// routine plane's nearest equivalent -- a body that asks for the statement's
+/// operands in the order IT names them, which is not the same claim -- is
+/// `Handles::input`/`output`, exercised by every arm and pinned by
+/// `handles_are_minted_in_the_order_the_body_asks`.
 #[test]
 fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     let all = geometric();
@@ -1801,12 +1985,7 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
             match driver_wgpu::dispatch::plan_one(
                 low,
                 launch,
-                kernels_wgpu::KERNELS,
-                Built {
-                    module,
-                    declared,
-                    sig: None,
-                },
+                Built { module, declared },
                 sources,
                 *geometry,
             ) {
@@ -1839,12 +2018,7 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
                     if let Ok(hollow) = driver_wgpu::dispatch::plan_one(
                         low,
                         launch,
-                        kernels_wgpu::KERNELS,
-                        Built {
-                            module,
-                            declared,
-                            sig: None,
-                        },
+                        Built { module, declared },
                         sources,
                         Geometry::default(),
                     ) {
@@ -1872,12 +2046,7 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
                     let Ok(told) = driver_wgpu::dispatch::plan_one(
                         low,
                         launch,
-                        kernels_wgpu::KERNELS,
-                        Built {
-                            module,
-                            declared,
-                            sig: None,
-                        },
+                        Built { module, declared },
                         Sources {
                             arena,
                             resolver: &sentinels,
@@ -2023,10 +2192,10 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     }
 
     assert_eq!(
-        launches, 6680,
+        launches, 7224,
         "a different number of rectangles is lowered"
     );
-    assert_eq!(planned, 6680, "a different number of rectangles records");
+    assert_eq!(planned, 7224, "a different number of rectangles records");
     assert!(
         lost_sentinels.is_empty(),
         "{} kernels plan against a resolver that answers nothing and refuse one \
@@ -2053,7 +2222,7 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     // one operand twice -- `Vector::head` passes the same cache plane's
     // strides twice, and a body may read an operand it also writes -- while an
     // `in_place` pair binds ONE buffer for two of the plan's args and an
-    // `unbound` slot binds none. So the plan's 15140 arena operands and the
+    // `unbound` slot binds none. So the plan's 17148 arena operands and the
     // ranges a body binds are two different counts, and only the direction is
     // a rule: every planned rectangle carries at least one range of the arena,
     // because a statement that touched no activation would not be a statement.
@@ -2167,10 +2336,11 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     //
     // It is the number the ROUTINE plane produces, and it is the same number
     // the table plane produced: `bind` divides the body's own lanes by the
-    // module's `@workgroup_size`, and while both planes were live
-    // `the_routine_path_plans_what_the_table_path_planned` compared them
-    // rectangle for rectangle. The history below is therefore still the
-    // history of this number, read off a different derivation of it.
+    // module's `@workgroup_size`, and while both planes were live the
+    // twice-derived control in this file compared them rectangle for
+    // rectangle -- see its retirement below, which is why it is described here
+    // rather than named. The history below is therefore still the history of
+    // this number, read off a different derivation of it.
     //
     // It is NOT the 35,473,250 `driver-vulkan` pins over the same twelve plans,
     // and the difference is a real one rather than a rounding: these grids are
@@ -2194,6 +2364,15 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
         // the GEMM asks for fewer workgroups. A count that had gone UP after a
         // tile grew would be the thing worth stopping for.
         //
+        // Down again by 16,640 -- 260 workgroups each for the 64 gemma-4
+        // `residual_add` rectangles the folding norm replaced. Work that is
+        // not dispatched because it was folded into its neighbour.
+        //
+        // And by 502,680 more when the routed tile's column axis went from 32
+        // to 64: half as many column tiles over the same rows. Down after a
+        // tile GREW, which is the direction that says the sweep found a real
+        // point rather than a wider dispatch.
+        //
         // Down again by 318,432 when upstream STATED `sdpa_paged_tiled` and
         // its sink, and the reason is worth having: while the row was
         // unstated the driver launched it on the TRACE's grid, which puts
@@ -2203,16 +2382,43 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
         // `row >= n_rows` to make the surplus do nothing. Wasteful, not wrong,
         // and now neither: 176 rectangles at up to `q_heads * 62` groups each
         // is the whole difference.
+        // Down by 14,009,424 -- by far the largest single move this number has
+        // made -- when upstream added `Qwen35MetalFacts::moe_tile`, the opt-in
+        // that lets a MoE prefill take a tiled GEMM over the expert banks
+        // instead of one matvec per row. That is the whole point of a tile, so
+        // the direction is the one to want: the two new symbols
+        // (`affine_qmm_t_routed_...` and `mxfp4_qmm_t_routed_bias_...`) do
+        // the same arithmetic in 29% fewer workgroups.
+        //
+        // Down again by 502,680 when `ROUTED_QMM_TILE` went from (32, 32)
+        // to (32, 64) in `7bda96b66`: half as many column tiles over the
+        // same expert widths. That commit swept the axis rather than
+        // arguing it -- gemma-4-26b-a4b 433.4 tok/s at `bn = 32` against
+        // 436.7 at 64 -- and the two routed rows in `REACHES` above are the
+        // SAME two symbols at the new tile, which is why the count there
+        // did not move either.
         workgroups,
-        48_780_882,
+        36_474_730,
         "the plans dispatch a different amount of work"
     );
     // The third dimension is a prefill's rows, and only the paged decodes put
     // anything there. A backend that flattened the grid to two dimensions would
     // have looked correct on every other rectangle.
     assert_eq!(
+        // x went 3584 -> 14040 with `moe_tile`, and the widest is NOT the new
+        // GEMM. It is `gptoss_swiglu_bfloat16` and `silu_mul_bfloat16`, the
+        // elementwise kernels over the ROUTED STACK -- and the stack is what
+        // grew: enabling the tile makes `route_sort` pad every expert's rows
+        // up to `tile_rows`, so qwen3-30b-a3b's 64-token prefill sorts into
+        // 4480 rows (140 tiles of 32) where it packed 512 before.
+        //
+        // `13440 = 4480 * 768 / 256` to the element, which is what says this
+        // is a grid over real rows and not a runaway. Padding is the price of
+        // tiling and it is paid here; the tile still wins, which is why the
+        // total workgroup count above FELL by fourteen million in the same
+        // change.
         widest_grid,
-        [3584, 25136, 64],
+        [14040, 25136, 64],
         "the widest grid in any dimension changed"
     );
 }
@@ -2277,6 +2483,7 @@ fn every_arm_naming_a_pool_number_is_handed_that_number_and_not_another() {
         rotary_dims: 64,
         n_experts: 8,
         experts_per_token: 4,
+        ..Default::default()
     };
     // A CONTIGUOUS pool states no page size, which is how `contiguous_pool`
     // tells the two apart. Both maps answer every other number, so a
@@ -2299,21 +2506,24 @@ fn every_arm_naming_a_pool_number_is_handed_that_number_and_not_another() {
     let mut ran = 0u32;
 
     for symbol in kernels_wgpu::entrypoints() {
-        let Some((routine, run)) = driver_wgpu::lowering::routine::armed(&symbol) else {
+        let Some(routine) = driver_wgpu::lowering::routine::armed(&symbol) else {
             continue;
         };
         let results = driver_wgpu::lowering::routine::results(routine);
-        let facts = driver_wgpu::lowering::arm::facts(&symbol, 1, geometry, 1, 512, 512);
-        let mut open = driver_wgpu::lowering::arm::Handles::with_numbers(
+        let facts = driver_wgpu::lowering::hold::facts(&symbol, 1, geometry, 1, 512, 512);
+        let mut open = driver_wgpu::lowering::hold::Handles::with_numbers(
             &args,
             results,
             &scalars,
             &contiguous,
         );
-        let free = run(&mut open, facts).ok();
+        let free =
+            driver_wgpu::lowering::bind::bind(routine.args, routine.sources, &mut open, facts).ok();
         let mut walled =
-            driver_wgpu::lowering::arm::Handles::with_numbers(&args, results, &scalars, &paged);
-        let held = run(&mut walled, facts).ok();
+            driver_wgpu::lowering::hold::Handles::with_numbers(&args, results, &scalars, &paged);
+        let held =
+            driver_wgpu::lowering::bind::bind(routine.args, routine.sources, &mut walled, facts)
+                .ok();
         if free.is_none() && held.is_none() {
             continue;
         }
@@ -2619,6 +2829,7 @@ fn every_launch_at_the_claimed_token_ceiling_fits_the_device() {
         rotary_dims: facts.head_dim,
         n_experts: facts.n_experts,
         experts_per_token: facts.experts_per_token,
+        ..Default::default()
     };
     let mods = modules(std::iter::once(&low));
 
@@ -2642,12 +2853,7 @@ fn every_launch_at_the_claimed_token_ceiling_fits_the_device() {
         match driver_wgpu::dispatch::plan_one(
             &low,
             launch,
-            kernels_wgpu::KERNELS,
-            Built {
-                module,
-                declared,
-                sig: None,
-            },
+            Built { module, declared },
             Sources {
                 arena,
                 resolver: &store,
@@ -2705,172 +2911,48 @@ fn every_launch_at_the_claimed_token_ceiling_fits_the_device() {
     );
 }
 
-/// The ROUTINE path plans what the TABLE path planned, on every real rectangle.
-///
-/// The control a LIVE family needs, and the reason `mlp::silu_mul` could be
-/// armed at all. `sample` and `ptir` were dark — no text names either symbol,
-/// so a wrong entrypoint, grid or argument order could not change an answer.
-/// Every family from here is one a model runs, and "the routine says the same
-/// thing the row did" stops being a claim and has to be a measurement.
-///
-/// Both halves are derived from the SAME rectangle out of the same real
-/// lowerings: `plan_one` takes the fork, `plan_by_row` is the table path with
-/// the fork behind it, and every field of the two `Dispatch`es is compared.
-/// That is `driver-metal`'s
-/// `the_routine_path_plans_what_the_table_path_planned`, which is the shape
-/// this copies.
-///
-/// # This test is currently VACUOUS and is left standing on purpose
-///
-/// `kernels_wgpu::KERNELS` is empty, so the row half of every comparison is
-/// `None` and the walk below skips every one of the 6680 rectangles. It
-/// passes, and it passes the way an empty loop passes: nothing is compared,
-/// so nothing can disagree. It did not become true when the rows went — its
-/// second half was deleted, and a differential test with one side left is not
-/// a differential test.
-///
-/// It is not repaired here because there is nothing on the routine plane to
-/// re-anchor it ON: the claim IS the agreement of two planes, and one plane
-/// is gone. Retiring it or rebuilding it against a recorded expectation is a
-/// decision about what replaces the control, not a repair, and it is left to
-/// whoever makes that decision. Read every other count in this file as the
-/// live coverage; read this one as zero.
-///
-/// # What it would catch
-///
-/// The arm returns `[gate, up, out, width, rows]`. Swapping the two inputs
-/// gives a model that runs and is wrong — silu of the up-projection times the
-/// gate — and no shape check anywhere would notice, because both operands are
-/// storage buffers of the same length. The buffer comparison below is what
-/// notices, when there is a row for it to compare against.
-#[test]
-fn the_routine_path_plans_what_the_table_path_planned() {
-    let all = geometric();
-    let mods = modules(all.iter().map(|(_, low, _)| low));
-
-    let mut compared = 0u32;
-    let mut symbols: BTreeMap<&str, u32> = BTreeMap::new();
-    let mut seen: BTreeMap<&str, u32> = BTreeMap::new();
-    for (text, low, geometry) in &all {
-        let buf = Placeholder(low.arena_bytes as u64);
-        let store = Everything(Placeholder(GENEROUS));
-        let arena = Arena {
-            buffer: &buf,
-            bytes: low.arena_bytes as u64,
-        };
-        for launch in &low.launches {
-            let symbol = &low.kernels[launch.kernel as usize];
-            // Only the armed ones: everything else takes the table path
-            // through both calls and would be comparing a function with
-            // itself.
-            *seen.entry(symbol.as_str()).or_default() += 1;
-            let Some(row) = kernels_wgpu::sig(symbol) else {
-                continue;
-            };
-            if driver_wgpu::lowering::arm::arm_for(symbol).is_none() {
-                continue;
-            }
-            let declared = &mods[symbol];
-            let module = driver_wgpu::geometry::Module::loaded(symbol, declared);
-            let built = |sig| Built {
-                module,
-                declared,
-                sig,
-            };
-            let sources = || Sources {
-                arena,
-                resolver: &store,
-                min_offset: STRICTEST_ALIGNMENT,
-            };
-
-            let by_routine = driver_wgpu::dispatch::plan_one(
-                low,
-                launch,
-                &[],
-                built(None),
-                sources(),
-                *geometry,
-            )
-            .unwrap_or_else(|why| panic!("{text}: `{symbol}` by routine: {why}"));
-            // The row is handed over explicitly. `KERNELS` no longer holds one
-            // for a retired family, and this is the path that needs it.
-            let by_row = driver_wgpu::dispatch::plan_by_row(
-                low,
-                launch,
-                &[],
-                built(Some(row)),
-                sources(),
-                *geometry,
-            )
-            .unwrap_or_else(|why| panic!("{text}: `{symbol}` by row: {why}"));
-
-            assert_eq!(
-                by_routine.groups, by_row.groups,
-                "{text}: `{symbol}` gets a different GRID from its routine \
-                 than from its row"
-            );
-            assert_eq!(
-                by_routine.buffers.len(),
-                by_row.buffers.len(),
-                "{text}: `{symbol}` binds a different NUMBER of buffers"
-            );
-            for (n, (a, b)) in by_routine.buffers.iter().zip(&by_row.buffers).enumerate() {
-                assert_eq!(
-                    a, b,
-                    "{text}: `{symbol}` binds a different buffer at {n}. An \
-                     arm that swapped two inputs of the same length would \
-                     look exactly like this and nothing else would see it"
-                );
-            }
-            assert_eq!(by_routine.op, by_row.op);
-            assert_eq!(by_routine.block_at, by_row.block_at);
-            assert_eq!(by_routine.param_slot(), by_row.param_slot());
-            compared += 1;
-            *symbols.entry(symbol.as_str()).or_default() += 1;
-        }
-    }
-
-    // WHEN THIS COMPARES NOTHING, AND WHY THAT IS NOT A PASS.
-    //
-    // Both halves need a ROW: `plan_by_row` has nothing to read once Stage 3
-    // deletes one. So this test can only speak about a family in the window
-    // between its arm landing and its rows coming off — which is the window
-    // the arming commit is supposed to use it in, and `mlp` did: 352
-    // rectangles agreed, then the rows went in the same commit.
-    //
-    // After that the window is empty until the next family is armed, and a
-    // silent pass over zero rectangles is exactly the failure this file
-    // refuses everywhere else. So it says so, loudly, and names what to do.
-    // It is NOT an `assert!(compared > 0)`: that would make an honest empty
-    // window a red branch, and the branch is shared.
-    // By SYMBOL, not by row name. `qmv_routed`'s row is named `qmv_routed`
-    // and its symbol is `affine_qmv_routed`; the registry is keyed on the
-    // symbol, so asking `arm_for` the row's NAME missed it and this test would
-    // have reported no window while quietly having one.
-    let armable: Vec<&str> = kernels_wgpu::KERNELS
-        .iter()
-        .filter(|k| driver_wgpu::lowering::arm::arm_for(k.symbol).is_some())
-        .map(|k| k.name)
-        .collect();
-    assert!(
-        armable.is_empty(),
-        "{armable:?} are armed AND still have rows, so this test had a window \
-         and compared {compared} rectangles in it. If that number is zero the \
-         corpus does not reach them and the comparison is not happening"
-    );
-    if compared == 0 {
-        println!(
-            "NOTHING COMPARED: every armed family has already retired its \
-             rows, so there is no row left to derive a second answer from. \
-             This test is live again the moment a family is armed, and the \
-             commit that arms one must run it BEFORE deleting the rows. The \
-             corpus holds {seen:?}"
-        );
-        return;
-    }
-    // By SYMBOL, which is what a plan spells: `silu_mul_bfloat16`, not
-    // `silu_mul`. That difference is the defect this test found — the fork
-    // matched arms by name and never fired for a kernel with an axis, so the
-    // first live arm was dead code until `arm::crossed` learned stems.
-    println!("{compared} rectangles agree, over {symbols:?}");
-}
+// RETIRED: it has nothing left to compare, and its instrument is deleted.
+//
+// THIS WAS THE CENTRAL CONTROL OF THE WHOLE REFACTOR. For every rectangle of
+// every real lowering in the text corpus it derived the dispatch TWICE -- once
+// through `plan_one`'s fork, which resolves the arm and runs the routine body,
+// and once through `plan_by_row`, which read the kernel's row -- and compared
+// every field: module, entrypoint, grid, buffer list, offsets, scalar bytes.
+//
+// It is why a LIVE family could be armed at all. `sample` and `ptir` were dark
+// -- no text names either symbol -- so their crossings could only be argued.
+// `mlp` was the first family the corpus actually fires, and argument was not
+// enough. Rectangles compared, family by family: mlp 352, norm 1700, the
+// five-family batch 2764, attn 704, gate/router/qmv 432.
+//
+// Because the comparison needed the very row it was about to delete, the
+// commit shape was forced: ARM, COMPARE, DELETE, in one commit per family. It
+// asserted `armable.is_empty()` -- no armed family may still hold rows -- so
+// a window could never be left open unused, and it printed its totals rather
+// than passing silently at zero.
+//
+// What it caught, which review had not:
+//
+// * `residual_add` asked for a 2-D grid against a `gid.x`-only shader. 63 of
+//   64 rows untouched, and the dispatch reports success.
+// * `gate` reads `input(0)` on metal and vulkan -- the tensor `output(0)`
+//   already aliases -- computing `attn *= sigmoid(attn)`. Fixed in both.
+// * the three transcode encoders forwarded no scalars at all, so their
+//   `@group(1)` uniform arrived empty and the shader read zero groups.
+//
+// IT WENT BLIND, NOT TRUE, and it went blind by succeeding: the last row it
+// could have compared was `silu_mul_strided`'s, and deleting that row is what
+// finished the job it existed to police. `plan_by_row` is gone with the
+// columns it read, so the comparison cannot be written again even in
+// principle.
+//
+// NOTHING REPLACES IT, and nothing should: a control that holds a new plane to
+// an old one has no work left once the old plane is deleted. What holds the
+// routine plane now is everything else in this file -- the walks that plan
+// every rectangle of every real lowering through `plan_one` and check it
+// against the MODULE (`every_launchs_scalars_land_where_its_module_reads_them`
+// compares a body's packing against `Declared::uniform_offsets`;
+// `every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal`
+// walks all 7224) -- plus, across backends,
+// `two_backends_that_crossed_the_same_kernel_agree_on_its_signature`, which is
+// routine against routine over 199 kernels and never needed a table.

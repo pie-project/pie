@@ -466,7 +466,7 @@ fn every_proof_these_crates_cite_by_name_can_be_found() {
 /// comparison: "a test that asserts WHICH refusal came back is the only way
 /// an alignment failure stays distinguishable from a length one."
 ///
-/// It is a principle this crate mostly keeps — **eighty-three of a hundred and nine**
+/// It is a principle this crate mostly keeps — **seventy-five of ninety-eight**
 /// refusal variants are named in a test — and nothing measured the rest. A
 /// refusal nothing names is one whose condition could be inverted, or whose
 /// message could describe a different fault, with every suite still green: it
@@ -547,15 +547,12 @@ fn every_refusal_this_crate_builds_is_one_a_test_names() {
         "Ceiling::StorageBinding",
         "Ceiling::UniformBinding",
         "Failed::Unreachable",
-        "Undispatchable::Contiguous",
-        "Undispatchable::Layout",
         // Unreachable today, and deliberately built anyway: no crossed body
         // states more than one dispatch, so `plan_one`'s narrow shape costs
         // nothing. A two-pass reduction is two entrypoints over one
         // statement, and the day one arrives this is a named refusal rather
         // than a silently dropped pass. Give it a test when a body does it.
         "Undispatchable::Multiple",
-        "Undispatchable::Unresolved",
         "Unfired::Impossible",
         "Unforked::Device",
         "Unforked::Unhoused",
@@ -707,8 +704,8 @@ fn every_refusal_this_crate_builds_is_one_a_test_names() {
     // less coverage than there is. Here the sentence fails.
     assert_eq!(
         (refusals.len(), refusals.len() - unnamed.len()),
-        (112, 86),
-        "this test's own doc says eighty-three of a hundred and nine refusal variants \
+        (98, 75),
+        "this test's own doc says seventy-five of ninety-eight refusal variants \
          are named by a test. Update the sentence with the number."
     );
 }

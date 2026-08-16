@@ -402,7 +402,7 @@ fn a_rectangles_dims_come_from_the_rectangle_and_the_fire_and_nowhere_else() {
             let symbol = low.kernels[launch.kernel as usize].as_str();
             let dims = facts_of(&low, launch, geometry());
             assert_eq!(dims.rows, rows, "`{symbol}` at {rows} rows");
-            assert_eq!(dims.q_heads, geometry().q_heads, "the fire states the rest");
+            assert_eq!(dims.q_heads(), geometry().q_heads, "the fire states the rest");
             assert!(
                 dims.width > 0,
                 "`{symbol}` states no widthed operand, so no rule can size it"
@@ -631,7 +631,7 @@ mod the_map {
 ///
 /// The KV cache outlives the fire, so no traced value stands for it and a
 /// statement names it as `StateRef { KvCache, layer }`. Every backend has
-/// answered that with a hand-written arm; `Source::KvKeys`/`KvValues` let the
+/// answered that with a hand-written arm; `Source::Named(<keys::KvKeys as keys::Fact>::KEY)`/`KvValues` let the
 /// ROW ask, and `Resolver::kv` is where the asking lands.
 mod state {
     use std::collections::HashMap;
@@ -862,6 +862,8 @@ fn a_row_can_say_its_grid_extent_comes_from_the_statement() {
         global_head_dim: 512,
         global_kv_heads: 4,
         full_attn_every: 6,
+        v_heads: 0,
+        v_dim: 0,
         ..Geometry::default()
     };
     // The PLANNED grid, not `facts_of`. `Facts::rotary_dims` is the fire's
@@ -1027,7 +1029,7 @@ fn the_mxfp4_expert_bank_reads_a_bias_and_is_handed_one() {
 ///
 /// # Why a plan-level test and not only a device one
 ///
-/// `norm::add_bias` states its row pitch as `Source::OutWidth(0)` — the row
+/// `norm::add_bias` states its row pitch as `Source::Slot(Kind::OutWidth, 0)` — the row
 /// DERIVES the number from the operand it biases rather than making a text
 /// repeat it. `param_layout`'s source match had no arm for that and ended in
 /// `_ => continue`, so the slot was never emitted at all: the kernel's

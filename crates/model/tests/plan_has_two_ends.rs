@@ -82,10 +82,7 @@ fn plans() -> Vec<(&'static str, ForwardPlan)> {
 /// statement they observe. So their POSITION is not representable and
 /// this does not pretend otherwise; what is representable, and is the
 /// stronger claim anyway, is WHICH VALUE the boundary exposes.
-fn seam_values<'a>(
-    plan: &'a ForwardPlan,
-    name: &str,
-) -> Option<&'a [model_ir::trace::ValueId]> {
+fn seam_values<'a>(plan: &'a ForwardPlan, name: &str) -> Option<&'a [model_ir::trace::ValueId]> {
     plan.seams
         .iter()
         .find(|s| s.seam == name)

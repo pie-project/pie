@@ -549,6 +549,8 @@ mod tests {
                 vocab: 2,
                 values: vec![10.0, 11.0, 20.0, 21.0, 30.0, 31.0],
             },
+            // No fire ran, so there is no arena to have kept.
+            arena: Vec::new(),
             fired: crate::serve::Fired {
                 dispatches: 0,
                 submissions: 0,

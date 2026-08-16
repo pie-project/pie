@@ -14,7 +14,7 @@
 //! 2. the text still does not state everything its kernels read. Every row
 //!    it names states its operands now — `tests/text_conformance.rs` holds
 //!    that at zero — so no launch is bound positionally any more. What the
-//!    rows still carry as `Unbound` is the gap: the gathers' token ids and
+//!    rows still leave unsourced is the gap: the gathers' token ids and
 //!    the paged attention's six fire tables are values no statement supplies.
 //!
 //!    A slot nobody bound is read anyway, and Metal does not validate a
@@ -159,6 +159,8 @@ fn gemma_geometry() -> Geometry {
         global_head_dim: 256,
         global_kv_heads: 4,
         full_attn_every: 6,
+        v_heads: 0,
+        v_dim: 0,
         ..geometry()
     }
 }

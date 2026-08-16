@@ -419,7 +419,7 @@ fn the_first_ported_routine_asks_for_the_grid_its_row_asked_for() {
 
     // The RULE, stated rather than read off a row: `layout` has retired and
     // `ple_combine` has none. It is `Elementwise` — `[width * rows, 1, 1]` —
-    // which is what `the_routine_path_plans_what_the_table_path_planned`
+    // which is what `every_launchs_scalars_land_where_its_module_reads_them`
     // compared this body against, on every rectangle of every text, in the
     // commit that armed it. What this test still adds is the DRIVER's
     // `groups`: the body states lanes and this is the function that turns
@@ -439,12 +439,12 @@ fn the_first_ported_routine_asks_for_the_grid_its_row_asked_for() {
         let to = Lanes::default();
         kernels_wgpu::layout::ple_combine(
             &to,
-            kernels_wgpu::routine::Buf(0),
-            kernels_wgpu::routine::Buf(1),
-            kernels_wgpu::routine::BufMut(2),
-            kernels_wgpu::routine::Buf(3),
-            kernels_wgpu::routine::Env(i32::try_from(width).expect("fits")),
-            kernels_wgpu::routine::Env(i32::try_from(rows).expect("fits")),
+            kernels::routine::InSlot::new(kernels_wgpu::routine::Buf(0)),
+            kernels::routine::InSlot::new(kernels_wgpu::routine::Buf(1)),
+            kernels::routine::OutSlot::new(kernels_wgpu::routine::BufMut(2)),
+            kernels::routine::Block::new(kernels_wgpu::routine::Buf(3)),
+            kernels::routine::Ask::new(i32::try_from(width).expect("fits")),
+            kernels::routine::Ask::new(i32::try_from(rows).expect("fits")),
         )
         .expect("the body dispatches");
         let lanes = to.0.borrow().expect("it dispatched once");

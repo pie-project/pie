@@ -126,24 +126,83 @@ fn x_at(vec_: u32, k: u32) -> f32 {
 // see `dot_lane`.
 const PIE_QMV_VPT = PIE_CODES_PER_WORD * 2;
 
-fn dot_lane(row: u32, vec_: u32, lid: u32) -> f32 {
+// One lane's block of `PIE_QMV_VPT` values, for FOUR rows at once.
+//
+// This is `qmv_fast_impl`'s inner loop as MLX writes it, and the shape of it is
+// the whole point. The version this replaces called `affine_value(row, k)` once
+// PER ELEMENT PER ROW, and that helper re-derived the word index, re-read the
+// packed word, and re-read the scale AND the bias every time -- so a lane's
+// sixteen values cost sixteen word loads and thirty-two scale loads per row,
+// where they need two and one.
+//
+// Three things are hoisted, and each is hoisted to where the value actually
+// changes:
+//
+// * **The scale and bias, to once per lane-block.** `PIE_QMV_VPT` divides
+//   `PIE_GROUP` at every instantiation this file stamps -- sixteen into 32, 64
+//   and 128 at four bits, eight into the same at eight -- so a lane's values
+//   never straddle two groups and one pair covers them all.
+// * **The packed word, to once per `PIE_CODES_PER_WORD` values.** That is what
+//   the word IS: eight codes at four bits, four at eight.
+// * **The activation, to once per value.** It was read once per value PER ROW.
+//
+// The four rows ride in a `vec4` rather than a loop, which is not a flourish:
+// a `var` array indexed by a loop variable is scratch memory in every backend
+// naga targets, so the array that would make this readable would also make it
+// slower than what it replaces.
+fn block_dot(rows: vec4<u32>, vec_: u32, k0: u32) -> vec4<f32> {
     let n = u32(params.in_vec_size);
-    let stride = u32(PIE_QMV_VPT) * 32u;
-    var acc = 0.0;
-    var k0 = lid * u32(PIE_QMV_VPT);
-    while k0 < n {
-        for (var i = 0u; i < u32(PIE_QMV_VPT); i = i + 1u) {
-            // The K tail. K is NOT a whole number of `vpt * 32` blocks -- the
-            // Metal comments record that assuming it was returned nonsense on
-            // gemma-4-31b at K=5376 -- so the last pass runs partly out of
-            // range and this is what keeps it out of the sum.
-            if k0 + i < n {
-                acc = acc + x_at(vec_, k0 + i) * affine_value(row, k0 + i);
-            }
+    let cpw = u32(PIE_CODES_PER_WORD);
+    let mask = (1u << u32(PIE_BITS)) - 1u;
+    let g = rows * (n / u32(PIE_GROUP)) + vec4<u32>(k0 / u32(PIE_GROUP));
+    let s = vec4<f32>(
+        qmv_bf16(scales[g.x >> 1u], g.x),
+        qmv_bf16(scales[g.y >> 1u], g.y),
+        qmv_bf16(scales[g.z >> 1u], g.z),
+        qmv_bf16(scales[g.w >> 1u], g.w),
+    );
+    let b = vec4<f32>(
+        qmv_bf16(biases[g.x >> 1u], g.x),
+        qmv_bf16(biases[g.y >> 1u], g.y),
+        qmv_bf16(biases[g.z >> 1u], g.z),
+        qmv_bf16(biases[g.w >> 1u], g.w),
+    );
+    let wbase = rows * (n / cpw);
+    var acc = vec4<f32>(0.0);
+    var xsum = 0.0;
+    // CONST BOUNDS, both of them. Written with a `let` copy of the same
+    // constant this ran 22% SLOWER than the loop it replaced, measured
+    // isolated at [4096, 4096] -- a bound naga cannot fold is a loop it cannot
+    // unroll, and an unrolled sixteen-step inner loop is most of what this
+    // kernel is.
+    //
+    // The tail is hoisted out of the inner loop for the same reason: a block
+    // wholly inside K takes the unguarded path, and only the last one per row
+    // pays a comparison per value.
+    let whole = k0 + u32(PIE_QMV_VPT) <= n;
+    for (var jw = 0u; jw < u32(PIE_QMV_VPT) / u32(PIE_CODES_PER_WORD); jw = jw + 1u) {
+        let base = k0 + jw * u32(PIE_CODES_PER_WORD);
+        // The K tail, guarded on the WORD as well as the value: a row is
+        // `n / cpw` words and reading one past the last row's last word is off
+        // the end of the buffer, not merely off the end of a row.
+        if base >= n {
+            break;
         }
-        k0 = k0 + stride;
+        let at = wbase + vec4<u32>(base / u32(PIE_CODES_PER_WORD));
+        let word = vec4<u32>(w[at.x], w[at.y], w[at.z], w[at.w]);
+        for (var c = 0u; c < u32(PIE_CODES_PER_WORD); c = c + 1u) {
+            if !whole && base + c >= n {
+                break;
+            }
+            let xv = x_at(vec_, base + c);
+            xsum = xsum + xv;
+            let code = (word >> vec4<u32>(u32(PIE_BITS) * c)) & vec4<u32>(mask);
+            acc = acc + xv * vec4<f32>(code);
+        }
     }
-    return acc;
+    // `sum_i x_i * (s * code_i + b)` regrouped: the bias rides the plain sum of
+    // the activations, which is why `xsum` is worth carrying.
+    return s * acc + b * vec4<f32>(xsum);
 }
 
 //#if !defined(PIE_WIDE_STRIDED)
@@ -153,27 +212,50 @@ fn reduce_store(lid: u32, ly: u32, wg: vec3<u32>) {
 
     // Every lane runs all four rows and stores all four partials, out of range
     // or not, because the `barrier()` below is next: an early return in front
-    // of a workgroup barrier is a HANG in WGSL, not a wrong number. The bound
-    // is applied to the VALUE (zero) and again to the store, never to whether
-    // an invocation arrives.
-    for (var r = 0u; r < 4u; r = r + 1u) {
-        let row = out0 + r;
-        var v = 0.0;
-        if row < u32(params.out_vec_size) {
-            v = dot_lane(row, vec_, lid);
-        }
-        qmv_partials[(ly * 4u + r) * 32u + lid] = v;
+    // of a workgroup barrier is a HANG in WGSL, not a wrong number. A row past
+    // the end is CLAMPED rather than skipped -- it keeps the lanes on the same
+    // trip count and its value is dropped at the store, which already asks.
+    let last = max(u32(params.out_vec_size), 1u) - 1u;
+    let rows = min(
+        vec4<u32>(out0, out0 + 1u, out0 + 2u, out0 + 3u),
+        vec4<u32>(last),
+    );
+    var total = vec4<f32>(0.0);
+    var k0 = lid * u32(PIE_QMV_VPT);
+    while k0 < u32(params.in_vec_size) {
+        total = total + block_dot(rows, vec_, k0);
+        k0 = k0 + u32(PIE_QMV_VPT) * 32u;
     }
+    qmv_partials[(ly * 4u + 0u) * 32u + lid] = total.x;
+    qmv_partials[(ly * 4u + 1u) * 32u + lid] = total.y;
+    qmv_partials[(ly * 4u + 2u) * 32u + lid] = total.z;
+    qmv_partials[(ly * 4u + 3u) * 32u + lid] = total.w;
     workgroupBarrier();
+
+    // A TREE, where this used to be lane zero adding thirty-two partials for
+    // each of four rows -- a hundred and twenty-eight serial adds with
+    // thirty-one lanes of the y-slot watching. Five halvings do the same work
+    // in five steps.
+    //
+    // The barrier is OUTSIDE the `if`, which is not a style choice: WGSL
+    // requires `workgroupBarrier` in uniform control flow, and a barrier
+    // reached by half a workgroup is undefined rather than slow.
+    for (var half = 16u; half > 0u; half = half >> 1u) {
+        if lid < half {
+            for (var r = 0u; r < 4u; r = r + 1u) {
+                let at = (ly * 4u + r) * 32u + lid;
+                qmv_partials[at] = qmv_partials[at] + qmv_partials[at + half];
+            }
+        }
+        workgroupBarrier();
+    }
 
     if lid == 0u {
         for (var r = 0u; r < 4u; r = r + 1u) {
             let row = out0 + r;
             if row < u32(params.out_vec_size) {
-                var sum = 0.0;
-                for (var i = 0u; i < 32u; i = i + 1u) {
-                    sum = sum + qmv_partials[(ly * 4u + r) * 32u + i];
-                }
+                let sum0 = qmv_partials[(ly * 4u + r) * 32u];
+                var sum = sum0;
 //#if defined(PIE_BIAS)
                 // Unconditional, where the GLSL asked `if (tail)`: every
                 // variant that defines PIE_BIAS also defines PIE_TAIL, so the

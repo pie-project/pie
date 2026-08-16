@@ -1,90 +1,25 @@
 //! `cascade.cuh`'s two merge launchers — the fold that turns a split-KV
 //! attention's partial states back into one answer.
 //!
-//! **Not a family**, for `driver_internal`'s reason: no statement names a
-//! merge. The fold is reached from inside an FA2 dispatch, which is a
-//! `driver-cuda` decision made after the attention kernel has already been
-//! planned — so there are `pub fn`s here and no `ROUTINES`, no `FAMILY` and no
-//! line in `lib.rs`' `FAMILIES`. `fire/merge_states.rs` is the one caller, and
-//! it calls by path.
+//! **Not a family**: nothing names a merge in a trace; it fires from inside
+//! an FA2 dispatch, so there is no `ROUTINES`/`FAMILY`, and
+//! `fire/merge_states.rs` is the one caller, by path.
 //!
-//! # THE SPECIFICATION NAMED THE WRONG FUNCTION
+//! [`merge_states_varlen`], not [`merge_states`], is what both FA2 batched
+//! dispatches call, because a ragged batch (different KV length per row)
+//! folded with a uniform chunk count reads another row's partials.
 //!
-//! The record that specified this fold asked for `MergeStates`
-//! (`cascade.cuh:637-668`, upstream's numbering) and its
-//! `num_index_sets >= seq_len` arm. That is a real launcher and it is
-//! [`merge_states`] below — but **it is not the one the FA2 split path
-//! calls.** Both batched dispatches call `VariableLengthMergeStates`:
-//!
-//! - `prefill.cuh:4350-4352` — `(tmp_v, tmp_s, params.merge_indptr, o, lse,
-//!   params.max_total_num_rows, params.total_num_rows, num_qo_heads,
-//!   HEAD_DIM_VO, ...)`
-//! - `decode.cuh:822-824` — `(tmp_v, tmp_s, params.o_indptr, o, lse,
-//!   params.paged_kv.batch_size, nullptr, num_qo_heads, HEAD_DIM, ...)`
-//!
-//! `MergeStates` is reached only from the SINGLE-request paths, where every
-//! row was split into the same number of chunks and one `num_index_sets`
-//! describes the batch.
-//!
-//! The difference is not a performance one. `MergeStatesKernel` folds
-//! `num_index_sets` states for **every** row (`cascade.cuh:221`);
-//! `PersistentVariableLengthMergeStatesKernel` reads each row's own count as
-//! `indptr[pos + 1] - indptr[pos]` (`:395`). A batch whose requests have
-//! different KV lengths has different chunk counts per row, so folding it
-//! with a uniform count reads another row's partials and produces a wrong
-//! answer that no assertion catches. Both are here;
-//! [`merge_states_varlen`] is the one the FA2 seam uses.
-//!
-//! # `VariableLengthAttentionSum` is not here, and that is a measurement
-//!
-//! Both call sites above are inside `if constexpr (AttentionVariant::use_softmax)`
-//! and have an `else` that calls `VariableLengthAttentionSum` instead
-//! (`prefill.cuh:4354-4356`, `decode.cuh:825-827`). Every variant this tree
-//! instantiates is a `::flashinfer::DefaultAttention` or a
-//! `PieScoreCapture`/`PieScoreCaptureWindow` wrapping one
-//! (`kernels/attn/fa2.cuh:163-197`), and `variants.cuh:33` writes
-//! `static constexpr bool use_softmax = true` with no specialisation. The
-//! `else` is therefore unreachable for every row in the lattice, and a sum
-//! kernel is not carried. If a variant with `use_softmax = false` is ever
-//! added, this paragraph is what has to change first.
-//!
-//! # A merge's CALLERS live on every architecture
-//!
-//! The deleted `attention_merge_states.cu` was compiled UNCONDITIONALLY
-//! rather than under `PIE_CUDA_FLASHINFER_HOPPER_SOURCE`, and the reasoning
-//! for putting it under the gate — the KV split producing its inputs is the
-//! **sm90 prefill's**, so nothing can reach a merge on an architecture where
-//! that unit is stubbed — is **true on sm_80 and sm_90 and FALSE on sm_100.**
-//! There the DECODE KV-split path calls a decode dispatch that is built on
-//! every architecture and then merges. On Blackwell the dispatch succeeded
-//! and the merge **threw**, poisoning the driver on the first fire and taking
-//! gpt-oss and gemma-4 down with it.
-//!
-//! That is a statement about where a merge's callers live, not about where a
-//! merge is fast, and it is why neither routine here may acquire an
-//! architecture gate. A gate does not degrade to a slower path; it degrades
-//! to a throw on the machine the split is most likely to be enabled for. The
-//! refusals below are shape refusals for that reason and there is no
-//! `compute_capability` read anywhere in this file.
-//!
-//! # A refusal is a refusal, never a fallback
-//!
-//! `DISPATCH_HEAD_DIM`'s `default:` is `throw std::invalid_argument`. An
-//! exception crossing the C ABI is undefined behaviour and in this tree it
-//! unwound to `SIGABRT` with no message. Here an uninstantiated head dim is a
-//! refusal naming the four that are here, and the caller decides — every
-//! caller in `driver-cuda` decides to stop. Nothing here substitutes a
-//! different kernel for one it cannot fire.
+//! **Neither routine may gate on architecture**: on sm_100 the decode
+//! KV-split path (built on every arch) reaches this merge too, so a gate
+//! would throw there rather than degrade — refusals below are shape-only,
+//! never a fallback for an uninstantiated head dim.
 #![allow(clippy::too_many_arguments)]
 
 /// The ragged fold the FA2 split path needs, as a job and a launch.
 ///
-/// `driver-cuda`'s `fire/merge_states.rs` until §6.3. It imported nothing
-/// but this crate — `Ctx`, `Refusal`, `bf16` and [`merge_states_varlen`]
-/// itself — so it was a host program for one of this module's kernels that
-/// happened to be compiled one crate up, and the descent of FA2's dispatch
-/// half is what made that visible: `attn::fa2::dispatch` builds the job and
-/// could not name its type.
+/// Moved down from `driver-cuda`'s `fire/merge_states.rs`: it imported
+/// nothing but this crate, and `attn::fa2::dispatch` needs to name the job's
+/// type to build it.
 pub mod merge_states;
 
 use core::ptr::NonNull;
@@ -113,11 +48,10 @@ pub const NUM_SMEM_STAGES: u32 = 4;
 /// `cascade.cuh:645` and `:700` — `constexpr uint32_t num_threads = 128`.
 ///
 /// The staged block is `(bdx, bdy)` with `bdy = num_threads / bdx`, so the
-/// product is this number exactly and the occupancy query's `blockSize` and
-/// the launch's block extent cannot disagree. `fire/flashinfer_fa2.rs`'
-/// `decode_max_grid_size` has to make that distinction because at GQA group 3
-/// the FA2 decode block is 120 threads and upstream still queries 128; here
-/// there is nothing to get wrong.
+/// product is always this number and the occupancy query's `blockSize` can
+/// never disagree with the launch's block extent (contrast
+/// `fire/flashinfer_fa2.rs`'s `decode_max_grid_size`, which must handle a
+/// 120-thread FA2 decode block against a 128-thread query).
 pub const NUM_THREADS: u32 = 128;
 
 /// `(vec_size, bdx, bdy)` for a head dim, as `MergeStates` derived it.
@@ -273,14 +207,13 @@ pub fn merge_states(
     }
 
     // `cascade.cuh:659-664`. `bdy` is `num_heads` here, so the block width is
-    // a runtime value and the 1,024-thread cap is checkable only on the host.
-    // At head dim 64 that is `bdx = 8` and the cap is reached at 128 query
-    // heads; at 512 it is `bdx = 32` and the cap is 32 heads.
+    // a runtime value and the 1,024-thread cap is checkable only on the host
+    // (at head dim 64, `bdx = 8` and the cap is 128 query heads; at 512,
+    // `bdx = 32` and the cap is 32 heads).
     //
-    // **A refusal upstream does not make.** `MergeStates` launches and returns
-    // `cudaErrorInvalidConfiguration`, which its callers hand to
-    // `FLASHINFER_CUDA_CALL`; the alternative to refusing here was a driver
-    // error whose message says nothing about heads.
+    // Refused here rather than upstream: `MergeStates` would otherwise launch
+    // and return a `cudaErrorInvalidConfiguration` whose message says nothing
+    // about heads.
     let threads = bdx.saturating_mul(num_heads);
     if threads > MAX_BLOCK_THREADS {
         return Err(Refusal::Wide {
@@ -315,30 +248,21 @@ pub fn merge_states(
 /// `VariableLengthMergeStates`, `cascade.cuh:686-736` — the ragged fold, and
 /// the one the FA2 split path calls.
 ///
-/// One kernel, always: `PersistentVariableLengthMergeStatesKernel`. There is
-/// no arm here — the raggedness is in `indptr` rather than in the launcher —
-/// so the only host decisions are the empty-work guard and the grid.
+/// One kernel, always: `PersistentVariableLengthMergeStatesKernel`. The
+/// raggedness is in `indptr`, not the launcher, so the only host decisions
+/// are the empty-work guard and the grid.
 ///
-/// # The grid is a performance knob and not a correctness input
+/// # The grid is a performance knob, not a correctness input
 ///
 /// `:711` launches `num_sms * num_blocks_per_sm` blocks and `:388` runs a
-/// grid-stride loop over `seq_len * num_heads`:
-///
-/// ```text
-/// for (uint32_t i = cta_id; i < seq_len * num_heads; i += num_ctas)
-/// ```
-///
-/// so **any positive grid computes the same answer** and a grid larger than
-/// the work simply retires idle blocks. That is what makes
-/// `:707-708`'s `cudaOccupancyMaxActiveBlocksPerMultiprocessor` safe to
-/// approximate — and [`blocks_per_sm`] does not approximate it, it asks the
-/// same question of the same `CUfunction`. When it cannot be asked the answer
-/// is 1 block per SM, which is the conservative direction: fewer,
-/// longer-lived blocks, all of them correct.
-///
-/// `:709` then bounds it by `ceil_div(max_seq_len * num_heads, num_sms)`, so
-/// a small batch does not launch a full-device grid to retire most of it.
-/// Both terms are in [`grid_blocks`].
+/// grid-stride loop over `seq_len * num_heads`, so any positive grid computes
+/// the same answer and a grid larger than the work just retires idle blocks.
+/// That is what makes `:707-708`'s
+/// `cudaOccupancyMaxActiveBlocksPerMultiprocessor` safe to approximate —
+/// [`blocks_per_sm`] answers 1 block per SM when it cannot ask, which is the
+/// conservative direction. `:709` then bounds the grid by
+/// `ceil_div(max_seq_len * num_heads, num_sms)` so a small batch does not
+/// launch a full-device grid; both terms are in [`grid_blocks`].
 ///
 /// # Geometry
 ///
@@ -348,13 +272,9 @@ pub fn merge_states(
 /// | block | `(bdx, num_threads / bdx, 1)` — `:701`, `:712` |
 /// | smem  | [`smem_bytes`] — `:703-704` |
 ///
-/// # PDL is not here
-///
-/// `:718-731` has a programmatic-dependent-launch path behind `enable_pdl`.
-/// Both FA2 call sites pass it through from their own dispatch and this
-/// driver's FA2 fires never set it — the lattice has no PDL axis — so the
-/// `else` at `:732` is the only branch that has ever run here and it is the
-/// only one carried.
+/// PDL (`:718-731`, behind `enable_pdl`) is not carried: every FA2 call site
+/// passes it through unset, so the `else` at `:732` is the only branch this
+/// driver has ever run.
 ///
 /// # Errors
 ///

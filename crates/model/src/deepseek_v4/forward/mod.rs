@@ -30,7 +30,19 @@ use model_dsl::{self as dsl, MatW, NormW, WeightRepr, matmul};
 use model_ir::trace::{FireClass, ForwardPlan, NormVariant};
 
 struct Dsv4LayerW {
+    // DECLARED AND NOT APPLIED, which is a finding and not an oversight of
+    // this struct. Both names used to be passed to `dsl::cuda::hc_rmsnorm_to_f32`,
+    // whose kernel (`kernels/norm/dsv4_hc.cuh:354`) takes no weight pointer
+    // at all -- the binder resolved the name, the arm never bound it, and
+    // §6.2's arity rule found the gap by counting one pointer read against
+    // two placed operands. The statement dropped them; the CHECKPOINT still
+    // carries the tensors, so they stay declared here and in the weight
+    // contract. Whether the hyper-connection residual should carry a learned
+    // gain is a question about `hc_rmsnorm_to_f32`, and nothing in this
+    // refactor changes what any fire computes.
+    #[expect(dead_code, reason = "declared for the checkpoint; see above")]
     attn_norm: NormW,
+    #[expect(dead_code, reason = "declared for the checkpoint; see above")]
     mlp_norm: NormW,
     wq_a: MatW,
     q_norm: NormW,
@@ -101,7 +113,7 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
         // The compressed pass needs the block boundaries this fire's
         // positions imply, and they are a FIRE fact — one statement,
         // outside the layer loop, exactly as the hand-written pass has it.
-        let (boundary_pos, _meta, _counts) = dsl::cuda::dsv4_boundary_meta(&embedded, class);
+        let (boundary_pos, boundary_req, _counts) = dsl::cuda::dsv4_boundary_meta(&embedded, class);
 
         for l in 0..facts.layers {
             let w = Dsv4LayerW::new(l, facts);
@@ -109,7 +121,7 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
             // Read a mix of the streams. `hc_pre` produces the layer's
             // input and the two mixes `hc_post` will need to write back.
             let normed_f32 =
-                dsl::cuda::hc_rmsnorm_to_f32(&streams, &w.attn_norm.name, facts.hidden);
+                dsl::cuda::hc_rmsnorm_to_f32(&streams, facts.hidden);
             let (x, post_mix, comb_mix) = dsl::cuda::hc_pre(&normed_f32, &streams, k, facts.hidden);
 
             // Q through its latent, then a per-head norm with NO gamma —
@@ -118,7 +130,7 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
             let q_a = matmul(&x, &w.wq_a);
             let q_a = dsl::cuda::rmsnorm(&q_a, &w.q_norm);
             let q = matmul(&q_a, &w.wq_b);
-            let q = dsl::cuda::per_head_rmsnorm(&q, "", a.heads, a.head_dim);
+            let q = dsl::cuda::per_head_rmsnorm(&q, a.heads, a.head_dim);
             let kv = matmul(&x, &w.wkv);
             let kv = dsl::cuda::rmsnorm(&kv, &w.kv_norm);
             // Partial rope on the LAST channels of each head.
@@ -136,9 +148,9 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
 
             // The compressed pass: gather this layer's block entries,
             // rope them the same way, store them, then attend.
-            let entries = dsl::cuda::dsv4_compress_gather_paged(&boundary_pos, l, a.head_dim);
+            let entries = dsl::cuda::dsv4_compress_gather_paged(&boundary_pos, &boundary_req, l, a.head_dim);
             let entries = dsl::cuda::rope_partial_last(&entries, a.heads, a.qk_rope_head_dim);
-            dsl::cuda::dsv4_store_comp_entries(&entries, &boundary_pos, l);
+            dsl::cuda::dsv4_store_comp_entries(&entries, &boundary_pos, &boundary_req, l);
             let (o_comp, lse_comp) =
                 dsl::cuda::attention_compressed_paged(&q, l, a.heads, a.head_dim);
 
@@ -162,7 +174,7 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
             streams = dsl::cuda::hc_post(&o, &streams, &post_mix, &comb_mix, k, facts.hidden);
 
             // ── MLP / MoE, over the same rank-K residual ─────────────
-            let normed_f32 = dsl::cuda::hc_rmsnorm_to_f32(&streams, &w.mlp_norm.name, facts.hidden);
+            let normed_f32 = dsl::cuda::hc_rmsnorm_to_f32(&streams, facts.hidden);
             let (m, post_mix, comb_mix) = dsl::cuda::hc_pre(&normed_f32, &streams, k, facts.hidden);
 
             let out = if !facts.is_moe_layer(l) {
@@ -192,7 +204,7 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
                     &experts,
                     facts.moe.top_k,
                 );
-                let act = dsl::cuda::swiglu_clamp(&gate_up, facts.moe.moe_intermediate, true);
+                let act = dsl::cuda::swiglu_clamp(&gate_up, facts.moe.moe_intermediate);
                 let route_out = dsl::cuda::moe_down_gemv(
                     &act,
                     &MatW {

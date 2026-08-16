@@ -370,18 +370,46 @@ template <typename T>
   const int rep = Hv / p.Hk;
   const int hk_idx = hv_idx / rep;
   const bool hk_first = (hv_idx % rep) == 0;
-  const int slot = int(slot_ids[0]), dk_idx = int(tpig.x), n_per_t = Dk / 32;
+  // THIS TOKEN'S seat, and the row its request starts at.
+  //
+  // A fire holds whatever the batcher packed, and `slot_ids` is per ROW: two
+  // requests in one prefill are two seats, so the row where the seat changes
+  // IS the request boundary and no second table has to say so. Reading
+  // `slot_ids[0]` made the whole rectangle one sequence -- every request
+  // after the first convolved over its predecessor's tokens and carried its
+  // recurrent state, and the FIRST one lost its history the moment the last
+  // token of the LAST request was the only one writing `new_conv_state`.
+  //
+  // The walk back is bounded by `Kc - 1`, which is as far as a convolution
+  // window reaches, so nothing here is linear in the prompt.
+  const int slot = int(slot_ids[t]), dk_idx = int(tpig.x), n_per_t = Dk / 32;
+  int start = t;
+  for (int back = 0; back < Kc - 1 && start > 0; ++back) {
+    if (int(slot_ids[start - 1]) != slot) break;
+    --start;
+  }
   const int q_off = p.q_off, k_off = p.k_off, v_off = p.v_off;
   const size_t pitch_t = size_t(row_pitch);
-  const size_t pitch_f = size_t(row_pitch) / 2;   // fp32 scratch shares the byte pitch
+  // Every scratch row is PACKED at its own width. `row_pitch` describes the
+  // in-projection and nothing else: one shared pitch would have to clear the
+  // widest of them, and `pre_gate` is WIDER than `mixed` on any stack whose
+  // value width reaches its key width -- qwen3-next asks 2*Hv + Hv*Dv = 8320
+  // floats of it against a conv_dim of 8192, and a shared pitch would have
+  // written each token's v channels over the next token's gates.
+  const size_t qk_pitch = size_t(Hv) * size_t(Dk);
+  const size_t g_pitch = 2 * size_t(Hv) + size_t(Hv) * size_t(Dv);
   const size_t row_t = size_t(t) * pitch_t;
 
-  // Tap j of token t's conv window: prompt row `t-(Kc-1)+j` when it exists,
-  // otherwise row `Kc + idx` of the history this prompt started from.
+  // Tap j of token t's conv window: prompt row `t-(Kc-1)+j` when that row is
+  // this REQUEST'S, otherwise row `Kc + local` of the history this request
+  // started from. `local` counts from the request's own first token, not the
+  // fire's, so a request that is not first in the rectangle still reads its
+  // own seat's history rather than its neighbour's tokens.
   auto tap = [&](int j, int c) -> float {
     const int idx = t - (Kc - 1) + j;
-    return idx >= 0 ? float(mixed[size_t(idx) * pitch_t + c])
-                    : conv_state[(slot * Kc + Kc + idx) * CDIM + c];
+    const int local = idx - start;
+    return idx >= start ? float(mixed[size_t(idx) * pitch_t + c])
+                        : conv_state[(slot * Kc + Kc + local) * CDIM + c];
   };
   auto convsilu = [&](int c) -> float {
     float acc = float(conv_b[c]);
@@ -401,36 +429,45 @@ template <typename T>
   qsq = simd_sum(qsq); ksq = simd_sum(ksq);
   const float qinv = p.inv_sqrt_dk / sqrt(qsq + p.eps);
   const float kinv = 1.0f / sqrt(ksq + p.eps);
-  device float* oq = pre_q + size_t(t) * pitch_f + size_t(hv_idx) * Dk;
-  device float* ok = pre_k + size_t(t) * pitch_f + size_t(hv_idx) * Dk;
+  device float* oq = pre_q + size_t(t) * qk_pitch + size_t(hv_idx) * Dk;
+  device float* ok = pre_k + size_t(t) * qk_pitch + size_t(hv_idx) * Dk;
   for (int i = 0; i < n_per_t; ++i) {
     const int d = n_per_t * dk_idx + i;
     oq[d] = qraw[i] * qinv;
     ok[d] = kraw[i] * kinv;
   }
   if (dk_idx == 0) {
-    const float ad = float(a_gate[row_t + hv_idx]) + float(dt_bias[hv_idx]);
+    // `a` and `b` are the in-projection's OWN outputs, one scalar per value
+    // head, so their rows are Hv wide -- not `row_pitch`, which belongs to
+    // `mixed` alone. This read them at the prompt's pitch and every token
+    // past the first landed 10,192 floats past its gate on qwen3.6-27B: a
+    // three-token prefill came back all-NaN, a four-token one did not, and
+    // the difference was only which garbage the arena happened to hold.
+    // `gdn_prep_slotted` and `gdn_core` both index `b_idx * Hv + hv_idx`.
+    const size_t gate_at = size_t(t) * size_t(Hv) + size_t(hv_idx);
+    const float ad = float(a_gate[gate_at]) + float(dt_bias[hv_idx]);
     const float sp = max(ad, 0.0f) + log(1.0f + exp(-fabs(ad)));
-    device float* g = pre_gate + size_t(t) * pitch_f + 2 * size_t(hv_idx);
+    device float* g = pre_gate + size_t(t) * g_pitch + 2 * size_t(hv_idx);
     g[0] = exp(-exp(float(A_log[hv_idx])) * sp);
-    g[1] = 1.0f / (1.0f + exp(-float(b_gate[row_t + hv_idx])));
+    g[1] = 1.0f / (1.0f + exp(-float(b_gate[gate_at])));
   }
   // The recurrent kernel's thirty-two Dk lanes all consume the same v scalar.
   // Compute each value-channel convolution once here, while tokens are
   // parallel, and place it after the two gate scalars in this fp32 scratch row.
-  device float* pv = pre_gate + size_t(t) * pitch_f + 2 * size_t(Hv);
+  device float* pv = pre_gate + size_t(t) * g_pitch + 2 * size_t(Hv);
   for (int dv = dk_idx; dv < Dv; dv += 32)
     pv[size_t(hv_idx) * Dv + dv] =
         convsilu(v_off + hv_idx * Dv + dv);
 
-  // Only the last scanned token carries the history forward.
-  if (t != n_scan - 1) return;
+  // Only each REQUEST'S last token carries that request's history forward.
+  if (t != n_scan - 1 && int(slot_ids[t + 1]) == slot) return;
   auto wb = [&](int c) {
     for (int j = 0; j < Kc; ++j) {
       const int idx = t - (Kc - 1) + j;
+      const int local = idx - start;
       new_conv_state[(slot * Kc + j) * CDIM + c] =
-          idx >= 0 ? float(mixed[size_t(idx) * pitch_t + c])
-                   : conv_state[(slot * Kc + Kc + idx) * CDIM + c];
+          idx >= start ? float(mixed[size_t(idx) * pitch_t + c])
+                       : conv_state[(slot * Kc + Kc + local) * CDIM + c];
     }
   };
   for (int i = 0; i < n_per_t; ++i) {
@@ -491,8 +528,12 @@ template <typename T, int LANES, int VROWS = 1>
   const int hv_idx = int(tpig.z);
   const int dv_base = (int(tpig.y) * ROWS + (int(tpig.x) / LANES)) * VROWS;
   const int dk_idx = int(tpig.x) % LANES;
-  const int slot = int(slot_ids[0]), n_per_t = Dk / LANES;
-  const size_t pitch_f = size_t(row_pitch) / 2;
+  const int n_per_t = Dk / LANES;
+  // See `gdn_prep_prefill`: every row here is packed at its own width, so
+  // `row_pitch` reaches this entrypoint to describe a buffer it never reads.
+  const size_t qk_pitch = size_t(Hv) * size_t(Dk);
+  const size_t g_pitch = 2 * size_t(Hv) + size_t(Hv) * size_t(Dv);
+  const size_t o_pitch = size_t(Hv) * size_t(Dv);
   const bool row_lead = dk_idx == 0;
   if (dv_base >= Dv) return;
   // A Dv the rows do not divide leaves the last group short; the spare rows are
@@ -502,20 +543,43 @@ template <typename T, int LANES, int VROWS = 1>
 
   // This simdgroup owns the whole (slot, hv, dv) state row, so the scan runs in
   // registers with no ordering beyond the loop itself.
+  //
+  // One row PER SEAT, in turn. `slot_ids` is per row and a fire holds whatever
+  // the batcher packed, so the rectangle is one sequence per seat laid end to
+  // end; a scan that read `slot_ids[0]` walked all of them into the first
+  // seat's state. The state is loaded when a seat begins and stored when it
+  // ends, which for a one-request fire is exactly the load and store this
+  // kernel already did.
+  int slot = int(slot_ids[0]);
   device float* i_state = rstate + (size_t((slot * Hv + hv_idx) * Dv + dv_base) * Dk);
   float st[VROWS][MAX_PER_T];
-  for (int v = 0; v < vn; ++v)
-    for (int i = 0; i < n_per_t; ++i)
-      st[v][i] = i_state[size_t(v) * Dk + n_per_t * dk_idx + i];
+  auto load = [&]() {
+    i_state = rstate + (size_t((slot * Hv + hv_idx) * Dv + dv_base) * Dk);
+    for (int v = 0; v < vn; ++v)
+      for (int i = 0; i < n_per_t; ++i)
+        st[v][i] = i_state[size_t(v) * Dk + n_per_t * dk_idx + i];
+  };
+  auto store = [&]() {
+    for (int v = 0; v < vn; ++v)
+      for (int i = 0; i < n_per_t; ++i)
+        i_state[size_t(v) * Dk + n_per_t * dk_idx + i] = st[v][i];
+  };
+  load();
 
   for (int t = 0; t < n_scan; ++t) {
-    const size_t row_t = size_t(t) * size_t(row_pitch);
-    const device float* iv = pre_gate + size_t(t) * pitch_f + 2 * size_t(Hv) +
+    const int seat = int(slot_ids[t]);
+    if (seat != slot) {
+      store();
+      slot = seat;
+      load();
+    }
+    const size_t row_t = size_t(t) * o_pitch;
+    const device float* iv = pre_gate + size_t(t) * g_pitch + 2 * size_t(Hv) +
                              size_t(hv_idx) * Dv + dv_base;
     // Read once for all VROWS rows: this is the whole point of the parameter.
-    const device float* iq = pre_q + size_t(t) * pitch_f + size_t(hv_idx) * Dk;
-    const device float* ik = pre_k + size_t(t) * pitch_f + size_t(hv_idx) * Dk;
-    const device float* g = pre_gate + size_t(t) * pitch_f + 2 * size_t(hv_idx);
+    const device float* iq = pre_q + size_t(t) * qk_pitch + size_t(hv_idx) * Dk;
+    const device float* ik = pre_k + size_t(t) * qk_pitch + size_t(hv_idx) * Dk;
+    const device float* g = pre_gate + size_t(t) * g_pitch + 2 * size_t(hv_idx);
     float q[MAX_PER_T], k[MAX_PER_T];
     for (int i = 0; i < n_per_t; ++i) {
       const int d = n_per_t * dk_idx + i;
@@ -538,9 +602,7 @@ template <typename T, int LANES, int VROWS = 1>
         core_out[row_t + size_t(hv_idx) * Dv + dv_base + v] = static_cast<T>(out);
     }
   }
-  for (int v = 0; v < vn; ++v)
-    for (int i = 0; i < n_per_t; ++i)
-      i_state[size_t(v) * Dk + n_per_t * dk_idx + i] = st[v][i];
+  store();
 }
 
 #define instantiate_gdn_prefill(name, itype)                                    \

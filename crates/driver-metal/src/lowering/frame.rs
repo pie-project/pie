@@ -220,7 +220,7 @@ pub fn rows_of(step: &Step<'_>) -> Result<Vec<Row>, Unbridgeable> {
 /// request that named it -- request `r`'s value `k` is row `qo_indptr[r] + k`
 /// -- and `rows_of` reads it that way to set `Row::samples`, which is what
 /// sizes the epilogue's gather. The gather's index list is the other reader:
-/// `row_gather` binds `Source::SamplingIndices` and indexes the fire's stream
+/// `row_gather` binds `Source::Named(<keys::SamplingIndices as keys::Fact>::KEY)` and indexes the fire's stream
 /// with it directly, so it needs the absolute row and nothing else will do.
 ///
 /// Handing it the wire values instead is not a refusal, it is a wrong answer:
@@ -460,7 +460,7 @@ mod tests {
     /// The gather reads the FIRE's rows, not the wire's numbers.
     ///
     /// The two agree at one request and disagree at two, which is why this
-    /// shipped: `row_gather` binds `Source::SamplingIndices` and indexes the
+    /// shipped: `row_gather` binds `Source::Named(<keys::SamplingIndices as keys::Fact>::KEY)` and indexes the
     /// stream with it, and every fixture with one request read correctly.
     /// On `[0, 2, 5]` the second request's last row is fire row 4 and its own
     /// number for it is 2 -- and 2 is a real row of the fire, belonging to

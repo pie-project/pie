@@ -4,10 +4,24 @@
 //! The C++ oracle in `tests/oracle/memory_planner/` compiles the shipping
 //! 1,221-line source and sweeps `plan_cuda_memory` over a grid of device
 //! shapes, model shapes and configurations. This file sweeps the identical
-//! grid through the Rust port and requires the transcripts to be
-//! byte-identical, then pins the **C++'s** FNV-1a 64 hash of it.
+//! grid through the Rust port and requires the transcripts to match on every
+//! row except the ones listed in [`DIVERGED`].
 //!
-//! `tests/oracle/memory_planner/run.sh` can no longer be run — its inputs were deleted, see `oracle_census.rs`. It is kept as the description of how this golden was taken, which is read but not re-derived. It once regenerated the golden.
+//! # The oracle can be re-run, and this file used to say it could not
+//!
+//! `tests/oracle/memory_planner/run.sh` **works.** It restores the C++ from
+//! git (`e7cd33cf1`), builds it against the `stub/` tree with plain `g++`,
+//! and needs no CUDA and no GPU. It reproduces [`GOLDEN_FNV1A64`] exactly.
+//!
+//! This file previously stated the opposite -- "its inputs were deleted, see
+//! `oracle_census.rs`" -- and the assertion below repeated it, adding that
+//! therefore "a divergence is THIS crate changing". Both halves were wrong,
+//! and the second is why it mattered: this test was red on a divergence that
+//! was correct and intended (see [`DIVERGED`]) while telling every reader
+//! that the only way to interpret a failure was as a regression here, and
+//! that the evidence needed to check that was unrecoverable. It was one
+//! `git show` away the whole time. A test that says its oracle is gone stops
+//! the diff that would have explained it in an afternoon.
 //!
 //! # Why this test exists in this shape
 //!
@@ -28,11 +42,39 @@ use driver_cuda::layout::memory_planner as mp;
 use driver_cuda::layout::profile_key::{ProfileKey, ProfileShape};
 use std::fmt::Write as _;
 
-/// FNV-1a 64 of the **C++** transcript.
+/// FNV-1a 64 of the **C++** transcript, all 963 rows.
 ///
 /// Hand-written rather than `DefaultHasher`, whose output is explicitly not
 /// stable across Rust releases.
+///
+/// **This crate no longer reproduces it, on purpose** -- see [`DIVERGED`].
+/// It is kept because it is the checksum `run.sh` prints, so it is how a
+/// re-run is confirmed to have rebuilt the *same* C++ rather than some other
+/// revision of it. Re-deriving it: restore the 1,221-line
+/// `store/memory_planner.cpp` from `e7cd33cf1` (the last revision whose
+/// includes match the stub tree; the later `bb7c2231a` adds
+/// `attention_workspace.hpp`, which the stubs do not have) and run
+/// `tests/oracle/memory_planner/run.sh`.
+#[expect(
+    dead_code,
+    reason = "the C++'s own checksum: what `run.sh` prints, and so how a \
+              re-run is confirmed to have rebuilt the same revision. Nothing \
+              in-process can compare against it without the 676 KB transcript"
+)]
 const GOLDEN_FNV1A64: u64 = 0x6c6a8167324e6af1;
+
+/// FNV-1a 64 of the C++ transcript with the [`DIVERGED`] rows removed.
+///
+/// **The live parity claim.** Taken from the same oracle run as
+/// [`GOLDEN_FNV1A64`], over the 878 rows this crate is still expected to
+/// answer identically.
+const GOLDEN_COMMON_FNV1A64: u64 = 0x2a6000bdc22d4b67;
+
+/// FNV-1a 64 of this crate's own transcript, all 963 rows.
+///
+/// Not a parity claim -- a change detector, so the 85 excused rows cannot
+/// drift unnoticed behind their exemption.
+const RUST_FNV1A64: u64 = 0xc1bc7e1812e6a17f;
 
 /// Rows the sweep produces, pinned separately: a hash mismatch says only
 /// "something moved", while a row count says whether the sweep itself shrank.
@@ -718,7 +760,7 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 }
 
 #[test]
-fn the_rust_planner_reproduces_the_cpp_transcript_byte_for_byte() {
+fn the_rust_planner_reproduces_the_cpp_except_where_the_family_table_left() {
     let devs = devices();
     let mods = models();
     let mut sw = Sweep::new();
@@ -1049,12 +1091,159 @@ fn the_rust_planner_reproduces_the_cpp_transcript_byte_for_byte() {
         rows, GOLDEN_ROWS,
         "row count moved: the sweep itself changed"
     );
+
+    // PARITY, on the rows where parity is still the claim.
+    //
+    // Every row whose label is not in `DIVERGED` is hashed and held against
+    // the C++'s hash of the same 878 rows. This is the assertion that used to
+    // be made over all 963 -- it is the same bytes, minus the rows the
+    // deletion below was ABOUT.
+    let common: String = sw
+        .out
+        .lines()
+        .filter(|line| {
+            let label = line.split('|').next().unwrap_or_default();
+            !DIVERGED.contains(&label)
+        })
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert_eq!(
+        common.matches('\n').count(),
+        GOLDEN_ROWS - DIVERGED.len(),
+        "a DIVERGED label matched no row, or matched more than one"
+    );
+    assert_eq!(
+        fnv1a64(common.as_bytes()),
+        GOLDEN_COMMON_FNV1A64,
+        "transcript diverged from the C++ OUTSIDE the rows the model_type \
+         table's deletion accounts for. Re-run the oracle -- \
+         `tests/oracle/memory_planner/run.sh` works again, it restores the \
+         C++ from git -- set MP_RUST_OUT=/tmp/rust.txt and MP_ORACLE_OUT=\
+         /tmp/cpp.txt, and diff them."
+    );
+
+    // AND the 85 that do diverge are still pinned, so they cannot drift
+    // unremarked just because they are excused from the C++ comparison.
     assert_eq!(
         fnv1a64(sw.out.as_bytes()),
-        GOLDEN_FNV1A64,
-        "transcript diverged from the C++. The oracle cannot be re-run to diff \
-         against (see `oracle_census.rs`), so the golden is the only record \
-         of the C++ and a divergence is THIS crate changing. Set \
-         MP_RUST_OUT=/tmp/rust.txt and read the transcript against the pin."
+        RUST_FNV1A64,
+        "the transcript changed. If the change is intended, re-run the oracle \
+         and re-derive BOTH pins -- the common hash is the one that says the \
+         C++ still agrees."
     );
 }
+
+/// The rows where this crate deliberately no longer answers what the C++ did.
+///
+/// `fc7bc648b` took the model_type table out of the driver. Three predicates
+/// went with it, all of them in `plan_cuda_memory` and all keyed on the
+/// checkpoint rather than the device:
+///
+/// ```text
+/// prefer_qwen3_8b_prefill_shape  = ... && hf.model_type == "qwen3" && hf.hidden_size == 4096
+/// prefer_qwen3_8b_tp2_ada_shape  = ... && hf.model_type == "qwen3" && hf.hidden_size == 4096
+/// prefer_nemotron_h_tp2_ada_prefill_shape = ... && nemotron_h_selected
+/// ```
+///
+/// The first raised the prefill cap to 12288 for that one checkpoint; the
+/// second pinned N to a literal 5632. Their own comment asks to "keep the
+/// predicate architectural rather than checkpoint-name based" directly above
+/// a line comparing `model_type` to `"qwen3"` -- which is the whole of what
+/// `no_family_names.rs` exists to forbid.
+///
+/// Measured, not assumed: of the 85 rows, 80 are the 12288 branch
+/// (C++ `prefill_target=12288` against this crate's 8192), 3 are the literal
+/// 5632, and 2 are `MULTIRANK` rows carrying the same 5632 shape. Nothing
+/// else in the sweep moves.
+///
+/// **This list is a ceiling.** A row added here is a row exempted from the
+/// C++ comparison, so it is the one edit in this file that gives something
+/// up -- and `GOLDEN_COMMON_FNV1A64` has to be re-derived from a real oracle
+/// run when it changes, not adjusted to whatever the Rust now prints.
+const DIVERGED: &[&str] = &[
+    "grid/l40s/qwen3-8b",
+    "grid/a100/qwen3-8b",
+    "grid/h100/qwen3-8b",
+    "grid/b200/qwen3-8b",
+    "grid/ada6000/qwen3-8b",
+    "profile/auto/l40s/qwen3-8b",
+    "profile/auto/a100/qwen3-8b",
+    "profile/auto/h100/qwen3-8b",
+    "profile/auto/b200/qwen3-8b",
+    "profile/auto/ada6000/qwen3-8b",
+    "tp/1/l40s/qwen3-8b",
+    "tp/1/h100/qwen3-8b",
+    "tp/2/l40s/qwen3-8b",
+    "util/0.70/qwen3-8b",
+    "util/0.85/qwen3-8b",
+    "util/0.90/qwen3-8b",
+    "util/0.95/qwen3-8b",
+    "util/0.99/qwen3-8b",
+    "util/1.00/qwen3-8b",
+    "used/0gib",
+    "used/8gib",
+    "used/20gib",
+    "used/30gib",
+    "used/38gib",
+    "pin/0/0",
+    "pin/0/32",
+    "pin/0/256",
+    "pin/512/0",
+    "pin/512/32",
+    "pin/512/256",
+    "pin/2048/0",
+    "pin/2048/32",
+    "pin/2048/256",
+    "pin/8192/0",
+    "pin/8192/32",
+    "pin/8192/256",
+    "pin/12288/0",
+    "pin/12288/32",
+    "pin/12288/256",
+    "pin/65536/0",
+    "pin/65536/32",
+    "pin/65536/256",
+    "pinpage/0",
+    "pinpage/16",
+    "pinpage/32",
+    "pinpage/64",
+    "calib/l40s/qwen3-8b",
+    "calib/pinned-ignored",
+    "prof/warmup",
+    "prof/exact",
+    "prof/page-only",
+    "prof/tokens-only",
+    "prof/requests-only",
+    "prof/profile-only",
+    "prof/no-budget",
+    "prof/drift-small",
+    "prof/drift-edge",
+    "prof/drift-over",
+    "prof/drift-under",
+    "prof/nomatch",
+    "prof/nomatch-profile",
+    "prof/complaint-only",
+    "prof/complaint-and-shape",
+    "prof/calibrating-ignores-cache",
+    "prof/calibrating-hides-complaint",
+    "prof/calibrating-hides-nomatch",
+    "prof/drift-exact",
+    "tpsolo/2/l40s/qwen3-8b",
+    "tpsolo/2/ada6000/qwen3-8b",
+    "switch/env0/bf161/qwen3-8b",
+    "switch/env0/bf160/qwen3-8b",
+    "switch/env1/bf161/qwen3-8b",
+    "switch/env1/bf160/qwen3-8b",
+    "mtp/0/qwen3-8b",
+    "mtp/1/qwen3-8b",
+    "mtp/4/qwen3-8b",
+    "mtp/32/qwen3-8b",
+    "mtp/64/qwen3-8b",
+    "mtp/-1/qwen3-8b",
+    "narrow/100/4096",
+    "narrow/128/4096",
+    "rendezvous/tp1/unkeyed",
+    "rendezvous/tp1/keyed",
+    "rendezvous/tp2/unkeyed",
+    "rendezvous/tp2/keyed",
+];

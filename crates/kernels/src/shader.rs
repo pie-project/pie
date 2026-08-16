@@ -1,44 +1,15 @@
 //! The shader backends' operand vocabulary, written once.
 //!
-//! `.wiki/kernel-x/refactor-bigplan.md` §7 Stage 1: the vocabulary is shared
-//! and **identical in all three** shader backends. Measured over the 300
-//! table statements: `Buf` 139, `I32` 73, `BufMut` 57, `I32s` 22, `F32` 20,
-//! `U32s` 15, `U8s` 12, `Usize` 10, `U32` 8, `InPacked` 1.
+//! Identical in metal, vulkan and wgpu, so it is declared here rather than
+//! three times. The count is [`COUNT`], asserted rather than narrated, and it
+//! may rise as more signatures are written down.
 //!
-//! # It is not closed, and the reason is worth keeping
+//! What is NOT shared is the value a backend binds, so the impls are generic
+//! over [`ShaderValue`], which asks only how to read a buffer handle or a
+//! scalar out of one.
 //!
-//! That census said TEN, and this module said "ten types, no eleventh" until
-//! `ssm` crossed and needed `F32s` and `F32sMut`. The census was not wrong —
-//! it was complete over the rows that STATE their operands, and 285 of the 481
-//! entrypoints have rows that state none. A family whose rows are bare
-//! contributes nothing to an operand census and everything to the vocabulary
-//! the moment somebody writes its signatures down.
-//!
-//! So the count is [`COUNT`], asserted rather than narrated, and it may rise
-//! as the dark families cross. What stays true is the shared part: a type here
-//! is one all three backends can use, and none of them has one the others
-//! lack.
-//!
-//! So they are declared here rather than three times. What is NOT shared is
-//! the value a backend binds — metal's, vulkan's and wgpu's `ArgValue` are
-//! their own — so the impls are generic over [`ShaderValue`], which is the
-//! little a shared operand type needs to know about a backend's value: how to
-//! read a buffer handle or a scalar out of one, and how to make one.
-//!
-//! # Why not share the value too
-//!
-//! Because it is the one thing that is genuinely per-backend, and forcing it
-//! would put a variant in every backend that only one of them uses. A metal
-//! `ArgValue` may one day carry a function-constant; a vulkan one a
-//! specialisation constant. `ShaderValue` asks for the ten kinds all three
-//! already have and nothing else.
-//!
-//! # CUDA does not use this
-//!
-//! `kernels-cuda-new`'s vocabulary is not these ten — it has pointer arrays,
-//! by-value aggregates, `MaybeConst`, and a `void*` ABI that drops the operand
-//! type. Its `Arg` impls stay its own. This module is named `shader` and not
-//! `arg` for that reason.
+//! CUDA does not use this: its vocabulary has pointer arrays, by-value
+//! aggregates and a `void*` ABI that drops the operand type.
 
 use crate::Ty;
 use crate::routine::{Arg, Backend, Refusal};
@@ -71,22 +42,18 @@ pub trait ShaderValue: Copy {
     fn buffer(handle: u32) -> Self;
     /// A value naming a buffer the launcher may WRITE through.
     ///
-    /// Defaults to [`Self::buffer`], because for two of the three backends
-    /// the distinction is not carried in the value: wgpu binds every storage
-    /// entry the same way and metal's plan reads writability elsewhere.
+    /// Defaults to [`Self::buffer`]: wgpu binds every storage entry the same
+    /// way and metal reads writability elsewhere.
     ///
-    /// `driver-vulkan` overrides it, and the reason is measured. It puts a
-    /// barrier between two dispatches only when they touch the same bytes,
-    /// and it decides that from which operands a launch may WRITE. A fire is
-    /// a few hundred rectangles over one arena; barriering every neighbouring
-    /// pair costs 8 microseconds each on an RTX 4090, which was 3.8 ms of a
-    /// 7.2 ms decode. Under `kernel!` that fact came off the row's operand
-    /// types. A routine states it in the argument TYPE -- `BufMut` against
-    /// `Buf` -- and this is how the type reaches the driver, which sees only
-    /// values.
+    /// `driver-vulkan` overrides it, and the reason is measured: it barriers
+    /// two dispatches only when they touch the same bytes, decided from which
+    /// operands a launch may WRITE. Barriering every neighbouring pair costs
+    /// 8 microseconds each on an RTX 4090 -- 3.8 ms of a 7.2 ms decode. A
+    /// routine states the direction in the argument TYPE, and this is how that
+    /// reaches a driver that sees only values.
     ///
-    /// A backend that does not override it loses nothing: every buffer reads
-    /// as written, which is the coarse and SAFE direction.
+    /// Not overriding it loses nothing: every buffer reads as written, which
+    /// is the coarse and SAFE direction.
     #[must_use]
     fn buffer_mut(handle: u32) -> Self {
         Self::buffer(handle)
@@ -99,22 +66,36 @@ pub trait ShaderValue: Copy {
     fn f32(v: f32) -> Self;
     /// A value carrying a 64-bit extent.
     fn usize(v: u64) -> Self;
+    /// A value carrying a 64-bit signed scalar.
+    ///
+    /// Defaults to [`Self::i32`] truncated, because no shader plane has a
+    /// 64-bit scalar carrier: WGSL and Slang have no `i64` a kernel takes by
+    /// value, so a signature that spelled one could not have reached them.
+    /// CUDA overrides it -- `long long` is a real parameter width there.
+    #[must_use]
+    fn i64(v: i64) -> Self {
+        Self::i32(v as i32)
+    }
+    /// A value carrying a one-bit flag.
+    ///
+    /// Defaults to a zero-or-one `i32`, which is how the three shader planes
+    /// carry every flag: a uniform block has no one-byte cell. CUDA
+    /// overrides it, because `bool` is one byte in the ABI and a four-byte
+    /// write there is a write over the neighbouring parameter.
+    #[must_use]
+    fn bool(v: bool) -> Self {
+        Self::i32(i32::from(v))
+    }
 }
 
 /// How one shader LANGUAGE spells the twelve operand types.
 ///
-/// The vocabulary is shared because it is one closed set of twelve; the
-/// SPELLINGS are not, because there are three languages. WGSL writes a
-/// read-only storage binding `read` and a signed array `array<i32>`; Slang
-/// writes `StructuredBuffer<PIE_ACT>` and `StructuredBuffer<int>`; MSL writes
-/// a pointer. One shared constant would have to be one of the three and
-/// therefore wrong in the other two, which is the defect
-/// `.wiki/kernel-x/refactor-bigplan.md` §1 is about — a fact recorded away
-/// from the thing it is a fact about.
+/// The vocabulary is one closed set; the SPELLINGS are not, there being three
+/// languages. One shared constant would have to be one of the three and
+/// therefore wrong in the other two.
 ///
-/// Implemented on the backend MARKER (`Vulkan`, `Wgpu`, `Metal`), not on its
-/// value: the value is a runtime binding and the spelling is a property of the
-/// text the kernel is written in.
+/// Implemented on the backend MARKER and not on its value: the value is a
+/// runtime binding, the spelling a property of the text the kernel is in.
 pub trait Lang: Backend {
     /// A read-only opaque buffer.
     const BUF: &'static str;
@@ -194,6 +175,50 @@ macro_rules! buffer_arg {
         impl<V: ShaderValue> Bind<V> for $name {
             fn v(self) -> V {
                 V::$bind(self.0)
+            }
+        }
+
+        // A shader plane spells its weights `Weight<N, Buf>` -- the bound
+        // ARGUMENT type -- where CUDA spells `Weight<N, *const bf16>`, the
+        // POINTEE. The two are disjoint, so both impls sit in the floor.
+        impl<const N: usize, B: crate::Backend> crate::routine::Arg<B>
+            for crate::routine::Weight<N, $name>
+        where
+            $name: crate::routine::Arg<B>,
+        {
+            const TY: Ty = <$name as crate::routine::Arg<B>>::TY;
+            const PROV: crate::routine::Provenance =
+                <$name as crate::routine::Arg<B>>::PROV;
+            const SIDE: crate::routine::Side = crate::routine::Side::Placed;
+            const SPELLING: &'static str =
+                <$name as crate::routine::Arg<B>>::SPELLING;
+            const SOURCE: Option<crate::Source> =
+                Some(crate::Source::Slot(crate::Kind::Weight, N as u8));
+
+            fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
+                <$name as crate::routine::Arg<B>>::unpack(value, at)
+                    .map(|ptr| crate::routine::Weight { ptr })
+            }
+        }
+
+        // The same weight when the row may leave it out.
+        impl<const N: usize, B: crate::Backend> crate::routine::Arg<B>
+            for crate::routine::Weight<N, crate::routine::Env<$name>>
+        where
+            crate::routine::Env<$name>: crate::routine::Arg<B>,
+        {
+            const TY: Ty = <crate::routine::Env<$name> as crate::routine::Arg<B>>::TY;
+            const PROV: crate::routine::Provenance =
+                <crate::routine::Env<$name> as crate::routine::Arg<B>>::PROV;
+            const SIDE: crate::routine::Side = crate::routine::Side::Placed;
+            const SPELLING: &'static str =
+                <crate::routine::Env<$name> as crate::routine::Arg<B>>::SPELLING;
+            const SOURCE: Option<crate::Source> =
+                Some(crate::Source::Slot(crate::Kind::Weight, N as u8));
+
+            fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
+                <crate::routine::Env<$name> as crate::routine::Arg<B>>::unpack(value, at)
+                    .map(|ptr| crate::routine::Weight { ptr })
             }
         }
     };
@@ -361,25 +386,20 @@ impl<V: ShaderValue, T: Bind<V>> Bind<V> for crate::routine::Env<T> {
 
 /// `LaunchRule::Elementwise`: one lane per element of the whole rectangle.
 ///
-/// The lane arithmetic is shared and the bodies are not, and that is not a
-/// contradiction. `refactor-bigplan.md` §2 keeps the bodies separate because
-/// the three backends have a right to differ about tiles, workgroup sizes and
-/// tiers; §1.2 measured that the GRID arithmetic already agrees at the source
-/// level, character for character. This is that half, written once.
+/// The lane arithmetic is shared and the bodies are not: the backends have a
+/// right to differ about tiles and workgroup sizes, while the GRID arithmetic
+/// already agreed character for character.
 ///
 /// # Errors
 ///
 /// [`Refusal::Empty`] when either extent is zero or negative, and
 /// [`Refusal::Grid`] when the product does not fit a `u32`.
 ///
-/// Both are refusals rather than clamps because both fail SILENTLY otherwise.
-/// A dispatch of zero runs nothing and reports success over a buffer that
-/// keeps whatever it held; a product that WRAPPED covers a fraction of the
-/// rectangle and also reports success -- which is `driver-metal`'s
-/// quarter-prefill defect in miniature, and it is why this takes the product
-/// in `u64` and refuses rather than multiplying two `u32`s and hoping. An
-/// extent of zero arrives here honestly -- a routed expert that won no tokens
-/// has zero rows -- so it is a value the caller reads, not a panic.
+/// Refusals rather than clamps because both fail SILENTLY otherwise: a
+/// dispatch of zero runs nothing and reports success, and a product that
+/// WRAPPED covers a fraction of the rectangle and also reports success. Hence
+/// the product in `u64`. A zero extent arrives honestly -- a routed expert
+/// that won no tokens has zero rows -- so it is a value, not a panic.
 pub fn elementwise(width: i32, rows: i32) -> Result<[u32; 3], Refusal> {
     let [w, r] = rectangle(width, rows)?;
     let n = u64::from(w) * u64::from(r);
@@ -553,6 +573,12 @@ mod tests {
     impl Backend for Shader {
         type Value = V;
         type Ctx<'a> = ();
+
+        // This harness exists to check SPELLINGS, and a spelling has no
+        // shape. Every table it drives is a shader table.
+        fn region(_value: &V, _at: usize) -> Result<crate::routine::Extent, Refusal> {
+            Err(Refusal::Absent { what: "a region's shape: this harness binds spellings" })
+        }
     }
 
     /// Spellings that are recognisably no real language's, so a test that

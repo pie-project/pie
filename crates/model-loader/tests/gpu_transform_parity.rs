@@ -240,6 +240,56 @@ struct Device {
     base: *mut c_void,
 }
 
+/// Run `f`, swallowing a panic and the message it would print.
+///
+/// cudarc is built `fallback-dynamic-loading`, so a missing `libcudart`
+/// does not come back as an error -- it PANICS from inside the shim. A
+/// guard that reads the count and matches on the result therefore never
+/// runs on the machine it exists for, which is the one failure mode a
+/// skip guard cannot have. Only the FIRST cudarc call is wrapped: past
+/// it the library is known loaded, and catching panics any wider would
+/// turn a real failure into a skip.
+fn quietly<R>(f: impl FnOnce() -> R + std::panic::UnwindSafe) -> Option<R> {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let out = std::panic::catch_unwind(f);
+    std::panic::set_hook(hook);
+    out.ok()
+}
+
+/// Is there a CUDA device to run on, or should this test say why not?
+///
+/// `#![cfg(feature = "cuda")]` gates this file on a BUILD, and a build
+/// that names CUDA is not a machine that has it. Without this the three
+/// tests below called `cudaMalloc` on whatever came back and died on an
+/// `assert_eq!(status, cudaSuccess, "cudaMalloc")` -- a red suite, on a
+/// machine where the honest answer is "not here". CI builds this crate
+/// with `cuda-13` on runners with no GPU.
+fn device_or_skip(what: &str) -> bool {
+    // The count lives INSIDE the closure: a `&mut i32` captured across a
+    // catch is not `UnwindSafe`, and it does not need to be.
+    let probe = quietly(|| {
+        let mut count: i32 = 0;
+        // SAFETY: `count` is a live local. This is the first cudarc call
+        // the process makes, and the one that panics for a missing library.
+        let status = unsafe { rt::cudaGetDeviceCount(&raw mut count) };
+        (status, count)
+    });
+    let Some((status, count)) = probe else {
+        eprintln!("skipping {what}: no CUDA runtime library on this machine");
+        return false;
+    };
+    if status != rt::cudaError::cudaSuccess {
+        eprintln!("skipping {what}: cudaGetDeviceCount: {status:?}");
+        return false;
+    }
+    if count == 0 {
+        eprintln!("skipping {what}: no CUDA device");
+        return false;
+    }
+    true
+}
+
 impl Device {
     fn new(bytes: usize, max_write: usize) -> Self {
         let bytes = bytes.max(1);
@@ -414,6 +464,9 @@ fn same_bytes(what: &str, device: &[u8], host: &[u8]) -> usize {
 /// device and against the host and compares the whole arena.
 #[test]
 fn a_named_row_fires_on_the_device_and_agrees_with_the_host() {
+    if !device_or_skip("the named-row device/host parity") {
+        return;
+    }
     let quant = |scheme: QuantScheme, bits: u8, group: u32| {
         Encoding::Quant(QuantSpec {
             scheme,
@@ -527,6 +580,9 @@ fn a_named_row_fires_on_the_device_and_agrees_with_the_host() {
 /// same function by different routes and that is the whole comparison.
 #[test]
 fn the_unreachable_scale_row_agrees_with_the_host_when_fired_by_hand() {
+    if !device_or_skip("the hand-fired scale row") {
+        return;
+    }
     // The reference. `scales` is an internal so the factors reach the Scale as
     // an operand rather than as a published tensor.
     let contract = ModelContract {
@@ -632,6 +688,9 @@ fn the_unreachable_scale_row_agrees_with_the_host_when_fired_by_hand() {
 /// silent `Ok(false)` that would send the transform to the host.
 #[test]
 fn a_launch_the_jit_refuses_fails_the_load() {
+    if !device_or_skip("the refused-launch case") {
+        return;
+    }
     let span = ArenaSpan {
         offset: 0,
         len: BF16_BYTES as usize,

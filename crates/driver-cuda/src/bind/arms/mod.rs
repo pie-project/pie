@@ -1,31 +1,47 @@
 //! Trace symbol → what runs it.
 //!
-//! One module per kernel family, each holding the arms that used to be a
-//! `bind!` block inside `kernels-cuda`. They moved because they read the
-//! DRIVER's vocabulary: a backend kernels crate exposes routines and cannot
-//! know what a trace states, so joining the two is this side's job.
-//!
-//! An arm that cannot be written at all is still a row here, carrying the
-//! sentence that says why. That is what makes an unservable symbol a refusal
-//! naming the missing fact rather than a lookup that answers nothing.
+//! One module per kernel family. A symbol no arm can serve is still a row,
+//! carrying the reason, so it refuses by naming the missing fact rather than
+//! answering nothing. [`row_census`] counts the rows at compile time.
 
 use core::ffi::c_void;
 
 use kernels::Refusal;
+use kernels::routine::{In, Out};
 
 use super::cx::Cx;
+use super::table;
+
+/// The `In<N, T>` a hand arm would otherwise write out longhand.
+///
+/// A generic `fn` and not a closure: a closure cannot be generic over a const
+/// parameter, so an arm could bind slot 1's pointer with slot 0's width.
+pub fn in_region<const N: usize, E: kernels::Elem>(
+    cx: &Cx<'_>,
+    ptr: *const E,
+    rows: i32,
+) -> In<N, E> {
+    In { ptr, rows, width: cx.in_width(N).unwrap_or(0) }
+}
+
+/// [`in_region`]'s output half. Same argument, same reason for the const.
+pub fn out_region<const N: usize, E: kernels::Elem>(
+    cx: &Cx<'_>,
+    ptr: *mut E,
+    rows: i32,
+) -> Out<N, E> {
+    Out { ptr, rows, width: cx.out_width(N).unwrap_or(0) }
+}
 
 mod attn;
-/// The tensor-parallel collectives — `comm`'s two and `dist`'s three, in one
-/// file because a sharded model text picks between the two families by
-/// message size and an arm for either has to know what the other does.
+/// The tensor-parallel collectives, `comm`'s and `dist`'s in one file: a
+/// sharded model text picks between them by message size.
 mod comm;
-/// The FlashInfer FA2 lattice's six dispatches. `attn`'s namespace, and a
-/// file of its own because they read the plan caches and nothing else does.
+/// The FlashInfer FA2 dispatches. `attn`'s namespace, and a file of its own
+/// because they read the plan caches and nothing else does.
 mod fa2;
-/// The matmuls. **Not one arm among them**, which is why this file did not
-/// exist and is exactly why it has to: three symbols live deployments lower
-/// to were reaching a fire with no registry entry at all.
+/// The matmuls, none armed here; the rows exist so live symbols reach a fire
+/// with a registry entry.
 mod gemm;
 mod layout;
 mod mlp;
@@ -42,37 +58,23 @@ pub type Arm = fn(&Cx<'_>, *mut c_void) -> Result<(), Refusal>;
 
 /// One symbol's binding, or the reason it has none.
 ///
-/// # THREE states, not two, and the third is the one that was missing
+/// Three states, spelled by `arm` and `unbound` between them:
 ///
-/// `arm` and `unbound` spell them between them, and every combination means
-/// something:
-///
-/// * `Some(arm)` — this binding runs it. [`Route::Bound`].
-/// * `None` + `Some(why)` — nothing can run it, ever, for that reason.
-///   [`Route::Unbound`], which [`Route::refusal`] turns into a LOAD-time
-///   refusal: a model naming this symbol is rejected before it fires.
-/// * `None` + `None` — **the DRIVER's hand dispatch runs it**, and this row
-///   exists so the registry accounts for the symbol. [`Route::Driver`], which
-///   falls through to `bind::dispatch`'s match. Write it as
-///   [`Bound::driver`], never as a bare literal.
-///
-/// The third state existed as a `Route` variant from the beginning and
-/// nothing produced it, so a hand-dispatched symbol was indistinguishable
-/// from one no registry had heard of — both answered [`Route::Rows`], and a
-/// fire refused `NoArm` naming neither what was missing nor who would supply
-/// it. That is what `executor_bind.rs`'s
-/// `every_lowered_symbol_runs_or_says_why_not` measures, and it is why the
-/// distinction had to become writable rather than merely nameable.
+/// * `Some(arm)` -- this runs it. [`Route::Bound`].
+/// * `None` + `Some(why)` -- nothing can, ever. [`Route::Unbound`], a LOAD-time
+///   refusal.
+/// * `None` + `None` -- the driver's hand dispatch runs it. [`Route::Driver`];
+///   write it as [`Bound::driver`]. Without this state a hand-dispatched symbol
+///   is indistinguishable from one no registry has heard of.
 #[derive(Debug)]
 pub struct Bound {
     /// The symbol a trace states.
     pub symbol: &'static str,
     /// What runs it.
     pub arm: Option<Arm>,
-    /// Why nothing does, in the words the arm that would have used them.
+    /// Why nothing does.
     ///
-    /// `None` alongside `arm: None` is not "no reason given" — see the type's
-    /// own doc for what the pair means.
+    /// `None` beside `arm: None` is not "no reason given" -- see the type doc.
     pub unbound: Option<&'static str>,
 }
 
@@ -93,6 +95,40 @@ static FAMILIES: &[&[Bound]] = &[
     comm::ARMS,
 ];
 
+/// How the registry's rows are declared: `(armed, refused, driver)`.
+///
+/// A `const fn`, so it is recomputed every build. It cannot separate crossed
+/// from hand-armed: both are `arm: Some(..)` and const-eval may not compare
+/// function pointers.
+#[must_use]
+pub const fn row_census() -> (usize, usize, usize) {
+    let (mut armed, mut refused, mut driver) = (0usize, 0usize, 0usize);
+    let mut f = 0;
+    while f < FAMILIES.len() {
+        let rows = FAMILIES[f];
+        let mut i = 0;
+        while i < rows.len() {
+            match (rows[i].arm.is_some(), rows[i].unbound.is_some()) {
+                (true, _) => armed += 1,
+                (false, true) => refused += 1,
+                (false, false) => driver += 1,
+            }
+            i += 1;
+        }
+        f += 1;
+    }
+    (armed, refused, driver)
+}
+
+// `refused` rising means a symbol left the plane; `driver` rising means a row
+// wants something `Cx` may not offer (northstar §3.3).
+const _: () = {
+    let (armed, refused, driver) = row_census();
+    assert!(armed == 138);
+    assert!(refused == 31);
+    assert!(driver == 3);
+};
+
 /// The binding for one symbol, if any family declares one.
 #[must_use]
 pub fn bound(symbol: &str) -> Option<&'static Bound> {
@@ -100,22 +136,20 @@ pub fn bound(symbol: &str) -> Option<&'static Bound> {
 }
 
 impl Bound {
-    /// A symbol the DRIVER's hand dispatch runs, declared so the registry
+    /// A symbol the driver's hand dispatch runs, declared so the registry
     /// accounts for it.
     ///
-    /// Not an arm and not a refusal: `bind::dispatch`'s match holds the body,
-    /// because it needs something a [`Cx`] must not offer — a cuBLAS handle,
-    /// a fire-scoped state pointer, an aux slot the resolver owns. [`Cx`] is
-    /// query-only by `northstar.md` §3.3 and a `Cx` that could hand any of
-    /// those over is the surface that section says must not exist.
-    ///
-    /// **The entry buys the account, not the dispatch.** Without it the
-    /// symbol answers [`Route::Rows`] and is indistinguishable from one no
-    /// registry has heard of; with it, a reader asking "what runs this?" is
-    /// told, in the file where every other answer for the family lives.
+    /// The body needs something a [`Cx`] must not offer -- a cuBLAS handle, a
+    /// fire-scoped state pointer, a resolver-owned aux slot.
     #[must_use]
     pub const fn driver(symbol: &'static str) -> Self {
         Self { symbol, arm: None, unbound: None }
+    }
+
+    /// A symbol the DERIVED column runs: the row states every operand.
+    #[must_use]
+    pub const fn derived(symbol: &'static str) -> Self {
+        Self { symbol, arm: Some(table::derived_arm), unbound: None }
     }
 
     /// Run this binding, or refuse with the reason it has none.
@@ -127,11 +161,8 @@ impl Bound {
     pub fn call(&self, cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
         match self.arm {
             Some(arm) => arm(cx, stream),
-            // A [`Bound::driver`] row never reaches here -- `route` answers
-            // `Route::Driver` for it and the dispatch falls through without
-            // building a `Cx` -- so the `unwrap_or` is the message for a row
-            // that stated no reason and is not driver-dispatched either,
-            // which is a row somebody wrote wrong.
+            // A [`Bound::driver`] row never reaches here, so the `unwrap_or`
+            // is the message for a row somebody wrote wrong.
             None => Err(Refusal::Unstated { what: self.unbound.unwrap_or(self.symbol) }),
         }
     }
@@ -139,9 +170,8 @@ impl Bound {
 
 /// What will fire one symbol, decided once at model load.
 ///
-/// Four answers, not two: an `Option` cannot tell "nothing declares this" from
-/// "something declares it and nothing can run it", and the difference is the
-/// difference between a broken model and an unsupported one.
+/// An `Option` cannot tell "nothing declares this" from "something declares it
+/// and nothing can run it" -- a broken model against an unsupported one.
 #[derive(Clone, Copy, Debug, Default)]
 pub enum Route {
     /// This binding runs it.
@@ -183,16 +213,11 @@ pub fn route(symbol: &str) -> Route {
         return match (b.arm, b.unbound) {
             (Some(_), _) => Route::Bound(b),
             (None, Some(why)) => Route::Unbound(why),
-            // The third state — see [`Bound`]. It falls through to the hand
-            // dispatch, and it must NOT answer `Route::Unbound`: that answer
-            // is a load-time refusal, so encoding a hand-dispatched symbol
-            // that way would reject every model naming it.
+            // Must NOT answer `Route::Unbound`: that is a load-time refusal
+            // and would reject every model naming a hand-dispatched symbol.
             (None, None) => Route::Driver,
         };
     }
-    // Everything else falls through to the hand-dispatch match below: the
-    // driver's own ops and the lattices that have not crossed. They were two
-    // variants when `execution::service` could tell them apart; it is gone
-    // with the classification table, and both always fell through together.
+    // Everything else falls through to the hand-dispatch match.
     Route::Rows
 }

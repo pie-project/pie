@@ -1060,12 +1060,18 @@ fn the_split_gdn_pair_is_the_fused_kernel_to_the_bit() {
 /// point of the prefill form is invisible.
 const T_SCAN: usize = 5;
 
-/// The prefill scratch's row stride, in activation elements. Both prefill
-/// kernels read the prompt through it and `pitch_f = row_pitch / 2` is the
-/// fp32 scratch's stride, so it has to clear `2 * Hv * Dk = 1024` for `pre_q`
-/// as well as `CDIM` for `mixed`. Not a round number, because a pitch that
-/// happens to equal a tensor's width cannot tell a pitched read from a packed
-/// one.
+/// The PROMPT's row stride, in activation elements.
+///
+/// `mixed` alone: it is how far apart the in-projection's token rows sit, and
+/// a prefill's rectangle is a window into a packed projection. The fp32
+/// scratch used to share it -- `pitch_f = row_pitch / 2`, one number for four
+/// buffers -- which held only while the widest scratch row fit inside the
+/// projection. `pre_gate` carries `2*Hv + Hv*Dv` floats and qwen3-next's is
+/// 8320 against a conv_dim of 8192, so every token's value channels landed on
+/// the next token's gates. Each buffer is packed at its own width now.
+///
+/// Not a round number, and larger than `CDIM`, because a pitch that happens
+/// to equal a tensor's width cannot tell a pitched read from a packed one.
 const ROW_PITCH: usize = 1100;
 
 /// One token through the fused `gdn_core`, at `ROWS = 1` and one slot.
@@ -1191,7 +1197,7 @@ fn fire_prefill(
     let mixed_a = alloc_bf16(context, prompt, "mixed");
     let conv_state_a = alloc_f32(context, conv_state, "conv_state");
     let rstate_a = alloc_f32(context, rstate_in, "rstate");
-    let core_out_a = alloc_bf16(context, &vec![0.0; T_SCAN * ROW_PITCH], "core_out");
+    let core_out_a = alloc_bf16(context, &vec![0.0; T_SCAN * HV * DV], "core_out");
     let conv_w_a = alloc_bf16(context, &w.conv_w, "conv_w");
     let conv_b_a = alloc_bf16(context, &w.conv_b, "conv_b");
     let a_log_a = alloc_f32(context, &w.a_log, "A_log");
@@ -1199,13 +1205,23 @@ fn fire_prefill(
     let a_gate_a = alloc_bf16(context, &w.a_gate_rows, "a_gate");
     let b_gate_a = alloc_bf16(context, &w.b_gate_rows, "b_gate");
     let new_conv_a = alloc_f32(context, &vec![-99.0; KC * CDIM], "new_conv_state");
-    let pitch_f = ROW_PITCH / 2;
-    let pre_q_a = alloc_f32(context, &vec![-99.0; T_SCAN * pitch_f], "pre_q");
-    let pre_k_a = alloc_f32(context, &vec![-99.0; T_SCAN * pitch_f], "pre_k");
-    let pre_gate_a = alloc_f32(context, &vec![-99.0; T_SCAN * pitch_f], "pre_gate");
-    // A single slot for the whole prompt: both prefill kernels read
-    // `slot_ids[0]` and nothing else.
-    let slot_a = alloc_words(context, &[0], "slot_ids");
+    // Every scratch row is packed at its OWN width -- `row_pitch` describes
+    // `mixed` and nothing else. See `gdn_prep.metal:377`: one shared pitch
+    // has to clear the widest row, and `pre_gate`'s `2*Hv + Hv*Dv` beats a
+    // real stack's conv_dim.
+    let qk_pitch = HV * DK;
+    let g_pitch = 2 * HV + HV * DV;
+    let pre_q_a = alloc_f32(context, &vec![-99.0; T_SCAN * qk_pitch], "pre_q");
+    let pre_k_a = alloc_f32(context, &vec![-99.0; T_SCAN * qk_pitch], "pre_k");
+    let pre_gate_a = alloc_f32(context, &vec![-99.0; T_SCAN * g_pitch], "pre_gate");
+    // ONE SEAT PER ROW, all the same seat: this prompt is one request.
+    //
+    // This staged a single word, because both prefill kernels read
+    // `slot_ids[0]` and nothing else -- which is also why a fire holding two
+    // requests convolved the second over the first's tokens. They read the
+    // table per row now, and the row where the seat changes is the request
+    // boundary.
+    let slot_a = alloc_words(context, &vec![0u32; T_SCAN], "slot_ids");
 
     let fill = |bind: &[(usize, u64)], wide: usize| -> Vec<BoundArg> {
         let mut args = vec![
@@ -1349,13 +1365,8 @@ fn fire_prefill(
         .run(|encoder| encode(encoder, &table, &pipelines, &staged, &dispatches))
         .unwrap_or_else(|why| panic!("`{scan_sym}` fires: {why}"));
 
-    let wide = read_bf16(&core_out_a, T_SCAN * ROW_PITCH);
-    let mut out = Vec::with_capacity(T_SCAN * HV * DV);
-    for t in 0..T_SCAN {
-        out.extend_from_slice(&wide[t * ROW_PITCH..t * ROW_PITCH + HV * DV]);
-    }
     (
-        out,
+        read_bf16(&core_out_a, T_SCAN * HV * DV),
         read_f32(&rstate_a, HV * DV * DK),
         read_f32(&new_conv_a, KC * CDIM),
     )
@@ -1465,8 +1476,13 @@ fn the_prefill_scan_answers_the_decode_walked_token_by_token() {
         conv_b: spread(CDIM, 7),
         a_log: (0..HV).map(|h| h as f32 * 0.25 - 0.5).collect(),
         dt_bias: spread(HV, 11),
-        a_gate_rows: spread(T_SCAN * ROW_PITCH, 13),
-        b_gate_rows: spread(T_SCAN * ROW_PITCH, 17),
+        // Hv per token, which is the width `in_proj_a` and `in_proj_b`
+        // produce. These were `T_SCAN * ROW_PITCH` and the decode oracle read
+        // them at that stride too, so the prefill prep's `a_gate[row_t + hv]`
+        // -- the PROMPT's pitch on a buffer Hv wide -- read exactly what the
+        // oracle expected and the pair agreed on the wrong layout.
+        a_gate_rows: spread(T_SCAN * HV, 13),
+        b_gate_rows: spread(T_SCAN * HV, 17),
     };
     // The prompt, row-pitched. Only the first `CDIM` of each stride is read,
     // and the rest exists to make a packed read answer differently.
@@ -1480,7 +1496,10 @@ fn the_prefill_scan_answers_the_decode_walked_token_by_token() {
     let mut rst = rstate0.clone();
     let mut want_out: Vec<f32> = Vec::with_capacity(T_SCAN * HV * DV);
     for t in 0..T_SCAN {
+        // Two strides, and they are different buffers: the prompt is pitched
+        // and the gates are packed at Hv.
         let base = t * ROW_PITCH;
+        let gate = t * HV;
         let (out, next_rst, next_conv) = fire_fused_one(
             &context,
             &compiler,
@@ -1488,8 +1507,8 @@ fn the_prefill_scan_answers_the_decode_walked_token_by_token() {
             &conv,
             &rst,
             &w,
-            &w.a_gate_rows[base..base + HV],
-            &w.b_gate_rows[base..base + HV],
+            &w.a_gate_rows[gate..gate + HV],
+            &w.b_gate_rows[gate..gate + HV],
         );
         want_out.extend_from_slice(&out);
         rst = next_rst;

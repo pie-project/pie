@@ -1,30 +1,9 @@
 //! The recurrent state cache: allocation, slot resets and slot copies.
 //!
-//! Port of `driver-cuda/csrc/src/store/recurrent_state_cache.{hpp,cpp}`.
-//! [`crate::layout::recurrent_layout`] already holds the stride and offset
-//! arithmetic; this module is the object that owns the four buffers and turns
-//! runtime requests into stream operations.
-//!
-//! Structured the same way as [`crate::pools::kv_cache`]: every device
-//! operation is produced as a **value** first -- a [`StateOp`] -- and executed
-//! second. A `cudaMemset2DAsync` with the wrong pitch does not fail, it zeroes
-//! another layer's state and shows up thousands of tokens later as a quality
-//! regression, so the descriptors are what the differential oracle checks.
-//!
-//! Four buffers, all pooled and flat:
-//!
-//! | buffer | shape | dtype |
-//! |---|---|---|
-//! | conv | `[linear_layers, slots, conv_kernel * conv_dim]` | `u16` |
-//! | recurrent | `[linear_layers, slots, v_heads * k_dim * v_dim]` | `bf16`/`f32` |
-//! | mtp pending hidden | `[slots, hidden_size]` | `u16` |
-//! | verify stash | `[linear_layers, max_tokens, hidden]` | `u16` |
-//! | rs buffer pool | `[linear_layers, slots, page_tokens, hidden]` | `u16` |
-//!
-//! The first two are `[layer, slot, state]` and not `[slot, layer, state]`
-//! precisely so a whole-slot reset is one strided 2D operation per buffer
-//! rather than one call per layer: slot `s` appears at a constant offset with
-//! a constant pitch, which is exactly `cudaMemset2DAsync`'s argument shape.
+//! Every device op is produced as a [`StateOp`] value first and executed
+//! second: a `cudaMemset2DAsync` with the wrong pitch silently zeroes another
+//! layer's state. The conv and recurrent buffers are `[layer, slot, state]`, so
+//! a whole-slot reset is one strided 2D op with a constant offset and pitch.
 
 use crate::error::{Error, Result};
 use crate::layout::recurrent_layout::{RecurrentShape, RecurrentStateLayout};
@@ -52,12 +31,8 @@ impl Buffer {
     }
 }
 
-/// One device operation the cache wants performed.
-///
-/// An enum rather than an immediate call because these are the whole
-/// observable behaviour of `reset`, `reset_slot` and the two copies. Nothing
-/// about a `cudaMemset2DAsync` is checkable after the fact, so it is checked
-/// before the fact.
+/// One device operation the cache wants performed. A value, not an immediate
+/// call: a `cudaMemset2DAsync` is not checkable after the fact, so check before.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateOp {
     /// Contiguous zero fill: `cudaMemsetAsync(base + offset, 0, len)`.
@@ -69,8 +44,7 @@ pub enum StateOp {
         /// Bytes to zero.
         len: u64,
     },
-    /// Strided zero fill: `cudaMemset2DAsync(base + offset, pitch, 0, width,
-    /// rows)`. One row per linear layer.
+    /// Strided zero fill, one row per linear layer.
     Memset2D {
         /// Which buffer.
         buffer: Buffer,
@@ -110,10 +84,8 @@ pub enum StateOp {
         rows: u64,
     },
     /// The `zero_slots_if_fresh` kernel: a device-predicated scatter reset.
-    ///
     /// Distinct from [`Self::Memset2D`] because the slot ids live in device
-    /// memory -- the host cannot know which rows will be touched, so it cannot
-    /// be expressed as a fixed offset.
+    /// memory, so the touched rows are not a fixed host-side offset.
     ZeroSlotsIfFresh {
         /// Which buffer.
         buffer: Buffer,
@@ -160,12 +132,9 @@ pub struct PoolDims {
 /// Bytes per `u16` element -- conv, MTP hidden, stash and pool are all `u16`.
 const U16: u64 = 2;
 
-/// The `PIE_RS_STASH_TOKENS` override, parsed the way `std::atoi` parses.
-///
-/// `atoi` returns 0 for anything it cannot read, including an empty string and
-/// trailing garbage after a valid prefix -- and 0 is exactly the value
-/// `configure_verify_hidden_stash` ignores, so a typo silently leaves the
-/// stash at its full prefill width rather than failing.
+/// The `PIE_RS_STASH_TOKENS` override, parsed the way `std::atoi` parses:
+/// unreadable input yields 0, which `configure_verify_hidden_stash` ignores, so
+/// a typo silently leaves the stash at its full prefill width.
 #[must_use]
 pub fn stash_tokens_cap() -> Option<i32> {
     let raw = std::env::var("PIE_RS_STASH_TOKENS").ok()?;
@@ -182,37 +151,15 @@ pub fn stash_tokens_cap() -> Option<i32> {
     Some(i32::try_from(sign * v).unwrap_or(i32::MAX))
 }
 
-/// Whether recurrent state is stored as `bf16`.
-///
-/// **Always true.** The C++ reads
-///
-/// ```text
-/// const char* v = nullptr;
-/// if (v == nullptr) return true;
-/// ```
-///
-/// -- the `std::getenv("PIE_QWEN35_RS_STATE_DTYPE")` that used to initialise
-/// `v` has been deleted, so the whole spelling table below it (`fp32`,
-/// `float32`, `bf16`, `bfloat16`, leading `0`/`1`) is unreachable and the
-/// switch documented in the header no longer exists.
-///
-/// Ported as a constant rather than as a re-implemented env lookup, because
-/// re-adding the lookup would change behaviour: several downstream things --
-/// the fp32 `recurrent_states_` buffer, the `recurrent_state()` accessor, and
-/// `allocate_bf16_recurrent`'s re-allocation path -- have been dead long
-/// enough that nothing has been exercising them. This is the one place that
-/// says so.
+/// Whether recurrent state is stored as `bf16`. Always true — a constant, not
+/// the deleted `PIE_QWEN35_RS_STATE_DTYPE` lookup; the fp32 paths are long dead.
 #[must_use]
 pub const fn recurrent_state_bf16_default() -> bool {
     true
 }
 
 impl RecurrentStateCache {
-    /// Plan a cache.
-    ///
-    /// `hidden_size` clamps up at 0 and `max_slots` clamps up at 1, both
-    /// matching the C++. A zero `hidden_size` means "no MTP tier" rather than
-    /// an error, because the non-MTP models simply do not pass one.
+    /// Plan a cache. A zero `hidden_size` means "no MTP tier", not an error.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn allocate(
@@ -226,8 +173,7 @@ impl RecurrentStateCache {
         max_slots: i32,
     ) -> Self {
         let hidden_size = hidden_size.max(0).unsigned_abs();
-        // Not clamped up to 1 here: `RecurrentStateLayout::new` owns that, and
-        // clamping in both places would leave neither one load-bearing.
+        // Not clamped to 1 here: `RecurrentStateLayout::new` owns that.
         let max_slots = max_slots.max(0).unsigned_abs();
         Self {
             layout: RecurrentStateLayout::new(
@@ -249,18 +195,8 @@ impl RecurrentStateCache {
         }
     }
 
-    /// Plan a cache whose recurrent state is `bf16` regardless of the default.
-    ///
-    /// Nemotron-H's Mamba2 state is defined in activation dtype, and fp32
-    /// storage is too large at serving request counts.
-    ///
-    /// The C++ implements this by calling `allocate` and then *re-allocating*
-    /// the recurrent slab if the default came back fp32 -- which, since
-    /// [`recurrent_state_bf16_default`] is now a constant `true`, never
-    /// happens. Here the flag is simply forced, so no allocation is made and
-    /// discarded. The observable result is identical; what differs is that the
-    /// C++ would issue a second `cudaMalloc` and a second full `reset` if the
-    /// default ever changed back.
+    /// Plan a cache whose recurrent state is `bf16` regardless of the default —
+    /// Nemotron-H's Mamba2 state is in activation dtype, and fp32 is too large.
     #[must_use]
     pub fn allocate_bf16_recurrent(
         layer_is_linear: &[bool],
@@ -303,11 +239,6 @@ impl RecurrentStateCache {
     }
 
     /// Whether the MTP pending-hidden buffer exists.
-    ///
-    /// The C++ tests `mtp_pending_hidden_.data() != nullptr && hidden_size_ >
-    /// 0`. Both halves are the same condition -- a `DeviceBuffer` of zero
-    /// elements never allocates -- but the redundancy is preserved in one
-    /// place here so the call sites read as one question.
     #[must_use]
     pub const fn has_mtp_hidden(&self) -> bool {
         self.layout.hidden_size() > 0
@@ -319,9 +250,7 @@ impl RecurrentStateCache {
         self.verify_stash.is_some()
     }
 
-    /// Channels in the causal-conv state — `KvCache`-style forwarding so
-    /// the generated bodies' `state_cache.conv_dim()` reads translate
-    /// one-to-one; the layout remains the single statement of the shape.
+    /// Channels in the causal-conv state.
     #[must_use]
     pub const fn conv_dim(&self) -> u32 {
         self.layout.conv_dim()
@@ -381,9 +310,8 @@ impl RecurrentStateCache {
         self.layout.conv_slot_stride_bytes()
     }
 
-    /// Elements between consecutive slots of `recurrent_state` — the C++
-    /// spells this `recurrent_slot_stride_floats`, a name that predates the
-    /// bf16 storage; the elements have not been floats since.
+    /// Elements between consecutive slots of `recurrent_state`. The `floats`
+    /// in the name predates bf16 storage; the elements are not floats.
     #[must_use]
     pub const fn recurrent_slot_stride_floats(&self) -> u64 {
         self.layout.recurrent_slot_stride_elems()
@@ -395,8 +323,7 @@ impl RecurrentStateCache {
         self.layout.recurrent_slot_stride_bytes()
     }
 
-    /// The verify stash's token capacity, `0` when unconfigured — the C++
-    /// field's resting value.
+    /// The verify stash's token capacity, `0` when unconfigured.
     #[must_use]
     pub const fn verify_stash_max_tokens(&self) -> u32 {
         match self.verify_stash {
@@ -432,10 +359,8 @@ impl RecurrentStateCache {
         self.rs_buffer_pool
     }
 
-    /// Zero every slot of every linear layer, plus the MTP tier.
-    ///
-    /// Issued at the start of each fresh prefill: this driver's batching model
-    /// carries no recurrent state across prefills.
+    /// Zero every slot of every linear layer, plus the MTP tier. Issued at each
+    /// fresh prefill — this driver carries no recurrent state across prefills.
     #[must_use]
     pub fn reset(&self) -> Vec<StateOp> {
         let mut ops = Vec::new();
@@ -495,11 +420,8 @@ impl RecurrentStateCache {
         Ok(ops)
     }
 
-    /// Device-predicated reset for the rows a fixed envelope marks fresh.
-    ///
-    /// Returns no operations at all when `request_count == 0`, matching the
-    /// C++'s early return. The kernel is not launched with a zero grid; it is
-    /// not launched.
+    /// Device-predicated reset for the rows a fixed envelope marks fresh; no
+    /// operations when `request_count == 0`.
     #[must_use]
     pub fn reset_slots_if_fresh(
         &self,
@@ -527,8 +449,7 @@ impl RecurrentStateCache {
         }
         if self.has_mtp_hidden() {
             let hidden_bytes = u64::from(self.layout.hidden_size()) * U16;
-            // One row, not `layers`: the MTP tier is `[slots, hidden]` with no
-            // layer axis at all.
+            // One row, not `layers`: the MTP tier is `[slots, hidden]`, no layer axis.
             ops.push(StateOp::ZeroSlotsIfFresh {
                 buffer: Buffer::MtpHidden,
                 slot_bytes: hidden_bytes,
@@ -561,14 +482,10 @@ impl RecurrentStateCache {
         Ok(ops)
     }
 
-    /// Copy only the conv and recurrent slabs, leaving MTP pending-hidden
-    /// alone.
+    /// Copy only the conv and recurrent slabs, leaving MTP pending-hidden alone.
     ///
-    /// The asymmetry is deliberate in the C++ and preserved here: a
-    /// speculative verifier rollback restores recurrent state to the accepted
-    /// prefix, but the MTP state was already rebuilt from exactly those
-    /// accepted tokens, so copying it would overwrite the newer value with an
-    /// older one.
+    /// Deliberate asymmetry: a rollback restores recurrent state, but MTP was
+    /// already rebuilt from those tokens, so copying it overwrites new with old.
     ///
     /// # Errors
     ///
@@ -598,20 +515,12 @@ impl RecurrentStateCache {
             .collect()
     }
 
-    /// Configure the frozen-verify hidden stash.
+    /// Configure the frozen-verify hidden stash. A no-op when any dimension is
+    /// zero or the model has no linear layers.
     ///
-    /// A no-op when any dimension is zero or the model has no linear layers,
-    /// matching the C++'s early return -- so a caller cannot tell a rejected
-    /// configuration from one it never made.
-    ///
-    /// `stash_tokens_cap` is the `PIE_RS_STASH_TOKENS` override, which only
-    /// ever lowers `max_tokens`. It exists because `max_tokens` arrives as a
-    /// *prefill* width (8192) while the stash is only written on a
-    /// frozen-verify fire, whose width is draft-tokens x requests (~256). At
-    /// 8192 x 10336 x 48 layers x 2 B the untrimmed stash is 7752 MiB, the
-    /// largest single item in the state arena -- and the state arena is
-    /// charged in full at every frame commit, even though prefill never
-    /// touches this buffer.
+    /// `stash_tokens_cap` (`PIE_RS_STASH_TOKENS`) only lowers `max_tokens`: it
+    /// arrives as a full prefill width, but the stash fires only on a far-smaller
+    /// frozen-verify, so the untrimmed buffer wastes the arena's largest slot.
     pub fn configure_verify_hidden_stash(
         &mut self,
         max_tokens: u32,
@@ -631,11 +540,9 @@ impl RecurrentStateCache {
         self.verify_stash = Some(StashDims { max_tokens, hidden });
     }
 
-    /// Byte offset of one linear layer's stash region.
-    ///
-    /// `None` when the stash is not configured or `linear_idx` is out of
-    /// range. Indexed by the **dense** linear index, not the transformer layer
-    /// index -- the caller has already compacted.
+    /// Byte offset of one linear layer's stash region. `None` when unconfigured
+    /// or out of range. Indexed by the dense linear index, not the transformer
+    /// layer index.
     #[must_use]
     pub fn verify_hidden_stash_layer(&self, linear_idx: u32) -> Option<u64> {
         let dims = self.verify_stash?;
@@ -656,9 +563,8 @@ impl RecurrentStateCache {
         })
     }
 
-    /// Configure the persistent buffered-activation pool.
-    ///
-    /// A no-op when any dimension is zero or the model has no linear layers.
+    /// Configure the persistent buffered-activation pool. A no-op when any
+    /// dimension is zero or the model has no linear layers.
     pub fn configure_rs_buffer_pool(&mut self, page_tokens: u32, hidden: u32, num_slots: u32) {
         if page_tokens == 0 || hidden == 0 || num_slots == 0 || self.layout.num_linear_layers() == 0
         {
@@ -671,13 +577,8 @@ impl RecurrentStateCache {
         });
     }
 
-    /// Byte offset of one buffered slab.
-    ///
-    /// `None` when the pool is not configured or either index is out of range.
-    /// `slot` indexes the **pool's own** slot count, which is independent of
-    /// `max_slots`: the runtime's arena hands out `RsSlab` object ids, and
-    /// there are as many of those as there are buffered slabs, not as there
-    /// are concurrent requests.
+    /// Byte offset of one buffered slab. `None` when unconfigured or out of
+    /// range. `slot` indexes the pool's own slot count, not `max_slots`.
     #[must_use]
     pub fn rs_buffer_slab(&self, linear_idx: u32, slot: u32) -> Option<u64> {
         let dims = self.rs_buffer_pool?;
@@ -704,15 +605,12 @@ impl RecurrentStateCache {
     }
 
     /// Byte offset of one layer/slot's conv state within the conv buffer.
-    ///
-    /// `Ok(None)` for a full-attention layer, which has no recurrent state and
-    /// whose C++ counterpart returns a null pointer -- a legitimate answer
-    /// that callers branch on, not a failure.
+    /// `Ok(None)` for a full-attention layer is a legitimate answer, not a
+    /// failure.
     ///
     /// # Errors
     ///
-    /// [`Error::Invalid`] when `slot` or `layer` is out of range. The **slot**
-    /// is checked first; asking for layer -1 of slot -1 reports the slot.
+    /// [`Error::Invalid`] when `slot` or `layer` is out of range (slot first).
     pub fn conv_state(&self, layer: i32, slot: i32) -> Result<Option<u64>> {
         self.checked_index(layer, slot, "RecurrentStateCache::conv_state")
             .map(|idx| {
@@ -724,11 +622,8 @@ impl RecurrentStateCache {
             })
     }
 
-    /// Byte offset of one layer/slot's recurrent state within its buffer.
-    ///
-    /// Named for the C++ `recurrent_state_raw`, but the C++ reports itself as
-    /// `recurrent_state` in both of its exceptions -- the `_raw` suffix was
-    /// added later and the messages were not updated. Preserved verbatim.
+    /// Byte offset of one layer/slot's recurrent state within its buffer. The
+    /// error names itself `recurrent_state`, not `_raw`, matching the C++.
     ///
     /// # Errors
     ///
@@ -744,19 +639,13 @@ impl RecurrentStateCache {
             })
     }
 
-    /// The `f32` view of the recurrent state.
-    ///
-    /// **Always an error.** The C++ checks `recurrent_state_bf16_` before it
-    /// checks anything else, and that flag is now unconditionally true (see
-    /// [`recurrent_state_bf16_default`]) -- so this accessor cannot succeed
-    /// for any argument, valid or not. Kept, and kept failing, because callers
-    /// that still reach for a `float*` should say so loudly rather than get a
-    /// pointer to `bf16` and read garbage.
+    /// The `f32` view of the recurrent state. Always an error while the state is
+    /// `bf16` (now unconditional): reaching for a `float*` should fail loudly,
+    /// not read `bf16` as garbage.
     ///
     /// # Errors
     ///
-    /// Always, while the recurrent state is `bf16`; otherwise as
-    /// [`Self::recurrent_state_raw`].
+    /// Always while `bf16`; else as [`Self::recurrent_state_raw`].
     pub fn recurrent_state_f32(&self, layer: i32, slot: i32) -> Result<Option<u64>> {
         if self.layout.recurrent_is_bf16() {
             return Err(Error::invalid(
@@ -767,9 +656,8 @@ impl RecurrentStateCache {
         self.recurrent_state_raw(layer, slot)
     }
 
-    /// Byte offset of one slot's MTP pending-hidden row.
-    ///
-    /// `Ok(None)` when the model has no MTP tier.
+    /// Byte offset of one slot's MTP pending-hidden row. `Ok(None)` when the
+    /// model has no MTP tier.
     ///
     /// # Errors
     ///
@@ -816,11 +704,8 @@ impl RecurrentStateCache {
         ]
     }
 
-    /// `who` is the name the C++ puts in the `std::out_of_range`, which is
-    /// not always the name of the method that throws: `recurrent_state_raw`
-    /// reports itself as `recurrent_state`, and `copy_slot_d2d` and
-    /// `copy_linear_state_slot_d2d` report separately. Passing it in keeps
-    /// those quirks at the call sites where they are visible.
+    /// `who` is the name reported in the error, which is not always the calling
+    /// method's name; passing it in keeps those quirks at the call sites.
     fn check_slot(&self, slot: i32, who: &'static str) -> Result<()> {
         if slot < 0 || slot.unsigned_abs() >= self.layout.max_slots() {
             return Err(Error::invalid(who, "slot out of range"));
@@ -858,7 +743,6 @@ mod tests {
         let c = cache();
         let ops = c.reset();
         assert_eq!(ops.len(), 3);
-        // conv: 4 taps * 128 ch * 2 B = 1024 per slot, 4 slots, 3 layers.
         assert_eq!(
             ops[0],
             StateOp::Memset {
@@ -867,7 +751,6 @@ mod tests {
                 len: 1024 * 4 * 3,
             }
         );
-        // recurrent: 2*8*16 = 256 elems * 2 B (bf16) = 512 per slot.
         assert_eq!(
             ops[1],
             StateOp::Memset {
@@ -958,7 +841,6 @@ mod tests {
     fn the_buffer_pool_slot_axis_is_its_own_not_max_slots() {
         let mut c = cache();
         c.configure_rs_buffer_pool(16, 32, 9);
-        // per slab: 16*32*2 = 1024 B. Layer 1 starts after 9 slabs.
         assert_eq!(c.rs_buffer_slab(1, 0), Some(9 * 1024));
         assert_eq!(c.rs_buffer_slab(1, 8), Some(9 * 1024 + 8 * 1024));
         assert_eq!(c.rs_buffer_slab(1, 9), None);

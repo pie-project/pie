@@ -6,10 +6,9 @@
 //! symbol so that a second activation dtype is a point, not eleven new names.
 #![allow(clippy::too_many_arguments)]
 
-use kernels::KernelSig;
 use kernels::routine::Refusal;
 
-use crate::routine::{Bind, Buf, BufMut, Ctx, Env, Fire, Routine};
+use crate::routine::{Else, Nth, Over, Reckoned, Say, keys, Ask, Bind, Block, Buf, BufMut, Ctx, Env, Fire, I32s, InSlot, OutSlot, Param, ParamOr, Routine, Weight};
 
 /// The entrypoints this family's crossed routines spell, now that their
 /// rows are gone. See [`crate::RETIRED`].
@@ -23,12 +22,16 @@ pub static ENTRYPOINTS: &[&str] = &[
     "rms_residual_bfloat16",
     "rms_residual_scaled_bfloat16",
     "rms_single_row_bfloat16",
+    "rms_rope_bfloat16",
+    "rms_rope_decode_bfloat16",
+    "rms_rope_freqs_bfloat16",
+    "rms_rope_freqs_decode_bfloat16",
+    "rms_rope_prop_bfloat16",
+    "rms_rope_prop_decode_bfloat16",
     "rms_strided_head_row_bfloat16",
     "rms_strided_row_bfloat16",
     "vnorm_single_row_bfloat16",
 ];
-
-pub static KERNELS: &[KernelSig] = &[];
 
 /// The workgroup width every reducing kernel in this file is compiled at.
 ///
@@ -137,13 +140,13 @@ fn per_head_row(heads: i32, rows: i32) -> Result<[u32; 3], Refusal> {
 /// See [`per_axis`].
 pub fn rms_single_row(
     ctx: &Ctx<'_>,
-    x: Buf,
-    w: Buf,
-    out: BufMut,
-    params: Buf,
-    width: Env<i32>,
-    axis: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    w: Weight<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    width: Ask<keys::Width, i32>,
+    axis: ParamOr<1, keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -167,12 +170,12 @@ pub fn rms_single_row(
 /// See [`per_row`].
 pub fn rms_strided_row(
     ctx: &Ctx<'_>,
-    x: Buf,
-    w: Buf,
-    out: BufMut,
-    params: Buf,
-    row_pitch: i32,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    w: Weight<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    row_pitch: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -196,20 +199,135 @@ pub fn rms_strided_row(
 /// See [`per_head_row`].
 pub fn rms_strided_head_row(
     ctx: &Ctx<'_>,
-    x: Buf,
-    w: Buf,
-    out: BufMut,
-    params: Buf,
-    row_pitch: i32,
-    heads: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    w: Weight<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    row_pitch: Ask<keys::Width, i32>,
+    heads: Reckoned<Over<Say<keys::Width>, Else<Nth<1>, Say<keys::Width>>>, Env<i32>>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: "rms_strided_head_row_bfloat16",
-            lanes: per_head_row(*heads, *rows)?,
+            lanes: per_head_row(**heads, *rows)?,
         },
         &[x.v(), w.v(), out.v(), params.v(), row_pitch.v()],
+    )
+}
+
+/// One workgroup per `(head, row)`, refusing the rotary widths the fused
+/// kernel cannot express.
+///
+/// The extent is [`per_head_row`]'s exactly -- the fusion changes what a
+/// workgroup DOES and not how many there are -- so this only adds the two
+/// refusals that come with carrying a rotation.
+///
+/// # Errors
+///
+/// [`per_head_row`]'s, plus:
+///
+/// [`Refusal::Empty`] for an empty rotary extent, which would be a norm
+/// spelled as a rotation.
+///
+/// [`Refusal::Narrow`] for an ODD rotary. The kernel pairs `i` with `i +
+/// rotary/2` and its tail loop starts at `rotary`, so an odd extent leaves
+/// element `rotary - 1` in neither: it belongs to no pair and is below the
+/// tail, and would come out RAW -- neither rotated nor normed nor even
+/// multiplied by the gain. `rope.rs`'s `rope_grid` refuses the same shape for
+/// the same reason and this is that refusal restated where the fused kernel
+/// can see it.
+///
+/// [`Refusal::Wide`] for a rotary past the head. Rotating beyond `axis_size`
+/// would reach into the next head's channels, which is a silent corruption
+/// rather than a fault because the buffer is long enough for it.
+fn per_head_row_rotating(
+    heads: i32,
+    rows: i32,
+    rotary: i32,
+    axis: i32,
+) -> Result<[u32; 3], Refusal> {
+    if rotary <= 0 {
+        return Err(Refusal::Empty { what: "rotary" });
+    }
+    if rotary % 2 != 0 {
+        return Err(Refusal::Narrow {
+            what: "rotary",
+            at: i64::from(rotary),
+        });
+    }
+    if axis > 0 && rotary > axis {
+        return Err(Refusal::Wide {
+            what: "rotary",
+            at: i64::from(rotary),
+            max: i64::from(axis),
+        });
+    }
+    per_head_row(heads, rows)
+}
+
+/// [`rms_strided_head_row`] with the NEOX rotation that always follows it
+/// folded into its epilogue.
+///
+/// Two of a decode layer's eleven stages are the q/k norm and then the rope,
+/// in that order, over the same tensor and at the same shape. This is that
+/// pair as one dispatch. The whole case for it is the barrier between them --
+/// a decode step on this backend is 73% ordering -- and the measurement that
+/// says the merge does not give it back is `tests/norm_bench.rs`.
+///
+/// # The operand order is the SHADER's
+///
+/// `x, w, params, position`, and `x` is bound once as a `BufMut` because the
+/// rotation is in place, which is `rope.rs`'s convention and not
+/// [`rms_strided_head_row`]'s. The norm alone is out-of-place and states an
+/// input and an output; the fused form cannot be, because the rotation reads
+/// what the norm just wrote.
+///
+/// # Nine stated params and no push range
+///
+/// `binding::params` places a launch's scalars in a push range OR in a
+/// parameter buffer and never both -- it asks push first, and a module
+/// answering with the right push size "is not also hiding a parameter
+/// buffer". A norm needs a struct, so this kernel's scalars all ride it, and
+/// the statement states nine where every other norm states five.
+///
+/// The four extra are `row_pitch`, `rotary`, `scale` and the rope base.
+/// `rotary` is there because it cannot be recovered from the rectangle:
+/// gemma-4 rotates a quarter of each full-attention head and all of each
+/// sliding one over the same tensor width. In `neox.slang` it is
+/// `gl_NumWorkGroups.x`, which this kernel's grid no longer has room for.
+///
+/// # Errors
+///
+/// See [`per_head_row_rotating`].
+pub fn rms_rope(
+    ctx: &Ctx<'_>,
+    x: OutSlot<0, BufMut>,
+    w: Weight<0, Buf>,
+    params: Block<Buf>,
+    position: Ask<keys::Positions, I32s>,
+    axis: ParamOr<1, keys::Width, i32>,
+    row_pitch: ParamOr<5, keys::Width, i32>,
+    rotary: ParamOr<6, keys::RotaryWidth, i32>,
+    rows: Ask<keys::Rows, i32>,
+) -> Result<(), Refusal> {
+    // The head count is `row_pitch / axis` and BOTH terms are read off the
+    // params run rather than one off the run and one off the rectangle. They
+    // are the same numbers either way when a text is right, and when it is
+    // wrong the grid and the block would disagree silently -- a shader
+    // indexing by one and a launch sized by the other.
+    let heads = if *axis > 0 { *row_pitch / *axis } else { 0 };
+    ctx.dispatch(
+        Fire {
+            entrypoint: "rms_rope_bfloat16",
+            lanes: per_head_row_rotating(heads, *rows, *rotary, *axis)?,
+        },
+        // Four operands and NO scalars. Everything this kernel takes rides
+        // the block, which `driver-vulkan`'s `encode` mints as the
+        // statement's whole params run -- so the nine fields of
+        // `RmsRopeParams` are nine stated params, in order, and the routine
+        // adds nothing after them.
+        &[x.v(), w.v(), params.v(), position.v()],
     )
 }
 
@@ -225,14 +343,14 @@ pub fn rms_strided_head_row(
 /// See [`per_axis`].
 pub fn rms_residual(
     ctx: &Ctx<'_>,
-    x: Buf,
-    w: Buf,
-    out: BufMut,
-    params: Buf,
-    r: Buf,
-    width: Env<i32>,
-    axis: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    w: Weight<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    r: InSlot<1, Buf>,
+    width: Ask<keys::Width, i32>,
+    axis: ParamOr<1, keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -255,15 +373,15 @@ pub fn rms_residual(
 /// See [`per_axis`].
 pub fn rms_residual_scaled(
     ctx: &Ctx<'_>,
-    x: Buf,
-    w: Buf,
-    out: BufMut,
-    params: Buf,
-    r: Buf,
-    s: Buf,
-    width: Env<i32>,
-    axis: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    w: Weight<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    r: InSlot<1, Buf>,
+    s: InSlot<2, Buf>,
+    width: Ask<keys::Width, i32>,
+    axis: ParamOr<1, keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -286,12 +404,12 @@ pub fn rms_residual_scaled(
 /// See [`per_axis`].
 pub fn vnorm_single_row(
     ctx: &Ctx<'_>,
-    x: Buf,
-    out: BufMut,
-    params: Buf,
-    width: Env<i32>,
-    axis: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    width: Ask<keys::Width, i32>,
+    axis: ParamOr<1, keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -319,13 +437,13 @@ pub fn vnorm_single_row(
 /// See [`per_head_row`].
 pub fn gated_rms(
     ctx: &Ctx<'_>,
-    x: Buf,
-    z: Buf,
-    w: Buf,
-    out: BufMut,
-    params: Buf,
-    heads: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    z: InSlot<1, Buf>,
+    w: Weight<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    heads: Ask<keys::VHeads, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -346,14 +464,14 @@ pub fn gated_rms(
 /// See [`per_head_row`].
 pub fn gated_rms_strided(
     ctx: &Ctx<'_>,
-    x: Buf,
-    z: Buf,
-    w: Buf,
-    out: BufMut,
-    params: Buf,
-    row_pitch: i32,
-    heads: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    z: InSlot<1, Buf>,
+    w: Weight<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    row_pitch: Ask<keys::Width, i32>,
+    heads: Ask<keys::VHeads, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -375,12 +493,12 @@ pub fn gated_rms_strided(
 /// See [`crate::routine::elementwise`].
 pub fn layer_scalar_mul(
     ctx: &Ctx<'_>,
-    x: Buf,
-    scalar: Buf,
-    out: BufMut,
-    _params: Buf,
-    width: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    scalar: Weight<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    _params: Block<Buf>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -402,11 +520,11 @@ pub fn layer_scalar_mul(
 /// See [`crate::routine::elementwise`].
 pub fn residual_add(
     ctx: &Ctx<'_>,
-    x: Buf,
-    residual: Buf,
-    out: BufMut,
-    width: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    residual: InSlot<1, Buf>,
+    out: OutSlot<0, BufMut>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -430,12 +548,12 @@ pub fn residual_add(
 /// See [`crate::routine::elementwise_rows`].
 pub fn residual_add_strided(
     ctx: &Ctx<'_>,
-    x: Buf,
-    residual: Buf,
-    out: BufMut,
-    row_pitch: i32,
-    width: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    residual: InSlot<1, Buf>,
+    out: OutSlot<0, BufMut>,
+    row_pitch: Param<0, i32>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -463,15 +581,15 @@ pub fn residual_add_strided(
 /// See [`crate::routine::elementwise_rows`].
 pub fn add_bias(
     ctx: &Ctx<'_>,
-    out: BufMut,
-    bias: Buf,
-    width: i32,
-    rows: Env<i32>,
+    out: OutSlot<0, BufMut>,
+    bias: Weight<0, Buf>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             entrypoint: "add_bias_bfloat16",
-            lanes: crate::routine::elementwise_rows(width, *rows)?,
+            lanes: crate::routine::elementwise_rows(*width, *rows)?,
         },
         &[out.v(), bias.v(), width.v()],
     )
@@ -491,6 +609,11 @@ pub static ROUTINES: &[Routine] = &[
     crate::routine!(residual_add),
     crate::routine!(residual_add_strided),
     crate::routine!(rms_residual),
+    // In place, like every rotation and unlike every other norm: the trace
+    // states the tensor as an input and an output and the kernel binds one
+    // `BufMut` for both, because the rotation reads what the norm just wrote
+    // and there is no second buffer between them to name.
+    crate::routine!(rms_rope, in_place = &[(0, 0)]),
     crate::routine!(rms_residual_scaled),
     crate::routine!(rms_single_row),
     crate::routine!(rms_strided_head_row),
@@ -534,16 +657,16 @@ mod tests {
         let seen = Seen::default();
         rms_single_row(
             &seen,
-            Buf(0),
-            Buf(1),
-            BufMut(2),
-            Buf(3),
-            Env(128),
-            Env(128),
-            Env(3),
+            InSlot::new(Buf(0)),
+            Weight::new(Buf(1)),
+            OutSlot::new(BufMut(2)),
+            Block::new(Buf(3)),
+            Ask::new(128),
+            ParamOr::new(128),
+            Ask::new(3),
         )
         .expect("a launch");
-        residual_add(&seen, Buf(0), Buf(1), BufMut(2), Env(128), Env(3)).expect("a launch");
+        residual_add(&seen, InSlot::new(Buf(0)), InSlot::new(Buf(1)), OutSlot::new(BufMut(2)), Ask::new(128), Ask::new(3)).expect("a launch");
 
         let calls = seen.0.borrow();
         assert_eq!(
@@ -569,24 +692,24 @@ mod tests {
         let seen = Seen::default();
         rms_strided_head_row(
             &seen,
-            Buf(0),
-            Buf(1),
-            BufMut(2),
-            Buf(3),
-            4096,
-            Env(8),
-            Env(5),
+            InSlot::new(Buf(0)),
+            Weight::new(Buf(1)),
+            OutSlot::new(BufMut(2)),
+            Block::new(Buf(3)),
+            Ask::new(4096),
+            Reckoned::new(Env(8)),
+            Ask::new(5),
         )
         .expect("a launch");
         gated_rms(
             &seen,
-            Buf(0),
-            Buf(1),
-            Buf(2),
-            BufMut(3),
-            Buf(4),
-            Env(8),
-            Env(5),
+            InSlot::new(Buf(0)),
+            InSlot::new(Buf(1)),
+            Weight::new(Buf(2)),
+            OutSlot::new(BufMut(3)),
+            Block::new(Buf(4)),
+            Ask::new(8),
+            Ask::new(5),
         )
         .expect("a launch");
 
@@ -610,8 +733,8 @@ mod tests {
     #[test]
     fn a_strided_elementwise_op_is_a_rectangle_and_a_flat_one_is_a_run() {
         let seen = Seen::default();
-        residual_add(&seen, Buf(0), Buf(1), BufMut(2), Env(128), Env(3)).expect("a launch");
-        residual_add_strided(&seen, Buf(0), Buf(1), BufMut(2), 4096, Env(128), Env(3))
+        residual_add(&seen, InSlot::new(Buf(0)), InSlot::new(Buf(1)), OutSlot::new(BufMut(2)), Ask::new(128), Ask::new(3)).expect("a launch");
+        residual_add_strided(&seen, InSlot::new(Buf(0)), InSlot::new(Buf(1)), OutSlot::new(BufMut(2)), Param::new(4096), Ask::new(128), Ask::new(3))
             .expect("a launch");
 
         let calls = seen.0.borrow();
@@ -634,7 +757,7 @@ mod tests {
     #[test]
     fn a_bias_is_launched_on_the_width_it_is_told() {
         let seen = Seen::default();
-        add_bias(&seen, BufMut(0), Buf(1), 640, Env(7)).expect("a launch");
+        add_bias(&seen, OutSlot::new(BufMut(0)), Weight::new(Buf(1)), Ask::new(640), Ask::new(7)).expect("a launch");
 
         let call = &seen.0.borrow()[0];
         assert_eq!(call.1, [640, 7, 1], "the grid is the pushed width by rows");

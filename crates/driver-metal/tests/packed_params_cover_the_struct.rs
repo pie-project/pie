@@ -94,15 +94,9 @@ fn planned<'a>(low: &'a Lowered, f: &LlamaLikeFacts) -> Vec<Dispatch<'a>> {
     low.launches
         .iter()
         .flat_map(|l| {
-            plan_launch(
-                low,
-                l,
-                frame,
-                geometry(f),
-                &mut store,
-            )
-            .ok()
-            .unwrap_or_default()
+            plan_launch(low, l, frame, geometry(f), &mut store)
+                .ok()
+                .unwrap_or_default()
         })
         .collect()
 }

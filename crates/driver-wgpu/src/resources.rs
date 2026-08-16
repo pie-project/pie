@@ -70,7 +70,7 @@ pub struct Shape {
     pub head_dim: u32,
     /// Rows per page.
     ///
-    /// The number `Source::KvPageSize` asks for, and the one a statement cannot
+    /// The number `Source::Named(<keys::KvPageSize as keys::Fact>::KEY)` asks for, and the one a statement cannot
     /// carry.
     pub page_size: u32,
     /// How many pages the pool holds, across all requests.
@@ -137,7 +137,7 @@ impl Shape {
             // every fire it serves. `Pool::number` answers this one from what
             // it staged; answering a stale width here would index a row's mask
             // at the previous fire's pitch.
-            FireNumber::AttentionMaskStride | FireNumber::Rows => None,
+            FireNumber::AttentionMaskStride => None,
         }
     }
 
@@ -237,6 +237,19 @@ pub struct Request {
     /// of all zeros: the first leaves `attention_mask_enabled` clear and the
     /// causal rule alone applies, the second forbids everything.
     pub mask: Vec<Vec<u8>>,
+    /// Which recurrent slot holds this request's gated-DeltaNet carry.
+    ///
+    /// [`Frame::of`] writes it into [`Frame::recurrent_slots`] once per ROW,
+    /// because that is how the `*_slotted` kernels index it: their grid is
+    /// `rows * v_heads` on z and they recover `slot_ids[z / v_heads]`, so the
+    /// table is per row and every row of one request names one slot.
+    ///
+    /// Zero for a model with no recurrent state, where nothing reads it. That
+    /// default is safe only because the table is not staged at all when the
+    /// deployment holds no pool -- see [`Pool::stage`] -- and it is the reason
+    /// a `Request` built by hand does not have to know about a family it does
+    /// not use.
+    pub slot: u32,
 }
 
 impl Request {
@@ -249,6 +262,7 @@ impl Request {
             samples: Vec::new(),
             mask: Vec::new(),
             writes: Vec::new(),
+            slot: 0,
         }
     }
 
@@ -495,6 +509,33 @@ pub struct Frame {
     /// `sampling_indices` alone was enough only while every request named
     /// exactly one.
     pub sampling_indptr: Vec<u32>,
+    /// Which recurrent SLOT each ROW's carry lives in.
+    ///
+    /// The gated DeltaNet's page table: its `*_slotted` kernels read it to
+    /// find their own state, the way a paged attention reads `kv_page_indices`.
+    /// EMPTY for every model whose deployment opens no recurrent pool, and an
+    /// empty table stages nothing — see [`Pool::stage`].
+    ///
+    /// # Per ROW, and it was per nothing at all
+    ///
+    /// One entry per row, parallel to [`Self::request_of_token`], holding the
+    /// slot of the request that owns that row. That is the subscript the
+    /// kernels use: their grid is `rows * v_heads` on z and each workgroup
+    /// recovers `slot_ids[z / v_heads]`.
+    ///
+    /// **This vector was declared and staged and never written**, which is a
+    /// defect with a particular shape: an unwritten table stages as empty, an
+    /// empty storage buffer answers every subscript with a clamp instead of a
+    /// trap, and so every request in every fire read slot zero. Nothing
+    /// refused, every dispatch succeeded, and each fire inherited the carry
+    /// the last one left — so the same prompt answered differently every time
+    /// it was asked. `driver-wgpu/tests/hybrid_probe.rs` is where that was
+    /// caught, by a control that was there for something else.
+    ///
+    /// The slot is the REQUEST's ([`Request::slot`]), assigned by
+    /// [`crate::pages::Book`] beside the pages, because where a conversation's
+    /// history lives is one fact and not two.
+    pub recurrent_slots: Vec<u32>,
     /// The custom mask, one BYTE per `(row, key)`, packed four to a word.
     ///
     /// `attn/sdpa_paged.wgsl` reads `attention_mask[row * stride + kp]` as a
@@ -648,6 +689,16 @@ impl Frame {
                     .push(u32::try_from(r).unwrap_or(u32::MAX));
                 frame.kv_write_page.push(page);
                 frame.kv_write_offset.push(offset);
+                // PER ROW, beside `request_of_token`, because that is how the
+                // `*_slotted` gated-DeltaNet kernels index it: their grid is
+                // `rows * v_heads` on z and each workgroup recovers
+                // `slot_ids[z / v_heads]`, so the subscript is a ROW and not a
+                // request. A table with one entry per request would be read
+                // past its end by every row after the first — and `wgpu`
+                // clamps an out-of-bounds storage read rather than trapping,
+                // so every token of one prompt would resolve the LAST slot and
+                // the fire would look like it worked.
+                frame.recurrent_slots.push(request.slot);
             }
         }
         frame
@@ -787,7 +838,7 @@ pub struct Pool {
     /// The mask pitch of the fire this pool last staged, in bytes.
     ///
     /// A per-FIRE number living on the pool because the pool is what stages a
-    /// fire's tables and what a row's `Source::AttentionMaskStride` is
+    /// fire's tables and what a row's `Source::Named(<keys::AttentionMaskStride as keys::Fact>::KEY)` is
     /// resolved against. Zero until a fire with a mask is staged, and back to
     /// zero for one without -- see `Pool::stage`.
     mask_stride: u32,
@@ -1017,6 +1068,7 @@ impl Pool {
             (FireTable::KvWritePage, &frame.kv_write_page),
             (FireTable::KvWriteOffset, &frame.kv_write_offset),
             (FireTable::SamplingIndices, &frame.sampling_indices),
+            (FireTable::RecurrentSlots, &frame.recurrent_slots),
         ] {
             self.state(device, which, words)?;
         }
@@ -1044,7 +1096,7 @@ impl Pool {
             self.state(device, FireTable::AttentionMaskEnabled, &vec![0; words])?;
         }
         // Recorded because the SCALAR is the fire's, not the pool's: the row
-        // names `Source::AttentionMaskStride` and `Pool::number` answers it
+        // names `Source::Named(<keys::AttentionMaskStride as keys::Fact>::KEY)` and `Pool::number` answers it
         // from here. Set on every stage, including to zero, so a fire with no
         // mask cannot read the previous fire's pitch.
         self.mask_stride = frame.attention_mask_stride;
@@ -1327,7 +1379,6 @@ impl Resolve for Pool {
             // The fire's, from what this pool last staged. `Shape` answers
             // `None` for it and says why.
             FireNumber::AttentionMaskStride => Some(self.mask_stride),
-            FireNumber::Rows => Some(self.rows),
             other => self.shape.number(other),
         }
     }
@@ -1419,6 +1470,243 @@ impl Resolve for Weights {
     }
 }
 
+/// What a driver must allocate to run a gated DeltaNet's recurrent stack.
+///
+/// Every field is a COUNT, not a byte total — the byte totals are the methods,
+/// so there is one place that multiplies and one place that can be wrong.
+/// Transcribed from `driver-metal`'s `layout::recurrent::Shape`, whose
+/// arithmetic is integers and holds on any backend; what differs between them
+/// is the memory next door, not this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recurrent {
+    /// How many layers of the stack are LINEAR-attention layers.
+    ///
+    /// Not the stack's depth: a hybrid interleaves full-attention layers that
+    /// carry KV pages and no state at all, and those allocate nothing here.
+    /// qwen3.5-0.8b is 24 layers of which 18 are linear.
+    pub linear_layers: u32,
+    /// Conv channel count — the width of the mixed q|k|v bank.
+    pub conv_dim: u32,
+    /// Conv kernel width, the window's depth in rows.
+    pub conv_k: u32,
+    /// Value heads.
+    pub v_heads: u32,
+    /// Value head dim.
+    pub v_dim: u32,
+    /// Key head dim — the recurrent state's inner extent.
+    pub k_dim: u32,
+    /// How many requests can hold a seat at once.
+    pub slots: u32,
+}
+
+/// Both recurrent planes are `f32`, and that is the KERNEL's property.
+///
+/// `ssm/gdn_prep.wgsl` and `ssm/gdn_core.wgsl` declare `conv_state` and
+/// `rstate` as `array<f32>`, so a driver sizing these from a model's
+/// `state_elem` — which some texts state as 2, meaning the bf16 a CUDA build
+/// uses — would allocate half a slab and index off the end of it on the first
+/// slot past zero. `driver-metal` says the same thing about its own `device
+/// float*`, which is why this constant is stated rather than derived.
+pub const RECURRENT_ELEM_BYTES: u64 = 4;
+
+/// Two conv planes per layer: the one a fire READS and the one it WRITES.
+///
+/// A count rather than a `+ conv` folded into one expression, because it is
+/// the thing a reader doubts. The planes are the same size, the kernel takes
+/// both, and the second is not scratch that could be shared between layers —
+/// the carry back happens after the whole fire, so every layer's second plane
+/// is still live when the next layer runs.
+pub const CONV_PLANES: u64 = 2;
+
+impl Recurrent {
+    /// Bytes of one slot's conv window — the stride a conv plane is indexed by.
+    #[must_use]
+    pub const fn conv_bytes_per_slot(&self) -> u64 {
+        self.conv_k as u64 * self.conv_dim as u64 * RECURRENT_ELEM_BYTES
+    }
+
+    /// Bytes one slot's recurrent state occupies in ONE layer.
+    #[must_use]
+    pub const fn state_bytes_per_slot(&self) -> u64 {
+        self.v_heads as u64 * self.v_dim as u64 * self.k_dim as u64 * RECURRENT_ELEM_BYTES
+    }
+
+    /// Bytes of ONE of a layer's two conv planes.
+    #[must_use]
+    pub const fn conv_bytes_per_layer(&self) -> u64 {
+        self.conv_bytes_per_slot() * self.slots as u64
+    }
+
+    /// Bytes of one layer's whole recurrent-state plane.
+    #[must_use]
+    pub const fn state_bytes_per_layer(&self) -> u64 {
+        self.state_bytes_per_slot() * self.slots as u64
+    }
+
+    /// Bytes one slot costs across the WHOLE stack.
+    ///
+    /// What a scheduler divides its budget by.
+    #[must_use]
+    pub const fn bytes_per_slot(&self) -> u64 {
+        self.linear_layers as u64
+            * (CONV_PLANES * self.conv_bytes_per_slot() + self.state_bytes_per_slot())
+    }
+
+    /// Bytes of the entire pool.
+    #[must_use]
+    pub const fn total_bytes(&self) -> u64 {
+        self.slots as u64 * self.bytes_per_slot()
+    }
+
+    /// The same shape with as many slots as `budget` bytes will hold.
+    ///
+    /// `None` when it will not hold one, which is a refusal rather than a
+    /// zero-slot pool: a stack with nowhere to keep its carry cannot serve a
+    /// single request, and a pool that reported zero seats would be discovered
+    /// at the first fire instead of at open.
+    #[must_use]
+    pub const fn slots_within(&self, budget: u64) -> Option<Self> {
+        let per = self.bytes_per_slot();
+        if per == 0 || budget < per {
+            return None;
+        }
+        let slots = budget / per;
+        Some(Self {
+            slots: slots as u32,
+            ..*self
+        })
+    }
+}
+
+/// The memory a [`Recurrent`] shape describes.
+///
+/// Same cut as [`Shape`] and [`Pool`]: the arithmetic is integers and holds
+/// with no adapter, the allocation is here behind `native`.
+///
+/// THREE planes per linear layer, not two. `conv_state` and `new_conv_state`
+/// are separate buffers because the kernel is still reading the old taps while
+/// it writes the new ones, and `recurrent_state` is updated in place and is
+/// both read and written. An arm that handed the same buffer twice would make
+/// a scan read what it had just written.
+#[cfg(feature = "native")]
+pub struct RecurrentPool {
+    shape: Recurrent,
+    /// One per linear layer, indexed by the layer's position in the stack.
+    ///
+    /// Sparse by layer NUMBER: a hybrid's linear layers are interleaved with
+    /// full-attention ones, and a kernel asks by the layer it is planning. So
+    /// the map is keyed on that number rather than packed, which costs a
+    /// lookup and cannot be indexed off by one.
+    conv: BTreeMap<u16, Buffer>,
+    fresh: BTreeMap<u16, Buffer>,
+    state: BTreeMap<u16, Buffer>,
+}
+
+#[cfg(feature = "native")]
+impl RecurrentPool {
+    /// Allocate three planes for each of `layers`.
+    ///
+    /// ZEROED, and nothing is uploaded to make it so — WebGPU requires a new
+    /// buffer's contents to be zero, which [`Pool::open`] relies on for the
+    /// same reason. Here the zero is not merely tidy: a carry that came up
+    /// holding the previous deployment's state would make the first token of
+    /// every request continue a sequence nobody asked about, fluently.
+    ///
+    /// # Errors
+    ///
+    /// [`Failed`] from the first allocation that does not fit.
+    pub fn open(
+        device: &Device,
+        shape: Recurrent,
+        layers: impl IntoIterator<Item = u16>,
+    ) -> Result<Self, Failed> {
+        let conv_bytes = shape.conv_bytes_per_layer();
+        let state_bytes = shape.state_bytes_per_layer();
+        let mut conv = BTreeMap::new();
+        let mut fresh = BTreeMap::new();
+        let mut state = BTreeMap::new();
+        for layer in layers {
+            conv.insert(layer, device.zeroed(conv_bytes)?);
+            fresh.insert(layer, device.zeroed(conv_bytes)?);
+            state.insert(layer, device.zeroed(state_bytes)?);
+        }
+        Ok(Self {
+            shape,
+            conv,
+            fresh,
+            state,
+        })
+    }
+
+    /// The shape this pool was opened at.
+    #[must_use]
+    pub const fn shape(&self) -> Recurrent {
+        self.shape
+    }
+
+    /// Carry the freshly rolled convolution windows back to the plane the
+    /// kernels READ, once per layer per fire, over the whole plane.
+    ///
+    /// `gdn_core` cannot shift its window in place -- `convsilu` reads the taps
+    /// while the writeback shifts them, from different workgroups -- so the
+    /// shifted window lands in a second plane. The kernels always READ
+    /// `conv_state` and always WRITE `new_conv_state`; they never alternate. So
+    /// after a fire the live windows are in the wrong plane and somebody has to
+    /// bring them back. Nothing did, and the consequence was not a crash: every
+    /// fire convolved over the window as it stood one fire ago, which for a
+    /// prompt into a fresh seat is genuinely zeros and therefore RIGHT, and for
+    /// every continuation after it is one step stale.
+    ///
+    /// `whether_the_fused_decode_computes_the_step_its_own_operands_imply`
+    /// caught it by walking the step twice: the same CPU reference reproduced
+    /// the decode to 1.2e-7 when fed `conv_state` and reproduced the prefill to
+    /// 1.0e-7 when fed `new_conv_state`. The kernel was faithful to what it was
+    /// handed and was handed the stale plane.
+    ///
+    /// # Why the whole plane, and why not a swap
+    ///
+    /// Swapping the two binds is the obvious way to avoid the copy and it is
+    /// wrong, in a way worth stating because it looks right. A bind is one
+    /// address for every row of a batch, while which plane holds a slot's live
+    /// window is per SLOT: a request that sat out this fire had nothing written
+    /// to the other plane, so after one swap it reads a window one step stale
+    /// and after the next, two. Copying the whole plane keeps both planes
+    /// identical for every slot the fire did not touch, which is the invariant
+    /// a swap breaks. `driver-metal`'s `layout::recurrent` states the same
+    /// reasoning and this backend now matches it.
+    ///
+    /// The whole plane rather than the touched slots because a fire's slots are
+    /// scattered, and scattered blits cost more setup than one contiguous copy
+    /// of a plane this size.
+    ///
+    /// # Errors
+    ///
+    /// [`Failed`] from the copy.
+    pub fn carry_back(&self, device: &Device) -> Result<(), Failed> {
+        let moves: Vec<(&Buffer, u64, &Buffer, u64)> = self
+            .conv
+            .iter()
+            .filter_map(|(layer, read)| self.fresh.get(layer).map(|wrote| (wrote, 0, read, 0)))
+            .collect();
+        device.transfer(&moves, self.shape.conv_bytes_per_layer())
+    }
+
+    /// The plane a kernel names, or `None` for a layer this pool does not hold.
+    ///
+    /// A full-attention layer of a hybrid holds none, and answering `None` for
+    /// it is correct: nothing should be asking, and a driver that handed back
+    /// another layer's carry would be worse than refusing.
+    #[must_use]
+    pub fn slab(&self, layer: u16, which: &str) -> Option<&Buffer> {
+        match which {
+            "conv_state" => self.conv.get(&layer),
+            "new_conv_state" => self.fresh.get(&layer),
+            "recurrent_state" => self.state.get(&layer),
+            _ => None,
+        }
+    }
+}
+
 /// A model's weights and a deployment's cache, as one resolver.
 ///
 /// Neither half can answer a fire on its own. [`Pool`] answers the cache, the
@@ -1448,6 +1736,13 @@ pub struct Model<'a> {
     pub weights: &'a Weights,
     /// The cache, the fire's tables and the fire's numbers.
     pub pool: &'a Pool,
+    /// The gated DeltaNet's carry, for a deployment that has one.
+    ///
+    /// `None` for every model this backend serves today, and a hybrid's arms
+    /// then decline by name with `Unplanned::NoSlab` rather than being handed
+    /// a null carry — see [`crate::binding::Resolve::slab`] for why that
+    /// distinction is not fussiness.
+    pub recurrent: Option<&'a RecurrentPool>,
 }
 
 #[cfg(feature = "native")]
@@ -1464,6 +1759,10 @@ impl Resolve for Model<'_> {
 
     fn kv(&self, layer: u16, values: bool) -> Option<&Buffer> {
         self.pool.cache(layer, values)
+    }
+
+    fn slab(&self, layer: u16, which: &'static str) -> Option<&Buffer> {
+        self.recurrent?.slab(layer, which)
     }
 
     fn table(&self, which: FireTable) -> Option<&Buffer> {
@@ -1840,6 +2139,43 @@ mod tests {
         let frame = Frame::of(shape, &[lane(), lane()]).expect("the program said so");
         assert_eq!(frame.kv_write_page, vec![7, 7]);
         assert_eq!(frame.kv_write_offset, vec![0, 0]);
+    }
+
+    /// A multi-request prefill states its seats ROW BY ROW, in run order.
+    ///
+    /// This is the table `ssm/gdn_prep.wgsl`'s prompt scan walks: it reads
+    /// `slot_ids[t]` at every token and stores its state back and reloads when
+    /// the seat changes, so what the rectangle means is "one sequence per
+    /// seat, laid end to end". A table with one entry per REQUEST rather than
+    /// per row would make the scan re-seat at the wrong tokens; a table that
+    /// repeated one seat would make two conversations into one.
+    ///
+    /// Two requests of unequal length on purpose. Equal lengths would pass
+    /// against a builder that pushed a fixed number of entries per request,
+    /// which is the mistake worth being able to fail.
+    #[test]
+    fn a_fire_of_two_conversations_states_a_seat_for_every_row_in_run_order() {
+        let shape = shape();
+        let mut first = Request::of(vec![0, 1, 2], vec![3]);
+        first.writes = vec![Some((3, 0)), Some((3, 1)), Some((3, 2))];
+        first.slot = 5;
+        let mut second = Request::of(vec![0, 1], vec![4]);
+        second.writes = vec![Some((4, 0)), Some((4, 1))];
+        second.slot = 2;
+        let frame = Frame::of(shape, &[first, second]).expect("two stageable requests");
+        assert_eq!(
+            frame.recurrent_slots,
+            vec![5, 5, 5, 2, 2],
+            "the seat table is per ROW and in run order, so a three-token \
+             conversation contributes three entries and the next one starts \
+             where it ends"
+        );
+        assert_eq!(
+            frame.recurrent_slots.len(),
+            frame.kv_write_page.len(),
+            "the seat table is the same height as every other per-row table, \
+             and a shorter one is read past its end by the rows after it"
+        );
     }
 
     /// Two requests may share a page they only READ, and not one they write.

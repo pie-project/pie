@@ -22,8 +22,15 @@ profile-fire = ["worker/profile-fire"]
 # said they were -- "Build the embedded drivers into the Python engine so
 # `pie.server.Server` can host the same local flavors as `pie serve`". `pie
 # serve` can host four; this wheel could host one.
-default = ["driver-cuda"]
-driver-cuda = ["worker/driver-cuda"]
+# The CUDA default is a GUESS, and it is spelled out here so that it is a
+# greppable one. It used to read `driver-cuda`, which resolved to the 13 ABI
+# three manifests away; a wheel built for a CUDA 12 box got no error, only a
+# segfault inside `cudaGraphAddNode`. Naming the ABI does not remove the
+# guess -- a wheel has to default to something -- but it puts it where a
+# packager can see and override it with `--no-default-features`.
+default = ["driver-cuda-13"]
+driver-cuda-12 = ["worker/driver-cuda-12"]
+driver-cuda-13 = ["worker/driver-cuda-13"]
 driver-metal = ["worker/driver-metal"]
 driver-vulkan = ["worker/driver-vulkan"]
 driver-wgpu = ["worker/driver-wgpu"]

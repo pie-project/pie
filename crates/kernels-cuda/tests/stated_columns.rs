@@ -194,7 +194,9 @@ impl Stated {
         self
     }
 
-    /// `(input, output)` pairs that must be given the same address.
+    /// `(output, input)` pairs that must be given the same address.
+    ///
+    /// OUTPUT FIRST -- see `kernels::routine::Routine::in_place`.
     const fn in_place(mut self, pairs: &'static [(u32, u32)]) -> Self {
         self.in_place = pairs;
         self
@@ -396,6 +398,18 @@ const AT_9E3936FB9: &[Stated] = &[
 struct Departed {
     symbol: &'static str,
     /// The decision, in one sentence, with the address that holds it.
+    ///
+    /// **File, not `file:line`, wherever the sentence is also quoted.** One
+    /// of these citations rotted three times against the same moving text
+    /// -- `arms/rope.rs`, still written `:647` when the line had reached
+    /// `:854` -- and every repair restored a number that was going to be
+    /// wrong again by the next refactor. The quotation beside it never
+    /// rotted once, because it moves WITH the text it names.
+    ///
+    /// A line number is only worth carrying where there is nothing else to
+    /// find the text by. Where a verbatim quote is already present, the
+    /// number is a second address for one thing, and the second address is
+    /// the one that decays.
     why: &'static str,
 }
 
@@ -411,8 +425,8 @@ const DEPARTED: &[Departed] = &[
     },
     Departed {
         symbol: "rope::rope_partial_bf16_position_delta",
-        why: "unreachable from either end -- its arm is `unbound` at \
-              `driver-cuda/src/bind/arms/rope.rs:261` (\"the offset added to \
+        why: "unreachable from either end -- its arm is `unbound` in \
+              `driver-cuda/src/bind/arms/rope.rs` (\"the offset added to \
               every position ... no statement carries\") and no `dsl::cuda` \
               builder records it, which is why `model/tests/kernels_table.rs` \
               lists it in `UNSTATED_ROWS`. See that list for the second, \
@@ -522,6 +536,148 @@ const DIVERGED: &[Diverged] = &[Diverged {
           that is wrong here, and this is a correction rather than a slip.",
 }];
 
+/// The `in_place` column, on one row — the twin of [`DIVERGED`], and it
+/// exists because a pin was holding the corrupting value.
+///
+/// # A pin is not evidence that the column was right
+///
+/// That sentence is the whole reason this constant is here rather than the
+/// two pins being quietly edited. `rope::rope_yarn_bf16` and
+/// `rope::qk_rmsnorm_mrope_bf16` stated no `in_place` at `9e3936fb9^`, and
+/// this file faithfully recorded it — while the launchers had declared
+/// `q: Out<0>` and `k: Out<1>` since Stage 2 and the device code
+/// (`prelude/rope.cuh`'s `rotate_pair`) reads and assigns the same two
+/// cells. **The pinned value was the defect**: with no alias declared, the
+/// planner hands the kernel two fresh buffers and `walk.rs:611`'s
+/// zero-query bug is manufactured, which is precisely the corruption
+/// `qk_rmsnorm_rope_bf16_devwin` was repaired for one commit earlier.
+///
+/// So the direction argument at [`DIVERGED`] has a counterpart here and it
+/// points the other way. There, `false → true` on `whole` can only refuse,
+/// so the reverts are what needed the argument. **Adding an alias cannot
+/// refuse and cannot corrupt** — it tells the planner two buffers are one,
+/// which they demonstrably are — while its absence corrupts silently. The
+/// asymmetry is opposite because the column means something different.
+///
+/// # Why a parallel constant rather than a field on `Diverged`
+///
+/// `Diverged` carries `was`/`is` as `bool`, and this file says so in as many
+/// words: *"a drift on the other two lands in `wrong` and stays there until
+/// someone extends this file."* This is that extension, done as the shape
+/// that comment implies rather than by generalising `Diverged` over a
+/// column type — two rows do not pay for a trait, and the `why` strings
+/// are what a reader comes here for.
+const DIVERGED_IN_PLACE: &[DivergedInPlace] = &[
+    DivergedInPlace {
+        symbol: "moe::add_moe_route_bias_bf16",
+        was: &[],
+        is: &[(0, 0)],
+        why: "the kernel ACCUMULATES (`moe_dispatch.cuh:1132` reads the \
+          destination cell before adding the expert bias into it), so \
+          result 0 must be the buffer input 0 already holds. Without the \
+          pair the allocator hands the result a fresh rectangle and the \
+          add runs over whatever was in it -- garbage, silently, with \
+          every operand resolving. §6.2 refuses it earlier and for a \
+          different reason: `reads = 2` against `placed = 3` once the \
+          bias became `Bank<0, T>`, which is the read side of the same \
+          missing pair.",
+    },
+    DivergedInPlace {
+        symbol: "rope::rope_yarn_bf16",
+        was: &[],
+        is: &[(0, 0), (1, 1)],
+        why: "`rotate_yarn` (`rope.cuh:597`) forms `qp`/`kp` and calls \
+          `rotate_pair`, which reads `h_ptr[i]` and `h_ptr[i + half]` \
+          and assigns those same two cells. The scaling was the right \
+          reason to check this separately from `rope_bf16` and it \
+          changes nothing: neither plane is read from one operand and \
+          written to another. `arity_problem` moves from a band of \
+          [2, 2] against `reads = 0` to [0, 2], so the read side was \
+          firing too -- and the filing that opened this named only the \
+          write side, which is how the other half survived the repair.",
+    },
+    DivergedInPlace {
+        symbol: "rope::qk_rmsnorm_mrope_bf16",
+        was: &[],
+        is: &[(0, 0), (1, 1)],
+        why: "`qk_rmsnorm_rotate_mrope` (`rope.cuh:429`) selects `row` from \
+          q or k, reduces over `row[i]`, and writes `row[i]` and \
+          `row[i + half]`. The normalisation happens before the \
+          rotation and both happen in place. Its band moves from \
+          [4, 4] against `reads = 2` to [2, 4]; the two extra reads \
+          over its twin are its two `Bank`s, so `reads = 2` is not \
+          slack in the new floor, it is exactly on it.",
+    },
+    // AND THIS ONE NAMES A RESULT THE STATEMENT NEVER DECLARES, which is a
+    // shape neither pin above has.
+    DivergedInPlace {
+        symbol: "norm::residual_add_rmsnorm_bf16",
+        was: &[],
+        is: &[(1, 0)],
+        why: "The launcher writes TWICE and the statement declares one \
+              result. `norm_out` is `Out<0, *mut T>`; `hidden` is \
+              `In<0, *mut T>` and its own comment has always said so -- \
+              *the statement lists it as an INPUT with no matching output, \
+              which is why the arm reaches for `cx.arg_in(0)` and casts \
+              away the const*. A pair is `(output, input)`, so the second \
+              write's output index is one past the only index there is, \
+              and `(1, 0)` is the vocabulary's way of saying a write \
+              landed in an operand's buffer rather than in a result. \
+              `arity_problem` reads it exactly so -- a pair whose output \
+              the statement never declares subtracts from `writes` -- \
+              which is what stopped this row failing §6.2 the moment the \
+              metal plane started checking it. The read side moves too: \
+              the floor drops from 3 to 2 against `reads = 2`, which is \
+              where it belonged, since `hidden` is a pointer the statement \
+              places and the signature counts as a write.",
+    },
+    // AND THESE TWO WERE ALREADY DIVERGENT WHEN THE MECHANISM WAS BUILT,
+    // which is the argument for building it rather than editing two pins.
+    // `4c3843dd3` repaired them with a full case at the `routine!` line and
+    // this file has been failing ever since, because the only way to record
+    // a deliberate `in_place` change was a list that did not exist. **A gate
+    // with no exemption path does not stop a change; it stops REPORTING.**
+    DivergedInPlace {
+        symbol: "attn::dsa_index_q_rope_bf16",
+        was: &[],
+        is: &[(0, 0)],
+        why: "`dsa_indexer.cuh:156-158` reads `row[d]` into a register buffer, rotates it \
+              with `rope_interleave_inplace`, and writes `row[d]` back -- one buffer read \
+              and written, and the launcher takes ONE pointer for both. It was left alone \
+              once because *adding `in_place` changes how a real fire is planned, which is \
+              a live repair with its own blast radius*, and half that blast radius was \
+              `alias()`: an `in_place` shifted every `In(n)` in the derived column, so a \
+              truthful declaration could move a launcher that takes the buffer twice onto \
+              the wrong operand. `operands` counts now -- the remap runs only where the \
+              column names FEWER `In`s than the statement has inputs -- and `alias()` is \
+              deleted outright. The reason expired before the pin did.",
+    },
+    DivergedInPlace {
+        symbol: "attn::dsa_index_knorm_rope_bf16",
+        was: &[],
+        is: &[(0, 0)],
+        why: "Its twin, one layernorm earlier, and the same `row[d]` read and written \
+              through one pointer. This pair is also where the `whole` argument above was \
+              worked out, so they are the two rows carrying a recorded divergence on BOTH \
+              columns in opposite directions: `whole` was reverted to `false` because \
+              `false -> true` can refuse a model that used to load, and `in_place` moved \
+              to true because its absence corrupts. Neither decision constrains the other, \
+              and having them side by side is the clearest statement in this file that the \
+              two columns are not the same kind of claim.",
+    },
+];
+
+/// One row's `in_place`, before and after — see [`DIVERGED_IN_PLACE`].
+struct DivergedInPlace {
+    symbol: &'static str,
+    /// What `9e3936fb9^` stated.
+    was: &'static [(u32, u32)],
+    /// What `sigs()` states now.
+    is: &'static [(u32, u32)],
+    /// Why the change is a correction and not a slip.
+    why: &'static str,
+}
+
 /// The pinned table is the file that was generated, not one that was edited.
 ///
 /// Three properties a hand edit breaks and the oracle below would not notice:
@@ -556,6 +712,8 @@ fn every_stated_column_still_says_what_it_said() {
         sigs().iter().map(|row| (row.symbol, row)).collect();
     let departed: Vec<&str> = DEPARTED.iter().map(|d| d.symbol).collect();
     let diverged: HashMap<&str, &Diverged> = DIVERGED.iter().map(|d| (d.symbol, d)).collect();
+    let diverged_in_place: HashMap<&str, &DivergedInPlace> =
+        DIVERGED_IN_PLACE.iter().map(|d| (d.symbol, d)).collect();
 
     let mut wrong: Vec<String> = Vec::new();
     let mut checked = 0usize;
@@ -595,7 +753,10 @@ fn every_stated_column_still_says_what_it_said() {
                 pinned.symbol, pinned.depth_prefix_plan, row.depth_prefix_plan
             ));
         }
-        if row.in_place != pinned.in_place {
+        // Exempted exactly as `whole` is above, and for a stronger reason:
+        // the two rows in `DIVERGED_IN_PLACE` had the pin holding the value
+        // that corrupts. See that constant.
+        if !diverged_in_place.contains_key(pinned.symbol) && row.in_place != pinned.in_place {
             wrong.push(format!(
                 "{}: `in_place` was {:?} at 9e3936fb9^, is {:?} now",
                 pinned.symbol, pinned.in_place, row.in_place
@@ -658,6 +819,44 @@ fn every_recorded_divergence_is_still_a_divergence() {
     }
 }
 
+/// The same guard for [`DIVERGED_IN_PLACE`], and it is not optional.
+///
+/// Without it that constant is a list that can only grow -- the exact
+/// failure the test above exists to prevent, and an exemption for an alias
+/// is worse than one for `whole` in the one way that matters. A stale
+/// `whole` exemption excuses a row that would only ever REFUSE. A stale
+/// `in_place` exemption excuses a row whose alias was reverted, which is
+/// the direction that corrupts, and it would excuse it with a paragraph
+/// arguing the kernel writes in place.
+#[test]
+fn every_recorded_alias_divergence_is_still_a_divergence() {
+    let now: HashMap<&str, &kernels::KernelSig> =
+        sigs().iter().map(|row| (row.symbol, row)).collect();
+    for d in DIVERGED_IN_PLACE {
+        assert_ne!(d.was, d.is, "{}: `DIVERGED_IN_PLACE` records no difference", d.symbol);
+        assert!(!d.why.is_empty(), "{}: a divergence with no argument is a bug report", d.symbol);
+        let pinned = AT_9E3936FB9
+            .iter()
+            .find(|r| r.symbol == d.symbol)
+            .unwrap_or_else(|| panic!("{}: diverges from a row 9e3936fb9^ never stated", d.symbol));
+        assert_eq!(
+            pinned.in_place, d.was,
+            "{}: `was` disagrees with the pinned table",
+            d.symbol
+        );
+        let row = now
+            .get(d.symbol)
+            .unwrap_or_else(|| panic!("{}: diverges from `sigs()` and is not in it", d.symbol));
+        assert_eq!(
+            row.in_place, d.is,
+            "{}: `DIVERGED_IN_PLACE` says this row states `in_place = {:?}` on purpose, and it \
+             states {:?}. If the alias was reverted, delete the entry -- but read the `why` \
+             first, because these two were reverted once already by never being stated.",
+            d.symbol, d.is, row.in_place
+        );
+    }
+}
+
 /// Exactly the symbols that were meant to leave have left.
 ///
 /// The other direction of the join, and the one with a deployment behind it:
@@ -684,4 +883,365 @@ fn exactly_the_symbols_that_were_meant_to_leave_have_left() {
     for d in DEPARTED {
         assert!(!d.why.is_empty(), "{}: a departure with no reason is a deletion", d.symbol);
     }
+}
+
+// ── A MARK WHOSE KEY ALREADY FITS ────────────────────────────────────────
+//
+// Five times this session a `#[source(X)]` mark was converted to
+// `Env<keys::X>` and the conversion needed NOTHING except someone noticing
+// that `keys::X` was already there and already declared over the parameter's
+// type. `rope.rs`'s `kv_page_indices` and `kv_page_indptr` had been
+// convertible since the keys were minted. `mlp.rs`'s four GLU scalars were
+// convertible the day `GluAlpha` and `GluLimit` landed.
+//
+// **NOBODY WAS WRONG ABOUT ANY OF THEM. There was simply no question being
+// asked**, and that is what a gate is for: the tree has a `keys.rs` full of
+// facts and a scattering of marks naming the same facts, and the only thing
+// that ever compared the two lists was a person reading both.
+//
+// THE EXEMPTIONS ARE THE INTERESTING PART, because a key existing is not a
+// key FITTING and the three ways it can fail to fit are three different
+// repairs in three different files:
+//
+//   - THE KEY IS WRONG. `keys::KvHndLayout` was declared over `i32` against
+//     a `bool` parameter. `rope.rs` diagnosed it, named `keys.rs` as the
+//     file that had to change, and `keys.rs` changed. The declaration had
+//     been wrong where nothing could contradict it -- `operand()` blocks
+//     that source through the allowlist, so no fire ever compared the
+//     declared `Ty::I32` against the `ArgValue::Bool` two lines beside it.
+//   - THE PARAMETER IS WRONG. `keys::KvKeys` is `*mut u8` against a
+//     `*mut bf16`. Here the KEY is right: a KV page is a run of bytes whose
+//     element type is the layer's dtype, and a key declared `*mut bf16`
+//     would be true of the bf16 launcher and false of its fp8 sibling.
+//     **A fact that is true of one instantiation is not a fact.**
+//   - NEITHER IS WRONG AND THE MARK IS BLOCKED ANYWAY. `Attn(..)` has no
+//     `operand()` arm at all; it appears only on the blocked allowlist.
+//
+// So the gate lists what it excuses and why, and a mark that appears here
+// without an entry is a mark someone could have converted and did not.
+//
+// THE CENSUS METHOD IS PART OF THE GATE AND NOT AN IMPLEMENTATION DETAIL.
+// `rope.rs`'s header counted its own marks four times -- fifty-two, then
+// sixty-five, then sixteen, then seven -- and every count was too high in
+// the same direction, because a naive `grep '#[source('` on that file
+// answers THIRTY and only TWO are marks. The other twenty-eight are
+// paragraphs talking about marks. Comment lines are stripped below for that
+// reason, and string-literal contents would be too if any mark could hide
+// in one.
+#[test]
+fn no_mark_names_a_fact_a_key_already_carries() {
+    // Marks that name a fact `keys.rs` declares, and the reason each one
+    // cannot take it. Removing a line here without converting the mark makes
+    // the test fail, which is the point: the exemption and the repair are
+    // the same edit.
+    const EXCUSED: &[(&str, &str)] = &[
+        (
+            "KvKeys",
+            "the key is `*mut u8` and right; the parameter is `*mut bf16` \
+             and this launcher is one instantiation of a family with an fp8 \
+             sibling. The route is a cast at the parameter, in thirty \
+             launchers, which is the shape of change that gets half made.",
+        ),
+        (
+            "KvValues",
+            "`KvKeys`'s reason, in the same signature two lines down.",
+        ),
+        // `"Attn"` STOOD HERE AND ITS EXCUSE WAS FALSIFIED BY BEING FIXED.
+        // It read *"`operand()` has no `Source::Attn` arm; the variant
+        // reaches the binder only through the blocked allowlist ... the mark
+        // is blocked by design and the key would be too"*. Every clause of
+        // that is now wrong and none of it was wrong when written:
+        // `operand()` gained `Source::Named(<keys::SmScale as keys::Fact>::KEY) => f.sm_scale()`, the
+        // allowlist lost its `Attn` entry in the same commit, and
+        // `keys::SmScale` was minted -- so `attn/xqa.rs`'s `sm_scale` is
+        // `Env<keys::SmScale>` and no `#[source(Attn` remains in the tree.
+        //
+        // **AN EXCUSE THAT NAMES ITS OWN BLOCKER IS THE ONLY KIND THAT CAN
+        // EXPIRE.** The two above say the key does not FIT -- `*mut u8`
+        // against a `*mut bf16` parameter -- a standing fact about two types
+        // that expires only if one of them changes. This one said the binder
+        // does not ANSWER, which is a fact about code somebody could go and
+        // write, and somebody did. The reverse check below is what turned
+        // that from a comment into a deadline: it failed the build the
+        // moment the mark left, quoting the excuse back.
+    ];
+
+    let keyed: Vec<&str> = include_str!("../../kernels/src/keys.rs")
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .filter_map(|l| l.split("=> Source::").nth(1))
+        .map(|r| {
+            r.trim_end_matches(|c: char| !c.is_alphanumeric())
+                .split(|c: char| !c.is_alphanumeric())
+                .next()
+                .unwrap_or("")
+        })
+        .filter(|v| !v.is_empty())
+        .collect();
+    assert!(
+        keyed.len() > 20,
+        "the scrape found {} keys, which means `keys.rs` changed shape and \
+         this gate is now measuring nothing -- an empty scrape passes every \
+         assertion below",
+        keyed.len(),
+    );
+
+    let mut unexcused: Vec<(&str, &str)> = Vec::new();
+    for (file, src) in [
+        ("attn/mod.rs", include_str!("../src/attn/mod.rs")),
+        ("attn/xqa.rs", include_str!("../src/attn/xqa.rs")),
+        ("gemm/mod.rs", include_str!("../src/gemm/mod.rs")),
+        ("layout.rs", include_str!("../src/layout.rs")),
+        ("mlp.rs", include_str!("../src/mlp.rs")),
+        ("moe.rs", include_str!("../src/moe.rs")),
+        ("norm.rs", include_str!("../src/norm.rs")),
+        ("quant.rs", include_str!("../src/quant.rs")),
+        ("rope.rs", include_str!("../src/rope.rs")),
+        ("ssm.rs", include_str!("../src/ssm.rs")),
+    ] {
+        for line in src.lines() {
+            // THE STRIP THAT MAKES THE NUMBER MEAN ANYTHING. Without it
+            // `rope.rs` alone contributes twenty-eight phantom marks.
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            let Some(rest) = line.split("#[source(").nth(1) else {
+                continue;
+            };
+            let variant = rest
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or("");
+            if variant.is_empty() || !keyed.contains(&variant) {
+                continue;
+            }
+            if EXCUSED.iter().any(|(v, _)| *v == variant) {
+                continue;
+            }
+            unexcused.push((file, variant));
+        }
+    }
+
+    assert!(
+        unexcused.is_empty(),
+        "these marks name a fact `keys.rs` already declares, so each is an \
+         `Env<keys::_>` parameter nobody wrote: {unexcused:?}",
+    );
+
+    // AND THE OTHER DIRECTION, which is the one that rots. An excused
+    // variant that no longer appears anywhere has had its mark converted or
+    // deleted, and the excuse outlived the thing it excused -- the same rot
+    // as a comment citing a line that moved, except that an excuse decays
+    // into PERMISSION rather than into noise.
+    let all: String = [
+        include_str!("../src/attn/mod.rs"),
+        include_str!("../src/rope.rs"),
+        include_str!("../src/attn/xqa.rs"),
+    ]
+    .concat();
+    for (variant, why) in EXCUSED {
+        assert!(
+            all.contains(&format!("#[source({variant}")),
+            "`{variant}` is excused for `{why}` and no longer appears; the \
+             excuse is now a standing permission for a mark nobody has",
+        );
+    }
+}
+
+
+/// **§3.11 CANNOT DELETE `take_source_attr`, AND THIS IS THE PROOF, HELD OPEN.**
+///
+/// `.wiki/kilimanjaro2.md` §3.11 folds `Source` to three variants and its
+/// plan for the attribute is deletion: every mark becomes a wrapper, so the
+/// parser has nothing left to parse. The named half of that is done -- marks
+/// went from fifty-two to seven across this refactor, and four families
+/// (`mlp`, `ssm`, `norm`, `moe`) reached zero.
+///
+/// The last seven do not convert, and not because nobody has got to them.
+/// Each is inexpressible in the wrapper notation for a reason recorded at its
+/// own site, and the reasons fall into four classes that have nothing to do
+/// with each other. **A PLAN THAT ENDS IN DELETION HAS TO BE TOLD WHEN THE
+/// REMAINDER STOPS SHRINKING**, because a backlog of seven and a floor of
+/// seven produce the same census reading, and the difference is the whole
+/// question of whether the next pass has work in it.
+///
+/// So the attribute survives, BOUNDED: this test pins the residue exactly.
+/// A new mark fails it, and a pinned mark that leaves without its pin also
+/// fails it. `take_source_attr` stops being an open door and becomes an
+/// escape hatch with a written list of who is allowed through.
+///
+/// THE SHARPEST OF THE FOUR CLASSES WAS CREATED BY THIS REFACTOR, NOT FOUND
+/// BY IT. §3.11's answer for a width mark is E1, *"a body that wants a width
+/// asks the region it already holds"*. `gemm/mod.rs`'s `n` and `k` cannot,
+/// because the operands they measure are `Unbound<*const *const c_void>` --
+/// host arrays of device pointers -- and **`Unbound<T>` is precisely the
+/// declaration that the body does NOT hold a region.** Before those
+/// parameters were wrapped, one commit ago, they sat among bare pointers and
+/// these two marks looked like ordinary backlog. The conversion that made the
+/// type say it is what proved the marks unconvertible: *two commits that
+/// looked independent, and one is the other's receipt.*
+#[test]
+fn the_marks_that_remain_are_the_ones_that_cannot_convert() {
+    // (file, variant, class). The class is the load-bearing column: a mark
+    // with no class is backlog, and a mark with one is a floor.
+    const RESIDUE: &[(&str, &str, &str)] = &[
+        (
+            "ssm.rs",
+            "WeightNamed2",
+            "THE KEY DOES NOT FIT, in `KvKeys`' class. `keys::NamedWeight2` is \
+             a non-nullable `*const u8`; the parameter is `MaybeConst<T>` and \
+             the C++ is `const T* __restrict__ bias // [C] nullable`. qwen3.5 \
+             builds this conv `bias=False`, so the null is a deployment and \
+             not a lookup that failed.",
+        ),
+        (
+            "gemm/mod.rs",
+            "OutWidth",
+            "NO REGION TO ASK. E1 needs a body holding a region; the operand \
+             is `Unbound<*const *const c_void>`, which says the address did \
+             not come from the statement. A device pointer inside a HOST \
+             array has no rectangle.",
+        ),
+        (
+            "gemm/mod.rs",
+            "InWidth",
+            "`OutWidth`'s reason, one line down, for the input side.",
+        ),
+        (
+            "quant.rs",
+            "OutElements",
+            "NO RECTANGLE EITHER, and for an unrelated reason: a byte run \
+             longer than `i32::MAX` does not fit `Extent`. Its own site says \
+             widening `Extent` to `i64` would retire this one and do nothing \
+             for the two above -- which is why they are separate classes and \
+             not one.",
+        ),
+        (
+            "rope.rs",
+            "KvKeys",
+            "THE KEY DOES NOT FIT. `*mut u8` against a `*mut bf16` \
+             parameter, and the key is the correct one -- a KV page is bytes \
+             whose element type is the layer's dtype, so a fact true of one \
+             instantiation is not a fact.",
+        ),
+        ("rope.rs", "KvValues", "`KvKeys`'s reason, two lines down."),
+        (
+            "attn/mod.rs",
+            "Weight",
+            "THE STATEMENT DOES NOT PLACE IT. `mla_prepare` has no weight \
+             parameter in the DSL at all, so this names a bank that does not \
+             exist -- the mark is a DEFECT, not a notation gap, and it is the \
+             one entry here that should someday leave by being fixed rather \
+             than by the notation growing.",
+        ),
+        // `("attn/xqa.rs", "Attn")` STOOD HERE AND CONVERTED, WHICH IS THE
+        // ONLY WAY AN ENTRY IS SUPPOSED TO LEAVE THIS LIST. Its class was
+        // *"blocked by design, pending the four-part binder template -- the
+        // only entry expected to convert"*, and the template landed: `Cx`
+        // accessor, `Facts` field, `facts()` fill, `operand()` arm, with
+        // `Source::Named(<keys::SmScale as keys::Fact>::KEY)` off the blocked allowlist in the same
+        // change. `sm_scale` is now `Env<keys::SmScale>`.
+        //
+        // **THE GATE CAUGHT ITS OWN SUBJECT MOVING.** The reverse check
+        // failed the build with the mark's class quoted back, which is what
+        // the class column is for: six of the seven were floor, this one was
+        // backlog, and the list said which before anybody touched it.
+    ];
+
+    // WALKED AT RUNTIME, NOT `include_str!`ed. Every other scrape in this
+    // file names its inputs, and every one of them has drifted at least once
+    // -- the list one gate above just failed the build by naming a `layer.rs`
+    // this crate does not have. A named list also cannot see a NEW file, and
+    // a new file is exactly where a new mark would arrive. `CARGO_MANIFEST_DIR`
+    // is set for tests and the sources are on disk beside them, so the gate
+    // reads the crate rather than a description of it.
+    fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+        for e in std::fs::read_dir(dir).expect("the crate's src/ is readable") {
+            let p = e.expect("a readable dir entry").path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                let rel = p
+                    .strip_prefix(concat!(env!("CARGO_MANIFEST_DIR"), "/src/"))
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((rel, std::fs::read_to_string(&p).expect("readable")));
+            }
+        }
+    }
+    let mut files: Vec<(String, String)> = Vec::new();
+    walk(
+        std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+        &mut files,
+    );
+    assert!(
+        files.len() > 20,
+        "the walk found {} files, so it is measuring nothing",
+        files.len(),
+    );
+
+    let mut found: Vec<(&str, &str)> = Vec::new();
+    for (name, src) in &files {
+        for line in src.lines() {
+            let t = line.trim_start();
+            // THREE CLAUSES, ONE PER DEFECT THIS SESSION MEASURED. Strip
+            // comments (`rope.rs` alone contributes twenty-eight phantoms);
+            // require the attribute to OPEN the trimmed line, which is what
+            // keeps `kernels-macros`' `compile_error!` text and two prose
+            // paragraphs inside multi-line string literals from counting --
+            // four of eleven raw hits tree-wide were exactly that.
+            if t.starts_with("//") || !t.starts_with("#[source(") {
+                continue;
+            }
+            let variant = t["#[source(".len()..]
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or("");
+            if !variant.is_empty() {
+                found.push((name.as_str(), variant));
+            }
+        }
+    }
+
+    let mut extra: Vec<&(&str, &str)> = found
+        .iter()
+        .filter(|(f, v)| !RESIDUE.iter().any(|(rf, rv, _)| rf == f && rv == v))
+        .collect();
+    extra.sort();
+    assert!(
+        extra.is_empty(),
+        "a `#[source(..)]` mark appeared that is not in the pinned residue: \
+         {extra:?}. Either convert it to a wrapper -- which is what §3.11 \
+         wants and what forty-five other marks did -- or add it here WITH \
+         the class of inexpressibility that stops it, because an unclassed \
+         entry turns this floor back into a backlog.",
+    );
+
+    // The direction that rots. A residue entry whose mark has gone is a
+    // deletion nobody recorded, and it reads in a diff exactly like an entry
+    // that is still holding -- the same ambiguity that made the numeric pins
+    // single-owner.
+    for (file, variant, why) in RESIDUE {
+        assert!(
+            found.iter().any(|(f, v)| f == file && v == variant),
+            "`{file}` no longer marks `{variant}`, pinned as `{why}`. If the \
+             notation grew to reach it, say so here and take the line out in \
+             the same commit; if the mark was merely deleted, the row it \
+             bound is now sourced by POSITION and nothing said so.",
+        );
+    }
+
+    // AND THE COUNT, said out loud, because the two assertions above both
+    // pass on an empty scrape -- the failure mode `keyed.len() > 20` exists
+    // to catch one gate over.
+    assert_eq!(
+        found.len(),
+        RESIDUE.len(),
+        "the scrape found {} marks against {} pinned; if this is zero the \
+         `include_str!` list has drifted from the crate and this test is \
+         measuring nothing",
+        found.len(),
+        RESIDUE.len(),
+    );
 }

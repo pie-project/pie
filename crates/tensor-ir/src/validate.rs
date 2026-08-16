@@ -1,3 +1,9 @@
+    //! The one check that has to see inside.
+    //!
+    //! Everything reachable through [`bind`] is tested from outside, in
+    //! `tests/validate.rs`. This stays here because it calls a pass directly,
+    //! which is the whole point of it.
+
 //! Bind-time validation: the single gate every inferlet-supplied trace passes
 //! before it reaches a backend. It is the one place the following are
 //! decided, and nothing downstream re-decides them:
@@ -959,11 +965,6 @@ pub(crate) fn classify_channels(
 
 #[cfg(test)]
 mod tests {
-    //! The one check that has to see inside.
-    //!
-    //! Everything reachable through [`bind`] is tested from outside, in
-    //! `tests/validate.rs`. This stays here because it calls a pass directly,
-    //! which is the whole point of it.
 
     use super::*;
     use crate::container::{ChanDType, ChannelDecl, PortBinding, StageProgram};

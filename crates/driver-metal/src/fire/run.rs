@@ -1,6 +1,6 @@
 //! Running a fire: the four calls, in one place.
 //!
-//! Everything under `model/` is a step of one walk, and this is the walk:
+//! Everything under `model/` is a step of one walk:
 //!
 //! ```text
 //! rows_of(step)          the frame's rows          model::frame
@@ -9,15 +9,13 @@
 //! encode(dispatches)     grids -> a command buffer model::encode
 //! ```
 //!
-//! Nothing here decides anything either. It allocates the arena the lowering
-//! asked for, stages the scalars the statements state, compiles the symbols
-//! they name, and runs them in order.
+//! Nothing here decides anything: it allocates the arena the lowering asked
+//! for, stages the scalars the statements state, compiles the symbols they
+//! name, and runs them in order.
 //!
-//! # What is deliberately NOT here
-//!
-//! The KV pool, the paged translation and the completion broker. Those are the
-//! frame's device half and they belong with the module that owns the buffers —
-//! this one owns only the arena, which is the lowering's own number.
+//! Deliberately NOT here: the KV pool, the paged translation and the
+//! completion broker, which belong with the module that owns the buffers —
+//! this one owns only the arena, the lowering's own number.
 
 use crate::bind::encode::{Params, Pipelines, encode};
 use crate::device::{Allocation, ArgumentTable, Context, Stepper, Timing};
@@ -44,20 +42,14 @@ pub struct Prepared {
 
 /// Allocate and stage everything one lowered fire needs.
 ///
-/// # The one hand-assembled path left
+/// Exists only for two tests in `device_real_weights.rs` that encode a
+/// prefix by hand; every other caller composes this and `encode` through
+/// [`run`], [`run_keeping_arena`] or [`submit`].
 ///
-/// [`run`], [`run_keeping_arena`] and [`submit`] are one function now. This
-/// is not part of it: it hands back the three pieces so a caller can encode
-/// them itself, and the only callers are two tests in
-/// `device_real_weights.rs` that encode a prefix by hand.
-///
-/// It is also the one that can be held wrong. The dispatches were planned
-/// against SOME frame; the arena allocated here gives a different one, so
-/// `Prepared::frame()` and the frame those dispatches were bound to agree
-/// only if the caller re-plans. `submit` cannot make that mistake because it
-/// allocates before it plans. `.wiki/driver/real-metal-north-star.md` §9
-/// wants this gone; what it costs is rewriting the two prefix tests, which
-/// is a change to the evidence and belongs in its own commit.
+/// Callers must re-plan before reusing the returned arena: the dispatches
+/// were planned against some frame, and the arena allocated here gives a
+/// different one, so `Prepared::frame()` only agrees with them if the caller
+/// re-plans. `submit` avoids the hazard by allocating before it plans.
 ///
 /// # Errors
 ///
@@ -96,10 +88,8 @@ impl Prepared {
     }
 }
 
-/// Plan, prepare, compile and run one lowered fire.
-///
-/// Returns the [`Timing`] the stepper measured, so a caller can compare a fire
-/// against the handwritten path it replaces without instrumenting anything.
+/// Plan, prepare, compile and run one lowered fire; returns the [`Timing`]
+/// the stepper measured.
 ///
 /// # Errors
 ///
@@ -116,24 +106,16 @@ pub fn run<R: Resolver>(
     run_keeping_arena(context, compiler, pipelines, lowered, geometry, resolver).map(|(t, _)| t)
 }
 
-/// [`run`], returning the ARENA beside the timing.
+/// [`run`], returning the ARENA beside the timing: reading it after a green
+/// run catches three failure modes that a passing run alone would not — an
+/// arena of zeros (projections no-opped), of NaNs (a norm handed a zero
+/// epsilon), or of identical rows (a per-token axis that never reached the
+/// kernels).
 ///
-/// The arena is where every activation this fire produced landed, and reading
-/// it is the difference between "the fire executed" and "the fire computed
-/// something". `run` drops it, which is right for a caller that wants the next
-/// fire and wrong for one that wants to look — and looking is how the three
-/// failure modes that survive a green execution get caught: an arena of zeros
-/// is a fire whose projections no-opped, an arena of NaNs is a norm handed a
-/// zero epsilon, and an arena of identical rows is a per-token axis that never
-/// reached the kernels.
-///
-/// # What it is not
-///
-/// Not the production path's twin — it IS the production path, with fresh
-/// state. A `Stepper`, `Scratch` and `Regions` built per call cannot
-/// pipeline, cannot reuse an address and cannot record, so this is the
-/// slowest way to run a fire and the only one that needs nothing kept.
-/// Use [`submit`] with a [`Machine`] to serve.
+/// It IS the production path, with fresh state: a `Stepper`, `Scratch` and
+/// `Regions` built per call cannot pipeline, reuse an address or record, so
+/// this is the slowest way to run a fire. Use [`submit`] with a [`Machine`]
+/// to serve.
 ///
 /// # Errors
 ///
@@ -146,21 +128,9 @@ pub fn run_keeping_arena<R: Resolver>(
     geometry: Geometry,
     resolver: &mut R,
 ) -> Result<(Timing, crate::fire::Lease)> {
-    // Its own everything, and that is the whole difference from `submit`.
-    //
-    // This function USED to reimplement `submit`: allocate, zero, plan,
-    // stage, size the table, ensure the pipelines, encode. Two copies of one
-    // sequence, and the tests drove this one while the engine drove the
-    // other -- `.wiki/driver/real-metal-north-star.md` §9: *a test that
-    // exercises a path production does not take is not a test of
-    // production.* The copies had already drifted: only `submit` registered
-    // its regions, pooled its scratch and looked for a recording.
-    //
-    // So this is `submit` now, with per-call state instead of the caller's.
-    // What that costs is exactly what the fresh state cannot do -- no
-    // pipelining (one stepper, one fire), no address reuse across calls, no
-    // recording -- and every one of those is a property of the STATE, which
-    // is what `Machine` was extracted to say.
+    // This is `submit`, with per-call state instead of the caller's: no
+    // pipelining (one stepper, one fire), no address reuse across calls, and
+    // no recording -- properties of the STATE, which is what `Machine` holds.
     let mut stepper = Stepper::new(context)?;
     let scratch = crate::fire::Scratch::new();
     let mut regions = crate::device::Regions::new();
@@ -174,19 +144,17 @@ pub fn run_keeping_arena<R: Resolver>(
             stepper: &mut stepper,
             scratch: &scratch,
             regions: &mut regions,
-            // Nothing but the arena and the params is registered above, and a
-            // fire's operands also point at weights this function never sees.
-            // Recording would allocate an ICB and fail to resolve, every call.
+            // Neither the weights nor the pool are registered here, so a
+            // recording would allocate an ICB and fail to resolve, every call.
             recordings: None,
         },
         lowered,
         geometry,
         resolver,
     )?;
-    // `fire` is alive across the wait, which is the point of `InFlight`: the
-    // command buffer still addresses its argument table and its staged
-    // params, and dropping either while it runs is a use-after-free that a
-    // green run does not show.
+    // `fire` stays alive across the wait: its command buffer still addresses
+    // the argument table and staged params, and dropping either early is a
+    // use-after-free a green run would not show.
     let timing = stepper.wait_for_timing(fire.value, began.elapsed())?;
     Ok((timing, fire.arena))
 }
@@ -194,12 +162,9 @@ pub fn run_keeping_arena<R: Resolver>(
 /// A fire that has been COMMITTED and may still be running.
 ///
 /// Everything the GPU still refers to, held together so a caller cannot drop
-/// half of it. The command buffer addresses the arena, reads its operands out
-/// of the argument table and its scalars out of the staged params; freeing
-/// any of the three while the buffer executes is a use-after-free that a
-/// green run will not show, because the bytes are usually still there.
-///
-/// So this owns them and hands back only `arena`, and only after
+/// half of it: freeing the arena, table or params while the command buffer
+/// executes is a use-after-free a green run will not show, since the bytes
+/// are usually still there. Hands back only `arena`, and only after
 /// [`Stepper::has_passed`] says the fire retired.
 pub struct InFlight {
     /// The timeline value this fire signals.
@@ -216,22 +181,16 @@ pub struct InFlight {
 
 /// Everything a driver keeps ACROSS fires.
 ///
-/// Five things, and what they have in common is the reason they are one
-/// struct: each is wrong to rebuild per fire, and each was wrong in its own
-/// way before it was held.
+/// Five things, each wrong to rebuild per fire: `stepper` (the timeline and
+/// allocator ring — fresh means no value to compare against, no pipelining),
+/// `scratch` (the fire's regions — fresh leaks into the residency set
+/// permanently and moves an address that should stay stable), `pipelines`
+/// (the compile cache — rebuilding recompiles every shader), and `context`/
+/// `compiler` (the device and its shader compiler).
 ///
-/// * `stepper` — the timeline and the allocator ring. A fresh one has no
-///   value to compare against and no allocator to alternate, so it cannot
-///   pipeline even in principle.
-/// * `scratch` — the fire's regions. A fresh region per fire leaks into the
-///   residency set permanently (nothing removes) and moves an address that
-///   is one of only three differing between two fires of one shape.
-/// * `pipelines` — the compile cache. Rebuilding it recompiles every shader.
-/// * `context`, `compiler` — the device and its shader compiler.
-///
-/// Grouped rather than passed as five parameters because they travel
-/// together and always will: a caller that has one has all of them, and the
-/// list was already at clippy's argument limit when `scratch` joined it.
+/// Grouped rather than passed as five parameters because a caller that has
+/// one has all of them, and separate parameters would exceed clippy's
+/// argument-count lint.
 #[derive(Debug)]
 pub struct Machine<'c, 's> {
     /// The device.
@@ -250,32 +209,20 @@ pub struct Machine<'c, 's> {
     pub regions: &'c mut crate::device::Regions,
     /// Fires already recorded, by what they are valid for.
     ///
-    /// `None` means **do not try**. A recording binds buffers, so it can only
-    /// be made once every region a fire's operands point into is registered
-    /// — the weights and the KV pool, which the caller owns and `submit` has
-    /// no way to reach. A caller that has not registered them would have
-    /// every attempt allocate an ICB, fail to resolve an address and throw
-    /// the buffer away, which is a leak dressed as a fallback. Saying so is
-    /// one word; discovering it is a residency set that grows per fire.
+    /// `None` means **do not try**: a recording binds buffers, so it can
+    /// only be made once every region a fire's operands point into — the
+    /// weights and the KV pool, owned by the caller — is registered.
     pub recordings: Option<&'c mut crate::fire::Recordings>,
 }
 
-/// Plan, encode and COMMIT one fire, without waiting for it.
+/// Plan, encode and COMMIT one fire, without waiting for it — [`run`] and
+/// [`run_keeping_arena`] are this function with per-call state, wrapped in a
+/// wait; this is the one encode path in the module.
 ///
-/// [`run`] and [`run_keeping_arena`] wrap this and end in a wait, so those
-/// callers cannot queue the next fire until this one has finished -- the call
-/// that would queue it has not returned. That makes a dispatch depth a number the engine honours
-/// and the driver serialises, which is what `.wiki/new-driver/next.md`
-/// priority 1 is about.
-///
-/// `stepper` is the caller's and must be the SAME one across fires: the
-/// timeline and the allocator ring live on it, and a fresh `Stepper` per fire
-/// -- which is what `run_keeping_arena` builds -- has neither a value to
-/// compare against nor an allocator to alternate. [`Stepper::submit`] bounds
+/// `stepper` is the caller's and must be the SAME one across fires: a fresh
+/// `Stepper` per fire (what `run_keeping_arena` builds) has no value to
+/// compare against and no allocator to alternate. [`Stepper::submit`] bounds
 /// the depth by waiting for the step two back.
-///
-/// [`run`] and [`run_keeping_arena`] are this function with per-call state.
-/// There is one encode path in this module, and it is here.
 ///
 /// # Errors
 ///
@@ -296,17 +243,11 @@ pub fn submit<R: Resolver>(
         recordings,
     } = machine;
     // LEASED, and `scratch` must be the caller's -- the same one across
-    // fires, like `stepper`. Two things follow from reuse, and both are
-    // measured in `.wiki/driver/graph-metal.md`:
-    //
-    // * `ring::allocate` adds every buffer to the residency set and NOTHING
-    //   removes it, so a fresh region per fire leaks permanently. Fifty
-    //   allocate-and-drop cycles leave fifty allocations and 52 MB resident.
-    //   A serving driver does three per fire.
-    // * the arena's address is one of only three things that differ between
-    //   two fires of one shape, and it is what stands between this driver and
-    //   recording its command buffer once instead of re-encoding 424
-    //   dispatches per fire -- 76.4% of a decode.
+    // fires, like `stepper`: `ring::allocate` adds every buffer to the
+    // residency set and nothing removes it, so a fresh region per fire leaks
+    // permanently, and the arena's address is one of only three things that
+    // differ between two fires of one shape, which is what recording a
+    // command buffer once instead of re-encoding every dispatch relies on.
     let arena = scratch.take(
         context,
         (lowered.arena_bytes as u64).max(1),
@@ -331,34 +272,18 @@ pub fn submit<R: Resolver>(
     regions.add(params.region());
     let table = ArgumentTable::new(context, table_width(&dispatches))?;
     pipelines.ensure(context, compiler, &dispatches)?;
-    // REPLAY if this exact fire has been recorded, encode if not.
-    //
-    // Measured: `llama_like`'s 424-dispatch decode costs **14.87 ms** to
-    // encode and **39.8 us** to replay -- 374x, because encoding is about
-    // 5 000 Objective-C messages and replaying is one. On decode that was
-    // 76.4% of the step.
+    // REPLAY if this exact fire has been recorded (roughly two orders of
+    // magnitude cheaper than re-encoding every dispatch), else ENCODE.
     //
     // The fingerprint is the validity condition, checked rather than assumed:
     // a recording bakes each operand's buffer and offset, its grid and its
-    // pipeline, and replaying one against a fire that differs in any of those
-    // runs the wrong program silently. A fire whose digest is new gets its own
-    // recording -- nothing is ever rewritten in place, because a fire in
-    // flight is executing out of its ICB.
+    // pipeline, so replaying one against a fire that differs in any of those
+    // would silently run the wrong program. A fire whose digest is new gets
+    // its own recording rather than rewriting one in flight.
     //
-    // Falls back to encoding for ONE failure and propagates the rest.
-    //
-    // `Error::Unrecordable` means an operand is in no registered allocation:
-    // a deployment that has not registered its regions, which the encode
-    // path does not care about because it binds addresses. That one is
-    // swallowed on purpose.
-    //
-    // Everything else `record` can fail at is a bug -- a symbol with no
-    // compiled pipeline after `ensure`, a dispatch stating scalars that were
-    // never staged, a device declining an ICB. This used to be `.ok()`, so
-    // all four arrived as "encode instead": three real faults turned into a
-    // 374x slowdown and no message, which is the worst available outcome
-    // because the answers stay right. The `match` is the fix, and the
-    // variant exists so it can be written.
+    // `Error::Unrecordable` (an operand in no registered allocation) falls
+    // back to encoding on purpose; anything else `record` can fail at is a
+    // bug and propagates.
     let recorded = match recordings.as_mut() {
         None => None,
         Some(recordings) => {

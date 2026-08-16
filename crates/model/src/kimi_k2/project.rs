@@ -54,7 +54,7 @@ pub fn manifest(f: &KimiFacts, tied_embeddings: bool) -> Manifest {
         .with(TensorSpec::required("norm", [hidden]))
         // TIED vs UNTIED as presence, which is the only way a manifest
         // can tell them apart: every extent agrees.
-        .either(!tied_embeddings, "lm_head", [vocab, hidden])
+        .tie(tied_embeddings, "lm_head", [vocab, hidden])
         .with(TensorSpec::required("layer.{}.input_layernorm", [hidden]))
         .with(TensorSpec::required(
             "layer.{}.post_attention_layernorm",
@@ -232,6 +232,7 @@ fn plan(
             // Only the rope half rotates; the nope half is carried
             // straight through, which is what makes the latent cacheable.
             rotary_dim: a.qk_rope_head_dim,
+            q_gate: false,
         })
         .collect();
 

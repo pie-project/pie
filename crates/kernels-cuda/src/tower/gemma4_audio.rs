@@ -1,95 +1,31 @@
 //! The gemma-4 AUDIO tower's host walk — the USM/Conformer encoder.
 //!
-//! The port of `driver-cuda/csrc/vision/gemma4_audio.cu`'s host half:
-//! `run_gemma4_audio`, `encode_gemma4_audio`, the `clin`/`ffn` lambdas, the
-//! `DeviceScratch` arena and the stride-62 struct rebuild that
-//! `gemma4_towers_c.cpp` did for it. All of it ran on the CPU; none of it is
-//! C++ any more.
+//! Log-mel features in, soft-token embedding rows out: an SSCP conv stack
+//! subsamples (time, freq), twelve conformer blocks run (macaron half-FFN,
+//! chunked-local attention, depthwise causal conv, half-FFN, RMSNorm),
+//! `output_proj` widens 1024 -> 1536, and a shared embedder projects to the
+//! text width.
 //!
-//! # What the walk is
-//!
-//! Log-mel features in, soft-token embedding rows out, in four stages:
-//!
-//! 1. **SSCP** — two `Conv2d(k3, s2, p1)` over (time, freq), each followed by
-//!    a LayerNorm over the CHANNEL axis and a ReLU, which is why each conv is
-//!    bracketed by a channels-last/channels-first transpose pair. Then a
-//!    flatten to `[T2, F2*C1]` and one projection to the tower width.
-//! 2. **Twelve conformer blocks**, each a macaron half-FFN, chunked-local
-//!    self-attention with a relative-position bias, a light depthwise causal
-//!    conv module, a second macaron half-FFN, and a final RMSNorm.
-//! 3. **`output_proj`**, a matmul with bias, 1024 → 1536.
-//! 4. **The shared embedder** — a parameterless RMSNorm then a projection
-//!    into the text width.
-//!
-//! Thirty-odd launches per layer, all of them JIT'd. The `.cu` said its
-//! kernels had already left — *"THE KERNELS ARE NOT HERE. All twelve moved to
-//! `vision/gemma4_audio.cuh` in the JIT crate's header tree"* — and what was
-//! left compiling was the loop above.
-//!
-//! # The four grids no rule states, and why that is not a wall
-//!
-//! Three SSCP kernels launch `dim3((F+15)/16, (T+15)/16, C)`: `Tile16`'s
-//! rectangle with a channel count on `grid.z`, which `Dims` has no field for.
-//! `k_local_attn` launches `dim3((N+127)/128, NH)`, a TILE count where every
-//! ported rule puts a count of things. Neither is a rule this crate may grow
-//! — §10.5 forbids growing the vocabulary for one kernel — and neither needs
-//! to be: the owner's principle puts the composition in Rust, so **the host
-//! computes the grid and the host is here**. Those four rows carry
-//! `LaunchRule::Unstated`, every operand sourced, and each fire below quotes
-//! the `dim3` it reproduces. [`super::fire_stated`] is the entry;
-//! `fire/attn_score.rs` has used that path since before the towers moved.
-//!
-//! # The thirteenth kernel
-//!
-//! The depthwise causal conv is not a vision kernel at all — the `.cu` says
-//! *"`k_depthwise_causal` is `pie::ssm::causal_conv1d_prefill<T, false>`
-//! — bit for bit the same accumulation in the same order"*. That template now
-//! carries a row of its own (`ssm::causal_conv1d_prefill_noact_bf16`), and
-//! `families/ssm.rs` records why it could not have one before: it had no
-//! caller. It has one, and the caller is this file.
-//!
-//! # A failure is a refusal
-//!
-//! Every `ACK(...)` in the `.cu` threw `std::runtime_error`, and every
-//! `throw` in `run_gemma4_audio` crossed the C ABI. Each is a `Result` here.
-//! Nothing substitutes a kernel, retries at another geometry, or treats a
-//! refused launch as a no-op — the next launch reads the buffer this one was
-//! supposed to write.
-//!
-//! # No numerics moved
-//!
-//! Unlike the vision tower, this walk's `k_rms` is the tower's OWN
-//! `vision::k_rms_bf16` at `<<<N, 256>>>` and `LaunchRule::PerRow` launches
-//! `grid[rows] block[256]` — the same grid, the same block. There is no
-//! divergence to state here; `super::gemma4_vision`'s 512→256 fold is not
-//! repeated because this tower never called `norm::rmsnorm_strided_bf16`.
+//! The depthwise causal conv reuses the SSM kernel
+//! `ssm::causal_conv1d_prefill_noact_bf16`. Unlike `super::gemma4_vision`, this
+//! tower's RMSNorm is the plain `vision::k_rms_bf16` at `<<<N, 256>>>`, with no
+//! 512->256 fold.
 
 use std::ffi::c_void;
 
-use kernels_cuda::jit::abi::bf16;
-use kernels_cuda::{ssm, vision};
-use model::shared::tower_names::AUDIO_SLOTS_PER_LAYER;
+use crate::jit::abi::bf16;
+use crate::{ssm, vision};
 
-use super::{Scratch, call};
-use crate::device::{StreamRef, read_raw_span};
-use crate::{Error, Result};
+use super::{Refused, Result, Scratch, Stream, call, read_raw_span};
 
 /// The subject of every refusal in this file, stated once.
-///
-/// `tests/no_family_names.rs` counts non-comment lines naming a family, and
-/// a walk that spells its own tower at forty refusal sites spells it forty
-/// times to a counter that cannot tell a refusal's subject from a routing
-/// decision. `super::gemma4_vision` collapsed thirty-two this way; this file
-/// was written at one.
 const WHO: &str = "gemma4_audio";
 
 /// A clipped linear's five slots: `[w, imin, imax, omin, omax]`.
 ///
-/// The clamp bounds are DEVICE pointers to single bf16 elements and all four
-/// are nullable — `k_clamp`'s row says `Buf | null` and the kernel's
-/// `lo ? F(*lo) : neg_inf()` is what a null means. Reading them on the host
-/// would be a synchronising copy per linear per layer, twenty-four times a
-/// block.
+/// The clamp bounds are nullable device pointers to single bf16 elements; a
+/// null bound is an open side. They are never read on the host, which would
+/// synchronise per linear per layer.
 #[derive(Clone, Copy, Debug)]
 pub struct Clip {
     /// The weight matrix, `[out, in]` bf16.
@@ -105,7 +41,7 @@ pub struct Clip {
 }
 
 impl Clip {
-    /// Five consecutive slots — `gemma4_towers_c.cpp`'s `clip_of`.
+    /// Five consecutive slots.
     fn of(t: &[*const c_void]) -> Self {
         Self {
             w: t[0],
@@ -117,7 +53,7 @@ impl Clip {
     }
 }
 
-/// One macaron feed-forward half — `AudioFfnRaw`, twelve consecutive slots.
+/// One macaron feed-forward half: twelve consecutive slots.
 #[derive(Clone, Copy, Debug)]
 pub struct Ffn {
     /// Pre-norm scale.
@@ -131,7 +67,7 @@ pub struct Ffn {
 }
 
 impl Ffn {
-    /// Twelve consecutive slots — `gemma4_towers_c.cpp`'s `ffn_of`.
+    /// Twelve consecutive slots.
     fn of(t: &[*const c_void]) -> Self {
         Self {
             pre_ln: t[0],
@@ -233,44 +169,36 @@ pub struct Weights {
 impl Weights {
     /// Rebuild the tower's weights from the flat pointer table.
     ///
-    /// The port of `gemma4_towers_c.cpp:48-118`, which existed only to turn
-    /// the stride-62 table `serve::encode` builds into the C++ struct the
-    /// walk consumed. In Rust the walk consumes this directly.
-    ///
-    /// The slot ORDER is `model::shared::tower_names::audio_layers`'s and the
-    /// offsets below are `gemma4_towers_c.cpp:76-92` unchanged.
-    ///
-    /// # Errors
-    ///
-    /// The table is not `depth * 62` entries long, which means the caller and
-    /// `tower_names` disagree about the layout — a refusal, because reading
-    /// one slot past the end is a weight pointer from another layer.
+    /// Slot order is `model::shared::tower_names::audio_layers`'s. A table
+    /// shorter than `depth * slots_per_layer` is refused: a slot past the
+    /// end is another layer's pointer.
     #[allow(clippy::too_many_arguments)]
     pub fn from_flat(
         head: [*const c_void; 8],
         layer_w: &[*const c_void],
         depth: usize,
+        slots_per_layer: usize,
         dims: [i32; 9],
         logit_cap: f32,
         residual_weight: f32,
         eps: f32,
     ) -> Result<Self> {
         let want = depth
-            .checked_mul(AUDIO_SLOTS_PER_LAYER)
-            .ok_or_else(|| Error::invalid(WHO, "layer table length overflowed"))?;
+            .checked_mul(slots_per_layer)
+            .ok_or_else(|| Refused::new(WHO, "layer table length overflowed"))?;
         if layer_w.len() < want {
-            return Err(Error::invalid(
+            return Err(Refused::new(
                 WHO,
                 format!(
                     "layer table holds {} pointers for {depth} layers of \
-                     {AUDIO_SLOTS_PER_LAYER}, which needs {want}",
+                     {slots_per_layer}, which needs {want}",
                     layer_w.len()
                 ),
             ));
         }
         let mut layers = Vec::with_capacity(depth);
         for i in 0..depth {
-            let t = &layer_w[i * AUDIO_SLOTS_PER_LAYER..(i + 1) * AUDIO_SLOTS_PER_LAYER];
+            let t = &layer_w[i * slots_per_layer..(i + 1) * slots_per_layer];
             layers.push(Layer {
                 ff1: Ffn::of(t),
                 ff2: Ffn::of(&t[12..]),
@@ -339,10 +267,6 @@ impl Weights {
     }
 
     /// Set the attention context horizons — `context_left`, `context_right`.
-    ///
-    /// Separate from [`Weights::from_flat`] because `from_flat` already takes
-    /// nine dimensions and two more would make it twelve positional `i32`s in
-    /// a row, which is the shape a caller silently transposes.
     #[must_use]
     pub fn with_context(mut self, left: i32, right: i32) -> Self {
         self.context_left = left;
@@ -351,12 +275,7 @@ impl Weights {
     }
 }
 
-/// Every shape the walk derives, computed and refused ONCE.
-///
-/// The C++ recomputed `(n-1)/2+1` in three places and read `w.hidden/w.heads`
-/// at every launch. Deriving them together is what makes the refusals below
-/// a single list instead of a check buried in the twentieth launch of a
-/// layer.
+/// Every shape the walk derives, computed and refused once.
 struct Walk {
     /// Tower width, `w.hidden`.
     hd: i32,
@@ -383,31 +302,24 @@ struct Walk {
 }
 
 impl Walk {
-    /// Derive the walk's shapes from the weights and the clip.
+    /// Derive the walk's shapes, with two refusals.
     ///
-    /// `gemma4_audio.cu:154-175`, with the two `throw`s as refusals.
-    ///
-    /// `chunk_size` and `context_right` are NOT read, and the `.cu` says why
-    /// at `:139-144`: for this configuration the HF blocked-5D mask
-    /// (chunk 12 / past 12 / future 0) plus `_rel_shift` collapses to a plain
-    /// causal sliding window, so the kernel takes `P` and derives the rest.
-    /// They stay on [`Weights`] because a checkpoint that changed them would
-    /// change that collapse, and a field that is absent cannot be checked
-    /// later.
+    /// `chunk_size` and `context_right` are not read: at chunk 12 / past 12 /
+    /// future 0 the mask is a plain causal sliding window. They stay on
+    /// [`Weights`] so a changed checkpoint stays visible.
     fn new(w: &Weights, n_frames: i32, n_mel: i32, out_len: i32) -> Result<Self> {
         let (hd, nh) = (w.hidden, w.heads);
         if hd != 1024 || nh != 8 {
-            return Err(Error::invalid(
+            return Err(Refused::new(
                 WHO,
                 format!("unexpected dims (expected hidden=1024, heads=8, got {hd}/{nh})"),
             ));
         }
         let head_dim = hd / nh;
-        // `(n - 1) / 2 + 1`, the `cdim` lambda — `Conv2d(k3, s2, p1)`'s output
-        // extent. Applied twice along each axis.
+        // `Conv2d(k3, s2, p1)`'s output extent, applied twice along each axis.
         let cdim = |n: i32| (n - 1) / 2 + 1;
         if n_frames <= 0 || n_mel <= 0 {
-            return Err(Error::invalid(
+            return Err(Refused::new(
                 WHO,
                 format!("invalid feature shape ({n_frames} frames of {n_mel})"),
             ));
@@ -415,7 +327,7 @@ impl Walk {
         let (t1, f1) = (cdim(n_frames), cdim(n_mel));
         let (t2, f2) = (cdim(t1), cdim(f1));
         if t2 != out_len {
-            return Err(Error::invalid(
+            return Err(Refused::new(
                 WHO,
                 format!("out_len != subsampled frames ({out_len} vs {t2})"),
             ));
@@ -442,16 +354,13 @@ impl Walk {
 
 /// A row-major element count as the `usize` an `Elementwise` row wants.
 fn elems(what: &str, rows: i32, width: i32) -> Result<usize> {
-    let r = usize::try_from(rows).map_err(|_| Error::invalid(WHO, format!("{what}: rows")))?;
-    let c = usize::try_from(width).map_err(|_| Error::invalid(WHO, format!("{what}: width")))?;
+    let r = usize::try_from(rows).map_err(|_| Refused::new(WHO, format!("{what}: rows")))?;
+    let c = usize::try_from(width).map_err(|_| Refused::new(WHO, format!("{what}: width")))?;
     r.checked_mul(c)
-        .ok_or_else(|| Error::invalid(WHO, format!("{what}: element count overflowed")))
+        .ok_or_else(|| Refused::new(WHO, format!("{what}: element count overflowed")))
 }
 
-/// `vd::k_rms<bfd><<<N, 256, 0, S>>>(x, w, o, N, W, EPS)`.
-///
-/// `weight` is nullable and the embedder's call passes null — a parameterless
-/// RMSNorm is what `Gemma4MultimodalEmbedder` is, not a missing weight.
+/// RMSNorm over each row's `width`, `weight` nullable (null = parameterless).
 fn rms(
     x: *const c_void,
     weight: *const c_void,
@@ -459,14 +368,14 @@ fn rms(
     rows: i32,
     width: i32,
     eps: f32,
-    stream: StreamRef<'_>,
+    stream: Stream<'_>,
 ) -> Result<()> {
     call("vision::k_rms_bf16", stream, |ctx| {
         vision::k_rms_bf16(ctx, x, weight, o, rows, width, eps)
     })
 }
 
-/// `vd::k_matmul<bfd><<<G2(Out, N), B2, 0, S>>>(x, w, y, N, Kin, Out)`.
+/// `y[N, Out] = x[N, Kin] @ w[Out, Kin]^T`.
 fn matmul(
     x: *const c_void,
     w: *const c_void,
@@ -474,33 +383,29 @@ fn matmul(
     n: i32,
     kin: i32,
     out: i32,
-    stream: StreamRef<'_>,
+    stream: Stream<'_>,
 ) -> Result<()> {
     call("vision::k_matmul_bf16", stream, |ctx| {
         vision::k_matmul_bf16(ctx, x, w, y, n, kin, out)
     })
 }
 
-/// `vd::k_clamp<bfd><<<(n+255)/256, 256, 0, S>>>(x, o, lo, hi, n)`.
+/// Clamp `n` elements of `x` into `[lo, hi]` (either bound nullable).
 fn clamp(
     x: *const c_void,
     o: *mut c_void,
     lo: *const c_void,
     hi: *const c_void,
     n: usize,
-    stream: StreamRef<'_>,
+    stream: Stream<'_>,
 ) -> Result<()> {
     call("vision::k_clamp_bf16", stream, |ctx| {
         vision::k_clamp_bf16(ctx, x, o, lo, hi, n)
     })
 }
 
-/// The clipped linear — `gemma4_audio.cu:163-166`'s `clin` lambda.
-///
-/// `clamp(x) → xc`, `matmul(xc, c.w) → out`, `clamp(out) → out` in place.
-/// Three launches, one intermediate (`xc`), and the second clamp reads and
-/// writes the same buffer, which is what the row's `in_place` cell states for
-/// `k_clamp`'s caller rather than a claim this file makes.
+/// The clipped linear: `clamp(x) -> xc`, `matmul(xc, c.w) -> out`, then
+/// `clamp(out)` in place (reads and writes the same buffer).
 #[allow(clippy::too_many_arguments)]
 fn clin(
     x: *const c_void,
@@ -510,7 +415,7 @@ fn clin(
     n: i32,
     kin: i32,
     o: i32,
-    stream: StreamRef<'_>,
+    stream: Stream<'_>,
 ) -> Result<()> {
     clamp(x, xc, c.imin, c.imax, elems("clin in", n, kin)?, stream)?;
     matmul(xc.cast_const(), c.w, out, n, kin, o, stream)?;
@@ -524,15 +429,13 @@ fn clin(
     )
 }
 
-/// The arena the walk writes through — `DeviceScratch`'s twelve `MAL` calls
-/// plus the SSCP's six, named so a reader can follow the dataflow.
+/// The arena the walk writes through.
 struct Arena {
     /// `[N, Hd]` — the residual stream.
     h: *mut c_void,
     /// `[N, Hd]` — a normalised copy of `h`.
     hn: *mut c_void,
-    /// `[N, IM]` — the clipped-linear input staging buffer, sized for the
-    /// widest linear in the block (the FFN's `4*hidden`).
+    /// `[N, IM]` — clipped-linear input staging, sized for the FFN's `4*hidden`.
     xc: *mut c_void,
     /// `[N, IM]` — the FFN's inner activations.
     ffmid: *mut c_void,
@@ -560,23 +463,11 @@ struct Arena {
     relk: *mut c_void,
 }
 
-/// The tower's forward pass over one clip — `run_gemma4_audio`.
+/// The tower's forward pass over one clip.
 ///
-/// `features` is the clip's log-mel plane as BYTES (f32, `[n_frames, n_mel]`,
-/// padding already stripped); `out_proj` receives `[out_len, text_hidden]`
-/// bf16. The C++ took a `const float*` and its caller divided a byte offset by
-/// four; the bytes are the same bytes and the division is gone.
-///
-/// The `Gemma4AudioCkptFn` hook is not ported. It was a parity-debugging
-/// callback defaulted to `nullptr`, set by nothing in the tree, and its five
-/// `CKPT` call sites each cost a `cudaStreamSynchronize` guarded by a null
-/// check — the same reasoning that dropped `VisDebugTap` from the vision
-/// walk.
-///
-/// # Errors
-///
-/// Unexpected tower dimensions, a subsampled length that disagrees with the
-/// caller's, an allocation the driver refused, or any refused launch.
+/// `features` is the clip's log-mel plane as bytes (f32, `[n_frames, n_mel]`,
+/// padding already stripped), so the host never divides a byte offset by the
+/// element size; `out_proj` receives `[out_len, text_hidden]` bf16.
 #[allow(clippy::too_many_lines)]
 pub fn run(
     w: &Weights,
@@ -585,22 +476,19 @@ pub fn run(
     n_mel: i32,
     out_len: i32,
     out_proj: *mut c_void,
-    stream: StreamRef<'_>,
+    stream: Stream<'_>,
 ) -> Result<()> {
     let g = Walk::new(w, n_frames, n_mel, out_len)?;
     let (hd, nh, im, n) = (g.hd, g.nh, g.im, g.n);
     let (opd, txt, eps) = (w.out_proj_dims, w.text_hidden, w.eps);
     let mut scratch = Scratch::new();
 
-    // ── 1) SSCP subsampling conv stack ──────────────────────────────────
-    // `:177-183` — the features arrive f32 and the tower runs bf16, so the
-    // upload is followed by one cast. `k_f32_to_bf16`'s row takes `F32s` and
-    // not `Buf`: this kernel's source is float whatever the row's element
-    // type is.
+    // Features arrive f32 and the tower runs bf16, so the upload is followed
+    // by one cast; the cast's source is float whatever the destination type.
     let (t0, f0) = (n_frames, n_mel);
     let mel = elems("mel plane", t0, f0)?;
     if features.len() < mel * 4 {
-        return Err(Error::invalid(
+        return Err(Refused::new(
             WHO,
             format!(
                 "clip features hold {} bytes for a [{t0}, {f0}] f32 plane, which needs {}",
@@ -614,11 +502,8 @@ pub fn run(
     call("vision::k_f32_to_bf16_bf16", stream, |ctx| {
         vision::k_f32_to_bf16_bf16(ctx, f32d.cast_const(), feat, mel)
     })?;
-    // `:182` synchronised here. It does not need to: the upload, the cast and
-    // every launch below are ordered on one stream, and the host reads
-    // nothing until `encode` copies the rows back. The C++ arena freed with
-    // `cudaFree`, which synchronises the device implicitly, so the walk was
-    // paying for that ordering whether it asked or not.
+    // No sync here: the upload, the cast and every launch below are ordered on
+    // one stream, and the host reads nothing until `encode` copies the rows back.
 
     let (c0ch, c1ch) = (w.sscp_ch0, w.sscp_ch1);
     let (t1, f1, t2, f2) = (g.t1, g.f1, n, g.f2);
@@ -627,7 +512,6 @@ pub fn run(
     let c1 = scratch.bf16(elems("sscp1", c1ch, t2 * f2)?)?;
     let c1cl = scratch.bf16(elems("sscp1 (channels-last)", c1ch, t2 * f2)?)?;
 
-    // `:186` — `dim3 g((F1+15)/16,(T1+15)/16,C0); k_conv2d_s2<bfd><<<g,B2,0,S>>>`.
     sscp(
         SscpStage {
             src: feat.cast_const(),
@@ -645,7 +529,6 @@ pub fn run(
         },
         stream,
     )?;
-    // `:193-197` — the same four launches over `(C0,T1,F1) → (C1,T2,F2)`.
     sscp(
         SscpStage {
             src: c0.cast_const(),
@@ -664,20 +547,17 @@ pub fn run(
         stream,
     )?;
 
-    // `:199-203` — flatten `[C1,T2,F2]` → `[T2, F2*C1]`, then `input_proj`.
+    // Flatten `[C1,T2,F2]` -> `[T2, F2*C1]`, then `input_proj`.
     let flat_w = f2
         .checked_mul(c1ch)
-        .ok_or_else(|| Error::invalid(WHO, "flattened SSCP width overflowed"))?;
+        .ok_or_else(|| Refused::new(WHO, "flattened SSCP width overflowed"))?;
     let flat = scratch.bf16(elems("sscp flat", n, flat_w)?)?;
-    // `dim3 g((FLAT+15)/16,(N+15)/16); k_sscp_flatten<bfd><<<g,B2,0,S>>>`.
     call("vision::k_sscp_flatten_bf16", stream, |ctx| {
         vision::k_sscp_flatten_bf16(ctx, c1.cast_const(), flat, c1ch, t2, f2)
     })?;
 
-    // ── 2) Conformer layers ─────────────────────────────────────────────
-    // `:202` and `:212-214`. Every buffer the loop needs is allocated once,
-    // outside it, exactly as the C++ did: twelve blocks reusing one arena is
-    // what makes this walk's footprint a function of `N` and not of depth.
+    // Every buffer the loop needs is allocated once, outside it: twelve blocks
+    // reuse one arena, so the footprint is a function of `N`, not depth.
     let a = Arena {
         h: scratch.bf16(elems("hidden", n, hd)?)?,
         hn: scratch.bf16(elems("hidden (normed)", n, hd)?)?,
@@ -705,9 +585,8 @@ pub fn run(
         stream,
     )?;
 
-    // `:220` — `dim3 g((Hd+15)/16,(P+15)/16); k_rel_pos_enc<bfd><<<g,B2,0,S>>>`.
-    // Shared across layers; `relative_k_proj` differs per layer, so `relk` is
-    // recomputed inside the loop and `pe` is not.
+    // `pe` is shared across layers; `relative_k_proj` differs per layer, so
+    // `relk` is recomputed inside the loop and `pe` is not.
     call("vision::k_rel_pos_enc_bf16", stream, |ctx| {
         vision::k_rel_pos_enc_bf16(ctx, a.pe, g.pp, hd)
     })?;
@@ -715,7 +594,6 @@ pub fn run(
     for layer in &w.layers {
         ffn(&g, &a, &layer.ff1, w.residual_weight, eps, stream)?;
 
-        // ── self-attention, `:238-246` ──────────────────────────────────
         rms(
             a.h.cast_const(),
             layer.norm_pre_attn,
@@ -728,8 +606,7 @@ pub fn run(
         clin(a.hn.cast_const(), a.q, a.xc, &layer.q, n, hd, hd, stream)?;
         clin(a.hn.cast_const(), a.k, a.xc, &layer.k, n, hd, hd, stream)?;
         clin(a.hn.cast_const(), a.v, a.xc, &layer.v, n, hd, hd, stream)?;
-        // `k_qkv_scale<bfd><<<G2(Hd,N),B2,0,S>>>`. Scales `q` and `k` IN
-        // PLACE, which is why both are `*mut`.
+        // Scales `q` and `k` in place, which is why both are `*mut`.
         call("vision::k_qkv_scale_bf16", stream, |ctx| {
             vision::k_qkv_scale_bf16(
                 ctx,
@@ -743,8 +620,7 @@ pub fn run(
                 g.k_scale,
             )
         })?;
-        // `:242` — `relative_k_proj(pe) → relk [P, H*hd]`. NOT a clipped
-        // linear: a plain matmul, `G2(Hd, P)`.
+        // `relative_k_proj(pe) -> relk`: a plain matmul, not a clipped linear.
         matmul(
             a.pe.cast_const(),
             layer.relative_k,
@@ -754,7 +630,6 @@ pub fn run(
             hd,
             stream,
         )?;
-        // `:243` — `dim3 g((N+127)/128,NH); k_local_attn<bfd><<<g,128,0,S>>>`.
         call("vision::k_local_attn_bf16", stream, |ctx| {
             vision::k_local_attn_bf16(
                 ctx,
@@ -796,7 +671,6 @@ pub fn run(
             stream,
         )?;
 
-        // ── light depthwise-conv module, `:248-271` ─────────────────────
         rms(
             a.h.cast_const(),
             layer.lconv_pre_ln,
@@ -816,24 +690,12 @@ pub fn run(
             2 * hd,
             stream,
         )?;
-        // `k_glu<bfd><<<G2(Hd,N),B2,0,S>>>` — `hd` is the OUTPUT width, half
-        // of `start`'s.
+        // `hd` is the output width, half of `start`'s.
         call("vision::k_glu_bf16", stream, |ctx| {
             vision::k_glu_bf16(ctx, a.start.cast_const(), a.glu, n, hd)
         })?;
-        // `:264-266`, transcribed whole:
-        //
-        // ```text
-        // constexpr int BLOCK=64; const int C=Hd, K=w.conv_kernel;
-        // if(N>0&&C>0&&K>0) sd::causal_conv1d_prefill<bfd,false><<<dim3(C),dim3(BLOCK),0,S>>>(
-        //     D(glu),D(L.depthwise_conv),nullptr,D(conv),nullptr,N,C,K);
-        // ```
-        //
-        // `bias` and `state_out` are null — this caller has neither, and both
-        // cells are `Buf | null` on the row for that reason. The degenerate
-        // guard is the launcher's own and stays: an empty grid is not a
-        // refusal, it is a clip with nothing in it, and `n <= 0` was already
-        // refused by `Walk::new`.
+        // `bias` and `state_out` are null here. The guard stays because an
+        // empty grid is not a refusal, and `Walk::new` already refused `n <= 0`.
         let k = w.conv_kernel;
         if n > 0 && hd > 0 && k > 0 {
             call("ssm::causal_conv1d_prefill_noact_bf16", stream, |ctx| {
@@ -841,18 +703,17 @@ pub fn run(
                     ctx,
                     a.glu.cast_const().cast(),
                     layer.depthwise_conv.cast(),
-                    kernels_cuda::jit::abi::MaybeConst::none(),
+                    kernels::routine::Env(crate::jit::abi::MaybeConst::none()),
                     a.conv.cast(),
-                    core::ptr::null_mut(),
+                    kernels::routine::Env(core::ptr::null_mut()),
                     n,
                     hd,
                     k,
                 )
             })?;
         }
-        // `:267` — the `clamp(±finfo_max)` HF applies here is a no-op in bf16
-        // range and the C++ skipped it. Skipped here too, for the same
-        // reason and not by omission.
+        // The `clamp(±finfo_max)` HF applies here is a no-op in bf16 range, so
+        // it is deliberately skipped, not omitted.
         rms(
             a.conv.cast_const(),
             layer.lconv_conv_norm,
@@ -884,9 +745,7 @@ pub fn run(
         rms(a.h.cast_const(), layer.norm_out, a.h, n, hd, eps, stream)?;
     }
 
-    // ── 3) output_proj (1024 → 1536, +bias), `:282-283` ──────────────────
     let enc = scratch.bf16(elems("encoder out", n, opd)?)?;
-    // `k_matmul_bias<bfd><<<G2(OPD,N),B2,0,S>>>`.
     call("vision::k_matmul_bias_bf16", stream, |ctx| {
         vision::k_matmul_bias_bf16(
             ctx,
@@ -900,25 +759,20 @@ pub fn run(
         )
     })?;
 
-    // ── 4) the shared embedder, `:287-289` ───────────────────────────────
-    // A PARAMETERLESS RMSNorm — the weight is null and that is what
-    // `Gemma4MultimodalEmbedder` is. `k_rms`'s row says `Buf | null`.
+    // A parameterless RMSNorm: the weight is null, which is what
+    // `Gemma4MultimodalEmbedder` is.
     let en = scratch.bf16(elems("embedder", n, opd)?)?;
     rms(enc.cast_const(), core::ptr::null(), en, n, opd, eps, stream)?;
     matmul(en.cast_const(), w.embed_proj, out_proj, n, opd, txt, stream)?;
 
-    // `:292` — the walk's own synchronise, kept: `scratch` frees on the drop
-    // below and the launches above still hold its pointers.
+    // Synchronise before `scratch` frees on the drop below: the launches above
+    // still hold its pointers.
     stream.synchronize()?;
     drop(scratch);
     Ok(())
 }
 
-/// One SSCP stage's four launches, named so the two call sites are one line.
-///
-/// A struct rather than eleven positional arguments because the two calls
-/// differ in every extent and a transposed `(t_in, f_in)` pair is exactly the
-/// mistake a positional list makes unreadable.
+/// One SSCP stage's inputs and extents.
 struct SscpStage {
     /// The stage's input, channels-first.
     src: *const c_void,
@@ -946,17 +800,10 @@ struct SscpStage {
     eps: f32,
 }
 
-/// `conv → channels-last → LayerNorm+ReLU → channels-first`.
-///
-/// `gemma4_audio.cu:184-190` and `:191-197`, which are the same four launches
-/// at two sets of extents. The transpose pair exists because the LayerNorm is
-/// over the CHANNEL axis and the conv's output is channels-first; the `.cu`
-/// records that as one of the three stages it verified against HF.
-///
-/// Three of the four grids are `dim3((F+15)/16, (T+15)/16, C)` — a channel
-/// count on `grid.z`, which is why no `LaunchRule` ever stated them. The grid
-/// is the routine's now, computed once from the same three extents.
-fn sscp(s: SscpStage, stream: StreamRef<'_>) -> Result<()> {
+/// `conv -> channels-last -> LayerNorm+ReLU -> channels-first`: the transpose
+/// pair exists because LayerNorm is over the channel axis, conv output
+/// channels-first.
+fn sscp(s: SscpStage, stream: Stream<'_>) -> Result<()> {
     call("vision::k_conv2d_s2_bf16", stream, |ctx| {
         vision::k_conv2d_s2_bf16(
             ctx, s.src, s.conv_w, s.chw, s.in_ch, s.t_in, s.f_in, s.out_ch, s.t_out, s.f_out,
@@ -973,20 +820,11 @@ fn sscp(s: SscpStage, stream: StreamRef<'_>) -> Result<()> {
         )
     })?;
     // The rows are the `T*F` spatial positions with the channel axis as the
-    // width, and the norm reads and writes `chlast` in place.
-    //
-    // The two launchers this one call replaces, verbatim — they are the reason
-    // this function takes its extents as a struct: the only difference between
-    // them is which of `(T1,F1,C0)` and `(T2,F2,C1)` is substituted.
-    //
-    // ```text
-    // vd::k_layernorm_relu<bfd><<<T1*F1,128,0,S>>>(D(c0cl),D(w.sscp0_norm),D(c0cl),T1*F1,C0,EPS);
-    // vd::k_layernorm_relu<bfd><<<T2*F2,128,0,S>>>(D(c1cl),D(w.sscp1_norm),D(c1cl),T2*F2,C1,EPS);
-    // ```
+    // width; the norm reads and writes `chlast` in place.
     let rows = s
         .t_out
         .checked_mul(s.f_out)
-        .ok_or_else(|| Error::invalid(WHO, "SSCP row count overflowed"))?;
+        .ok_or_else(|| Refused::new(WHO, "SSCP row count overflowed"))?;
     call("vision::k_layernorm_relu_bf16", stream, |ctx| {
         vision::k_layernorm_relu_bf16(
             ctx,
@@ -1010,35 +848,29 @@ fn sscp(s: SscpStage, stream: StreamRef<'_>) -> Result<()> {
     })
 }
 
-/// `vd::k_add<bfd><<<(n+255)/256, 256, 0, S>>>(a, b, n)` — `a += b`, with
-/// operand 0 both the read and the write.
-fn add(y: *mut c_void, x: *const c_void, n: usize, stream: StreamRef<'_>) -> Result<()> {
+/// `y += x` over `n` elements, `y` both read and written.
+fn add(y: *mut c_void, x: *const c_void, n: usize, stream: Stream<'_>) -> Result<()> {
     call("vision::k_add_bf16", stream, |ctx| {
         vision::k_add_bf16(ctx, y, x, n)
     })
 }
 
-/// `vd::k_silu<bfd><<<(n+255)/256, 256, 0, S>>>(x, x, n)`, in place.
-fn silu(x: *mut c_void, n: usize, stream: StreamRef<'_>) -> Result<()> {
+/// SiLU over `n` elements, in place.
+fn silu(x: *mut c_void, n: usize, stream: Stream<'_>) -> Result<()> {
     call("vision::k_silu_bf16", stream, |ctx| {
         vision::k_silu_bf16(ctx, x.cast_const(), x, n)
     })
 }
 
-/// The macaron half-FFN — `gemma4_audio.cu:223-231`'s `ffn` lambda.
-///
-/// `rms → clin(fc1) → silu → clin(fc2) → rms → axpy`, six composed steps over
-/// two intermediates (`ffmid` at `[N, 4*hidden]` and `ffout` at `[N, hidden]`)
-/// and one in-place scale-and-accumulate onto the residual stream. This is
-/// the shape the owner's principle names directly: kernels producing
-/// intermediate results, composed by host code, and the host code is this.
+/// The macaron half-FFN: `rms -> clin(fc1) -> silu -> clin(fc2) -> rms -> axpy`,
+/// over `ffmid` at `[N, 4*hidden]` and `ffout` at `[N, hidden]`.
 fn ffn(
     g: &Walk,
     a: &Arena,
     f: &Ffn,
     residual_weight: f32,
     eps: f32,
-    stream: StreamRef<'_>,
+    stream: Stream<'_>,
 ) -> Result<()> {
     let (n, hd, im) = (g.n, g.hd, g.im);
     rms(a.h.cast_const(), f.pre_ln, a.hn, n, hd, eps, stream)?;
@@ -1055,7 +887,6 @@ fn ffn(
         stream,
     )?;
     rms(a.ffout.cast_const(), f.post_ln, a.ffout, n, hd, eps, stream)?;
-    // `k_axpy<bfd><<<(N*Hd+255)/256, 256, 0, S>>>(h, ffout, RW, N*Hd)` —
     // `h += RW * ffout`, the macaron half-step's residual weight.
     let count = elems("ffn residual", n, hd)?;
     call("vision::k_axpy_bf16", stream, |ctx| {
@@ -1063,8 +894,7 @@ fn ffn(
     })
 }
 
-/// Frames after subsampling — `gemma4_audio.hpp`'s
-/// `gemma4_audio_subsampled_len`, `floor((n-1)/2)+1` twice.
+/// Frames after subsampling: `floor((n-1)/2)+1` applied twice.
 #[must_use]
 pub fn subsampled_len(n_frames: i32) -> i32 {
     let conv = |n: i32| (n + 2 - 3) / 2 + 1;
@@ -1073,36 +903,27 @@ pub fn subsampled_len(n_frames: i32) -> i32 {
 
 /// The encode-ABI entry: host log-mel features in, host bf16 rows out.
 ///
-/// The port of `encode_gemma4_audio` (`gemma4_audio.cu:307-351`). One clip per
-/// iteration, each with its own arena, each synchronised before the next —
-/// the shape the C++ had, kept because the output rows are read back to the
-/// host between clips.
-///
-/// `features` is the whole feature plane as BYTES and `feature_byte_indptr`
-/// cuts it, which is what the plan carries.
-///
-/// # Errors
-///
-/// A feature span that is not a whole number of mel frames, an output buffer
-/// too small for the rows this clip produces, or any refused launch. Each is
-/// the `throw` the C++ made at the same point, as a value.
+/// One clip per iteration, each with its own arena and synchronised before the
+/// next, because the output rows are read back to the host between clips.
+/// `features` is the whole feature plane as bytes and `feature_byte_indptr`
+/// cuts it.
 pub fn encode(
     w: &Weights,
     features: &[u8],
     feature_byte_indptr: &[u32],
     output_rows: &mut [u8],
     output_row_indptr: &mut [u32],
-    stream: StreamRef<'_>,
+    stream: Stream<'_>,
 ) -> Result<()> {
     let num_clips = output_row_indptr.len().saturating_sub(1);
     if num_clips == 0 || feature_byte_indptr.len() < num_clips + 1 {
-        return Err(Error::invalid(WHO, "invalid standalone encode inputs"));
+        return Err(Refused::new(WHO, "invalid standalone encode inputs"));
     }
     let n_mel = w.n_mel;
     let mel = usize::try_from(n_mel)
         .ok()
         .filter(|v| *v != 0)
-        .ok_or_else(|| Error::invalid(WHO, "the tower states no mel bin count"))?;
+        .ok_or_else(|| Refused::new(WHO, "the tower states no mel bin count"))?;
     let row_bytes = usize::try_from(w.text_hidden).unwrap_or(0) * 2;
     let mut rows_written = 0usize;
     output_row_indptr[0] = 0;
@@ -1110,7 +931,7 @@ pub fn encode(
         let blo = feature_byte_indptr[clip] as usize;
         let bhi = feature_byte_indptr[clip + 1] as usize;
         if bhi < blo || bhi > features.len() {
-            return Err(Error::invalid(
+            return Err(Refused::new(
                 WHO,
                 format!("clip {clip}'s feature span [{blo}, {bhi}) leaves the payload"),
             ));
@@ -1118,29 +939,29 @@ pub fn encode(
         let floats = (bhi - blo) / 4;
         let frames = floats / mel;
         if frames == 0 || !floats.is_multiple_of(mel) {
-            return Err(Error::invalid(
+            return Err(Refused::new(
                 WHO,
                 format!("invalid feature shape ({floats} floats over {mel} mel bins)"),
             ));
         }
         let frames_i = i32::try_from(frames)
-            .map_err(|_| Error::invalid(WHO, "mel frame count overflowed an int"))?;
+            .map_err(|_| Refused::new(WHO, "mel frame count overflowed an int"))?;
         let rows = subsampled_len(frames_i);
         let rows_u = usize::try_from(rows)
-            .map_err(|_| Error::invalid(WHO, "subsampled row count is negative"))?;
+            .map_err(|_| Refused::new(WHO, "subsampled row count is negative"))?;
         let want = rows_written
             .checked_add(rows_u)
             .and_then(|r| r.checked_mul(row_bytes))
-            .ok_or_else(|| Error::invalid(WHO, "output row count overflowed"))?;
+            .ok_or_else(|| Refused::new(WHO, "output row count overflowed"))?;
         if want > output_rows.len() {
-            return Err(Error::invalid(WHO, "encode output buffer too small"));
+            return Err(Refused::new(WHO, "encode output buffer too small"));
         }
 
         let mut scratch = Scratch::new();
         let projected = scratch.bf16(
             rows_u
                 .checked_mul(usize::try_from(w.text_hidden).unwrap_or(0))
-                .ok_or_else(|| Error::invalid(WHO, "projected row buffer overflowed"))?,
+                .ok_or_else(|| Refused::new(WHO, "projected row buffer overflowed"))?,
         )?;
         run(
             w,
@@ -1151,8 +972,6 @@ pub fn encode(
             projected,
             stream,
         )?;
-        // `:342-346` — the rows come back to the host between clips, because
-        // the encode ABI's output is a host buffer.
         let begin = rows_written * row_bytes;
         let end = begin + rows_u * row_bytes;
         // SAFETY: `projected` is `rows * text_hidden` bf16 elements of this
@@ -1163,7 +982,7 @@ pub fn encode(
         drop(scratch);
         rows_written += rows_u;
         output_row_indptr[clip + 1] = u32::try_from(rows_written)
-            .map_err(|_| Error::invalid(WHO, "encoded row count overflowed u32"))?;
+            .map_err(|_| Refused::new(WHO, "encoded row count overflowed u32"))?;
     }
     Ok(())
 }

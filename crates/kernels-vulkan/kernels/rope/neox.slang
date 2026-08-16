@@ -78,6 +78,51 @@ void main(uint3 group : SV_GroupID) {
 // workgroup fact, not a lane fact -- so the GLSL builtin stays, as it does in
 // `common/reduce.slang` and for the same reason.
 
+// # The merge this kernel is on the wrong side of
+//
+// A decode step is 73% ordering (see the `hazards` doc in
+// `driver-vulkan/src/device.rs` for how that was priced against the bus), so
+// the only thing worth buying is a stage boundary, and only a merge that adds
+// no arithmetic can afford one. Two of the eleven stages in a layer are the
+// qk-norms and then the ropes, in that order, and they are the same shape:
+// `rms_single_row` at a per-head axis puts one workgroup on one head, and so
+// would this kernel if it were written per head instead of per pair.
+//
+// So a fused `rms_rope` is free by construction, which almost nothing else
+// is. One workgroup owns a head. It reduces the head's `head_dim` elements
+// exactly as `norm/rms.slang` does, gets `inv_rms`, and then instead of
+// writing the normed row for another launch to read back, each thread takes
+// some of the head_dim/2 rotary pairs, applies the gain and the scale to the
+// two elements it already has, rotates them, and writes once. The norm's two
+// passes over the row stay two passes. THE ROPE'S OWN READ AND WRITE
+// DISAPPEAR ENTIRELY, along with the barrier between them.
+//
+// It is worth 0.099 ms of a 2.77 ms step, and that is measured rather than
+// modelled: with the barrier before every `neox` fire suppressed -- which is
+// exactly the ordering the fused kernel removes and nothing else -- the step
+// goes 2.772 -> 2.674 short and 2.954 -> 2.853 long, over four runs each with
+// no overlap between the spreads. 3.5 us for each of the 28, which is the
+// MARGINAL price from the curve in the `hazards` doc and not the 6.5 us
+// average that dropping every barrier at once implies. Merging two stages
+// buys the marginal one; only overlap across the whole run buys the other.
+//
+// Unlike every merge refuted before it, this one does not change how much
+// parallelism the launch has: the norm already runs one workgroup per head,
+// and this kernel today runs head_dim/2 workgroups of ONE THREAD per head,
+// so the fused form has the same threads in a better shape.
+//
+// What it costs to write: this file's five arms (plain, prop, freqs, decode,
+// strided) have to survive the move, `kernels-metal` has to declare the
+// symbol or `check_plan` refuses the text (see `model-ir/src/kernels.rs`),
+// and the census signatures move in the same diff. Validate it the way
+// `the_tiled_gemm_answers_the_way_the_vector_kernel_does` does -- one text
+// under two fact settings, tolerance and argmax rather than equality.
+//
+// The stage after it, the kv append, is the same trade again: if the fused
+// kernel wrote k's rotated pair straight into its page slot, and the v
+// projection wrote v into its own, `kv_append_paged` would have nothing left
+// to copy. That is a second boundary for no arithmetic at all.
+
 // pie:instantiate neox_decode_bfloat16 PIE_DECODE=1
 // pie:instantiate neox_freqs_decode_bfloat16 PIE_FREQS=1 PIE_DECODE=1
 // pie:instantiate neox_freqs_mb_bfloat16 PIE_FREQS=1

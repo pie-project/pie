@@ -1,4 +1,4 @@
-//! Qwen2 as llama.cpp spells it, in the vocabulary the catalog reads.
+//! Qwen2's tensor names, in pie's vocabulary and in the two foreign ones.
 //!
 //! GGUF is a third weight vocabulary beside the trace's `layer.7.qkv` and
 //! HuggingFace's `model.layers.7.self_attn.q_proj.weight`. It calls that
@@ -23,13 +23,15 @@
 //! calls each tensor -- and a rename is a claim that can be checked by
 //! reading it.
 //!
-//! # Why it lives here and not in `shared`
+//! # The day the split moved to `shared`, as its own doc predicted
 //!
-//! `shared`'s bar is "**more than one generation binds it**, not 'it looks
-//! reusable'". One generation does. The `blk.{bid}.` split is genuinely
-//! architecture-independent in llama.cpp -- `TENSOR_NAMES` takes no
-//! architecture argument -- and it will still be that on the day a second
-//! family wants it, which is the day it moves.
+//! This file used to argue that the `blk.{bid}.` split stays here because
+//! "`shared`'s bar is **more than one generation binds it**", and that it
+//! "will still be architecture-independent on the day a second family wants
+//! it, which is the day it moves". Four generations wanted it, each with its
+//! own copy of the same `split_layer` and the same `Table`. That day arrived,
+//! and the machinery is now [`crate::shared::vocabulary`]. What stayed is
+//! what was never shared: the rows.
 //!
 //! # The one thing this map cannot say
 //!
@@ -42,81 +44,77 @@
 //! not redundant, since llama.cpp quantized this head to Q8_0 while the
 //! embedding it would be tied to is Q4_0.
 
-/// The HuggingFace name for a GGUF tensor, or `None` if this map has none.
-///
-/// `None` is a refusal and not a skip. A tensor silently left out is a model
-/// that loads with a layer missing, and the caller turns this into an error
-/// naming the tensor.
-#[must_use]
-pub fn hf_name(gguf: &str) -> Option<String> {
-    // The suffix rides along untouched: `.weight` and `.bias` mean the same
-    // thing in both vocabularies, and splitting them off leaves a stem that
-    // is one table lookup.
-    let (stem, suffix) = match gguf.rsplit_once('.') {
-        Some((stem, tail @ ("weight" | "bias"))) => (stem, tail),
-        _ => return None,
-    };
-    let hf = match split_layer(stem) {
-        Some((layer, member)) => format!("model.layers.{layer}.{}", LAYER.get_member(member)?),
-        // Not `model.`-prefixed, because HuggingFace does not prefix it: the
-        // head sits outside the decoder that `model.` names.
-        None if stem == "output" => "lm_head".to_string(),
-        None => format!("model.{}", MODEL.get_member(stem)?),
-    };
-    Some(format!("{hf}.{suffix}"))
-}
+use crate::shared::vocabulary::{Member, Vocab};
 
-/// `blk.7.attn_q` as `(7, "attn_q")`.
+/// Every tensor Qwen2 publishes, and what each vocabulary calls it.
 ///
-/// The index is parsed rather than matched so that a malformed `blk.x.` falls
-/// through to the unmapped case instead of being read as layer 0.
-fn split_layer(stem: &str) -> Option<(u32, &str)> {
-    let rest = stem.strip_prefix("blk.")?;
-    let (index, member) = rest.split_once('.')?;
-    Some((index.parse().ok()?, member))
-}
-
-/// A small ordered table, looked up by scan.
+/// # `attn_norm` and `ffn_norm` are the pair worth reading twice
 ///
-/// Fifteen rows total. A `HashMap` here would cost a build and an allocation
-/// per import to beat a scan over twelve strings, and the table reads as a
-/// table this way -- which is the point of stating it rather than sharing it.
-struct Table(&'static [(&'static str, &'static str)]);
-
-impl Table {
-    fn get_member(&self, member: &str) -> Option<&'static str> {
-        self.0
-            .iter()
-            .find(|(gguf, _)| *gguf == member)
-            .map(|(_, hf)| *hf)
-    }
-}
-
-/// The per-layer members, all twelve of them.
-///
-/// `attn_norm` and `ffn_norm` are the pair worth reading twice: llama.cpp
-/// names them for what they precede, HuggingFace for where they sit in the
-/// block, so `ffn_norm` is `post_attention_layernorm` and NOT anything with
+/// llama.cpp names a norm for what it PRECEDES and HuggingFace for where it
+/// SITS, so `ffn_norm` is `post_attention_layernorm` and not anything with
 /// "ffn" in it. The two vocabularies disagree about which end of the residual
-/// a norm belongs to, and this row is that disagreement.
-const LAYER: Table = Table(&[
-    ("attn_q", "self_attn.q_proj"),
-    ("attn_k", "self_attn.k_proj"),
-    ("attn_v", "self_attn.v_proj"),
-    ("attn_output", "self_attn.o_proj"),
-    ("attn_norm", "input_layernorm"),
-    ("ffn_norm", "post_attention_layernorm"),
-    ("ffn_gate", "mlp.gate_proj"),
-    ("ffn_up", "mlp.up_proj"),
-    ("ffn_down", "mlp.down_proj"),
+/// a norm belongs to, and these two rows are that disagreement.
+///
+/// # The one row this table cannot get right
+///
+/// `output` / `lm_head`. The 0.5B row is `tied_embeddings: true`, and pie
+/// spells a tie as the head's ABSENCE, so an artifact carrying one is a
+/// different model as far as the catalog is concerned. The row is here
+/// anyway and identification is left to say so, because the alternative is
+/// worse: GGUF states no tie key at all, so dropping the tensor here would be
+/// this table guessing at a fact the file does not contain -- and the tensor
+/// is not redundant, since llama.cpp quantized this head to Q8_0 while the
+/// embedding it would be tied to is Q4_0.
+///
+/// # The rows with no `gguf` column
+///
+/// `q_norm` and `post_feedforward_layernorm` are published by rows in
+/// `crate::qwen_2` and by no Qwen2 GGUF measured here. They are not omissions
+/// in the GGUF column: a family's table answers for every vocabulary that
+/// names the family, and a member only one of them has is a `None`.
+pub const VOCAB: Vocab = Vocab(&[
+    // ── Inside a decoder layer ───────────────────────────────────────
+    Member::gguf(
+        "model.layers.{layer}.self_attn.q_proj",
+        "blk.{layer}.attn_q",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.self_attn.k_proj",
+        "blk.{layer}.attn_k",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.self_attn.v_proj",
+        "blk.{layer}.attn_v",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.self_attn.o_proj",
+        "blk.{layer}.attn_output",
+    ),
+    Member::same("model.layers.{layer}.self_attn.q_norm"),
+    Member::gguf(
+        "model.layers.{layer}.input_layernorm",
+        "blk.{layer}.attn_norm",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.post_attention_layernorm",
+        "blk.{layer}.ffn_norm",
+    ),
+    Member::same("model.layers.{layer}.post_feedforward_layernorm"),
+    Member::gguf("model.layers.{layer}.mlp.gate_proj", "blk.{layer}.ffn_gate"),
+    Member::gguf("model.layers.{layer}.mlp.up_proj", "blk.{layer}.ffn_up"),
+    Member::gguf("model.layers.{layer}.mlp.down_proj", "blk.{layer}.ffn_down"),
+    // ── Outside it ───────────────────────────────────────────────────
+    Member::gguf("model.embed_tokens", "token_embd"),
+    Member::gguf("model.norm", "output_norm"),
+    // Not under `model.`, because the head sits outside the decoder that
+    // `model.` names. A whole-name table states that; a stem table carved it
+    // out by hand.
+    Member::gguf("lm_head", "output"),
 ]);
-
-/// The model-level tables. `output` is handled above, outside `model.`.
-const MODEL: Table = Table(&[("token_embd", "embed_tokens"), ("output_norm", "norm")]);
 
 #[cfg(test)]
 mod tests {
-    use super::hf_name;
+    use super::VOCAB;
 
     /// Every name a real Qwen2 GGUF holds is mapped.
     ///
@@ -132,7 +130,10 @@ mod tests {
                 "blk.3.attn_k.weight",
                 "model.layers.3.self_attn.k_proj.weight",
             ),
-            ("blk.3.attn_norm.weight", "model.layers.3.input_layernorm.weight"),
+            (
+                "blk.3.attn_norm.weight",
+                "model.layers.3.input_layernorm.weight",
+            ),
             (
                 "blk.3.attn_output.weight",
                 "model.layers.3.self_attn.o_proj.weight",
@@ -147,8 +148,14 @@ mod tests {
                 "blk.3.attn_v.weight",
                 "model.layers.3.self_attn.v_proj.weight",
             ),
-            ("blk.3.ffn_down.weight", "model.layers.3.mlp.down_proj.weight"),
-            ("blk.3.ffn_gate.weight", "model.layers.3.mlp.gate_proj.weight"),
+            (
+                "blk.3.ffn_down.weight",
+                "model.layers.3.mlp.down_proj.weight",
+            ),
+            (
+                "blk.3.ffn_gate.weight",
+                "model.layers.3.mlp.gate_proj.weight",
+            ),
             (
                 "blk.3.ffn_norm.weight",
                 "model.layers.3.post_attention_layernorm.weight",
@@ -159,7 +166,7 @@ mod tests {
             ("token_embd.weight", "model.embed_tokens.weight"),
         ];
         for (gguf, hf) in published {
-            assert_eq!(hf_name(gguf).as_deref(), Some(hf), "mapping {gguf}");
+            assert_eq!(VOCAB.from_gguf(gguf).as_deref(), Some(hf), "mapping {gguf}");
         }
     }
 
@@ -173,7 +180,9 @@ mod tests {
     fn the_layer_index_is_carried_through() {
         for layer in [0u32, 7, 23, 199] {
             assert_eq!(
-                hf_name(&format!("blk.{layer}.attn_q.weight")).as_deref(),
+                VOCAB
+                    .from_gguf(&format!("blk.{layer}.attn_q.weight"))
+                    .as_deref(),
                 Some(format!("model.layers.{layer}.self_attn.q_proj.weight").as_str())
             );
         }
@@ -188,15 +197,15 @@ mod tests {
     #[test]
     fn an_unknown_name_is_refused_rather_than_guessed() {
         for unknown in [
-            "blk.3.attn_q_norm.weight",   // qwen3's, not qwen2's
-            "blk.3.ffn_gate_inp.weight",  // a mixture's router
-            "blk.x.attn_q.weight",        // not an index
-            "blk.3.attn_q",               // no suffix
-            "blk.3.attn_q.scales",        // a suffix this map does not carry
-            "token_embd",                 // no suffix
-            "rope_freqs.weight",          // computed, not published, by pie
+            "blk.3.attn_q_norm.weight",  // qwen3's, not qwen2's
+            "blk.3.ffn_gate_inp.weight", // a mixture's router
+            "blk.x.attn_q.weight",       // not an index
+            "blk.3.attn_q",              // no suffix
+            "blk.3.attn_q.scales",       // a suffix this map does not carry
+            "token_embd",                // no suffix
+            "rope_freqs.weight",         // computed, not published, by pie
         ] {
-            assert_eq!(hf_name(unknown), None, "should not map {unknown}");
+            assert_eq!(VOCAB.from_gguf(unknown), None, "should not map {unknown}");
         }
     }
 }

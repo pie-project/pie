@@ -22,7 +22,8 @@ doctest = false
 # is no fallback: the dummy driver these no-GPU diagnostics used to run
 # against is deleted, so a build with neither feature reaches no device.
 default = []
-driver-cuda = ["pie/driver-cuda"]
+driver-cuda-12 = ["pie/driver-cuda-12"]
+driver-cuda-13 = ["pie/driver-cuda-13"]
 # The Vulkan analogue. Same composition root, a different embedded driver --
 # and the only one of the two that runs on a machine without CUDA installed.
 driver-vulkan = ["pie/driver-vulkan"]

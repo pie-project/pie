@@ -395,16 +395,20 @@ impl Variant for Qwen35 {
         class: model_ir::trace::FireClass,
         load: Deployed<'_>,
     ) -> Result<model_ir::trace::ForwardPlan, crate::deployment::Refusal> {
-        // METAL, refused by name. `llama_like_metal` is the only Metal
-        // text in this build and it is not this model's — see
-        // [`project::NO_METAL`] for what it states instead and why
-        // reaching for it would trace a different model under this
-        // row's id. The refusal is stated HERE, at the row, rather than
-        // consulted from a list of architecture strings a driver keeps:
-        // a list is a fourth place for the answer to live and a fourth
-        // place for it to be wrong.
-        if let crate::catalog::Backend::Metal(_) = load.backend {
-            return Err(crate::deployment::Refusal::Unsupported(project::NO_METAL));
+        // METAL, and it is this row's OWN text now rather than a refusal.
+        // `qwen3_5_hybrid_metal` states the gated-deltanet layers this
+        // family interleaves with attention, which is the thing
+        // `llama_like_metal` does not have and the reason reaching for
+        // that one would have traced a different model under this id.
+        if let crate::catalog::Backend::Metal(bind) = load.backend {
+            project::metal_kernel_refusal(&self.shape, load, bind)?;
+            return Ok(project::trace_metal(
+                &self.shape,
+                class,
+                self.rope_theta,
+                self.norm_eps,
+                bind,
+            ));
         }
         Ok(project::trace(&self.shape, class, load))
     }
@@ -784,54 +788,61 @@ mod tests {
         }
     }
 
-    /// A METAL load is refused BY NAME rather than traced as a llama.
+    /// A METAL load traces this row's OWN text, on both backends.
     ///
-    /// The guard that replaces `driver-metal`'s `LLAMA_LIKE` table. That
-    /// table answered "does this build serve you" from an architecture
-    /// STRING reduced by `canonical()`, in a driver, before any text was
-    /// traced — so it could say yes to a row this build cannot resolve
-    /// (it listed `gpt_oss`, whose every publication either fails this
-    /// crate's manifest or names tensors `driver-metal` has no handle
-    /// for) and no to one whose text it models (it omitted `gemma3`). The row answers now, and what it answers with is a
-    /// sentence naming what is missing.
+    /// What this replaces is a refusal, and before that
+    /// `driver-metal`'s `LLAMA_LIKE` table, which answered "does this
+    /// build serve you" from an architecture STRING reduced by
+    /// `canonical()`, in a driver, before any text was traced. The row
+    /// answers now, and what it answers with is a plan.
     ///
-    /// The comparison is against [`project::NO_METAL`] itself and not a
-    /// paraphrase, so the sentence a caller is shown is the sentence
-    /// this test pins — `csm`'s `NO_TRACE` sets the same shape.
+    /// The assertion worth keeping from the refusal era is the second
+    /// one: the Metal arm is about the BACKEND and nothing else, so
+    /// every existing CUDA caller reaches the same text unchanged.
     #[test]
-    fn a_metal_load_is_refused_by_name_and_not_traced_as_a_llama() {
+    fn a_metal_load_traces_this_rows_own_text() {
         use crate::catalog::{Backend, Deployed, MetalBinding};
-        use crate::deployment::Refusal;
         use model_ir::trace::FireClass;
 
         let bind = MetalBinding {
             quant_group: 64,
             quant_bits: 4,
-            router_quant_group: 0,
-            router_quant_bits: 0,
+            router_quant_group: 64,
+            router_quant_bits: 8,
             moe_mxfp4: false,
             fuse_residual_gemv: true,
             paged_multi_batch: true,
             qmm_multi_batch: true,
             add_bias: false,
+            fused_qk_rope: false,
         };
         assert!(!VARIANTS.is_empty());
         for v in VARIANTS {
             for class in [FireClass::Prefill, FireClass::Decode] {
-                let err = v
+                let plan = v
                     .trace(class, Deployed::metal(&bind))
-                    .expect_err("this build has no Metal text for this generation");
-                assert_eq!(
-                    err,
-                    Refusal::Unsupported(project::NO_METAL),
-                    "`{}` refused a Metal load with a sentence that is not the \
-                     one the row states",
+                    .expect("this build has Metal text for this generation");
+                assert!(
+                    !plan.ops.is_empty(),
+                    "`{}` traced an empty Metal plan for {class:?}",
+                    v.id
+                );
+                // The GDN layers are the thing `llama_like_metal` does
+                // not have; a plan without them would be the wrong
+                // model traced under this row's id.
+                assert!(
+                    plan.ops.iter().any(|op| matches!(
+                        &op.kind,
+                        model_ir::trace::OpKind::Launch { kernel, .. }
+                            if kernel.starts_with("gdn_")
+                    )),
+                    "`{}` traced a Metal plan with no gated-deltanet row",
                     v.id
                 );
             }
         }
-        // And the refusal is about the BACKEND and nothing else: the
-        // same rows keep answering a CUDA load exactly as they did.
+        // And the arm is about the BACKEND and nothing else: the same
+        // rows keep answering a CUDA load exactly as they did.
         for v in VARIANTS {
             assert!(
                 v.trace(FireClass::Decode, Deployed::single()).is_ok(),
@@ -844,3 +855,7 @@ mod tests {
         assert!(matches!(Deployed::single().backend, Backend::Cuda));
     }
 }
+
+/// This generation's tensor names, in every vocabulary that spells them.
+#[cfg(feature = "contract")]
+pub mod import;

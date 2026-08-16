@@ -253,10 +253,10 @@ fn nothing_this_crate_needs_to_build_compiles_c() {
             }
             continue;
         }
-        if let Some(links) = p.links {
-            if !LINKS_WITHOUT_A_LIBRARY.contains(&p.name) {
-                suspect.push(format!("`{}` owns the native library `{links}`", p.name));
-            }
+        if let Some(links) = p.links
+            && !LINKS_WITHOUT_A_LIBRARY.contains(&p.name)
+        {
+            suspect.push(format!("`{}` owns the native library `{links}`", p.name));
         }
         // NOT "has a build script". Several crates in this closure have one and
         // none of them compiles anything -- `serde` and `proc-macro2` and

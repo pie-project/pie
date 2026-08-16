@@ -4,16 +4,9 @@
 //! [`crate::cascade`] — that module's header is where the
 //! `MergeStates`/`VariableLengthMergeStates` distinction, the architecture
 //! argument and the occupancy note live. What is here is the seam: the plan's
-//! `u64` addresses, and an answer the seven call sites cannot mistake for a
-//! success.
-//!
-//! # Why this file still exists
-//!
-//! `flashinfer_fa2_dispatch`'s [`Partials`](super::flashinfer_fa2_dispatch::Partials)
-//! carries device addresses as `u64` — `plan_info`'s offsets are added to a
-//! workspace base and never dereferenced on the host — and a routine takes
-//! pointers. That widening, and the `#[must_use]` answer below, are the
-//! driver's half; everything else went down.
+//! `u64` addresses (`plan_info`'s offsets are added to a workspace base and
+//! never dereferenced on the host, and a routine takes pointers), and an
+//! answer the seven call sites cannot mistake for a success.
 
 use std::ffi::c_void;
 
@@ -21,15 +14,12 @@ use crate::jit::Ctx;
 use kernels::Refusal;
 use crate::jit::abi::bf16;
 
-
 /// Whether the fold ran.
 ///
-/// `fire/gemv.rs`' `#[must_use] enum Gemv`, for its reason and one more of
-/// this path's own: a declined merge leaves `v_merged` holding whatever the
-/// attention kernel did **not** write — the partials went to `tmp_v` — so a
-/// caller that ignores this answer reads uninitialised workspace and calls it
-/// an attention output. *"It declined"* must not be spellable like *"it
-/// ran"*.
+/// `fire/gemv.rs`' `#[must_use] enum Gemv`, plus one reason of this path's
+/// own: a declined merge leaves `v_merged` holding whatever the attention
+/// kernel did **not** write, so a caller that ignores this answer reads
+/// uninitialised workspace and calls it an attention output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]
 pub enum Merged {
@@ -43,11 +33,9 @@ pub enum Merged {
 impl Merged {
     /// Panic unless the fold ran, naming the caller.
     ///
-    /// The six FA2 call sites all want this and none of them can carry on
-    /// without the merge: the alternative is returning an attention output
-    /// that is a workspace scratch buffer. `what` is the dispatch's own name
-    /// so the message says which of the six, which a panic from inside the
-    /// routine could not.
+    /// The six FA2 call sites all want this and none can carry on without the
+    /// merge. `what` is the dispatch's own name, so the message says which of
+    /// the six — which a panic from inside the routine could not.
     ///
     /// # Panics
     ///
@@ -99,9 +87,6 @@ pub struct VarLen {
 }
 
 /// [`super::merge_states_varlen`], over a plan's addresses.
-///
-/// The ragged fold, and the one the FA2 split path calls: `prefill.cuh:4350-4352`
-/// and `decode.cuh:822-824` fire exactly this, in exactly this position.
 ///
 /// # Safety
 ///
@@ -169,10 +154,6 @@ mod tests {
 
     /// The job defaults to all-zero, which every refusal path reads as
     /// "nothing to do" rather than as a shape.
-    ///
-    /// `Default` is derived so a caller can fill three fields and leave the
-    /// rest; this is the assertion that the derived value is not accidentally
-    /// a launchable one.
     #[test]
     fn a_default_job_names_no_shape() {
         assert_eq!(VarLen::default().head_dim, 0);

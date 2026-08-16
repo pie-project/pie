@@ -126,6 +126,19 @@ pub enum FireNumber {
     /// the causal rule alone". Not a fact about the cache, which is why
     /// [`crate::resources::Pool`] answers it and `Shape` does not.
     AttentionMaskStride,
+    /// The fire's longest history, ROUNDED UP TO A POWER OF TWO.
+    ///
+    /// One past the largest position any row of the fire attends from, which
+    /// is how many keys the busiest decode row walks. It decides how many ways
+    /// [`kernels_vulkan::attn::decode_splits`] cuts the key range, and it is
+    /// bucketed because that grid is RECORDED: `crate::replay` re-submits a
+    /// decode's command buffer across tokens, so a number that moved every
+    /// token would re-plan every token. A power-of-two bucket moves a handful
+    /// of times in a sequence's life.
+    ///
+    /// Zero from a resolver that does not know -- and zero means one split,
+    /// which is the single-pass path this backend has always taken.
+    KvHistoryBucket,
 }
 
 /// The fire-wide tables a kernel row may name.
@@ -158,6 +171,18 @@ pub enum FireTable {
     RopeFrequencies,
     /// Which rows the readout samples.
     SamplingIndices,
+    /// Scratch for the flash decode's partial softmaxes.
+    ///
+    /// `splits * rows * q_heads * (head_dim + 2)` floats: an unnormalised
+    /// weighted-V accumulator per `(split, row, head)`, then a `(max,
+    /// sum_exp)` pair each. Written by every workgroup of the split pass and
+    /// read by the fold, and by nothing else -- so it is never zeroed and
+    /// never read back.
+    ///
+    /// A driver resource and not an operand, for the same reason the KV cache
+    /// is one: no traced value stands for it, so no plan mentions it and no
+    /// arena holds it.
+    AttnPartials,
 }
 
 impl std::fmt::Display for Unbindable {
@@ -239,7 +264,7 @@ pub enum Unbindable {
     /// A row states the shape of every deployment its kernel serves, so a
     /// statement reaching only part of that shape is ordinary -- but a slot
     /// left holding nothing is a descriptor the shader reads, so it is a
-    /// refusal rather than a gap. `Source::Unbound` is how a row says "gap".
+    /// refusal rather than a gap. A row says "gap" by stating `None`.
     NoOperand,
     /// The row names the KV cache and the resolver does not hold one.
     NoKvCache {
@@ -376,7 +401,7 @@ pub enum Slot<'a> {
     Params,
     /// A slot the row states and nothing fills.
     ///
-    /// `Source::Unbound`. `kv_append_paged` has six, kept so that the rest of
+    /// Source `None`. `kv_append_paged` has six, kept so that the rest of
     /// its row stays at the positions a shared ring ABI put them; the module
     /// leaves them as descriptor holes and nothing reads them.
     Nothing,
@@ -401,8 +426,10 @@ pub enum Params {
     ///
     /// The bytes are laid out at the offsets the SHADER declares, not packed
     /// end to end, because those are not always the same thing and the
-    /// difference is silent -- `crate::lowering::pack` exists for that reason
-    /// and this is the same rule applied to a plan.
+    /// difference is silent. `crate::lowering::pack` stood for that reason and
+    /// this named it; the row packer is deleted on all three shader backends
+    /// and `lowering::routine::bind` applies the same rule from a body's own
+    /// arguments.
     Push(Vec<u8>),
     /// The scalars are a struct in a storage buffer, at this binding.
     ///
@@ -442,7 +469,7 @@ pub enum Misplaced {
     /// The row addresses the KV cache CONTIGUOUSLY, and this driver's pool is
     /// paged.
     ///
-    /// [`kernels::Source::KvHeadStride`] and [`kernels::Source::KvSeqStride`]
+    /// [`kernels::Source::Named(<kernels::keys::KvHeadStride as kernels::keys::Fact>::KEY)`] and [`kernels::Source::Named(<kernels::keys::KvSeqStride as kernels::keys::Fact>::KEY)`]
     /// appear on exactly the rows that walk the cache with two strides and no
     /// page table -- `kv_append`, `sdpa_vector_decode`,
     /// `sdpa_vector_decode_swa`. The paged writer beside them takes
@@ -921,7 +948,7 @@ pub enum Unlayoutable {
     /// not all unbound.
     ///
     /// A row states every deployment its kernel serves, so a row longer than
-    /// one module is ordinary -- but only where the tail is `Unbound`. A
+    /// one module is ordinary -- but only where the tail is `None`. A
     /// buffer past the end is a buffer nothing can hold.
     Overlong {
         /// How many slots the row states.

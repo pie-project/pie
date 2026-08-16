@@ -269,7 +269,7 @@ pub fn writes_stay_in_the_declared_span(
 /// this driver already derives from `qo_indptr`, and honouring it is not a
 /// behaviour, it is an optimisation.
 #[must_use]
-pub fn unserved_in(plan: &LaunchPlan) -> Option<&'static str> {
+pub fn unserved_in(plan: &LaunchPlan, holds_recurrent: bool) -> Option<&'static str> {
     // Order is the order the fields appear in `LaunchPlan`, so that a field
     // added there and not here is visible as a gap in this list rather than
     // as an answer nobody checked.
@@ -301,8 +301,18 @@ pub fn unserved_in(plan: &LaunchPlan) -> Option<&'static str> {
     // and the worker use it to tell one translation from another, and a driver
     // acts on the translation it was handed rather than on which one it is.
     // Refusing it would refuse every pipeline-scoped fire.
-    if !plan.rs_slot_ids.is_empty() || !plan.rs_buffer_slot_ids.is_empty() {
-        return Some("recurrent state: no model this driver serves holds any");
+    // A question about the DRIVER and not about the plan, which is why it is
+    // the one refusal here that takes an argument. This read *"no model this
+    // driver serves holds any"* and was true when written; a deployment that
+    // states a `resources::Recurrent` shape now opens a `RecurrentPool`, and
+    // refusing its plan would refuse the thing the pool was allocated for.
+    //
+    // Still refused when there is no pool, and emphatically: the slot ids are
+    // where each request's carry LIVES, so serving the plan without them
+    // would run every request against slot zero -- one carry shared by all of
+    // them, which is not a fault and not a NaN.
+    if !holds_recurrent && (!plan.rs_slot_ids.is_empty() || !plan.rs_buffer_slot_ids.is_empty()) {
+        return Some("recurrent state: this deployment allocated no slots for it");
     }
 
     // A mask table with no user mask behind it is the engine's own synthesis,
@@ -912,6 +922,26 @@ pub fn requests_of(plan: &LaunchPlan) -> Result<Vec<Request>, Unlaunched> {
         );
         request.mask = mask_rows_of(plan, r, hi - lo)?;
         request.samples = sample_rows_of(plan, r, lo, hi)?;
+        // THE ENGINE'S SEAT, not this driver's. `rs_slot_ids` is one per
+        // request and it is the engine that assigns them across fires; a
+        // driver that renumbered them would point a scan at another
+        // conversation's carry. `Frame::of` spreads it per row, which is the
+        // same table `driver-metal` builds as `rs_slot_ids[req_of_token[t]]`.
+        //
+        // Empty for a model with no recurrent state, where nothing reads it.
+        // A plan that states SOME slots and not enough of them is malformed
+        // rather than defaulted: slot zero is a real slot holding a real
+        // conversation, so the default would be another request's carry, read
+        // fluently and silently.
+        if !plan.rs_slot_ids.is_empty() {
+            let Some(&slot) = plan.rs_slot_ids.get(r) else {
+                return Err(Unlaunched::Malformed(format!(
+                    "the plan describes {rows} requests and states {} recurrent slots",
+                    plan.rs_slot_ids.len()
+                )));
+            };
+            request.slot = slot;
+        }
         out.push(request);
     }
     Ok(out)
@@ -1173,6 +1203,55 @@ mod tests {
             qo_indptr: qo.to_vec(),
             ..LaunchPlan::default()
         }
+    }
+
+    /// **The engine's recurrent seats are carried through, and a short list is
+    /// refused rather than defaulted.**
+    ///
+    /// `rs_slot_ids` is the engine's assignment of a conversation to a place
+    /// in the gated DeltaNet's state slab, and it is the ENGINE's because it
+    /// holds across fires. A driver that dropped it would put every
+    /// conversation in slot zero — which is not an empty slot, it is the first
+    /// conversation's — and the model would answer fluently out of somebody
+    /// else's carry.
+    ///
+    /// That is not hypothetical. `Frame::recurrent_slots` was declared,
+    /// staged and never written, and the visible symptom was that the same
+    /// prompt answered a different way every time it was asked.
+    ///
+    /// So the short-list case refuses instead of padding with zero, for the
+    /// same reason: the pad would be a real seat.
+    #[test]
+    fn the_engine_states_which_recurrent_seat_each_request_holds() {
+        let mut p = plan(&[0, 2, 3], &[1, 2, 3], &[0, 1, 0], &[0, 1], &[0, 1, 2]);
+        p.rs_slot_ids = vec![5, 2];
+        let got = requests_of(&p).expect("two requests");
+        assert_eq!(
+            got.iter().map(|r| r.slot).collect::<Vec<_>>(),
+            vec![5, 2],
+            "the engine's seats were not carried onto the requests"
+        );
+
+        // A model with no recurrent state states none, and nothing reads it.
+        let none = plan(&[0, 2, 3], &[1, 2, 3], &[0, 1, 0], &[0, 1], &[0, 1, 2]);
+        assert_eq!(
+            requests_of(&none)
+                .expect("two requests")
+                .iter()
+                .map(|r| r.slot)
+                .collect::<Vec<_>>(),
+            vec![0, 0],
+        );
+
+        let mut short = plan(&[0, 2, 3], &[1, 2, 3], &[0, 1, 0], &[0, 1], &[0, 1, 2]);
+        short.rs_slot_ids = vec![5];
+        let Err(Unlaunched::Malformed(why)) = requests_of(&short) else {
+            panic!("a plan stating one seat for two requests was accepted");
+        };
+        assert!(
+            why.contains('2') && why.contains('1'),
+            "the refusal does not say how many of each: {why}"
+        );
     }
 
     /// Two requests of different lengths are split at the CSR's boundaries.
@@ -1505,8 +1584,29 @@ mod tests {
     fn a_plan_naming_what_this_driver_cannot_do_is_refused_by_that_name() {
         let base = plan(&[0, 1], &[100], &[0], &[4], &[0, 1]);
         assert!(
-            unserved_in(&base).is_none(),
+            unserved_in(&base, false).is_none(),
             "a plain text decode is refused, so this driver serves nothing"
+        );
+
+        // The RECURRENT refusal is the one question here about the DRIVER
+        // rather than the plan, so it is asked both ways. A deployment that
+        // opened a `RecurrentPool` must not have its hybrid's plan refused --
+        // that plan is what the pool was allocated for -- and one that did not
+        // must, emphatically: `rs_slot_ids` is where each request's carry
+        // LIVES, so serving without them runs every request against slot zero.
+        // One carry shared by all of them is not a fault and not a NaN.
+        let hybrid = LaunchPlan {
+            rs_slot_ids: vec![0, 1],
+            ..base.clone()
+        };
+        assert!(
+            unserved_in(&hybrid, false).is_some(),
+            "a driver holding no slots must refuse a plan that names them"
+        );
+        assert!(
+            unserved_in(&hybrid, true).is_none(),
+            "and one that allocated them must not: the refusal was about the \
+             deployment's resources, and they now exist"
         );
 
         let cases: Vec<(&str, LaunchPlan)> = vec![
@@ -1576,8 +1676,8 @@ mod tests {
         ];
 
         for (name, p) in &cases {
-            let why =
-                unserved_in(p).unwrap_or_else(|| panic!("{name} is ignored rather than refused"));
+            let why = unserved_in(p, false)
+                .unwrap_or_else(|| panic!("{name} is ignored rather than refused"));
             assert!(
                 why.contains(name),
                 "{name} is refused, but the refusal says {why:?} instead, which \
@@ -1598,16 +1698,19 @@ mod tests {
             ..base.clone()
         };
         assert!(
-            unserved_in(&two).is_none(),
+            unserved_in(&two, false).is_none(),
             "a text-only batch of two is refused for a side-channel that holds nothing"
         );
         // And the boundary is still read: a table whose total is non-zero
         // names rows, whatever its length.
         assert_eq!(
-            unserved_in(&LaunchPlan {
-                image_indptr: vec![0, 1],
-                ..base.clone()
-            }),
+            unserved_in(
+                &LaunchPlan {
+                    image_indptr: vec![0, 1],
+                    ..base.clone()
+                },
+                false
+            ),
             Some("images: this driver serves text-only models"),
             "an image the plan names only in its CSR is served silently"
         );
@@ -1656,7 +1759,7 @@ mod tests {
             ..LaunchPlan::default()
         };
         assert!(
-            unserved_in(&base).is_none(),
+            unserved_in(&base, false).is_none(),
             "the same plan without a mask table is served, so what follows is \
              about the table and nothing else"
         );
@@ -1668,7 +1771,7 @@ mod tests {
             mask_indptr: vec![0, 3, 4],
             ..base.clone()
         };
-        assert_eq!(unserved_in(&served), None);
+        assert_eq!(unserved_in(&served, false), None);
         assert!(
             masks_are_exactly_causal(&served),
             "the oracle agrees this fixture is the synthesized causal mask"
@@ -1692,7 +1795,7 @@ mod tests {
             mask_indptr: vec![0, 0, 1],
             ..base.clone()
         };
-        assert_eq!(unserved_in(&mixed), None);
+        assert_eq!(unserved_in(&mixed, false), None);
         let got = requests_of(&mixed).expect("the plan converts");
         assert!(got[0].mask.is_empty(), "an elided request states no mask");
         assert_eq!(got[1].mask, vec![vec![1u8, 1, 1, 1, 1]]);
@@ -1710,7 +1813,7 @@ mod tests {
             mask_indptr: vec![0, 3, 4],
             ..base.clone()
         };
-        assert_eq!(unserved_in(&odd), None);
+        assert_eq!(unserved_in(&odd, false), None);
         assert_eq!(
             requests_of(&odd).expect("converts")[1].mask,
             vec![vec![1u8, 1, 1, 1, 1]],
@@ -1747,7 +1850,11 @@ mod tests {
             mask_indptr: vec![0, 2],
             ..base.clone()
         };
-        assert_eq!(unserved_in(&window), None, "a guest mask is served now");
+        assert_eq!(
+            unserved_in(&window, false),
+            None,
+            "a guest mask is served now"
+        );
         assert_eq!(
             requests_of(&window).expect("converts")[0].mask,
             vec![vec![0u8, 0, 1, 1], vec![0, 0, 0, 1, 1]]
@@ -1763,7 +1870,7 @@ mod tests {
             mask_indptr: vec![0, 2],
             ..base
         };
-        assert_eq!(unserved_in(&holed), None);
+        assert_eq!(unserved_in(&holed, false), None);
         assert_eq!(
             requests_of(&holed).expect("converts")[0].mask,
             vec![vec![1u8, 0, 1, 1], vec![1, 1, 1, 1, 1]]
@@ -1827,10 +1934,13 @@ mod tests {
         // And the flag with nothing behind it is still refused at admission,
         // because there is nothing to build a rectangle from.
         assert!(
-            unserved_in(&LaunchPlan {
-                has_user_mask: true,
-                ..base
-            })
+            unserved_in(
+                &LaunchPlan {
+                    has_user_mask: true,
+                    ..base
+                },
+                false
+            )
             .is_some_and(|s| s.contains("user mask")),
             "a mask the guest asked for with no rows on the wire"
         );
@@ -1872,7 +1982,7 @@ mod tests {
     fn a_request_reads_out_its_own_rows_however_many_it_names() {
         let base = plan(&[0, 1, 3], &[10, 11, 12], &[0, 1, 2], &[0, 1], &[0, 1, 2]);
         assert!(
-            unserved_in(&base).is_none(),
+            unserved_in(&base, false).is_none(),
             "a plan with no sampling table is the ordinary case and is served"
         );
         // No table: every request reads out its own last row, which
@@ -1886,7 +1996,7 @@ mod tests {
             sampling_indptr: vec![0, 1, 2],
             ..base.clone()
         };
-        assert_eq!(unserved_in(&one), None);
+        assert_eq!(unserved_in(&one, false), None);
         let got = requests_of(&one).expect("converts");
         assert_eq!(
             got.iter().map(|r| r.samples.clone()).collect::<Vec<_>>(),
@@ -1900,7 +2010,7 @@ mod tests {
             sampling_indptr: vec![0, 1, 3],
             ..base.clone()
         };
-        assert_eq!(unserved_in(&many), None, "served now, not refused");
+        assert_eq!(unserved_in(&many, false), None, "served now, not refused");
         let got = requests_of(&many).expect("converts");
         assert_eq!(
             got.iter().map(|r| r.samples.clone()).collect::<Vec<_>>(),
@@ -1922,11 +2032,14 @@ mod tests {
 
         // And a table that names NO rows for anybody asks for nothing.
         assert_eq!(
-            unserved_in(&LaunchPlan {
-                sampling_indices: Vec::new(),
-                sampling_indptr: vec![0, 0, 0],
-                ..base
-            }),
+            unserved_in(
+                &LaunchPlan {
+                    sampling_indices: Vec::new(),
+                    sampling_indptr: vec![0, 0, 0],
+                    ..base
+                },
+                false
+            ),
             None,
             "an empty sampling table asks for nothing, so there is nothing to refuse"
         );
@@ -1980,6 +2093,14 @@ mod answered {
         walk(&src, &mut files);
         assert!(files.len() > 5, "only {} sources found", files.len());
 
+        // Declarations are read from the ORIGINAL text and constructions from
+        // the blanked one: a `Display` impl is where a variant is named, never
+        // where it is made.
+        let scanned: Vec<(String, String)> = files
+            .iter()
+            .map(|(name, text)| (name.clone(), without_display(text)))
+            .collect();
+
         let declared: Vec<(String, String, String)> = files
             .iter()
             .flat_map(|(name, text)| {
@@ -2006,7 +2127,7 @@ mod answered {
             }
             let qualified = format!("{enum_name}::{variant}");
             let shorthand = format!("Self::{variant}");
-            let built = files.iter().any(|(name, text)| {
+            let built = scanned.iter().any(|(name, text)| {
                 text.lines().any(|line| {
                     let code = line.split_once("//").map_or(line, |(before, _)| before);
                     built(code, &qualified) || (name == home && built(code, &shorthand))
@@ -2087,6 +2208,49 @@ mod answered {
     ///
     /// Whole-path, too: `Failed::Wgpu` must not be satisfied by
     /// `Failed::WgpuSomething`.
+    /// `text` with every `Display`/`Debug` impl body blanked out.
+    ///
+    /// **The loophole this closes was live and was hiding two variants.**
+    /// [`built`] decides "pattern or construction" by looking for `=>` on the
+    /// same LINE, so a single-line match arm is correctly read as a pattern --
+    /// but a multi-line one is not:
+    ///
+    /// ```ignore
+    /// Self::Unresolved {          // no `=>` on this line
+    ///     symbol,                 // ...so it reads as a construction
+    /// ```
+    ///
+    /// `Undispatchable::{Arity, Unresolved}` were declared, printed, and built
+    /// by nothing, and this test passed over both while its own failure
+    /// message said *"Printing one in a `Display` arm is not building it"*.
+    ///
+    /// Blanking the impl is coarser than parsing and is the right coarseness:
+    /// a `Display` body's whole job is to name every variant, so nothing in
+    /// one can ever be evidence that a variant is CONSTRUCTED.
+    fn without_display(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut lines = text.lines().peekable();
+        while let Some(line) = lines.next() {
+            let opens = line.trim_start().starts_with("impl ")
+                && (line.contains("fmt::Display for") || line.contains("fmt::Debug for"));
+            out.push_str(line);
+            out.push('\n');
+            if !opens {
+                continue;
+            }
+            // Skip to the impl's closing brace, counting from this line so a
+            // `{` on the `impl` line itself is the one being matched.
+            let mut depth = line.matches('{').count() - line.matches('}').count();
+            while depth > 0 {
+                let Some(inner) = lines.next() else { break };
+                depth += inner.matches('{').count();
+                depth -= inner.matches('}').count();
+                out.push('\n');
+            }
+        }
+        out
+    }
+
     fn built(code: &str, needle: &str) -> bool {
         let arrow = code.find("=>");
         let guarded = code.contains("matches!(") || code.contains("if let ");

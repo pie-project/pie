@@ -67,6 +67,7 @@ const BINDING: MetalBinding = MetalBinding {
     // the Metal text states no bias, no trace asks for `q_bias`, and the map
     // entry that answers it looks like dead weight.
     add_bias: true,
+    fused_qk_rope: false,
 };
 
 /// The catalog is big enough that a walk of it means something.
@@ -210,11 +211,17 @@ fn every_row_either_traces_metal_or_refuses_it_in_words() {
 /// the TEXT, and it is the claim that would have failed.
 #[test]
 fn the_rows_that_serve_metal_are_the_llama_like_ones() {
-    // The TEN generations whose forward reaches `llama_like_metal`: the
-    // seven that call the family projection directly, plus gemma-3,
-    // gemma-4 and gpt-oss, whose own projections write their fields over
-    // the family's and call the same text.
-    let generations: [(&str, &[&'static dyn catalog::Variant]); 10] = [
+    // The ELEVEN generations that answer a Metal load. Ten reach
+    // `llama_like_metal`: the seven that call the family projection
+    // directly, plus gemma-3, gemma-4 and gpt-oss, whose own projections
+    // write their fields over the family's and call the same text.
+    //
+    // The eleventh is the first that does NOT -- qwen-3.5 interleaves
+    // gated-deltanet layers with attention and has a text of its own.
+    // That is why this test's name outlived its claim: the property is
+    // "the catalog's Metal surface is the list below", and the list
+    // stopped being one text some time after it was written.
+    let generations: [(&str, &[&'static dyn catalog::Variant]); 11] = [
         ("qwen_2", model::qwen_2::rows()),
         ("qwen_3", model::qwen_3::rows()),
         ("llama_3", model::llama_3::rows()),
@@ -229,6 +236,10 @@ fn the_rows_that_serve_metal_are_the_llama_like_ones() {
         // the shared text did not state, and a YaRN ladder the driver's
         // geometry declined to derive.
         ("gpt_oss", model::gpt_oss::rows()),
+        // The one with its own text: `qwen3_5_hybrid_metal`. Its GDN
+        // rows carry recurrent state through slabs no llama has, so
+        // nothing about it could be written over the family's fields.
+        ("qwen_3_5", model::qwen_3_5::rows()),
     ];
     let expected: Vec<&'static str> = generations
         .iter()

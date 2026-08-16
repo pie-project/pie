@@ -40,7 +40,7 @@ use kernels_cuda::jit::abi::bf16;
 /// over. A fire does this for itself; a caller doing driver-API work beside a
 /// fire has to do it for itself too, which is worth demonstrating here.
 fn arch_or_skip(what: &str) -> Option<&'static str> {
-    match cache::arch() {
+    match quietly(cache::arch).flatten() {
         Some(arch) => match cache::bind_context() {
             Ok(()) => Some(arch),
             Err(why) => {
@@ -53,6 +53,27 @@ fn arch_or_skip(what: &str) -> Option<&'static str> {
             None
         }
     }
+}
+
+/// Run `f`, turning a panic into `None` and printing nothing.
+///
+/// The `Option` above reads as "ask whether there is a device", and it answers
+/// only half the question. `cudarc` is built `fallback-dynamic-loading`, so
+/// every CUDA symbol is `dlopen`'d on first use and a MISSING library is a
+/// PANIC -- `panic_no_lib_found` -- rather than an `Err`. So the skip covered
+/// "driver present, no device" and the case it was actually written for, an
+/// ordinary runner with no CUDA installed at all, unwound straight past it and
+/// FAILED. Measured with an `LD_PRELOAD` shim that refuses to `dlopen` the
+/// CUDA libraries: this file went from 5 skips to 4 failures.
+///
+/// Only the FIRST call needs wrapping. Once one answers, the library is
+/// loaded and everything after it is an ordinary call that can return `Err`.
+fn quietly<R>(f: impl FnOnce() -> R + std::panic::UnwindSafe) -> Option<R> {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let out = std::panic::catch_unwind(f);
+    std::panic::set_hook(hook);
+    out.ok()
 }
 
 /// `n` bf16 elements on the device, filled with 1.0.
@@ -142,9 +163,16 @@ fn a_kernel_with_no_launcher_fires() {
 /// pass every test that only ever called one of them.
 ///
 /// The difference between the two is the vocabulary, not the kernel.
-/// `norm::scalar_mul_bf16` takes a typed pointer and a `usize` and computes
-/// its own grid; `call` takes `&[ArgValue]` and a symbol, and is what a trace
-/// reaches. Both end at the same `ctx.launch`.
+/// `norm::scalar_mul_bf16` takes an `Out<0, *mut bf16>` -- a rectangle -- and
+/// a scale, and computes both its grid and its element count from that;
+/// `call` takes `&[ArgValue]` and a symbol, and is what a trace reaches. Both
+/// end at the same `ctx.launch` and hand it the same `(ptr, s, n)`.
+///
+/// This paragraph read *"takes a typed pointer and a `usize`"* until the
+/// `#[source(OutElements(0))] n` deletion, and the sentence outlived the
+/// signature it described by long enough for the call below to stop
+/// compiling without anyone noticing -- which is the same gate, and the same
+/// lesson, as the call site's own note.
 #[test]
 fn the_dynamic_path_and_the_routine_agree() {
     let Some(_) = arch_or_skip("the_dynamic_path_and_the_routine_agree") else { return };
@@ -153,11 +181,40 @@ fn the_dynamic_path_and_the_routine_agree() {
 
     // SAFETY: a live device allocation of `n` bf16 elements and the null stream.
     let ctx = unsafe { Ctx::on(std::ptr::null_mut()) };
+    // THE ROUTINE HALF TAKES A RECTANGLE AND THE DYNAMIC HALF BELOW STILL
+    // TAKES THREE LOOSE ARGUMENTS, and that divergence is not a defect --
+    // it is the whole point of the test stated in the new notation. The
+    // `__global__`'s ABI is `(ptr, s, n)` and always was; what changed is
+    // who computes `n`. `norm::scalar_mul` lost `#[source(OutElements(0))]
+    // n: usize` when its output became a region, and now multiplies
+    // `x.rows * x.width` itself (`norm.rs`, `stated_width` then
+    // `saturating_mul`). So the launcher builds the same `&[ptr, s, n]` it
+    // always did and the two paths still meet at `ctx.launch`.
+    //
+    // THIS CALL WAS STALE UNTIL NOW AND IS THE ONLY ONE IN THE TREE THAT
+    // WAS. It read:
+    //
+    //     scalar_mul::<bf16>(&ctx, buffer.ptr as *mut bf16, 2.0, buffer.n)
+    //
+    // -- a bare pointer where an `Out<0, _>` is required and a fourth
+    // argument to a three-parameter fn. Two hard type errors that sat here
+    // undetected, because `fire.rs` is `#![cfg(feature = "_cuda")]` (:23)
+    // and a default `cargo check` never compiles this target. See the
+    // audit note in `kernels-cuda/src/layout.rs` for why that gate, and not
+    // "bypasses the binder", is what defines the blind spot.
+    //
+    // `rows: 1` because `Ones` is a flat allocation with no row structure:
+    // one row of `n` elements gives the kernel back exactly the `n` this
+    // call used to pass by hand, so the assertion below is comparing what
+    // it compared before.
     let fired = kernels_cuda::norm::scalar_mul::<bf16>(
         &ctx,
-        buffer.ptr as *mut kernels_cuda::jit::abi::bf16,
-        2.0,
-        buffer.n,
+        kernels_cuda::Out {
+            ptr: buffer.ptr as *mut kernels_cuda::jit::abi::bf16,
+            rows: 1,
+            width: i32::try_from(buffer.n).expect("the test's 1024 fits an i32"),
+        },
+        kernels::routine::ParamF32(2.0),
     );
     assert_eq!(fired, Ok(()), "the routine fires");
     buffer.assert_doubled("the routine");

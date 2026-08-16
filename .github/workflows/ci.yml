@@ -145,6 +145,20 @@ jobs:
       # said so. A test that does not compile is a check that is not running,
       # and it is the quietest kind of gap there is.
       #
+      # `kernels-cuda` is the third, and it is the one that looked impossible.
+      # It has NO build script, no `links` key, and `cudarc` behind
+      # `dep:cudarc` -- so its default feature set is the row table and the
+      # planners, which are pure Rust and lint on a runner with no CUDA and no
+      # nvcc. Only `_cuda` reaches a device binding, and nothing in this `-p`
+      # list turns it on. The twelve findings that had to go first were
+      # mechanical but not all of them: two `if` chains are the archive's own
+      # duplicated arms (`prefill.cuh`'s `get_num_warps_q` and `get_num_mma_q`
+      # both special-case `cta_tile_q == 32` for `HEAD_DIM_VO >= 512`), so
+      # they carry an `#[allow]` and the archive's comment rather than a fold
+      # that would stop matching the C++. Its `_cuda` half is NOT gated here
+      # and still carries 32 `not_unsafe_ptr_arg_deref`, which is a signature
+      # decision across the whole crate and not a lint fix.
+      #
       # `--all-targets` is what closes it: it compiles the `#[cfg(test)]`
       # modules, which `cargo check` and a bare `cargo clippy` do not. Both
       # crates are Rust plus a shader tree and both compile and lint clean on
@@ -171,7 +185,8 @@ jobs:
             -p engine -p gateway -p grammar -p inferlet \
             -p inferlet-macros -p kernels -p pie -p tokenizer -p worker \
             -p driver-wgpu -p kernels-wgpu \
-            -p kernels-metal -p kernels-vulkan \
+            -p kernels-metal -p kernels-vulkan -p kernels-cuda \
+            -p model-dsl -p model-ir \
             -- -D warnings
 
       # The WebGPU pair's second half. Both halves of `driver-wgpu` compile on
@@ -246,7 +261,8 @@ jobs:
             -p gateway -p grammar -p inferlet \
             -p inferlet-macros -p kernels -p kernels-metal -p kernels-vulkan \
             -p pie -p pie-gpu-tests -p pie-server-py -p tokenizer \
-            -p driver-wgpu -p kernels-wgpu -p driver-vulkan
+            -p driver-wgpu -p kernels-wgpu -p driver-vulkan \
+            -p model-dsl -p model-ir
 
   # Full-workspace verification — the guardrail + anti-bitrot net. Closes the
   # gap that let the runtime benches rot unseen: the dedicated jobs only build a
@@ -427,18 +443,87 @@ jobs:
       - name: cargo test (driver-cuda, portable half, no feature at all)
         run: cargo test -p driver-cuda
 
-      # The one test that cannot live beside the driver. It registers a REAL
-      # PTIR program through `pie_cuda_register_program` and fires it, which
-      # needs the producer half — `tensor_compiler`'s bind/compile/emit chain
-      # and `engine`'s `ProgramDescBorrow` to lower the result into the C
-      # records the entry point reads. A dev-dependency the other way would
-      # be a cycle, so it lives in `engine`.
+      # THE GATE THAT WOULD HAVE CAUGHT A DEAD KERNEL, and did not exist until
+      # one shipped. Every kernel in `kernels-cuda` is TEXT that NVRTC compiles
+      # at run time, so a root that stops compiling is not a failing test
+      # anywhere -- it is a kernel that silently does not exist until something
+      # fires it and the request errors. `attn/attention_mla_fa2` shipped that
+      # way: one `template` keyword on a non-template member of vendored
+      # FlashInfer, behind `__CUDA_ARCH__ >= 900`, invisible to every job in
+      # this file because nothing here runs this crate with a CUDA feature at
+      # all. The workspace sweep builds it with default features, where layer 3
+      # is cfg'd out entirely.
       #
-      # It skips without a device or without the cached Qwen3-0.6B, like
-      # every GPU-touching test here — but it compiles everywhere, which is
-      # what this step is for on a runner with no card.
-      - name: cargo test (the PTIR program path, through the ABI)
-        run: cargo test -p engine --features driver-cuda --test ptir_shell
+      # `libnvrtc` is the whole of what this needs. The crate links nothing,
+      # carries its own headers and shims, and NVRTC targets an architecture
+      # rather than talking to one -- so no toolkit, no driver and no GPU are
+      # involved, exactly like the two steps above. The wheel is the delivery
+      # that does not drag a toolkit behind it; `LD_LIBRARY_PATH` has to name
+      # its directory because `libnvrtc.so.13` loads `libnvrtc-builtins.so`
+      # beside itself and reports a "corrupted" builtins if it cannot.
+      #
+      # WHAT IT COVERS AND WHAT IT DOES NOT, measured rather than assumed. It
+      # compiles 126 of 127 roots and 792 instantiations for real. The 127th is
+      # cooperative: `grid.sync()` leaves an extern that `cuLink` resolves and
+      # `cuLinkCreate` is a context call, so it names itself as skipped and is
+      # covered only where a device exists. And with no device to ask,
+      # `cache::arch()` falls back to `sm_89` -- the floor the fp8 shim sets --
+      # so code gated above that, which is where the bug above lived, still
+      # needs real hardware to see. This is a net, not a proof: it catches the
+      # arch-independent breakage, which is most of it.
+      #
+      # `typecheck_tu` is the second half of the step and used to be none of
+      # it. It compiles a unit per measured `LAYOUTS` static, and one of its
+      # four roots device-links -- which it treated as grounds to return,
+      # dropping all four. So on THIS runner, the one the step was written for,
+      # it finished in 0.01 s having asserted nothing, and read green. It now
+      # partitions the way its sibling does: 3 of 4 roots, 6 aggregates, 40
+      # assertions, and the 4th named as skipped. Confirmed to still bite by
+      # planting a wrong field offset, which fails the step here.
+      - name: cargo test (kernels-cuda, JIT roots against real NVRTC)
+        run: |
+          python3 -m venv /tmp/nvrtc
+          /tmp/nvrtc/bin/pip install --quiet nvidia-cuda-nvrtc
+          export LD_LIBRARY_PATH="$(echo /tmp/nvrtc/lib/python*/site-packages/nvidia/cu13/lib):$LD_LIBRARY_PATH"
+          cargo test -p kernels-cuda --features cuda-13 \
+            --test every_instantiation_compiles --test typecheck_tu -- --nocapture
+
+      # The test that fires a REAL PTIR program: register bytecode, publish a
+      # seed into a channel, read the program's own answer back out. It is the
+      # only thing in the tree that covers that path -- `driver-cuda`'s
+      # `serve.rs` registers `ProgramRegistration { program_hash, ..Default }`,
+      # a descriptor with NO bytecode, so `plan.executable` is false and
+      # `run_program` returns early in every one of its cases; and
+      # `gpu_ptir_emitted.rs` says in its own header that it does not claim a
+      # program runs.
+      #
+      # This step used to read `cargo test -p engine --features
+      # driver-cuda-13 --test ptir_shell`, and that command had stopped
+      # COMPILING. The C ABI it was written against -- `pie_cuda_create`,
+      # `pie_cuda_register_program`, the `driver_api::local::Pie*` descriptors
+      # -- was deleted when the driver became a Rust `Shell`; the sibling
+      # `driver-cuda/tests/serve.rs` was ported with it and this file was not.
+      # Eighteen errors. Nothing caught it because this branch has never run
+      # CI, so the step has never once executed.
+      #
+      # It now lives beside the driver, which is also where the reason it did
+      # not went: it sat in `engine` because building a registerable program
+      # needs `tensor_compiler`'s bind/compile/emit chain and "a dev-dependency
+      # the other way would be a cycle". `driver-cuda` already has
+      # `tensor-compiler` and `tensor-ir` as dev-dependencies and two of its
+      # tests already drive that exact chain.
+      #
+      # `abi` is not optional in the spelling: `Shell` and `driver_api::local`
+      # are behind it, which is why the driver-cuda steps above -- which do not
+      # pass it -- do not build this target.
+      #
+      # It skips without a device or without the cached Qwen3-0.6B, like every
+      # GPU-touching test there, so on this runner it compiles and skips. That
+      # is what this step is for. Where a card exists it takes 15 s and it
+      # earns them: it caught a `Shell::drop` that released two of its three
+      # attention workspaces and debug-asserted on the third.
+      - name: cargo test (the PTIR program path, through the driver shell)
+        run: cargo test -p driver-cuda --features cuda-13,abi --test gpu_ptir_shell
 
   metal-kernel-boundary:
     name: metal kernel boundary (kernels-metal reaches nothing above it)
@@ -818,17 +903,16 @@ jobs:
       - name: cargo test (pie, driver-wgpu template + seam)
         run: cargo test -p pie --lib --features driver-wgpu
 
-      # The TWO-driver binary, which is the configuration neither driver's own
-      # job builds. `driver-wgpu` and `driver-vulkan` landed within a day of
-      # each other into the same files, the same functions and the same match
-      # arms -- eleven conflicts -- and a duplicated arm or a colliding name
-      # shows up only where both are on. The commit that wired this backend
-      # claimed the pair builds and put nothing behind the claim.
-      #
-      # It needs no shader toolchain: `kernels-vulkan`'s `native` is what costs
-      # `slangc` and nothing on this path turns it on.
-      - name: cargo build (pie binary, both portable drivers)
-        run: cargo build -p pie --features driver-wgpu,driver-vulkan
+      # The two-driver binary USED TO be built here, on the grounds that it
+      # "needs no shader toolchain: `kernels-vulkan`'s `native` is what costs
+      # `slangc` and nothing on this path turns it on". That second clause
+      # stopped being true when the SPIR-V moved into the rlib:
+      # `driver-vulkan/native` now enables `kernels-vulkan/native`, because a
+      # driver that means to run has to CARRY the words it hands
+      # `vkCreateShaderModule`, and `engine/driver-vulkan` has always turned
+      # `driver-vulkan/native` on. So the step moved to the `driver-vulkan`
+      # job below, which installs `slangc` already. It is the same build; only
+      # the runner that can afford it changed.
 
   # The Vulkan backend, which had no job of its own until the question that
   # kept it out was actually asked.
@@ -937,6 +1021,20 @@ jobs:
 
       - name: cargo build (pie binary, driver-vulkan)
         run: cargo build -p pie --features driver-vulkan
+
+      # The TWO-driver binary, which is the configuration neither driver's own
+      # job builds otherwise. `driver-wgpu` and `driver-vulkan` landed within a
+      # day of each other into the same files, the same functions and the same
+      # match arms -- eleven conflicts -- and a duplicated arm or a colliding
+      # name shows up only where both are on. The commit that wired the wgpu
+      # backend claimed the pair builds and put nothing behind the claim.
+      #
+      # It sits in THIS job rather than the wgpu one because `driver-vulkan`
+      # now costs `slangc` on any path that reaches its device half, and this
+      # is the job that has one. The wgpu crates are not otherwise built here;
+      # that is the price of the toolchain being the scarce thing.
+      - name: cargo build (pie binary, both portable drivers)
+        run: cargo build -p pie --features driver-wgpu,driver-vulkan
 
   # The Metal driver and the seam that joins it to the engine.
   #
@@ -1114,7 +1212,7 @@ jobs:
       - name: cargo build (driver-cuda)
         run: |
           cargo build -p worker \
-            --no-default-features --features driver-cuda
+            --no-default-features --features driver-cuda-13
 
       - name: Native CUDA entrypoint validation
         run: |

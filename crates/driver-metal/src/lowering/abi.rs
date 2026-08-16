@@ -489,12 +489,6 @@ mod tests {
         assert_eq!(Kernel::LmHeadUntied.index(), 58);
         assert_eq!(Kernel::Router.index(), 71);
         assert_eq!(Kernel::G4Router.index(), 84);
-        // 91, not 97: six kinds between `G4Router` and here were the same
-        // operation under a second family's prefix -- `g4_moe_sort` beside
-        // `ll_moe_sort`, documented in the same words -- and merging them
-        // moved everything downstream by six. Every anchor at or below
-        // `G4Router` is unchanged, which is the point of pinning block
-        // boundaries rather than one number at the end.
         assert_eq!(Kernel::G4BranchAdd.index(), 91);
         assert_eq!(
             Kernel::GoSdpaSinkPaged.index(),

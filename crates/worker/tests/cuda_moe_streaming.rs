@@ -2,43 +2,36 @@
 //! tokens whether its routed experts are resident or paged in through the slab.
 //!
 //! Streaming is a residency decision, not a numerical one. The group's plan is
-//! the stacking contract's expression with the expert axis removed, so a slot
-//! holds bit-for-bit what one stride of the stack would have held, and the
-//! GEMMs that read it are the same GEMMs. Any difference in the decoded text is
-//! a bug -- in the plan, the rebinding, or the eviction.
+//! the stacking contract with the expert axis removed, so a slot holds
+//! bit-for-bit what one stride of the stack would have held and the GEMMs that
+//! read it are the same GEMMs. Any difference in the decoded text is a bug — in
+//! the plan, the rebinding, or the eviction.
 //!
-//! The harness boots one model per process, so the comparison is across two
-//! runs rather than inside one. Run both and diff the `MOE_STREAM_RESULT` line:
+//! One model boots per process, so the comparison is across two runs. Run both
+//! and diff the `MOE_STREAM_RESULT` line:
 //!
 //!   S=/path/to/qwen3-moe-snapshot
 //!   PIE_CUDA_TEST_SNAPSHOT=$S \
-//!     cargo test -p pie-worker --features driver-cuda \
+//!     cargo test -p pie-worker --features driver-cuda-13 \
 //!     --test cuda_moe_streaming -- --ignored --nocapture
 //!   PIE_CUDA_TEST_SNAPSHOT=$S PIE_CUDA_TEST_STREAM_EXPERTS=1 \
 //!     PIE_CUDA_TEST_EXPERT_CACHE_GB=0.0004 \
-//!     cargo test -p pie-worker --features driver-cuda \
+//!     cargo test -p pie-worker --features driver-cuda-13 \
 //!     --test cuda_moe_streaming -- --ignored --nocapture
 //!
-//! A deliberately tiny `expert_cache_gb` is the interesting setting: it forces
-//! the slab down to a couple of slots so every layer evicts, which is the only
-//! way the eviction path gets exercised at all.
-//!
-//! Both runs take the per-expert dispatch: streamed experts have no fused slab
-//! to stride, so the resident run is pinned to the same path rather than the
-//! batched decode one. Otherwise the diff would confound a residency change
-//! with a change of kernel -- which is exactly what it did on first run, and
-//! the batched and per-expert GEMMs do not agree to the last bit.
-//!
-//! A random-weight fixture is not automatically a useful oracle here: an
+//! A deliberately tiny `expert_cache_gb` forces the slab down to a couple of
+//! slots so every layer evicts, which is the only way the eviction path is
+//! exercised. Both runs take the per-expert dispatch: streamed experts have no
+//! fused slab to stride, and the batched and per-expert GEMMs do not agree to
+//! the last bit, so pinning avoids confounding residency with kernel choice.
+//! Scale the fixture's per-expert `down_proj` by a per-expert factor first — an
 //! untrained model's argmax tends to be the same token whatever the experts
-//! hold, so a wrong page-in sails through. Scale the fixture's per-expert
-//! `down_proj` by a per-expert factor first; then expert identity is visible in
-//! the decoded text, which is the only thing this test can see.
+//! hold, so a wrong page-in would sail through.
 
 mod common;
 
 #[test]
-#[ignore = "real-hardware: needs an RTX GPU + --features driver-cuda + a local MoE snapshot; one boot per process"]
+#[ignore = "real-hardware: needs an RTX GPU + --features driver-cuda-13 + a local MoE snapshot; one boot per process"]
 fn cuda_moe_decodes_the_same_tokens_streamed_or_resident() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -52,9 +45,6 @@ fn cuda_moe_decodes_the_same_tokens_streamed_or_resident() {
             worker.url()
         );
 
-        // Temperature 0 is an in-graph argmax, so the emitted tokens are a
-        // pure function of the logits. Two runs that route the same experts
-        // through the same GEMMs therefore have to emit the same text.
         let started = std::time::Instant::now();
         let result = common::spawn_inferlet(
             "text-completion-bench",

@@ -95,6 +95,17 @@ impl Recordings {
         self.recorded
     }
 
+    /// Why a fire was refused a recording, for whoever has to say so.
+    ///
+    /// `run::submit` swallows `Unrecordable` on purpose -- a fire that cannot
+    /// be recorded is encoded instead, which is slower and right, and serving
+    /// has nothing to do about it. But that leaves the refusal with no reader,
+    /// and a gate that asserts a fire WAS recorded could only report `left: 0`.
+    /// A 374x slowdown deserves better than a count.
+    pub fn refusals(&self) -> impl Iterator<Item = &str> {
+        self.refused.values().map(String::as_str)
+    }
+
     /// Forget every recording.
     ///
     /// For a model reload, which moves every weight address and invalidates

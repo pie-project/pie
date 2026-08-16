@@ -28,6 +28,13 @@ path = "src/lib.rs"
 # and cargo permits a dev-dependency to point back. Nothing in `src` gains an
 # edge, so the shared crate stays the floor it is.
 [dev-dependencies]
+# The attribute half of the pair, so that `routine_derivation` can check the
+# DERIVED column and not only the argument table. `kernels-macros` depends on
+# `syn`, `quote` and `proc-macro2` and on nothing in this workspace, so there
+# is no cycle to break -- and a dev-dependency keeps it out of the crate's
+# real dependency graph, which `lib.rs:1522` is careful about: *"the macro
+# lives in `kernels-macros` because `routine!` takes a PATH"*.
+kernels-macros = { path = "../kernels-macros" }
 kernels-metal = { path = "../kernels-metal" }
 kernels-vulkan = { path = "../kernels-vulkan" }
 kernels-wgpu = { path = "../kernels-wgpu" }

@@ -1,19 +1,16 @@
 //! The model contract: a declaration of what the model needs, as expressions
 //! over the checkpoint's byte space.
 //!
-//! See `loader/spec.md` for the design rationale. In short: the contract
-//! declares every tensor the driver will bind and where its bytes come from;
-//! the compiler decides how to move them, and no part of it needs to know the
-//! model family. The declarer is `model::contract` — an author turns a
-//! driver's facts-and-policy request into one of these on this side of the
-//! ABI (`plan/model-in-rust.md` §2), so the contract is internal IR now, not
-//! an input a caller hands over.
+//! The contract declares every tensor the driver will bind and where its bytes
+//! come from; the compiler decides how to move them, and no part of it needs
+//! to know the model family. The declarer is `model::contract`, on this side
+//! of the ABI, so the contract is internal IR now, not an input a caller hands
+//! over. See `loader/spec.md` for the design rationale.
 //!
 //! This module owns the *declaration* — the grammar, the builders, and the
-//! types a contract is written in. Everything that computes over one lives in a
-//! child: [`infer`] says what an expression denotes and what it denotes at one
-//! rank, [`compile`] solves it into byte rectangles, and [`rewrite`] edits a
-//! checked contract in place.
+//! types a contract is written in. Everything that computes over one lives in
+//! a child: [`infer`] says what an expression denotes, [`compile`] solves it
+//! into byte rectangles, and [`rewrite`] edits a checked contract in place.
 
 use serde::{Deserialize, Serialize};
 
@@ -32,16 +29,12 @@ pub mod rewrite;
 /// denotes a piecewise-affine partial map from output coordinates to source
 /// coordinates, and the fragment is closed under composition. Any expression
 /// built from them alone compiles to a set of byte spans without materializing
-/// intermediates.
+/// intermediates. [`Expr::Repack`], [`Expr::Cast`] and [`Expr::Scale`] are the
+/// escape hatches: they need a kernel, and are deliberately marked as such.
 ///
-/// [`Expr::Repack`], [`Expr::Cast`] and [`Expr::Scale`] are the escape
-/// hatches. They need a kernel and are deliberately marked as such.
-///
-/// The organizing question is what each node *preserves*, not what it is called.
-/// Two axes classify the nine that have an operand: what is preserved, and
-/// whether it is free. The three leaves — [`Expr::Src`], [`Expr::Out`] and
-/// [`Expr::Fill`] — sit outside the table, because with no operand to preserve
-/// anything *from*, neither axis says anything about them.
+/// Two axes classify the nine nodes with an operand by what they preserve; the
+/// three leaves — [`Expr::Src`], [`Expr::Out`] and [`Expr::Fill`] — sit outside
+/// the table, having no operand to preserve anything from.
 ///
 /// |          | free                                       | kernel  |
 /// |----------|--------------------------------------------|---------|
@@ -49,40 +42,21 @@ pub mod rewrite;
 /// | type     | `Transmute`                                | `Cast`  |
 /// | value    | —                                          | `Scale` |
 ///
-/// A row says what a node is allowed to change; everything below its row it
-/// preserves. So the affine fragment preserves bytes, values and type together
-/// and only moves them; [`Expr::Transmute`] preserves the bytes and renames
-/// them; [`Expr::Cast`] preserves the values and rewrites their representation;
-/// [`Expr::Scale`] preserves the type and rewrites the values. [`Expr::Repack`]
-/// is not "what is left" -- it is placement priced as a kernel, and it is held
-/// to its row: it may pad, and it may not reinterpret an element.
-///
-/// The empty cell is principled rather than missing. A value cannot be changed
-/// for free, so there is nothing to put there.
+/// A row says what a node may change; everything below its row it preserves.
+/// [`Expr::Repack`] is placement priced as a kernel, and is held to its row: it
+/// may pad, and it may not reinterpret an element. The empty cell is
+/// principled rather than missing — a value cannot be changed for free.
 ///
 /// Within a row, placement is a strict cost ladder that `infer` enforces in
 /// both directions: a `Stride` expressible as a `Slice` is refused, a `Gather`
 /// expressible as either is refused, and no node may denote exactly its
-/// operand. The cheap node must not be spellable as the expensive one, or the
-/// distinction buys nothing.
+/// operand. [`Expr::Gather`] has no user today; it is kept as the ladder's top
+/// rung and the placement fragment's closure.
 ///
-/// [`Expr::Gather`] has no user today — every selection a driver has needed so
-/// far is a band or an arithmetic progression, and the one place that once
-/// wanted an index list turned out to be a `Stride`. It is kept because it is
-/// the ladder's top rung and the placement fragment's closure: it is what makes
-/// "these elements, in this order" expressible at all, and without it the two
-/// rungs below it are two special cases rather than the cheap ends of one
-/// operation. That is recorded here because nothing else would tell a reader
-/// why a fully implemented node has no callers.
-///
-/// **What the placement fragment cannot say.** Every node maps output axis `k`
-/// from operand axis `k`, so as index maps they are the per-axis-diagonal
-/// subgroup: no node permutes axes. A permutation that fixes the innermost
-/// axis is expressible as a `Concat` of `Slice`s, verbosely; a transpose that
-/// moves the innermost axis is not expressible at all, because it is the one
-/// rearrangement that is not a reordering of runs. Nothing needs it today —
-/// every tile swizzle that would want it is inside a [`Expr::Repack`] — and it
-/// is recorded here so that the next node added is measured against it.
+/// Every node maps output axis `k` from operand axis `k`, so no node permutes
+/// axes: a permutation that fixes the innermost axis is a verbose
+/// [`Expr::Concat`] of `Slice`s, and a transpose that moves the innermost axis
+/// is not expressible at all.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Expr {
     /// A tensor read from the checkpoint, by its on-disk name.
@@ -100,25 +74,20 @@ pub enum Expr {
     ///
     /// The third leaf, and the one with no source at all. It exists so that
     /// zero-extension is expressible as what it is — `Concat([x, Fill], axis)` —
-    /// rather than as a `Pad` node that was a [`Expr::Concat`] with a leg it could
-    /// not name. Naming the leg is what lets the type checker see it: the
-    /// padding is now a tensor with a declared type, and `Concat` checks it
-    /// against the data the way it checks every other leg.
+    /// rather than as a `Pad` node that was a [`Expr::Concat`] with a leg it
+    /// could not name. Naming the leg is what lets the type checker see it.
     ///
-    /// `infer` admits exactly one constant today, and says so rather than
-    /// implying it. A fill is realized by zeroing the destination and never
-    /// writing there ([`StorageInstr::Fill`](crate::plan::StorageInstr::Fill)),
-    /// so the value must be one a run of zero bytes denotes. That rules out
+    /// `infer` admits exactly one constant today. A fill is realized by zeroing
+    /// the destination and never writing there
+    /// ([`StorageInstr::Fill`](crate::plan::StorageInstr::Fill)), so the value
+    /// must be one a run of zero bytes denotes. That rules out
     /// [`DType::E8M0`](crate::types::DType::E8M0), whose zero byte means
     /// `2^-127`, and it rules out every [`Encoding::Quant`] — a code word means
     /// nothing without its block scale, and the code that reads as zero is
     /// scheme-specific (`Int4B8` stores zero as 8, and its code 0 is -8).
     ///
     /// The value is carried rather than assumed so that widening the set is a
-    /// change to [`StorageInstr::Fill`](crate::plan::StorageInstr::Fill), not to
-    /// the algebra. The node and the instruction share a name because the
-    /// instruction is what the node lowers to -- though not one for one, since
-    /// one zeroing covers every hole in a buffer.
+    /// change to the instruction, not to the algebra.
     Fill { value: u32, ty: TensorType },
     /// A contiguous band: `out[.., i, ..] = src[.., start + i, ..]` for `i` in
     /// `0..len`.
@@ -126,12 +95,10 @@ pub enum Expr {
     /// Covers tensor-parallel sharding and fused-tensor splitting. A band is
     /// the placement that costs nothing: it leaves every inner extent alone, so
     /// it never breaks a run below one row of the operand, and on the leading
-    /// axis it is a byte range.
-    ///
-    /// That is why the strided case is [`Expr::Stride`] and not a `step` field
-    /// here. The two have different costs, different rules on a quantized axis,
-    /// and only one of them may ever need a kernel; a field cannot say which
-    /// of those an expression is without every reader inspecting it.
+    /// axis it is a byte range. That is why the strided case is [`Expr::Stride`]
+    /// and not a `step` field here: the two have different costs and different
+    /// rules on a quantized axis, and a field cannot say which one an
+    /// expression is without every reader inspecting it.
     Slice {
         src: Box<Expr>,
         axis: Axis,
@@ -141,15 +108,12 @@ pub enum Expr {
     /// A strided selection: `out[.., i, ..] = src[.., start + i * step, ..]`
     /// for `i` in `0..len`, with `step >= 2`.
     ///
-    /// The even/odd row interleave of a GPT-OSS gate/up pair is this, and so is
-    /// every other "take one row in `n`". Separate from [`Expr::Slice`]
-    /// because a stride is the one placement that fragments: it breaks the
-    /// operand's contiguity at the innermost level it touches, so selecting
-    /// single elements is thousands of tiny runs where a band is one.
-    ///
-    /// It also may not touch a quantized axis at all. A band can, provided it
-    /// lands on group boundaries; a stride cannot, because taking every other
-    /// element of a block leaves a block that no scale describes.
+    /// The even/odd row interleave of a GPT-OSS gate/up pair is this. Separate
+    /// from [`Expr::Slice`] because a stride is the one placement that
+    /// fragments: it breaks the operand's contiguity at the innermost level it
+    /// touches, so selecting single elements is thousands of tiny runs where a
+    /// band is one. It also may not touch a quantized axis at all — taking
+    /// every other element of a block leaves a block no scale describes.
     Stride {
         src: Box<Expr>,
         axis: Axis,
@@ -161,22 +125,18 @@ pub enum Expr {
     ///
     /// The third and last placement node, and the general one: [`Expr::Slice`]
     /// is a run, [`Expr::Stride`] is an arithmetic progression, and this is a
-    /// list nobody can compute. They form a cost hierarchy the author picks a
-    /// rung of, and the type checker holds them to it — a list that *is* a run
-    /// or *is* a progression is rejected with the node to say it instead, so
-    /// the cheap operation is never spelled as the expensive one.
+    /// list nobody can compute. A list that *is* a run or *is* a progression is
+    /// rejected with the node to say it instead.
     ///
-    /// The indices are constants rather than a nested [`Expr`], which is what
-    /// keeps the whole algebra `Eq` and hashable and keeps lowering a matter of
-    /// arithmetic. That is not a limitation in practice: a permutation a kernel
-    /// needs is a property of the kernel, known when the contract is written.
+    /// The indices are constants rather than a nested [`Expr`], which keeps the
+    /// algebra `Eq` and hashable and keeps lowering a matter of arithmetic. A
+    /// permutation a kernel needs is a property of the kernel, known when the
+    /// contract is written. Duplicates are allowed — a broadcast is exactly
+    /// reading one source row twice.
     ///
-    /// Duplicates are allowed — reading one source row twice is a well-defined
-    /// thing to want, and a broadcast is exactly that.
-    ///
-    /// Like a stride, it may not touch a quantized axis: a permutation of a
-    /// block leaves a block no scale describes. A permutation *of whole blocks*
-    /// is a placement its groups survive, and that is spelled `Concat` of `Slice`s.
+    /// Like a stride, it may not touch a quantized axis. A permutation *of
+    /// whole blocks* is a placement its groups survive, and that is spelled
+    /// `Concat` of `Slice`s.
     Gather {
         src: Box<Expr>,
         axis: Axis,
@@ -189,10 +149,8 @@ pub enum Expr {
     /// The one node that changes nothing at all. A checkpoint stores sub-byte
     /// weights packed into a wider word (MLX ships 4-bit values eight to a
     /// `u32`), and a stack of per-expert slabs is a concatenation of tensors
-    /// that must first gain the axis they are stacked along. Both say the same
-    /// thing — *these bytes are that type* — and used to be two nodes whose
-    /// rules contradicted each other on a quantized operand: one refused it
-    /// outright, the other required a whole tensor and allowed anything else.
+    /// that must first gain the axis they are stacked along. Both say *these
+    /// bytes are that type*.
     ///
     /// Three conditions, each with its own reason:
     ///
@@ -217,37 +175,33 @@ pub enum Expr {
     /// [`local_range`], and the band it denotes is checked by everything a
     /// [`Expr::Slice`] is checked by, quantization-group alignment included.
     ///
-    /// Lowering is where the split stops being symbolic. A byte offset cannot
-    /// be, so
+    /// A byte offset cannot be symbolic, so
     /// [`Resolver::specialize`](crate::contract::infer::Resolver::specialize)
     /// rewrites each `Shard` into the concrete `Slice` this rank reads before
     /// anything below the frontend sees it — a rewrite the lowering requires,
     /// not a precondition the type checker has.
     ///
-    /// Stated as a node rather than a field beside the expression so that a
-    /// contract stays rank-independent — the author writes the partition, not
-    /// the arithmetic — and so that it composes: a shard of one leg of a
+    /// A node rather than a field beside the expression so that a contract
+    /// stays rank-independent and so that it composes: a shard of one leg of a
     /// [`Expr::Concat`] is expressible, which a whole-expression flag cannot say.
     Shard { src: Box<Expr>, axis: Axis },
     /// A checkpoint tensor whose name carries this group instance's index:
     /// `Src(template.replace("{}", index))`.
     ///
     /// The second and last node whose meaning depends on something outside the
-    /// expression, and it is the [`Expr::Shard`] of a [`GroupContract`]: a
-    /// group is written once for the whole grid, and
+    /// expression, and it is the [`Expr::Shard`] of a [`GroupContract`]:
     /// [`Resolver::specialize`](crate::contract::infer::Resolver::specialize)
     /// substitutes the instance before lowering, because a tensor name cannot
     /// be symbolic any more than a byte offset can.
     ///
     /// Exactly one `{}`, substituted with the index in decimal, and no other
-    /// placeholder syntax. That is deliberate: the loader must never *parse* a
-    /// checkpoint name — the whole point of a contract is that naming is the
-    /// author's business — and a template with formatting options is a small
-    /// language whose evaluator would be exactly that parser.
+    /// placeholder syntax. The loader must never *parse* a checkpoint name, and
+    /// a template with formatting options is a small language whose evaluator
+    /// would be exactly that parser.
     ///
-    /// Only for grids whose members are separate checkpoint tensors, the way
-    /// DeepSeek-V4 ships one tensor per expert. A fused `[E, ..]` bank is a
-    /// single tensor and its member is a band, which is [`Expr::Select`].
+    /// Only for grids whose members are separate checkpoint tensors. A fused
+    /// `[E, ..]` bank is a single tensor and its member is a band, which is
+    /// [`Expr::Select`].
     SrcIndexed(String),
     /// This group instance's band: [`Expr::Slice`] at `start = index * stride`.
     ///
@@ -264,8 +218,7 @@ pub enum Expr {
     ///
     /// Its type does not mention the index at all: `len` along `axis`, whatever
     /// the instance. Uniformity is therefore structural here, and only
-    /// [`Expr::SrcIndexed`] — which can name tensors that genuinely differ —
-    /// needs the per-instance check.
+    /// [`Expr::SrcIndexed`] needs the per-instance check.
     Select {
         src: Box<Expr>,
         axis: Axis,
@@ -276,30 +229,24 @@ pub enum Expr {
     /// checker, so it must declare its own output type.
     ///
     /// Opaque in one direction only. *What* the swizzle does to a byte is the
-    /// kernel's business -- a sub-word tile interleave is a fact about a GEMM,
-    /// not about tensors -- but *how many* bytes there are on each side is not
-    /// opaque at all: the operand's type says one side and `to` says the other.
+    /// kernel's business; *how many* bytes there are on each side is not opaque
+    /// at all, since the operand's type says one side and `to` says the other.
     ///
     /// So a repack names a kernel and nothing else. Which rows it reads is
-    /// `src`'s business, and `src` is an ordinary expression: a band is
-    /// [`Expr::Slice`], this rank's share is [`Expr::Shard`], an interleaved
-    /// half is [`Expr::Stride`]. That is what keeps the escape hatch from
-    /// re-implementing the algebra beside it, and what lets a repack be
-    /// sharded like everything else instead of by a rank resolved into an
-    /// integer before the contract is written.
+    /// `src`'s business, and `src` is an ordinary expression. That keeps the
+    /// escape hatch from re-implementing the algebra beside it, and lets a
+    /// repack be sharded like everything else.
     ///
     /// The one geometric fact left to the kernel is padding: a layout with a
-    /// tile quantum takes a `to` with more rows or columns than the operand
-    /// has and zero-fills the tail. Stating it as `Concat[src, Fill]` would be
-    /// truthful but would materialize the padded operand before the swizzle
-    /// that is about to rewrite it anyway.
+    /// tile quantum takes a `to` with more rows or columns than the operand has
+    /// and zero-fills the tail. `Concat[src, Fill]` would be truthful but would
+    /// materialize the padded operand before the swizzle rewrites it anyway.
     ///
     /// Padding is the *only* thing it may add. An element is the same width on
     /// both sides, because this is the kernel-priced member of the placement
     /// family: it changes where a byte sits and never what a byte means. A
-    /// repack that named a different element width sized its destination
-    /// buffer from a lie, which is [`Expr::Transmute`]'s invariant reached
-    /// from the other side.
+    /// repack that named a different element width sized its destination buffer
+    /// from a lie.
     Repack {
         src: Box<Expr>,
         layout: RepackLayout,
@@ -307,12 +254,12 @@ pub enum Expr {
     },
     /// Escape hatch: the same values in a different representation.
     ///
-    /// The exact dual of [`Expr::Transmute`], and the pair is worth reading
-    /// together: a transmute preserves the *bytes* and renames them, a cast
-    /// preserves the *values* and rewrites them. One is free; this one is a
-    /// kernel. Rust spells the same distinction `transmute` and `as`.
+    /// The exact dual of [`Expr::Transmute`]: a transmute preserves the *bytes*
+    /// and renames them, a cast preserves the *values* and rewrites them. One
+    /// is free; this one is a kernel. Rust spells the same distinction
+    /// `transmute` and `as`.
     ///
-    /// Covers all three directions at once, because they are one question --
+    /// Covers all three directions at once, because they are one question —
     /// what representation, not what operation:
     ///
     /// * raw to raw is a numeric cast (BF16 to F32);
@@ -320,42 +267,36 @@ pub enum Expr {
     ///   tensor holding the scales the encoder computes;
     /// * quantized to raw is decoding.
     ///
-    /// Shape is preserved in every direction: a cast has an opinion about
-    /// element representation and none about placement. Re-encoding one
-    /// quantized scheme directly as another is refused -- no kernel does it,
-    /// and the destination's scales are not a function of the source's -- so
-    /// the two-step is what a contract says instead: declare the decoded
-    /// tensor [`Visibility::Internal`] and cast *that*. A kernel node reads any
-    /// expression, [`Expr::Out`] included, which is what makes step two
-    /// spellable; what it may not read is another kernel directly, and naming
-    /// the intermediate is how a contract sequences two. Which node decodes
-    /// depends on the scheme -- a cast to the logical dtype where a backend
-    /// implements one, a per-group [`Expr::Scale`] for a block-scaled scheme.
+    /// Shape is preserved in every direction. Re-encoding one quantized scheme
+    /// directly as another is refused — no kernel does it, and the
+    /// destination's scales are not a function of the source's — so a contract
+    /// declares the decoded tensor [`Visibility::Internal`] and casts *that*. A
+    /// kernel node reads any expression, [`Expr::Out`] included, but may not
+    /// read another kernel directly; naming the intermediate is how a contract
+    /// sequences two.
     ///
     /// Stated as a node rather than left implicit in the gap between what an
-    /// expression yields and what its declaration says, because that gap hid a
-    /// kernel: two declarations that differ only in `encoding` looked alike at
-    /// the author's fingertips while one of them ran a converter and invented a
-    /// scale tensor below the type checker.
+    /// expression yields and what its declaration says: that gap hid a kernel,
+    /// with two declarations differing only in `encoding` looking alike while
+    /// one of them ran a converter and invented a scale tensor.
     Cast { src: Box<Expr>, to: Encoding },
     /// Escape hatch: elementwise multiply. `out[i] = src[i] * factor[i]`.
     ///
-    /// One of two operators that change a *value*, and the only one that changes
-    /// it by arithmetic somebody asked for: a [`Expr::Cast`] moves a value only
-    /// as far as its new representation forces. Everything else moves bytes or
-    /// renames their type, which is why an expression's output can be checked by
-    /// arithmetic on extents alone. That property is worth the price of
-    /// admission being explicit: a family reaches for this only when a factor
-    /// has to be folded into a weight, and folding it at load time is what stops
-    /// the alternative — a driver copying the tensor to the host, scaling it
-    /// there and uploading the result during bind, outside the plan entirely.
+    /// The only operator that changes a value by arithmetic somebody asked for
+    /// — a [`Expr::Cast`] moves a value only as far as its new representation
+    /// forces. Everything else moves bytes or renames their type, which is why
+    /// an expression's output can be checked by arithmetic on extents alone. A
+    /// family reaches for this only when a factor has to be folded into a
+    /// weight, and folding it at load time is what stops a driver copying the
+    /// tensor to the host, scaling it there and uploading the result during
+    /// bind, outside the plan entirely.
     ///
     /// With a [`ScaleFactor::PerBlock`] factor this is dequantization, and it
     /// overlaps [`Expr::Cast`] into a raw encoding on purpose: a cast decodes
-    /// with the scales the *scheme* says are there, while this decodes with
-    /// scales an author names. That is the whole difference, and it is why this
-    /// is the only variant in the algebra with two children — outbound, a
-    /// quantized tensor's scales are its outputs; inbound they are inputs.
+    /// with the scales the *scheme* says are there, this decodes with scales an
+    /// author names. It is the only variant in the algebra with two children —
+    /// outbound, a quantized tensor's scales are its outputs; inbound they are
+    /// inputs.
     Scale { src: Box<Expr>, factor: ScaleFactor },
     /// Escape hatch: elementwise add of one constant. `out[i] = src[i] + by`,
     /// as [`f32::to_bits`] for the reason [`ScaleFactor::Uniform`] gives.
@@ -410,21 +351,18 @@ pub enum ScaleFactor {
     ///
     /// **The grouping is the shape ratio, and nothing else states it.** A
     /// `[256, 512]` weight with `[2, 4]` factors is blocked 128x128; with
-    /// `[256, 4]` it is blocked 1x128, which is the one-dimensional case; with
-    /// `[256, 1]` it is one factor per row. This used to carry a `group` and an
-    /// `axis` beside the operand, which said the same thing a second time and
-    /// therefore could disagree with it — and being one number, could only ever
-    /// say it about one axis, so a two-dimensional block scale was not
-    /// expressible at all even though both executors' kernels index one.
+    /// `[256, 4]` it is blocked 1x128; with `[256, 1]` it is one factor per
+    /// row. A `group`/`axis` pair beside the operand said the same thing twice
+    /// and could disagree with it, and being one number could only say it about
+    /// one axis, so a two-dimensional block scale was not expressible at all
+    /// even though both executors' kernels index one.
     ///
-    /// This is how a block-scaled checkpoint is dequantized, and stating it as
-    /// an expression is the point. The scales are a tensor like any other, so
-    /// they take the same [`Expr::Shard`], [`Expr::Slice`] and [`Expr::Concat`]
-    /// the weight takes, written beside it and checked against the weight by
-    /// `infer`. The alternative — pairing a weight with its scales by appending
-    /// a suffix to its name, somewhere below the contract — cannot be checked
-    /// at all: a partition applied to one and not the other is silent, and a
-    /// pairing that fails to match simply does nothing.
+    /// The scales are a tensor like any other, so they take the same
+    /// [`Expr::Shard`], [`Expr::Slice`] and [`Expr::Concat`] the weight takes,
+    /// written beside it and checked against the weight by `infer`. Pairing a
+    /// weight with its scales by name suffix below the contract cannot be
+    /// checked at all: a partition applied to one and not the other is silent,
+    /// and a pairing that fails to match simply does nothing.
     PerBlock { by: Box<Expr> },
 }
 
@@ -432,15 +370,19 @@ pub enum ScaleFactor {
 /// are encoded.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TensorType {
+    /// Logical shape, in elements.
     pub shape: Vec<i64>,
+    /// How those elements are encoded.
     pub encoding: Encoding,
 }
 
 impl TensorType {
+    /// A type with the given shape and encoding.
     pub fn new(shape: Vec<i64>, encoding: Encoding) -> Self {
         Self { shape, encoding }
     }
 
+    /// A raw (unquantized) type of `dtype`.
     pub fn raw(shape: Vec<i64>, dtype: DType) -> Self {
         Self {
             shape,
@@ -448,6 +390,7 @@ impl TensorType {
         }
     }
 
+    /// Number of axes.
     pub fn rank(&self) -> usize {
         self.shape.len()
     }
@@ -487,9 +430,13 @@ impl TensorType {
 /// state and could not stand behind.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TensorContract {
+    /// Declared name of the tensor.
     pub name: String,
+    /// How to build it from the checkpoint. See [`Expr`].
     pub expr: Expr,
+    /// Declared logical shape, or `None` where the contract makes no claim.
     pub shape: Option<Vec<i64>>,
+    /// Declared encoding of its elements.
     pub encoding: Encoding,
     /// Set when this entry holds scales for another entry. See [`Scales`].
     pub scales: Option<Scales>,
@@ -505,16 +452,9 @@ pub struct TensorContract {
 /// What a scale tensor scales, said by the entry that declares the scales.
 ///
 /// A quantized weight and its scales are two runtime tensors, and the driver's
-/// kernels need to know they belong together. The loader used to work that out
-/// by matching name suffixes — `{name}_scale_inv`, then `{base}.scale` — with
-/// the group size hardcoded to 128 beside them.
-///
-/// That guess had an author. `deepseek_v4_contract.hpp::dsv4_block_scales_to_fp32`
-/// finds the pairing properly: it takes a `.scale` tensor, looks up
-/// `<base>.weight`, and publishes the scale only if that companion is really
-/// FP8-E4M3 — "guessing is how a scale tensor gets silently reinterpreted", as
-/// its own comment puts it. Then it dropped the pair on the floor and the loader
-/// re-derived it from strings. This field is the driver keeping what it found.
+/// kernels need to know they belong together. The pairing is stated here rather
+/// than guessed from name suffixes: a suffix match is how a scale tensor gets
+/// silently reinterpreted as one it never belonged to.
 ///
 /// Only for scales the *checkpoint* shipped. When the loader quantizes a tensor
 /// it creates the scale tensor itself and states the pairing from there, with no
@@ -527,14 +467,18 @@ pub struct Scales {
     /// published tensors rather than feeding one into the other, and the one
     /// authoring site in the tree declares the scales first.
     pub of: String,
+    /// How finely the scales divide `of`. See [`QuantGranularity`].
     pub granularity: QuantGranularity,
     /// Elements of `of` per scale entry, for [`QuantGranularity::PerGroup`].
     pub group_size: u32,
+    /// The axis of `of` that per-channel scales index.
     pub channel_axis: u32,
+    /// How the scale values themselves are stored. See [`ScaleForm`].
     pub form: ScaleForm,
 }
 
 impl TensorContract {
+    /// A public entry named `name` and built by `expr`, declaring no scales.
     pub fn new(name: impl Into<String>, expr: Expr, shape: Vec<i64>, encoding: Encoding) -> Self {
         Self {
             name: name.into(),
@@ -583,12 +527,10 @@ pub struct ModelContract {
     /// Byte alignment every materialized buffer must satisfy. A target
     /// property; there is no reason to repeat it per tensor.
     pub alignment: u32,
+    /// Every tensor the contract declares.
     pub tensors: Vec<TensorContract>,
     /// Grids of interchangeable tensors, declared once and instantiated
     /// `arity` times. See [`GroupContract`].
-    ///
-    /// Defaulted on the way in, so every contract written before groups
-    /// existed reads as having none — which is what each of them meant.
     #[serde(default)]
     pub groups: Vec<GroupContract>,
 }
@@ -634,7 +576,9 @@ pub struct GroupContract {
 /// this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Partition {
+    /// Which rank of `world` this partition is.
     pub rank: u32,
+    /// How many ranks share the tensor.
     pub world: u32,
 }
 
@@ -645,6 +589,7 @@ impl Partition {
     /// single-GPU load uses.
     pub const WHOLE: Self = Self { rank: 0, world: 1 };
 
+    /// The partition `rank` of `world` denotes.
     pub fn new(rank: u32, world: u32) -> Self {
         Self { rank, world }
     }
@@ -776,10 +721,12 @@ impl Expr {
         }
     }
 
+    /// A checkpoint tensor named `name`. See [`Expr::Src`].
     pub fn src(name: impl Into<String>) -> Self {
         Expr::Src(name.into())
     }
 
+    /// A published tensor named `name`. See [`Expr::Out`].
     pub fn out(name: impl Into<String>) -> Self {
         Expr::Out(name.into())
     }
@@ -800,6 +747,7 @@ impl Expr {
         }
     }
 
+    /// The `[start, start + len)` run of `axis`. See [`Expr::Slice`].
     pub fn slice(self, axis: u8, start: i64, len: i64) -> Self {
         Expr::Slice {
             src: Box::new(self),
@@ -809,6 +757,7 @@ impl Expr {
         }
     }
 
+    /// Every `step`-th element of `axis` from `start`. See [`Expr::Stride`].
     pub fn stride(self, axis: u8, start: i64, len: i64, step: i64) -> Self {
         Expr::Stride {
             src: Box::new(self),
@@ -828,6 +777,7 @@ impl Expr {
         }
     }
 
+    /// `parts` joined along `axis`. See [`Expr::Concat`].
     pub fn concat(axis: u8, parts: Vec<Expr>) -> Self {
         Expr::Concat {
             axis: Axis(axis),
@@ -835,6 +785,7 @@ impl Expr {
         }
     }
 
+    /// A constant tensor of `value` with type `ty`. See [`Expr::Fill`].
     pub fn fill(value: f32, ty: TensorType) -> Self {
         Expr::Fill {
             value: value.to_bits(),
@@ -842,6 +793,7 @@ impl Expr {
         }
     }
 
+    /// The same bytes read as `to`. See [`Expr::Transmute`].
     pub fn transmute(self, to: TensorType) -> Self {
         Expr::Transmute {
             src: Box::new(self),
@@ -849,6 +801,7 @@ impl Expr {
         }
     }
 
+    /// The same values in `layout`, typed `to`. See [`Expr::Repack`].
     pub fn repack(self, layout: RepackLayout, to: TensorType) -> Self {
         Expr::Repack {
             src: Box::new(self),
@@ -892,6 +845,7 @@ impl Expr {
         }
     }
 
+    /// This rank's share of `axis`. See [`Expr::Shard`].
     pub fn shard(self, axis: u8) -> Self {
         Expr::Shard {
             src: Box::new(self),

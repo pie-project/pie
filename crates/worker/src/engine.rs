@@ -553,7 +553,7 @@ fn load_model_drivers(
         #[allow(unreachable_patterns)]
         if tp_degree > 1 {
             match resolved {
-                #[cfg(feature = "driver-cuda")]
+                #[cfg(feature = "_driver-cuda")]
                 ResolvedFlavor::Embedded(Flavor::Cuda) => {}
                 _ => anyhow::bail!(
                     "model {:?}: tensor_parallel_size={tp_degree} is only \
@@ -1019,7 +1019,7 @@ async fn assemble_distributed<C: ControlLink>(
               would be a parameter list with a name"
 )]
 #[cfg_attr(
-    not(any(feature = "driver-cuda", feature = "driver-metal")),
+    not(any(feature = "_driver-cuda", feature = "driver-metal")),
     allow(
         unused_variables,
         unreachable_code,
@@ -1038,7 +1038,7 @@ fn create_driver_group(
     tp_degree: usize,
     component: driver_api::ModelComponent,
 ) -> Result<GroupDriver> {
-    #[cfg(feature = "driver-cuda")]
+    #[cfg(feature = "_driver-cuda")]
     {
         if flavor == Flavor::Cuda && tp_degree > 1 {
             let rank_opts = cuda_rank_options(m, group_idx, group, base_opts)?;
@@ -1060,7 +1060,7 @@ fn create_driver_group(
         }
     }
 
-    #[cfg(not(feature = "driver-cuda"))]
+    #[cfg(not(feature = "_driver-cuda"))]
     let _ = (flavor, tp_degree);
 
     let first_driver_idx = group.first().copied().ok_or_else(|| {
@@ -1084,12 +1084,12 @@ fn create_driver_group(
 }
 
 fn embedded_opts_for_device(base_opts: &DriverOptions, device: String) -> DriverOptions {
-    #[cfg(not(feature = "driver-cuda"))]
+    #[cfg(not(feature = "_driver-cuda"))]
     let _ = &device;
 
     #[allow(unreachable_patterns)]
     match base_opts {
-        #[cfg(feature = "driver-cuda")]
+        #[cfg(feature = "_driver-cuda")]
         DriverOptions::CudaNative(opts) => {
             let mut opts = opts.clone();
             opts.device = device;
@@ -1107,17 +1107,17 @@ fn embedded_opts_for_device(base_opts: &DriverOptions, device: String) -> Driver
 /// the caller asked for a measurement this backend does not have, and refusing
 /// the boot over it would be worse than doing the ordinary thing.
 fn apply_embedded_calibration(options: &mut DriverOptions, calibrate: bool) {
-    #[cfg(feature = "driver-cuda")]
+    #[cfg(feature = "_driver-cuda")]
     if let DriverOptions::CudaNative(opts) = options {
         opts.calibrate_planner = calibrate;
     }
 
-    #[cfg(not(feature = "driver-cuda"))]
+    #[cfg(not(feature = "_driver-cuda"))]
     let _ = (options, calibrate);
 }
 
 fn apply_embedded_verbose(options: &mut DriverOptions, verbose: bool) {
-    #[cfg(feature = "driver-cuda")]
+    #[cfg(feature = "_driver-cuda")]
     if let DriverOptions::CudaNative(opts) = options {
         opts.verbose = verbose;
     }
@@ -1127,11 +1127,11 @@ fn apply_embedded_verbose(options: &mut DriverOptions, verbose: bool) {
         opts.verbose = verbose;
     }
 
-    #[cfg(not(any(feature = "driver-cuda", feature = "driver-metal")))]
+    #[cfg(not(any(feature = "_driver-cuda", feature = "driver-metal")))]
     let _ = (options, verbose);
 }
 
-#[cfg(feature = "driver-cuda")]
+#[cfg(feature = "_driver-cuda")]
 fn cuda_rank_options(
     m: &config::ModelConfig,
     group_idx: usize,

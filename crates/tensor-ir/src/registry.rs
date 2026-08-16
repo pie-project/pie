@@ -117,23 +117,14 @@ crate::declare_tagged_enum! {
         /// An explicit attention mask replacing the derived causal one.
         /// Read.
         AttnMask = 9, "attn_mask";
-        // ── Recurrent-state buffered-slot family. Wire-additive: tags 0-9 are
-        // unmoved, so a pure-attention guest's container is byte-identical.
-        //
-        // NO GUEST BINDS THESE ANY MORE. `rs-geometry` used to carry the
-        // buffer's addressing, and the runtime derived the same values from
-        // the `RsStore` it is authoritative for and refused any fire whose
-        // guest copy disagreed — five channels of page arithmetic with one
-        // satisfying assignment. The tags are RESERVED rather than reclaimed:
-        // renumbering would silently change the meaning of already-compiled
-        // containers, which is a far worse trade than five unused names.
-        //
-        // `RsBufferLen` is the exception, and its direction is INVERTING. The
-        // live buffered token count is exactly the quantity t15 makes
-        // device-resident, so it comes back not as something the guest states
-        // but as something the device writes and the host reads as an upper
-        // bound. `FireGeometry::rs_buffer_lens` is already staged for it.
-        /// RESERVED. The buffer's page pool. Derived by the runtime.
+        // ── Recurrent-state buffered-slot family. Wire-additive: tags 0-9
+        // stay unmoved so a pure-attention guest's container is
+        // byte-identical. RESERVED rather than reclaimed: renumbering would
+        // silently change the meaning of already-compiled containers.
+        // `RsBufferLen` inverts direction — the device writes the live
+        // buffered token count and the host reads it as an upper bound
+        // (`FireGeometry::rs_buffer_lens`), rather than the guest stating it.
+        /// RESERVED. Page tables for the recurrent-state buffered slots.
         RsBufferPages = 10, "rs_buffer_pages";
         /// RESERVED. Row offsets splitting `rs_buffer_pages` per request.
         /// Derived by the runtime.
@@ -161,19 +152,11 @@ impl Port {
     /// positions, `w_slot`/`w_off`) consumes — a token is spent by the pass
     /// that embeds it; geometry and masks are state, peeked.
     ///
-    /// `RsFoldLen` joined the consuming side (2026-08-07). It reads like
-    /// geometry, but a fold length is not state a later fire re-reads: it
-    /// is a COUNT spent by the one fire that folds on it. Peeking it had a
-    /// consequence beyond bookkeeping — a peek records `desc_reads` on the
-    /// channel, that state PERSISTS ACROSS PASSES, and
-    /// `dsl::context::record_channel_put` then drains a peeked port before
-    /// a put. So a device handoff (fire A computes the count, fire B folds
-    /// on it) made fire A emit an implicit take of the channel it was
-    /// about to produce, and the driver refused the launch forever:
-    /// `req cons pub 0/0`, a fire waiting on its own output.
-    /// `cuda_gdn_foldcommit::the_fold_length_can_live_on_device` and
-    /// `cuda_mtp_native_verify::a_device_resident_fold_length_decodes_identically`
-    /// are the tests that were red for it.
+    /// `RsFoldLen` also consumes: it is a count spent by the fire that folds
+    /// on it, not state a later fire re-reads. Peeking it would let a device
+    /// handoff (fire A computes the count, fire B folds on it) make fire A
+    /// implicitly take its own not-yet-produced output, deadlocking the
+    /// launch.
     pub fn consumes(self) -> bool {
         matches!(
             self,
@@ -227,14 +210,9 @@ pub fn intrinsic_stages(intr: IntrinsicId) -> &'static [Stage] {
 
 /// Whether `profile` provides `intr`.
 ///
-/// Exhaustive on purpose, and deliberately one function.
-///
-/// The tempting split is two: a list of which intrinsics are model-gated, and
-/// a mapping from each gated one to its profile flag with a `_ => true` arm.
-/// Under that shape a new gated intrinsic added to the list but missed in the
-/// mapping is available on every model — a capability check that passes by
-/// being forgotten, which is the worst way for one to fail. One exhaustive
-/// match with no catch-all makes the compiler ask the question instead.
+/// Deliberately one exhaustive match, not a gated-list + mapping split:
+/// that shape lets a newly gated intrinsic default to available if the
+/// mapping misses it — a capability check that passes by being forgotten.
 pub fn intrinsic_available(intr: IntrinsicId, profile: &ModelProfile) -> bool {
     match intr {
         IntrinsicId::MtpLogits => profile.has_mtp_logits,

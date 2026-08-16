@@ -418,8 +418,7 @@ fn an_adapter_opens_and_reports_what_it_offers() {
     println!("features     {:?}", device.features());
     println!("unreachable  {:?}", device.unreachable());
     println!(
-        "downlevel    {} rows need more than the guaranteed {} storage buffers",
-        kernels_wgpu::over_downlevel_storage_limit().len(),
+        "downlevel    the guaranteed floor is {} storage buffers per stage",
         kernels_wgpu::DOWNLEVEL_STORAGE_BUFFERS
     );
 
@@ -460,11 +459,19 @@ fn rule_of(name: &str) -> kernels::LaunchRule {
         // `kv_append_paged`'s row said `PerHead`, which is `[1, kv_heads,
         // rows]` -- the shape this file's paged-append test asserts.
         "kv_append_paged_bfloat16" => kernels::LaunchRule::PerHead,
-        other => {
-            kernels_wgpu::sig(other)
-                .unwrap_or_else(|| panic!("no row and no stated rule for `{other}`"))
-                .launch
-        }
+        // EXHAUSTIVE, and it has to be: this fell back to the row's `launch`
+        // column, which no longer exists. A grid is the ROUTINE's to state
+        // now, and a routine needs a `Ctx` to state anything -- which is the
+        // whole plan path, and these two tests are about what the SHADER
+        // computes rather than about planning. So the three rules they need
+        // are written here, with the reason, and a fourth caller has to add
+        // its own rather than get a wrong answer from a lookup that cannot
+        // fail loudly.
+        other => panic!(
+            "`{other}` has no stated rule in this file. These tests bypass the \
+             plan path deliberately, so a rule they need is stated here or not \
+             at all -- add it above with why it is that shape."
+        ),
     }
 }
 
@@ -2040,9 +2047,13 @@ fn fire_one<M: driver_wgpu::serve::Modules>(
                 rotary_dims: 128,
                 n_experts: 0,
                 experts_per_token: 0,
+                ..Default::default()
             },
             tier: Capability::Baseline,
             one_at_a_time: false,
+            // The whole plan: this fires a real text and reads its answer,
+            // where a prefix is for finding where one goes wrong.
+            prefix: None,
         },
     )
 }
@@ -2365,12 +2376,26 @@ fn the_first_ported_routine_runs_on_this_adapter_and_averages_two_streams() {
 
     kernels_wgpu::layout::ple_combine(
         &encoder,
-        kernels_wgpu::routine::Buf(0),
-        kernels_wgpu::routine::Buf(1),
-        kernels_wgpu::routine::BufMut(2),
-        kernels_wgpu::routine::Buf(3),
-        kernels_wgpu::routine::Env(i32::try_from(WORDS).expect("fits")),
-        kernels_wgpu::routine::Env(1),
+        // The two inputs and the result state their SLOTS now, and the
+        // per-layer embedding table is the FIRE's -- `Env`, because no
+        // statement places it as an operand. That marking is the read-side
+        // repair the arity checker was red for: `Provenance::Env` is what
+        // `arity_problem` skips.
+        kernels_wgpu::routine::InSlot {
+            ptr: kernels_wgpu::routine::Buf(0),
+        },
+        kernels_wgpu::routine::InSlot {
+            ptr: kernels_wgpu::routine::Buf(1),
+        },
+        kernels_wgpu::routine::OutSlot {
+            ptr: kernels_wgpu::routine::BufMut(2),
+        },
+        // The per-layer table is a `Block` and the two extents are `Ask`ed
+        // facts by name -- upstream retyped all three. The numbers are the
+        // same; the types say who SUPPLIES them.
+        kernels_wgpu::routine::Block::new(kernels_wgpu::routine::Buf(3)),
+        kernels_wgpu::routine::Ask::new(i32::try_from(WORDS).expect("fits")),
+        kernels_wgpu::routine::Ask::new(1),
     )
     .expect("the routine dispatches on this adapter");
 

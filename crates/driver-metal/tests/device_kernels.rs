@@ -181,7 +181,7 @@ fn every_declared_entrypoint_builds_a_pipeline_on_this_device() {
                 // literal here would go stale the day the body retunes,
                 // and it would go stale silently in the safe direction --
                 // a test that admits 1024 while the body launches 1088.
-                let Some((routine, _)) = driver_metal::lowering::routine::crossed(entry) else {
+                let Some(routine) = driver_metal::lowering::routine::crossed(entry) else {
                     continue;
                 };
                 let wants = match routine.name {

@@ -29,6 +29,7 @@
 //! intended sharing passes while an accidental one still fails.
 
 use model_compiler::lower::{Buffers, Row, value_bytes};
+use model_ir::kernels::Backend;
 use model_ir::trace::{FireClass, ForwardPlan, OpKind, ValueId};
 
 /// A decode-shaped fire: every row samples, so the epilogue's row space
@@ -943,13 +944,35 @@ fn an_alias_lands_inside_its_owner() {
 /// while the attention dispatch whose result the guard owns executed
 /// six ops later.
 ///
-/// This asks the same question of the TEXT, without a GPU: for every
-/// guard that produces a value, every launch that could bind it should
-/// lie in `[guard + 1, guard + 1 + span)`. Printed rather than asserted
-/// on the first pass — the point is to find out which of the two is
-/// wrong before deciding which to call the bug.
+/// This asks the same question of the TEXT, without a GPU. It printed
+/// rather than asserted on its first pass, because the point was to find
+/// out which of the two was wrong before deciding which to call the bug.
+/// The answer is in [`UNWRITTEN`]: llama_like's 56 value-producing
+/// guards are all clean, and every one of qwen3.5's 18 is broken the
+/// same way, in all three of its regions.
+///
+/// The cause is one clause. `Lowerer::emit` hands a region's output to a
+/// statement that declares none of its own, but only when the statement
+/// also names no `StateRef` — an exclusion added for
+/// `attn::dequant_kv_cache_layer_to_bf16_active`, which stages a cache,
+/// produces nothing, and broke its row's arity when it was handed a
+/// fourth operand. The GDN prefill recurrence matches that same
+/// predicate and means the opposite: it writes the recurrent slab AND is
+/// the value its region exists to produce. Its row says so outright —
+/// `out: OutSlot<0, Or<*mut f32>>`, optional exactly so the row "stays
+/// in `opt_writes` against a statement declaring no out". So the row
+/// asks for the output, the lowerer declines to pass it, and the `Val`
+/// the guard hands qwen3.5's attention is written by nobody.
+///
+/// Which makes the fix a row question rather than an `OpKind` question:
+/// the two statements are indistinguishable in the trace and distinct in
+/// their declarations, so the lowerer has to consult the row. That is a
+/// change to `model-compiler`, and it is written down here rather than
+/// made here.
 #[test]
-fn what_a_value_producing_guard_spans() {
+fn a_value_producing_guard_has_a_writer_in_every_region() {
+    let mut checked = 0;
+    let mut unwritten: Vec<String> = Vec::new();
     for (name, class, plan) in families() {
         for (i, op) in plan.ops.iter().enumerate() {
             let OpKind::Guard { arms, else_ops } = &op.kind else {
@@ -958,39 +981,138 @@ fn what_a_value_producing_guard_spans() {
             if op.outputs.is_empty() {
                 continue;
             }
-            let n_arms = arms.len();
             let span: usize =
                 arms.iter().map(|a| a.ops as usize).sum::<usize>() + *else_ops as usize;
             let body = (i + 1)..(i + 1 + span);
-            // Who READS the guard's result, and how far past the span
-            // that sits. A reader inside the body would be stranger
-            // still; what is expected is a reader just after it.
+            assert!(
+                body.end <= plan.ops.len(),
+                "{name} {class:?} guard@{i}: span {span} runs {} ops past the plan — \
+                 the arm counts and the op list disagree",
+                body.end - plan.ops.len()
+            );
             let out = op.outputs[0];
+
+            // The statements that write this guard's value. Either the
+            // lowerer hands it to them -- `Lowerer::emit` rewires a
+            // statement that declares no result to a row that accepts one --
+            // or the DSL already named it as their own result, which
+            // `dsl::regions` does when it is given the shape up front.
+            //
+            // The first half MIRRORS the lowerer, and must keep mirroring
+            // it: this test predicts what lowering will do from the trace
+            // alone, so a predicate here that has drifted from
+            // `Lowerer::emit`'s reports a pass it did not earn.
+            // THE MIRROR GOT SHORTER BECAUSE THE LOWERER DID. This asked
+            // `accepts_an_unstated_result(Cuda, kernel)` -- *"does this
+            // launcher wear an `Or<_>`?"* -- because that was the question
+            // `Lowerer::emit` asked before handing a region's buffer to a
+            // statement declaring no result. The statement STATES it now, in
+            // `Op::dest`, so both sides read the same field and there is no
+            // predicate left to drift.
+            //
+            // The 54 UNWRITTEN regions this file recorded were the drift:
+            // an earlier mirror asked `state_ref().is_none()` and read the
+            // ssm prefill arms backwards. A mirror that reads the same field
+            // as the thing it mirrors cannot be wrong about it.
+            let binds = |j: usize| {
+                let o = &plan.ops[j];
+                (o.outputs.is_empty() && o.dest.contains(&out)) || o.outputs.contains(&out)
+            };
+            let mut at = body.start;
+            for (a, arm) in arms
+                .iter()
+                .map(|a| (format!("{:?}", a.pred), a.ops as usize))
+                .chain(std::iter::once(("otherwise".into(), *else_ops as usize)))
+                .enumerate()
+                .map(|(n, (p, c))| (n, (p, c)))
+            {
+                let (pred, count) = arm;
+                let region = at..at + count;
+                if count != 0 && !region.clone().any(binds) {
+                    unwritten.push(format!(
+                        "{name} {class:?} guard@{i} region {a} ({pred}) -> v{out}: {:?}",
+                        region
+                            .clone()
+                            .map(|j| short(&plan.ops[j].kind))
+                            .collect::<Vec<_>>()
+                    ));
+                }
+                at = region.end;
+            }
+
+            // A reader inside the body would be reading the value the
+            // region is still writing. What is expected is a reader at or
+            // after the body — llama_like's sits exactly at `body.end`,
+            // qwen3.5's one HookSite later.
             let reader = plan
                 .ops
                 .iter()
                 .enumerate()
                 .find(|(_, o)| o.inputs.contains(&out))
                 .map(|(j, _)| j);
-            println!(
-                "{name:12} {class:?} guard@{i} arms={n_arms} else={else_ops} \
-                 span={span} body={body:?} out=v{out} first_reader={reader:?}"
-            );
-            for j in body.clone() {
-                if let Some(o) = plan.ops.get(j) {
-                    println!("    body op {j}: {:?}", short(&o.kind));
-                }
-            }
             if let Some(r) = reader {
-                for j in body.end..r.min(body.end + 8) {
-                    if let Some(o) = plan.ops.get(j) {
-                        println!("    AFTER op {j}: {:?}", short(&o.kind));
-                    }
-                }
+                assert!(
+                    r >= body.end,
+                    "{name} {class:?} guard@{i}: op {r} reads v{out} from INSIDE the guard's \
+                     body {body:?} — a region reading the output it is chosen to produce"
+                );
             }
+            checked += 1;
         }
     }
+    let known: Vec<&str> = unwritten
+        .iter()
+        .filter(|u| UNWRITTEN.iter().any(|k| u.contains(k)))
+        .map(String::as_str)
+        .collect();
+    let news: Vec<&String> = unwritten
+        .iter()
+        .filter(|u| !UNWRITTEN.iter().any(|k| u.contains(k)))
+        .collect();
+    assert!(
+        news.is_empty(),
+        "{} guard regions produce a value nobody writes, and they are NOT the \
+         recorded GDN defect:\n{}",
+        news.len(),
+        news.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n")
+    );
+    assert_eq!(
+        known.len(),
+        0,
+        "the GDN defect is repaired and this number is how that stays true. A \
+         non-zero count means the lowerer's clause narrowed, the recurrence was \
+         respelled, or a row lost the `OutSlot` that lets it take a region's \
+         output; whichever it is, `UNWRITTEN` and this number are the record of \
+         it and both should move together"
+    );
+    assert!(
+        checked >= 74,
+        "only {checked} value-producing guards reached — this test counts the ones it \
+         checked so that a family dropping out of `families()` is not read as a pass"
+    );
 }
+
+/// The statements a value-producing region runs that write no value.
+///
+/// **EMPTY, and that is the repair.** Every entry was the same defect:
+/// the row states an `OutSlot`, the statement declares no result, and
+/// `Lowerer::emit` withheld the region's output because the statement
+/// also named a `StateRef`. Three GDN prefill symbols sat here across 54
+/// regions -- 18 qwen3.5 guards times 3. The clause now asks the ROW
+/// whether it accepts a result rather than asking the OP whether it
+/// touches state (`kernels::accepts_an_unstated_result`), and all 54
+/// found their writer at once. The list stays for the next one.
+///
+/// It has a sibling this list cannot hold, because no family in
+/// `families()` builds it: `llama_like::forward::all_reduce` opens a
+/// `guarded_value` whose two arms call `cuda::all_reduce_p2p` and
+/// `cuda::all_reduce_out`, both of which DECLARE a result and have it
+/// dropped at the call. Same outcome by the other route — the arms write
+/// buffers of their own and the guard's `Val` is written by nobody — and
+/// `rustc` already says so, as the two `unused return value ... that
+/// must be used` warnings the crate has carried. It needs a tensor
+/// parallel fixture to be caught here rather than read here.
+const UNWRITTEN: &[&str] = &[];
 
 fn short(k: &OpKind) -> String {
     match k {

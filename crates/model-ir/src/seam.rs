@@ -1,38 +1,8 @@
-//! THE SEAM VOCABULARY — the named extension points a declaration states
-//! and a lowering reads.
+//! Seam vocabulary: named extension points stated by model text and
+//! read by lowerings.
 //!
-//! It sat inside the authoring module (`dsl::seam`) while there was one
-//! crate, and that was the single real back edge in the whole toolchain:
-//! [`crate::trace::TraceBuilder::finish`] calls [`check_plan`] and
-//! `model-compiler`'s lowering reads [`OUT`], so both the producer of the
-//! traced form and its consumer reached into a module whose other 7,700
-//! lines are authoring surface. Nothing here names a `Val`, a weight
-//! handle or any other authoring type — a seam is IR, so this is where it
-//! lives, and moving it is what let the three crates layer at all.
-//!
-//! What did NOT come along is the RECORDER (`dsl::seam(..)`, the free
-//! function that lowers a seam statement onto a tape): it takes `&Val` and
-//! is therefore surface. The split is exactly the declaration/recording
-//! line — the words are here, the act of writing them is in `model-dsl`.
-//!
-//! V2 (north-star-dsl.md "V2 — THE REDESIGN"): the seam vocabulary.
-//!
-//! A seam is a named, typed, identity-by-default extension point in the
-//! model text — the ONE surface behind what were three mechanisms (the
-//! two [`crate::trace::HookStage`]s, the `HasLora` guard arm, and the
-//! dispatch-side prologue/epilogue stages). At THIS rung only the
-//! surface unifies: each seam lowers to exactly the op(s) the pre-seam
-//! text recorded, and the goldens pin that byte-identity. The IR's own
-//! Seam op and the signature-table ABI are later rungs; what changes
-//! now is that the model text states extension points in one vocabulary
-//! instead of naming mechanisms.
 
-/// What an attachment at a seam MAY do. Caps are the seam's
-/// interface; whether a given deployment can service a cap is a
-/// dispatch-table fact refused at load (the XQA-has-no-capture
-/// contract's future home — enforcement lands with the signature
-/// ABI). The vocabulary documents the gradient: pure expressions
-/// innermost, observation mid-body, full PTIR at the boundary.
+/// What an attachment at a seam may do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cap {
     /// Pure value rewrite `|x, y| y'` (the adapter family).
@@ -51,57 +21,38 @@ pub enum Cap {
     Emit,
 }
 
-/// A seam's SIGNATURE (`.wiki/tart/dsl.md` ①): the stable NAME the
-/// request surface keys on (`fwd.adapter("attn.qv", ..)`,
-/// `fwd.attach(..)`), what an attachment SEES, what it MAY do, and —
-/// for the seams that have one — where it sits and where its output
-/// lands.
-///
-/// `after` / `before` and `sink` are the two lines the doc singles
-/// out as carrying what is today only a comment. They are not
-/// documentation here: [`check_plan`] reads `after` / `before`.
+/// A seam signature: name, observed value roles, capabilities, position
+/// rule, and optional sink.
 pub struct Def {
     pub name: &'static str,
-    /// The value roles an attachment observes or rewrites, in
-    /// operand order.
+    /// Value roles in operand order.
     pub sees: &'static [&'static str],
     pub caps: &'static [Cap],
-    /// The seam's POSITION rule, for seams whose arithmetic depends
-    /// on it. `after` names the op kinds that must have produced the
-    /// values it sees; `before` names the op kinds that must not yet
-    /// have consumed them.
+    /// Position rule for seams whose arithmetic depends on placement.
     pub position: Option<Position>,
     /// Where a sink-writing attachment's output lands.
     pub sink: Option<&'static str>,
 }
 
-/// A seam's position rule, stated as op-kind names
-/// ([`crate::trace::OpKind`]'s discriminants, plus `"Launch:<symbol>"`
-/// for stated kernels).
+/// A seam position rule, stated as op-kind names.
 #[derive(Debug, Clone, Copy)]
 pub struct Position {
     pub after: &'static [&'static str],
     pub before: &'static [&'static str],
 }
 
-/// Pre-attention observation seam: sees the just-projected q; a
-/// page-mask-sink attachment narrows the page list the SAME stated
-/// attention kernel consumes as substituted arguments (today's
-/// `OnAttnProj`).
+/// Pre-attention observation seam over q; a page-mask sink narrows the
+/// page list consumed by the same stated attention kernel.
 pub const ATTN_Q: Def = Def {
     name: "attn.q",
     sees: &["q"],
     caps: &[Cap::Observe, Cap::PageMaskSink],
     position: None,
-    // Where Quest's `attn_page_mask` lands. Hardcoded in
-    // `emit_cuda::emit_masked_pages_bracket` today; declared here,
-    // consumed when the launch ABI flattens (migration step 6).
+    // Quest's `attn_page_mask` lands in the attention page-list sink.
     sink: Some("attention.pages"),
 };
 
-/// Post-attention observation seam: sees the scores the (possibly
-/// capturing) dispatch published through the sideband (today's
-/// `OnAttn`).
+/// Post-attention observation seam over published scores.
 pub const ATTN_OUT: Def = Def {
     name: "attn.out",
     sees: &["a"],
@@ -110,13 +61,9 @@ pub const ATTN_OUT: Def = Def {
     sink: None,
 };
 
-/// The adapter value seam over the raw q/v projections — pure
-/// expressions of `(x, y)`, `fwd.adapter`'s site family (today's
-/// `HasLora` guard arm).
-/// THE POSITION RULE IS THE POINT: the correction lands on the raw
-/// projections, before bias, norms, rope and the KV append. Applying
-/// it after rope is DIFFERENT ARITHMETIC — the bug the first live
-/// A/B caught. It was a comment until now.
+/// Adapter value seam over raw q/v projections.
+/// The correction must land before bias, norms, rope and KV append;
+/// after rope is different arithmetic.
 pub const ATTN_QV: Def = Def {
     name: "attn.qv",
     sees: &["q", "v"],
@@ -128,9 +75,7 @@ pub const ATTN_QV: Def = Def {
     sink: None,
 };
 
-/// Entry boundary seam (prologue's home). Boundary attachments
-/// never enter row signatures — they cause no divergence — which is
-/// why their dispatch-side lowering needs no trace op at any rung.
+/// Entry boundary seam; boundary attachments do not enter row signatures.
 pub const IN: Def = Def {
     name: "in",
     sees: &[],
@@ -148,14 +93,9 @@ pub const OUT: Def = Def {
     sink: None,
 };
 
-/// LOAD-TIME check of the seams a text stated.
-///
-/// One rule today, and it is the one whose violation is silent:
-/// [`ATTN_QV`]'s position. The adapter's delta must land on the base
-/// projection, not on base + bias, and not after rope — so between
-/// the ops that PRODUCE the values the seam sees and the seam's own
-/// statement, nothing may consume them. A live A/B caught exactly
-/// this once; the rule stops being a comment here.
+/// Load-time check of stated seams.
+/// The silent case is [`ATTN_QV`]: its delta must land on the base
+/// projection before consumers such as bias or rope.
 pub fn check_plan(plan: &crate::trace::ForwardPlan) -> Vec<String> {
     let mut problems = Vec::new();
     for stmt in &plan.seams {
@@ -170,9 +110,7 @@ pub fn check_plan(plan: &crate::trace::ForwardPlan) -> Vec<String> {
             continue;
         };
         let at = at as usize;
-        // The values this statement sees are the inputs of the op
-        // it carries (the adapter's guard opens at `at`; its
-        // correction launch is the next op and names q and v).
+        // Adapter guard at `at`; correction launch at `at + 1` names q and v.
         let Some(seen) = plan.ops.get(at + 1).map(|op| op.inputs.clone()) else {
             continue;
         };
@@ -249,6 +187,7 @@ mod seam_tests {
             inputs,
             outputs,
             layer: Some(0),
+            dest: Vec::new(),
         }
     }
 
@@ -280,8 +219,7 @@ mod seam_tests {
         }
     }
 
-    /// `q` and `v` from projections, seam immediately after: the shape
-    /// every live text has.
+    /// Projection outputs, seam immediately after.
     fn well_placed() -> Vec<Op> {
         vec![
             op(matmul(), vec![], vec![1]),
@@ -301,21 +239,18 @@ mod seam_tests {
                 seam: "attn.qv".to_string(),
                 layer: Some(0),
                 op: Some(2),
-                // This fixture exists for the adapter POSITION rule, which
-                // reads `layer`/`op` and never the exposed set.
+                // The adapter position rule ignores this exposed set.
                 values: vec![],
             }],
         }
     }
 
-    /// The adapter's position rule FIRES. Without this the live traces'
-    /// clean check proves only that the walk found nothing to look at.
+    /// The adapter's position rule is not vacuous.
     #[test]
     fn the_adapter_position_rule_is_not_vacuous() {
         assert!(seam::check_plan(&plan(well_placed())).is_empty());
 
-        // A bias consuming q BEFORE the seam: the delta would land on
-        // base + bias. This is the shape the live A/B caught.
+        // Bias consumes q before the seam: delta would land on base + bias.
         let mut ops = well_placed();
         ops.insert(
             2,
@@ -333,8 +268,7 @@ mod seam_tests {
         assert_eq!(problems.len(), 1, "{problems:#?}");
         assert!(problems[0].contains("AddBias"), "{}", problems[0]);
 
-        // A seam placed after rope: different arithmetic, and the
-        // producer is no longer a projection.
+        // After rope is different arithmetic and a different producer.
         let ops = vec![
             op(matmul(), vec![], vec![1]),
             op(matmul(), vec![], vec![2]),
@@ -356,8 +290,7 @@ mod seam_tests {
         assert!(problems[0].contains("Rope"), "{}", problems[0]);
     }
 
-    /// Every seam a text may state is declared, and its `sees` arity is
-    /// what the statement passes.
+    /// Stated seams are declared with the expected arity.
     #[test]
     fn the_seam_table_is_complete() {
         for d in seam::ALL {

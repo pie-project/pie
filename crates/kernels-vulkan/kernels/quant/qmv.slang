@@ -80,8 +80,10 @@ struct Push {
 // because two warps per workgroup cannot use a barrier without half the group
 // idling through it, not because it was faster. What this measurement DOES
 // establish is that this kernel is not short of resident warps -- doubling
-// them changed nothing -- which rules occupancy out as the remaining limit and
-// is the reason the next attempt should be split-K, not a wider group.
+// them changed nothing -- which rules occupancy out as the remaining limit. It
+// was read at the time as pointing at split-K; the `floor K` rows of
+// `tests/qmv_bench.rs` have since ruled that out too, and the note above
+// `dot_lane4` says how.
 #define PIE_LANES 64
 
 groupshared float partials[8 * PIE_LANES];
@@ -117,6 +119,7 @@ float x_at(uint vec, uint k) {
 // groupshared array no reachable code touches is one slangc drops.
 groupshared float xs_sh[PIE_XCHUNK];
 
+
 // One pass over K for all FOUR of a lane's rows, reading coalesced.
 //
 // Everything here was measured on a 4090 against a real 4-bit qwen3-0.6B
@@ -147,10 +150,32 @@ groupshared float xs_sh[PIE_XCHUNK];
 // pattern they establish is the one a split-K form will need -- but the honest
 // reading is that this kernel's remaining cost is NOT its access pattern, and
 // an L1 that holds a 6 KB activation vector was already absorbing the defect.
-// Read that with the `PIE_LANES` note above, which rules out occupancy by the
-// same method: what is left is that a decode's matvec has too little work per
-// dispatch to fill the card, and the fix for that is splitting K across
-// workgroups, not tuning the loop.
+//
+// # Split-K would buy nothing, and that is now measured rather than reasoned
+//
+// The paragraph above and the `PIE_LANES` note both end by pointing at
+// split-K: occupancy was ruled out by doubling the warps and the access
+// pattern by fixing it, so what was left looked like too little work per
+// dispatch to fill the card. `tests/qmv_bench.rs` asked that directly and the
+// answer is no.
+//
+// A barrier-separated dispatch of this kernel costs ~6.14 us on an RTX PRO
+// 4500, and it costs the SAME 6.14 us at one workgroup as at 256 (`floor`),
+// and the same again at K=64 as at K=1024 (`floor K`) -- sixteen times less
+// work for an identical price. A cost that does not move when the work moves
+// by 16x or the parallelism by 256x is not a work cost, and split-K only
+// manufactures more workgroups.
+//
+// The same dispatches unbarriered cost 0.78 us (`overlap`), which is 640 GB/s
+// -- so the kernel is close to what the card can do and ~5.4 us of every
+// dispatch is the barrier in front of it. An execution-only dependency still
+// costs ~4-6 us, so the drain is intrinsic and cannot be masked away either.
+//
+// What is left is the barrier COUNT. A decode records 311 of them, 91%
+// read-after-write, which is what a forward pass is; at ~6 us each that is
+// most of a 2.9 ms step. The way to a faster decode here is fewer serialized
+// dispatches -- fusing a norm into the projection that reads it, a rope into
+// the append that follows it -- and not a faster matvec.
 //
 // `sum(x)` does not depend on the row, so it is computed once per word and
 // handed to all four rows -- see `pie_affine_word_dot_presummed`.
@@ -252,6 +277,151 @@ void reduce_store(bool tail, uint3 group, uint3 local) {
         }
     }
 }
+
+// AN RMSNORM-FUSED MATVEC WAS ALSO WRITTEN HERE AND MEASURED AWAY, AND IT IS
+// THE MORE INTERESTING OF THE TWO, BECAUSE IT DID EXACTLY WHAT IT SET OUT TO
+// DO AND THE STEP GOT SLOWER ANYWAY.
+//
+// The argument was the strongest one in this driver, and it is written down
+// in `hazards` in `driver-vulkan/src/device.rs`: patching every barrier out
+// of a qwen3-0.6b decode takes the same 452 dispatches from 1.517 ms to
+// 0.460, so ordering is two thirds of a step, the unit that costs is the
+// STAGE rather than the dispatch, and a layer's eleven stages are ~0.14 ms
+// each. `attn_norm` is read by q, k and v and by nothing else, so folding it
+// into their prologue lets the forward text stop stating it: one stage off
+// the layer, for a redundant pass over K that the traffic table below says is
+// nearly free.
+//
+// It worked. `affine_qmv_fast_rmsnorm` was written on both backends, the
+// plan fell from 452 launches to 424, and -- once `model-compiler`'s arena
+// stopped handing `k_norm` the block `q_norm` had just freed, which is a
+// write-after-read this driver has to order and which had been silently
+// eating the win -- the barrier count fell from 311 to 283. Exactly one
+// stage a layer, which is what was predicted.
+//
+// Three configurations, median device ms a step, same binary, same box,
+// three runs each and the spreads do not overlap:
+//
+//   | configuration                | barriers | ms/step |
+//   |------------------------------|----------|---------|
+//   | as it ships                  |      311 |   2.757 |
+//   | + arena cooling              |      311 |   2.807 |
+//   | + arena cooling + norm fusion|      283 |   2.846 |
+//
+// A stage came off and the step got 0.09 ms SLOWER. Both halves cost:
+// holding a dead block out of the arena for two ops buys nothing on its own
+// (the count does not move without the fusion) and still costs 0.05 ms in
+// bytes and locality, and the fused kernel costs another 0.04 ms because the
+// norm is not a prologue at all once it is written -- the gain multiply and
+// the bf16 round land on EVERY ELEMENT of every chunk in the inner loop, and
+// the workgroup reduce that finds the inverse RMS puts a barrier inside every
+// threadgroup. A projection's threadgroups are its output rows over eight, so
+// q's 2048 rows recompute that reduction 256 times.
+//
+// WHAT IS REFUTED, MEASURED RATHER THAN GUESSED. The first suspicion was the
+// pricing -- that "0.14 ms a stage" is an average over all 311 barriers and
+// would not survive being applied to one. So the stage was priced on its own,
+// with no kernel involved: drop one hazard in every N and time the step.
+//
+//   | barriers dropped | ms/step | delta | us/barrier |
+//   |------------------|---------|-------|------------|
+//   | 0 (all 311 kept) |   2.810 |    -- |         -- |
+//   | 28 (one a layer) |   2.711 | 0.099 |        3.5 |
+//   | 52               |   2.595 | 0.215 |        4.1 |
+//   | 104              |   2.519 | 0.291 |        2.8 |
+//   | 156              |   2.186 | 0.624 |        4.0 |
+//
+// Linear, and 3.7 us a barrier against the 3.4 the average predicted. The
+// currency is SOUND and the stage this kernel removed was worth its 0.10 ms.
+// What sank it is the side nothing had priced: the kernel added about 0.13 ms
+// of arithmetic to buy that 0.10.
+//
+// So the lesson is a BUDGET, not a prohibition. A merge is worth ~0.10 ms a
+// stage and has to add less work than that, and the way to lose is exactly
+// what happened here -- a projection's threadgroups are its output rows over
+// eight, so folding a reduction over K into its prologue makes every one of
+// them redo it, 256 times over for q, on top of a gain multiply and a bf16
+// round on every element of the inner loop. A merge that only touches
+// elements the kernel already reads is free and this one was not. Of the
+// three left in `hazards`, kv-append-into-rope and the qk-norms-into-rope are
+// free by construction; swiglu into gate/up is not, and should be measured
+// before it is written.
+//
+// A BATCHED MATVEC WAS WRITTEN HERE AND MEASURED AWAY. DO NOT WRITE IT AGAIN.
+//
+// The kernel is gone -- `tests/entrypoints.rs` holds that a built entrypoint
+// is a dispatched entrypoint, and this one would never have been dispatched.
+// What is kept is the reasoning that led to it and the measurement that
+// killed it, because the reasoning is persuasive and wrong, and the next
+// person to look at a decode batch will arrive at it again unaided.
+//
+// # Why it looked necessary
+//
+// `dot_lane4` above computes four output rows for ONE activation vector, and a
+// batch is served by launching it once per vector along the grid's x extent.
+// Every one of those launches re-reads the entire weight plane. `tests/
+// qmv_bench.rs` measures what that costs: the ffn gate/up projection is
+// 6.15 us at one token and 78.96 at thirty-two -- thirteen times the price for
+// thirty-two times the work, where a form that read its weights once would
+// have stayed near flat. A whole decode step is 2.75 ms of device at batch 1
+// and 8.35 at batch 8 for the same reason: the fixed costs amortise and the
+// projections, which are 70% of a step, do not.
+//
+// The tiled GEMM is not the answer to that and this is not a duplicate of it.
+// `affine_qmm_t` has a floor of ~102 us against this kernel's 6.14 -- it
+// amortises a large setup over hundreds of prefill rows and has nothing to
+// offer at ten. What a decode batch wants is this kernel's launch cost with
+// the GEMM's weight reuse, which is what the loop nest below is.
+//
+// # Why the premise is false
+//
+// The kernel was built -- `PIE_MROWS` activation vectors to a workgroup,
+// each weight word fetched once and applied to all of them, the codes
+// unpacked once -- and measured against the single form it was to replace,
+// at a batch of thirty-two, walking the weight plane from well inside this
+// card's 72 MB of L2 to well outside it:
+//
+//     plane      1.5 MB    8 MB    24 MB    64 MB   128 MB
+//     batched     77.68  332.28   909.41  2587.83  5249.42
+//     single      72.03  313.36   864.65  2724.79  5693.45
+//
+// The batched form loses at every plane that fits in L2 and wins by five to
+// eight percent at the two that do not. Every projection
+// in every model this tree targets is on the losing side of that line: the
+// 0.6B's ffn gate/up plane is 1.5 MB, and a 4096-by-12288 ffn -- gemma4's
+// shape -- is 24 MB.
+//
+// The reason is in the last two columns rather than the first three. If the
+// re-read were reaching DRAM, sharing a word across two vectors would halve
+// the traffic and roughly halve the time. It moves it by eight percent. At
+// the 128 MB plane the single form moves 128 MB of weights in 5.69 ms, which
+// is 24 GB/s of real DRAM traffic on a card that streams thirty times that.
+// The thirty-two workgroups reading one plane are co-resident in time, so the
+// plane streams through L2 once and all thirty-two rows consume it there no
+// matter how large it is. The re-read is an L2 hit, and an L2 hit is not what
+// the matvec is spending its time on.
+//
+// So the decode matvec is not weight-fetch-bound and never was. It is bound
+// by the arithmetic and the L2-to-SM issue rate, both of which scale with the
+// batch and neither of which a weight-sharing loop nest removes -- sharing
+// the word saves the unpack, not the fused multiply-add. Holding the extra
+// vectors costs occupancy, which is the five percent it loses by inside L2.
+// `PIE_MROWS` was tried at four before two: four is worse again (26.63 us
+// against 16.37 at sixteen tokens), which is the register pressure of
+// `xw[4][8] + xsum[4] + acc[4][4]` showing up directly. Two was the widest
+// that stayed within a few percent, and a few percent behind is still behind.
+//
+// The half of that table which does NOT depend on the deleted kernel is kept
+// running in `qmv_bench.rs` under "what the matvec's weight traffic actually
+// costs": the single form's real DRAM rate across the same planes. As long
+// as that stays an order of magnitude under what the card can stream, no
+// weight-sharing rewrite of this kernel can pay.
+//
+// What survives from this is a redirection, not a kernel. The projections
+// really are 70% of a decode step and really do fail to amortise across a
+// batch -- but the cost to attack is the per-launch and per-barrier one
+// (a decode records 311 barriers, ~1.9 ms of a 2.9 ms step), which means
+// FUSION: fewer stages, not cheaper reads inside a stage.
 
 #if defined(PIE_WIDE_STRIDED)
 void wide_strided(uint3 group, uint3 local) {

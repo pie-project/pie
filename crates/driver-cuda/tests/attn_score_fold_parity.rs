@@ -1,2 +1,3 @@
-//! PLACEHOLDER-REFACTOR-SCAFFOLD: created only so the workspace manifest
-//! parses while an unrelated in-flight change lands the real target.
+//! Parity fixture for the attention score fold: this driver's
+//! `attn_score_fold_heads` against the reference it is ported from. The target
+//! is declared and carries no cases yet.

@@ -24,7 +24,7 @@
 //! `#[ignore]`, driver-cuda. Run:
 //!   PIE_COMPILER_LAUNCHER=env CUDACXX=/usr/local/cuda/bin/nvcc \
 //!   CPM_SOURCE_CACHE=$HOME/.cache/pie-cpm \
-//!   cargo test -p pie-gpu-tests --features driver-cuda --test cuda_selfspec31 -- --ignored --nocapture
+//!   cargo test -p pie-gpu-tests --features driver-cuda-13 --test cuda_selfspec31 -- --ignored --nocapture
 
 mod common;
 

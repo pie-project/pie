@@ -9,7 +9,7 @@
 
 use kernels::routine::Refusal;
 
-use crate::routine::{Bind, Buf, BufMut, Ctx, Env, Fire, Routine, elementwise, elementwise_rows};
+use crate::routine::{elementwise, elementwise_rows, keys, Else, Nth, Over, Reckoned, Say, Ask, Bind, Block, Buf, BufMut, Ctx, Env, Fire, InSlot, OutSlot, Param, ParamOr, Routine, Weight};
 
 /// The shaders this family's routines reach: `(file, entrypoint)`, one pair
 /// per instantiated name.
@@ -122,13 +122,13 @@ fn head_row_grid(threads: u32, heads: i32, rows: i32) -> Result<[u32; 3], Refusa
 /// See [`rms_grid`].
 pub fn rms_single_row(
     ctx: &Ctx<'_>,
-    x: Buf,
-    w: Buf,
-    out: BufMut,
-    params: Buf,
-    width: Env<i32>,
-    axis: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    w: Weight<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    width: Ask<keys::Width, i32>,
+    axis: ParamOr<1, keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     let (lanes, group) = rms_grid(*width, *axis, *rows)?;
     ctx.dispatch(
@@ -156,13 +156,13 @@ pub fn rms_single_row(
 /// when the lane total does not fit a `u32`.
 pub fn rms_strided_row(
     ctx: &Ctx<'_>,
-    x: Buf,
-    w: Buf,
-    out: BufMut,
-    params: Buf,
-    row_pitch: i32,
-    axis: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    w: Weight<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    row_pitch: Ask<keys::Width, i32>,
+    axis: ParamOr<1, keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     let t = rms_threads(*axis)?;
     if *rows <= 0 {
@@ -191,21 +191,21 @@ pub fn rms_strided_row(
 /// See [`head_row_grid`].
 pub fn rms_strided_head_row(
     ctx: &Ctx<'_>,
-    x: Buf,
-    w: Buf,
-    out: BufMut,
-    params: Buf,
-    row_pitch: i32,
-    axis: Env<i32>,
-    heads: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    w: Weight<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    row_pitch: Ask<keys::Width, i32>,
+    axis: ParamOr<1, keys::Width, i32>,
+    heads: Reckoned<Over<Say<keys::Width>, Else<Nth<1>, Say<keys::Width>>>, Env<i32>>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     let t = rms_threads(*axis)?;
     ctx.dispatch(
         Fire {
             entrypoint: "rms_strided_head_row_bfloat16",
             file: RMS_FILE,
-            lanes: head_row_grid(t, *heads, *rows)?,
+            lanes: head_row_grid(t, **heads, *rows)?,
             group: [t, 1, 1],
         },
         &[x.v(), w.v(), out.v(), params.v(), row_pitch.v()],
@@ -224,14 +224,14 @@ pub fn rms_strided_head_row(
 /// See [`rms_grid`].
 pub fn rms_residual(
     ctx: &Ctx<'_>,
-    x: Buf,
-    w: Buf,
-    out: BufMut,
-    params: Buf,
-    r: Buf,
-    width: Env<i32>,
-    axis: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    w: Weight<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    r: InSlot<1, Buf>,
+    width: Ask<keys::Width, i32>,
+    axis: ParamOr<1, keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     let (lanes, group) = rms_grid(*width, *axis, *rows)?;
     ctx.dispatch(
@@ -252,15 +252,15 @@ pub fn rms_residual(
 /// See [`rms_grid`].
 pub fn rms_residual_scaled(
     ctx: &Ctx<'_>,
-    x: Buf,
-    w: Buf,
-    out: BufMut,
-    params: Buf,
-    r: Buf,
-    s: Buf,
-    width: Env<i32>,
-    axis: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    w: Weight<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    r: InSlot<1, Buf>,
+    s: InSlot<2, Buf>,
+    width: Ask<keys::Width, i32>,
+    axis: ParamOr<1, keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     let (lanes, group) = rms_grid(*width, *axis, *rows)?;
     ctx.dispatch(
@@ -284,12 +284,12 @@ pub fn rms_residual_scaled(
 /// See [`rms_grid`].
 pub fn vnorm_single_row(
     ctx: &Ctx<'_>,
-    x: Buf,
-    out: BufMut,
-    params: Buf,
-    width: Env<i32>,
-    axis: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    width: Ask<keys::Width, i32>,
+    axis: ParamOr<1, keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     let (lanes, group) = rms_grid(*width, *axis, *rows)?;
     ctx.dispatch(
@@ -319,14 +319,14 @@ pub fn vnorm_single_row(
 /// See [`head_row_grid`], plus [`Refusal::Empty`] for an empty head width.
 pub fn gated_rms(
     ctx: &Ctx<'_>,
-    x: Buf,
-    z: Buf,
-    w: Buf,
-    out: BufMut,
-    params: Buf,
-    vd: Env<i32>,
-    heads: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    z: InSlot<1, Buf>,
+    w: Weight<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    vd: Ask<keys::VDim, i32>,
+    heads: Ask<keys::VHeads, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     let t = head_width(*vd)?;
     ctx.dispatch(
@@ -352,15 +352,15 @@ pub fn gated_rms(
 /// See [`gated_rms`].
 pub fn gated_rms_strided(
     ctx: &Ctx<'_>,
-    x: Buf,
-    z: Buf,
-    w: Buf,
-    out: BufMut,
-    params: Buf,
-    row_pitch: i32,
-    vd: Env<i32>,
-    heads: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    z: InSlot<1, Buf>,
+    w: Weight<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    row_pitch: Ask<keys::Width, i32>,
+    vd: Ask<keys::VDim, i32>,
+    heads: Ask<keys::VHeads, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     let t = head_width(*vd)?;
     ctx.dispatch(
@@ -402,12 +402,12 @@ fn head_width(vd: i32) -> Result<u32, Refusal> {
 /// See [`elementwise`].
 pub fn layer_scalar_mul(
     ctx: &Ctx<'_>,
-    x: Buf,
-    scalar: Buf,
-    out: BufMut,
-    params: Buf,
-    width: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    scalar: Weight<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -431,11 +431,11 @@ pub fn layer_scalar_mul(
 /// See [`elementwise`].
 pub fn residual_add(
     ctx: &Ctx<'_>,
-    x: Buf,
-    residual: Buf,
-    out: BufMut,
-    width: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    residual: InSlot<1, Buf>,
+    out: OutSlot<0, BufMut>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -460,12 +460,12 @@ pub fn residual_add(
 /// See [`elementwise_rows`].
 pub fn residual_add_strided(
     ctx: &Ctx<'_>,
-    x: Buf,
-    residual: Buf,
-    out: BufMut,
-    row_pitch: i32,
-    width: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    residual: InSlot<1, Buf>,
+    out: OutSlot<0, BufMut>,
+    row_pitch: Param<0, i32>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -491,12 +491,12 @@ pub fn residual_add_strided(
 /// [`Refusal::Empty`] for an empty width or row count.
 pub fn add_bias(
     ctx: &Ctx<'_>,
-    out: BufMut,
-    bias: Buf,
-    width: i32,
-    rows: Env<i32>,
+    out: OutSlot<0, BufMut>,
+    bias: Weight<0, Buf>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
-    let lanes = elementwise_rows(width, *rows)?;
+    let lanes = elementwise_rows(*width, *rows)?;
     ctx.dispatch(
         Fire {
             entrypoint: "add_bias_bfloat16",
@@ -570,13 +570,13 @@ mod tests {
         let seen = Seen::default();
         rms_single_row(
             &seen,
-            Buf(1),
-            Buf(2),
-            BufMut(3),
-            Buf(4),
-            Env(8),
-            Env(8),
-            Env(1),
+            InSlot::new(Buf(1)),
+            Weight::new(Buf(2)),
+            OutSlot::new(BufMut(3)),
+            Block::new(Buf(4)),
+            Ask::new(8),
+            ParamOr::new(8),
+            Ask::new(1),
         )
         .expect("a launch");
         assert_eq!(
@@ -584,7 +584,7 @@ mod tests {
             [
                 ArgValue::Buffer(1),
                 ArgValue::Buffer(2),
-                ArgValue::Buffer(3),
+                ArgValue::BufferMut(3),
                 ArgValue::Buffer(4)
             ],
             "x, w, out, params -- the shader's order and not the trace's"
@@ -631,14 +631,14 @@ mod tests {
         let seen = Seen::default();
         gated_rms(
             &seen,
-            Buf(1),
-            Buf(2),
-            Buf(3),
-            BufMut(4),
-            Buf(5),
-            Env(128),
-            Env(16),
-            Env(7),
+            InSlot::new(Buf(1)),
+            InSlot::new(Buf(2)),
+            Weight::new(Buf(3)),
+            OutSlot::new(BufMut(4)),
+            Block::new(Buf(5)),
+            Ask::new(128),
+            Ask::new(16),
+            Ask::new(7),
         )
         .expect("a launch");
         let (fire, _) = one(&seen);
@@ -657,16 +657,16 @@ mod tests {
         let seen = Seen::default();
         rms_strided_row(
             &seen,
-            Buf(1),
-            Buf(2),
-            BufMut(3),
-            Buf(4),
-            4096,
-            Env(8),
-            Env(2),
+            InSlot::new(Buf(1)),
+            Weight::new(Buf(2)),
+            OutSlot::new(BufMut(3)),
+            Block::new(Buf(4)),
+            Ask::new(4096),
+            ParamOr::new(8),
+            Ask::new(2),
         )
         .expect("a launch");
-        residual_add_strided(&seen, Buf(1), Buf(2), BufMut(3), 4096, Env(8), Env(2))
+        residual_add_strided(&seen, InSlot::new(Buf(1)), InSlot::new(Buf(2)), OutSlot::new(BufMut(3)), Param::new(4096), Ask::new(8), Ask::new(2))
             .expect("a launch");
         let calls = seen.0.borrow();
         assert_eq!(
@@ -711,11 +711,15 @@ mod tests {
     #[test]
     fn the_bias_binds_the_value_it_biases_once() {
         let seen = Seen::default();
-        add_bias(&seen, BufMut(1), Buf(2), 96, Env(4)).expect("a launch");
+        add_bias(&seen, OutSlot::new(BufMut(1)), Weight::new(Buf(2)), Ask::new(96), Ask::new(4)).expect("a launch");
         let (fire, args) = one(&seen);
         assert_eq!(
             args,
-            [ArgValue::Buffer(1), ArgValue::Buffer(2), ArgValue::I32(96)],
+            [
+                ArgValue::BufferMut(1),
+                ArgValue::Buffer(2),
+                ArgValue::I32(96)
+            ],
             "out, bias, width -- and `out` is the input too"
         );
         assert_eq!(fire.lanes, [96, 4, 1]);
@@ -724,7 +728,7 @@ mod tests {
             [96, 1, 1],
             "the row, clamped to 256 -- not a flat 256 over a 96-wide row"
         );
-        add_bias(&seen, BufMut(1), Buf(2), 4096, Env(4)).expect("a launch");
+        add_bias(&seen, OutSlot::new(BufMut(1)), Weight::new(Buf(2)), Ask::new(4096), Ask::new(4)).expect("a launch");
         assert_eq!(seen.0.borrow()[1].0.group, [256, 1, 1], "and clamped");
     }
 }

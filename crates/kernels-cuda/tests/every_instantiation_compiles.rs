@@ -29,6 +29,18 @@
 //! Needs `libnvrtc`, not a device: `nvrtcCompileProgram` targets an
 //! architecture, it does not talk to one. Skips with a message when the
 //! library will not load, so a box without CUDA still runs the suite.
+//!
+//! WITHOUT A DEVICE IT IS STILL WORTH RUNNING, AND TWO THINGS LIMIT IT.
+//! `cache::arch()` reads a device, so a box without one falls back to `sm_89`
+//! -- the floor the fp8 shim sets, below which 70 roots refuse by `#error` on
+//! purpose. The fallback read `compute_89` until it was measured: a virtual
+//! architecture is rejected by `jit::nvrtc::options`, so every one of the 127
+//! roots failed on the arch string alone and the deviceless path had never
+//! worked. The limits that remain are real ones. First, one cooperative root
+//! (`attn/attention_mla_fa2`) links through `cuLinkCreate`, a CONTEXT call,
+//! and is skipped by name rather than failing the run. Second, `sm_89` never
+//! parses code gated above it: `mla.cuh:762` was unbuildable at `>= 900` and
+//! only a device that new ever saw it.
 
 #![cfg(feature = "_cuda")]
 
@@ -36,7 +48,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use kernels_cuda::jit::{Root, Toolchain};
-use kernels_cuda::jit::abi::Elem;
+use kernels_cuda::jit::abi::Inst;
 use kernels_cuda::jit::nvrtc;
 use kernels_cuda::source::Header;
 use kernels_cuda::quant;
@@ -346,7 +358,7 @@ fn fill(id: &str, elems: &[&'static str]) -> Vec<String> {
 /// the element type is stated ONCE, where the instantiation is chosen. So this
 /// reads the choice from where it is made — `routine!(swiglu_bf16 =
 /// swiglu::<bf16>)` — and fills the hole with what the crate says that type is
-/// spelled, `<bf16 as Elem>::CPP`. The two halves of an id can no longer
+/// spelled, `<bf16 as Inst>::CPP`. The two halves of an id can no longer
 /// disagree, because neither is written twice.
 fn instantiated_at(text: &str) -> BTreeMap<String, BTreeSet<&'static str>> {
     let mut out: BTreeMap<String, BTreeSet<&'static str>> = BTreeMap::new();
@@ -376,11 +388,11 @@ fn instantiated_at(text: &str) -> BTreeMap<String, BTreeSet<&'static str>> {
 
 /// The element types a routine may be instantiated at, as the crate spells
 /// them. Asked of the crate rather than written out, so a new element type is
-/// one `impl Elem` and not two statements.
+/// one `impl Inst` and not two statements.
 const ELEMENTS: &[(&str, &str)] = &[
-    ("bf16", <kernels_cuda::jit::abi::bf16 as Elem>::CPP),
-    ("f16", <kernels_cuda::jit::abi::f16 as Elem>::CPP),
-    ("fp8_e4m3", <kernels_cuda::jit::abi::fp8_e4m3 as Elem>::CPP),
+    ("bf16", <kernels_cuda::jit::abi::bf16 as Inst>::CPP),
+    ("f16", <kernels_cuda::jit::abi::f16 as Inst>::CPP),
+    ("fp8_e4m3", <kernels_cuda::jit::abi::fp8_e4m3 as Inst>::CPP),
 ];
 
 /// Every carried file the crate compiles, with the template-ids it asks for.
@@ -782,13 +794,31 @@ fn computed() -> Vec<Job> {
 
 // ===========================================================================
 
+/// Run `f`, answering `None` if it panics, without printing a crash report.
+///
+/// `cudarc`'s loader is `fallback-dynamic-loading` and nothing here has a
+/// `DT_NEEDED` on `libnvrtc` or `libcuda`: the first call `dlopen`s the
+/// library and PANICS through `cudarc::panic_no_lib_found` if no candidate
+/// name resolves. So neither `nvrtc::version()`'s `Result` nor `arch()`'s
+/// `Option` can report a library that is simply not installed -- the `Err` and
+/// `None` arms were unreachable on a box with no CUDA, which FAILED this test
+/// rather than skipping it, the opposite of what its doc promised. Catching is
+/// what makes the promise true.
+fn quietly<R>(f: impl FnOnce() -> R + std::panic::UnwindSafe) -> Option<R> {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let out = std::panic::catch_unwind(f);
+    std::panic::set_hook(hook);
+    out.ok()
+}
+
 #[test]
 fn every_instantiation_a_body_names_compiles() {
-    let Ok(have) = nvrtc::version() else {
+    let Some(have) = quietly(nvrtc::version).and_then(Result::ok) else {
         eprintln!("SKIPPED: libnvrtc will not load, so nothing here can be compiled");
         return;
     };
-    let arch = kernels_cuda::jit::cache::arch().unwrap_or("compute_89");
+    let arch = quietly(kernels_cuda::jit::cache::arch).flatten().unwrap_or("sm_89");
 
     let (written, computed) = (written(), computed());
     let count = |jobs: &[Job]| jobs.iter().map(|j| j.wanted.len()).sum::<usize>();
@@ -802,10 +832,34 @@ fn every_instantiation_a_body_names_compiles() {
 
     // One thread per root. The lattices are FlashInfer, whose points take tens
     // of seconds each and would otherwise make this too slow to leave on.
+    //
+    // A cooperative root device-links, and `bind_context` reaches `libcuda`,
+    // which `dlopen` may not find -- and `cudarc` answers that by panicking, on
+    // a worker thread, where it would abort the run rather than report a root.
+    // Each thread catches its own; the hook is silenced ONCE around the whole
+    // scope because `set_hook` is process-global and swapping it per thread
+    // would race. A caught panic becomes the same message `device_link`
+    // returns, so it lands in the partition below with the device-link case it
+    // is: the library missing and the context missing are one situation.
     let jobs: Vec<Job> = written.into_iter().chain(computed).collect();
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
     let failed: BTreeMap<String, String> = std::thread::scope(|scope| {
-        let running: Vec<_> =
-            jobs.iter().map(|job| scope.spawn(move || (job, job.compile(arch)))).collect();
+        let running: Vec<_> = jobs
+            .iter()
+            .map(|job| {
+                scope.spawn(move || {
+                    let out = std::panic::catch_unwind(|| job.compile(arch)).unwrap_or_else(|_| {
+                        Err(format!(
+                            "`{}` needs a current CUDA context and the driver library \
+                             would not load",
+                            job.name
+                        ))
+                    });
+                    (job, out)
+                })
+            })
+            .collect();
         running
             .into_iter()
             .filter_map(|handle| match handle.join().expect("a compile thread") {
@@ -814,6 +868,26 @@ fn every_instantiation_a_body_names_compiles() {
             })
             .collect()
     });
+    std::panic::set_hook(hook);
+
+    // A cooperative root is the one kind that cannot be checked by NVRTC
+    // alone: `grid.sync()` leaves an unresolved extern that `cuLink` resolves,
+    // and `cuLinkCreate` is a CONTEXT call. On a box with a toolkit and no
+    // device every other root still compiles, so failing the whole run on that
+    // one would make this test unrunnable anywhere but a GPU -- which is why
+    // it gates nothing today. Partition it out and say so, matching the one
+    // message `device_link` produces for exactly this case: a real compile
+    // error reads differently and still fails below.
+    let (contextless, failed): (BTreeMap<String, String>, BTreeMap<String, String>) =
+        failed.into_iter().partition(|(_, why)| why.contains("needs a current CUDA context"));
+    if !contextless.is_empty() {
+        eprintln!(
+            "SKIPPED {} cooperative root(s), which need a context this machine has no device \
+             to give: {}",
+            contextless.len(),
+            contextless.keys().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
 
     assert!(
         failed.is_empty(),

@@ -17,16 +17,22 @@
 //! `driver-wgpu` feature in `crates/engine/Cargo.toml` for what follows from
 //! that and what deliberately does not.
 //!
-//! # No module directory, and that is the headline difference from Vulkan
+//! # No module directory, which the Vulkan seam has now copied
 //!
-//! [`VulkanDriver::create`](super::VulkanDriver::create) fails at boot without
-//! `PIE_KERNELS_VULKAN_SPV_DIR` or `[model] kernels`, because SPIR-V is a build
-//! product that has to be found on disk. `kernels-wgpu` embeds every shader
-//! source in its rlib and `naga` compiles it in this process, so there is no
-//! directory to ship beside the binary, no `OUT_DIR` to relay, and no way for a
-//! deployment to be given this driver and not its kernels. Everything the
-//! Vulkan seam does with `modules`, `module_dir` and `read_modules` is absent
-//! here rather than reimplemented.
+//! `kernels-wgpu` embeds every shader source in its rlib and `naga` compiles
+//! it in this process, so there is no directory to ship beside the binary, no
+//! `OUT_DIR` to relay, and no way for a deployment to be given this driver and
+//! not its kernels.
+//!
+//! This USED to be the headline difference from Vulkan:
+//! [`VulkanDriver::create`](super::VulkanDriver::create) failed at boot without
+//! `PIE_KERNELS_VULKAN_SPV_DIR` or `[model] kernels`, on the grounds that
+//! SPIR-V is a build product that has to be found on disk. The premise was
+//! true and the conclusion was not — a build product can be `include_bytes!`d
+//! as easily as a source can be `include_str!`d — and that seam's `modules`,
+//! `module_dir` and `read_modules` are deleted rather than fixed. What is left
+//! of the difference is when the compiler runs: `slangc` at build time there,
+//! `naga` in this process here.
 //!
 //! # Where loading lives, and why it is not next door
 //!
@@ -347,6 +353,7 @@ impl Driver for WgpuDriver {
                 // left to a constant.
                 theta: theta_of(row, &deployment)?,
                 rescale: rescale_of(row, &deployment)?,
+                recurrent: recurrent_of(&deployment),
                 ..driver_wgpu::shell::Deployment::default()
             },
         )
@@ -777,6 +784,50 @@ fn boot_kv_pages(config_bytes: &[u8]) -> u32 {
 /// A row whose `theta_by_layer` is non-empty, which is exactly the "they are
 /// not all the same" case that method exists to report, and a row that states
 /// no usable base at all.
+/// The gated DeltaNet's slab geometry, for a hybrid stack.
+///
+/// `None` for a dense model, and the shell then opens no pool and a GDN arm
+/// declines by name — which is every model this backend serves today.
+///
+/// # Two numbers taken and one refused
+///
+/// `linear_layers` is a COUNT of the layers that are linear, not the stack's
+/// depth: a hybrid interleaves full-attention layers that carry KV pages and
+/// no state at all, and those allocate nothing.
+///
+/// **`state_elem` is deliberately not read.** Some texts state it as 2,
+/// meaning the bf16 a CUDA build uses, and `gdn_prep.wgsl` and `gdn_core.wgsl`
+/// declare their planes as `array<f32>`. A driver sizing from the text would
+/// allocate half a slab and index off the end of it on the first slot past
+/// zero. `resources::RECURRENT_ELEM_BYTES` is the one place that says four,
+/// and `driver-metal` refuses the same field for the same reason.
+///
+/// # Why the seat count is a knob
+///
+/// Slots are SEATS, not pages, and one is expensive — a request holds its seat
+/// from its first token to its last, so there is nothing to resize toward.
+/// `PIE_WGPU_RS_SLOTS` is the ceiling and the allocation both, with a small
+/// default rather than a fraction of memory. `driver-metal` reached the same
+/// shape with `PIE_METAL_RS_SLOTS`.
+fn recurrent_of(
+    deployment: &model::deployment::Deployment,
+) -> Option<driver_wgpu::resources::Recurrent> {
+    let rs = deployment.recurrent.as_ref()?;
+    let slots: u32 = std::env::var("PIE_WGPU_RS_SLOTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    Some(driver_wgpu::resources::Recurrent {
+        linear_layers: u32::try_from(rs.linear_layers.len()).unwrap_or(0),
+        conv_dim: u32::try_from(rs.conv_dim).unwrap_or(0),
+        conv_k: u32::try_from(rs.conv_k).unwrap_or(0),
+        v_heads: u32::try_from(rs.v_h).unwrap_or(0),
+        v_dim: u32::try_from(rs.v_d).unwrap_or(0),
+        k_dim: u32::try_from(rs.k_d).unwrap_or(0),
+        slots,
+    })
+}
+
 fn theta_of(
     row: &'static dyn model::catalog::Variant,
     deployment: &model::deployment::Deployment,
@@ -1030,30 +1081,56 @@ fn every_launch_fits(text: &driver_wgpu::shell::Text, rows: u32) -> bool {
     ) else {
         return false;
     };
+    // PLANNED, not read off a row. This asked `dispatch::rule_of` for the
+    // symbol's `LaunchRule` and `dispatch::dims_of` for its extent, and both
+    // read the kernel table -- so when the last row was retired, `rule_of`
+    // began answering `Err` for every symbol, every launch was `continue`d,
+    // and this function returned `true` unconditionally. `max_forward_tokens`
+    // would have gone back to being the literal that this seam's own doc
+    // explains it must not be, and nothing would have said so.
+    //
+    // `plan_one` is the path a real fire takes. It needs a resolver only to
+    // place bytes, and the question here is about the GRID, so it is given
+    // `Unbacked` -- which answers a size for anything and holds no memory.
+    let held = driver_wgpu::binding::Placeholder(u64::from(u32::MAX));
+    let store = driver_wgpu::binding::Unbacked(held);
+    let arena = driver_wgpu::binding::Arena {
+        buffer: &held,
+        bytes: u64::from(u32::MAX),
+    };
     for launch in &low.launches {
         let symbol = &low.kernels[launch.kernel as usize];
-        let Ok(rule) = driver_wgpu::dispatch::rule_of(driver_wgpu::KERNELS, symbol) else {
-            continue;
-        };
-        let Some(sig) = driver_wgpu::sig_in(driver_wgpu::KERNELS, symbol) else {
-            continue;
-        };
         let Ok(declared) =
             driver_wgpu::reflect::entrypoint(symbol, driver_wgpu::Capability::Baseline)
         else {
             continue;
         };
         let module = driver_wgpu::geometry::Module::loaded(symbol, &declared);
-        let dims = driver_wgpu::dispatch::dims_of(sig, &low, launch, text.geometry);
-        match driver_wgpu::geometry::groups_within(
-            rule,
-            dims,
-            module,
-            driver_wgpu::geometry::MAX_WORKGROUPS_PER_DIMENSION,
-        ) {
-            Ok(_) => {}
-            Err(driver_wgpu::geometry::Ungeometric::Unruled(_)) => {}
-            Err(_) => return false,
+        let Ok(planned) = driver_wgpu::dispatch::plan_one(
+            &low,
+            launch,
+            driver_wgpu::dispatch::Built {
+                module,
+                declared: &declared,
+            },
+            driver_wgpu::dispatch::Sources {
+                arena,
+                resolver: &store,
+                min_offset: 1,
+            },
+            text.geometry,
+        ) else {
+            // A rectangle this driver cannot plan does not bound how wide a
+            // fire may be: `frames::unserved_in` and `dispatch` refuse it by
+            // name wherever it is actually reached.
+            continue;
+        };
+        if planned
+            .groups
+            .iter()
+            .any(|axis| *axis > driver_wgpu::geometry::MAX_WORKGROUPS_PER_DIMENSION)
+        {
+            return false;
         }
     }
     true
@@ -1211,6 +1288,22 @@ fn text_of(
             // mixture is either served or refused by a check that can see it.
             n_experts: row.load_shape().n_experts,
             experts_per_token: deployment.shape.experts_per_token,
+            // The recurrent pair, which is NOT the attention pair. A
+            // gated-deltanet layer's value heads size the recurrent slab,
+            // the gated norm and the scan grid, and a stack that mixes them
+            // with full layers -- qwen3.5 runs 32 heads of 128 beside 2 of
+            // 256 -- states both. Zero for a stack with none, which
+            // `Geometry::recurrent` reads as "use the attention pair".
+            v_heads: deployment
+                .recurrent
+                .as_ref()
+                .and_then(|rs| u32::try_from(rs.v_h).ok())
+                .unwrap_or(0),
+            v_dim: deployment
+                .recurrent
+                .as_ref()
+                .and_then(|rs| u32::try_from(rs.v_d).ok())
+                .unwrap_or(0),
         },
         layers: u16::try_from(deployment.layers).map_err(|_| {
             anyhow!(

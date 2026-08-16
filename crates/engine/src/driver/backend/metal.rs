@@ -1,52 +1,23 @@
 //! The seam to `driver-metal`.
 //!
-//! # A library call, not an ABI crossing
-//!
-//! The CUDA seam beside this one goes through the C ABI —
-//! `pie_cuda_create`, `pie_cuda_launch`, a `*mut PieDriver` — because the
-//! driver it talks to is C++. This one does not, because the driver it talks
-//! to is Rust, and a `#[repr(C)]` boundary between two Rust crates is a second
-//! spelling of a contract they already share.
-//!
-//! That is `metal.md`'s task 9 arriving early and from the other end: the C
-//! boundary retires when its last C++ consumer does, and nothing here adds a
-//! new one.
-//!
-//! # What this file is, and what it stopped being
+//! Unlike the CUDA seam beside it, this one is a library call and not a C ABI
+//! crossing: the driver it talks to is Rust, and a `#[repr(C)]` boundary
+//! between two Rust crates is a second spelling of a contract they share.
 //!
 //! It is the DOOR, and only the door: it parses the boot config, brokers a
-//! completion, calls one method on [`driver_metal::serve::Shell`], and
-//! turns what comes back into the engine's own nouns. The work is next door,
-//! in the crate that owns the device.
+//! completion, calls one method on [`driver_metal::serve::Shell`], and turns
+//! what comes back into the engine's own nouns. The work is next door, in the
+//! crate that owns the device.
 //!
-//! It used to be 1,317 lines that assembled the seven-field `Machine` by
-//! hand, computed KV write pages, staged nine fire tables and built the KV
-//! page resolver — all of it the driver's work, done on this side of the
-//! crate boundary, where every internal change to it was a breaking change.
-//! `driver-cuda`'s seam beside this one is 456 lines of pure delegation and
-//! always was, because a `PieDriver` is opaque and there was nothing to reach
-//! into. This one had the same nouns and no wall
-//! (`.wiki/driver/real-metal-north-star.md` §9, "one door").
-//!
-//! # What is servable today, and what is not
-//!
-//! The verbs split cleanly. `create`, `device_facts`, the registry four and
-//! `close_*` are answered by machinery that is already ported and device
-//! tested. `encode` refuses, as the CUDA side does — Metal media encode is
-//! unsupported on both. `launch`, `copy_kv` and `resize_pool` are served: the
-//! KV pool is ported, `launch` plans, lowers and runs a step against it,
-//! `copy_kv` plans the movement and applies it, and `resize_pool` commits or
-//! releases pages without moving a single address a fire has bound — the
-//! pages are sparse, which is what makes that possible.
-//!
-//! `copy_state` is the one that refuses. A state copy moves recurrent state,
-//! and no row this driver serves has any — the rows that do (`qwen3_5` and
-//! its neighbours) refuse a Metal load at the row itself, so it is
-//! unreachable rather than unfinished.
-//!
-//! It refuses by name rather than being absent. A backend that cannot be
-//! selected teaches nothing; one that is selected and says exactly which verb
-//! it cannot serve is a working seam with a stated hole.
+//! `create`, `device_facts`, the registry four and `close_*` are answered by
+//! machinery that is ported and device tested. `launch`, `copy_kv` and
+//! `resize_pool` are served against the ported KV pool — `resize_pool` commits
+//! or releases pages without moving an address a fire has bound, the pages
+//! being sparse. `encode` refuses, as the CUDA side does: Metal media encode is
+//! unsupported on both. `copy_state` refuses because no row this driver serves
+//! has recurrent state — the rows that do refuse a Metal load at the row
+//! itself. Refusing by name rather than being absent is what makes this a
+//! working seam with a stated hole.
 
 use anyhow::{Result, anyhow, bail};
 
@@ -77,12 +48,8 @@ impl MetalDriver {
     /// No Metal 4 device, or a device whose queue could not be created. Both
     /// are boot conditions, not runtime ones.
     pub fn create(config_bytes: &[u8]) -> Result<Self> {
-        // ONE READER of the boot document, in `crate::driver::boot`. This
-        // site used to rebuild the `from_utf8` -> `toml::Table` ->
-        // `get("model")` chain itself, and so did the Vulkan and WebGPU seams
-        // beside it -- three readers of one format, inside the crate whose
-        // format it is, each quoting the same sentence about why a driver
-        // must not be the second one.
+        // ONE READER of the boot document, in `crate::driver::boot`: the crate
+        // that owns the format parses it, and no driver seam is a second.
         let boot = crate::driver::BootConfig::parse(config_bytes);
         let shell = driver_metal::serve::Shell::open(boot.config, boot.model_id)
             .map_err(|e| anyhow!("metal shell: {e}"))?;
@@ -203,8 +170,7 @@ impl Driver for MetalDriver {
                 // logging backend is not a library's business. A fault kills
                 // the one instance and does not fail the frame; the guest
                 // behind it learns of it from the poison word
-                // `driver::Registry::fire` publishes on the rings that
-                // instance's host reads, not from this line.
+                // `driver::Registry::fire` publishes, not from this line.
                 for (instance, why) in faults {
                     tracing::warn!(instance, %why, "metal: program faulted");
                 }
@@ -254,10 +220,9 @@ impl Driver for MetalDriver {
         self.shell.resize_pool(desc)?;
         // The WORK is settled already -- `Stepper::trim` waits for the GPU to
         // pass the unmap before it returns, and a growth is complete once the
-        // memory is attached. The COMPLETION is a separate fact, and this line
-        // used to get it wrong: it minted one and dropped the target, so the
-        // engine waited on an op nobody would ever settle. `settle_control`
-        // does both halves, in the order the engine's own check requires.
+        // memory is attached. The COMPLETION is the separate fact, and
+        // `settle_control` mints it and settles it in the order the engine's
+        // own check requires.
         Ok(settle_control(&self.broker))
     }
 

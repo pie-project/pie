@@ -1,77 +1,36 @@
-//! ② KERNEL SIGNATURES — the compiler's end of the tables.
+//! Kernel signatures, from the compiler's side.
 //!
-//! The rows moved out. A kernel's contract belongs beside the kernel, so the
-//! CUDA table is [`kernels_cuda::sigs`] and the Metal one WAS
-//! [`kernels_metal::KERNELS`], each in the crate that also holds the `.cu` /
-//! `.metal` it describes — one source file and one table row, same directory,
-//! same diff hunk. Metal's is empty: every family crossed to a `Routine`, and
-//! what this module reads there is [`kernels_metal::declared`]. [`Stated`] is
-//! the shape both planes answer in. The words a row is written in are the `kernels` crate's,
-//! which is also where the reasons for `whole` / `needs` / `lacks` / `sink`
-//! are written down.
-//!
-//! What stays here is what is about the COMPILER rather than about a kernel:
-//! [`Backend`], which reads a backend out of a traced family name, and
-//! [`check_plan`], which walks a [`ForwardPlan`]. Both are re-exported
-//! through this module so call sites keep saying `kernels::sig(..)`.
-//!
-//! The tables are consumed with `default-features = false`, so reading a
-//! symbol's contract does not build a single `.cu`.
+//! Contracts live beside their kernels ([`kernels_cuda::sigs`], and for Metal
+//! the routines behind [`kernels_metal::declared`]); [`Stated`] is the shape
+//! both planes answer in. What lives here is compiler-side: [`Backend`] and
+//! [`check_plan`]. The tables are consumed with `default-features = false`,
+//! so reading a contract builds no `.cu`.
 
-use crate::trace::{ForwardPlan, OpKind};
+use crate::trace::{ForwardPlan, Op, OpKind};
 
-// The vocabulary and the one remaining table, re-exported so this module
-// reads as one surface. `Cap` and `Prepare` are named by model texts and by
-// the tests below; `KernelSig` is what `trace` and `emit_cuda` hold a
-// reference to.
 pub use kernels::{Cap, KernelSig};
 pub use kernels_cuda::sigs;
-// The census -- every entrypoint Metal can dispatch, which is what a text may
-// launch. It outlived `kernels_metal::KERNELS`, whose rows used to GENERATE
-// it and which is an empty slice now.
+/// Every entrypoint Metal can dispatch, and so everything a text may launch.
 pub use kernels_metal::entrypoints as metal_entrypoints;
 
 /// Which backend's kernels a lowered trace states.
 ///
-/// The table is per-BACKEND because a kernel signature is backend-owned
-/// (`.wiki/tart/dsl.md` ②). A model text is written for one backend and
-/// states that backend's symbols; the family name says which —
-/// `llama_like.cuda.decode` is CUDA's, `llama_like.metal.decode` is Metal's.
-///
-/// # Two variants, four execution shells
-///
-/// This enum names the SURFACE a text was written against, not the device
-/// that will run it, and the two are not one-to-one. `driver-vulkan` and
-/// `driver-wgpu` execute plans traced by `llama_like_metal` — their tables
-/// (`kernels_vulkan::KERNELS`, `kernels_wgpu::KERNELS`) are
-/// `kernels-metal`'s coverage ROW FOR ROW, so a plan naming Metal's symbols
-/// resolves in either of them. There is no `Backend::Vulkan` because no
-/// family name would ever produce one: a variant nothing can construct is
-/// not a safeguard, it is a branch that never runs.
-///
-/// [`check_plan`] therefore validates a Vulkan- or WGPU-bound plan against
-/// **Metal's** statements, and that is sound only for as long as the three
-/// stay equal. They were held equal by
-/// `kernels-{vulkan,wgpu}/tests/entrypoints.rs`'s
-/// `every_row_states_the_same_facts_kernels_metal_does` and
-/// `every_row_asks_for_the_same_operands_kernels_metal_does`, which diff the
-/// tables' source text and carry NO exception list — a comparison that only
-/// runs while both sides have rows. Metal has none. What holds the three
-/// equal now is `kernels/tests/shader_backends_agree.rs`, which counts each
-/// backend's rows, routines and RETIREMENTS into one union and requires the
-/// hundred; a name a sibling adds and Metal never had would fail there. If
-/// that ever changes, this is the code that silently loses its guarantee: the
-/// load-time refusal below stops firing and the failure reappears as a
-/// bind-time `expect("stated")` inside the driver.
+/// Two variants, four execution shells: this names the surface a text was
+/// written against, not the device that runs it. Vulkan and WGPU execute
+/// plans traced by `llama_like_metal`, so they are checked against Metal's
+/// statements — sound only while the three tables stay equal, which
+/// `kernels/tests/shader_backends_agree.rs` holds. Hence no `Backend::Vulkan`:
+/// no family name could construct one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
+    /// `kernels-cuda`'s table.
     Cuda,
+    /// `kernels-metal`'s table.
     Metal,
 }
 
 impl Backend {
-    /// The backend a traced family name names, or `None` for a SEMANTIC
-    /// trace — which states no kernels at all, so no table applies.
+    /// `None` for a semantic trace, which states no kernels at all.
     pub fn of_family(family: &str) -> Option<Backend> {
         let mut parts = family.split('.').skip(1);
         match parts.next() {
@@ -80,45 +39,58 @@ impl Backend {
             _ => None,
         }
     }
-
 }
 
-/// What a backend states about one symbol, from whichever plane states it.
-///
-/// The compiler asks a table two questions and nothing else: does anything
-/// declare this symbol, and what does it say about `whole` and `in_place`.
-/// Both were `KernelSig` fields, which was fine while a kernel was a ROW.
-/// A crossed kernel is a `Routine` instead, and its
-/// [`kernels::routine::Declared`] states the same two facts — so this is the
-/// answer with the plane forgotten, exactly as `Declared` is the row with the
-/// backend forgotten.
-///
-/// It exists because `kernels-metal` finished crossing: its table is empty,
-/// and a lookup that only read tables began refusing every Metal model at
-/// load. `refactor-bigplan.md` §7 Stage 5 deletes `KernelSig` once the last
-/// backend is here, and at that point this struct is the only shape left.
+/// What a backend states about one symbol, with the plane forgotten — a CUDA
+/// row and a Metal [`kernels::routine::Declared`] answer here alike.
 #[derive(Debug, Clone, Copy)]
 pub struct Stated {
-    /// This statement consumes its whole operand, not a row range.
+    /// Consumes its whole operand, not a row range.
     pub whole: bool,
-    /// This statement pairs the depth-PREFIX plan, and its dedicated
-    /// workspace, on a union's tail layers.
-    ///
-    /// A kernel property rather than an op's, which is why it is answered
-    /// here: `ForwardPlan::depth_prefix_plan` asks the backend about the
-    /// symbol the op launches.
+    /// Pairs the depth-prefix plan, and its workspace, on a union's tail
+    /// layers. A kernel property, not an op's.
     pub depth_prefix_plan: bool,
-    /// `(input, output)` pairs that must be given the same address.
+    /// `(output, input)` pairs that must be given the same address.
+    ///
+    /// Output first. Both are `u32`, so a swap is silent.
     pub in_place: &'static [(u32, u32)],
+    /// The routine's arguments, in signature order, and who supplies each.
+    /// Derived from the `fn`, which is what makes the arity rule cost no new
+    /// column. Empty means the plane states no signature, and the rule then
+    /// has nothing to compare.
+    pub args: &'static [(kernels::Ty, kernels::routine::Provenance)],
+    /// Which side of the statement each argument sits on, in [`Self::args`]
+    /// order. A `*mut` in an input slot is an operand the statement places,
+    /// not a result it forgot. See [`kernels::routine::Side`].
+    pub sides: &'static [kernels::routine::Side],
+}
+
+impl Stated {
+    /// The pointers a statement must place: `(reads, writes)`, before the
+    /// in-place slack and optional ceiling the caller adds.
+    ///
+    /// `(0, 0)` both when the plane states no signature and when a routine
+    /// binds nothing; check [`Self::args`] for emptiness to tell them apart.
+    #[must_use]
+    pub fn places(&self) -> (usize, usize) {
+        use kernels::routine::Provenance;
+
+        let (mut reads, mut writes) = (0, 0);
+        for (ty, prov) in self.args {
+            match (ty.binds(), prov) {
+                (kernels::Binds::Reads, Provenance::Trace) => reads += 1,
+                (kernels::Binds::Writes, Provenance::Trace) => writes += 1,
+                _ => {}
+            }
+        }
+        (reads, writes)
+    }
 }
 
 /// What `backend` states about `symbol`, or `None` if nothing does.
 ///
-/// CUDA reads its rows, because CUDA has not crossed. Metal reads its
-/// ROUTINES, resolved through [`kernels_metal::kernel_of`] so that a text
-/// spelling a base name and a lowering carrying an instantiated point both
-/// land on the same statement — which is what `kernels::sig_in`'s two passes
-/// did for a row, and is the behaviour that has to survive the crossing.
+/// Metal resolves through [`kernels_metal::kernel_of`], so a text spelling a
+/// base name and a lowering carrying an instantiated point agree.
 #[must_use]
 pub fn stated_in(backend: Backend, symbol: &str) -> Option<Stated> {
     match backend {
@@ -126,11 +98,12 @@ pub fn stated_in(backend: Backend, symbol: &str) -> Option<Stated> {
             whole: k.whole,
             depth_prefix_plan: k.depth_prefix_plan,
             in_place: k.in_place,
+            args: k.args,
+            sides: k.sides,
         }),
         Backend::Metal => {
-            // Memoised: `declared()` builds its `Vec` from ten `ROUTINES`
-            // slices on every call, and this is asked once per launched op of
-            // every model that loads.
+            // Memoised: `declared()` rebuilds its `Vec` on every call, and
+            // this is asked once per launched op of every model that loads.
             static ROUTINES: std::sync::OnceLock<
                 std::collections::BTreeMap<&'static str, kernels::routine::Declared>,
             > = std::sync::OnceLock::new();
@@ -148,65 +121,165 @@ pub fn stated_in(backend: Backend, symbol: &str) -> Option<Stated> {
                     whole: d.whole,
                     depth_prefix_plan: d.depth_prefix_plan,
                     in_place: d.in_place,
+                    args: d.args,
+                    sides: d.sides,
                 })
-                // One of the hundred with no routine to state it. Metal has
-                // exactly one, `silu_mul_strided`, whose entrypoint leaves a
-                // buffer slot empty and so cannot be given a positional
-                // argument list at all -- `driver-metal` calls it DARK and
-                // refuses to lower it. Declared, because the shader is real
-                // and the census names it; stating nothing, because nothing
-                // states it. A text that launched it would pass here and be
-                // refused where the refusal is true.
+                // Metal's `silu_mul_strided` has no routine: its entrypoint
+                // leaves a buffer slot empty, so it has no positional
+                // argument list. `driver-metal` refuses to lower it.
                 .or(Some(Stated {
                     whole: false,
                     depth_prefix_plan: false,
                     in_place: &[],
+                    args: &[],
+                    sides: &[],
                 }))
         }
     }
 }
 
-/// The ROW for one CUDA symbol.
+/// The row for one CUDA symbol, for readers that want the row itself: the
+/// CUDA emitter and the table tests.
 ///
-/// There is no `sig_in(backend, ..)` beside it, and there was: it took a
-/// backend, looked the symbol up in that backend's table, and answered `None`
-/// for every Metal symbol once Metal retired its rows. A function that takes
-/// a choice it can only answer one way is a trap -- `None` reads as "nothing
-/// declares this" at every call site, and three callers believed it. Ask
-/// [`stated_in`] anything the compiler decides; this is for the readers that
-/// want the ROW, which is the CUDA emitter and the tests measuring what is
-/// left of the tables.
+/// Anything the compiler decides goes to [`stated_in`] instead — this answers
+/// `None` for every Metal symbol, which does not mean nothing declares it.
 pub fn sig(symbol: &str) -> Option<&'static KernelSig> {
     kernels::sig_in(sigs(), symbol)
 }
 
-/// LOAD-TIME check of a traced form against the kernel table.
+/// Symbols the arity rule cannot hold. Empty: each former entry encoded an
+/// operation in its operand count, and was fixed by splitting the symbol.
+pub const ARITY_EXCEPTIONS: &[&str] = &[];
+
+/// For one statement: does it place what the routine reads and writes?
 ///
-/// WHICH table is [`Backend::of_family`]'s answer, and that answer is the
-/// AUTHORING surface rather than the executing device — read [`Backend`]
-/// before trusting this for a Vulkan or WGPU deployment, because those two
-/// are checked against Metal's rows.
+/// `None` when it agrees, when the symbol is excepted, or when the plane
+/// states no signature.
 ///
-/// Two rules, both of which are runtime failures today:
+/// An in-place pair is slack on the read side rather than a subtraction,
+/// because a routine may spell the alias as one `*mut` parameter or as a
+/// `*const`/`*mut` pair: placed reads run from `inputs + weights - in_place`
+/// to `inputs + weights`. A [`Provenance::Either`] argument raises the
+/// ceiling by one and the floor by nothing. `in_value_region` says the guard
+/// owns the result and the launch records none, so the write floor drops to
+/// zero — the ceiling still holds, since declaring more results than the
+/// routine writes is wrong in a region too.
+fn arity_problem(
+    k: &Stated,
+    kernel: &str,
+    weights: usize,
+    op: &Op,
+    in_value_region: bool,
+) -> Option<String> {
+    use kernels::routine::{Provenance, Side};
+
+    if k.args.is_empty() || ARITY_EXCEPTIONS.contains(&kernel) {
+        return None;
+    }
+    let (mut reads, mut writes) = (0usize, 0usize);
+    let (mut opt_reads, mut opt_writes) = (0usize, 0usize);
+    for (i, (ty, prov)) in k.args.iter().enumerate() {
+        // The slot answers first, the pointer only where no slot does:
+        // `norm::residual_add_rmsnorm`'s `hidden: In<0, *mut T>` is an
+        // operand written through, not an undeclared result.
+        let binds = match k.sides.get(i) {
+            Some(Side::Placed) => kernels::Binds::Reads,
+            Some(Side::Declared) => kernels::Binds::Writes,
+            Some(Side::OfType) | None => ty.binds(),
+        };
+        // An `Env` argument is the fire's by declaration, whatever its type:
+        // a page index the runtime always has and no trace ever names.
+        match (binds, prov) {
+            (_, Provenance::Env) => {}
+            (kernels::Binds::Reads, Provenance::Trace) => reads += 1,
+            (kernels::Binds::Writes, Provenance::Trace) => writes += 1,
+            (kernels::Binds::Reads, Provenance::Either) => opt_reads += 1,
+            (kernels::Binds::Writes, Provenance::Either) => opt_writes += 1,
+            (kernels::Binds::Nothing, _) => {}
+        }
+    }
+    // Read side only, and the asymmetry is deliberate: a pair is
+    // `(output, input)`, so its output half is already in `op.outputs` and
+    // the write side compares flat. Parameters that write STATE rather than a
+    // result -- `rope::rope_write_kv_bf16`'s `k_pages` -- are counted on
+    // neither side; the vocabulary cannot yet declare them.
+    let aliased = k.in_place.len().min(op.inputs.len());
+    let placed = op.inputs.len() + weights;
+    let read_problem = if reads > placed || reads + opt_reads < placed - aliased {
+        Some(format!(
+            "`{kernel}` reads {reads} pointer{} but the statement places {placed} \
+             ({} input{}, {weights} weight{}{}); a builder and an arm that disagree about \
+             operand COUNT disagree about every position after the first",
+            plural(reads),
+            op.inputs.len(),
+            plural(op.inputs.len()),
+            plural(weights),
+            if aliased > 0 {
+                format!(", {aliased} of them possibly in place")
+            } else {
+                String::new()
+            },
+        ))
+    } else {
+        None
+    };
+    let declared = op.outputs.len();
+    let floor = if in_value_region { 0 } else { writes };
+    let write_problem = if declared < floor || declared > writes + opt_writes {
+        Some(format!(
+            "`{kernel}` writes {}{writes} pointer{} but the statement declares {declared} \
+             result{}",
+            if opt_writes > 0 { "at least " } else { "" },
+            plural(writes),
+            plural(declared),
+        ))
+    } else {
+        None
+    };
+
+    match (read_problem, write_problem) {
+        (None, None) => None,
+        (Some(r), None) => Some(r),
+        (None, Some(w)) => Some(w),
+        (Some(r), Some(w)) => Some(format!("{r}; and separately, {w}")),
+    }
+}
+
+/// `""` or `"s"`.
+const fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// Load-time check of a traced form against the kernel table, catching three
+/// failures that would otherwise surface at runtime:
 ///
-/// 1. a `whole` kernel may not be stated inside a [`OpKind::Peel`]'s
-///    regions — the peel gives each region a row window, and a
-///    fire-wide-prepared kernel has no way to honour one;
-/// 2. every launched symbol must be declared, so the table cannot rot
-///    while the model texts move on.
+/// 1. a `whole` kernel stated inside a [`OpKind::Peel`] region, which gives
+///    it a row window it cannot honour;
+/// 2. a launched symbol nothing declares;
+/// 3. operand counts that disagree with the routine's.
+///
+/// The table is [`Backend::of_family`]'s answer, which is the authoring
+/// surface, not the executing device — see [`Backend`] before trusting this
+/// for Vulkan or WGPU. Reads are compared against `inputs + weights`
+/// together, since a weight and an input are both `const T*`.
 ///
 /// Returns the failures rather than panicking, so a caller can name the
 /// family it was loading.
 pub fn check_plan(plan: &ForwardPlan) -> Vec<String> {
     let mut problems = Vec::new();
     let backend = Backend::of_family(&plan.family);
-    // Ops inside a Peel's two regions, as a countdown over the flat op
-    // list (regions are consecutive: prefix then tail, right after the
-    // op — `OpKind::Peel`'s doc).
+    // Countdowns over the flat op list; both kinds' regions are consecutive
+    // and sit immediately after the op.
     let mut peeled = 0usize;
+    // A value-producing guard owns its outputs, so the launches inside it
+    // record none and their writes must not be compared against their own
+    // `outputs`. Stays zero for a guard that declares nothing.
+    let mut regioned = 0usize;
     for op in &plan.ops {
         let inside_peel = peeled > 0;
+        let inside_value_region = regioned > 0;
         peeled = peeled.saturating_sub(1);
+        regioned = regioned.saturating_sub(1);
         match &op.kind {
             OpKind::Peel {
                 prefix_ops,
@@ -215,15 +288,20 @@ pub fn check_plan(plan: &ForwardPlan) -> Vec<String> {
             } => {
                 peeled = peeled.max(*prefix_ops as usize + *tail_ops as usize);
             }
-            OpKind::Launch { kernel, .. } => match backend.and_then(|b| stated_in(b, kernel)) {
+            OpKind::Guard { arms, else_ops } if !op.outputs.is_empty() => {
+                let span = arms.iter().map(|a| a.ops as usize).sum::<usize>()
+                    + *else_ops as usize;
+                regioned = regioned.max(span);
+            }
+            OpKind::Launch {
+                kernel, weights, ..
+            } => match backend.and_then(|b| stated_in(b, kernel)) {
                 None => problems.push(format!(
                     "{}: launches `{kernel}`, which no {} kernel declares",
                     plan.family,
                     match backend {
                         Some(b) => format!("{b:?}").to_lowercase(),
-                        // A semantic trace states no kernels; one that
-                        // does has a family name that does not say
-                        // whose they are.
+                        // A semantic trace states no kernels.
                         None => "backend's".to_string(),
                     }
                 )),
@@ -232,7 +310,18 @@ pub fn check_plan(plan: &ForwardPlan) -> Vec<String> {
                      region, which gives it a row window it cannot honour",
                     plan.family
                 )),
-                Some(_) => {}
+                Some(k) => {
+                    // A `scale.` name is a constant riding the weight slot,
+                    // not a pointer: it reaches the arm through
+                    // `DispatchCtx::scales`, so counting it as an operand
+                    // would make `norm::scalar_mul_bf16` look one short.
+                    let bound = weights.iter().filter(|w| !w.starts_with("scale.")).count();
+                    if let Some(why) =
+                        arity_problem(&k, kernel, bound, op, inside_value_region)
+                    {
+                        problems.push(format!("{}: {why}", plan.family));
+                    }
+                }
             },
             _ => {}
         }
@@ -240,61 +329,38 @@ pub fn check_plan(plan: &ForwardPlan) -> Vec<String> {
     problems
 }
 
-/// Which outputs a stated kernel writes over which inputs.
-///
-/// Reads the BACKEND's table, which is why it takes the plan: the family
-/// name says which backend, exactly as `check_plan` reads it.
+/// Which outputs a stated kernel writes over which inputs. Takes the plan
+/// because the answer is the backend's.
 pub fn in_place_pairs(plan: &ForwardPlan, kernel: &str) -> &'static [(u32, u32)] {
     Backend::of_family(&plan.family)
         .and_then(|b| stated_in(b, kernel))
         .map_or(&[][..], |s| s.in_place)
 }
 
-/// Which outputs a SEMANTIC op writes over which inputs.
+/// Which outputs a semantic op writes over which inputs.
 ///
-/// The companion to [`in_place_pairs`], for the kinds that name no
-/// kernel. A stated kernel carries this fact in the `kernel!` table
-/// because the symbol is the thing being described; a semantic kind is
-/// described by the kind itself, so the fact lives here.
-///
-/// It takes no backend, and that is a claim rather than a convenience:
-/// these are properties of what the kind MEANS, so a backend that
-/// disagreed would not be another implementation of the kind.
+/// Takes no backend by claim, not convenience: these follow from what the
+/// kind means, so a backend that disagreed would not be implementing it.
 pub fn semantic_in_place(kind: &OpKind) -> &'static [(u32, u32)] {
     match kind {
-        // Rope ROTATES; it does not produce. Every driver's arm takes
-        // one q pointer and one k pointer and no separate destination
-        // -- CUDA's four families and Metal's alike -- because there is
-        // no other way to write the kernel.
-        //
-        // The trace still names the rotated q and k as new values,
-        // which is right: SSA is how a reader tells the pre-rope q from
-        // the post-rope one. What was missing is that those names are
-        // two names for one buffer, and while every q was pinned to the
-        // same workspace field, nothing needed the distinction. A host
-        // that assigns addresses does: it gave the normed k an address
-        // of its own, and rope then rotated the OTHER address and left
-        // the real k unread.
+        // Rope rotates in place; the trace's SSA names for rotated q and k
+        // are two names for one buffer.
         OpKind::Rope { .. } => &[(0, 0), (1, 1)],
-        // `beta_one` IS the accumulate: cuBLAS computes `C = A·Bᵀ + C`,
-        // so C is read as well as written and the residual it folds must
-        // BE C. `try_fold_residual` pushes that residual as input 1 and
-        // gives the op a fresh output id, which is right for dataflow —
-        // a reader after the fold wants the summed stream, not the
-        // pre-fold one — and says nothing about memory. This does.
-        //
-        // Only when it folded: a plain matmul writes its output and
-        // reads nothing of it.
+        // `C = A·Bᵀ + C`, so C is read as well as written and the residual it
+        // folds must be C. Only when folded.
         OpKind::Matmul { beta_one: true, .. } => &[(0, 1)],
-        // `attn_out *= sigmoid(gate)`. The full-attention output gate,
-        // and the kernel qwen3.5 states for it is spelled
-        // `sigmoid_gate_inplace_bf16` -- the gate is read-only, the
-        // gated value is rewritten where it lies.
+        // `attn_out *= sigmoid(gate)`; the gate is read-only.
         OpKind::SigmoidGateMul => &[(0, 0)],
-        // `x[r, :] += bias`. One buffer in both drivers that state it --
-        // gpt-oss's `o_bias`, llama_like's three attention biases -- and
-        // the kernel has no destination parameter to give it another.
+        // `x[r, :] += bias`, and the kernel has no destination parameter.
         OpKind::AddBias { .. } => &[(0, 0)],
+        // `stream += branch`: the arms take a destination and an addend with
+        // no separate source. `norm::residual_add_bf16`'s row says the same,
+        // but rows are consulted only for `OpKind::Launch`, so without this
+        // `alias_owners` lets the sum land wherever the arena pointed.
+        //
+        // Safe for a backend whose kernel is not in place: elementwise
+        // `out[i] = in0[i] + in1[i]` still holds when `out` aliases `in0`.
+        OpKind::ResidualAdd => &[(0, 0)],
         _ => &[],
     }
 }

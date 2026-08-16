@@ -147,7 +147,23 @@ default = []
 # It needs a CUDA runtime ABI chosen, for the reason that crate's own
 # `compile_error!` gives: guessing wrong is a segfault inside the driver
 # rather than a build error.
-driver-cuda = ["dep:driver-cuda", "driver-cuda/cuda-13", "driver-cuda/abi"]
+#
+# So the version is IN THE NAME, and there is no version-less `driver-cuda`
+# to select. This crate used to offer one, defined as `driver-cuda/cuda-13`,
+# and that is precisely the guess `driver-cuda` refuses to make: `pie` exposed
+# only the bare name, so `cuda-12` was unreachable from any binary while CI
+# shipped six `cuda12.8`-labelled artifacts built against the 13 ABI. Naming
+# the version is what makes forgetting it impossible -- Cargo answers a stale
+# `--features driver-cuda` with "the package does not contain this feature",
+# which is a better error than a segfault in `cudaGraphAddNode`.
+#
+# `_driver-cuda` is the private "the CUDA shell is linked" gate, the same
+# shape and the same underscore as `driver-cuda`'s own `_cuda`: every
+# `#[cfg]` in this crate is written against it, so the modules do not have to
+# name a version they do not care about.
+_driver-cuda = ["dep:driver-cuda", "driver-cuda/abi"]
+driver-cuda-12 = ["_driver-cuda", "driver-cuda/cuda-12"]
+driver-cuda-13 = ["_driver-cuda", "driver-cuda/cuda-13"]
 # The Rust Metal shell's seam. No archive and no `extern "C"`: this one is a
 # library call, so the feature owes nothing but the dependency and the
 # driver's own device gate.
@@ -231,8 +247,12 @@ driver-wgpu = [
 # `src/scheduler/probe/` submodule) with its probe-holder
 # struct + `probe_<domain>!` macro pair, then add a feature flag here.
 profile-fire = []          # per-fire scheduler lifecycle (90×/sec at conc=256)
-profile-hot-path = ["profile-fire"]  # convenience bundle
-profile-all = ["profile-fire"]       # everything
+# `profile-hot-path` and `profile-all` STOOD HERE, both defined as
+# `["profile-fire"]` -- three names for one domain, because `probe.rs` has
+# only ever had one. Neither carried a `#[cfg]` of its own and neither was
+# forwarded past `worker`, so no binary could select them and no code could
+# tell them apart. Bring them back when a SECOND domain makes a bundle mean
+# something; a bundle of one is a promise the catalog does not keep.
 
 [dev-dependencies]
 tempfile = "3"

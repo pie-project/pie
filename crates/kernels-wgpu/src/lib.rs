@@ -1,6 +1,39 @@
 //! WEBGPU's kernel signature table — one row per KERNEL in `kernels/`, and one
 //! row is many entrypoints.
 //!
+//! ## A window where this crate did not compile, and what it cost
+//!
+//! `The column is the boundary now, and eighteen arms are what it could not
+//! carry` (79c145590) redesigned `kernels::routine`, and its own message names
+//! the surface it was checked against: *"`cargo check -p kernels -p
+//! kernels-cuda -p driver-cuda --features cuda-12`"*. `kernels-cuda` was
+//! migrated with it; the shader backends were not. Checked out alone, that
+//! commit gave **743 errors here and 799 in `kernels-metal`** — a migration in
+//! flight rather than a regression to bisect, and the metal sibling being in
+//! the identical state was the evidence.
+//!
+//! Gone for that window was the vocabulary a routine signature is written in:
+//! `Ask`, `Block`, `Else`, `Held`, `InSlot`, `Nth`, `Null`, `OutSlot`, `Over`,
+//! `ParamOr`, `ParamOrLit`, `Reckoned`, `Say`, `Times`, plus twelve `keys`.
+//! **`kernels: restore the shader planes' slot vocabulary beside CUDA's`
+//! (64022e07e) put it back**, so nothing here needs porting and the note
+//! survives only for what it is evidence of.
+//!
+//! Which is this. `a1fcf1bc9` reached `origin/rewrite` without building: its
+//! tree passed the gate — `driver-wgpu` 23, `kernels-wgpu` 37/13/55/4, serving
+//! 22 of 22 in release — and then `git rebase` moved it onto a base the gate
+//! had never seen, and it went out unchecked. **A rebase is a change to the
+//! tree and deserves the same gate a change to the source does.** This branch
+//! rebases before every commit onto a very active upstream, so that is not a
+//! rare hazard here; it is the normal one.
+//!
+//! The second lesson is about the triage itself. Between the break and the
+//! restore I wrote that this crate needed a hundred signatures ported, which
+//! was true of the tree in front of me and false of the tree an hour later.
+//! **A note that describes a live outage has to be timestamped by something**,
+//! and this one is now dated by the two commit hashes either side of it rather
+//! than left reading as a standing fact.
+//!
 //! ## Why this crate is the one that needs no toolchain
 //!
 //! `kernels-cuda` costs nothing at build time and `libnvrtc.so` at RUN time: a
@@ -72,11 +105,13 @@
 //! a different number than its neighbour, and a family's shaders are one file.
 //! Group 1 binding 0 is the same in all 100 rows, so a shader states it once.
 //!
-//! [`bindings`] is the rule as code, so that a shell binding a launch and a
-//! test checking a shader compute it from one place rather than agreeing by
-//! habit. The rule is stated here rather than per-row on purpose: it is a
-//! property of the API, not of any kernel, and a table that spelled it 99 times
-//! would let row 100 spell it differently.
+//! `bindings` WAS the rule as code, so that a shell binding a launch and a test
+//! checking a shader computed it from one place rather than agreeing by habit.
+//! It read a row's operand list, and there are no rows: a ROUTINE's signature
+//! states the same list in a form the compiler checks, and the shell numbers
+//! the handles an arm mints in the order the body asked for them. The rule
+//! above is still the rule — it is a property of the API, not of any kernel —
+//! and `driver-wgpu::lowering::routine::bind` is where it is now applied.
 //!
 //! ### The trap this rule exists to make unrepresentable
 //!
@@ -89,11 +124,13 @@
 //! refuse a bind group that does not MATCH its layout, which is more than
 //! Vulkan does, but the layout is derived from the same wrong reading.
 //!
-//! [`uniform_layout`] is the other half. `Binding::Uniform(n)` is a field
-//! INDEX, and a shell needs an OFFSET, and turning one into the other is not
+//! The OFFSETS are the other half, and turning a field index into one is not
 //! multiplication: WGSL's uniform address space aligns a member to its own
 //! size, so an eight-byte value after a lone four-byte one starts at 8 and not
-//! at 4, and the struct itself rounds up to 16.
+//! at 4, and the struct itself rounds up to 16. `uniform_layout` computed that
+//! from a row; `driver-wgpu::reflect::Declared::uniform_offsets` reads it off
+//! the MODULE with naga, which is the shader itself rather than a description
+//! of it, and `driver-wgpu::lowering::routine::bind` packs against that.
 //!
 //! ## What a shell that RUNS these has to do
 //!
@@ -108,13 +145,18 @@
 //!   so an overshoot is harmless. An UNDERSHOOT is not, and it is the direction
 //!   that fails silently: a lane that never launches writes nothing, the gap
 //!   reads back as whatever the buffer held, and the dispatch completes.
-//!   [`kernels::KernelSig::grid_param`], `head_param`, `heads_param` and
-//!   `rows_param` say which of the STATEMENT's params give the shape.
+//!   A routine takes the shape as an ARGUMENT, and
+//!   `driver-wgpu::lowering::arm::Handles::stated` supplies it: the
+//!   statement's scalar where there is one, the fire's where there is not, and
+//!   never a zero. Four `KernelSig` columns used to name those params by
+//!   index; see their retirement in `kernels`.
 //! * **Ask the adapter for its limits.** WebGPU's guaranteed floor is **8**
-//!   storage buffers per shader stage, and [`over_downlevel_storage_limit`]
-//!   names the rows that need more — `sdpa_paged_decode` binds eleven. A shell
-//!   that requests `Limits::downlevel_defaults()` will fail to create those
-//!   pipelines on hardware that would have run them.
+//!   storage buffers per shader stage, and `sdpa_paged_decode` binds eleven. A
+//!   shell that requests `Limits::downlevel_defaults()` will fail to create
+//!   those pipelines on hardware that would have run them.
+//!   `over_downlevel_storage_limit` named them off the table;
+//!   `driver-wgpu::Device::unreachable` names them off the MODULES, against
+//!   the adapter's real limit rather than the guaranteed floor.
 //! * **A workgroup size is fixed when the module compiles.** WGSL's
 //!   `@workgroup_size` is a compile-time attribute (an `override` may size it,
 //!   but not a uniform), where a Metal threadgroup is sized at dispatch. A body
@@ -186,40 +228,24 @@ const N: usize = total();
 const EMPTY: KernelSig = KernelSig {
     name: "",
     symbol: "",
-    file: None,
-    launch: kernels::LaunchRule::Unstated,
     whole: false,
-    lacks: &[],
-    sink: None,
     in_place: &[],
     depth_prefix_plan: false,
     args: &[],
-    operands: &[],
+    sides: &[],
     axes: &[],
-    grid_param: None,
-    head_param: None,
-    heads_param: None,
-    rows_param: None,
 };
 
 const fn copy_sig(k: &KernelSig) -> KernelSig {
     KernelSig {
         name: k.name,
         symbol: k.symbol,
-        file: k.file,
-        launch: k.launch,
         whole: k.whole,
-        lacks: k.lacks,
-        sink: k.sink,
         in_place: k.in_place,
         depth_prefix_plan: k.depth_prefix_plan,
         args: k.args,
-        operands: k.operands,
+        sides: k.sides,
         axes: k.axes,
-        grid_param: k.grid_param,
-        head_param: k.head_param,
-        heads_param: k.heads_param,
-        rows_param: k.rows_param,
     }
 }
 
@@ -450,7 +476,7 @@ pub fn sig(symbol: &str) -> Option<&'static KernelSig> {
     kernels::sig_in(KERNELS, symbol)
 }
 
-/// Where one operand rides. See [`bindings`].
+/// Where one operand rides. See this module's header for the rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Binding {
     /// `@group(0) @binding(N) var<storage, ...>`.
@@ -476,71 +502,16 @@ pub enum Binding {
     Packed,
 }
 
-/// Which storage binding each operand of `sig` takes, and which uniform field,
-/// under the two-pass rule this module's own docs state.
-///
-/// Both runs are indexed from zero and both follow the row's order, so the
-/// answer for operand `k` is a function of the row alone — which is the point:
-/// a shell binding a launch and a test checking a shader compute the same thing
-/// from the same place.
-///
-/// A row with no operands is UNSTATED (see [`kernels::KernelSig::operands`]),
-/// and this answers with an empty vector rather than inventing a nullary
-/// layout. An unstated row is still LAUNCHABLE — a shell falls back to the
-/// lowered plan's own argument order — but it is not launchable from here.
-#[must_use]
-pub fn bindings(sig: &KernelSig) -> Vec<Binding> {
-    let mut storages = 0;
-    let mut uniforms = 0;
-    sig.operands
-        .iter()
-        .map(|op| {
-            if matches!(op.ty, kernels::Ty::InPacked) {
-                // Consumes neither run: see `Binding::Packed`.
-                Binding::Packed
-            } else if is_buffer(op.ty) {
-                let at = storages;
-                storages += 1;
-                Binding::Storage(at)
-            } else {
-                let at = uniforms;
-                uniforms += 1;
-                Binding::Uniform(at)
-            }
-        })
-        .collect()
-}
-
-/// How many entries a row's `@group(0)` bind group layout declares.
-#[must_use]
-pub fn storage_count(sig: &KernelSig) -> u32 {
-    sig.operands.iter().filter(|op| is_buffer(op.ty)).count() as u32
-}
-
 /// WebGPU's guaranteed floor for storage buffers in one shader stage.
 ///
 /// `wgpu::Limits::downlevel_defaults().max_storage_buffers_per_shader_stage`,
 /// restated as a number so this crate can name it without depending on `wgpu`.
-/// A row above it is not wrong; it is a row whose pipeline needs a device that
-/// reports more than the floor, and [`over_downlevel_storage_limit`] is how a
-/// shell finds out which rows those are before it picks its limits.
+/// A kernel above it is not wrong; it is one whose pipeline needs a device
+/// that reports more than the floor. `driver-wgpu::Device::unreachable` is how
+/// a shell finds out which, before a model is loaded — counted off the modules
+/// that have to be bound, and against the adapter's REAL limit rather than
+/// this floor.
 pub const DOWNLEVEL_STORAGE_BUFFERS: u32 = 8;
-
-/// The rows whose `@group(0)` is wider than [`DOWNLEVEL_STORAGE_BUFFERS`].
-///
-/// Returned rather than asserted, because "too many" is a property of the
-/// DEVICE and not of the row: `sdpa_paged_decode`'s eleven buffers are eleven
-/// real tensors, and every desktop adapter offers far more than eight. A shell
-/// that requests `Limits::downlevel_defaults()` out of caution would fail to
-/// create exactly these pipelines, and the failure would arrive at model load
-/// with a wgpu message about a limit rather than about attention.
-#[must_use]
-pub fn over_downlevel_storage_limit() -> Vec<&'static KernelSig> {
-    KERNELS
-        .iter()
-        .filter(|sig| storage_count(sig) > DOWNLEVEL_STORAGE_BUFFERS)
-        .collect()
-}
 
 /// One scalar's place in the uniform block, in BYTES.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -562,60 +533,6 @@ pub struct UniformField {
     pub split: bool,
 }
 
-/// The uniform block's byte layout, which [`Binding::Uniform`] does NOT give.
-///
-/// `Binding::Uniform(n)` is a field INDEX and a shell needs an offset, and
-/// turning one into the other is not multiplication. WGSL's uniform address
-/// space aligns a member to its own alignment, and the `vec2<u32>` a 64-bit
-/// operand becomes has an alignment of 8 — so `attn/kv_write`'s
-///
-/// ```text
-/// head_dim: i32, k_head_stride: vec2<u32>, k_seq_stride: vec2<u32>
-/// ```
-///
-/// is 24 bytes with four bytes of padding after the first field, where the
-/// naive sum of widths says 20. A shell that packs by concatenation writes both
-/// strides four bytes low and the shader reads two halves of two different
-/// numbers. Nothing reports it: a uniform buffer is bytes, and wgpu does not
-/// know what they were supposed to mean.
-///
-/// Derived here rather than hand-computed in each caller, for the same reason
-/// [`bindings`] exists rather than each caller counting buffers.
-#[must_use]
-pub fn uniform_layout(sig: &KernelSig) -> Vec<UniformField> {
-    let mut at = 0u32;
-    sig.operands
-        .iter()
-        .filter(|op| !is_buffer(op.ty) && !matches!(op.ty, kernels::Ty::InPacked))
-        .map(|op| {
-            let size = uniform_width(op.ty);
-            at = at.next_multiple_of(size);
-            let field = UniformField {
-                name: op.name,
-                offset: at,
-                size,
-                split: size == 8,
-            };
-            at += size;
-            field
-        })
-        .collect()
-}
-
-/// The uniform block's total size in bytes, padding included.
-///
-/// Rounded up to **16**, not to the widest member. That is not a Vulkan push
-/// block: WGSL's uniform address space gives every host-shareable struct an
-/// alignment of at least 16, and `wgpu` rejects a binding whose size is not a
-/// multiple of it. A row with no scalars answers zero, which is a row that
-/// declares no `@group(1)` at all.
-#[must_use]
-pub fn uniform_size(sig: &KernelSig) -> u32 {
-    let fields = uniform_layout(sig);
-    let Some(last) = fields.last() else { return 0 };
-    (last.offset + last.size).next_multiple_of(16)
-}
-
 /// WebGPU's guaranteed floor for one uniform binding's size, in bytes.
 ///
 /// `wgpu::Limits::downlevel_defaults().max_uniform_buffer_binding_size` is
@@ -624,14 +541,6 @@ pub fn uniform_size(sig: &KernelSig) -> u32 {
 /// the check is cheap and the failure it prevents is a pipeline that refuses to
 /// build on the one device that mattered.
 pub const DOWNLEVEL_UNIFORM_BYTES: u32 = 16 * 1024;
-
-/// Every scalar kind a row can name is four or eight bytes wide.
-fn uniform_width(ty: kernels::Ty) -> u32 {
-    match ty {
-        kernels::Ty::Usize | kernels::Ty::I64 => 8,
-        _ => 4,
-    }
-}
 
 /// Whether a kind crosses as a device allocation rather than as a value.
 ///

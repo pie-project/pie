@@ -27,7 +27,7 @@
 //! [`Frame::of`]: crate::resources::Frame::of
 //! [`Unstageable::SharedPage`]: crate::resources::Unstageable::SharedPage
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::resources::{Request, Shape};
 
@@ -121,6 +121,20 @@ struct Seat {
     pages: Vec<u32>,
     /// How many tokens it has appended. Its next position.
     tokens: usize,
+    /// Which recurrent slot holds its gated-DeltaNet carry.
+    ///
+    /// # Why the book owns this and not the pool
+    ///
+    /// It is the same fact the pages are: WHERE this conversation's history
+    /// lives. A linear-attention layer keeps its history in a state slab
+    /// instead of a page table, and the two have to be seated together or a
+    /// conversation reads its own keys beside somebody else's carry.
+    ///
+    /// Assigned as the lowest index no other seat holds, so a dropped
+    /// conversation's slot is reused rather than the counter running away from
+    /// a pool that has a fixed number of them. It is stable for the life of
+    /// the seat, which is what makes the carry a carry.
+    slot: u32,
 }
 
 /// Who owns which page, and how far each conversation has got.
@@ -179,6 +193,19 @@ impl Book {
         self.seats.get(&who).map(|s| s.pages.as_slice())
     }
 
+    /// The recurrent seat `who` holds, or `None` if `who` has no seat here.
+    ///
+    /// The sibling of [`Self::pages`], for the other pool. A conversation's
+    /// carry lives at one slot for its whole life ([`Self::grow`] seats it
+    /// once and [`Self::fork`] copies it), so this is a property of the seat
+    /// rather than of any one fire — which is what makes it readable from
+    /// outside, and what a probe comparing two conversations' state needs in
+    /// order to know which bytes are whose.
+    #[must_use]
+    pub fn slot(&self, who: u64) -> Option<u32> {
+        self.seats.get(&who).map(|s| s.slot)
+    }
+
     /// Give `who` room for `tokens` more, and say what to fire.
     ///
     /// The positions and the pages are returned TOGETHER, as one [`Request`],
@@ -200,7 +227,11 @@ impl Book {
     ///
     /// [`Unstageable::PastItsPages`]: crate::resources::Unstageable::PastItsPages
     pub fn grow(&mut self, who: u64, tokens: usize) -> Result<Request, Unhoused> {
+        // Before the seat is borrowed, because the answer depends on every
+        // OTHER seat and `entry` holds the map.
+        let slot = self.free_slot(who);
         let seat = self.seats.entry(who).or_default();
+        seat.slot = slot;
         let first = seat.tokens;
         let after = first + tokens;
         let page_size = self.shape.page_size as usize;
@@ -230,12 +261,30 @@ impl Book {
             seat.pages.push(page);
         }
         seat.tokens = after;
-        Ok(Request::of(
+        let slot = seat.slot;
+        let mut request = Request::of(
             (first..after)
                 .map(|p| u32::try_from(p).unwrap_or(u32::MAX))
                 .collect(),
             seat.pages.clone(),
-        ))
+        );
+        request.slot = slot;
+        Ok(request)
+    }
+
+    /// The recurrent slot `who` already holds, or the lowest nobody does.
+    ///
+    /// Linear scan over the seats, which are few and are already a `BTreeMap`
+    /// this crate walks per fire. A counter would be cheaper and would run
+    /// away from a pool with a fixed slot count: a server that seats and drops
+    /// conversations all day would hand out slot ten thousand while nine
+    /// thousand of them stood empty.
+    fn free_slot(&self, who: u64) -> u32 {
+        if let Some(seat) = self.seats.get(&who) {
+            return seat.slot;
+        }
+        let taken: BTreeSet<u32> = self.seats.values().map(|s| s.slot).collect();
+        (0u32..).find(|s| !taken.contains(s)).unwrap_or(u32::MAX)
     }
 
     /// Seat `to` on fresh pages holding the same history as `from`.
@@ -285,7 +334,14 @@ impl Book {
             moves.push((source, page));
             pages.push(page);
         }
-        self.seats.insert(to, Seat { pages, tokens });
+        // A forked lane needs its OWN carry: the beam's whole point is that
+        // the lanes diverge, and two lanes sharing a slot would each fold
+        // their tokens into one state. The pages are copied above; the slot is
+        // allocated fresh, and the carry it starts from is whatever the pool
+        // holds there -- which is the same gap `copy_kv` fills for the pages
+        // and which no caller has asked for yet.
+        let slot = self.free_slot(to);
+        self.seats.insert(to, Seat { pages, tokens, slot });
         Ok(moves)
     }
 
@@ -607,5 +663,32 @@ mod tests {
         assert!(book.grow(2, 1).is_err(), "the cache is still full");
         book.resize(4).expect("room again");
         book.grow(2, 1).expect("a page to sit on");
+    }
+
+    /// **Two conversations do not share a recurrent slot, and one keeps its
+    /// own across fires.**
+    ///
+    /// Both halves, because they fail in opposite directions and a table that
+    /// got either one wrong would still look like it worked. A slot that moved
+    /// between fires would lose a conversation's carry every step, and one
+    /// shared between conversations would fold two histories into one state —
+    /// and neither shows up in the output as anything but a fluent wrong
+    /// answer, because a gated DeltaNet reads whatever is in the slab.
+    #[test]
+    fn a_seat_keeps_one_recurrent_slot_and_no_other_seat_has_it() {
+        let mut book = Book::over(shape(16, 4));
+        let a = book.grow(7, 3).expect("room for three");
+        let b = book.grow(9, 3).expect("room for three");
+        assert_ne!(a.slot, b.slot, "two conversations share a carry");
+
+        let again = book.grow(7, 1).expect("room for one more");
+        assert_eq!(a.slot, again.slot, "a conversation's carry moved under it");
+
+        // The lowest FREE one, not the next one ever handed out: a pool has a
+        // fixed number of slots, and a counter that only goes up would run off
+        // the end of a slab that was mostly empty.
+        book.release(7);
+        let c = book.grow(11, 1).expect("room for one");
+        assert_eq!(c.slot, a.slot, "the dropped seat's slot was not reused");
     }
 }

@@ -1,4 +1,4 @@
-//! Gemma 3 as llama.cpp spells it, in the vocabulary the catalog reads.
+//! Gemma 3's tensor names, in pie's vocabulary and the two foreign ones.
 //!
 //! # The family where a rename is not enough, for the second reason
 //!
@@ -68,25 +68,65 @@
 //! put the tower under `v.` names that this map does not carry -- so they are
 //! refused by name rather than half-imported. Adding them is rows in
 //! [`LAYER`] and [`MODEL`], once there is a file to check them against.
+use crate::shared::vocabulary::{Member, Vocab};
 
-/// The HuggingFace name for a GGUF tensor, or `None` if this map has none.
+/// Every tensor Gemma 3 publishes, and what each vocabulary calls it.
 ///
-/// `None` is a refusal and not a skip. A tensor silently left out is a model
-/// that loads with a layer missing, and the caller turns this into an error
-/// naming the tensor.
-#[must_use]
-pub fn hf_name(gguf: &str) -> Option<String> {
-    let (stem, suffix) = match gguf.rsplit_once('.') {
-        Some((stem, tail @ ("weight" | "bias"))) => (stem, tail),
-        _ => return None,
-    };
-    let hf = match split_layer(stem) {
-        Some((layer, member)) => format!("model.layers.{layer}.{}", LAYER.get_member(member)?),
-        None if stem == "output" => "lm_head".to_string(),
-        None => format!("model.{}", MODEL.get_member(stem)?),
-    };
-    Some(format!("{hf}.{suffix}"))
-}
+/// The four norm rows are the ones to read against the table in this module's
+/// documentation; the other nine are the same as every llama-like family's
+/// and are written out anyway, because a table assembled from a base plus a
+/// delta cannot be read against a file.
+pub const VOCAB: Vocab = Vocab(&[
+    // ── Inside a decoder layer ───────────────────────────────────────
+    Member::gguf(
+        "model.layers.{layer}.self_attn.q_proj",
+        "blk.{layer}.attn_q",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.self_attn.k_proj",
+        "blk.{layer}.attn_k",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.self_attn.v_proj",
+        "blk.{layer}.attn_v",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.self_attn.o_proj",
+        "blk.{layer}.attn_output",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.self_attn.q_norm",
+        "blk.{layer}.attn_q_norm",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.self_attn.k_norm",
+        "blk.{layer}.attn_k_norm",
+    ),
+    // The four rows where the two vocabularies disagree about position.
+    Member::gguf(
+        "model.layers.{layer}.input_layernorm",
+        "blk.{layer}.attn_norm",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.post_attention_layernorm",
+        "blk.{layer}.post_attention_norm",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.pre_feedforward_layernorm",
+        "blk.{layer}.ffn_norm",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.post_feedforward_layernorm",
+        "blk.{layer}.post_ffw_norm",
+    ),
+    Member::gguf("model.layers.{layer}.mlp.gate_proj", "blk.{layer}.ffn_gate"),
+    Member::gguf("model.layers.{layer}.mlp.up_proj", "blk.{layer}.ffn_up"),
+    Member::gguf("model.layers.{layer}.mlp.down_proj", "blk.{layer}.ffn_down"),
+    // ── Outside it ───────────────────────────────────────────────────
+    Member::gguf("model.embed_tokens", "token_embd"),
+    Member::gguf("model.norm", "output_norm"),
+    Member::gguf("lm_head", "output"),
+]);
 
 /// The constant llama.cpp folded into this tensor, for pie to take back out.
 ///
@@ -107,52 +147,9 @@ pub fn folded_constant(gguf: &str) -> Option<f32> {
     gguf.ends_with("norm.weight").then_some(-1.0)
 }
 
-/// `blk.7.attn_q` as `(7, "attn_q")`.
-fn split_layer(stem: &str) -> Option<(u32, &str)> {
-    let rest = stem.strip_prefix("blk.")?;
-    let (index, member) = rest.split_once('.')?;
-    Some((index.parse().ok()?, member))
-}
-
-/// A small ordered table, looked up by scan.
-struct Table(&'static [(&'static str, &'static str)]);
-
-impl Table {
-    fn get_member(&self, member: &str) -> Option<&'static str> {
-        self.0
-            .iter()
-            .find(|(gguf, _)| *gguf == member)
-            .map(|(_, hf)| *hf)
-    }
-}
-
-/// The per-layer members, all thirteen of them.
-///
-/// The four norm rows are the ones to read against the table in this module's
-/// documentation; the other nine are the same as every llama-like family's
-/// and are written out anyway.
-const LAYER: Table = Table(&[
-    ("attn_q", "self_attn.q_proj"),
-    ("attn_k", "self_attn.k_proj"),
-    ("attn_v", "self_attn.v_proj"),
-    ("attn_output", "self_attn.o_proj"),
-    ("attn_q_norm", "self_attn.q_norm"),
-    ("attn_k_norm", "self_attn.k_norm"),
-    ("attn_norm", "input_layernorm"),
-    ("post_attention_norm", "post_attention_layernorm"),
-    ("ffn_norm", "pre_feedforward_layernorm"),
-    ("post_ffw_norm", "post_feedforward_layernorm"),
-    ("ffn_gate", "mlp.gate_proj"),
-    ("ffn_up", "mlp.up_proj"),
-    ("ffn_down", "mlp.down_proj"),
-]);
-
-/// The model-level tables. `output` is handled above, outside `model.`.
-const MODEL: Table = Table(&[("token_embd", "embed_tokens"), ("output_norm", "norm")]);
-
 #[cfg(test)]
 mod tests {
-    use super::{folded_constant, hf_name};
+    use super::{VOCAB, folded_constant};
 
     /// Every name a real Gemma 3 GGUF holds is mapped.
     ///
@@ -214,7 +211,7 @@ mod tests {
             ("token_embd.weight", "model.embed_tokens.weight"),
         ];
         for (gguf, hf) in published {
-            assert_eq!(hf_name(gguf).as_deref(), Some(hf), "mapping {gguf}");
+            assert_eq!(VOCAB.from_gguf(gguf).as_deref(), Some(hf), "mapping {gguf}");
         }
     }
 
@@ -233,7 +230,7 @@ mod tests {
             "post_ffw_norm",
         ]
         .iter()
-        .map(|m| hf_name(&format!("blk.0.{m}.weight")).unwrap())
+        .map(|m| VOCAB.from_gguf(&format!("blk.0.{m}.weight")).unwrap())
         .collect();
         assert_eq!(
             names,
@@ -278,7 +275,9 @@ mod tests {
     fn the_layer_index_is_carried_through() {
         for layer in [0u32, 7, 17, 199] {
             assert_eq!(
-                hf_name(&format!("blk.{layer}.post_ffw_norm.weight")).as_deref(),
+                VOCAB
+                    .from_gguf(&format!("blk.{layer}.post_ffw_norm.weight"))
+                    .as_deref(),
                 Some(format!("model.layers.{layer}.post_feedforward_layernorm.weight").as_str())
             );
         }
@@ -295,7 +294,7 @@ mod tests {
             "blk.3.attn_norm",           // no suffix
             "token_embd",                // no suffix
         ] {
-            assert_eq!(hf_name(unknown), None, "should not map {unknown}");
+            assert_eq!(VOCAB.from_gguf(unknown), None, "should not map {unknown}");
         }
     }
 }

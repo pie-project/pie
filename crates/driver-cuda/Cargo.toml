@@ -497,6 +497,13 @@ required-features = ["_cuda"]
 name = "gpu_ptir_fire"
 required-features = ["_cuda"]
 
+# Ported from `crates/engine/tests/ptir_shell.rs`: it needs `abi` for
+# `driver_api::local`/`Shell` the way `serve.rs` does, on top of the
+# producer chain `gpu_ptir_fire`/`gpu_ptir_emitted` already dev-depend on.
+[[test]]
+name = "gpu_ptir_shell"
+required-features = ["_cuda", "abi"]
+
 [[test]]
 name = "gpu_graph"
 required-features = ["_cuda"]

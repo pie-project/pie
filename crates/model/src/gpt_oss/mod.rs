@@ -757,6 +757,7 @@ mod tests {
             paged_multi_batch: true,
             qmm_multi_batch: true,
             add_bias: true,
+            fused_qk_rope: false,
         };
         assert!(!VARIANTS.is_empty());
         for v in VARIANTS {
@@ -775,9 +776,23 @@ mod tests {
                         "the CLAMPED gate, which is a different kernel and not a scalar",
                     ),
                     (
-                        "mxfp4_qmv_routed_bias",
+                        // The ARM differs by class -- a prefill batches the
+                        // routed projection into a GEMM and a decode reads it
+                        // a row at a time -- but the ENCODING may not. Both
+                        // names begin here, and an affine reading of this
+                        // bank is what produced 909,207 NaNs.
+                        "mxfp4_qm",
                         "the expert bank's own encoding -- an affine reading of it \
                          produced 909,207 NaNs",
+                    ),
+                    (
+                        // And the bank's PROJECTION BIAS with it: gpt-oss is
+                        // the only family here whose experts carry one, and
+                        // the `_bias` suffix is the only thing in the symbol
+                        // that says the kernel will read it.
+                        "_routed_bias",
+                        "the expert projections' bias, which no other routed \
+                         family publishes",
                     ),
                     ("o_bias", "the attention landing's bias"),
                     ("router_bias", "the ROUTER's bias, which moves a ranking"),
@@ -841,6 +856,7 @@ mod tests {
                 paged_multi_batch: true,
                 qmm_multi_batch: true,
                 add_bias: true,
+                fused_qk_rope: false,
             };
             let plan = VARIANTS[0]
                 .trace(FireClass::Decode, Deployed::metal(&bind))
@@ -880,3 +896,7 @@ mod tests {
         );
     }
 }
+
+/// This generation's tensor names, in every vocabulary that spells them.
+#[cfg(feature = "contract")]
+pub mod import;

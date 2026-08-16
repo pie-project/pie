@@ -227,6 +227,23 @@ pub struct MetalBinding {
     /// [`LlamaLikeMetalFacts::add_bias`]:
     ///     crate::shared::llama_like::forward::facts::LlamaLikeMetalFacts::add_bias
     pub add_bias: bool,
+    /// Whether this build can launch `norm::rms_rope`, and so whether the text
+    /// may state the per-head q/k norm and its rotation as ONE dispatch.
+    ///
+    /// Only `driver-vulkan` can. The symbol resolves on the Metal side through
+    /// a census entry with no `.metal` body behind it -- which is what lets
+    /// `model-ir` check a Vulkan text, since Vulkan consumes the
+    /// metal-flavoured one -- so a build that says `true` without the kernel
+    /// plans a text it cannot fire.
+    ///
+    /// See [`LlamaLikeMetalFacts::fused_qk_rope`], which this becomes. Unlike
+    /// [`Self::add_bias`], saying `false` here is not a wrong answer quietly
+    /// taken: the two texts compute the same thing and differ only in how many
+    /// dispatches they take to say it.
+    ///
+    /// [`LlamaLikeMetalFacts::fused_qk_rope`]:
+    ///     crate::shared::llama_like::forward::facts::LlamaLikeMetalFacts::fused_qk_rope
+    pub fused_qk_rope: bool,
 }
 
 /// Which driver is asking for the text.
@@ -1378,6 +1395,73 @@ pub(crate) mod identify_tests {
                 );
             }
         }
+    }
+
+    /// Tolerating a redundant tied head did not make any two rows
+    /// ambiguous.
+    ///
+    /// THE CONTROL ON [`TensorSpec::tied`], at catalog scale. Accepting a
+    /// tensor a row previously forbade is exactly the move that can make a
+    /// checkpoint match two rows, and identification being one-to-one is
+    /// the property the manifest exists to hold. So this is
+    /// `every_row_is_identified_as_itself_and_not_as_a_sibling` run again
+    /// against the harder artifact: every tied row's checkpoint WITH the
+    /// redundant copy the export writes, which is the file a stock HF
+    /// download actually is.
+    #[test]
+    fn a_tied_row_still_identifies_itself_when_the_export_publishes_the_head() {
+        let mut checked = 0usize;
+        let mut wrong: Vec<String> = Vec::new();
+        for row in catalog() {
+            let copies: Vec<(String, Vec<u64>)> = row
+                .manifest()
+                .tensors
+                .iter()
+                .filter(|t| !t.tied_copy.is_empty())
+                .map(|t| (t.name.clone(), t.tied_copy.clone()))
+                .collect();
+            if copies.is_empty() {
+                continue;
+            }
+            checked += 1;
+            let mut metadata = checkpoint_of(*row);
+            for (name, extents) in copies {
+                let elems: u64 = extents.iter().product();
+                metadata.tensors.push(RawTensor {
+                    id: TensorId(u32::try_from(metadata.tensors.len()).unwrap_or(0)),
+                    name,
+                    file_id: FileId(0),
+                    file_offset: 0,
+                    span_bytes: elems * 2,
+                    shape: extents
+                        .iter()
+                        .map(|&e| i64::try_from(e).unwrap_or(0))
+                        .collect(),
+                    encoding: Encoding::Raw(DType::BF16),
+                });
+            }
+            match identify(&metadata, &Override::None) {
+                Ok(found) if found.id() == row.id() => {}
+                Err(Unmatched::Ambiguous { ids }) if are_declared_twins(&ids) => {}
+                Ok(found) => {
+                    wrong.push(format!("{} identified as {}", row.id(), found.id()));
+                }
+                Err(e) => wrong.push(format!("{} no longer identifies: {e}", row.id())),
+            }
+        }
+        assert!(
+            checked > 0,
+            "no row in the catalog states a tie, so this test measured \
+             nothing — `TensorSpec::tied` is unreached and the refusal it \
+             was written for is back",
+        );
+        assert!(
+            wrong.is_empty(),
+            "tolerating the redundant copy an HF export writes broke \
+             one-to-one identification, which is worse than the refusal it \
+             replaced:\n  {}",
+            wrong.join("\n  ")
+        );
     }
 
     /// A declared twin is a CHOICE the caller makes, not a guess the

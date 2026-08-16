@@ -1,163 +1,16 @@
-//! The custom P2P all-reduce: the two symbols a sharded model text states,
-//! the cross product they select from, and the launches that reach it.
+//! The custom P2P all-reduce: the plain bf16 reduction and the fused
+//! all-reduce + residual-add + RMSNorm landing, mirrored from vllm's and
+//! flashinfer's vendored CUDA headers and compiled through NVRTC on demand.
 //!
-//! # What this is
+//! [`resolve`], [`fusion_geometry`] and [`plain_geometry`] pick a template-id
+//! and launch rectangle out of the reachable cross product ([`INSTANTIATED`],
+//! [`NRANKS`], [`PLAIN_NRANKS`]). [`Plane`] is the `Copy` handle a launch
+//! reads; the owning lifecycle (peer access, IPC mappings, the
+//! `Signal`/`RankData` slabs) stays in `driver-cuda`.
 //!
-//! `comm/custom_all_reduce.cu` was 664 lines with **zero** `__global__` and
-//! **zero** `<<<>>>` — a host program that happened to carry a `.cu`
-//! extension for linkage. Exactly two lines of it reached device text:
-//! `impl_->allreduce<__nv_bfloat16>` at `:614-620` and
-//! `allreduce_fusion_kernel_launcher` at `:157-162`. Both named headers in a
-//! flashinfer tree that was CPM-*fetched* at configure time and not vendored,
-//! so for as long as that was true both bodies below returned
-//! `Decline::NoDeviceText` and [`CAN_LAUNCH`] was `false`.
-//!
-//! **That is history.** `kernels/flashinfer/comm/` now holds
-//! `vllm_custom_all_reduce.cuh` and `trtllm_allreduce_fusion.cuh`,
-//! internalised under `MODIFICATIONS`' procedure with their host halves
-//! removed; `kernels/comm/all_reduce.cuh` is the NVRTC root over both; and
-//! [`ROOT`] compiles it. Both bodies launch.
-//!
-//! # WHAT HAS NEVER RUN, and it is most of this file
-//!
-//! A collective needs a peer. **This module has been compiled and never
-//! fired**, because the box it was written on has one GPU:
-//!
-//! * Every template-id [`Instantiation::name_expression`] and
-//!   [`plain_name_expression`] can return compiles under real NVRTC 13.0, all
-//!   32 of them, and every one lowers to a mangled name. Measured through this
-//!   crate's own compiler and its own header set at `sm_89`, `sm_90a`,
-//!   `sm_100a` and `sm_120a`: rc=0 and 32/32 at each. That is
-//!   `every_instantiation_compiles`'s subject and it is a real check — it
-//!   proves the vendored text, the shims and the template arguments agree.
-//!   `sm_80` and `sm_86` refuse, and not for a reason of this module's:
-//!   `shim/cuda_fp8.h` carries an `#error` below sm_89 that every
-//!   `Headers::LibraryAndUpstream` root in the crate hits, because
-//!   `vec_dtypes.cuh` includes it.
-//! * **No launch below has ever been observed to produce a correct sum**, on
-//!   any world size, because a two-rank fire needs two devices. The grid
-//!   arithmetic, the parameter block's field order, the Lamport handshake and
-//!   the peer addressing are argued from upstream's source and checked by a
-//!   compiler, not by an answer.
-//!
-//! Every claim in this file distinguishes the two. Where a sentence says
-//! "measured" it names the measurement; where it does not, it is an argument.
-//!
-//! # Why the LIFECYCLE is not here, and where the line falls
-//!
-//! `driver-cuda`'s `fire/all_reduce.rs` keeps `CustomAllReduce`: peer-access
-//! enablement, the IPC handle exchange, the `Signal` + staging slab, the
-//! `RankData` slab, the fusion plane's four allocations and its Lamport
-//! initialisation, `register_buffer`, `register_graph_buffers` and the
-//! destructor that closes what they opened. Every one of those owns a device
-//! resource with a lifetime, and every one of them reports through
-//! `driver_cuda::error::Error` — a type carrying a `cudaError` code and a
-//! `String`, which this crate cannot name and whose nearest thing here
-//! ([`Decline`]) deliberately carries neither.
-//!
-//! What is here is what a LAUNCH needs: the cross product as data, the two
-//! `switch`es that pick a point out of it ([`resolve`]), the grid arithmetic
-//! that used to be `allreduce_fusion_kernel_launcher`'s
-//! ([`fusion_geometry`]) and `vllm::CustomAllreduce::allreduce`'s
-//! ([`plain_geometry`]), the parameter block ([`FusionParams`]), the refusals,
-//! and the two bodies.
-//!
-//! [`Plane`] is the seam: what the constructor established, `Copy`, which is
-//! all either body reads off the instance.
-//!
-//! # `driver_bound!`, and the one column that is not obvious
-//!
-//! Neither symbol is `routine!`, and the reason is the plainest in the table:
-//! **a collective takes a communicator.** The group, its rank, its peer
-//! mappings and its registered buffers are properties of the deployment's
-//! process group, assembled at load and named by no trace statement.
-//!
-//! Both are `whole`, and for a reason stronger than "a reduction is over the
-//! whole value": **every rank must enter the same collective the same number
-//! of times**, so a row window that split one rank's launch and not another's
-//! would DEADLOCK rather than compute a wrong answer. The refusal is not an
-//! optimisation. They are also synchronisation points, which the
-//! graph-capture rules have to know.
-//!
-//! [`all_reduce_residual_rmsnorm_bf16`] additionally states
-//! `in_place = &[(0, 1)]`: the fused landing has TWO results, so it needs a
-//! pair list rather than a single alias — the residual stream is updated in
-//! place and the normed activation is the other.
-//!
-//! # The 240-kernel cross product, and what 111s means under a JIT
-//!
-//! `kernels.def`'s `PIE_AR_FUSION_PATTERN` block made the argument, and the
-//! measurement in it must not be consumed by this port, so it is restated
-//! here with its arithmetic intact. flashinfer's `allreduce_fusion_op()`
-//! turns four runtime values into one compile-time cross product:
-//!
-//! ```text
-//!   nranks {2,4,8,16}  x  pattern {10}  x  fp32_acc {2}
-//!       x  (oneshot x trigger_completion_at_end {2}, or twoshot {1})
-//!     = 4 x 10 x 2 x 3
-//!     = 240 kernels
-//! ```
-//!
-//! — **96% of every kernel in `custom_all_reduce.cu`, and the reason that
-//! translation unit cost 111s (40s cicc + 44s ptxas)**. pie reaches exactly
-//! one pattern, `kARResidualRMSNorm`; the other nine are FP8/FP4 quant
-//! epilogues no pie call site can select.
-//!
-//! Three of those four axes are template parameters and the fourth is not:
-//! `use_oneshot` and `trigger_completion_at_end` are RUNTIME fields of
-//! `AllReduceFusionParams` that upstream's host launcher branched on to pick
-//! among three `__global__`s. So the 240 is `80 host instantiations x 3
-//! device leaves`, and [`Leaf`] is that third factor named.
-//!
-//! **The vendoring moved that line, and this is where it moved to.**
-//! `allreduce_fusion_kernel_launcher` is HOST C++ — it calls
-//! `cudaLaunchKernelEx` — so it is removed with the rest of the host half and
-//! no `nvrtcAddNameExpression` could ever have lowered its name. What NVRTC
-//! is handed is the `__global__` the launcher would have picked, so the three
-//! leaves are three template-ids here rather than one template-id and a
-//! branch. [`Instantiation::name_expression`] is that: **24 arms,
-//! `4 nranks x 1 pattern x 2 fp32_acc x 3 leaves`, which is
-//! [`AOT_POINTS_AFTER_PRUNING`] exactly** — the same number pie's own
-//! ahead-of-time build compiled, now as a set of strings a fixture can hand to
-//! a compiler.
-//!
-//! **The measurement was about an AHEAD-OF-TIME translation unit, and under
-//! a JIT it says something different.** Written out:
-//!
-//! ```text
-//!   upstream, unpruned          4 x 10 x 2 x 3  = 240 kernels   ~111 s
-//!   pie's AOT build, pruned     4 x  1 x 2 x 3  =  24 kernels   ~11 s
-//!   under NVRTC, on demand              reached =   1 kernel    ~0.46 s, once
-//! ```
-//!
-//! 111s / 240 is **~0.46s per instantiation**, and that figure is the whole
-//! translation. Ahead of time it was a cost paid on the build's critical
-//! path on every build, whether or not a single one of the 240 ever ran; the
-//! `PIE_AR_FUSION_PATTERN` list bought back 216 of them, or ~99s. Under a
-//! JIT that compiles on demand the cross product stops being a *build* cost
-//! at all and becomes a **cache-key space**: a point nobody reaches is never
-//! compiled, so there is nothing left for a list to prune, and the remaining
-//! ~11s of pie's own pruned build goes with it. What survives is ~0.46s of
-//! FIRST-CALL latency for the one point pie reaches, paid once per process
-//! and off everyone else's critical path.
-//!
-//! So the list's job changes rather than ends. It no longer states which
-//! points were BUILT; it states which points are **reachable**, and that is
-//! checkable before a fire instead of during one. [`INSTANTIATED`] is that
-//! list, in Rust, and [`resolve`] is the check.
-//!
-//! # The runtime throw became a refusal
-//!
-//! `kernels.def` said it plainly: *"a missing entry surfaces as a runtime
-//! throw, not a link error"*. Both throws are here, and neither is spelled
-//! like a failure of the launch:
-//!
-//! ```text
-//!   custom_all_reduce.cu:171-176  "pattern N is not instantiated"
-//!                                   -> Decline::PatternNotInstantiated
-//!   custom_all_reduce.cu:206-209  "does not support TP world size N"
-//!                                   -> Decline::WorldSizeUnsupported
-//! ```
+//! Compiles under real NVRTC (`every_instantiation_compiles`); not yet
+//! verified against a multi-GPU launch, since a two-rank fire needs two
+//! devices and this crate has never had them.
 //!
 //! A decline enqueues **nothing** — the caller's `output` is exactly as it
 //! found it, and `dist::all_reduce_bf16` (NCCL, and equally absent) is the
@@ -172,116 +25,59 @@ use kernels::Refusal;
 
 // ── the root ─────────────────────────────────────────────────────────────
 
-// The template-ids live in `Instantiation::name_expression` and
-// `plain_name_expression` below, spelled as NVRTC is handed them.
-//
-// **These are the `__global__`s, not upstream's launcher.**
-// `allreduce_fusion_kernel_launcher` is host C++ and is removed from the
-// vendored header; the three `__global__`s it dispatched to are what a JIT can
-// name, which is why `Leaf` appears in a template-id here and was a runtime
-// branch upstream.
-//
-// Two functions rather than one, because the two symbols do not share an axis:
-// the fused landing is `{nranks} x {fp32_acc} x {leaf}` over flashinfer's
-// instantiated world sizes, and the plain reduction is `{ngpus} x {stage}` over
-// vllm's, which are a different set -- `{2,4,6,8}` against `{2,4,8,16}`. See
-// `PLAIN_NRANKS`.
-//
-// WRITTEN OUT, AND NOT BUILT WITH A `format!`. A template-id assembled at run
-// time is one no fixture can compile ahead of the fire that needs it, and
-// `every_instantiation_compiles` is the only thing in this repository that has
-// ever put one of these through a compiler: it reads the literals out of these
-// two `fn` bodies, pairs them with the carried file the launch sites name, and
-// hands all 32 to NVRTC. Measured on an L40S with NVRTC 13.0: rc=0 and 32/32
-// lowered, at sm_89 and again at sm_90a.
+// Template-ids are written out literally rather than built with `format!`,
+// so `every_instantiation_compiles` can read them out of these two `fn`
+// bodies and put every one through NVRTC ahead of any fire. The fused
+// landing (`{nranks} x {fp32_acc} x {leaf}`, flashinfer's world sizes) and
+// the plain reduction (`{ngpus} x {stage}`, vllm's [`PLAIN_NRANKS`]) don't
+// share an axis, hence two functions.
 
-// ── the constants a LAUNCH fixes ─────────────────────────────────────────
+// ── the constants a launch fixes ─────────────────────────────────────────
 //
-// The plane's own sizes -- `SIGNAL_BYTES`, `RANK_DATA_BYTES`, the Lamport
-// cap, the 2 MiB fusion alignment -- stayed with the constructor that spends
-// them. These are the launch rectangle, so they are here.
+// The plane's own sizes (`Signal`/`RankData` byte counts, the Lamport cap,
+// the fusion alignment) stay with the constructor that spends them; these
+// are the launch rectangle.
 
-/// Whether a call into this module can reach device text — **`true`.**
+/// Whether a call into this module can reach device text.
 ///
-/// It was `false` for as long as `flashinfer/comm/` was CPM-fetched by
-/// upstream and not vendored here. It is `true` now because
-/// `kernels/flashinfer/comm/` holds both headers and [`ROOT`] compiles
-/// them.
+/// Claims only that a resolved call reaches [`Ctx::launch`] — that device
+/// text exists, compiles, and is named by a template-id — not that the
+/// result is correct: no launch here has run on more than one device.
 ///
-/// # What it does and does not claim
-///
-/// It claims that a call which resolves reaches [`Ctx::launch`] — that there
-/// is device text, that it compiles, and that a template-id names it. It
-/// claims **nothing** about whether the result is right, and this file's
-/// header says at length why it cannot: no launch here has ever run on more
-/// than one device. The honest reading is *"the refusal that stood in front
-/// of tensor parallelism is gone"*, not *"tensor parallelism is verified"*.
-///
-/// # Why a constant rather than a comment
-///
-/// A deployment has to decide, before it serves a single token, whether a
-/// tensor-parallel rank can combine its shards. `driver-cuda`'s
-/// `serve::load::tp_serving_refusal` reads this — so the driver's refusal is
-/// derived from the launch half's own statement about itself instead of being
-/// a second, hand-written account of the same absence that can drift from it.
-/// The old refusal was exactly that second account, and it had already
-/// drifted: it said *"no `CustomAllReduce` handle to pass"* after the handle
-/// existed.
-///
-/// `the_bodies_agree_with_can_launch` fails the moment this and the bodies
-/// disagree, in either direction.
+/// `driver-cuda`'s `serve::load::tp_serving_refusal` reads this constant
+/// directly, so a deployment's tensor-parallel refusal cannot drift from
+/// what the launch half actually does. `the_bodies_agree_with_can_launch`
+/// enforces the two stay equal.
 pub const CAN_LAUNCH: bool = true;
 
-/// The vector width both kernels move data in, in bf16 ELEMENTS.
+/// The vector width both kernels move data in, in bf16 ELEMENTS — **8**,
+/// i.e. 16 bytes (`ld.128`/`st.128`).
 ///
-/// Two derivations of one number, and they have to agree or one of the two
-/// kernels is addressing wrongly:
+/// Two independent upstream derivations that must agree:
+/// * vllm — `packed_t<T>::P = array_t<T, 16 / sizeof(T)>`
+///   (`vllm_custom_all_reduce.cuh:83`); `allreduce()` refuses `size % d != 0`.
+/// * flashinfer — `VEC_SIZE = kBytesPerAccess / sizeof(T)`, `kBytesPerAccess
+///   == 16` (`trtllm_allreduce_fusion.cuh:30`).
 ///
-/// * vllm — `packed_t<T>::P` is `array_t<T, 16 / sizeof(T)>`
-///   (`vllm_custom_all_reduce.cuh:83`), so `d == 8` for bf16 and
-///   `allreduce()` refuses a `size % d != 0`.
-/// * flashinfer — `VEC_SIZE = details::kBytesPerAccess / sizeof(T)` with
-///   `kBytesPerAccess == 16` (`trtllm_allreduce_fusion.cuh:30`).
-///
-/// Both are "16 bytes", which is `ld.128`/`st.128`, which is the whole reason
-/// the number exists. `Decline::FusionHiddenNotOctet`'s `hidden % 8` is this
-/// number on the fused side and [`Decline::Vector`] is it on the plain side.
+/// `Decline::FusionHiddenNotOctet` (fused) and [`Decline::Vector`] (plain)
+/// are this number on each side.
 pub const VEC_SIZE: i32 = 8;
 
 /// The cluster dimension every launch in this module sets — **1**.
 ///
-/// # This is a deviation from upstream and it is deliberate
+/// A deliberate deviation from upstream, which picks `cluster_size` up to 8
+/// on SM 90+ so a token's `hidden_dim / VEC_SIZE` threads can span multiple
+/// blocks: [`crate::jit::Launch`] carries no cluster dimension to set one
+/// with. Pinning to 1 caps `hidden_dim` at 8192 (see
+/// [`Decline::FusionBlockWidth`]) — Llama-3-70B's 8192 and Qwen3-32B's 5120
+/// fit; a 12k or 16k hidden size would not.
 ///
-/// `allreduce_fusion_kernel_launcher` picks `cluster_size = 8` on SM 90 and
-/// above and then halves it until the token divides, so that one token's
-/// `hidden_dim / VEC_SIZE` threads can span up to eight blocks. That needs
-/// `cudaLaunchAttributeClusterDimension` on the launch, and
-/// [`crate::jit::Launch`] carries no cluster dimension — it has `grid`,
-/// `block`, `smem` and `cooperative`, and `jit::launch::issue` sets at most
-/// the cooperative attribute.
-///
-/// **What pinning it to 1 costs, exactly.** With one block per token the
-/// block is `hidden_dim / 8` threads wide, so the ceiling is
-/// `hidden_dim <= 8192`; above that [`fusion_geometry`] answers
-/// [`Decline::FusionBlockWidth`] where upstream would have split the token
-/// across a cluster. Llama-3-70B's 8192 and Qwen3-32B's 5120 are inside it;
-/// a 12k or 16k hidden size is not.
-///
-/// **What it does NOT cost.** A cluster of one is the DEFAULT cluster shape
-/// on sm_90, not a special case: `%cluster_nctarank` reads 1, so
-/// `FusedOp::rms_norm`'s `if (cluster.num_blocks() > 1)` is false and the
-/// distributed-shared-memory reduction is skipped, and `IndexHelper` computes
-/// exactly what its own `#else` arm computes below sm_90. So the arithmetic
-/// is upstream's at cluster size 1 rather than an approximation of it.
-///
-/// The other thing this pin buys is that `adjust_for_sm_count` — upstream's
-/// loop that widens the block when `cluster_num * cluster_size > sm_count` —
-/// is a no-op, because its guard is `cluster_size > 1`. That loop is the only
-/// reader of upstream's `max_threads_per_block`, which is
-/// `min(max_registers / registers_per_thread, 1024)` and needs
-/// `cudaFuncGetAttributes` on the compiled kernel. **Neither is computed
-/// here, and with cluster size 1 neither has a reader.** Lifting this pin
-/// means restoring both.
+/// This is not an approximation: cluster size 1 is upstream's own default
+/// shape at this size (`cluster.num_blocks() > 1` is already false, so its
+/// distributed-shared-memory path is skipped regardless), so the arithmetic
+/// stays exactly upstream's. It also makes `adjust_for_sm_count` and
+/// `max_threads_per_block` — upstream's dead code once `cluster_size == 1`
+/// — unnecessary to compute here.
 pub const CLUSTER_SIZE: i32 = 1;
 
 /// The widest block CUDA will launch, on every architecture this crate
@@ -296,27 +92,17 @@ pub const MAX_BLOCK_THREADS: i32 = 1024;
 /// `flashinfer::trtllm_allreduce_fusion::AllReduceFusionPattern`, with
 /// upstream's discriminants.
 ///
-/// **The discriminants are not contiguous** — 6 and 7 are absent upstream —
-/// so this enum states each one explicitly rather than relying on
-/// declaration order. A `from_code` that assumed density would map
-/// `kARResidualRMSNormPerTokenGroupFP8PackedQuant` (8) onto a pattern two
-/// places away, silently, on a path whose whole job is to refuse the
-/// patterns pie cannot serve.
+/// The discriminants are not contiguous (6 and 7 are absent upstream), so
+/// each is stated explicitly rather than relying on declaration order.
 ///
-/// `#[repr(i32)]` is now load-bearing rather than documentary: this type is a
-/// FIELD of [`FusionParams`], which is `#[repr(C)]` and crosses to the device
-/// as a by-value kernel parameter. `sizeof(AllReduceFusionPattern) == 4`,
-/// measured against the vendored header.
+/// `#[repr(i32)]` is load-bearing: this type is a field of [`FusionParams`],
+/// which is `#[repr(C)]` and crosses to the device as a by-value kernel
+/// parameter (`sizeof == 4`, measured against the vendored header).
 ///
-/// # A drift worth recording
-///
-/// `kernels.def`'s block says `pattern {10}` and derives `4 x 10 x 2 x 3 =
-/// 240` from it. The vendored header declares **eight** enumerators spanning
-/// 0..=9. The 240 is preserved above exactly as measured — it was measured
-/// against the header the archive compiled, and a measurement is not amended
-/// by a later reading — but a re-measurement on the vendored copy would find
-/// `4 x 8 x 2 x 3 = 192`. Recorded rather than reconciled: the only number
-/// this module ACTS on is the size of [`INSTANTIATED`], which is 1 either way.
+/// [`UPSTREAM_POINTS`] (240) assumes 10 patterns, `kernels.def`'s count; the
+/// vendored header declares 8, which would give 192. Left at 240 since the
+/// only number this module acts on is [`INSTANTIATED`]'s length, which is 1
+/// either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(i32)]
 pub enum FusionPattern {
@@ -389,12 +175,9 @@ impl FusionPattern {
 /// `flashinfer::QuantizationSFLayout` — `fp4_layout.cuh:21-35`.
 ///
 /// A field of [`FusionParams`], read only by the FP4 quant epilogues, which
-/// no pattern in [`INSTANTIATED`] selects. It is a real `#[repr(i32)]` enum
-/// rather than the `&'static str` this struct used to carry, for one reason:
-/// the struct is now `#[repr(C)]` and crosses to the device, so the field has
-/// to be four bytes with upstream's discriminant. `sizeof` and the
-/// declaration order are read off the vendored header, which this tree now
-/// has.
+/// no pattern in [`INSTANTIATED`] selects. `#[repr(i32)]` because the struct
+/// is `#[repr(C)]` and crosses to the device: the field must be four bytes
+/// with upstream's discriminant and declaration order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum SfLayout {
@@ -408,45 +191,35 @@ pub enum SfLayout {
 
 /// `kernels.def`'s `PIE_AR_FUSION_PATTERN` list, in Rust — **one entry.**
 ///
-/// This is the whole of what the `#include "kernels.def"` inside
-/// `dispatch_ar_fusion_pattern` (`custom_all_reduce.cu:163-169`) expanded to.
-/// The C++ expanded it into `case` labels of a `switch` on
-/// `params.pattern`; [`resolve`] is that switch, and the `default:` that
-/// threw is [`Decline::PatternNotInstantiated`].
+/// The C++ `switch` on `params.pattern` (`custom_all_reduce.cu:163-169`),
+/// now [`resolve`]; its `default: throw` is
+/// [`Decline::PatternNotInstantiated`].
 ///
-/// **Adding a pattern to a call site requires adding it here** and to
-/// [`Instantiation::name_expression`], exactly as `kernels.def` said — but the consequence has
-/// changed twice and is now best: a missing entry used to surface as a
-/// runtime throw deep inside a fire; then as a `Decline` a caller handles by
-/// type; and now the added entry is a string a fixture compiles before it can
-/// ever be fired.
+/// Adding a pattern to a call site requires adding it here and to
+/// [`Instantiation::name_expression`] — a missing entry there is a
+/// `cargo test` failure, since `every_instantiation_compiles` compiles every
+/// string this list can produce.
 pub static INSTANTIATED: &[FusionPattern] = &[FusionPattern::ARResidualRMSNorm];
 
 /// upstream flashinfer's supported TP world sizes for the FUSED landing —
 /// `allreduce_fusion_op`'s `switch (params.nranks)`.
 ///
-/// **Deliberately unpruned, and the archive said why** (`:177-179`): *"nranks
-/// is upstream flashinfer's supported set rather than a pie-owned axis, so it
-/// stays fully instantiated: TP world size is a deployment choice and pruning
-/// it would turn a valid launch into a runtime throw."* Under a JIT the
-/// argument gets stronger, not weaker — an unreached world size now costs
-/// nothing at all, not even a compile.
+/// Deliberately unpruned: TP world size is a deployment choice, not a
+/// pie-owned axis, so pruning it would turn a valid launch into a runtime
+/// refusal. Under a JIT an unreached world size costs nothing at all, not
+/// even a compile.
 pub static NRANKS: &[i32] = &[2, 4, 8, 16];
 
 /// upstream vllm's supported world sizes for the PLAIN reduction —
 /// `vllm_custom_all_reduce.cuh:490-500`'s `REDUCE_CASE(2/4/6/8)`.
 ///
-/// **It is a different set from [`NRANKS`] and neither contains the other.**
-/// vllm has 6 and flashinfer does not; flashinfer has 16 and vllm does not.
-/// That is not a mistake to reconcile: they are two upstreams' independent
-/// choices about which `ngpus` to instantiate, and a deployment at world size
-/// 6 can run the plain reduction and cannot run the fused landing (which is
-/// world size 2 only anyway, so nothing is lost).
+/// A different set from [`NRANKS`] and neither contains the other: vllm has
+/// 6 and flashinfer does not, flashinfer has 16 and vllm does not. Two
+/// upstreams' independent instantiation choices, not a mismatch to reconcile.
 ///
 /// `CustomAllReduce::initialise` refuses anything outside `{2,4,6,8}` at
-/// construction, so a `Plane` reaching [`plain_geometry`] with something else
-/// cannot come from this tree — the check is kept because it is upstream's
-/// `default: throw` and because the raw-pointer ABI forms exist.
+/// construction, so [`plain_geometry`] keeps the same check for the
+/// raw-pointer ABI forms that bypass it.
 pub static PLAIN_NRANKS: &[i32] = &[2, 4, 6, 8];
 
 /// Which of the three fused device leaves a set of runtime flags selects.
@@ -513,10 +286,8 @@ pub const FP32_ACC_VALUES: usize = 2;
 
 /// The cross product `kernels.def` measured: **240 kernels**.
 ///
-/// Stated as a constant rather than recomputed, because it is a
-/// MEASUREMENT's denominator and recomputing it from today's
-/// [`FusionPattern::ALL`] would silently restate it as 192 — see that type's
-/// drift note.
+/// Stated as a constant, not recomputed from [`FusionPattern::ALL`] — see
+/// that type's doc for why the two disagree.
 pub const UPSTREAM_POINTS: usize = 240;
 
 /// The translation unit's cost, in seconds — `kernels.def:114-115`.
@@ -532,8 +303,8 @@ pub const AOT_PTXAS_SECONDS: usize = 44;
 /// the pattern axis: `4 nranks x 1 pattern x 2 fp32_acc x 3 leaves` = **24**.
 ///
 /// Derived rather than written, so that adding a pattern to [`INSTANTIATED`]
-/// moves the figure the module's header quotes — and
-/// [`Instantiation::name_expression`] has exactly this many arms, which
+/// updates this automatically — and [`Instantiation::name_expression`] has
+/// exactly this many arms, which
 /// `the_instantiation_table_is_the_pruned_cross_product` pins.
 pub const AOT_POINTS_AFTER_PRUNING: usize =
     NRANKS.len() * INSTANTIATED.len() * FP32_ACC_VALUES * LEAVES;
@@ -559,16 +330,13 @@ pub struct Instantiation {
 impl Instantiation {
     /// The template-id NVRTC is handed for this point.
     ///
-    /// A `match` over WRITTEN-OUT strings, not a `format!`, so that the id a
-    /// fire hands NVRTC is byte for byte the id
-    /// `every_instantiation_compiles` put through a compiler — that fixture
-    /// reads these literals out of this `fn` and pairs them with the carried
-    /// file the two launch sites name.
+    /// Written out as literal strings, not built with `format!`, so
+    /// `every_instantiation_compiles` can read them out of this `fn` and
+    /// compile every one ahead of any fire.
     ///
-    /// `None` cannot happen after [`resolve`], which admits only
-    /// `nranks in NRANKS` and `pattern in INSTANTIATED`, and the arms cover
-    /// that product times both `fp32_acc` values times all three leaves.
-    /// `the_table_covers_everything_resolve_admits` is what keeps that true.
+    /// `None` cannot happen after [`resolve`]: the arms cover
+    /// `NRANKS x INSTANTIATED x fp32_acc x Leaf` exactly, which
+    /// `the_table_covers_everything_resolve_admits` checks.
     #[must_use]
     pub fn name_expression(&self) -> Option<&'static str> {
         match (self.nranks, self.fp32_acc, self.leaf) {
@@ -771,19 +539,17 @@ pub fn resolve(
 
 /// Why a call did not reduce anything.
 ///
-/// Every arm enqueues NOTHING, which is the whole contract: on a decline the
-/// caller's `output` is exactly as it found it and `dist::all_reduce_bf16`
-/// (NCCL) is the arm to take instead. `custom_all_reduce.hpp:160-163` is the
-/// sentence this type exists to keep true — *"WHICH is a guard in the text
-/// rather than an `if` inside a driver method"*.
+/// Every arm enqueues NOTHING: on a decline the caller's `output` is exactly
+/// as it found it, and `dist::all_reduce_bf16` (NCCL) is the arm to take
+/// instead. `custom_all_reduce.hpp:160-163` states the same guard in the
+/// header text rather than as an `if` inside a driver method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decline {
     /// `car` was null — `custom_all_reduce.hpp:170-174`, `:193-197`.
     ///
-    /// **A refusal, not a fallback.** The header threw here, and its comment
-    /// says why: *"a null one is a deployment that configured no custom
-    /// all-reduce, which is a refusal rather than a fallback: the fused
-    /// landing IS this kernel, and there is no other way to spell it."*
+    /// A refusal, not a fallback: a null instance means this deployment
+    /// configured no custom all-reduce, and the fused landing IS this
+    /// kernel with no other way to spell it.
     NoInstance,
     /// The instance exists but construction never completed —
     /// `custom_all_reduce.cu:606-608`, `:503`, `:544`.
@@ -891,10 +657,9 @@ pub enum Decline {
     },
     /// The fused kernel's block would be wider than a CUDA block can be.
     ///
-    /// **Not upstream's refusal, and [`CLUSTER_SIZE`] is why it exists.**
-    /// With one block per token the block is `hidden_dim / VEC_SIZE` threads;
-    /// upstream would have spread the token over a cluster of up to eight
-    /// blocks instead. The ceiling this makes is `hidden_dim <= 8192`.
+    /// Not upstream's refusal: it exists because [`CLUSTER_SIZE`] is pinned
+    /// to 1, so the whole token's threads land in one block instead of
+    /// spreading over a cluster.
     FusionBlockWidth {
         /// The hidden size asked for.
         hidden: i32,
@@ -939,10 +704,8 @@ pub enum Decline {
     },
     /// A device property the launch needs and the driver would not say.
     ///
-    /// The multiprocessor count, which upstream got from
-    /// `cudaDeviceGetAttribute(cudaDevAttrMultiProcessorCount)` inside
-    /// `get_sm_count()` — removed with the rest of the host half, and
-    /// `jit::Ctx::multiprocessors` now.
+    /// The multiprocessor count, sourced from `jit::Ctx::multiprocessors`
+    /// (upstream's `get_sm_count()`, via `cudaDeviceGetAttribute`).
     DeviceQuery {
         /// What could not be asked.
         what: &'static str,
@@ -956,6 +719,26 @@ pub enum Decline {
     /// detail once per instantiation; the [`Refusal`] is what a caller can
     /// branch on.
     Launch(Refusal),
+    /// The P2P reduction declined THIS MESSAGE and NCCL refused it too.
+    ///
+    /// The one variant that is not a statement about the custom all-reduce:
+    /// it carries [`fall_back_out_of_place`]'s second refusal, from
+    /// `dist::all_reduce_bf16_out`, and exists so that the fallback can live
+    /// in this file without losing the answer a caller is owed.
+    ///
+    /// **Which of two absences a caller is told about.** When both arms are
+    /// missing there are two true things to say, and the rule is: report the
+    /// P2P decline when the P2P path is STRUCTURALLY unavailable, and NCCL's
+    /// when the P2P path merely declined this message. `AboveCrossover`,
+    /// `Bytes` and `NotFullyConnected` are the second kind -- they are
+    /// `can_handle` saying *"this one is NCCL's"*, the crossover query
+    /// working exactly as designed, and the honest report is that NCCL is not
+    /// here. Everything else is the first kind: no device text, no plane, an
+    /// unregistered buffer, and telling an operator about NCCL when their
+    /// build has no all-reduce kernel at all sends them to the wrong
+    /// repository. So only the three message-shaped declines ever become a
+    /// `FellBack`; the rest come back out of the fallback unchanged.
+    FellBack(Refusal),
 }
 
 impl fmt::Display for Decline {
@@ -1036,6 +819,9 @@ impl fmt::Display for Decline {
             ),
             Self::DeviceQuery { what } => write!(f, "the driver would not say {what}"),
             Self::Launch(why) => write!(f, "the launch refused: {why}"),
+            Self::FellBack(why) => {
+                write!(f, "this message was NCCL's and NCCL refused it: {why}")
+            }
         }
     }
 }
@@ -1057,15 +843,12 @@ pub enum AllReduce {
     Declined(Decline),
 }
 
-// ── the parameter block, which is now an ABI ─────────────────────────────
+// ── the parameter block ──────────────────────────────────────────────────
 
 /// `flashinfer::trtllm_allreduce_fusion::AllReduceFusionParams<T>`, mirrored.
 ///
-/// **`#[repr(C)]`, and that is a change.** This struct used to be a
-/// CHECKLIST — deliberately not `repr(C)`, because the header was not
-/// vendored and the field order could not be read. It is vendored now, so
-/// this is the layout, and it crosses to the device as a by-value kernel
-/// parameter through [`ArgValue::Bytes`].
+/// `#[repr(C)]`: this is the vendored header's layout, and it crosses to the
+/// device as a by-value kernel parameter through [`ArgValue::Bytes`].
 ///
 /// Measured against `kernels/flashinfer/comm/trtllm_allreduce_fusion.cuh`
 /// at `T = __nv_bfloat16` with NVRTC 13.0, using `__INTADDR__` (the only
@@ -1080,16 +863,13 @@ pub enum AllReduce {
 ///   block_quant_group_size 128   tma_aligned_mn 132
 /// ```
 ///
-/// `the_parameter_block_is_the_upstream_struct` restates every one of those
-/// against Rust's own `offset_of!`, so a reordered field here is a test
-/// failure rather than a wrong kernel argument.
+/// `the_parameter_block_is_the_upstream_struct` checks every offset above
+/// against Rust's own `offset_of!`, so a reordered field is a test failure
+/// rather than a wrong kernel argument.
 ///
-/// # Two fields upstream has that this does not carry as data
-///
-/// `launch_with_pdl` is not a member of the struct at all — it was the
-/// launcher's second argument, and the launcher is host C++ that is gone.
-/// `use_fp32_acc` is the `Fp32Acc` TEMPLATE parameter, which is why it is
-/// part of [`Instantiation`] and not of this block.
+/// Two upstream fields are not carried: `launch_with_pdl` is a launcher
+/// argument this module has none of, and `use_fp32_acc` is the `Fp32Acc`
+/// TEMPLATE parameter, part of [`Instantiation`] instead.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct FusionParams {
@@ -1125,12 +905,8 @@ pub struct FusionParams {
     pub rms_gamma: *mut c_void,
     /// `params.rms_eps` — `:651`.
     pub rms_eps: f32,
-    /// `params.weight_bias`, upstream's `= 0.f` default.
-    ///
-    /// **Not a field the archive's `custom_all_reduce.cu` set**, because the
-    /// header it compiled against did not have one. The vendored header does:
-    /// `0` is standard RMSNorm and `1` is Gemma/Qwen3.5's `(1 + gamma)`. A
-    /// `#[repr(C)]` mirror has to carry it whatever pie sets, and pie sets 0.
+    /// `params.weight_bias`, upstream's `= 0.f` default: `0` is standard
+    /// RMSNorm, `1` is Gemma/Qwen3.5's `(1 + gamma)`. pie always sets 0.
     pub weight_bias: f32,
     /// `params.scale_factor = nullptr` — `:652`.
     pub scale_factor: *mut f32,
@@ -1140,11 +916,8 @@ pub struct FusionParams {
     pub layout: SfLayout,
     /// `params.stream` — `:655`.
     ///
-    /// **Read by nothing on the device.** It is a `cudaStream_t` the host
-    /// launcher put into `cudaLaunchConfig_t`; here the stream is
-    /// `Ctx::stream()` and the field is carried because it is four bytes of
-    /// alignment and eight of padding in the middle of a struct whose layout
-    /// has to match.
+    /// Read by nothing on the device; carried only because the struct's
+    /// layout must match upstream's, padding included.
     pub stream: *mut c_void,
     /// `params.pattern` — `:656`.
     pub pattern: FusionPattern,
@@ -1195,7 +968,7 @@ impl FusionParams {
     }
 }
 
-// ── the geometry, which used to be two host launchers ────────────────────
+// ── the geometry ─────────────────────────────────────────────────────────
 
 /// One launch rectangle and the template-id that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1283,14 +1056,9 @@ pub fn fusion_geometry(
         per_rank + i32::from(tokens % nranks != 0)
     };
     // `:1659`, with `cluster_size == 1`, so the divide-then-multiply is the
-    // identity and this is `min(sm_count, cluster_num)`.
-    //
-    // The `.max(1)` is NOT upstream's and is one line of paranoia:
-    // `cluster_num` is at least 1 because `tokens > 0` is checked above, so
-    // the only way to reach zero is a device reporting no multiprocessors.
-    // Upstream would launch a zero-block grid there; `Ctx::launch` refuses one
-    // as `Refusal::Empty`, which would be a confusing way to hear about a
-    // broken driver.
+    // identity and this is `min(sm_count, cluster_num)`. The `.max(1)` is not
+    // upstream's: it guards a device reporting zero multiprocessors, which
+    // would otherwise launch a zero-block grid and hit `Refusal::Empty`.
     let sm_count = i32::try_from(multiprocessors).unwrap_or(i32::MAX);
     let grid = cluster_num.min(sm_count).max(1);
     Ok(Geometry {
@@ -1421,7 +1189,7 @@ pub fn plain_name_expression(world_size: i32, stage: Stage) -> Option<&'static s
     }
 }
 
-// ── the plane, which is the seam ─────────────────────────────────────────
+// ── the plane ─────────────────────────────────────────────────────────────
 
 /// The fusion plane's three facts, as a launch reads them.
 ///
@@ -1444,31 +1212,22 @@ pub struct FusionPlane {
 /// What the PLAIN reduction reads off the instance, which [`FusionPlane`]
 /// does not carry any of.
 ///
-/// # Why this is separate, and why it arrived late
-///
-/// The two kernels do not share an addressing scheme. The fused landing takes
-/// ONE pointer — `params.workspace`, a device array the constructor filled —
-/// and derives every peer address on the device. The plain kernels take three
-/// things the host has to hand over: the peer `Signal*` array by value, this
-/// rank's own `Signal*`, and a `RankData*` naming the eight peer addresses of
-/// the input's base allocation.
-///
-/// So a `Plane` carrying only `world_size`, `rank` and the fusion workspace
-/// was enough for the fused launcher and not for the plain one, and this is
-/// the widening. It is recorded because the gap was measured before it was
-/// closed: vendoring the headers alone would not have finished the plain arm.
+/// The two kernels do not share an addressing scheme: the fused landing
+/// derives every peer address on the device from one workspace pointer,
+/// while the plain kernels need the host to hand over the peer `Signal*`
+/// array, this rank's own `Signal*`, and a `RankData*` naming the input's
+/// eight peer addresses.
 ///
 /// # `rank_data` is PER CALL and the other three are not
 ///
-/// `signals`, `self_signal` and `fully_connected` are what the constructor
-/// established. `rank_data` is `buffers_[input]` — the slot
-/// `register_buffer` wrote for THIS input's base allocation — so the driver
-/// resolves it per fire and hands over null when the input was never
-/// registered, which is [`Decline::Unregistered`].
+/// `signals`, `self_signal` and `fully_connected` are set at construction.
+/// `rank_data` is `buffers_[input]` — the slot `register_buffer` wrote for
+/// THIS input's base allocation — so the driver resolves it per fire and
+/// hands over null when the input was never registered, which is
+/// [`Decline::Unregistered`].
 ///
-/// They travel together anyway, because a plane with three of the four is a
-/// plane no launch can use, and two `Option`s would make four states where
-/// there are two.
+/// They travel together anyway: a plane with three of the four is unusable,
+/// and two `Option`s would make four states where there are two.
 #[derive(Debug, Clone, Copy)]
 pub struct PeerPlane {
     /// `RankSignals::signals[8]` — `vllm_custom_all_reduce.cuh:66-68`, passed
@@ -1492,16 +1251,13 @@ pub struct PeerPlane {
 
 /// What a `CustomAllReduce` tells a launch about itself.
 ///
-/// The whole of what either body below reads off the instance, and the seam
-/// the descent is drawn on: the lifecycle stays in `driver-cuda`, which fills
-/// one of these per call.
+/// Everything either body below reads off the instance; the lifecycle stays
+/// in `driver-cuda`, which fills one of these per call.
 ///
-/// It carries no communicator, no IPC map and no registered-buffer set,
-/// because neither body needs one. `CustomAllReduce::can_handle` does need
-/// them — it walks the registered-buffer map and queries the stream's capture
-/// state — and that is exactly why `can_handle` stayed up while
-/// [`Plane::can_fuse_residual_rmsnorm`] came down: the two predicates read
-/// different things, and only one of them reads the plane alone.
+/// Carries no communicator, IPC map or registered-buffer set: neither body
+/// needs them. `CustomAllReduce::can_handle` does (it walks the
+/// registered-buffer map and queries the stream's capture state), which is
+/// why that check stays in `driver-cuda` rather than here.
 #[derive(Debug, Clone, Copy)]
 pub struct Plane {
     /// The group size.
@@ -1544,9 +1300,8 @@ impl Plane {
         if hidden != fusion.hidden {
             return Err(Decline::FusionHidden { hidden, want: fusion.hidden });
         }
-        // `:493`. The fusion plane is built for TP=2 only (`:308`), so this
-        // is unreachable from a constructed plane -- kept because the C++
-        // kept it and because it is the invariant, not a consequence.
+        // `:493`. Unreachable from a constructed plane (fusion is built only
+        // for TP=2, `:308`), kept because the C++ checked it explicitly.
         if self.world_size != 2 {
             return Err(Decline::FusionWorldSize { world_size: self.world_size });
         }
@@ -1561,47 +1316,142 @@ impl Plane {
 // ── the two symbols ──────────────────────────────────────────────────────
 
 /// `comm::all_reduce_bf16` — `custom_all_reduce.cu:603-621`, the plain bf16
-/// in-place all-reduce.
+/// in-place all-reduce, **and NCCL when the P2P reduction declines.**
+///
+/// # The fallback is here and not in an arm
+///
+/// It was `bind/arms/comm.rs`'s: the arm matched on [`AllReduce::Declined`]
+/// and called `dist::all_reduce_bf16_out` itself. That is a dispatch, and a
+/// dispatch belongs to the launcher — kilimanjaro3 §3.9, *"inside
+/// `all_reduce_bf16`, which already knows why it declined"* — with the
+/// precedent one file over: `norm::rmsnorm_bf16_with_fp16` falls through to
+/// `unstrided_bf16` in its own body, and a launcher calling a launcher is
+/// ordinary.
+///
+/// What the arm keeps is the part a `Cx` cannot answer: whether THIS RANK has
+/// a plane at all. `fire::all_reduce::admitted` is a driver query over the
+/// resident `CustomAllReduce`, it takes `&mut`-owned state to build one, and
+/// its answer arrives as a [`Decline`] BEFORE any `Ctx` exists to carry it —
+/// so the arm still asks, and hands the decline to
+/// [`fall_back_out_of_place`], which is this file's and is the same policy
+/// this function applies to its own.
+///
+/// [`plain_all_reduce_bf16`] is the P2P half alone, and it is PRIVATE: a
+/// public one would be an invitation to call the reduction without the
+/// fallback, which is the arrangement §3.9 is undoing.
+///
+/// # The one consequence, named because it is latent rather than absent
+///
+/// `fire/all_reduce.rs`'s handle-shaped `all_reduce_bf16` pushes the input
+/// onto `graph_unreg_buffers` when `capturing && fired == Launched`, and
+/// `plane_for` indexes a `RankData` SLOT by how many buffers have been
+/// noted — so a note for a launch the P2P path never made would shift every
+/// later slot by one. A fallback that SUCCEEDED would now report `Launched`
+/// to that caller.
+///
+/// It cannot happen today: `dist::all_reduce_bf16_out` is `Err(no_nccl(..))`
+/// unconditionally, its own `# Errors` says *"Always"*, and that function has
+/// no caller at all (`fire/all_reduce.rs:1183` — *"Neither function below has
+/// a caller today"*). The day `cudarc`'s `nccl` feature is on, that push has
+/// to ask a narrower question than `== Launched`, and this paragraph is where
+/// the question is written down.
 ///
 /// `count` is an ELEMENT count, not bytes (`custom_all_reduce.hpp:100`).
 ///
-/// # The line that has now crossed
-///
-/// `impl_->allreduce<__nv_bfloat16>(stream, in, out, count, 36, 512)`. The
-/// two constants are [`MAX_BLOCKS`] and [`ALL_REDUCE_THREADS`]; `36` is not a
-/// choice, it is `vllm_custom_all_reduce.cuh:46`'s `kMaxBlocks` and the first
-/// dimension of the `Signal` counters, so a larger grid would index off the
-/// end of a 3,456-byte struct.
-///
-/// `(int)count` at `:618` was a silent narrowing. It is
-/// [`Decline::Vector`]'s and [`plain_geometry`]'s `i32::try_from` now, and it
-/// still cannot bite: `can_handle` refuses above `max_bytes`, 8 MiB by
-/// default, which is 4 Mi bf16 elements.
-///
-/// # What the kernel reads, and what it does not
-///
-/// **`input` is not a kernel argument.** The four peer addresses come from
-/// `*rank_data`, which `register_buffer` wrote at the input's BASE
-/// allocation, and the kernel indexes them itself. `input` is used here only
-/// to be checked for null — upstream used it to look the slot up, which the
-/// driver does before the call. That asymmetry is upstream's and it is worth
-/// knowing: registering the base and passing an offset pointer would reduce
-/// the wrong bytes.
-///
-/// Nothing is appended to the driver's `graph_unreg_buffers` from here, and
-/// that stays deliberate: a deferred registration for a launch that declined
-/// would bind the next real one to the wrong slot. The driver appends after
-/// [`AllReduce::Launched`].
-///
 /// # Safety
 ///
-/// `input` and `output` must address at least `count` live bf16 elements, and
-/// `plane` must describe a live P2P plane whose peers are mapped for the
-/// duration of the launch. **Nothing here checks either.**
+/// `input` and `output` must address at least `count` live bf16 elements.
+/// Nothing here checks that. The plane's own obligation — live peers, mapped
+/// for the duration of the launch — is [`Ctx::with_comm`]'s `# Safety`.
 #[must_use]
 pub fn all_reduce_bf16(
     ctx: &Ctx,
-    plane: Plane,
+    input: *const c_void,
+    output: *mut c_void,
+    count: usize,
+) -> AllReduce {
+    match plain_all_reduce_bf16(ctx, input, output, count) {
+        AllReduce::Launched => AllReduce::Launched,
+        AllReduce::Declined(why) => fall_back_out_of_place(ctx, input, output, count, why),
+    }
+}
+
+/// `dist::all_reduce_bf16_out`, tried because the P2P reduction declined.
+///
+/// The NCCL arm with exactly this operand shape — one input, one separate
+/// output, the sum over the group — so a fallback that succeeds produces the
+/// right answer and the caller is none the wiser. It refuses today:
+/// `cudarc`'s `nccl` feature is off, so no binding exists to call.
+///
+/// Either way the caller never gets [`AllReduce::Launched`] with this rank's
+/// unreduced partial sitting in the destination, which is the failure this
+/// path prevents.
+///
+/// `why` is the decline that sent us here, and it decides which of two
+/// absences the caller is told about when NCCL refuses as well —
+/// [`Decline::FellBack`] carries the argument. `pub` because the driver's
+/// plane query declines before a plane-bearing `Ctx` exists, so
+/// `bind/arms/comm.rs` reaches this with `admitted`'s decline in hand; the
+/// policy is stated once, here.
+///
+/// # Safety
+///
+/// [`all_reduce_bf16`]'s, unchanged: `input` and `output` must address at
+/// least `count` live bf16 elements. No plane is needed — this arm reaches no
+/// peer memory.
+#[must_use]
+pub fn fall_back_out_of_place(
+    ctx: &Ctx,
+    input: *const c_void,
+    output: *mut c_void,
+    count: usize,
+    why: Decline,
+) -> AllReduce {
+    let elems = i64::try_from(count).unwrap_or(i64::MAX);
+    match crate::dist::all_reduce_out_of_place(ctx, input, output, elems) {
+        // If NCCL ever lands, this is the whole of the fallback: same
+        // operands, same semantics.
+        Ok(()) => AllReduce::Launched,
+        Err(nccl) => AllReduce::Declined(match why {
+            Decline::AboveCrossover { .. }
+            | Decline::Bytes { .. }
+            | Decline::NotFullyConnected { .. } => Decline::FellBack(nccl),
+            structural => structural,
+        }),
+    }
+}
+
+/// The P2P half of [`all_reduce_bf16`], with no fallback under it.
+///
+/// `impl_->allreduce<__nv_bfloat16>(stream, in, out, count, 36, 512)`: `36`
+/// and `512` are [`MAX_BLOCKS`] and [`ALL_REDUCE_THREADS`]. `36` is
+/// `vllm_custom_all_reduce.cuh:46`'s `kMaxBlocks`, the first dimension of the
+/// `Signal` counters, so a larger grid would index off the end of a
+/// 3,456-byte struct.
+///
+/// `(int)count` at `:618` was a silent narrowing; it is [`Decline::Vector`]'s
+/// and [`plain_geometry`]'s `i32::try_from` now, and still cannot bite:
+/// `can_handle` refuses above `max_bytes`, 8 MiB by default, 4 Mi bf16
+/// elements.
+///
+/// **`input` is not a kernel argument.** The four peer addresses come from
+/// `*rank_data`, which `register_buffer` wrote at the input's BASE
+/// allocation; `input` is checked here only for null. Registering the base
+/// and passing an offset pointer would reduce the wrong bytes.
+///
+/// Nothing is appended to the driver's `graph_unreg_buffers` from here: a
+/// deferred registration for a declined launch would bind the next real one
+/// to the wrong slot. The driver appends after [`AllReduce::Launched`].
+///
+/// The plane comes from [`Ctx::with_comm`], not a parameter here; an absent
+/// one is [`Decline::NoInstance`].
+///
+/// # Safety
+///
+/// [`all_reduce_bf16`]'s.
+#[must_use]
+fn plain_all_reduce_bf16(
+    ctx: &Ctx,
     input: *const c_void,
     output: *mut c_void,
     count: usize,
@@ -1613,6 +1463,12 @@ pub fn all_reduce_bf16(
     if input.is_null() {
         return AllReduce::Declined(Decline::NullInput);
     }
+    // A context with no plane is a rank with no custom all-reduce, which is
+    // the `car == nullptr` the header threw on -- routed, not refused, by
+    // `bind/arms/comm.rs`.
+    let Ok(plane) = ctx.comm() else {
+        return AllReduce::Declined(Decline::NoInstance);
+    };
     // The moved-from state the C++ called `!impl_`.
     if plane.peers.self_signal.is_null() {
         return AllReduce::Declined(Decline::NotInitialised);
@@ -1673,27 +1529,25 @@ pub fn all_reduce_bf16(
 /// the fused all-reduce + residual add + RMSNorm.
 ///
 /// The C++ threw when `can_fuse_residual_rmsnorm` said no (`:633-635`); that
-/// throw is the [`Decline`] the query returns, unchanged, which is the whole
-/// point of the query returning one.
+/// throw is the [`Decline`] the query returns, unchanged.
 ///
 /// # What crosses
 ///
 /// [`FusionParams`] by value, and nothing else: every peer address the kernel
 /// touches is derived on the device from `params.workspace`, the `3*world+1`
-/// pointer array the constructor built. That is why this arm needed no
-/// [`PeerPlane`] and the plain one did.
+/// pointer array the constructor built — no [`PeerPlane`] needed.
 ///
 /// # Safety
 ///
 /// `input`, `residual_inout` and `norm_out` must address at least
-/// `tokens * hidden` live bf16 elements and `rms_gamma` at least `hidden`;
-/// `plane.fusion.workspace` must be the array the constructor filled, with
-/// every peer's Lamport buffer mapped for the duration of the launch.
+/// `tokens * hidden` live bf16 elements and `rms_gamma` at least `hidden`.
+/// The plane's obligation — `plane.fusion.workspace` mapped with every peer's
+/// Lamport buffer for the duration of the launch — is [`Ctx::with_comm`]'s
+/// `# Safety`.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn all_reduce_residual_rmsnorm_bf16(
     ctx: &Ctx,
-    plane: Plane,
     input: *const c_void,
     residual_inout: *mut c_void,
     rms_gamma: *const c_void,
@@ -1702,6 +1556,10 @@ pub fn all_reduce_residual_rmsnorm_bf16(
     hidden: i32,
     eps: f32,
 ) -> AllReduce {
+    // As in `all_reduce_bf16`: no plane is no instance.
+    let Ok(plane) = ctx.comm() else {
+        return AllReduce::Declined(Decline::NoInstance);
+    };
     if let Err(decline) = plane.can_fuse_residual_rmsnorm(tokens, hidden) {
         return AllReduce::Declined(decline);
     }
@@ -1795,14 +1653,15 @@ pub fn all_reduce_residual_rmsnorm_bf16(
 /// The P2P collectives' two symbols, declared so a sharded model text
 /// resolves.
 ///
-/// `driver_bound!` and not `routine!`: a collective takes a COMMUNICATOR, and
-/// a communicator is a property of the deployment's process group that no
-/// trace statement carries or could. The `dist::` three say the same thing
-/// about NCCL; the difference between the two families is that these have
-/// device text and those have nothing at all.
+/// `driver_bound!`, not `routine!`: a collective takes a COMMUNICATOR, a
+/// property of the deployment's process group that no trace statement can
+/// carry.
 ///
-/// Both `whole`, and the fused landing's `in_place` pair — the module header
-/// carries both arguments.
+/// Both `whole`: every rank must enter the same collective the same number
+/// of times, so a row window that split one rank's launch and not another's
+/// would deadlock rather than compute a wrong answer. The fused landing also
+/// states `in_place = &[(0, 1)]`: the residual is updated in place and the
+/// normed activation is the other result.
 pub static ROUTINES: &[Routine] = &[
     driver_bound!(all_reduce_bf16, whole),
     driver_bound!(all_reduce_residual_rmsnorm_bf16, whole, in_place = &[(0, 1)]),
@@ -1825,12 +1684,9 @@ mod tests {
     /// A plane sized to admit the one point pie reaches, with no live device
     /// memory behind any of it.
     ///
-    /// Every field is non-null where a null would be refused BEFORE the
-    /// launch, because a test whose subject is a shape check must not be
-    /// passing for want of a pointer. Nothing here is dereferenced on the
-    /// host, and nothing in this module launches on the tests' path except
-    /// `the_bodies_agree_with_can_launch`, which is why that one is the only
-    /// test with a `#[cfg]`-shaped caveat in its own doc.
+    /// Every field is non-null where a null would be refused before the
+    /// launch, since a shape-check test must not pass for want of a pointer.
+    /// Nothing here is dereferenced on the host.
     fn plane() -> Plane {
         Plane {
             world_size: REACHED.nranks,
@@ -1850,21 +1706,14 @@ mod tests {
     }
 
     /// [`CAN_LAUNCH`] is what a DEPLOYMENT reads to decide whether a
-    /// tensor-parallel rank can combine its shards, so it must not be able to
-    /// drift from what the bodies actually do.
+    /// tensor-parallel rank can combine its shards, so it must not drift from
+    /// what the bodies actually do.
     ///
-    /// **This test does not launch and cannot**, which is the shape the flip
-    /// to `true` forced. While `CAN_LAUNCH` was `false` both bodies answered
-    /// `Decline::NoDeviceText` on a resolved point and the test called them.
-    /// Calling them now would reach `Ctx::launch`, which compiles device text
-    /// and needs a GPU, so the test would either need one or would pass by
-    /// finding a refusal from the wrong layer.
-    ///
-    /// So what it asserts is the property that remains checkable without a
-    /// device, and it is the one that matters: **`CAN_LAUNCH` is true exactly
-    /// when there is a template-id for the reached point.** A body cannot
-    /// launch without one, and no other decline in either body is a statement
-    /// about this repository — every one of them is a statement about the
+    /// Does not launch (that needs a GPU and device text); it asserts the
+    /// property that stays checkable without one: **`CAN_LAUNCH` is true
+    /// exactly when there is a template-id for the reached point.** A body
+    /// cannot launch without one, and no other decline in either body is a
+    /// statement about this repository — every one is a statement about the
     /// call. `every_instantiation_compiles` is the other half, on a box with
     /// NVRTC.
     #[test]
@@ -1888,28 +1737,28 @@ mod tests {
     ///
     /// The two bodies check their shapes before they reach `Ctx::launch`, so
     /// a call that is going to be refused is refused on a box with no GPU —
-    /// which is what makes `bind/arms/comm.rs`' fallback to NCCL a decision
-    /// taken before any device work.
+    /// which is what makes [`fall_back_out_of_place`] a decision taken before
+    /// any device work. The structural declines this test mints
+    /// (`NullInput`, `NoInstance`) are exactly the ones that path forwards
+    /// unchanged rather than reporting as NCCL's, so moving the fallback into
+    /// this file changed neither what these calls answer nor when.
     #[test]
     fn a_shape_refusal_needs_no_device() {
-        // SAFETY: the null stream is CUDA's legal default, and nothing here
-        // launches -- every call below is refused before `Ctx::launch`.
-        let ctx = unsafe { Ctx::on(core::ptr::null_mut()) };
+        // SAFETY: the null stream is CUDA's legal default, the plane's
+        // pointers are dangling and never dereferenced on the host, and
+        // nothing here launches -- every call below is refused before
+        // `Ctx::launch`.
+        let ctx = unsafe { Ctx::on(core::ptr::null_mut()).with_comm(plane()) };
 
-        let null_input = all_reduce_bf16(
-            &ctx,
-            plane(),
-            core::ptr::null(),
-            core::ptr::dangling_mut(),
-            4096,
-        );
+        let null_input = all_reduce_bf16(&ctx, core::ptr::null(), core::ptr::dangling_mut(), 4096);
         assert_eq!(null_input, AllReduce::Declined(Decline::NullInput));
 
         let mut unregistered = plane();
         unregistered.peers.rank_data = core::ptr::null_mut();
+        // SAFETY: as above.
+        let unregistered = unsafe { Ctx::on(core::ptr::null_mut()).with_comm(unregistered) };
         let refused = all_reduce_bf16(
-            &ctx,
-            unregistered,
+            &unregistered,
             core::ptr::dangling(),
             core::ptr::dangling_mut(),
             4096,
@@ -1920,7 +1769,6 @@ mod tests {
         // and is refused before anything is computed.
         let fused = all_reduce_residual_rmsnorm_bf16(
             &ctx,
-            plane(),
             core::ptr::dangling(),
             core::ptr::dangling_mut(),
             core::ptr::dangling(),
@@ -1932,6 +1780,37 @@ mod tests {
         assert_eq!(
             fused,
             AllReduce::Declined(Decline::FusionHidden { hidden: 2048, want: 4096 })
+        );
+    }
+
+    /// A `Ctx` with no plane on it is a rank with no custom all-reduce, and
+    /// both bodies say so in the one word a caller can route on: this state
+    /// and `custom_all_reduce.hpp:170`'s null `car` must land on the same
+    /// [`Decline::NoInstance`], not `NotInitialised` or a leaked `Ctx::comm`
+    /// `Refusal`.
+    #[test]
+    fn a_context_with_no_plane_is_no_instance() {
+        // SAFETY: the null stream is CUDA's legal default and nothing here
+        // launches -- both calls are refused for want of a plane.
+        let ctx = unsafe { Ctx::on(core::ptr::null_mut()) };
+
+        assert_eq!(
+            all_reduce_bf16(&ctx, core::ptr::dangling(), core::ptr::dangling_mut(), 4096),
+            AllReduce::Declined(Decline::NoInstance)
+        );
+
+        assert_eq!(
+            all_reduce_residual_rmsnorm_bf16(
+                &ctx,
+                core::ptr::dangling(),
+                core::ptr::dangling_mut(),
+                core::ptr::dangling(),
+                core::ptr::dangling_mut(),
+                1,
+                4096,
+                1e-6,
+            ),
+            AllReduce::Declined(Decline::NoInstance)
         );
     }
 
@@ -1950,10 +1829,10 @@ mod tests {
     /// The instantiation set is the pruned cross product, point for point.
     ///
     /// The arms are 24 hand-written strings and the number they must come to
-    /// is derived from four other constants, so this is the assertion that
-    /// keeps a hand-written set from silently becoming a different lattice
-    /// than the one the module's header describes. Counting DISTINCT ids is
-    /// what makes it real: three arms that returned one string would cover the
+    /// is derived from four other constants, so this test keeps a
+    /// hand-written set from silently becoming a different lattice than
+    /// [`AOT_POINTS_AFTER_PRUNING`] states. Counting DISTINCT ids is what
+    /// makes it real: three arms that returned one string would cover the
     /// product and compile one kernel.
     #[test]
     fn the_instantiation_table_is_the_pruned_cross_product() {

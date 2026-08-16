@@ -1,85 +1,31 @@
-//! §3.2 — [`Abi`], the one place a crossing type is spelled.
+//! §3.2 — [`Abi`]: the one place a crossing type's C++ spelling, marshalling
+//! tag, and nullability are written, so the typecheck translation unit, the
+//! argument buffer, and the device declaration cannot drift from each other.
 //!
-//! # The two-formats-one-width hazard
+//! `bf16` and `f16` are both sixteen-bit `unsigned short` at the C ABI but
+//! mean different numbers; keeping them as distinct Rust types (`*mut bf16`
+//! vs `*mut f16`) makes confusing them a type error instead of a kernel that
+//! runs and silently produces wrong numbers.
 //!
-//! `bf16` and `f16` are both sixteen bits, both `unsigned short` to any C
-//! ABI, and mean entirely different numbers. Under the row world they were
-//! two spellings of `Ty` (`Ty::Bf16s`, `Ty::F16s`) that a `void*` operand
-//! (`Ty::BufMut`) erased, and the compiler could not tell them apart because
-//! at the ABI they ARE the same. A row that named the wrong one produced a
-//! kernel that ran, produced numbers, and produced wrong numbers.
+//! [`Abi`] is a trait, not an enum: adding a crossing type is one impl next
+//! to the kernel that needs it, not a new variant plus every `match`.
 //!
-//! Here they are distinct Rust types. `*mut bf16` and `*mut f16` are not
-//! interchangeable, so the hazard becomes the type system's DEFAULT rather
-//! than a rule someone has to remember. That is the whole reason these two
-//! unit structs exist.
+//! A nullable pointer is spelled `Option<NonNull<T>>` so "does this accept
+//! null" is checked by the type, not a runtime `bool` flag.
 //!
-//! # An open set, not a closed enum
+//! [`Abi::arg`] takes `&self`, not `self`: a by-value aggregate answers with
+//! a pointer into the receiver, so the receiver must be the caller's own
+//! binding and not a value moved into (and dangling after) `arg`'s frame.
 //!
-//! `kernels::Ty` is an enum: adding a crossing type means adding a variant
-//! and finding every `match`. [`Abi`] is a trait: adding a crossing type
-//! means writing one impl, next to the kernel that needed it, and nothing
-//! else in the tree changes. §3.2's word for this is "open set", and it is
-//! why the typecheck emitter below can spell types the old
-//! `emit_device_typecheck` had to refuse.
-//!
-//! # Nullable pointers
-//!
-//! A launcher that accepts a null and means something by it says so in its
-//! Rust type: `Option<NonNull<T>>`, whose niche makes it the same word at
-//! the ABI and whose absence is unmistakable at the call site. The row
-//! world spelled this `Operand::nullable: bool` — a fact "not checkable by
-//! the C++ compiler", as `kernels::Operand`'s own doc says, because every
-//! pointer accepts null. It is checkable by this one.
-//!
-//! # By-value aggregates, and why [`Abi::arg`] takes `&self`
-//!
-//! A `__global__` that takes a struct **by value** — XQA's
-//! `KVCacheList<true>` at `xqa/mha.cuh:2804`, FA2's `__grid_constant__`
-//! params — crosses as [`ArgValue::Bytes`](crate::jit::ArgValue::Bytes),
-//! which is a borrowed `(ptr, len)`. That is the reason this trait's one
-//! method takes `&self` rather than `self`:
-//!
-//! > `fn arg(self) -> ArgValue` moves the value into `arg`'s own frame,
-//! > takes its address, and returns. The address is dangling before the
-//! > caller sees it. For a scalar that is invisible because the value is
-//! > copied into the cell; for an aggregate it is a launch reading a dead
-//! > stack frame, which is the exact failure `northstar.md` §5.1 predicted
-//! > this variant's first caller would meet — *"a wrong bypass is a launch
-//! > with a garbage struct, not a type error"*.
-//!
-//! With `&self`, the borrow is of the `raw::` stub's own parameter binding,
-//! which lives across the `fire` call, and `Args::bind` copies out of it
-//! before returning. `Abi: Copy`, so `&self` costs a scalar impl nothing.
-//!
-//! **What a by-value aggregate is checked by**, since no `Ty` can name it:
-//!
-//! 1. [`by_value!`](crate::by_value) asserts the Rust mirror's `size_of`,
-//!    `align_of` and every `offset_of` against numbers **measured out of
-//!    NVRTC's PTX**, in `const` context, so a drifted mirror is a Rust
-//!    compile error.
-//! 2. [`typecheck_tu`] emits the same numbers as C++ `static_assert`s over
-//!    the header's own declaration, so a drifted *header* is a C++ compile
-//!    error. `tests/typecheck_tu.rs` compiles one per root that declares an
-//!    aggregate.
-//!
-//! The two are the same measurement asserted from both sides, and that is
-//! stronger than the tag it replaces: `Ty` could never have said anything
-//! about a field offset.
-//!
-//! **What is NOT checked, and why not yet.** A third check belongs here —
-//! comparing a `__global__`'s whole parameter list against the [`Abi::CPP`]
-//! of the routine that launches it, so that an aggregate passed where the
-//! kernel takes a pointer is a compile error rather than a garbage read.
-//! Every piece of it exists: [`Abi::CPP`] per type, and
-//! [`Routine::spelling`](kernels::routine::Routine::spelling) per routine,
-//! derived from the signature. What is missing is the PAIRING. A routine
-//! names its instantiation inside its body rather than in data, so nothing
-//! can ask a routine which template-id it launches; and even paired, the
-//! `&[..]` list a body hands `Ctx::launch` is not its own parameter list,
-//! because bodies compute derived arguments. Making this reachable wants
-//! `Ctx::launch` generic over a tuple of [`Abi`] types, so the spellings
-//! derive at the launch site where the pairing already exists.
+//! A by-value aggregate's layout is checked from both sides:
+//! [`by_value!`](crate::by_value) asserts the Rust mirror's
+//! `size_of`/`align_of`/`offset_of` against NVRTC-measured numbers in
+//! `const` context (a Rust compile error on drift), and [`typecheck_tu`]
+//! emits the same numbers as C++ `static_assert`s over the header's own
+//! declaration (a C++ compile error on drift, `tests/typecheck_tu.rs`). Not
+//! yet checked: a `__global__`'s whole parameter list against the launching
+//! routine's [`Abi::CPP`] list — nothing pairs a routine with the template
+//! instantiation it launches.
 
 use core::ffi::c_void;
 use core::ptr::NonNull;
@@ -188,39 +134,35 @@ pub struct fp8_e4m3(pub u8);
 
 /// A device element type, as a routine spells it into a template-id.
 ///
-/// # Why a trait and not a `match` on a runtime tag
-///
-/// A routine's element type is a fact about the STATEMENT, known where the
-/// routine is declared and nowhere else. Before this it was written into the
-/// template-id by hand — `qwen_gdn_qk_norm<..pie::bf16, 128>` — once per
-/// launch, and the Rust `fn` was named `_bf16` to say the same thing a third
-/// time. The three could disagree and nothing compared them.
-///
-/// A body generic over `T: Elem` states it once. `ROUTINES` names the
-/// instantiation, which is the one place the choice belongs: a trace asks for
-/// `ssm::qwen_gdn_post_conv_prep_bf16`, and the row that answers is the row
-/// that says `::<bf16, 128>`.
-///
-/// # The spelling is the C++ one, absolutely qualified
-///
-/// NVRTC resolves a name expression in the translation unit's own scope, and
-/// the roots here are headers included into an empty unit — so a relative
-/// spelling has nothing to be relative to. Every `CPP` below is what
-/// `nvrtcAddNameExpression` is handed, character for character.
-pub trait Elem {
+/// A body generic over `T: Inst` states its element type once; `ROUTINES`
+/// names the instantiation. Every `CPP` is fully qualified (e.g.
+/// `::pie::bf16`) because NVRTC resolves a name expression in the
+/// translation unit's own empty scope, where a relative spelling has
+/// nothing to be relative to.
+pub trait Inst {
     /// How the device text spells this type.
     const CPP: &'static str;
 }
 
-impl Elem for bf16 {
+// RENAMED FROM `Elem`, AND THE RENAME IS THE POINT. This trait answers *"how
+// does the device text spell this type"* -- a C++ INSTANTIATION -- and two of
+// its implementors, `ssm_f32` and `quant_f32`, are zero-sized structs that
+// exist only to pick a template argument. Nothing points at them.
+//
+// `kernels::Elem` is the other half: what a `*const`/`*mut` may ADDRESS, with
+// the `Ty` each direction binds as. F3 spends a wrapper's type parameter on
+// that one, so it needed the name, and one word over two mechanisms is the
+// `Weight`/`Bank` collision this tree already files as a defect.
+
+impl Inst for bf16 {
     const CPP: &'static str = "::pie::bf16";
 }
 
-impl Elem for f16 {
+impl Inst for f16 {
     const CPP: &'static str = "::pie::f16";
 }
 
-impl Elem for fp8_e4m3 {
+impl Inst for fp8_e4m3 {
     const CPP: &'static str = "::pie::fp8_e4m3";
 }
 
@@ -235,7 +177,7 @@ impl Elem for fp8_e4m3 {
 #[repr(transparent)]
 pub struct u16_(pub u16);
 
-impl Elem for u16_ {
+impl Inst for u16_ {
     const CPP: &'static str = "::pie::u16";
 }
 
@@ -251,7 +193,7 @@ impl Elem for u16_ {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ssm_f32;
 
-impl Elem for ssm_f32 {
+impl Inst for ssm_f32 {
     const CPP: &'static str = "::pie::ssm::f32";
 }
 
@@ -260,7 +202,7 @@ impl Elem for ssm_f32 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ssm_state_bf16;
 
-impl Elem for ssm_state_bf16 {
+impl Inst for ssm_state_bf16 {
     const CPP: &'static str = "::pie::ssm::state_bf16";
 }
 
@@ -270,7 +212,7 @@ impl Elem for ssm_state_bf16 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct quant_f32;
 
-impl Elem for quant_f32 {
+impl Inst for quant_f32 {
     const CPP: &'static str = "::pie::quant::f32";
 }
 
@@ -337,28 +279,11 @@ scalar_abi!(usize, "std::size_t", Usize, Usize);
 
 /// `__nv_fp8_interpretation_t`, as the kernels take it.
 ///
-/// **A newtype rather than `u32`, and `scalar_abi!` cannot spell it.** That
-/// macro writes `ArgValue::$arg(*self)`, which requires the Rust type to *be*
-/// the payload; here the payload is the field. Two lines of the macro's body
-/// would have to become a conversion, and the macro is right not to have one:
-/// every other scalar in this list is its own payload, and a macro that
-/// admitted a conversion would stop proving that.
-///
-/// # Why not `u32`
-///
-/// `u32` compiles, binds, and launches. `Args::bind` passes because
-/// `Ty::U32` and `Ty::Fp8Kind` both marshal four bytes into eight, and the
-/// only thing that would notice is [`typecheck_tu`], which compares
-/// `unsigned int` against `::__nv_fp8_interpretation_t` and is the one reader
-/// that can tell them apart. **That is §3.2's bypass exactly** — two formats
-/// at one width, distinguished by nothing the binder checks — and the whole
-/// argument for `Abi::CPP` existing beside `Abi::TY` is that the spelling is
-/// the check.
-///
-/// `kernels::Ty::cpp` has spelled it `::__nv_fp8_interpretation_t` since it
-/// was written, and `kernels-cuda::abi:446` records the measurement that
-/// makes the four bytes safe: the enum is four bytes wide, asserted in the
-/// generated typecheck rather than assumed.
+/// A newtype and not `u32`: `scalar_abi!` requires the Rust type to *be* the
+/// `ArgValue` payload, and here the payload is the field, not the wrapper.
+/// `u32` would also compile and bind (`Ty::U32`/`Ty::Fp8Kind` both marshal
+/// four bytes) — only [`typecheck_tu`], comparing `unsigned int` against
+/// `::__nv_fp8_interpretation_t`, would catch the swap.
 #[allow(non_camel_case_types)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(transparent)]
@@ -380,17 +305,20 @@ impl Abi for fp8_kind {
 
 crate::arg_via_abi!(fp8_kind);
 
-// No scalar `u8`, and not an oversight: `Ty` has no general byte tag — the
-// row world only ever crossed a scalar byte as a semantic enum (`KvScheme`,
-// `KvDType`, both checked against `ArgValue::U8`) — and no fn-world kernel
-// takes one. An open set adds the impl with its first kernel, under
-// whichever tag is honest for it, rather than minting a near-miss here.
+// No scalar `u8` impl: `Ty` has no general byte tag and no fn-world kernel
+// needs one yet; the open set adds it with that kernel, not speculatively.
 
 /// One pointer impl: `*const T` and `*mut T` for one pointee.
 ///
-/// `$cpp` is the WHOLE type including the `const` and the star, because the
-/// typecheck TU compares whole parameter types and a `const` in the wrong
-/// place is exactly the drift it is there to catch.
+/// `$cpp` spells the WHOLE type, `const` and star included, because the
+/// typecheck TU compares whole parameter types.
+///
+/// `unpack` accepts a [`Region`] as well as a bare [`Ptr`]: the binder mints
+/// a `Region` (address plus shape) for every resolved operand, and a bare
+/// pointer type here takes just the address, dropping the shape.
+///
+/// [`Region`]: crate::jit::ArgValue::Region
+/// [`Ptr`]: crate::jit::ArgValue::Ptr
 macro_rules! ptr_abi {
     ($pointee:ty, $const_cpp:literal, $const_ty:ident, $mut_cpp:literal, $mut_ty:ident) => {
         impl Abi for *const $pointee {
@@ -401,7 +329,10 @@ macro_rules! ptr_abi {
             }
             fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
                 match value {
-                    crate::jit::ArgValue::Ptr(p) => Ok(p.cast::<$pointee>().cast_const()),
+                    crate::jit::ArgValue::Ptr(p)
+                    | crate::jit::ArgValue::Region { ptr: p, .. } => {
+                        Ok(p.cast::<$pointee>().cast_const())
+                    }
                     _ => Err(wrong_kind(at, Ty::$const_ty)),
                 }
             }
@@ -414,7 +345,8 @@ macro_rules! ptr_abi {
             }
             fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
                 match value {
-                    crate::jit::ArgValue::Ptr(p) => Ok(p.cast::<$pointee>()),
+                    crate::jit::ArgValue::Ptr(p)
+                    | crate::jit::ArgValue::Region { ptr: p, .. } => Ok(p.cast::<$pointee>()),
                     _ => Err(wrong_kind(at, Ty::$mut_ty)),
                 }
             }
@@ -431,7 +363,10 @@ macro_rules! ptr_abi {
             }
             fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
                 match value {
-                    crate::jit::ArgValue::Ptr(p) => Ok(NonNull::new(p.cast::<$pointee>())),
+                    crate::jit::ArgValue::Ptr(p)
+                    | crate::jit::ArgValue::Region { ptr: p, .. } => {
+                        Ok(NonNull::new(p.cast::<$pointee>()))
+                    }
                     _ => Err(wrong_kind(at, Ty::$mut_ty)),
                 }
             }
@@ -448,7 +383,8 @@ macro_rules! ptr_abi {
             }
             fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
                 match value {
-                    crate::jit::ArgValue::Ptr(p) => {
+                    crate::jit::ArgValue::Ptr(p)
+                    | crate::jit::ArgValue::Region { ptr: p, .. } => {
                         Ok(MaybeConst(NonNull::new(p.cast::<$pointee>())))
                     }
                     _ => Err(wrong_kind(at, Ty::$const_ty)),
@@ -464,27 +400,53 @@ macro_rules! ptr_abi {
     };
 }
 
-// The spellings are `kernels::Ty::cpp()`'s, so a row and a declaration
-// describing the same parameter produce the same typecheck line.
-//
-// THAT SENTENCE BECAME TRUE OF THE TWO SIXTEEN-BIT FORMATS HERE, and it had
-// been false of them since this file was written. `CPP` for `*mut bf16` has
-// always been `::pie::bf16*`, and the tag beside
-// it said `Ty::BufMut`, whose `cpp()` is `void*` -- so a row and a declaration
-// describing one destination produced two different lines, and
-// `abi::self_describing` declined the `void*` one outright because every
-// object pointer converts to it and an assertion against it holds for every
-// possible kernel.
-//
-// Measured over `unit!`'s declarations at `d737aad29`, with each row's own
-// `where [T = …]` substituted first: 266 fn-world rows at 2207 operand
-// positions, of which **172 rows carry a written sixteen-bit destination at
-// 269 positions** -- 252 bf16 (`*mut bf16` 245, `Option<NonNull<bf16>>` 7) and
-// 17 f16 (`*mut f16` 11, `Option<NonNull<f16>>` 6). All 269 were `void*` and
-// none was asserted. `tests/device_typecheck_types.rs`'s
-// `the_written_sixteen_bit_positions_are_two_hundred_and_sixty_nine`
-// re-derives that number from `unit::rows()` at run time rather than trusting
-// this comment.
+/// `<*const E as Abi>::TY` and `<E as kernels::Elem>::TY_CONST` are the same
+/// number, asserted where both are visible.
+///
+/// # Why a second macro and not a line inside `ptr_abi!`
+///
+/// THE ORPHAN RULE SPLIT THE MAPPING AND THIS IS WHAT REJOINS IT.
+/// `impl kernels::Elem for f32` cannot be written in this crate -- neither
+/// the trait nor the type is local -- so the primitive pointees are
+/// implemented in `kernels/src/routine.rs` and this crate holds only their
+/// `Abi`. Two copies of one mapping is the defect `Inst` exists to remove, so
+/// the copies are made to disagree LOUDLY: every invocation below fails to
+/// compile the moment a `ptr_abi!` line and its `Inst` impl name different
+/// `Ty`s.
+///
+/// Not every `ptr_abi!` pointee has an `Inst`, which is why this is opt-in.
+/// `*const c_void` is a pointee whose own pointee is a pointer -- the
+/// `void**` shape -- and F3 is about what a `*const`/`*mut` addresses, not
+/// about arrays of addresses. Those lines get `Abi` and no `Inst`, and a
+/// signature cannot name one as an element.
+///
+/// `as u8` because `Ty` is not `PartialEq` in a const context; the
+/// discriminants are what the ABI actually binds.
+macro_rules! elem_agrees {
+    ($($pointee:ty),* $(,)?) => {
+        $(const _: () = {
+            assert!(<*const $pointee as Abi>::TY as u8 == <$pointee as kernels::Elem>::TY_CONST as u8);
+            assert!(<*mut $pointee as Abi>::TY as u8 == <$pointee as kernels::Elem>::TY_MUT as u8);
+        };)*
+    };
+}
+
+// THE LOCAL POINTEES. These four are this crate's own types, so the orphan
+// rule allows the impl here -- beside the C++ spellings they already carry.
+impl kernels::Elem for bf16 {
+    const CPP_CONST: &'static str = "const ::pie::bf16*";
+    const CPP_MUT: &'static str = "::pie::bf16*";
+    const TY_CONST: Ty = Ty::Bf16s;
+    const TY_MUT: Ty = Ty::Bf16sMut;
+}
+
+impl kernels::Elem for f16 {
+    const CPP_CONST: &'static str = "const ::pie::f16*";
+    const CPP_MUT: &'static str = "::pie::f16*";
+    const TY_CONST: Ty = Ty::F16s;
+    const TY_MUT: Ty = Ty::F16sMut;
+}
+
 ptr_abi!(
     bf16,
     "const ::pie::bf16*",
@@ -507,33 +469,13 @@ ptr_abi!(
     BufMut
 );
 ptr_abi!(i32, "const ::std::int32_t*", I32s, "::std::int32_t*", I32sMut);
-// `moe::hash_route_lookup`'s `tid2eid`, a `[vocab, K]` `const int64_t*` table.
-//
-// `kernels::Ty::I64s` exists and `I64sMut` does not, so the mut spelling
-// reuses `BufMut`. This used to read "exactly as `bf16` and `f16` do above",
-// and that clause went with the tags: **`i64` is now the only pointee in this
-// file whose READ half has a kind of its own and whose WRITTEN half does
-// not.** That is a statement about `kernels::Ty`, not about this file --
-// closing it is one variant plus its `cpp()`/`rust()`/`is_buffer` arms in the
-// PORTABLE crate, which Metal, Vulkan, WGPU and CPU all read, so it is not an
-// edit this file can make.
-//
-// `fp8_e4m3` above is a DIFFERENT shape and not a fourth case of this one:
-// neither of its halves is named (`Buf`/`BufMut`), so it is a format with no
-// vocabulary rather than a half missing from one.
+// `moe::hash_route_lookup`'s `tid2eid` needs `const int64_t*`. No
+// `Ty::I64sMut` exists, so the mut spelling reuses `BufMut` until
+// `kernels::Ty` gains one.
 ptr_abi!(i64, "const ::std::int64_t*", I64s, "::std::int64_t*", BufMut);
-// `moe::build_moe_ptrs_aligned`'s six operands, `const T**` and `T**` at
-// `moe_dispatch.cuh:1046-1051`. **The pointee is the POINTER**, which is why
-// these are `ptr_abi!(*const bf16, …)` rather than an impl on
-// `*mut *const c_void`: `CPP` is the DEVICE parameter's spelling, and the
-// device parameter is `const bf16**`, where `Ty::BufArrayOut::cpp()` is
-// `const void**` because that was the deleted C launcher's. `ptr_abi!(bf16, …)`
-// above already carries exactly that split, so this is the established shape.
-//
-// Spelling any of the six `*const c_void` instead would compile, put `Ty::Buf`
-// where `Args::bind` checks, and put `const void*` in the typecheck
-// translation unit where the kernel says `const bf16*` — the bypass that
-// reproduces the deleted rows' `Ty`s and loses the only thing the port added.
+// `moe::build_moe_ptrs_aligned`'s six operands are `const T**`/`T**`: the
+// pointee is itself a pointer, so `CPP` must spell `const bf16**` etc, not
+// the untyped `const void**` a bare `*const c_void` impl would give.
 ptr_abi!(
     *const bf16,
     "const ::pie::bf16* const*",
@@ -562,75 +504,29 @@ ptr_abi!(
     "const ::std::int32_t**",
     BufArrayOut
 );
-// The impl arrives with its first kernel, which is what an open set means
-// (see the note above `scalar_abi!`). `i8`'s is
-// `sample::lm_head_gemv_argmax_int8_bf16`, whose `const int8_t* __restrict__
-// lm_head_weight` its row states as `I8s`. Spelling it `*const c_void`
-// instead would compile, put `Ty::Buf` where `Args::bind` checks `I8s`, and
-// put `const void*` in the typecheck TU where the kernel says `const
-// int8_t*` — a bypass with no type error anywhere, which is the failure mode
-// `x/xqa.rs`'s header names.
 ptr_abi!(i8, "const ::std::int8_t*", I8s, "::std::int8_t*", I8sMut);
 ptr_abi!(u32, "const ::std::uint32_t*", U32s, "::std::uint32_t*", U32sMut);
 ptr_abi!(u8, "const ::std::uint8_t*", U8s, "::std::uint8_t*", U8sMut);
-// `u16` is the WIDTH and nothing about the format, and that is the whole
-// care this impl needs.
-//
-// `Ty::U16s`'s own doc: *"it says the WIDTH and nothing about the format —
-// so it cannot stand in for either"* `Bf16s` or `F16s`. In fn-world that
-// sentence becomes a rule with teeth: **`*const u16` here means the
-// `__global__` literally takes `uint16_t*`**, not "some sixteen-bit thing".
-// A `template <class T>` instantiated at `pie::bf16` is spelled `*const
-// bf16` — that is what §3.2's unit structs are for, and reaching for `u16`
-// to avoid a generic parameter would re-open the two-formats-one-width
-// hazard the whole of §3.2 exists to close.
-//
-// The honest case, and the impl's first caller: `layout/gather_rows.cuh`'s
-// two kernels are instantiated at `pie::u16` and NOT at `pie::bf16`,
-// and `families/layout.rs` says why — *"both are pure copies: neither ever
-// converts to float, and the ahead-of-time launchers take `u16*` for exactly
-// that reason. A tag type that promises arithmetic nobody performs is a tag
-// type that invites it."* The device text says `uint16_t`, so the
-// declaration says `u16`. That is the test to apply: read the
-// instantiation, not the operand's name.
+// `*const u16` means the device parameter is literally `uint16_t*` — a
+// width, not a format — distinct from the `u16_` `Inst` marker above, which
+// names a template argument rather than a pointee.
 ptr_abi!(u16, "const ::std::uint16_t*", U16s, "::std::uint16_t*", U16sMut);
 ptr_abi!(f32, "const float*", F32s, "float*", F32sMut);
-// No `u64` pointer impl, and this one is a REFUSAL rather than an absence.
-//
-// `pie::sample::lm_head_gemv_argmax_int8` takes `u64* partial_pairs` —
-// one packed `(value, token)` per tile per row. `families/sample.rs` found
-// that `kernels::Ty` has no word for it and refused to mint one on §10.5
-// grounds; the port carried the compromise across unchanged, as `*mut
-// c_void` under `Ty::BufMut`, which is what the row already said.
-//
-// `Abi` could add the impl on its own — `CPP` is `"::std::uint64_t*"` — but
-// `TY` could not, and an impl whose `TY` lied would be exactly the bypass
-// the `i8` note above exists to prevent. Closing it is `Ty::U64sMut` plus
-// its `cpp()`/`rust()`/`ArgValue` arms in `crates/kernels`, a crate the
-// row world still marshals every operand through. That is a step-9 change,
-// when `Ty` retires or becomes fn-world's alone; doing it mid-sweep would
-// add a variant to the dynamic path for one operand while thirteen families
-// still depend on that path's stability. The buffer crosses correctly today
-// — it is opaque to the host and only its width is wrong in the tag.
+// No `u64` pointer impl: `pie::sample::lm_head_gemv_argmax_int8`'s
+// `u64* partial_pairs` has no `Ty` word for it, so it crosses today as
+// `*mut c_void` under `Ty::BufMut` (opaque to the host; only the tag's
+// width is wrong, not the crossing). Closing it needs a `Ty::U64sMut` in
+// `crates/kernels`, shared by every backend.
 ptr_abi!(c_void, "const void*", Buf, "void*", BufMut);
-// THE ARRAY KINDS, and the pleasing part is that two lines land all four.
-//
-// `ptr_abi!`'s two halves are `*const $pointee` and `*mut $pointee`, and
-// with a pointer as the pointee that is exactly `Ty`'s own four-way split:
-// the OUTER const/mut is whether the launcher may move the cursor, the
-// INNER is whether it may write through it. `Ty::BufArray`'s doc says
-// naming reads outside-in; these read outside-in too, and the C++ spellings
-// are `kernels/src/lib.rs:1021-1024` verbatim.
+// Pointer-to-pointer array kinds: outer const/mut is whether the launcher
+// may move the cursor, inner is whether it may write through it. `ptr_abi!`
+// produces all four from one invocation so a second invocation can't drift
+// from the first:
 //
 //   *const *const c_void -> "const void* const*"  BufArray
 //   *mut   *const c_void -> "const void**"        BufArrayOut
 //   *const *mut   c_void -> "void* const*"        BufArrayMut
 //   *mut   *mut   c_void -> "void**"              BufArrayOutMut
-//
-// `ssm` asked for the two `*const`-outer forms and gets four, because a
-// macro that produced only the halves asked for would have to be invoked
-// again with the same pointee to produce the others — and that is the shape
-// where two spellings of one type drift apart.
 ptr_abi!(*const c_void, "const void* const*", BufArray, "const void**", BufArrayOut);
 ptr_abi!(*mut c_void, "void* const*", BufArrayMut, "void**", BufArrayOutMut);
 
@@ -653,7 +549,7 @@ impl Abi for Stream {
     }
     fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
         match value {
-            crate::jit::ArgValue::Ptr(p) => Ok(Self(*p)),
+            crate::jit::ArgValue::Ptr(p) | crate::jit::ArgValue::Region { ptr: p, .. } => Ok(Self(*p)),
             _ => Err(wrong_kind(at, Ty::Stream)),
         }
     }
@@ -713,13 +609,10 @@ pub trait ByValue: Abi {
 /// # What this generates
 ///
 /// 1. An [`Abi`] impl whose [`arg`](Abi::arg) is
-///    [`ArgValue::Bytes`](crate::jit::ArgValue::Bytes) over the
-///    receiver. That makes the aggregate an ORDINARY `Abi` type: a
-///    [`unit!`](crate::unit) declaration names it exactly the way it names
-///    `f32`, and nothing in `unit!`, `contract!` or `bind!` knows the
-///    difference. §3.2's "open set of impls, not a closed enum" is what buys
-///    that; a `Ty` variant per aggregate would have been the forty-variant
-///    `LaunchRule` mistake one level down.
+///    [`ArgValue::Bytes`](crate::jit::ArgValue::Bytes) over the receiver, so
+///    a [`unit!`](crate::unit) declaration names the aggregate exactly like
+///    it names `f32`; nothing in `unit!`, `contract!` or `bind!` treats it
+///    specially.
 /// 2. A [`ByValue`] impl carrying the measured [`Layout`].
 /// 3. `const` assertions on `size_of`, `align_of` and every named
 ///    `offset_of`. **These are the point.** A field inserted, widened or
@@ -729,30 +622,12 @@ pub trait ByValue: Abi {
 ///
 /// # The tag
 ///
-/// `tag = ` names a [`Ty`] and every choice is a near-miss, so the macro
-/// makes the caller write one — and then checks it. `Ty` is a closed enum of
-/// things the row world could bind from a `Source`; no variant of it can name
-/// an arbitrary struct, and adding one that means "some aggregate" would tag
-/// every aggregate alike — the exact hazard `ArgValue::Bytes`'s own comment
-/// refuses, and per-struct variants would be the forty-variant `LaunchRule`
-/// mistake in a second place.
-///
-/// The rule is **[`Ty::needs_mirror`] must be true**, and the macro asserts
-/// it in `const` context. That predicate is `Ty`'s own answer to "does this
-/// kind cross as a `#[repr(C)]` struct rather than as a primitive or a
-/// pointer", which is precisely the question a by-value aggregate is asking.
-/// It also happens to be the set `Args::bind` refuses — it accepts pointer
-/// kinds and the ten scalar kinds and nothing else — so if some future walker
-/// did consult the tag, the answer is a named `ArgError::Unsupported` and not
-/// a silent accept of eight bytes where forty were meant. `bind` never gets
-/// that far today: it short-circuits on `ArgValue::Bytes` before the tag
-/// match, and every fn-world operand is `Source::Unbound` besides.
-///
-/// [`Ty::cpp`] for the chosen variant will not be this type's C++ spelling.
-/// That does not drift, because no fn-world parameter is ever spelled
-/// through `Ty::cpp` — [`typecheck_tu`] spells every one through
-/// [`Abi::CPP`] — and it is one more reason `Abi::TY` dies with `Ty` at
-/// step 9.
+/// `tag = ` names a [`Ty`]; the macro asserts **[`Ty::needs_mirror`] must be
+/// true** in `const` context, since a `Ty` meaning "some aggregate" would
+/// tag every aggregate alike — the exact hazard `ArgValue::Bytes` exists to
+/// avoid. [`Ty::cpp`] for the chosen tag is NOT this type's C++ spelling
+/// (that is always [`Abi::CPP`], via [`typecheck_tu`]) — the tag identifies
+/// only the crossing kind.
 ///
 /// [`Ty::needs_mirror`]: kernels::Ty::needs_mirror
 ///
@@ -818,12 +693,10 @@ macro_rules! by_value {
                  a Ty whose needs_mirror() is true.",
             ),
         );
-        // 64-bit only. These compare a Rust mirror against a layout MEASURED
-        // from C++ on a CUDA host, and every one of these structs holds raw
-        // pointers -- so on a 32-bit target the sizes and offsets cannot
-        // match, and the types can never be used there either. Ungated, they
-        // made the whole workspace unbuildable for `wasm32-unknown-unknown`,
-        // which `driver-wgpu`'s browser gate builds.
+// 64-bit only: these assert a layout measured on a CUDA (64-bit) host
+// against structs holding raw pointers, which cannot match on a 32-bit
+// target; ungated they broke the `wasm32-unknown-unknown` build
+// `driver-wgpu` gates.
         #[cfg(target_pointer_width = "64")]
         const _: () = assert!(
             ::core::mem::size_of::<$rust>() == $size,
@@ -846,44 +719,19 @@ macro_rules! by_value {
         )*
     };
 
-    // The untagged arm: an aggregate with no `Ty` that means it.
-    //
-    // The tagged arm above requires `Ty::$tag.needs_mirror()`, and that is a
-    // CLOSED SET OF SIX in a crate three portable backends share. `Abi` is an
-    // open set — any `#[repr(C)]` mirror can implement it — so the tagged arm
-    // gates an open set behind a closed one, and the gate only opened for
-    // `xqa`'s `KvCacheList` because `Ty::KvCacheLayerView` already existed and
-    // already meant roughly the right thing. **Eleven families produced no
-    // second `by_value!`**, and this is why.
-    //
-    // The two ways out were both refused, for reasons already written down:
-    //
-    //  * Borrow a neighbouring tag. `runtime::args`' own doc bars it — "the
-    //    check would pass on a `MLAParams` bound where a `HopperParams` is
-    //    declared and catch nothing." A tag that is approximately right is
-    //    worse than no tag, because it reads as a statement.
-    //  * Add a `Ty` per aggregate. This module's header bars it — "a `Ty`
-    //    variant per aggregate would have been the forty-variant `LaunchRule`
-    //    mistake one level down." And step 9 is measured at shrinking `Ty`,
-    //    not growing it.
-    //
-    // So this arm states no tag at all. `TY` is `Ty::Unstated`'s honest
-    // stand-in: `Ty::MlaPlanCache`, chosen because it is on NEITHER
-    // `is_pointer`'s list NOR `bind::device::scalar`'s, so a walker that did
-    // consult the tag gets `ArgError::Unsupported` — a named refusal, never a
-    // silent accept of eight bytes where two hundred were meant.
-    //
-    // Nothing consults it today. `Args::bind` short-circuits on
-    // `ArgValue::Bytes` before the tag match, every fn-world operand is
-    // `Source::Unbound`, and `typecheck_tu` spells parameters through
-    // `Abi::CPP` rather than `Ty::cpp`. `Abi::TY` dies with `Ty` at step 9,
-    // and this arm is the reason it should: **the field was never carrying a
-    // fact, it was carrying a permission.**
-    //
-    // Everything else is identical to the tagged arm — the same `ArgValue`,
-    // the same `Layout`, the same size/align/offset assertions naming the
-    // same probe. The measurement is the point of the macro and this arm
-    // loses none of it.
+    // The untagged arm: some aggregates have no `Ty` that means them, and
+    // `Ty::needs_mirror()` is a closed set the tagged arm cannot open for
+    // them. Two rejected fixes: reusing a neighbouring tag (an
+    // approximately-right tag reads as an assertion and checks nothing),
+    // and minting a `Ty` per aggregate (reopens the closed enum this
+    // file's header avoids). Instead `TY` here is `Ty::MlaPlanCache`, an
+    // inert stand-in outside both `is_pointer` and
+    // `bind::device::scalar`'s lists, so a future reader who does consult
+    // it gets a named `ArgError::Unsupported`, not a silent wrong read.
+    // Nothing consults it today: `Args::bind` short-circuits on
+    // `ArgValue::Bytes`, and `typecheck_tu` spells parameters through
+    // `Abi::CPP`. Otherwise identical to the tagged arm: same `ArgValue`,
+    // same `Layout`, same size/align/offset assertions.
     (
         $rust:ident as $cpp:literal,
         untagged,
@@ -923,12 +771,6 @@ macro_rules! by_value {
             };
         }
 
-        // 64-bit only. These compare a Rust mirror against a layout MEASURED
-        // from C++ on a CUDA host, and every one of these structs holds raw
-        // pointers -- so on a 32-bit target the sizes and offsets cannot
-        // match, and the types can never be used there either. Ungated, they
-        // made the whole workspace unbuildable for `wasm32-unknown-unknown`,
-        // which `driver-wgpu`'s browser gate builds.
         #[cfg(target_pointer_width = "64")]
         const _: () = assert!(
             ::core::mem::size_of::<$rust>() == $size,
@@ -1027,18 +869,11 @@ fn push_static_assert(out: &mut String, cond: &str, message: &str) {
 /// this crate is asked for by name. The answer wanted is whether the unit
 /// compiles at all; the entry point exists to make that question askable.
 ///
-/// `__INTADDR__` and not `offsetof`, and that is not a style choice: NVRTC's
-/// front end is EDG, and `shim/README.md`'s "The measurement that
-/// outlives the row" records six spellings tried against it, of which this is
-/// the only one that compiles. `offsetof` and `__builtin_offsetof` both give
-/// *"type name is not allowed"*; all three pointer-difference forms give
-/// *"must have a constant value"*. That section says the measurement is kept
-/// because "the next carried header that restates an upstream struct will need
-/// it" — this is that reader.
-///
-/// It also means the unit needs no `#include` the root has not already made,
-/// which matters: `cstddef` is carried without `offsetof`, its last asking
-/// site having been deleted with `moe_glue.cuh`.
+/// `__INTADDR__` and not `offsetof`: NVRTC's EDG front end rejects
+/// `offsetof`/`__builtin_offsetof` ("type name is not allowed") and
+/// pointer-difference forms ("must have a constant value"); this is the one
+/// spelling that compiles, and it needs no extra `#include` beyond the
+/// root's own.
 #[must_use]
 pub fn typecheck_tu(root: &str, layouts: &[Layout]) -> String {
     let mut out = String::with_capacity(root.len() + layouts.len() * 512);
@@ -1073,3 +908,17 @@ pub fn typecheck_tu(root: &str, layouts: &[Layout]) -> String {
     }
     out
 }
+
+// THE TWO COPIES OF THE POINTEE MAPPING, ASSERTED EQUAL.
+//
+// Seven primitives implemented in `kernels` and two local types implemented
+// above; each has an `Abi` pair here whose `Ty`s were written on the
+// `ptr_abi!` line. This is the whole reason the split is tolerable: the
+// orphan rule forced a second copy, and a second copy that cannot silently
+// disagree is a cross-check rather than a duplication.
+//
+// `i64` is the one worth reading twice -- its mutable direction is `BufMut`
+// and not an `I64sMut`, because nothing in the tree declares an `int64_t*`
+// parameter. An asymmetry stated in two files and asserted equal is an
+// asymmetry that stays deliberate.
+elem_agrees!(bf16, f16, i32, i64, i8, u32, u8, u16, f32, c_void);

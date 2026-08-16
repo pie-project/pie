@@ -631,6 +631,7 @@ mod tests {
             paged_multi_batch: true,
             qmm_multi_batch: true,
             add_bias: false,
+            fused_qk_rope: false,
         };
         assert!(!VARIANTS.is_empty());
         for v in VARIANTS {
@@ -672,3 +673,7 @@ mod tests {
         assert!(matches!(Deployed::single().backend, Backend::Cuda));
     }
 }
+
+/// This generation's tensor names, in every vocabulary that spells them.
+#[cfg(feature = "contract")]
+pub mod import;

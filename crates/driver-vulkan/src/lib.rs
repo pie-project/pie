@@ -1,5 +1,7 @@
-//! The Vulkan execution shell: what it takes to actually FIRE the modules
-//! `kernels-vulkan` compiles.
+//! The Vulkan execution shell: instances, queues, descriptor pools, command
+//! buffers, and the arithmetic that turns one rectangle of a plan into one
+//! `vkCmdDispatch`. `kernels-vulkan` owns the SPIR-V modules and the table of
+//! what their entrypoints take; this crate owns what it takes to fire them.
 //!
 //! `kernels-vulkan` is a table and 665 SPIR-V modules. It knows what each
 //! entrypoint's operands are, what its push block looks like, and which device
@@ -1314,29 +1316,72 @@
 //! ### The host, measured with the tool off
 //!
 //! Release, per decode step, `run_all` broken into its phases against the
-//! wall:
+//! wall. The tool is [`phase`], turned on by `PIE_VULKAN_HOST_PHASES` and
+//! driven by `tests/hostprof.rs`; the first record of this table was four
+//! timers edited into a working copy, which is why it has no middle column:
 //!
-//! | phase | short (24 tok) | long (384 tok) |
-//! | --- | --- | --- |
-//! | argument checks | 0.007 ms | 0.010 ms |
-//! | descriptor sets | 0.134 ms | 0.113 ms |
-//! | command recording | 0.421 ms | 0.349 ms |
-//! | submit and wait | 3.469 ms | 12.961 ms |
-//! | outside `run_all` | 1.917 ms | 1.867 ms |
-//! | wall | 5.949 ms | 15.300 ms |
+//! | phase | first record | before | after (short) | after (long) |
+//! | --- | --- | --- | --- | --- |
+//! | argument checks | 0.007 ms | -- | 0.007 ms | 0.006 ms |
+//! | descriptor sets | 0.134 ms | -- | 0.123 ms | 0.121 ms |
+//! | command recording | 0.421 ms | -- | 0.383 ms | 0.383 ms |
+//! | submit and wait | 3.469 ms | 3.437 ms | 2.870 ms | 12.070 ms |
+//! | outside `run_all` | 1.917 ms | 4.94 ms | 1.44 ms | 1.39 ms |
+//! | wall | 5.949 ms | 8.377 ms | 4.803 ms | 14.150 ms |
 //!
-//! The host is 2.48 ms and **it does not move with context**: 42% of a short
-//! step and 15% of a long one, and the same milliseconds in both. Three
+//! The host was 2.48 ms when this was first written and **it does not move
+//! with context**: the same milliseconds at 24 tokens and at 384. Three
 //! quarters of it is outside `run_all` altogether -- the lowering, the plan,
-//! the scalar blocks -- which is a part of this driver no measurement here
-//! has ever looked at. The recording of four hundred and fifty dispatches is
-//! 0.42 ms of it and the descriptor sets 0.13, both of which had been assumed
+//! the scalar blocks -- which was a part of this driver no measurement here
+//! had ever looked at. The recording of four hundred and fifty dispatches is
+//! 0.38 ms of it and the descriptor sets 0.12, both of which had been assumed
 //! to be the expensive part and are not.
+//!
+//! Looking properly found that it had grown rather than held: the crossing to
+//! `hold::arm_for` had put a discarded SPIR-V parse into `serve::fire` once
+//! per RECTANGLE rather than once per symbol, and by the time a repeatable
+//! tool existed that was 3.18 ms of a 4.94 ms host step. Caching it, the arm
+//! lookup, the pipeline probe and the arena buffer -- all four of them things
+//! a decode recomputes identically every token -- took a short step from 8.38
+//! ms to 4.80 and a long one from 18.02 to 14.15. See
+//! `the_projections_dominate_both_steps_now_that_the_decode_splits_its_keys`
+//! for the phase-by-phase table.
 //!
 //! So there are two targets and they belong to different regimes. Long
 //! conversations are attention, and the occupancy work above is the answer.
-//! Short ones are the host, and the answer is somewhere in the 1.9 ms before
-//! the first Vulkan call.
+//! Short ones are the host, and what is left of it -- 1.4 ms, almost all of
+//! it planning 452 rectangles at 1.5 microseconds each -- comes down by
+//! stating fewer rectangles rather than by caching anything more.
+//!
+//! # BOTH OF THOSE CONCLUSIONS WERE READ OFF A BROKEN SUBTRACTION
+//!
+//! The `outside run_all` row is `median - run_all`, and after `replay`
+//! landed, ninety-four percent of steps never enter `run_all` -- they submit
+//! an already-recorded command buffer and wait on a fence. So that row is not
+//! host time, it is host time PLUS the entire fence wait, and the closer this
+//! driver got to replaying everything the more of the card's own execution it
+//! swallowed. It reported 1.4 ms of host. Subtracting the
+//! `fire/replay/submit` span as well, the host is **0.09 ms** -- six percent
+//! of a step, not thirty.
+//!
+//! The row is left standing because the columns beside it are a historical
+//! record and the SPIR-V regression it caught was real; what is retracted is
+//! reading it as a host figure. The lesson is not that a number was wrong.
+//! It is that this one was wrong in the flattering direction: a profile that
+//! says the host owns the step is a profile that sends the next week's work
+//! to the host, and it will keep saying so no matter how much of the host you
+//! delete, because what it is really measuring is the GPU.
+//!
+//! Both targets are on the CARD, and they are the same target. The step is
+//! 1.62 ms, of which 1.51 is inside the submit; and of THAT, 1.06 ms is not
+//! arithmetic but ORDERING -- delete the pipeline barriers and the same
+//! dispatches, giving wrong answers, finish in 0.46 ms. 452 dispatches with
+//! 311 barriers between them, each dispatch a single row of a 0.6b model and
+//! therefore almost entirely launch latency, and the barriers stop the card
+//! from hiding one behind another. See `hazards` in `device.rs`.
+//!
+//! "State fewer rectangles" survives as the conclusion. Every reason given
+//! for it here was the wrong reason.
 //!
 //! The dump did find something it was not looking for, one crate over.
 //! `sdpa_vector.slang` -- the dense decode, off this model's path -- still gave
@@ -2316,7 +2361,7 @@
 //! came first, and it was three things:
 //!
 //! * **the pitch.** `kernels-vulkan`'s `sdpa_paged_decode` wired
-//!   `attention_mask_stride` to `Source::Param(3)`, the model text's literal
+//!   `attention_mask_stride` to `Source::Slot(Kind::Param, 3)`, the model text's literal
 //!   `0`; `kernels-wgpu` wires the same operand to the driver's own staged
 //!   pitch. One word, and without it every mask is read at a stride of zero.
 //! * **the rectangle.** [`resources::Frame::mask_from`] packs the fire's rows
@@ -2384,13 +2429,10 @@
 //! `a_piece_of_a_request_carries_its_rows_mask_and_write_targets` is there so
 //! the next field added is refused by a test rather than dropped by a helper.
 //!
+//! Module map, invariants and measurements: `.wiki/driver-vulkan.md`.
 
-// The manifest deliberately does not take the workspace lint table, because it
-// forbids `unsafe_code` and every `ash` entry point is unsafe. The rest of that
-// table is worth having, so it is restated here without that one name -- and
-// the portable half keeps its own guarantee a different way, by containing no
-// `unsafe` at all, which `tests/pure.rs` asserts by reading the modules this
-// file does not gate.
+// Not the workspace lint table: that one forbids `unsafe_code`, and every `ash`
+// entry point is unsafe.
 #![deny(missing_docs)]
 #![deny(
     clippy::todo,
@@ -2400,10 +2442,10 @@
 )]
 #![deny(clippy::print_stdout)]
 
-/// What a statement supplies a routine, per routine: the `operands` column as
-/// code, and the registry of which families' arms are written.
 #[cfg(feature = "native")]
-pub mod arm;
+pub mod hold;
+#[cfg(feature = "native")]
+pub mod bind;
 #[cfg(feature = "native")]
 pub mod binding;
 #[cfg(feature = "native")]
@@ -2411,30 +2453,11 @@ pub mod device;
 #[cfg(feature = "native")]
 pub mod dispatch;
 
-/// [`Encode`](kernels_vulkan::routine::Encode) over this driver's resources:
-/// the seam a routine body dispatches through.
-///
-/// `.wiki/kernel-x/refactor-bigplan.md` §7 Stage 2. It lands before the
-/// families so that each port has somewhere to arrive.
-///
-/// `native`-gated with the resources it encodes onto: it names `binding`,
-/// `device` and `dispatch`, all three of which are. It was ungated while it
-/// was dark and nothing called it, so nothing built it either.
 #[cfg(feature = "native")]
 pub mod encode;
-// A step's geometry, filled in from the channels the last fire wrote it into
-// and translated from working-set pages to physical ones. Gated with the
-// serving half because it reads the program registry, though it is arithmetic
-// over CSRs and needs no device.
 #[cfg(feature = "native")]
 pub mod envelope;
-// Two constants and a function over a `Device`. Ungated so that
-// `facts::PAGE_SIZE` and `facts::BACKEND` -- which an engine reads to CHOOSE a
-// backend, before it has one -- do not require Vulkan to be present.
 pub mod facts;
-// The engine's frame, split into this driver's requests. Gated with the rest
-// of the serving half because `Request` and `Step` are, though the split
-// itself is arithmetic over CSRs and its tests need no device.
 #[cfg(feature = "native")]
 pub mod frames;
 pub mod geometry;
@@ -2462,7 +2485,12 @@ pub use driver::names;
 #[cfg(feature = "native")]
 pub mod pages;
 #[cfg(feature = "native")]
+pub mod replay;
+#[cfg(feature = "native")]
 pub mod resources;
+// Wall-clock accounting for the HOST side of a step. Ungated: it holds no
+// device handle and a caller with no GPU can still read the totals.
+pub mod phase;
 // Ungated on purpose: the channel plane needs no device, which is the whole
 // argument for the `driver` crate existing, and gating it would make the
 // no-default-features build unable to state a verb it can serve in full.

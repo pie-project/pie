@@ -56,9 +56,12 @@
 // `GdnCoreParams` are not: the row states these two as numbers and the rest as
 // a pointer.
 //
-// `row_pitch` is the bf16 output row pitch; the fp32 scratch's is HALF of it,
-// which is `pitch_f` in the body. The two are different numbers and using one
-// for the other reads the next token's staged q where this token's should be.
+// `row_pitch` describes the IN-PROJECTION, `mixed`, and nothing else. Every
+// fp32 scratch row is packed at its OWN width -- `Hv*Dk` for q and k,
+// `2*Hv + Hv*Dv` for the gates and the staged v -- and the body computes those
+// from `GdnCoreParams`. A shared pitch has to clear the widest of them, and
+// `pre_gate` is wider than `mixed` on any stack whose value width reaches its
+// key width.
 struct Params {
     row_pitch: i32,
     n_scan: i32,
@@ -211,10 +214,26 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let hv_idx = i32(wid.z);
     let dv_base = (i32(wid.y) * rows + (i32(lid.x) / lanes)) * vrows;
     let dk_idx = i32(lid.x) % lanes;
-    // One prefill is one sequence, so the slot is the first and only one.
-    let slot = i32(slot_ids[0]);
+    // ONE ROW PER SEAT, IN TURN, and not one seat for the whole rectangle.
+    //
+    // `slot_ids` is per ROW and a fire holds whatever the batcher packed, so a
+    // prefill rectangle is one sequence per seat laid end to end. Reading
+    // `slot_ids[0]` and keeping it walked every request in the fire into the
+    // FIRST one's state -- each one continuing the last one's recurrence and
+    // all of them writing back over one seat. `kernels-metal`'s scan records
+    // the same defect and the same repair.
+    //
+    // It is invisible to a fire of one request, which is every probe in
+    // `driver-wgpu/tests/hybrid_probe.rs`: with one seat the comparison below
+    // is never true and this is exactly the code that ran before.
+    var slot = i32(slot_ids[0]);
     let n_per_t = p.Dk / lanes;
-    let pitch_f = params.row_pitch / 2;
+    // See the prefill arm above: every scratch row is packed at its own width
+    // and `row_pitch` reaches this entrypoint to describe a buffer it never
+    // reads.
+    let qk_pitch = p.Hv * p.Dk;
+    let g_pitch = 2 * p.Hv + p.Hv * p.Dv;
+    let o_pitch = p.Hv * p.Dv;
     let row_lead = dk_idx == 0;
     let active_group = dv_base < p.Dv;
     // The tail: a value block only partly inside `Dv`. `vn` is how many of this
@@ -231,7 +250,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     // over every token, and written back once -- which is the entire reason
     // this arm exists instead of calling the recurrent kernel `n_scan` times.
     var st: array<array<f32, 32>, PIE_VROWS>;
-    let state_base = ((slot * p.Hv + hv_idx) * p.Dv + dv_base) * p.Dk;
+    var state_base = ((slot * p.Hv + hv_idx) * p.Dv + dv_base) * p.Dk;
     for (var v = 0; v < vrows; v = v + 1) {
         for (var i = 0; i < 32; i = i + 1) {
             var val = 0.0;
@@ -246,8 +265,39 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     // bound is a uniform, so every invocation runs the same number of
     // iterations and the barriers inside stay uniform.
     for (var t = 0; t < params.n_scan; t = t + 1) {
-        let row_t = t * params.row_pitch;
-        let row_f = t * pitch_f;
+        // The seat this row belongs to. When it changes the previous request
+        // has ended, so its state is written back and the new one's is loaded
+        // -- which for a one-request fire is exactly the load above and the
+        // store below and nothing else.
+        //
+        // UNIFORM, and that is what makes it legal here: every invocation
+        // reads the same `slot_ids[t]` and carries the same `slot`, so the
+        // branch is taken by all of the workgroup or none of it. There is no
+        // barrier inside it either way.
+        let seat = i32(slot_ids[t]);
+        if (seat != slot) {
+            for (var v = 0; v < vrows; v = v + 1) {
+                for (var i = 0; i < 32; i = i + 1) {
+                    if (v < vn && i < n_per_t) {
+                        rstate[state_base + v * p.Dk + n_per_t * dk_idx + i] = st[v][i];
+                    }
+                }
+            }
+            slot = seat;
+            state_base = ((slot * p.Hv + hv_idx) * p.Dv + dv_base) * p.Dk;
+            for (var v = 0; v < vrows; v = v + 1) {
+                for (var i = 0; i < 32; i = i + 1) {
+                    var val = 0.0;
+                    if (v < vn && i < n_per_t) {
+                        val = rstate[state_base + v * p.Dk + n_per_t * dk_idx + i];
+                    }
+                    st[v][i] = val;
+                }
+            }
+        }
+        let row_t = t * o_pitch;
+        let row_f = t * qk_pitch;
+        let g_row = t * g_pitch;
         var q: array<f32, 32>;
         var k: array<f32, 32>;
         for (var i = 0; i < 32; i = i + 1) {
@@ -263,8 +313,8 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         }
         // The two gates the prep arm staged: `ga` is the decay and `gb` the
         // delta-rule beta. Two floats per head, before the per-channel v.
-        let ga = pre_gate[row_f + 2 * hv_idx + 0];
-        let gb = pre_gate[row_f + 2 * hv_idx + 1];
+        let ga = pre_gate[g_row + 2 * hv_idx + 0];
+        let gb = pre_gate[g_row + 2 * hv_idx + 1];
         var kv: array<f32, PIE_VROWS>;
         for (var v = 0; v < vrows; v = v + 1) {
             var acc = 0.0;
@@ -288,7 +338,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
                 // The staged v channels sit AFTER the two per-head gates,
                 // which is what the `2 * p.Hv` is: the scratch row is
                 // `[gate pairs for every head][v for every head and channel]`.
-                vv = pre_gate[row_f + 2 * p.Hv + hv_idx * p.Dv + dv_base + v];
+                vv = pre_gate[g_row + 2 * p.Hv + hv_idx * p.Dv + dv_base + v];
             }
             let delta = (vv - kv[v]) * gb;
             var outv = 0.0;
@@ -367,20 +417,24 @@ fn write_conv_token(slot: i32, b_idx: i32, c: i32) {
 // itself, so only the taps before the prompt's start come from the conv state
 // -- which is what the negative `idx` branch is, and why a prefill needs no
 // per-token state update until the last token.
-fn tap(slot: i32, t: i32, j: i32, c: i32) -> f32 {
+fn tap(slot: i32, t: i32, start: i32, j: i32, c: i32) -> f32 {
     let idx = t - (p.Kc - 1) + j;
-    if (idx >= 0) {
+    if (idx >= start) {
         return load_mixed(idx * params.row_pitch + c);
     }
-    // `p.Kc + idx` with `idx` negative indexes from the END of the stored
-    // window, which is where the prompt's left context is.
-    return conv_state[(slot * p.Kc + p.Kc + idx) * p.conv_dim + c];
+    // `p.Kc + local` with `local` negative indexes from the END of the stored
+    // window, which is where THIS REQUEST'S left context is. `local` counts
+    // from the request's own first row and not the fire's, so a request that
+    // is not first in the rectangle reads its own seat's history instead of
+    // its neighbour's tokens.
+    let local = idx - start;
+    return conv_state[(slot * p.Kc + p.Kc + local) * p.conv_dim + c];
 }
 
-fn convsilu_prefill(slot: i32, t: i32, c: i32) -> f32 {
+fn convsilu_prefill(slot: i32, t: i32, start: i32, c: i32) -> f32 {
     var acc = load_conv_b(c);
     for (var j = 0; j < p.Kc - 1; j = j + 1) {
-        acc = acc + tap(slot, t, j, c) * load_conv_w(c * p.Kc + j);
+        acc = acc + tap(slot, t, start, j, c) * load_conv_w(c * p.Kc + j);
     }
     acc = acc + load_mixed(t * params.row_pitch + c) * load_conv_w(c * p.Kc + (p.Kc - 1));
     return silu(acc);
@@ -388,14 +442,14 @@ fn convsilu_prefill(slot: i32, t: i32, c: i32) -> f32 {
 
 // The state the NEXT dispatch will read: the last `Kc` tokens ending at `t`.
 // Only the final token of the prompt calls this.
-fn write_conv_prefill(slot: i32, t: i32, c: i32) {
+fn write_conv_prefill(slot: i32, t: i32, start: i32, c: i32) {
     for (var j = 0; j < p.Kc; j = j + 1) {
         let idx = t - (p.Kc - 1) + j;
         var v = 0.0;
-        if (idx >= 0) {
+        if (idx >= start) {
             v = load_mixed(idx * params.row_pitch + c);
         } else {
-            v = conv_state[(slot * p.Kc + p.Kc + idx) * p.conv_dim + c];
+            v = conv_state[(slot * p.Kc + p.Kc + (idx - start)) * p.conv_dim + c];
         }
         new_conv_state[(slot * p.Kc + j) * p.conv_dim + c] = v;
     }
@@ -480,18 +534,53 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let rep = p.Hv / p.Hk;
     let hk_idx = hv_idx / rep;
     let hk_first = (hv_idx % rep) == 0;
-    let slot = i32(slot_ids[0]);
+    // THIS ROW'S SEAT, and the row where it changes IS the request boundary.
+    //
+    // A fire holds whatever the batcher packed and `slot_ids` is per ROW, so
+    // two requests in one prefill are two seats and no second table has to say
+    // where one ends. Reading `slot_ids[0]` made the whole rectangle one
+    // sequence: every request after the first convolved over its
+    // predecessor's tokens and carried its recurrent state, and the first one
+    // lost its history the moment only the LAST request's last token wrote
+    // `new_conv_state`. `kernels-metal`'s prep records the same three defects.
+    //
+    // `start` is this request's first row, found by walking back while the
+    // seat holds. Bounded by `Kc - 1` because that is as far as a convolution
+    // window reaches, so nothing here is linear in the prompt -- and with one
+    // seat it lands on `max(0, t - (Kc - 1))`, which makes every branch below
+    // resolve exactly as it did when this read `slot_ids[0]`.
+    let slot = i32(slot_ids[t]);
+    var start = t;
+    for (var back = 0; back < p.Kc - 1 && start > 0; back = back + 1) {
+        if (i32(slot_ids[start - 1]) != slot) {
+            break;
+        }
+        start = start - 1;
+    }
     let dk_idx = i32(lid.x);
     let n_per_t = p.Dk / 32;
-    let pitch_f = params.row_pitch / 2;
+    // EVERY SCRATCH ROW IS PACKED AT ITS OWN WIDTH, and `row_pitch` describes
+    // the in-projection alone. One shared pitch has to clear the widest of
+    // them, and `pre_gate` is WIDER than `mixed` on any stack whose value width
+    // reaches its key width: `kernels-metal`'s note gives qwen3-next asking
+    // `2*Hv + Hv*Dv = 8320` floats against a `conv_dim` of 8192, so a shared
+    // pitch writes each token's v channels over the next token's gates.
+    //
+    // This body divided `row_pitch` by two and strode all three by it, which
+    // is the ABI `ssm/gdn_prep.metal` used to have and repaired. Its repair
+    // records the symptom: *"a three-token prefill came back all-NaN, a
+    // four-token one did not, and the difference was only which garbage the
+    // arena happened to hold."*
+    let qk_pitch = p.Hv * p.Dk;
+    let g_pitch = 2 * p.Hv + p.Hv * p.Dv;
     var qraw: array<f32, 8>;
     var kraw: array<f32, 8>;
     var qsq = 0.0;
     var ksq = 0.0;
     for (var i = 0; i < n_per_t; i = i + 1) {
         let d = n_per_t * dk_idx + i;
-        qraw[i] = convsilu_prefill(slot, t, p.q_off + hk_idx * p.Dk + d);
-        kraw[i] = convsilu_prefill(slot, t, p.k_off + hk_idx * p.Dk + d);
+        qraw[i] = convsilu_prefill(slot, t, start, p.q_off + hk_idx * p.Dk + d);
+        kraw[i] = convsilu_prefill(slot, t, start, p.k_off + hk_idx * p.Dk + d);
         qsq = qsq + qraw[i] * qraw[i];
         ksq = ksq + kraw[i] * kraw[i];
     }
@@ -499,47 +588,54 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     // scaled once, not twice.
     let qinv = p.inv_sqrt_dk / sqrt(row_sum32(lid.x, lid.y, qsq) + p.eps);
     let kinv = 1.0 / sqrt(row_sum32(lid.x, lid.y, ksq) + p.eps);
-    let row_f = t * pitch_f;
+    let qk_row = t * qk_pitch;
+    let g_row = t * g_pitch;
     for (var i = 0; i < n_per_t; i = i + 1) {
         let d = n_per_t * dk_idx + i;
         // Staged by VALUE head, not key head: the scan reads `hv_idx * Dk`, so
         // a group-query model writes each key head's q/k once per value head
         // that shares it. That is the redundancy the split accepts in exchange
         // for the scan never touching the conv.
-        pre_q[row_f + hv_idx * p.Dk + d] = qraw[i] * qinv;
-        pre_k[row_f + hv_idx * p.Dk + d] = kraw[i] * kinv;
+        pre_q[qk_row + hv_idx * p.Dk + d] = qraw[i] * qinv;
+        pre_k[qk_row + hv_idx * p.Dk + d] = kraw[i] * kinv;
     }
     if (dk_idx == 0) {
-        let row_t = t * params.row_pitch;
-        let ad = load_a_gate(row_t + hv_idx) + load_dt_bias(hv_idx);
+        // `a` and `b` are the IN-PROJECTION's own outputs, one scalar per value
+        // head, so their rows are `Hv` wide -- not `row_pitch`, which belongs
+        // to `mixed` alone. `gdn_prep_slotted` and `gdn_core` both index
+        // `b_idx * Hv + hv_idx`, and this arm read them at the prompt's pitch.
+        let gate_at = t * p.Hv + hv_idx;
+        let ad = load_a_gate(gate_at) + load_dt_bias(hv_idx);
         // softplus in the form that does not overflow: `log(1 + e^x)` is
         // infinite by x = 89 and this is not.
         let sp = max(ad, 0.0) + log(1.0 + exp(-abs(ad)));
-        pre_gate[row_f + 2 * hv_idx + 0] = exp(-exp(A_log[hv_idx]) * sp);
-        pre_gate[row_f + 2 * hv_idx + 1] = 1.0 / (1.0 + exp(-load_b_gate(row_t + hv_idx)));
+        pre_gate[g_row + 2 * hv_idx + 0] = exp(-exp(A_log[hv_idx]) * sp);
+        pre_gate[g_row + 2 * hv_idx + 1] = 1.0 / (1.0 + exp(-load_b_gate(gate_at)));
     }
     // `Dv` is not bounded by the workgroup width, so this strides: a body that
     // gave each of the 32 lanes one channel would stage a quarter of a
     // `Dv = 128` head and leave the rest holding the last prompt's values.
     for (var dv = dk_idx; dv < p.Dv; dv = dv + 32) {
-        pre_gate[row_f + 2 * p.Hv + hv_idx * p.Dv + dv] =
-            convsilu_prefill(slot, t, p.v_off + hv_idx * p.Dv + dv);
+        pre_gate[g_row + 2 * p.Hv + hv_idx * p.Dv + dv] =
+            convsilu_prefill(slot, t, start, p.v_off + hv_idx * p.Dv + dv);
     }
-    // Only the LAST token's window becomes the next dispatch's conv state.
-    // Every earlier token's is already in `mixed`. Returning here is safe in a
-    // way it would not be twenty lines up: both `row_sum32` calls are done.
-    if (t != params.n_scan - 1) {
+    // Only each REQUEST'S last token carries that request's history forward.
+    // Every earlier token's window is already in `mixed`. Returning here is
+    // safe in a way it would not be twenty lines up: both `row_sum32` calls
+    // are done, and the condition is uniform because one workgroup owns one
+    // `(t, hv)` pair.
+    if (t != params.n_scan - 1 && i32(slot_ids[t + 1]) == slot) {
         return;
     }
     if (hk_first) {
         for (var i = 0; i < n_per_t; i = i + 1) {
             let d = n_per_t * dk_idx + i;
-            write_conv_prefill(slot, t, p.q_off + hk_idx * p.Dk + d);
-            write_conv_prefill(slot, t, p.k_off + hk_idx * p.Dk + d);
+            write_conv_prefill(slot, t, start, p.q_off + hk_idx * p.Dk + d);
+            write_conv_prefill(slot, t, start, p.k_off + hk_idx * p.Dk + d);
         }
     }
     for (var dv = dk_idx; dv < p.Dv; dv = dv + 32) {
-        write_conv_prefill(slot, t, p.v_off + hv_idx * p.Dv + dv);
+        write_conv_prefill(slot, t, start, p.v_off + hv_idx * p.Dv + dv);
     }
 //#else
     let n = i32(wid.z);

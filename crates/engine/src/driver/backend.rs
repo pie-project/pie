@@ -111,7 +111,7 @@ pub mod open {
     // selected -- which is how the workspace clippy gate builds this crate --
     // the import has no user and `-D warnings` refuses the crate.
     #[cfg(any(
-        feature = "driver-cuda",
+        feature = "_driver-cuda",
         feature = "driver-metal",
         feature = "driver-vulkan",
         feature = "driver-wgpu"
@@ -123,7 +123,7 @@ pub mod open {
     /// # Errors
     ///
     /// No device, or a boot config this driver refuses.
-    #[cfg(feature = "driver-cuda")]
+    #[cfg(feature = "_driver-cuda")]
     pub fn cuda(config_bytes: &[u8]) -> Result<DriverBackend> {
         Ok(Box::new(super::cuda::CudaDriver::create(config_bytes)?))
     }
@@ -133,7 +133,7 @@ pub mod open {
     /// # Errors
     ///
     /// Any rank's device failed to open.
-    #[cfg(feature = "driver-cuda")]
+    #[cfg(feature = "_driver-cuda")]
     pub fn cuda_group(config_blobs: Vec<Vec<u8>>) -> Result<(DriverBackend, usize)> {
         let (driver, ranks) = super::cuda::CudaDriver::create_group(config_blobs)?;
         Ok((Box::new(driver), ranks))
@@ -221,7 +221,7 @@ pub(crate) fn settle_control(
     completion
 }
 
-#[cfg(feature = "driver-cuda")]
+#[cfg(feature = "_driver-cuda")]
 mod cuda;
 #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
 mod metal;
@@ -239,7 +239,7 @@ mod vulkan;
 #[cfg(feature = "driver-wgpu")]
 mod wgpu;
 
-#[cfg(feature = "driver-cuda")]
+#[cfg(feature = "_driver-cuda")]
 pub use cuda::CudaDriver;
 #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
 pub use metal::MetalDriver;

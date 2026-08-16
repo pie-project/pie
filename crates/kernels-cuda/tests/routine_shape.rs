@@ -23,6 +23,7 @@ const ROTATE_BLOCK: u32 = 256;
 /// check a device pointer either way, so the obligation is stated once at
 /// `call()`, where the pointers come from, instead of restated by all 200 of
 /// these.
+#[kernels_macros::routine]
 fn rope_standard_table(
     ctx: &Ctx,
     positions: Env<*const i32>,
@@ -55,6 +56,7 @@ fn rope_standard_table(
 }
 
 /// A second routine, at a different arity and with a stated fact.
+#[kernels_macros::routine]
 fn rope_bf16_stub(
     ctx: &Ctx,
     q: *mut bf16,

@@ -17,7 +17,7 @@
 //!
 //! Derived at LOAD from the checkpoint's config, which makes it the driver's
 //! answer and not the text's -- the same argument
-//! [`kernels::Source::KvHeadStride`] makes for the pool's strides. A model
+//! [`kernels::Source::Named(<kernels::keys::KvHeadStride as kernels::keys::Fact>::KEY)`] makes for the pool's strides. A model
 //! states an architecture; a config states a deployment.
 
 /// The rescaling a config asks for, or none.

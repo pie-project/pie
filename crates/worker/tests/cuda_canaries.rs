@@ -11,12 +11,12 @@
 //!
 //! Shares the `common` cuda harness (`boot_cuda` + `install_inferlet` +
 //! `spawn_inferlet`). One boot per process (global engine state). Run warm:
-//!   cargo test -p pie-worker --features driver-cuda --test cuda_canaries -- --ignored --nocapture
+//!   cargo test -p pie-worker --features driver-cuda-13 --test cuda_canaries -- --ignored --nocapture
 
 mod common;
 
 #[test]
-#[ignore = "real-hardware: needs an RTX GPU + --features driver-cuda + a local model snapshot; one boot per process"]
+#[ignore = "real-hardware: needs an RTX GPU + --features driver-cuda-13 + a local model snapshot; one boot per process"]
 fn cuda_inferlet_canaries() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {

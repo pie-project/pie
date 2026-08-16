@@ -1,72 +1,33 @@
 //! Gemma-4's vision tower: the host walk, in Rust.
 //!
-//! The port of `driver-cuda/csrc/vision/gemma4_vision.cu` (322 lines) and of
-//! `gemma4_towers_c.cpp`'s vision half (52 lines). Both were host C++ over
-//! device text that had already moved to
-//! `kernels-cuda/kernels/vision/gemma4_vision.cuh`; what is here is that
-//! same walk with the `<<<>>>` written by [`super::fire`] instead of by nvcc.
+//! A port of the C++ vision launcher; its device text already lives in
+//! `kernels-cuda`'s `gemma4_vision.cuh`, so this is that walk with the
+//! `<<<>>>` written by [`super::call`]. Fifteen launches: fourteen JIT rows
+//! plus `gemm::act_x_wt_bf16`, a cuBLAS call with no grid to state.
 //!
-//! # Every launch, and the launcher it reproduces
-//!
-//! Each fire below quotes the C++ expression it replaces. The rule named in
-//! the row was written against that expression — `families/vision.rs` records
-//! the check for each — so the comment is the citation the rule's own doc
-//! points back at, and a reader can compare the two without a build.
-//!
-//! Fifteen launches, fourteen of them JIT rows. The fifteenth is
-//! `gemm::act_x_wt_bf16`, which is a cuBLAS call with no `<<<>>>` to state: it
-//! holds a runtime autotuner that may choose a gemv, and `execution.rs`
-//! already calls it `Service::Cublas`. It crosses through the generated
-//! `pie_k_*` entry, which is the boundary `fire/lora.rs` and
-//! `bind/service.rs` already use for it.
-//!
-//! # The one numerics divergence, stated rather than buried
-//!
-//! The C++ `rms()` helper carried a local copy of
-//! `norm::rmsnorm_strided_bf16`'s vec8/scalar decision and launched the vec8
-//! arm **at block 512**. The JIT row's vec8 specialisation is instantiated at
-//! `BLOCK = 256`, and `LaunchRule::Rms` launches 256 threads to match. The
-//! DECISION is identical — `families/norm.rs`'s `RMSNORM_STRIDED_VEC8`
-//! predicate is `rms_vec8_ok`'s clauses term for term — but the fold is 256
-//! wide where it was 512, so the reduction tree differs and the last bit of a
-//! row's inverse-RMS can differ with it.
-//!
-//! §42's parity claim for this tower was BYTE IDENTITY, measured over four
-//! shapes and two weight sets, so this is a real change and not a rounding
-//! footnote. It is here rather than in a new row because a row instantiated
-//! at 512 for one caller is `LaunchRule::Rms` growing a second block width for
-//! one tower, which §10.5 forbids. See `super`'s header.
+//! Numerics: the RMSNorm vec8 arm folds at `BLOCK = 256`, not the C++'s 512,
+//! so the last bit of a row's inverse-RMS can differ.
 
 use std::ffi::c_void;
 
-use kernels_cuda::jit::abi::bf16;
-use kernels_cuda::{norm, vision};
-use model::shared::tower_names::VISION_SLOTS_PER_LAYER;
+use crate::jit::abi::bf16;
+use crate::{norm, vision};
+use kernels::keys::{self, Fact};
+use kernels::routine::{Bank, In, Out};
 
-use super::{Scratch, call};
-use crate::device::{StreamRef, read_raw_span};
-use crate::{Error, Result};
+use super::{Refused, Result, Scratch, Stream, call, read_raw_span};
 
-/// The tower's name, in ONE place.
-///
-/// Every refusal below reads `gemma4_vision: ...` and every one of them used
-/// to spell it. `tests/no_family_names.rs` is why they do not any more: the
-/// driver is not allowed to learn a family name, and a walk that says
-/// `Error::invalid("gemma4_vision", …)` thirty times says it thirty times to
-/// a counter that cannot tell a refusal's subject from a dispatch decision.
-/// Collapsing it here does not hide the name — the messages are unchanged —
-/// it makes the file name its tower ONCE, which is the honest count.
+/// The tower's name, in one place.
 const WHO: &str = "gemma4_vision";
 
-/// A patch of `3 * 16 * 16` floats — `gemma4_vision.cu:251`'s `patch_dim`.
+/// A patch of `3 * 16 * 16` floats.
 const PATCH_DIM: usize = 3 * 16 * 16;
 
 /// A clipped linear's five slots: `[w, imin, imax, omin, omax]`.
 ///
-/// `imin`/`imax`/`omin`/`omax` are DEVICE pointers to single elements and all
-/// four are nullable — the row says `Buf | null` and the kernel's
-/// `lo ? F(*lo) : neg_inf()` is what a null means. Reading them on the host
-/// would be a synchronising copy per linear per layer.
+/// The four clamp slots are device pointers to single elements, each nullable;
+/// a null reads as `neg_inf`. Reading them on the host would be a synchronising
+/// copy per linear per layer.
 #[derive(Clone, Copy, Debug)]
 pub struct Clip {
     /// The weight matrix, `[out, in]` bf16.
@@ -82,7 +43,7 @@ pub struct Clip {
 }
 
 impl Clip {
-    /// Five consecutive slots — `gemma4_towers_c.cpp`'s `clip_of`.
+    /// Five consecutive slots from the table.
     fn of(t: &[*const c_void]) -> Self {
         Self {
             w: t[0],
@@ -125,7 +86,7 @@ pub struct Layer {
     pub down: Clip,
 }
 
-/// The tower's weights and its eight scalars — `VisRawWeights`.
+/// The tower's weights and its eight scalars.
 #[derive(Clone, Debug)]
 pub struct Weights {
     /// Patch embedding projection.
@@ -157,25 +118,16 @@ pub struct Weights {
 impl Weights {
     /// Rebuild the tower's weights from the flat pointer table.
     ///
-    /// The port of `gemma4_towers_c.cpp:41-92`, which existed only to turn
-    /// the stride-41 table `serve::encode` builds into the C++ struct the walk
-    /// consumed. In Rust the walk consumes this directly, so the marshalling
-    /// is the only thing that file did and it is these thirty lines.
-    ///
-    /// The slot ORDER is `model::shared::tower_names::vision_layers`'s, and
-    /// the offsets below are `gemma4_towers_c.cpp:60-72` unchanged.
-    ///
-    /// # Errors
-    ///
-    /// The table is not `depth * 41` entries long, which means the caller and
-    /// `tower_names` disagree about the layout — a refusal, because reading
-    /// one slot past the end is a weight pointer from another layer.
+    /// Slot order is `model::shared::tower_names::vision_layers`'s. Refuses
+    /// unless the table is `depth * slots_per_layer` long: a short table
+    /// means reading a slot past the end, a weight pointer from another layer.
     pub fn from_flat(
         patch_w: *const c_void,
         pos_table: *const c_void,
         embed_proj: *const c_void,
         layer_w: &[*const c_void],
         depth: usize,
+        slots_per_layer: usize,
         hidden: i32,
         heads: i32,
         intermediate: i32,
@@ -186,21 +138,21 @@ impl Weights {
         theta: f32,
     ) -> Result<Self> {
         let want = depth
-            .checked_mul(VISION_SLOTS_PER_LAYER)
-            .ok_or_else(|| Error::invalid(WHO, "layer table length overflowed"))?;
+            .checked_mul(slots_per_layer)
+            .ok_or_else(|| Refused::new(WHO, "layer table length overflowed"))?;
         if layer_w.len() < want {
-            return Err(Error::invalid(
+            return Err(Refused::new(
                 WHO,
                 format!(
                     "layer table holds {} pointers for {depth} layers of \
-                     {VISION_SLOTS_PER_LAYER}, which needs {want}",
+                     {slots_per_layer}, which needs {want}",
                     layer_w.len()
                 ),
             ));
         }
         let mut layers = Vec::with_capacity(depth);
         for i in 0..depth {
-            let t = &layer_w[i * VISION_SLOTS_PER_LAYER..(i + 1) * VISION_SLOTS_PER_LAYER];
+            let t = &layer_w[i * slots_per_layer..(i + 1) * slots_per_layer];
             layers.push(Layer {
                 in_ln: t[0],
                 post_attn_ln: t[1],
@@ -236,25 +188,11 @@ impl Weights {
 
 /// `norm::rmsnorm_bf16`'s two arms, chosen by the crate rather than copied.
 ///
-/// The C++ `rms()` helper (`gemma4_vision.cu:156-168`) was a third copy of
-/// `rmsnorm_strided_bf16`'s host decision: six clauses over three pointer
-/// alignments and a hidden size, then one of two `<<<>>>` expressions. Firing
-/// the base symbol hands that decision to
-/// `families/norm.rs::RMSNORM_STRIDED_VEC8`, whose predicate is the same six
-/// clauses expressed as `Term::Multiple` and `Term::Aligned` over the same
-/// operands — so the arm chosen is the arm the tower chose.
-///
-/// The strides are `hidden, hidden, hidden`, which is what `rmsnorm_bf16`
-/// itself substituted when it forwarded to the strided form.
-///
-/// `LaunchRule::Rms` is `grid[rows,1,1] block[256,1,1] smem 32`. The C++
-/// scalar arm is `<<<dim3(rows), dim3(256), 0, S>>>` — the same grid, the same
-/// block, and 32 bytes of DYNAMIC shared memory the kernel does not read: its
-/// `buf` is a static `__shared__ float[BLOCK]`. See `families/norm.rs`.
-///
-/// **The vec8 arm's block moves from 512 to 256.** The module header states
-/// why that is a divergence, why it is stated rather than fixed, and what it
-/// costs.
+/// Firing the base symbol hands the arm choice to
+/// `families/norm.rs::RMSNORM_STRIDED_VEC8`, whose predicate is the same
+/// clauses over the same operands. The strides are `hidden, hidden, hidden`,
+/// as `rmsnorm_bf16` substituted when forwarding to the strided form. The vec8
+/// arm's block is 256 here, not the C++'s 512 — see the module header.
 fn rms(
     x: *const c_void,
     weight: *const c_void,
@@ -262,19 +200,20 @@ fn rms(
     rows: i32,
     hidden: i32,
     eps: f32,
-    stream: StreamRef<'_>,
+    stream: Stream<'_>,
 ) -> Result<()> {
     call("norm::rmsnorm_strided_bf16", stream, |ctx| {
         norm::rmsnorm_strided_bf16(
             ctx,
-            x.cast(),
-            weight.cast(),
-            y.cast(),
-            rows,
-            hidden,
-            hidden,
-            hidden,
-            eps,
+            // The stride is now the difference between the two regions' widths;
+            // this caller passes `hidden` for both.
+            In { ptr: x.cast(), rows, width: hidden },
+            // `Bank`, not `Weight`: the callee reads its weight as the
+            // positional bank (`args[n_in + n_out]`), and the two wrappers look
+            // alike enough that a swap would not be caught by the compiler.
+            Bank { ptr: weight.cast() },
+            Out { ptr: y.cast(), rows, width: hidden },
+            keys::RmsEps::env(eps),
         )
     })
 }
@@ -282,23 +221,14 @@ fn rms(
 /// A non-negative extent as the `u32` a `Dims` field is.
 fn extent(what: &'static str, value: i32) -> Result<u32> {
     u32::try_from(value)
-        .map_err(|_| Error::invalid(WHO, format!("{what}: {value} is not an extent")))
+        .map_err(|_| Refused::new(WHO, format!("{what}: {value} is not an extent")))
 }
 
-/// The tower's forward pass over one image — `run_gemma4_vision`.
+/// The tower's forward pass over one image.
 ///
 /// `pixel` is `[n, hidden]` bf16 patch embeddings, `pos` the `[n, 2]` grid
 /// coordinates as floats, `grp` the `[n]` pooling group index. `out_proj`
 /// receives `[out_len, text_hidden]` bf16.
-///
-/// The `VisDebugTap` parameter is gone. It was a parity-debugging callback
-/// defaulted to `nullptr`, and after `scatter_gemma4_vision`'s deletion the
-/// tower's only caller was `encode_gemma4_vision`, which never passed one.
-///
-/// # Errors
-///
-/// A refused launch, a refused allocation, or a shape the tower does not
-/// implement. Never a substitution.
 #[allow(clippy::too_many_arguments)]
 fn run(
     w: &Weights,
@@ -309,34 +239,26 @@ fn run(
     out_len: i32,
     out_proj: *mut c_void,
     cublas: *mut c_void,
-    stream: StreamRef<'_>,
+    stream: Stream<'_>,
 ) -> Result<()> {
     let (hd, nh, im) = (w.hidden, w.heads, w.intermediate);
     let (txt, pt) = (w.text_hidden, w.pos_table_size);
     let (eps, theta) = (w.eps, w.theta);
-    // `gemma4_vision.cu:180`. The kernels hard-code a 64-wide head and a
-    // 16-wide half; `families/vision.rs`'s `k_rope_axial2d` row records that
-    // this precondition lives on the tower because nothing in the row states
-    // it, and `axial_rope` checks `head_dim` without reading it.
+    // The kernels hard-code a 64-wide head and 16-wide half, a precondition
+    // that lives on the tower because the rope row does not state it.
     if hd != 768 || nh != 12 {
-        return Err(Error::invalid(
+        return Err(Refused::new(
             WHO,
             format!("unexpected dims (expected hidden=768, heads=12, got hidden={hd}, heads={nh})"),
         ));
     }
     let n_u = extent("patches", n)?;
     let hd_u = extent("hidden", hd)?;
-    // `im_u` STOOD HERE and its only reader was the `rect(n_u, im_u)` at the
-    // geglu fire, which fn-world deleted. The CHECK it performed has not gone
-    // with it: a negative `im` is still refused, here, before any allocation,
-    // and it must be — `inter_elems` below is built from `im` and would
-    // otherwise size three scratch buffers off a sign-extended cast.
+    // Refuse a negative `im` before any allocation: `inter_elems` below is
+    // built from it and would otherwise size scratch off a sign-extended cast.
     extent("intermediate", im)?;
-    // `out_len_u` went the same way as `im_u` above and for the same reason:
-    // its readers were `rect` calls the fn-world crossing deleted. `out_len`
-    // itself is still read below — `pooled_elems`, the two `gemm` extents —
-    // through `try_from`, which is why only the unsigned copy is gone and not
-    // the check.
+    // Likewise refuse a negative `out_len` here; it is read below through
+    // `try_from` for `pooled_elems` and the two gemm extents.
     extent("pooled rows", out_len)?;
     let nz = usize::try_from(n).unwrap_or(0);
     let hidden_elems = nz * hd as usize;
@@ -356,13 +278,13 @@ fn run(
     let tmp = scratch.bf16(hidden_elems)?;
     let scr = scratch.f32s(nz * nz)?;
 
-    // `gemma4_vision.cu:193` — the patch pixels rescaled into `hn`.
+    // The patch pixels rescaled into `hn`.
     call("vision::k_scale_bf16", stream, |ctx| {
         vision::k_scale_bf16(ctx, pixel, hn, hidden_elems)
     })?;
-    // `:194` — cuBLAS, no `<<<>>>`. See the module header.
+    // cuBLAS, no grid to state.
     gemm(cublas, hn.cast_const(), w.patch_w, h, n, hd, hd);
-    // `:195` — the two axial position-table rows, added in place on `h`.
+    // The two axial position-table rows, added in place on `h`.
     call("vision::k_addpos_grid2d_bf16", stream, |ctx| {
         vision::k_addpos_grid2d_bf16(ctx, h, w.pos_table, pos.cast_const(), n, hd, pt)
     })?;
@@ -372,11 +294,10 @@ fn run(
         clin(cublas, hn.cast_const(), q, xc, &layer.q, n, hd, hd, stream)?;
         clin(cublas, hn.cast_const(), k, xc, &layer.k, n, hd, hd, stream)?;
         clin(cublas, hn.cast_const(), v, xc, &layer.v, n, hd, hd, stream)?;
-        // `:200` — the per-head norms are `rows = N * NH` of 64, which is the
-        // `hidden, hidden, hidden` strides at a head's width.
+        // The per-head norms are `rows = N * NH` at a head's width (64).
         let head_rows = n
             .checked_mul(nh)
-            .ok_or_else(|| Error::invalid(WHO, "N * NH overflowed"))?;
+            .ok_or_else(|| Refused::new(WHO, "N * NH overflowed"))?;
         let head_dim = hd / nh;
         rms(
             q.cast_const(),
@@ -396,31 +317,25 @@ fn run(
             eps,
             stream,
         )?;
-        // `:200` — `nd::rmsnorm_no_scale<bfd,256><<<dim3(N*NH),dim3(256),0,S>>>(D(v),D(v),64,EPS);`
-        // `LaunchRule::RowsPerHead` with an ABSENT `stated_head_dim` is
-        // `grid[rows,1,1] block[256,1,1]`, and the head width is the operand
-        // the C++ passed as `64` rather than an extent the rule recovers.
+        // `rmsnorm_no_scale` over `v`: the head width (64) is passed as an
+        // operand, not recovered from the grid.
         call("norm::rmsnorm_no_scale_bf16", stream, |ctx| {
             norm::rmsnorm_no_scale::<bf16>(
                 ctx,
-                v.cast_const().cast(),
-                v.cast(),
-                head_rows,
-                head_dim,
-                0,
-                eps,
+                In { ptr: v.cast_const().cast(), rows: head_rows, width: head_dim },
+                Out { ptr: v.cast(), rows: head_rows, width: head_dim },
+                keys::PerHeadDim::env(0),
+                keys::RmsEps::env(eps),
             )
         })?;
-        // `:201` — one C++ line, two launches, one tensor each:
-        // `dim3 rg(1,NH,N);vd::k_rope_axial2d<bfd><<<rg,32,0,S>>>(D(q),pos,N,NH,THETA);vd::k_rope_axial2d<bfd><<<rg,32,0,S>>>(D(k),pos,N,NH,THETA);`
+        // Axial 2-D rope over `q` then `k`.
         for tensor in [q, k] {
             call("vision::k_rope_axial2d_bf16", stream, |ctx| {
                 vision::k_rope_axial2d_bf16(ctx, tensor, pos.cast_const(), n, nh, theta)
             })?;
         }
-        // `:202` — the head loop, three launches per head. The host varies
-        // `hh` across twelve calls of one routine, because the head is an
-        // operand and not a grid axis at any of the three.
+        // The head loop: three launches per head, the head an operand rather
+        // than a grid axis.
         for head in 0..nh {
             call("vision::k_qk_bf16", stream, |ctx| {
                 vision::k_qk_bf16(ctx, q.cast_const(), k.cast_const(), scr, n, nh, head, 1.0)
@@ -476,32 +391,21 @@ fn run(
             im,
             stream,
         )?;
-        // `:208` — `geglu_tanh<<<(ge+255)/256, 256, 0, S>>>` with
-        // `ge = (int)((long)N*IM)`. That grid was `LaunchRule::Elementwise`
-        // evaluated from the `N` by `IM` rectangle; §5 step 5 took `mlp` into
-        // fn-world, so it is `x::mlp::elementwise(n)` inside the host program
-        // — the same `(n + 255) / 256` by 256, written beside the `<<<>>>`
-        // this comment cites — and `rect(n_u, im_u)` has nothing left to say.
-        //
-        // The element count was ALREADY the last operand and is still the
-        // last parameter, so the `try_from` that refuses an `N * IM` too big
-        // for the kernel's `int` stays exactly where it was. It has to: the
-        // host program takes an `i32`, and a silent `as` here would launch a
-        // negative extent that `Refusal::Empty` would then report as an empty
-        // tensor.
+        // geglu over the `N` by `IM` rectangle.
         //
         // SAFETY: `stream` outlives the launch, and the three pointers address
         // this tower's own arena for `inter_elems` bf16 elements.
-        let ctx = unsafe { kernels_cuda::jit::Ctx::on(stream.as_raw().cast()) };
-        kernels_cuda::mlp::geglu_tanh::<bf16>(
+        let ctx = unsafe { crate::jit::Ctx::on(stream.as_raw()) };
+        crate::mlp::geglu_tanh::<bf16>(
             &ctx,
-            gate.cast_const().cast(),
-            up.cast_const().cast(),
-            act.cast(),
-            i32::try_from(inter_elems)
-                .map_err(|_| Error::invalid(WHO, "N * IM does not fit the kernel's int"))?,
+            // `geglu_tanh` forms its extent with `saturating_mul`, so an
+            // overflowing `rows * width` would launch over `i32::MAX` rather
+            // than refuse. Nothing here reaches that: `n` is a token count.
+            In { ptr: gate.cast_const().cast(), rows: n, width: im },
+            In { ptr: up.cast_const().cast(), rows: n, width: im },
+            Out { ptr: act.cast(), rows: n, width: im },
         )
-        .map_err(|why| Error::invalid("mlp::geglu_tanh_bf16", format!("{why:?}")))?;
+        .map_err(|why| Refused::new("mlp::geglu_tanh_bf16", format!("{why:?}")))?;
         clin(
             cublas,
             act.cast_const(),
@@ -518,36 +422,32 @@ fn run(
     }
 
     let pooled_elems = usize::try_from(out_len).unwrap_or(0) * hd as usize;
-    // `:215` — `cudaMemsetAsync(pf, 0, OUTL*Hd*4, S)` on the accumulator the
-    // pool `atomicAdd`s into.
+    // The accumulator the pooling scatter `atomicAdd`s into, zeroed first.
     let pf = scratch.zeroed_f32s(pooled_elems, stream)?;
-    // `:216` — the pooling scatter, over the INPUT rectangle. `9.f` is the
-    // C++'s own literal rather than `pool_kernel * pool_kernel`.
+    // The pooling scatter over the input rectangle; `9.0` is a literal, not
+    // `pool_kernel * pool_kernel`.
     call("vision::k_pool_bf16", stream, |ctx| {
         vision::k_pool_bf16(ctx, h.cast_const(), grp.cast_const(), pf, n, hd, 9.0)
     })?;
     let pooled = scratch.bf16(pooled_elems)?;
-    // `:217` — the accumulator scaled and narrowed, with `sqrtf((float)Hd)`
-    // computed on the host as an operand.
+    // The accumulator scaled and narrowed; `sqrt(Hd)` is a host operand.
     #[allow(clippy::cast_precision_loss)]
     let scale = (hd as f32).sqrt();
     call("vision::k_pool_finish_bf16", stream, |ctx| {
         vision::k_pool_finish_bf16(ctx, pf.cast_const(), pooled, scale, pooled_elems)
     })?;
     let pn = scratch.bf16(pooled_elems)?;
-    // `:219` — `rmsnorm_no_scale<bfd,256><<<dim3(OUTL), dim3(256), 0, S>>>`.
+    // The pooled rows normalised.
     call("norm::rmsnorm_no_scale_bf16", stream, |ctx| {
         norm::rmsnorm_no_scale::<bf16>(
             ctx,
-            pooled.cast_const().cast(),
-            pn.cast(),
-            out_len,
-            hd,
-            0,
-            eps,
+            In { ptr: pooled.cast_const().cast(), rows: out_len, width: hd },
+            Out { ptr: pn.cast(), rows: out_len, width: hd },
+            keys::PerHeadDim::env(0),
+            keys::RmsEps::env(eps),
         )
     })?;
-    // `:220` — the third and last cuBLAS call.
+    // The third and last cuBLAS call.
     gemm(
         cublas,
         pn.cast_const(),
@@ -557,17 +457,14 @@ fn run(
         txt,
         hd,
     );
-    // `:221`. The arena is dropped after this, which is the order the C++
-    // destructor ran in: synchronise, then free.
+    // Synchronise, then free the arena — in that order.
     stream.synchronize()?;
     drop(scratch);
     Ok(())
 }
 
-/// A clipped linear — `gemma4_vision.cu:188-191`'s `clin` lambda.
-///
-/// Clamp the input into the shared `xc` staging buffer, GEMM it against the
-/// clip's weight, clamp the output in place.
+/// A clipped linear: clamp the input into the shared `xc` staging buffer, GEMM
+/// it against the clip's weight, then clamp the output in place.
 #[allow(clippy::too_many_arguments)]
 fn clin(
     cublas: *mut c_void,
@@ -578,11 +475,10 @@ fn clin(
     n: i32,
     k_in: i32,
     out_width: i32,
-    stream: StreamRef<'_>,
+    stream: Stream<'_>,
 ) -> Result<()> {
-    // The three extents are checked HERE and not left to the routine: the two
-    // element counts below are built from them, and a negative `k_in` would
-    // size a clamp off a sign-extended cast before any routine saw it.
+    // Check the extents here: the element counts below are built from them, and
+    // a negative `k_in` would size a clamp off a sign-extended cast.
     extent("clin rows", n)?;
     extent("clin in", k_in)?;
     extent("clin out", out_width)?;
@@ -597,15 +493,8 @@ fn clin(
     })
 }
 
-/// `kernels::gemm::act_x_wt_bf16` — `beta` defaulted to `0.f` as the C++
-/// declaration did (`gemm/gemm.hpp:295`, in a header that is now deleted).
-///
-/// This used to be the one host call in this walk that stayed C++, on the
-/// grounds that it is a cuBLAS dispatch with a runtime autotuner behind it,
-/// not a `<<<>>>` a row could state. Both halves of that are still true and
-/// neither is a reason any more: the autotuner is
-/// [`crate::fire::gemm::act_x_wt_bf16`], Rust, and the row is on
-/// `execution::RUST_SERVED` so no `pie_k_*` entry survives to call.
+/// `kernels::gemm::act_x_wt_bf16` with `beta` defaulted to `0.0`, via the Rust
+/// autotuner [`crate::gemm::dense::act_x_wt_bf16`].
 fn gemm(
     handle: *mut c_void,
     act: *const c_void,
@@ -615,58 +504,55 @@ fn gemm(
     n: i32,
     k: i32,
 ) {
-    // SAFETY: the pointers are scratch allocations and published weights,
-    // live until the caller synchronises; `handle` is a live cuBLAS handle
-    // bound to this walk's stream. The same assertion `fire/lora.rs` makes at
-    // its four call sites of this entry.
+    // SAFETY: the pointers are scratch allocations and published weights, live
+    // until the caller synchronises; `handle` is a live cuBLAS handle bound to
+    // this walk's stream.
     unsafe {
-        crate::fire::gemm::act_x_wt_bf16(handle, act, w, y, m, n, k, 0.0);
+        crate::gemm::dense::act_x_wt_bf16(handle, act, w, y, m, n, k, 0.0);
     }
 }
 
-/// `norm::residual_add_bf16`, with the C++'s zero-length guard.
+/// `norm::residual_add_bf16`, with a zero-length guard.
 ///
-/// `gemma4_vision.cu:205` and `:211` both read
-/// `{ const long n = (long)N*Hd; if (n) residual_add<<<(n+255)/256, 256, 0, S>>>(...); }`.
-/// The guard has to come across: `LaunchRule::Elementwise` answers
-/// `Ungeometric::Empty` for a zero rectangle, so a legal no-op would arrive
-/// here as a refusal — the trap `fire/attn_score.rs` documents for its own
-/// `num_requests <= 0`.
+/// `LaunchRule::Elementwise` refuses a zero rectangle, so without the early-out
+/// a legal empty no-op would arrive here as a refusal.
 fn residual_add(
     y: *mut c_void,
     x: *const c_void,
     elems: usize,
     rows: u32,
     width: u32,
-    stream: StreamRef<'_>,
+    stream: Stream<'_>,
 ) -> Result<()> {
     if elems == 0 {
         return Ok(());
     }
-    let _ = (rows, width);
+    // The two `try_from`s refuse rather than cast: an `as i32` on an over-large
+    // `u32` would make a negative extent, reported downstream as an empty
+    // tensor — a wrong answer wearing a plausible refusal.
+    let rows = i32::try_from(rows)
+        .map_err(|_| Refused::new(WHO, "the residual rectangle's row count exceeds i32"))?;
+    let width = i32::try_from(width)
+        .map_err(|_| Refused::new(WHO, "the residual rectangle's row width exceeds i32"))?;
     call("norm::residual_add_bf16", stream, |ctx| {
-        norm::residual_add::<bf16>(ctx, y.cast(), x.cast(), elems)
+        norm::residual_add::<bf16>(
+            ctx,
+            Out { ptr: y.cast(), rows, width },
+            In { ptr: x.cast(), rows, width },
+        )
     })
 }
 
 /// The encode-ABI entry: host pixels in, host bf16 embedding rows out.
 ///
-/// The port of `encode_gemma4_vision` (`gemma4_vision.cu:241-320`). One image
-/// per iteration, each with its own arena, each synchronised before the next
-/// — the shape the C++ had, kept because the output rows are read back to the
-/// host between images.
-///
-/// `pixels` is the whole image plane as BYTES and `pixel_byte_indptr` cuts it,
-/// which is what the plan carries (`MediaEncodePlan::validate` proves the
-/// partition and the `f32` alignment). The C++ took a `const float*` and
-/// divided the offsets by four; the bytes are the same bytes and the division
-/// is gone.
+/// One image per iteration, each with its own arena, synchronised before the
+/// next because the output rows are read back to the host between images.
+/// `pixels` is the image plane as bytes and `pixel_byte_indptr` cuts it.
 ///
 /// # Errors
 ///
 /// A patch count that is not a whole number of pooling groups, an output
-/// buffer too small for the rows this image produces, or any refused launch.
-/// Each is the `throw` the C++ made at the same point, as a value.
+/// buffer too small, or any refused launch.
 pub fn encode(
     w: &Weights,
     pixels: &[u8],
@@ -675,18 +561,18 @@ pub fn encode(
     output_rows: &mut [u8],
     output_row_indptr: &mut [u32],
     cublas: *mut c_void,
-    stream: StreamRef<'_>,
+    stream: Stream<'_>,
 ) -> Result<()> {
     let num_images = output_row_indptr.len().saturating_sub(1);
     if num_images == 0 || pixel_byte_indptr.len() < num_images + 1 {
-        return Err(Error::invalid(WHO, "invalid standalone encode inputs"));
+        return Err(Refused::new(WHO, "invalid standalone encode inputs"));
     }
     let pk = usize::try_from(w.pool_kernel)
-        .map_err(|_| Error::invalid(WHO, "pool_kernel is negative"))?;
+        .map_err(|_| Refused::new(WHO, "pool_kernel is negative"))?;
     let pk2 = pk
         .checked_mul(pk)
         .filter(|v| *v != 0)
-        .ok_or_else(|| Error::invalid(WHO, "pool_kernel is zero"))?;
+        .ok_or_else(|| Refused::new(WHO, "pool_kernel is zero"))?;
     let row_bytes = usize::try_from(w.text_hidden).unwrap_or(0) * 2;
     let mut rows_written = 0usize;
     let mut patch_off = 0usize;
@@ -695,7 +581,7 @@ pub fn encode(
         let blo = pixel_byte_indptr[image] as usize;
         let bhi = pixel_byte_indptr[image + 1] as usize;
         if bhi < blo || bhi > pixels.len() {
-            return Err(Error::invalid(
+            return Err(Refused::new(
                 WHO,
                 format!("image {image}'s pixel span [{blo}, {bhi}) leaves the payload"),
             ));
@@ -703,7 +589,7 @@ pub fn encode(
         let n_floats = (bhi - blo) / 4;
         let n_patch = n_floats / PATCH_DIM;
         if n_patch == 0 || !n_patch.is_multiple_of(pk2) {
-            return Err(Error::invalid(
+            return Err(Refused::new(
                 WHO,
                 format!("invalid patch count ({n_patch} for a {pk}x{pk} pool)"),
             ));
@@ -712,12 +598,12 @@ pub fn encode(
         let want = rows_written
             .checked_add(out_len)
             .and_then(|r| r.checked_mul(row_bytes))
-            .ok_or_else(|| Error::invalid(WHO, "output row count overflowed"))?;
+            .ok_or_else(|| Refused::new(WHO, "output row count overflowed"))?;
         if want > output_rows.len() {
-            return Err(Error::invalid(WHO, "encode output buffer too small"));
+            return Err(Refused::new(WHO, "encode output buffer too small"));
         }
         if patch_positions.len() < (patch_off + n_patch) * 2 {
-            return Err(Error::invalid(
+            return Err(Refused::new(
                 WHO,
                 "patch position table is shorter than the patches it describes",
             ));
@@ -727,16 +613,13 @@ pub fn encode(
         let mut scratch = Scratch::new();
         let pix_f32 = scratch.upload_bytes(&pixels[blo..bhi], stream)?;
         let pix_bf = scratch.bf16(n_floats)?;
-        // `:280` — the uploaded plane narrowed to the tower's format. The
-        // SOURCE is float whatever the destination's element type is.
+        // The uploaded plane narrowed to bf16; the source is float.
         call("vision::k_f32_to_bf16_bf16", stream, |ctx| {
             vision::k_f32_to_bf16_bf16(ctx, pix_f32.cast_const(), pix_bf, n_floats)
         })?;
 
-        // `:283-296` — the host's own arithmetic: the positions widened to
-        // float for the two kernels that consume them as trigonometric
-        // arguments, and the pooling group index, which is a division by a
-        // pooling kernel the patch grid does not carry.
+        // Host arithmetic: positions widened to float for the trig kernels, and
+        // the pooling group index (a division the patch grid does not carry).
         let mut posf = vec![0.0f32; n_patch * 2];
         let mut grp = vec![0i32; n_patch];
         let mut maxx = 0u32;
@@ -744,7 +627,7 @@ pub fn encode(
             maxx = maxx.max(pos_h[2 * patch]);
         }
         let gx = i32::try_from((maxx as usize + 1) / pk)
-            .map_err(|_| Error::invalid(WHO, "pooling grid width overflowed"))?;
+            .map_err(|_| Refused::new(WHO, "pooling grid width overflowed"))?;
         for patch in 0..n_patch {
             let (px, py) = (pos_h[2 * patch], pos_h[2 * patch + 1]);
             #[allow(clippy::cast_precision_loss)]
@@ -767,15 +650,14 @@ pub fn encode(
             pos_d,
             grp_d,
             i32::try_from(n_patch)
-                .map_err(|_| Error::invalid(WHO, "patch count overflowed an int"))?,
+                .map_err(|_| Refused::new(WHO, "patch count overflowed an int"))?,
             i32::try_from(out_len)
-                .map_err(|_| Error::invalid(WHO, "pooled row count overflowed"))?,
+                .map_err(|_| Refused::new(WHO, "pooled row count overflowed"))?,
             proj_d,
             cublas,
             stream,
         )?;
-        // `:310` — the rows come back to the host between images, because the
-        // encode ABI's output is a host buffer.
+        // The rows come back to the host between images.
         let begin = rows_written * row_bytes;
         let end = begin + out_len * row_bytes;
         // SAFETY: `proj_d` is `out_len * text_hidden` bf16 elements of this
@@ -786,7 +668,7 @@ pub fn encode(
         drop(scratch);
         rows_written += out_len;
         output_row_indptr[image + 1] = u32::try_from(rows_written)
-            .map_err(|_| Error::invalid(WHO, "encoded row count overflowed u32"))?;
+            .map_err(|_| Refused::new(WHO, "encoded row count overflowed u32"))?;
         patch_off += n_patch;
     }
     Ok(())

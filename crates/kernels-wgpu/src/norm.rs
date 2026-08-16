@@ -13,7 +13,7 @@ use kernels::KernelSig;
 /// `refactor-bigplan.md` §7 Stage 3. Twelve kernels, every one of them live —
 /// `rms_single_row` is 1084 rectangles of the corpus on its own, one per layer
 /// of every model — so the crossing was measured before the rows went:
-/// `the_routine_path_plans_what_the_table_path_planned` derived 1700
+/// `every_launchs_scalars_land_where_its_module_reads_them` derived 1700
 /// rectangles twice, by the row and by the arm, and compared every field.
 ///
 /// It found one on its first run. [`residual_add`] asked for a
@@ -41,7 +41,7 @@ pub static ENTRYPOINTS: &[&str] = &[
     "vnorm_single_row_bfloat16",
 ];
 
-use crate::routine::{Bind, Buf, BufMut, Ctx, Env, Fire, Routine};
+use crate::routine::{Else, Nth, Over, Reckoned, Say, keys, Ask, Bind, Block, Buf, BufMut, Ctx, Env, Fire, InSlot, OutSlot, Param, ParamOr, Routine, Weight};
 use kernels::routine::Refusal;
 
 /// The workgroup width every shader in this family declares.
@@ -148,13 +148,13 @@ fn per_head_row(heads: i32, rows: i32) -> Result<[u32; 3], Refusal> {
 /// row, or a lane count that overflows.
 pub fn rms_single_row(
     ctx: &Ctx<'_>,
-    x: Buf,
-    w: Buf,
-    out: BufMut,
-    params: Buf,
-    width: Env<i32>,
-    axis: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    w: Weight<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    width: Ask<keys::Width, i32>,
+    axis: ParamOr<1, keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -173,12 +173,12 @@ pub fn rms_single_row(
 /// As `per_row`, which is `per_axis` at one axis per row.
 pub fn rms_strided_row(
     ctx: &Ctx<'_>,
-    x: Buf,
-    w: Buf,
-    out: BufMut,
-    params: Buf,
-    row_pitch: i32,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    w: Weight<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    row_pitch: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -197,19 +197,19 @@ pub fn rms_strided_row(
 /// As `per_head_row`: an empty head or row count.
 pub fn rms_strided_head_row(
     ctx: &Ctx<'_>,
-    x: Buf,
-    w: Buf,
-    out: BufMut,
-    params: Buf,
-    row_pitch: i32,
-    heads: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    w: Weight<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    row_pitch: Ask<keys::Width, i32>,
+    heads: Reckoned<Over<Say<keys::Width>, Else<Nth<1>, Say<keys::Width>>>, Env<i32>>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "norm/rms.wgsl",
             entrypoint: "rms_strided_head_row_bfloat16",
-            lanes: per_head_row(*heads, *rows)?,
+            lanes: per_head_row(**heads, *rows)?,
         },
         &[x.v(), w.v(), out.v(), params.v(), row_pitch.v()],
     )
@@ -223,14 +223,14 @@ pub fn rms_strided_head_row(
 /// row, or a lane count that overflows.
 pub fn rms_residual(
     ctx: &Ctx<'_>,
-    x: Buf,
-    w: Buf,
-    out: BufMut,
-    params: Buf,
-    r: Buf,
-    width: Env<i32>,
-    axis: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    w: Weight<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    r: InSlot<1, Buf>,
+    width: Ask<keys::Width, i32>,
+    axis: ParamOr<1, keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -250,15 +250,15 @@ pub fn rms_residual(
 /// row, or a lane count that overflows.
 pub fn rms_residual_scaled(
     ctx: &Ctx<'_>,
-    x: Buf,
-    w: Buf,
-    out: BufMut,
-    params: Buf,
-    r: Buf,
-    s: Buf,
-    width: Env<i32>,
-    axis: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    w: Weight<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    r: InSlot<1, Buf>,
+    s: InSlot<2, Buf>,
+    width: Ask<keys::Width, i32>,
+    axis: ParamOr<1, keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -283,12 +283,12 @@ pub fn rms_residual_scaled(
 /// row, or a lane count that overflows.
 pub fn vnorm_single_row(
     ctx: &Ctx<'_>,
-    x: Buf,
-    out: BufMut,
-    params: Buf,
-    width: Env<i32>,
-    axis: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    width: Ask<keys::Width, i32>,
+    axis: ParamOr<1, keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -307,13 +307,13 @@ pub fn vnorm_single_row(
 /// As `per_head_row`: an empty head or row count.
 pub fn gated_rms(
     ctx: &Ctx<'_>,
-    x: Buf,
-    z: Buf,
-    w: Buf,
-    out: BufMut,
-    params: Buf,
-    heads: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    z: InSlot<1, Buf>,
+    w: Weight<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    heads: Ask<keys::VHeads, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -332,14 +332,14 @@ pub fn gated_rms(
 /// As `per_head_row`: an empty head or row count.
 pub fn gated_rms_strided(
     ctx: &Ctx<'_>,
-    x: Buf,
-    z: Buf,
-    w: Buf,
-    out: BufMut,
-    params: Buf,
-    row_pitch: i32,
-    heads: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    z: InSlot<1, Buf>,
+    w: Weight<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    row_pitch: Ask<keys::Width, i32>,
+    heads: Ask<keys::VHeads, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -361,12 +361,12 @@ pub fn gated_rms_strided(
 /// [`kernels::shader::elementwise_rows`]'s, for a zero width or row count.
 pub fn layer_scalar_mul(
     ctx: &Ctx<'_>,
-    x: Buf,
-    scalar: Buf,
-    out: BufMut,
-    params: Buf,
-    width: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    scalar: Weight<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -389,11 +389,11 @@ pub fn layer_scalar_mul(
 /// [`kernels::shader::elementwise_rows`]'s.
 pub fn residual_add(
     ctx: &Ctx<'_>,
-    x: Buf,
-    residual: Buf,
-    out: BufMut,
-    width: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    residual: InSlot<1, Buf>,
+    out: OutSlot<0, BufMut>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -411,7 +411,7 @@ pub fn residual_add(
             // and had never fired: nothing was armed, so every real
             // `residual_add` went through the row, which states
             // `LaunchRule::Elementwise` and is right.
-            // `the_routine_path_plans_what_the_table_path_planned` caught it
+            // `every_launchs_scalars_land_where_its_module_reads_them` caught it
             // on the first run after `norm` was armed, `[12, 64, 1]` against
             // the row's `[720, 1, 1]`.
             lanes: kernels::shader::elementwise(*width, *rows)?,
@@ -427,12 +427,12 @@ pub fn residual_add(
 /// [`kernels::shader::elementwise_rows`]'s.
 pub fn residual_add_strided(
     ctx: &Ctx<'_>,
-    x: Buf,
-    residual: Buf,
-    out: BufMut,
-    row_pitch: i32,
-    width: Env<i32>,
-    rows: Env<i32>,
+    x: InSlot<0, Buf>,
+    residual: InSlot<1, Buf>,
+    out: OutSlot<0, BufMut>,
+    row_pitch: Param<0, i32>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -454,16 +454,16 @@ pub fn residual_add_strided(
 /// [`kernels::shader::elementwise_rows`]'s.
 pub fn add_bias(
     ctx: &Ctx<'_>,
-    out: BufMut,
-    bias: Buf,
-    width: i32,
-    rows: Env<i32>,
+    out: OutSlot<0, BufMut>,
+    bias: Weight<0, Buf>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "norm/add_bias.wgsl",
             entrypoint: "add_bias_bfloat16",
-            lanes: kernels::shader::elementwise_rows(width, *rows)?,
+            lanes: kernels::shader::elementwise_rows(*width, *rows)?,
         },
         &[out.v(), bias.v(), width.v()],
     )

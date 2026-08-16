@@ -337,7 +337,8 @@ pub static ENTRYPOINTS: &[&str] = &[
     "mxfp4_dequant_bf16",
 ];
 
-use crate::routine::{Bind, Buf, BufMut, Ctx, Env, Fire, Routine};
+use crate::routine::{keys, Ask, Bind, Buf, BufMut, Ctx, Env, Fire, Param, Routine};
+use crate::routine::{InSlot, Nth, OutSlot, Reckoned, Say, Times, Weight};
 use kernels::routine::Refusal;
 
 /// `affine_qmm_t`, indexed by `qmm_point`.
@@ -893,24 +894,24 @@ fn qmv_grid(vecs: i32, out_vec_size: i32) -> Result<[u32; 3], Refusal> {
 /// whatever `qmm_grid` refuses.
 pub fn qmm_t(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    k: i32,
-    n: i32,
-    group: Env<i32>,
-    bits: Env<i32>,
-    bm: Env<i32>,
-    bn: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
+    bm: Ask<keys::TileM, i32>,
+    bn: Ask<keys::TileN, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmm_t.wgsl",
             entrypoint: QMM_T[qmm_point(*group, *bits, *bm, *bn)?],
-            lanes: qmm_grid(n, *bn, *m, *bm, 1)?,
+            lanes: qmm_grid(*n, *bn, *m, *bm, 1)?,
         },
         &[w.v(), scales.v(), biases.v(), x.v(), y.v(), k.v(), n.v()],
     )
@@ -928,25 +929,25 @@ pub fn qmm_t(
 /// whatever `qmm_grid` refuses.
 pub fn qmm_t_bias(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    bias: Buf,
-    k: i32,
-    n: i32,
-    group: Env<i32>,
-    bits: Env<i32>,
-    bm: Env<i32>,
-    bn: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    bias: Weight<3, Buf>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
+    bm: Ask<keys::TileM, i32>,
+    bn: Ask<keys::TileN, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmm_t.wgsl",
             entrypoint: QMM_T_BIAS[qmm_point(*group, *bits, *bm, *bn)?],
-            lanes: qmm_grid(n, *bn, *m, *bm, 1)?,
+            lanes: qmm_grid(*n, *bn, *m, *bm, 1)?,
         },
         &[
             w.v(),
@@ -974,25 +975,25 @@ pub fn qmm_t_bias(
 /// whatever `qmm_grid` refuses.
 pub fn qmm_t_residual(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    k: i32,
-    n: i32,
-    residual: Buf,
-    group: Env<i32>,
-    bits: Env<i32>,
-    bm: Env<i32>,
-    bn: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    residual: InSlot<1, Buf>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
+    bm: Ask<keys::TileM, i32>,
+    bn: Ask<keys::TileN, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmm_t.wgsl",
             entrypoint: QMM_T_RESIDUAL[qmm_point(*group, *bits, *bm, *bn)?],
-            lanes: qmm_grid(n, *bn, *m, *bm, 1)?,
+            lanes: qmm_grid(*n, *bn, *m, *bm, 1)?,
         },
         &[
             w.v(),
@@ -1022,22 +1023,22 @@ pub fn qmm_t_residual(
 /// whatever `qmm_grid` refuses.
 pub fn qmm_t_fp16_precast(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    y: BufMut,
-    half_in: Buf,
-    k: i32,
-    n: i32,
-    bm: Env<i32>,
-    bn: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    y: OutSlot<0, BufMut>,
+    half_in: InSlot<0, Buf>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    bm: Ask<keys::TileM, i32>,
+    bn: Ask<keys::TileN, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmm_t.wgsl",
             entrypoint: QMM_T_FP16_PRECAST[tile_point(*bm, *bn)?],
-            lanes: qmm_grid(n, *bn, *m, *bm, 1)?,
+            lanes: qmm_grid(*n, *bn, *m, *bm, 1)?,
         },
         &[
             w.v(),
@@ -1066,23 +1067,23 @@ pub fn qmm_t_fp16_precast(
 /// whatever `qmm_grid` refuses.
 pub fn qmm_t_bias_fp16_precast(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    y: BufMut,
-    bias: Buf,
-    half_in: Buf,
-    k: i32,
-    n: i32,
-    bm: Env<i32>,
-    bn: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    y: OutSlot<0, BufMut>,
+    bias: Weight<3, Buf>,
+    half_in: InSlot<0, Buf>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    bm: Ask<keys::TileM, i32>,
+    bn: Ask<keys::TileN, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmm_t.wgsl",
             entrypoint: QMM_T_BIAS_FP16_PRECAST[tile_point(*bm, *bn)?],
-            lanes: qmm_grid(n, *bn, *m, *bm, 1)?,
+            lanes: qmm_grid(*n, *bn, *m, *bm, 1)?,
         },
         &[
             w.v(),
@@ -1112,23 +1113,23 @@ pub fn qmm_t_bias_fp16_precast(
 /// whatever `qmm_grid` refuses.
 pub fn qmm_t_residual_fp16_precast(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    y: BufMut,
-    residual: Buf,
-    half_in: Buf,
-    k: i32,
-    n: i32,
-    bm: Env<i32>,
-    bn: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    y: OutSlot<0, BufMut>,
+    residual: InSlot<1, Buf>,
+    half_in: InSlot<0, Buf>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    bm: Ask<keys::TileM, i32>,
+    bn: Ask<keys::TileN, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmm_t.wgsl",
             entrypoint: QMM_T_RESIDUAL_FP16_PRECAST[tile_point(*bm, *bn)?],
-            lanes: qmm_grid(n, *bn, *m, *bm, 1)?,
+            lanes: qmm_grid(*n, *bn, *m, *bm, 1)?,
         },
         &[
             w.v(),
@@ -1158,27 +1159,27 @@ pub fn qmm_t_residual_fp16_precast(
 /// whatever `qmm_grid` refuses.
 pub fn qmm_t_splitk(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    out: BufMut,
-    k: i32,
-    n: i32,
-    row_stride: i32,
-    k_partition_size: i32,
-    split_k_partition_stride: i32,
-    split_k: i32,
-    group: Env<i32>,
-    bits: Env<i32>,
-    bm: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    row_stride: Param<2, i32>,
+    k_partition_size: Param<3, i32>,
+    split_k_partition_stride: Param<4, i32>,
+    split_k: Param<5, i32>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
+    bm: Ask<keys::TileM, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmm_t.wgsl",
             entrypoint: QMM_T_SPLITK[wide_point(*group, *bits, *bm)?],
-            lanes: qmm_grid(n, WIDE_BN, *m, *bm, split_k)?,
+            lanes: qmm_grid(*n, WIDE_BN, *m, *bm, *split_k)?,
         },
         &[
             w.v(),
@@ -1211,27 +1212,27 @@ pub fn qmm_t_splitk(
 /// whatever `qmm_grid` refuses.
 pub fn qmm_t_splitk_f32(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    out: BufMut,
-    k: i32,
-    n: i32,
-    row_stride: i32,
-    k_partition_size: i32,
-    split_k_partition_stride: i32,
-    split_k: i32,
-    group: Env<i32>,
-    bits: Env<i32>,
-    bm: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    row_stride: Param<2, i32>,
+    k_partition_size: Param<3, i32>,
+    split_k_partition_stride: Param<4, i32>,
+    split_k: Param<5, i32>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
+    bm: Ask<keys::TileM, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmm_t.wgsl",
             entrypoint: QMM_T_SPLITK_F32[wide_point(*group, *bits, *bm)?],
-            lanes: qmm_grid(n, WIDE_BN, *m, *bm, split_k)?,
+            lanes: qmm_grid(*n, WIDE_BN, *m, *bm, *split_k)?,
         },
         &[
             w.v(),
@@ -1271,25 +1272,25 @@ pub fn qmm_t_splitk_f32(
 /// whatever `qmm_grid` refuses.
 pub fn qmm_t_splitk_fp16_precast(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    out: BufMut,
-    half_in: Buf,
-    k: i32,
-    n: i32,
-    row_stride: i32,
-    k_partition_size: i32,
-    split_k_partition_stride: i32,
-    split_k: i32,
-    bm: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    out: OutSlot<0, BufMut>,
+    half_in: InSlot<0, Buf>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    row_stride: Param<2, i32>,
+    k_partition_size: Param<3, i32>,
+    split_k_partition_stride: Param<4, i32>,
+    split_k: Param<5, i32>,
+    bm: Ask<keys::TileM, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmm_t.wgsl",
             entrypoint: QMM_T_SPLITK_FP16_PRECAST[row_tile_point(*bm)?],
-            lanes: qmm_grid(n, WIDE_BN, *m, *bm, split_k)?,
+            lanes: qmm_grid(*n, WIDE_BN, *m, *bm, *split_k)?,
         },
         &[
             w.v(),
@@ -1329,25 +1330,25 @@ pub fn qmm_t_splitk_fp16_precast(
 /// whatever `qmm_grid` refuses.
 pub fn qmm_t_splitk_fp16_precast_f32(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    out: BufMut,
-    half_in: Buf,
-    k: i32,
-    n: i32,
-    row_stride: i32,
-    k_partition_size: i32,
-    split_k_partition_stride: i32,
-    split_k: i32,
-    bm: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    out: OutSlot<0, BufMut>,
+    half_in: InSlot<0, Buf>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    row_stride: Param<2, i32>,
+    k_partition_size: Param<3, i32>,
+    split_k_partition_stride: Param<4, i32>,
+    split_k: Param<5, i32>,
+    bm: Ask<keys::TileM, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmm_t.wgsl",
             entrypoint: QMM_T_SPLITK_FP16_PRECAST_F32[row_tile_point(*bm)?],
-            lanes: qmm_grid(n, WIDE_BN, *m, *bm, split_k)?,
+            lanes: qmm_grid(*n, WIDE_BN, *m, *bm, *split_k)?,
         },
         &[
             w.v(),
@@ -1377,24 +1378,24 @@ pub fn qmm_t_splitk_fp16_precast_f32(
 /// whatever `qmm_grid` refuses.
 pub fn qmm_t_strided(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    k: i32,
-    n: i32,
-    row_stride: i32,
-    group: Env<i32>,
-    bits: Env<i32>,
-    bm: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    row_stride: Param<2, i32>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
+    bm: Ask<keys::TileM, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmm_t.wgsl",
             entrypoint: QMM_T_STRIDED[wide_point(*group, *bits, *bm)?],
-            lanes: qmm_grid(n, WIDE_BN, *m, *bm, 1)?,
+            lanes: qmm_grid(*n, WIDE_BN, *m, *bm, 1)?,
         },
         &[
             w.v(),
@@ -1421,25 +1422,25 @@ pub fn qmm_t_strided(
 /// whatever `qmm_grid` refuses.
 pub fn qmm_t_strided_residual(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    residual: Buf,
-    k: i32,
-    n: i32,
-    row_stride: i32,
-    group: Env<i32>,
-    bits: Env<i32>,
-    bm: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    residual: InSlot<1, Buf>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    row_stride: Param<2, i32>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
+    bm: Ask<keys::TileM, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmm_t.wgsl",
             entrypoint: QMM_T_STRIDED_RESIDUAL[wide_point(*group, *bits, *bm)?],
-            lanes: qmm_grid(n, WIDE_BN, *m, *bm, 1)?,
+            lanes: qmm_grid(*n, WIDE_BN, *m, *bm, 1)?,
         },
         &[
             w.v(),
@@ -1474,22 +1475,22 @@ pub fn qmm_t_strided_residual(
 /// whatever `qmm_grid` refuses.
 pub fn qmm_t_strided_fp16_precast(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    y: BufMut,
-    half_in: Buf,
-    k: i32,
-    n: i32,
-    row_stride: i32,
-    bm: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    y: OutSlot<0, BufMut>,
+    half_in: InSlot<0, Buf>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    row_stride: Param<2, i32>,
+    bm: Ask<keys::TileM, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmm_t.wgsl",
             entrypoint: QMM_T_STRIDED_FP16_PRECAST[row_tile_point(*bm)?],
-            lanes: qmm_grid(n, WIDE_BN, *m, *bm, 1)?,
+            lanes: qmm_grid(*n, WIDE_BN, *m, *bm, 1)?,
         },
         &[
             w.v(),
@@ -1523,23 +1524,23 @@ pub fn qmm_t_strided_fp16_precast(
 /// whatever `qmm_grid` refuses.
 pub fn qmm_t_strided_fp16_precast_residual(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    y: BufMut,
-    residual: Buf,
-    half_in: Buf,
-    k: i32,
-    n: i32,
-    row_stride: i32,
-    bm: Env<i32>,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    y: OutSlot<0, BufMut>,
+    residual: InSlot<1, Buf>,
+    half_in: InSlot<0, Buf>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    row_stride: Param<2, i32>,
+    bm: Ask<keys::TileM, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmm_t.wgsl",
             entrypoint: QMM_T_STRIDED_FP16_PRECAST_RESIDUAL[row_tile_point(*bm)?],
-            lanes: qmm_grid(n, WIDE_BN, *m, *bm, 1)?,
+            lanes: qmm_grid(*n, WIDE_BN, *m, *bm, 1)?,
         },
         &[
             w.v(),
@@ -1570,20 +1571,20 @@ pub fn qmm_t_strided_fp16_precast_residual(
 /// [`Refusal::Empty`] for an empty rectangle.
 pub fn qmm_splitk_reduce(
     ctx: &Ctx<'_>,
-    y: BufMut,
-    partial: Buf,
-    k: i32,
-    n: i32,
-    row_stride: i32,
-    split_k_partition_stride: i32,
-    split_k: i32,
-    m: Env<i32>,
+    y: OutSlot<0, BufMut>,
+    partial: InSlot<0, Buf>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    row_stride: Param<2, i32>,
+    split_k_partition_stride: Param<3, i32>,
+    split_k: Param<4, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmm_t.wgsl",
             entrypoint: "qmm_splitk_reduce_bfloat16",
-            lanes: kernels::shader::elementwise_rows(n, *m)?,
+            lanes: kernels::shader::elementwise_rows(*n, *m)?,
         },
         &[
             y.v(),
@@ -1612,20 +1613,20 @@ pub fn qmm_splitk_reduce(
 /// [`Refusal::Empty`] for an empty rectangle.
 pub fn qmm_splitk_reduce_f32(
     ctx: &Ctx<'_>,
-    y: BufMut,
-    partial: Buf,
-    k: i32,
-    n: i32,
-    row_stride: i32,
-    split_k_partition_stride: i32,
-    split_k: i32,
-    m: Env<i32>,
+    y: OutSlot<0, BufMut>,
+    partial: InSlot<0, Buf>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    row_stride: Param<2, i32>,
+    split_k_partition_stride: Param<3, i32>,
+    split_k: Param<4, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmm_t.wgsl",
             entrypoint: "qmm_splitk_reduce_f32_bfloat16",
-            lanes: kernels::shader::elementwise_rows(n, *m)?,
+            lanes: kernels::shader::elementwise_rows(*n, *m)?,
         },
         &[
             y.v(),
@@ -1653,18 +1654,18 @@ pub fn qmm_splitk_reduce_f32(
 /// [`Refusal::Empty`] for an empty count.
 pub fn cast_qmm_input_bfloat16_to_float16(
     ctx: &Ctx<'_>,
-    cast_in: Buf,
-    half_out: BufMut,
-    k: i32,
-    n: i32,
-    row_stride: i32,
-    count: i32,
+    cast_in: InSlot<0, Buf>,
+    half_out: OutSlot<0, BufMut>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    row_stride: Param<2, i32>,
+    count: Param<3, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmm_t.wgsl",
             entrypoint: "cast_qmm_input_bfloat16_to_float16",
-            lanes: kernels::shader::elementwise(count, 1)?,
+            lanes: kernels::shader::elementwise(*count, 1)?,
         },
         &[
             cast_in.v(),
@@ -1690,28 +1691,36 @@ pub fn cast_qmm_input_bfloat16_to_float16(
 /// [`Refusal::Empty`] for an empty rectangle.
 pub fn cast_qmm_input_strided_bfloat16_to_float16(
     ctx: &Ctx<'_>,
-    cast_in: Buf,
-    half_out: BufMut,
-    k: i32,
-    n: i32,
-    row_stride: i32,
-    count: i32,
-    rows: Env<i32>,
+    cast_in: InSlot<0, Buf>,
+    half_out: OutSlot<0, BufMut>,
+    k: Param<0, i32>,
+    // NEITHER REACHES THE SHADER. `qmm_t.wgsl`'s `PIE_CAST_INPUT` +
+    // `PIE_STRIDED` arm declares `Params { k, row_stride }` and nothing else,
+    // so forwarding four scalars packs 16 bytes into an 8-byte block. `n` is
+    // the unread slot the shared argument table keeps between the packed and
+    // strided forms, and `count` is `rows * k` -- a fire's number the PACKED
+    // form takes and this one derives from the grid.
+    //
+    // `Env` is the marking that says so: `Provenance::Trace` would claim the
+    // statement supplies them for the block, and a `Trace` scalar that is not
+    // forwarded is read as the field at that offset.
+    //
+    // This arm was never launched until upstream pointed the dense projections
+    // at the fp16 precast path, which is why a body that over-forwarded by two
+    // scalars had never been fired.
+    n: Reckoned<Nth<1>, Env<i32>>,
+    row_stride: Param<2, i32>,
+    count: Reckoned<Times<Say<keys::Rows>, Nth<0>>, Env<i32>>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
+    let _ = (n, count);
     ctx.dispatch(
         Fire {
             module: "quant/qmm_t.wgsl",
             entrypoint: "cast_qmm_input_strided_bfloat16_to_float16",
-            lanes: kernels::shader::elementwise_rows(k, *rows)?,
+            lanes: kernels::shader::elementwise_rows(*k, *rows)?,
         },
-        &[
-            cast_in.v(),
-            half_out.v(),
-            k.v(),
-            n.v(),
-            row_stride.v(),
-            count.v(),
-        ],
+        &[cast_in.v(), half_out.v(), k.v(), row_stride.v()],
     )
 }
 
@@ -1730,22 +1739,22 @@ pub fn cast_qmm_input_strided_bfloat16_to_float16(
 /// whatever `qmv_grid` refuses.
 pub fn qmv_fast(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    in_vec_size: i32,
-    out_vec_size: i32,
-    group: Env<i32>,
-    bits: Env<i32>,
-    vecs: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    in_vec_size: Param<0, i32>,
+    out_vec_size: Param<1, i32>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
+    vecs: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmv.wgsl",
             entrypoint: QMV_FAST[codec_point(*group, *bits)?],
-            lanes: qmv_grid(*vecs, out_vec_size)?,
+            lanes: qmv_grid(*vecs, *out_vec_size)?,
         },
         &[
             w.v(),
@@ -1769,23 +1778,23 @@ pub fn qmv_fast(
 /// whatever `qmv_grid` refuses.
 pub fn qmv_fast_residual(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    in_vec_size: i32,
-    out_vec_size: i32,
-    residual: Buf,
-    group: Env<i32>,
-    bits: Env<i32>,
-    vecs: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    in_vec_size: Param<0, i32>,
+    out_vec_size: Param<1, i32>,
+    residual: InSlot<1, Buf>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
+    vecs: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmv.wgsl",
             entrypoint: QMV_FAST_RESIDUAL[codec_point(*group, *bits)?],
-            lanes: qmv_grid(*vecs, out_vec_size)?,
+            lanes: qmv_grid(*vecs, *out_vec_size)?,
         },
         &[
             w.v(),
@@ -1811,21 +1820,21 @@ pub fn qmv_fast_residual(
 /// whatever `qmv_grid` refuses.
 pub fn qmv_tail(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    in_vec_size: i32,
-    out_vec_size: i32,
-    bits: Env<i32>,
-    vecs: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    in_vec_size: Param<0, i32>,
+    out_vec_size: Param<1, i32>,
+    bits: Ask<keys::QuantBits, i32>,
+    vecs: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmv.wgsl",
             entrypoint: QMV_TAIL[bits_point(*bits)?],
-            lanes: qmv_grid(*vecs, out_vec_size)?,
+            lanes: qmv_grid(*vecs, *out_vec_size)?,
         },
         &[
             w.v(),
@@ -1847,22 +1856,22 @@ pub fn qmv_tail(
 /// whatever `qmv_grid` refuses.
 pub fn qmv_tail_bias(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    bias: Buf,
-    in_vec_size: i32,
-    out_vec_size: i32,
-    bits: Env<i32>,
-    vecs: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    bias: Weight<3, Buf>,
+    in_vec_size: Param<0, i32>,
+    out_vec_size: Param<1, i32>,
+    bits: Ask<keys::QuantBits, i32>,
+    vecs: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmv.wgsl",
             entrypoint: QMV_TAIL_BIAS[bits_point(*bits)?],
-            lanes: qmv_grid(*vecs, out_vec_size)?,
+            lanes: qmv_grid(*vecs, *out_vec_size)?,
         },
         &[
             w.v(),
@@ -1889,22 +1898,22 @@ pub fn qmv_tail_bias(
 /// whatever `qmv_grid` refuses.
 pub fn qmv_wide_strided(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    in_vec_size: i32,
-    out_vec_size: i32,
-    row_stride: i32,
-    m: i32,
-    bits: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    in_vec_size: Param<0, i32>,
+    out_vec_size: Param<1, i32>,
+    row_stride: Param<2, i32>,
+    m: Ask<keys::Rows, i32>,
+    bits: Ask<keys::QuantBits, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmv.wgsl",
             entrypoint: QMV_WIDE_STRIDED[bits_point(*bits)?],
-            lanes: qmv_grid(quarters(m), out_vec_size)?,
+            lanes: qmv_grid(quarters(*m), *out_vec_size)?,
         },
         &[
             w.v(),
@@ -1932,20 +1941,20 @@ pub fn qmv_wide_strided(
 /// [`Refusal::Empty`] for an empty rectangle, and whatever `qmm_grid` refuses.
 pub fn qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    k: i32,
-    n: i32,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmm_t.wgsl",
             entrypoint: "affine_qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4",
-            lanes: qmm_grid(n, 32, *m, 128, 1)?,
+            lanes: qmm_grid(*n, 32, *m, 128, 1)?,
         },
         &[w.v(), scales.v(), biases.v(), x.v(), y.v(), k.v(), n.v()],
     )
@@ -1963,20 +1972,20 @@ pub fn qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4(
 /// [`Refusal::Empty`] for an empty rectangle, and whatever `qmm_grid` refuses.
 pub fn qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    k: i32,
-    n: i32,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmm_t.wgsl",
             entrypoint: "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2",
-            lanes: qmm_grid(n, 32, *m, 32, 1)?,
+            lanes: qmm_grid(*n, 32, *m, 32, 1)?,
         },
         &[w.v(), scales.v(), biases.v(), x.v(), y.v(), k.v(), n.v()],
     )
@@ -1994,20 +2003,20 @@ pub fn qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2(
 /// [`Refusal::Empty`] for an empty rectangle, and whatever `qmm_grid` refuses.
 pub fn qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    k: i32,
-    n: i32,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmm_t.wgsl",
             entrypoint: "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2",
-            lanes: qmm_grid(n, 32, *m, 64, 1)?,
+            lanes: qmm_grid(*n, 32, *m, 64, 1)?,
         },
         &[w.v(), scales.v(), biases.v(), x.v(), y.v(), k.v(), n.v()],
     )
@@ -2025,20 +2034,20 @@ pub fn qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2(
 /// [`Refusal::Empty`] for an empty rectangle, and whatever `qmm_grid` refuses.
 pub fn qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    k: i32,
-    n: i32,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmm_t.wgsl",
             entrypoint: "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1",
-            lanes: qmm_grid(n, 32, *m, 64, 1)?,
+            lanes: qmm_grid(*n, 32, *m, 64, 1)?,
         },
         &[w.v(), scales.v(), biases.v(), x.v(), y.v(), k.v(), n.v()],
     )
@@ -2056,20 +2065,20 @@ pub fn qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1(
 /// [`Refusal::Empty`] for an empty rectangle, and whatever `qmm_grid` refuses.
 pub fn qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4(
     ctx: &Ctx<'_>,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    x: Buf,
-    y: BufMut,
-    k: i32,
-    n: i32,
-    m: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    x: InSlot<0, Buf>,
+    y: OutSlot<0, BufMut>,
+    k: Param<0, i32>,
+    n: Param<1, i32>,
+    m: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/qmm_t.wgsl",
             entrypoint: "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4",
-            lanes: qmm_grid(n, 64, *m, 64, 1)?,
+            lanes: qmm_grid(*n, 64, *m, 64, 1)?,
         },
         &[w.v(), scales.v(), biases.v(), x.v(), y.v(), k.v(), n.v()],
     )
@@ -2087,10 +2096,10 @@ pub fn qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4(
 /// [`Refusal::Empty`] for an empty count.
 pub fn encode_u4_bf16(
     ctx: &Ctx<'_>,
-    input: Buf,
-    codes: BufMut,
-    scales: BufMut,
-    biases: BufMut,
+    input: InSlot<0, Buf>,
+    codes: OutSlot<0, BufMut>,
+    scales: OutSlot<1, BufMut>,
+    biases: OutSlot<2, BufMut>,
     // FORWARDED AS SCALARS, not as a buffer.
     //
     // `transcode.wgsl` puts this pair in a `@group(1) @binding(0)` UNIFORM —
@@ -2108,14 +2117,14 @@ pub fn encode_u4_bf16(
     // computes the grid and is NOT forwarded — that is what
     // `a_body_passes_the_arguments_its_signature_takes_in_order` enforces — so
     // a value the SHADER reads has to be stated.
-    groups: i32,
-    group_size: i32,
+    groups: Ask<keys::Rows, i32>,
+    group_size: Param<1, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/transcode.wgsl",
             entrypoint: "affine_encode_u4_bf16",
-            lanes: kernels::shader::elementwise(groups, 1)?,
+            lanes: kernels::shader::elementwise(*groups, 1)?,
         },
         &[
             input.v(),
@@ -2140,10 +2149,10 @@ pub fn encode_u4_bf16(
 /// [`Refusal::Empty`] for an empty count.
 pub fn encode_u4_f32(
     ctx: &Ctx<'_>,
-    input: Buf,
-    codes: BufMut,
-    scales: BufMut,
-    biases: BufMut,
+    input: InSlot<0, Buf>,
+    codes: OutSlot<0, BufMut>,
+    scales: OutSlot<1, BufMut>,
+    biases: OutSlot<2, BufMut>,
     // FORWARDED AS SCALARS, not as a buffer.
     //
     // `transcode.wgsl` puts this pair in a `@group(1) @binding(0)` UNIFORM —
@@ -2155,14 +2164,14 @@ pub fn encode_u4_f32(
     // zero groups is a loop that runs no iterations and reports success.
     //
     // A TRACE scalar, for the reason `encode_u4_bf16` states above.
-    groups: i32,
-    group_size: i32,
+    groups: Ask<keys::Rows, i32>,
+    group_size: Param<1, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/transcode.wgsl",
             entrypoint: "affine_encode_u4_f32",
-            lanes: kernels::shader::elementwise(groups, 1)?,
+            lanes: kernels::shader::elementwise(*groups, 1)?,
         },
         &[
             input.v(),
@@ -2187,9 +2196,9 @@ pub fn encode_u4_f32(
 /// [`Refusal::Empty`] for an empty count.
 pub fn mxfp4_dequant_bf16(
     ctx: &Ctx<'_>,
-    payload: Buf,
-    exponents: Buf,
-    out: BufMut,
+    payload: InSlot<0, Buf>,
+    exponents: InSlot<1, Buf>,
+    out: OutSlot<0, BufMut>,
     // FORWARDED AS SCALARS, not as a buffer.
     //
     // `transcode.wgsl` puts this pair in a `@group(1) @binding(0)` UNIFORM —
@@ -2207,14 +2216,14 @@ pub fn mxfp4_dequant_bf16(
     // computes the grid and is NOT forwarded — that is what
     // `a_body_passes_the_arguments_its_signature_takes_in_order` enforces — so
     // a value the SHADER reads has to be stated.
-    blocks: i32,
-    block_size: i32,
+    blocks: Ask<keys::Rows, i32>,
+    block_size: Param<1, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
             module: "quant/transcode.wgsl",
             entrypoint: "mxfp4_dequant_bf16",
-            lanes: kernels::shader::elementwise(blocks, 1)?,
+            lanes: kernels::shader::elementwise(*blocks, 1)?,
         },
         &[
             payload.v(),

@@ -1,16 +1,3 @@
-//! kimi_k3's per-backend binding facts — of which this generation has
-//! none, yet.
-//!
-//! The SHAPE moved to `../spec.rs` (ungated: a row is written in it, and
-//! a row has to exist under every aspect — `chat`, `contract` and
-//! `forward` all read it, and only one of those compiles the tracer).
-//!
-//! What would live here is what a deployment BOUND rather than what the
-//! model IS — kimi-k2's `KimiCudaFacts` is the shape of it: one fused
-//! latent GEMM instead of two, a YaRN rope the config asked for. k3's
-//! text reads neither, so this file is the re-export that keeps
-//! `forward`'s spelling of the facts working unchanged.
+//! kimi_k3's per-backend binding facts — of which this generation has none yet.
 
-/// The shape, re-exported so a declaration reaches its facts and the
-/// words they are stated in from one place.
 pub use super::super::spec::{KimiK3Facts, KimiK3KdaFacts, KimiK3MlaFacts, KimiK3MoeFacts};

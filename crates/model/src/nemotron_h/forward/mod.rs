@@ -113,6 +113,7 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
                         &conv_in,
                         &dsl::ConvW {
                             name: format!("layer.{l}.mamba_conv"),
+                            bias: Some(format!("layer.{l}.mamba_conv_bias")),
                             kernel: mb.conv_kernel,
                             layer: l,
                         },
@@ -121,7 +122,7 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
                     // `dt` and the decay `A` are per-token and computed
                     // ONCE, before the scan — a separate statement
                     // because the scan reads them, it does not make them.
-                    let (a_par, _d_par, dt_bias) = dsl::cuda::nemotron_prepare_mamba_params(
+                    let (a_par, d_par, dt_bias) = dsl::cuda::nemotron_prepare_mamba_params(
                         t,
                         l,
                         &format!("layer.{l}.mamba_a_log"),
@@ -129,10 +130,23 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
                         &format!("layer.{l}.mamba_dt_bias"),
                         mb.num_heads,
                     );
-                    let _ = dt_bias;
-                    let (dt, _da) =
-                        dsl::cuda::nemotron_prepare_mamba_dt_da(&dt_raw, &a_par, mb.num_heads);
-                    let core = dsl::cuda::nemotron_mamba_ssm(&conv_out, &dt, l, mb.intermediate());
+                    let (dt, da) = dsl::cuda::nemotron_prepare_mamba_dt_da(
+                        &dt_raw,
+                        &a_par,
+                        &dt_bias,
+                        mb.num_heads,
+                    );
+                    let core = dsl::cuda::nemotron_mamba_ssm(
+                        &conv_out,
+                        &dt,
+                        &dt_raw,
+                        &a_par,
+                        &d_par,
+                        &dt_bias,
+                        &da,
+                        l,
+                        mb.intermediate(),
+                    );
                     dsl::seam(core.trace(), &dsl::seam::ATTN_OUT, &[&core], Some(l));
                     // A GATED norm, not a plain one: `z` is the gate the
                     // split produced and the norm applies it.
@@ -152,7 +166,7 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
                     let kv = dsl::Kv::at(t, l);
                     dsl::cuda::write_kv_to_pages(&k, &v, &kv);
                     dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
-                    let o = dsl::cuda::attention_for(class, &q, &kv, window_left)
+                    let o = dsl::cuda::attention_for(class, &q, &kv, window_left, facts.attn.head_dim)
                         .expect("a plain attention statement produces its value");
                     dsl::seam(o.trace(), &dsl::seam::ATTN_OUT, &[&o], Some(l));
                     y += matmul(&o, &w.o_proj);

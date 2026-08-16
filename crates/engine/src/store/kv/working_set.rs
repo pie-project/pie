@@ -1,3 +1,10 @@
+    //! Process-teardown fallback coverage (thrust-3): a `KvWorkingSet` value
+    //! dropped directly — never routed through `HostKvWorkingSet::drop`'s
+    //! explicit `release()` — must still return its reserved/committed pages
+    //! to the pool. This is the host-level analog of the CUDA-contention
+    //! "solo lane exhausts an 8-page pool" repro: an exhausted pool that
+    //! isn't reclaimed on teardown compounds across every later process.
+
 //! Thin WIT/resource handle for `kv-working-set` (kv_refact.md,
 //! `store/kv/working_set.rs`). All substantive operations delegate to the
 //! owning `KvStore`, resolved through `store::registry` by `(model, driver)`.
@@ -358,12 +365,6 @@ impl KvWorkingSet {
 
 #[cfg(test)]
 mod tests {
-    //! Process-teardown fallback coverage (thrust-3): a `KvWorkingSet` value
-    //! dropped directly — never routed through `HostKvWorkingSet::drop`'s
-    //! explicit `release()` — must still return its reserved/committed pages
-    //! to the pool. This is the host-level analog of the CUDA-contention
-    //! "solo lane exhausts an 8-page pool" repro: an exhausted pool that
-    //! isn't reclaimed on teardown compounds across every later process.
     use super::*;
     use crate::store::kv::write::PageCommit;
     use crate::store::registry;

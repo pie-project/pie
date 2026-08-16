@@ -4,7 +4,7 @@
 
 use anyhow::{Result, anyhow};
 
-#[cfg(feature = "driver-cuda")]
+#[cfg(feature = "_driver-cuda")]
 use crate::config::CudaNativeDriverOptions;
 #[cfg(feature = "driver-metal")]
 use crate::config::MetalDriverOptions;
@@ -93,7 +93,7 @@ pub fn resolve_flavor(kind: DriverKind, model_name: &str) -> Result<ResolvedFlav
 /// it with the right device for each DP replica.
 #[cfg_attr(
     not(any(
-        feature = "driver-cuda",
+        feature = "_driver-cuda",
         feature = "driver-metal",
         feature = "driver-vulkan",
         feature = "driver-wgpu"
@@ -107,7 +107,7 @@ pub fn resolve_flavor(kind: DriverKind, model_name: &str) -> Result<ResolvedFlav
 )]
 pub fn build_embedded_options(m: &config::ModelConfig, flavor: Flavor) -> Result<DriverOptions> {
     match flavor {
-        #[cfg(feature = "driver-cuda")]
+        #[cfg(feature = "_driver-cuda")]
         Flavor::Cuda => {
             let mut c: CudaNativeDriverOptions = m
                 .driver

@@ -1,41 +1,17 @@
-//! Device/pinned scratch for FlashInfer's plan + dispatch path —
-//! gate-attn-ws.
-//!
-//! Ports `driver-cuda`'s `AttentionWorkspace` (the class step 2b sent home
-//! from the kernels crate). The kernels never see this type: they take an
-//! [`AttentionWorkspaceView`], the five values they actually read.
-//! Everything the class adds on top — the allocation, the pinned
-//! plan-staging slots and the events that fence them — is scheduling,
-//! sized by the driver's run-ahead depth.
-//!
-//! # The slot rotation, which is the point
-//!
-//! One staging slot is claimed per step ([`AttentionWorkspace::
-//! begin_plan_update`]) and is reusable only after its upload event
-//! retires. The rotation ADVANCES before the slot is prepared, and a
-//! pending upload is synced BEFORE the slot is handed out — that fence is
-//! what makes reuse safe, and the parity transcript pins both orderings,
-//! including that a lazy pin FAILING mid-rotation leaves the rotation
-//! advanced (the C++ throws after the advance) and the machine working.
-//!
-//! # Explicit release
-//!
-//! The C++ destructor syncs pending uploads and frees pins; a Rust `Drop`
-//! cannot, because every CUDA call goes through [`StagingOps`] and `Drop`
-//! has no `&mut O` to call it with — the `page_mask` precedent exactly.
-//! [`AttentionWorkspace::release`] is the destructor; `Drop` only
-//! `debug_assert!`s the caller met the obligation.
+//! Device/pinned scratch for FlashInfer's plan + dispatch path. Kernels see only
+//! an [`AttentionWorkspaceView`]; the rest is scheduling sized by run-ahead
+//! depth. One staging slot is claimed per step, reusable only after its upload
+//! event retires — a pending upload is synced before hand-out, the fence that
+//! makes reuse safe. Release is explicit ([`AttentionWorkspace::release`])
+//! because `Drop` has no `&mut O` for [`StagingOps`]; it only asserts it ran.
 
 use std::ffi::c_void;
 
 use crate::bind::abi::AttentionWorkspaceView;
 
-/// What the workspace asks of CUDA: pinned host memory, events, and the
-/// device buffers themselves.
-///
-/// The real implementation calls the runtime; the parity test's recorder
-/// answers symbolically. The event type is associated so the real side can
-/// use `cudaEvent_t` while tests use ordinals.
+/// What the workspace asks of CUDA: pinned host memory, events, device buffers.
+/// The event type is associated so the live side uses `cudaEvent_t` while tests
+/// use ordinals.
 pub trait StagingOps {
     /// The upload-fence event handle.
     type Event;
@@ -48,44 +24,27 @@ pub trait StagingOps {
     fn event_create(&mut self) -> Option<Self::Event>;
     /// `cudaEventDestroy`.
     fn event_destroy(&mut self, event: Self::Event);
-    /// `cudaEventSynchronize` — blocks until the upload retires.
-    /// Wait on a fence. `false` is a CUDA failure.
-    ///
-    /// FALLIBLE, and it used to be `()` with a `assert!` behind it
-    /// "because that is what the C++ does". True, and it made a whole
-    /// feature unbuildable: the planner CALIBRATION sweep probes fire
-    /// shapes to find the ones a deployment can bind, so a shape it
-    /// cannot bind is the probe's ANSWER — and a probe that aborts the
-    /// process instead of returning cannot probe. See
-    /// `layout::calibrate`.
+    /// Wait on a fence; `false` is a CUDA failure. Fallible, not a panic: the
+    /// calibration sweep probes fire shapes, so an unbindable shape is the
+    /// probe's answer, and a probe that aborts the process cannot probe.
     #[must_use]
     fn event_synchronize(&mut self, event: &Self::Event) -> bool;
-    /// `cudaEventRecord` on the given stream.
-    /// Record a fence on `stream`. `false` is a CUDA failure. See
-    /// [`Self::event_synchronize`] for why neither of these panics.
+    /// Record a fence on `stream`; `false` is a CUDA failure. See
+    /// [`Self::event_synchronize`] for why neither panics.
     #[must_use]
     fn event_record(&mut self, event: &Self::Event, stream: *mut c_void) -> bool;
-    /// The device allocation behind each scratch buffer
-    /// (`DeviceTensor::allocate` in the C++), or `None` on failure.
+    /// The device allocation behind each scratch buffer, or `None` on failure.
     fn alloc_device(&mut self, bytes: usize) -> Option<*mut c_void>;
     /// Release a device buffer.
     fn free_device(&mut self, ptr: *mut c_void);
 }
 
-/// The live [`StagingOps`] (retirement plan phase B): raw
-/// `cudaMalloc`/`cudaMallocHost` and the event quartet, through cudarc's
-/// dynamically-loaded runtime — the same calls `attention_workspace.cpp`
-/// makes. Raw rather than [`crate::device::Allocator`] on purpose: the
-/// workspace allocates at boot and frees at teardown, never inside a
-/// capture, and the C++ frees unconditionally too.
-///
-/// The fence pair REPORTS rather than panicking, which is where this
-/// stops copying the C++ (both its sites are `CUDA_CHECK`). A fence that
-/// silently failed would hand a staging slot to the host while the GPU
-/// still reads it — so the failure is propagated, not swallowed. What it
-/// must not do is ABORT: the planner calibration sweep exists to find
-/// which fire shapes a deployment can bind, so a shape it cannot bind is
-/// an answer and not a crash.
+/// The live [`StagingOps`]: raw `cudaMalloc`/`cudaMallocHost` and the event
+/// quartet through cudarc's runtime. Raw rather than [`crate::device::Allocator`]
+/// because the workspace allocates at boot and frees at teardown, never inside a
+/// capture. The fence pair reports rather than panicking: a silent failure would
+/// hand a slot to the host while the GPU still reads it — see
+/// [`StagingOps::event_synchronize`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LiveStagingOps;
 
@@ -143,12 +102,9 @@ impl StagingOps for LiveStagingOps {
     }
 }
 
-/// Why an allocation or a plan-slot claim failed.
-///
-/// The C++ throws `std::runtime_error` from `CUDA_CHECK` for all of these;
-/// they are named here because the caller's recovery differs: a failed
-/// device allocation is a sizing problem, a failed pin is host memory
-/// pressure, and a failed event create is handle exhaustion.
+/// Why an allocation or a plan-slot claim failed. Named separately because
+/// recovery differs: a device alloc is a sizing problem, a pin is host memory
+/// pressure, an event create is handle exhaustion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StagingError {
     /// A device scratch buffer could not be allocated.
@@ -157,12 +113,8 @@ pub enum StagingError {
     PinFailed,
     /// `cudaEventCreateWithFlags` refused a slot's fence event.
     EventCreateFailed,
-    /// A fence would not record or would not retire.
-    ///
-    /// Its own variant rather than a panic, and the distinction is the
-    /// point: the planner calibration sweep probes fire shapes to find the
-    /// ones a deployment can bind, so a shape it cannot bind has to come
-    /// back as an ANSWER. A probe that cannot fail safely cannot probe.
+    /// A fence would not record or retire. Its own variant, not a panic, so the
+    /// calibration sweep can treat an unbindable shape as an answer.
     FenceFailed,
 }
 
@@ -186,9 +138,8 @@ pub struct AttentionWorkspace<E> {
     int_buf: *mut c_void,
     int_bytes: usize,
     staging_bytes: usize,
-    /// Slot 0 is pinned at [`allocate`](Self::allocate); the rest pin
-    /// lazily on first rotation, so a non-rotating workspace does not hold
-    /// the full depth's worth of pinned host memory.
+    /// Slot 0 is pinned at [`allocate`](Self::allocate); the rest pin lazily on
+    /// first rotation, so a non-rotating workspace holds only one pin.
     plan_staging: Vec<PlanStaging<E>>,
     active_plan_slot: usize,
     next_plan_slot: usize,
@@ -197,14 +148,9 @@ pub struct AttentionWorkspace<E> {
 
 impl<E> AttentionWorkspace<E> {
     /// Allocate the two device scratch buffers and the staging pool.
-    ///
-    /// `plan_staging_slots` is the caller's run-ahead depth in STEPS — the
-    /// scheduler's number, not a kernel's — and `0` is clamped to one slot
-    /// because slot 0 is pinned here and the rotation takes a modulus.
-    ///
-    /// On failure, everything created before the failing call is released
-    /// — the C++ catch block, reproduced: per slot, the event then the
-    /// pin; the device buffers by RAII (explicitly here).
+    /// `plan_staging_slots` is the run-ahead depth in steps; `0` clamps to one
+    /// slot, since slot 0 is pinned here and the rotation takes a modulus. On
+    /// failure, everything created before the failing call is released.
     pub fn allocate<O: StagingOps<Event = E>>(
         ops: &mut O,
         float_workspace_bytes: usize,
@@ -260,8 +206,8 @@ impl<E> AttentionWorkspace<E> {
         Ok(ws)
     }
 
-    /// What a kernel is handed. Named rather than a conversion so the crate
-    /// boundary is legible at the call site.
+    /// What a kernel is handed — named, not a conversion, so the crate boundary
+    /// is legible at the call site.
     #[must_use]
     pub fn view(&self) -> AttentionWorkspaceView {
         AttentionWorkspaceView {
@@ -285,7 +231,7 @@ impl<E> AttentionWorkspace<E> {
         self.int_buf
     }
 
-    /// The ACTIVE slot's pinned host block.
+    /// The active slot's pinned host block.
     #[must_use]
     pub fn page_locked_int(&self) -> *mut c_void {
         self.plan_staging[self.active_plan_slot].host
@@ -303,11 +249,9 @@ impl<E> AttentionWorkspace<E> {
         self.int_bytes
     }
 
-    /// Claim the next staging slot for this step's plan writes.
-    ///
-    /// Rotates FIRST — on failure the rotation stays advanced, as in the
-    /// C++, where the throw happens after the advance — then lazily pins
-    /// the slot, then syncs its pending upload so reuse is fenced.
+    /// Claim the next staging slot for this step's plan writes. Rotates first,
+    /// so on failure the rotation stays advanced; then lazily pins the slot and
+    /// syncs its pending upload so reuse is fenced.
     pub fn begin_plan_update<O: StagingOps<Event = E>>(
         &mut self,
         ops: &mut O,
@@ -327,14 +271,13 @@ impl<E> AttentionWorkspace<E> {
         Ok(())
     }
 
-    /// Record the active slot's upload fence on `stream` and mark it
-    /// pending — the slot is now the GPU's until the event retires.
+    /// Record the active slot's upload fence on `stream` and mark it pending —
+    /// the slot is the GPU's until the event retires.
     ///
     /// # Errors
     ///
-    /// [`StagingError::FenceFailed`] when the fence will not record. The slot is
-    /// left UNPENDING in that case, which is the safe reading: nothing is
-    /// owed to a fence that does not exist.
+    /// [`StagingError::FenceFailed`] when the fence will not record; the slot is
+    /// left unpending, since nothing is owed to a fence that does not exist.
     pub fn end_plan_update<O: StagingOps<Event = E>>(
         &mut self,
         ops: &mut O,
@@ -352,8 +295,8 @@ impl<E> AttentionWorkspace<E> {
         Ok(())
     }
 
-    /// The C++ destructor: per slot, sync a pending upload, destroy the
-    /// event, free the pin; then release the device buffers.
+    /// The destructor: per slot, sync a pending upload, destroy the event, free
+    /// the pin; then release the device buffers.
     pub fn release<O: StagingOps<Event = E>>(&mut self, ops: &mut O) {
         if self.released {
             return;
@@ -364,11 +307,8 @@ impl<E> AttentionWorkspace<E> {
                     .upload_done
                     .as_ref()
                     .expect("a pending upload always has its fence event");
-                // Release cannot report, so a failed fence here is
-                // ignored deliberately: the alternative is leaking the pin
-                // and the event, and a teardown that refuses to tear down
-                // is worse than one that frees after a fence it could not
-                // confirm.
+                // Release cannot report, so a failed fence is ignored: leaking
+                // the pin and event is worse than freeing after an unconfirmed fence.
                 let _ = ops.event_synchronize(ev);
                 staging.upload_pending = false;
             }
@@ -392,9 +332,8 @@ impl<E> AttentionWorkspace<E> {
     }
 }
 
-/// Pin the slot's host block and create its fence event if either is
-/// missing. Host first, then event — the order decides what a failure
-/// leaves behind, and script `h` of the oracle pins exactly that.
+/// Pin the slot's host block and create its fence event if either is missing.
+/// Host first, then event — the order decides what a failure leaves behind.
 fn ensure_plan_slot<O: StagingOps>(
     ops: &mut O,
     staging_bytes: usize,
@@ -410,21 +349,10 @@ fn ensure_plan_slot<O: StagingOps>(
 }
 
 impl<E> Drop for AttentionWorkspace<E> {
-    /// A leaked workspace does not leak safely: a pending upload's slot
-    /// would be reusable while the GPU still reads it. The obligation is
-    /// [`Self::release`]; this only checks it was met.
-    ///
-    /// **Not while the thread is already panicking.** A panic raised in a
-    /// `Drop` that is itself running because of an earlier panic aborts the
-    /// process, and what reaches the terminal is this message instead of the
-    /// one that actually failed. `device/cublas.rs`' `Drop` carries the long
-    /// version; the short one is that a gemma-4 A/B refused with a named
-    /// arm's whole explanation attached, and the run died on SIGABRT saying
-    /// only *"panic in a destructor during cleanup"*.
-    ///
-    /// The unwinding path is also where the check is worth least: a
-    /// workspace not released on the way out of a panic is a consequence of
-    /// the failure, not the failure.
+    /// A leaked workspace does not leak safely: a pending upload's slot would be
+    /// reusable while the GPU still reads it. The obligation is [`Self::release`];
+    /// this only checks it was met, and not while already panicking — a panic in
+    /// a `Drop` running because of an earlier panic aborts the process.
     fn drop(&mut self) {
         debug_assert!(
             self.released || std::thread::panicking(),

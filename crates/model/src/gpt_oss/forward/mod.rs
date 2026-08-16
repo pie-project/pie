@@ -185,7 +185,7 @@ pub fn gpt_oss_cuda(facts: &GptOssFacts, cuda: &GptOssCudaFacts, class: FireClas
             // rather than a kernel this text selects, which is why the
             // alternation `is_sliding` describes leaves no mark on the plan.
             dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
-            let (o, lse) = dsl::cuda::attention_for_lse(class, &q, &kv, facts.q_heads);
+            let (o, lse) = dsl::cuda::attention_for_lse(class, &q, &kv, facts.q_heads, facts.head_dim);
             let a = dsl::cuda::attention_sink_rescale(&o, &lse, &w.sinks);
 
             // Post-attention observation. On the sink layers this sees the

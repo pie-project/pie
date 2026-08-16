@@ -49,7 +49,7 @@ use crate::device::{Device, Pipelines};
 use crate::dispatch::Geometry;
 use crate::pages::{Book, Unhoused};
 use crate::resources::{Frame, Model, Pool, Request, Unstageable, Weights};
-use crate::serve::{Fire, Fired, Logits, Modules, Unfired, Unread, fire, logits_of};
+use crate::serve::{Fire, Fired, Logits, Modules, Unfired, Unread, fire_reusing, logits_of};
 use kernels_vulkan::Capability;
 
 /// What one conversation wants out of one fire.
@@ -91,6 +91,113 @@ pub struct Held<'a> {
     pub weights: &'a Weights,
     /// Lowerings already computed, by the row shape that produced them.
     pub lowerings: &'a mut Lowerings,
+    /// The arena buffer, kept between steps instead of reallocated per step.
+    pub arenas: &'a mut Arenas,
+    /// The last fire, kept so the next one need not be planned or recorded.
+    ///
+    /// Here rather than beside the pipelines for the reason the pipelines are
+    /// NOT here: a pipeline is a property of the device and two deployments
+    /// on one device share them, while a plan is a property of one
+    /// deployment's lowering, arena and pool. Two deployments sharing one of
+    /// these would take turns invalidating it.
+    pub plans: &'a mut crate::replay::Plans,
+}
+
+/// The scratch arena a step fires into, kept between steps.
+///
+/// # What it is for
+///
+/// A decode step allocates a device buffer for the plan's arena, zeroes it,
+/// fires into it, reads the logits out and frees it -- every token. The SIZE
+/// of that buffer is a property of the LOWERING and nothing else:
+/// `Lowered::arena_bytes` is what `model_compiler` computed from the plan, and
+/// a conversation that decodes for a thousand tokens asks for the same 326 KB
+/// a thousand times.
+///
+/// Measured, release, `tests/hostprof.rs`, per decode step on a 4090:
+/// `vkCreateBuffer` plus `vkAllocateMemory` is **0.132 ms** and the matching
+/// `vkDestroyBuffer` plus `vkFreeMemory` is **0.089 ms**, against a host step
+/// of 1.72 ms outside `run_all` -- a denominator since retracted as mostly
+/// fence wait, see this crate's module doc; the two absolute figures are
+/// phase spans and stand. A fifth of a millisecond a token to hand the
+/// same allocation back and ask for it again; both rows read 0.000 ms with
+/// this cache in front of them, and only the `vkCmdFillBuffer` that zeroes it
+/// is left.
+///
+/// # Why this is sound
+///
+/// The buffer is returned to this cache at the point the step used to free
+/// it, which is AFTER `logits_of` has copied the readout out to the host --
+/// and `Device::run_all` waits on a fence, so by then the queue is done with
+/// it. Nothing holds a `Bound` into it: the dispatches that named it were
+/// dropped with the fire.
+///
+/// It is handed back out only for an EXACT byte size, and `arena_for` zeroes
+/// whatever it gets before the fire sees it, exactly as it did when every
+/// arena was fresh. So a step cannot observe whether its arena is new --
+/// which is the property that makes this a cache and not a change of
+/// behaviour.
+///
+/// # Why one buffer and why a ceiling
+///
+/// One, because a shell decodes at one row shape for as long as a
+/// conversation runs, so a second slot would hold a prefill's arena that the
+/// next thousand steps do not want. A prefill's arena is `rows * vocab * 4`
+/// -- 233 MB for 384 rows -- and keeping that between steps would be a
+/// quarter of a gigabyte of VRAM held for a fire that has finished. Anything
+/// over [`Arenas::KEEP`] is freed on the spot and the decode-sized buffer, if
+/// one is held, stays.
+#[derive(Default)]
+pub struct Arenas {
+    /// The one buffer, if there is one worth keeping.
+    held: Option<crate::device::Buffer>,
+}
+
+impl Arenas {
+    /// The largest arena worth holding between steps: 16 MiB.
+    ///
+    /// Well above every decode arena this fleet states -- qwen3-0.6b's is 326
+    /// KB and gpt-oss-20B's is under two megabytes -- and far below the
+    /// prefill arenas that must not be held.
+    const KEEP: u64 = 16 << 20;
+
+    /// The held buffer if it is EXACTLY `size` bytes, taking it out of the
+    /// cache.
+    ///
+    /// Exact and not "at least", though a larger one would serve: an arena
+    /// bound `whole` at a length past what the plan states is a descriptor
+    /// range this crate did not compute, and `binding::extent`'s refusals are
+    /// the check that a rectangle fits its arena. Handing out a bigger buffer
+    /// would make that check pass for a plan it should refuse.
+    fn take(&mut self, size: u64) -> Option<crate::device::Buffer> {
+        if self.held.as_ref().is_some_and(|b| b.size() == size) {
+            return self.held.take();
+        }
+        None
+    }
+
+    /// Give a buffer back, keeping it if it is small enough to be worth
+    /// holding.
+    fn give(&mut self, device: &Device, buffer: crate::device::Buffer) {
+        if buffer.size() > Self::KEEP {
+            device.free(buffer);
+            return;
+        }
+        if let Some(old) = self.held.replace(buffer) {
+            device.free(old);
+        }
+    }
+
+    /// Free what is held.
+    ///
+    /// Explicit and not a `Drop`, for the reason [`Device::free`] is: the
+    /// device is what destroys a buffer, and a cache that borrowed one could
+    /// not be held beside it. [`crate::shell::Shell`]'s `Drop` is the caller.
+    pub fn release(&mut self, device: &Device) {
+        if let Some(b) = self.held.take() {
+            device.free(b);
+        }
+    }
 }
 
 /// Lowerings kept between fires, by the row shape they were lowered for.
@@ -124,8 +231,10 @@ pub struct Held<'a> {
 /// pattern is the same thing and is one line instead of a counter per entry.
 #[derive(Default)]
 pub struct Lowerings {
-    held: Vec<(bool, Vec<Row>, Lowered)>,
+    held: Vec<(bool, Vec<Row>, Lowered, u64)>,
     lowered: u32,
+    /// The last serial handed out. See [`Lowerings::of`].
+    serial: u64,
 }
 
 impl Lowerings {
@@ -159,13 +268,13 @@ impl Lowerings {
         prefill: bool,
         plan: &ForwardPlan,
         rows: &[Row],
-    ) -> Result<&Lowered, Uncovered> {
+    ) -> Result<(&Lowered, u64), Uncovered> {
         if let Some(at) = self
             .held
             .iter()
-            .position(|(p, k, _)| *p == prefill && k.as_slice() == rows)
+            .position(|(p, k, _, _)| *p == prefill && k.as_slice() == rows)
         {
-            return Ok(&self.held[at].2);
+            return Ok((&self.held[at].2, self.held[at].3));
         }
         self.lowered += 1;
         let low = lower(
@@ -178,8 +287,17 @@ impl Lowerings {
         if self.held.len() == Self::CAP {
             self.held.remove(0);
         }
-        self.held.push((prefill, rows.to_vec(), low));
-        Ok(&self.held.last().expect("just pushed").2)
+        // A NUMBER PER LOWERING, AND NEVER REUSED. `crate::replay` keys a
+        // recorded fire on which lowering produced it, and the obvious key --
+        // the `&Lowered`'s address -- is the one that cannot be used: this is
+        // a `Vec` that reallocates and evicts, so an address that named one
+        // lowering can later name another, and a plan cache that believed it
+        // would replay one shape's command buffer for another shape's rows.
+        self.serial += 1;
+        let serial = self.serial;
+        self.held.push((prefill, rows.to_vec(), low, serial));
+        let last = self.held.last().expect("just pushed");
+        Ok((&last.2, last.3))
     }
 }
 
@@ -562,6 +680,7 @@ impl Serving<'_> {
         if requests.is_empty() {
             return Err(Unstepped::Nothing);
         }
+        let frame_span = crate::phase::span("step/frame");
         let shape = held.pool.shape();
         let frame = Frame::of(shape, requests).map_err(Unstepped::Unstageable)?;
         // EVERY ROW SAMPLES, and this is a workaround with a name.
@@ -611,12 +730,39 @@ impl Serving<'_> {
         let plan = if prefill { self.prefill } else { self.plan };
         // Split from `held` by field, so that the borrow this lowering is
         // returned behind does not stand in the way of `held.pool` below.
-        let low = held
+        drop(frame_span);
+        let lower_span = crate::phase::span("step/lower");
+        let (low, serial) = held
             .lowerings
             .of(prefill, plan, &rows)
             .map_err(Unstepped::Uncovered)?;
+        drop(lower_span);
 
+        let stage_span = crate::phase::span("step/stage");
         held.pool.stage(device, &frame).map_err(Unstepped::Failed)?;
+        // The flash decode's scratch, sized before anything is planned
+        // because the arm reads the table's PRESENCE to decide whether it may
+        // split at all. `Pool::partials` grows and never shrinks, so a steady
+        // decode allocates this once and `crate::replay` keeps its key.
+        {
+            use crate::binding::FireNumber;
+            use crate::binding::Resolve;
+            let bucket = held.pool.number(FireNumber::KvHistoryBucket).unwrap_or(0);
+            let rows = frame.rows() as u32;
+            let splits = kernels_vulkan::attn::decode_splits(
+                i32::try_from(bucket).unwrap_or(i32::MAX),
+                self.geometry.q_heads.cast_signed(),
+                rows.cast_signed(),
+            )
+            .max(1) as u64;
+            let floats = splits
+                * u64::from(rows)
+                * u64::from(self.geometry.q_heads)
+                * (u64::from(self.geometry.head_dim) + 2);
+            held.pool
+                .partials(device, floats)
+                .map_err(Unstepped::Failed)?;
+        }
         // AND THE TABLE MUST SAY THE SAME THING THE LOWERING WAS TOLD.
         //
         // `Pool::stage` writes `SamplingIndices` from the frame, which names
@@ -650,12 +796,36 @@ impl Serving<'_> {
             .state(device, crate::binding::FireTable::TokenIds, &ids)
             .map_err(Unstepped::Failed)?;
 
-        let arena = arena_for(device, low.arena_bytes)?;
+        drop(stage_span);
+        let arena_span = crate::phase::span("step/arena");
+        let arena = arena_for(device, held.arenas, low.arena_bytes)?;
+        drop(arena_span);
         let model = Model {
             weights: held.weights,
             pool: held.pool,
         };
-        let ran = fire(
+        let fire_span = crate::phase::span("step/fire");
+        // WHAT MAKES THE LAST FIRE STILL THE RIGHT ANSWER.
+        //
+        // Every part of it is stated rather than inferred, and the two halves
+        // come from different places for a reason `crate::replay::Key` gives
+        // at length: the device counts what it allocated and freed, which
+        // covers every buffer any of these 452 rectangles could bind, and the
+        // caller states everything that is NOT a buffer -- which lowering,
+        // and the four fire-wide numbers a routine reads off the pool, none
+        // of which any allocation counter can see change.
+        let key = crate::replay::Key {
+            plan: serial,
+            state: state_of(&model, held.weights),
+            arena: arena.identity(),
+            arena_bytes: low.arena_bytes as u64,
+            allocations: device.allocations(),
+            frees: device.frees(),
+            geometry: self.geometry,
+            tier: self.tier,
+            align: device.min_storage_offset(),
+        };
+        let ran = fire_reusing(
             device,
             pipelines,
             modules,
@@ -670,6 +840,8 @@ impl Serving<'_> {
                 tier: self.tier,
                 one_at_a_time: false,
             },
+            held.plans,
+            key,
         );
         // THE ROWS A CALLER WILL ASK ABOUT, and not every row the text
         // computed. The two differ by three orders of magnitude on a prefill:
@@ -684,6 +856,8 @@ impl Serving<'_> {
         // names the last row of each request it contains, and a request's
         // last row lies in the piece that contains it, so every row `over`
         // can reach was read by the sub-fire that produced it.
+        drop(fire_span);
+        let read_span = crate::phase::span("step/logits");
         let readout_of = last_row_of(requests.len(), &frame.request_of_token);
         // This piece's own last rows, PLUS every row its requests asked for.
         // `slice` carries `samples` through the cut for exactly this: without
@@ -703,10 +877,14 @@ impl Serving<'_> {
                 Err(e) => Err(Unstepped::Unread(e)),
             }
         });
-        // Freed on both paths: a step that refused and leaked its arena would
-        // run a server out of memory in exactly the situations where it was
-        // already in trouble.
-        device.free(arena);
+        drop(read_span);
+        let free_span = crate::phase::span("step/free");
+        // Given back on both paths: a step that refused and leaked its arena
+        // would run a server out of memory in exactly the situations where it
+        // was already in trouble. `Arenas::give` frees anything it does not
+        // keep, so this is that free plus a decode's one reuse.
+        held.arenas.give(device, arena);
+        drop(free_span);
         let (fired, logits) = read?;
         Ok(Step {
             logits,
@@ -729,6 +907,50 @@ impl Serving<'_> {
 /// refusal has to pass through it untouched. Matching the whole path by hand
 /// is how a later variant that happens to carry a `tile` field stays
 /// unhandled instead of quietly becoming a split.
+/// Everything a fire's resolver answers that is not a buffer, as one number.
+///
+/// The device's allocation and free counts say that the SET of buffers has
+/// not moved, which covers every weight, every KV layer and every fire table
+/// -- a table this pool replaced was one `vkCreateBuffer` and one
+/// `vkDestroyBuffer`, and both are counted. What they cannot see is a NUMBER:
+/// `Resolve::number` answers the page size, the two cache strides and the
+/// mask pitch, a routine bakes them into a push block or a scalar block, and
+/// none of the four allocates anything when it changes.
+///
+/// So they are asked for directly, through the same resolver the fire will
+/// use. Four calls, on a path that is about to plan 452 rectangles.
+///
+/// The weight count is in here as the cheapest statement that the checkpoint
+/// is the same one; a store that swapped a tensor for another of the same
+/// size would have freed one buffer and allocated another, which the device
+/// counts.
+fn state_of(model: &Model<'_>, weights: &Weights) -> u64 {
+    use crate::binding::FireNumber;
+    use crate::binding::Resolve;
+    let mut state = weights.len() as u64;
+    for which in [
+        FireNumber::KvPageSize,
+        FireNumber::KvHeadStride,
+        FireNumber::KvSeqStride,
+        FireNumber::AttentionMaskStride,
+        // The flash decode's split count is a function of this bucket, the
+        // split count is a GRID, and the grid is what `crate::replay`
+        // re-submits. Leave it out and the boundary where the bucket doubles
+        // replays the old grid -- half the history unattended, and only at
+        // that one token. See `crate::binding::FireNumber::KvHistoryBucket`.
+        FireNumber::KvHistoryBucket,
+    ] {
+        // A missing answer and a zero are different facts, and a routine acts
+        // on the difference -- a mask pitch of zero is "no mask", where
+        // `None` is "this resolver does not answer that". Folded so they
+        // cannot collide.
+        state = state.wrapping_mul(0x100_0000_01b3)
+            ^ u64::from(model.number(which).unwrap_or(u32::MAX))
+            ^ u64::from(model.number(which).is_none());
+    }
+    state
+}
+
 /// A zeroed arena, zeroed BY THE DEVICE.
 ///
 /// # Why not `Device::buffer(&vec![0u8; n])`
@@ -769,12 +991,23 @@ impl Serving<'_> {
 /// # Errors
 ///
 /// [`Unstepped::Failed`], if the allocation or the fill is refused.
-fn arena_for(device: &Device, bytes: usize) -> Result<crate::device::Buffer, Unstepped> {
+fn arena_for(
+    device: &Device,
+    arenas: &mut Arenas,
+    bytes: usize,
+) -> Result<crate::device::Buffer, Unstepped> {
     // Rounded up because `Device::zero` fills whole words, and an arena whose
     // size is not a multiple of four would otherwise leave its last bytes
     // holding whatever the allocation came with.
     let size = (bytes as u64).max(4).next_multiple_of(4);
-    let arena = device.empty(size).map_err(Unstepped::Failed)?;
+    let alloc = crate::phase::span("step/arena/empty");
+    // The step before this one's, when it was the same size. See [`Arenas`].
+    let arena = match arenas.take(size) {
+        Some(held) => held,
+        None => device.empty(size).map_err(Unstepped::Failed)?,
+    };
+    drop(alloc);
+    let _z = crate::phase::span("step/arena/zero");
     device.zero(&arena, 0, size).map_err(Unstepped::Failed)?;
     Ok(arena)
 }

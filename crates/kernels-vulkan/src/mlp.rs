@@ -4,10 +4,10 @@
 //! name: it bakes gpt-oss's asymmetric clamp, its `alpha` and its `(up + 1)`
 //! term, and its own first line says so.
 
-use kernels::KernelSig;
 use kernels::routine::Refusal;
 
-use crate::routine::{Bind, Buf, BufMut, Ctx, Env, Fire, Routine, elementwise};
+use crate::routine::{elementwise, keys, Ask, Bind, Block, Buf, BufMut, Ctx, Fire, Routine};
+use crate::routine::{InSlot, OutSlot, Param};
 
 /// gemma's gated activation: `gelu_tanh(gate) * up`, the tanh approximation
 /// and not the erf one.
@@ -28,12 +28,12 @@ use crate::routine::{Bind, Buf, BufMut, Ctx, Env, Fire, Routine, elementwise};
 /// See [`crate::routine::elementwise`].
 pub fn geglu_tanh(
     ctx: &Ctx<'_>,
-    gate: Buf,
-    up: Buf,
-    out: BufMut,
-    _params: Buf,
-    width: Env<i32>,
-    rows: Env<i32>,
+    gate: InSlot<0, Buf>,
+    up: InSlot<1, Buf>,
+    out: OutSlot<0, BufMut>,
+    _params: Block<Buf>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -62,12 +62,12 @@ pub fn geglu_tanh(
 /// See [`crate::routine::elementwise`].
 pub fn geglu_tanh_strided(
     ctx: &Ctx<'_>,
-    gate: Buf,
-    up: Buf,
-    out: BufMut,
-    params: Buf,
-    width: Env<i32>,
-    rows: Env<i32>,
+    gate: InSlot<0, Buf>,
+    up: InSlot<1, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -93,12 +93,12 @@ pub fn geglu_tanh_strided(
 /// See [`crate::routine::elementwise`].
 pub fn gptoss_swiglu(
     ctx: &Ctx<'_>,
-    gate: Buf,
-    up: Buf,
-    out: BufMut,
-    params: Buf,
-    width: Env<i32>,
-    rows: Env<i32>,
+    gate: InSlot<0, Buf>,
+    up: InSlot<1, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -125,11 +125,11 @@ pub fn gptoss_swiglu(
 /// See [`crate::routine::elementwise`].
 pub fn silu_mul(
     ctx: &Ctx<'_>,
-    gate: Buf,
-    up: Buf,
-    out: BufMut,
-    width: Env<i32>,
-    rows: Env<i32>,
+    gate: InSlot<0, Buf>,
+    up: InSlot<1, Buf>,
+    out: OutSlot<0, BufMut>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -159,12 +159,12 @@ pub fn silu_mul(
 /// See [`crate::routine::elementwise_rows`].
 pub fn silu_mul_strided(
     ctx: &Ctx<'_>,
-    gate: Buf,
-    up: Buf,
-    out: BufMut,
-    row_pitch: i32,
-    width: Env<i32>,
-    rows: Env<i32>,
+    gate: InSlot<0, Buf>,
+    up: InSlot<1, Buf>,
+    out: OutSlot<0, BufMut>,
+    row_pitch: Param<0, i32>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -193,9 +193,6 @@ pub static ENTRYPOINTS: &[&str] = &[
     "silu_mul_bfloat16",
     "silu_mul_strided_bfloat16",
 ];
-
-/// This family states no rows. See [`crate::RETIRED`].
-pub static KERNELS: &[KernelSig] = &[];
 
 #[cfg(test)]
 mod tests {
@@ -236,13 +233,13 @@ mod tests {
     #[test]
     fn every_activation_launches_one_lane_per_element_on_x_alone() {
         let seen = Seen::default();
-        geglu_tanh(&seen, Buf(0), Buf(1), BufMut(2), Buf(3), Env(64), Env(3))
+        geglu_tanh(&seen, InSlot::new(Buf(0)), InSlot::new(Buf(1)), OutSlot::new(BufMut(2)), Block::new(Buf(3)), Ask::new(64), Ask::new(3))
             .expect("64 wide by 3 rows is a launch");
-        geglu_tanh_strided(&seen, Buf(0), Buf(1), BufMut(2), Buf(3), Env(64), Env(3))
+        geglu_tanh_strided(&seen, InSlot::new(Buf(0)), InSlot::new(Buf(1)), OutSlot::new(BufMut(2)), Block::new(Buf(3)), Ask::new(64), Ask::new(3))
             .expect("a pitch does not make it two-dimensional");
-        gptoss_swiglu(&seen, Buf(0), Buf(1), BufMut(2), Buf(3), Env(64), Env(3))
+        gptoss_swiglu(&seen, InSlot::new(Buf(0)), InSlot::new(Buf(1)), OutSlot::new(BufMut(2)), Block::new(Buf(3)), Ask::new(64), Ask::new(3))
             .expect("64 wide by 3 rows is a launch");
-        silu_mul(&seen, Buf(0), Buf(1), BufMut(2), Env(64), Env(3))
+        silu_mul(&seen, InSlot::new(Buf(0)), InSlot::new(Buf(1)), OutSlot::new(BufMut(2)), Ask::new(64), Ask::new(3))
             .expect("64 wide by 3 rows is a launch");
 
         let calls = seen.0.borrow();
@@ -277,14 +274,14 @@ mod tests {
         let seen = Seen::default();
         assert!(
             matches!(
-                silu_mul(&seen, Buf(0), Buf(1), BufMut(2), Env(64), Env(0)),
+                silu_mul(&seen, InSlot::new(Buf(0)), InSlot::new(Buf(1)), OutSlot::new(BufMut(2)), Ask::new(64), Ask::new(0)),
                 Err(Refusal::Empty { what: "rows" })
             ),
             "no rows routed to this expert is not a launch of nothing"
         );
         assert!(
             matches!(
-                silu_mul(&seen, Buf(0), Buf(1), BufMut(2), Env(0), Env(3)),
+                silu_mul(&seen, InSlot::new(Buf(0)), InSlot::new(Buf(1)), OutSlot::new(BufMut(2)), Ask::new(0), Ask::new(3)),
                 Err(Refusal::Empty { what: "width" })
             ),
             "a zero-wide row is refused too, and the refusal NAMES which \
@@ -306,7 +303,7 @@ mod tests {
     #[test]
     fn a_rectangle_too_large_to_count_is_refused() {
         let seen = Seen::default();
-        let e = silu_mul(&seen, Buf(0), Buf(1), BufMut(2), Env(1 << 20), Env(1 << 13));
+        let e = silu_mul(&seen, InSlot::new(Buf(0)), InSlot::new(Buf(1)), OutSlot::new(BufMut(2)), Ask::new(1 << 20), Ask::new(1 << 13));
         assert!(
             matches!(
                 e,

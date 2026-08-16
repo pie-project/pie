@@ -5,30 +5,84 @@
 //! one answers the question one layer below: how does a checkpoint written in
 //! somebody else's vocabulary become a zt artifact at all.
 //!
-//! For HuggingFace the answer is "it already is one", which is why this
-//! module names only GGUF. That identity is an accident worth stating: the
-//! catalog's rows are spelled HuggingFace-shaped, so a HuggingFace checkpoint
-//! passes through and matches. `tests/a_row_identifies_from_its_own_names.rs`
-//! turns the accident into a decision, and this module is what a vocabulary
-//! that does NOT get the accident has to go through.
+//! The answer is a TABLE, one per family, and this module is where a file
+//! is turned into the right one. [`FAMILIES`] is the registry: a generation,
+//! the llama.cpp architecture it answers to, the naming tables it owns, and
+//! the catalog rows those tables are checked against.
 //!
-//! # Dispatched on what the file says, not on what it looks like
+//! # Three vocabularies, and pie owning its own
+//!
+//! A weight has three names: llama.cpp's (`blk.3.attn_q`), HuggingFace's
+//! (`model.layers.3.self_attn.q_proj`), and the one pie writes into the
+//! artifact. For a long time pie had no third name -- it BORROWED
+//! HuggingFace's. That borrowing was invisible in two ways at once. The
+//! HuggingFace arm here was empty, because the identity map needs no code;
+//! and every GGUF table's target column was produced by a function literally
+//! called `hf_name`, because the thing a GGUF name was translated INTO was,
+//! by construction, HuggingFace's spelling.
+//!
+//! [`crate::shared::vocabulary`] gives that third name a column. Each
+//! family's `import.rs` holds a `VOCAB` whose rows are `(pie, hf, gguf)`, and
+//! the `pie` column is what lands in the artifact. Today every `pie` equals
+//! its `hf`, so the artifacts are byte-identical to the ones this build
+//! produced before the tables existed -- which is the point: the change is a
+//! change of WHERE the decision lives, not of what it decided.
+//!
+//! # Why every family has a table, including the ones that need none
+//!
+//! Five families used to have an `import.rs` and sixteen did not, and the
+//! rule sorting them was "does a GGUF arm exist for it". That rule made the
+//! HuggingFace door a place where nothing was written down: a checkpoint
+//! whose names pie had never seen was accepted, silently, because acceptance
+//! was the absence of a check rather than the result of one.
+//!
+//! Now every family that ships catalog rows ships a table, and the tables
+//! are GROUNDED: `every_tensor_a_generations_rows_ask_for_has_a_row_in_its_table`
+//! puts each `pie` entry through `Observed::logical` and requires it to cover
+//! every tensor the generation's rows actually ask for. A table that drifts
+//! from its rows fails a test naming both the family and the file.
+//!
+//! # Strictness follows the data, not the format
+//!
+//! GGUF always refuses a name no row matches, and the reason is about the
+//! data rather than about strictness: `blk.3.attn_q` passed through unchanged
+//! is a tensor no contract can ever bind, so "lose nothing" is not on the
+//! menu.
+//!
+//! HuggingFace is the other case, and the switch is [`Vocab::respells`] --
+//! true when any row's `pie` differs from its `hf`. It is false for every
+//! family in this build, so unknown names pass through and nothing changes.
+//! The day someone edits a `pie` column, that family starts REFUSING what it
+//! cannot place, by name, because from that moment a passed-through name
+//! would leave the artifact half in one vocabulary and half in the other.
+//! The switch throws itself; nobody has to remember to throw it.
+//!
+//! # Dispatched on what the file says about itself, both times
 //!
 //! `crate::shared::weight_names::wire` has to sniff: it picks a family by
 //! looking for a tensor only one of them publishes, in an order that matters,
 //! with qwen3.5 explicitly bailing when gemma-4's tensor is present. Nothing
-//! here needs that, because a GGUF declares `general.architecture` in its
-//! key-value block. The dispatch is a string match on a fact the file states
-//! about itself.
+//! here needs that. A GGUF declares `general.architecture` in its key-value
+//! block; a HuggingFace checkpoint declares `model_type` in `config.json`.
+//! Both doors are a string match on a fact the file states about itself, and
+//! [`MODEL_TYPES`] is the one table joining the second to the first.
 //!
-//! # Five arms, and the others refusing
+//! That table used to have a third copy, hand-maintained in `pie`'s
+//! `src/ops/model.rs` for `pie model list`, "kept in sync with the C++
+//! drivers" by hand -- and it had drifted, naming three architectures no row
+//! in this build advertises. It is now a call to
+//! [`arch_for_model_type`], and a test refuses an entry no generation
+//! answers to.
 //!
-//! `qwen2`, `qwen3`, `qwen3moe`, `llama` and `gemma3` are here. That the rest
-//! are missing is not a stub: they are REFUSED, by name, with the reason --
-//! which is the same shape the family contract table already uses ("no MLX
-//! authoring pass exists..."), and it is an honest answer where a silent
-//! partial map would not be. Adding an architecture is a module in its
-//! generation and an arm here.
+//! # Five GGUF arms, and the others refusing
+//!
+//! `qwen2`, `qwen3`, `qwen3moe`, `llama` and `gemma3` have a `gguf` column.
+//! That the rest do not is not a stub: they are REFUSED, by name, with the
+//! reason -- which is the same shape the family contract table already uses
+//! ("no MLX authoring pass exists..."), and it is an honest answer where a
+//! silent partial map would not be. Note that a table can be reachable
+//! through the HuggingFace door and not through the GGUF one; that is the
+//! normal case now, not an omission.
 //!
 //! # Why an arm answers five questions and not one
 //!
@@ -201,6 +255,7 @@
 //! file this pass was not given. Refusing at the door says that once. The
 //! text map above is the head start for whoever brings the tower.
 
+use crate::shared::vocabulary::Vocab;
 use model_loader::checkpoint::Attributes;
 use model_loader::error::Error;
 
@@ -275,8 +330,9 @@ impl Ingest {
 /// which would mean a tensor renamed but not regrouped, or renamed but not
 /// unfolded, and a model that serves slightly wrong answers.
 struct Pass {
-    /// The artifact's name for a GGUF name, or `None` if the map has none.
-    name: fn(&str) -> Option<String>,
+    /// The family's whole naming table, which the GGUF column of answers
+    /// "what does the artifact call this".
+    vocab: Vocab,
     /// Tensors the converter derived, which pie derives for itself.
     derived: fn(&str) -> bool,
     /// How many row groups a tensor regroups by, or `None` for rows already
@@ -293,37 +349,37 @@ struct Pass {
 fn pass_for(architecture: &str) -> Result<Pass, Error> {
     match architecture {
         "qwen2" => Ok(Pass {
-            name: crate::qwen_2::import::hf_name,
+            vocab: crate::qwen_2::import::VOCAB,
             derived: |_| false,
             regroup: |_, _| None,
             folded: |_| None,
             stacked: |_| false,
         }),
         "qwen3" => Ok(Pass {
-            name: crate::qwen_3::import::hf_name,
+            vocab: crate::qwen_3::import::VOCAB,
             derived: |_| false,
             regroup: |_, _| None,
             folded: |_| None,
             stacked: |_| false,
         }),
         "qwen3moe" => Ok(Pass {
-            name: crate::qwen_3::import_moe::hf_name,
+            vocab: crate::qwen_3::import_moe::VOCAB,
             derived: |_| false,
             regroup: |_, _| None,
             folded: |_| None,
             stacked: crate::qwen_3::import_moe::is_stacked,
         }),
         "gemma3" => Ok(Pass {
-            name: crate::gemma_3::import::hf_name,
+            vocab: crate::gemma_3::import::VOCAB,
             derived: |_| false,
             regroup: |_, _| None,
             folded: crate::gemma_3::import::folded_constant,
             stacked: |_| false,
         }),
         "llama" => Ok(Pass {
-            name: crate::llama_2::import::hf_name,
-            derived: crate::llama_2::import::is_derived,
-            regroup: crate::llama_2::import::regroup_heads,
+            vocab: crate::shared::llama_like::import::VOCAB,
+            derived: crate::shared::llama_like::import::is_derived,
+            regroup: crate::shared::llama_like::import::regroup_heads,
             folded: |_| None,
             stacked: |_| false,
         }),
@@ -334,6 +390,308 @@ fn pass_for(architecture: &str) -> Result<Pass, Error> {
              `crates/model/src/ingest.rs`"
         ))),
     }
+}
+
+/// Every generation, and the naming tables it publishes in.
+///
+/// The one place a `model_type` becomes a table. A generation appears here
+/// exactly once, and the [`Family::arch`] column is cross-checked against
+/// what its own rows advertise, so this table cannot drift from the catalog
+/// without a test saying so.
+struct Family {
+    /// The generation module's name, for messages.
+    generation: &'static str,
+    /// pie's architecture name, as this generation's rows advertise it.
+    ///
+    /// Empty for a generation whose rows advertise none. Those cannot be
+    /// reached through the HuggingFace door at all -- see [`hf_family`].
+    arch: &'static str,
+    /// Its naming tables, tried in order.
+    ///
+    /// More than one when a generation is several llama.cpp architectures:
+    /// `crate::qwen_3` is `qwen3` and `qwen3moe`, and the two disagree about
+    /// the MLP.
+    vocabs: &'static [Vocab],
+    /// Its catalog rows, which the tables above are checked against.
+    ///
+    /// Read only by `every_tensor_a_generations_rows_ask_for_has_a_row_in_its_table`
+    /// and its two siblings. That is the point of the field: the table is
+    /// data, and the rows are what makes it checkable rather than asserted.
+    #[allow(dead_code, reason = "read by the tests that ground this table")]
+    rows: fn() -> &'static [&'static dyn crate::catalog::Variant],
+}
+
+/// Every generation this build ships, and the table each publishes in.
+const FAMILIES: &[Family] = &[
+    Family {
+        generation: "llama_3",
+        arch: "llama",
+        vocabs: &[crate::llama_3::import::VOCAB],
+        rows: crate::llama_3::rows,
+    },
+    Family {
+        generation: "qwen_2",
+        arch: "qwen2",
+        vocabs: &[crate::qwen_2::import::VOCAB],
+        rows: crate::qwen_2::rows,
+    },
+    Family {
+        generation: "qwen_3",
+        arch: "qwen3",
+        vocabs: &[
+            crate::qwen_3::import::VOCAB,
+            crate::qwen_3::import_moe::VOCAB,
+        ],
+        rows: crate::qwen_3::rows,
+    },
+    Family {
+        generation: "qwen_3_5",
+        arch: "qwen3_5",
+        vocabs: &[crate::qwen_3_5::import::VOCAB],
+        rows: crate::qwen_3_5::rows,
+    },
+    Family {
+        generation: "gemma_2",
+        arch: "gemma2",
+        vocabs: &[crate::gemma_2::import::VOCAB],
+        rows: crate::gemma_2::rows,
+    },
+    Family {
+        generation: "gemma_3",
+        arch: "gemma3",
+        vocabs: &[crate::gemma_3::import::VOCAB],
+        rows: crate::gemma_3::rows,
+    },
+    Family {
+        generation: "gemma_3n",
+        arch: "gemma3n",
+        vocabs: &[crate::gemma_3n::import::VOCAB],
+        rows: crate::gemma_3n::rows,
+    },
+    Family {
+        generation: "gemma_4",
+        arch: "gemma4",
+        vocabs: &[crate::gemma_4::import::VOCAB],
+        rows: crate::gemma_4::rows,
+    },
+    Family {
+        generation: "glm_5",
+        arch: "",
+        vocabs: &[crate::glm_5::import::VOCAB],
+        rows: crate::glm_5::rows,
+    },
+    Family {
+        generation: "gpt_oss",
+        arch: "gptoss",
+        vocabs: &[crate::gpt_oss::import::VOCAB],
+        rows: crate::gpt_oss::rows,
+    },
+    Family {
+        generation: "kimi_k2",
+        arch: "",
+        vocabs: &[crate::kimi_k2::import::VOCAB],
+        rows: crate::kimi_k2::rows,
+    },
+    Family {
+        generation: "kimi_k3",
+        arch: "",
+        vocabs: &[crate::kimi_k3::import::VOCAB],
+        rows: crate::kimi_k3::rows,
+    },
+    Family {
+        generation: "deepseek_v4",
+        arch: "",
+        vocabs: &[crate::deepseek_v4::import::VOCAB],
+        rows: crate::deepseek_v4::rows,
+    },
+    Family {
+        generation: "nemotron_h",
+        arch: "nemotron_h",
+        vocabs: &[crate::nemotron_h::import::VOCAB],
+        rows: crate::nemotron_h::rows,
+    },
+    Family {
+        generation: "olmo_2",
+        arch: "olmo2",
+        vocabs: &[crate::olmo_2::import::VOCAB],
+        rows: crate::olmo_2::rows,
+    },
+    Family {
+        generation: "olmo_3",
+        arch: "olmo3",
+        vocabs: &[crate::olmo_3::import::VOCAB],
+        rows: crate::olmo_3::rows,
+    },
+    Family {
+        generation: "phi_3",
+        arch: "phi3",
+        vocabs: &[crate::phi_3::import::VOCAB],
+        rows: crate::phi_3::rows,
+    },
+    Family {
+        generation: "mistral_3",
+        arch: "mistral",
+        vocabs: &[crate::mistral_3::import::VOCAB],
+        rows: crate::mistral_3::rows,
+    },
+    Family {
+        generation: "csm",
+        arch: "",
+        vocabs: &[crate::csm::import::VOCAB],
+        rows: crate::csm::rows,
+    },
+];
+
+/// HuggingFace `model_type` to pie's architecture name.
+///
+/// The two vocabularies for "which model is this", and the map between them
+/// is not a rule: `gpt_oss` and `gptoss` are the same model spelled by two
+/// projects, `gemma3_text` is the text tower of `gemma3`, and `qwen3_vl_text`
+/// is a third generation's name for a fourth thing. There is nothing to
+/// derive, so it is a table.
+///
+/// It is not a NEW table. It was `HF_TO_PIE_ARCH` in `src/ops/model.rs`,
+/// where `pie model list` used it to say whether a downloaded repository was
+/// servable -- a fact about the catalog, decided in the CLI, against a table
+/// kept in sync with the C++ loaders by hand. Here it is one lookup away from
+/// the rows it is a fact about, and one test away from drifting from them.
+const MODEL_TYPES: &[(&str, &str)] = &[
+    ("llama", "llama"),
+    ("qwen2", "qwen2"),
+    ("qwen3", "qwen3"),
+    ("qwen3_moe", "qwen3"),
+    ("qwen3_5", "qwen3_5"),
+    ("qwen3_5_moe", "qwen3_5"),
+    ("qwen3_5_moe_text", "qwen3_5"),
+    ("qwen3_vl", "qwen3_5"),
+    ("qwen3_vl_text", "qwen3_5"),
+    ("gemma2", "gemma2"),
+    ("gemma3", "gemma3"),
+    ("gemma3_text", "gemma3"),
+    ("gemma3n", "gemma3n"),
+    ("gemma3n_text", "gemma3n"),
+    ("gemma4", "gemma4"),
+    ("gemma4_text", "gemma4"),
+    ("gptoss", "gptoss"),
+    ("gpt_oss", "gptoss"),
+    ("nemotron_h", "nemotron_h"),
+    ("olmo2", "olmo2"),
+    ("olmo3", "olmo3"),
+    ("phi3", "phi3"),
+    ("mistral", "mistral"),
+    ("mistral3", "mistral"),
+];
+
+/// pie's architecture name for a HuggingFace `model_type`, or `None`.
+#[must_use]
+pub fn arch_for_model_type(model_type: &str) -> Option<&'static str> {
+    MODEL_TYPES
+        .iter()
+        .find(|(hf, _)| *hf == model_type)
+        .map(|(_, arch)| *arch)
+}
+
+/// The generation a checkpoint declaring this `model_type` belongs to.
+///
+/// Empty for three kinds of answer, and they are not the same kind:
+///
+/// * a `model_type` no [`MODEL_TYPES`] row names -- a family this build does
+///   not ship, or one whose config spells itself in a way nobody has read yet;
+/// * a `model_type` that names an architecture no generation advertises;
+/// * a generation whose rows advertise NO architecture at all. `glm_5`,
+///   `kimi_k2`, `kimi_k3`, `deepseek_v4` and `csm` are in that state today,
+///   which is a gap in the catalog and not in this module: their tables are
+///   written and cannot be reached until a row of theirs says what it is.
+///
+/// All three end in the same place -- names pass through untouched, and
+/// identification says what happened. See [`ingest`] for why that is the
+/// right answer while no table respells.
+fn hf_family(model_type: &str) -> Option<&'static Family> {
+    let arch = arch_for_model_type(model_type)?;
+    FAMILIES
+        .iter()
+        .find(|f| !f.arch.is_empty() && f.arch == arch)
+}
+
+/// The vocabulary a checkpoint spells its tensor names in.
+///
+/// Two, and both are dispatched on a string the FILE states about itself:
+/// GGUF's `general.architecture` in the key-value block, and HuggingFace's
+/// `model_type` in `config.json`. Neither is sniffed.
+pub enum Vocabulary<'a> {
+    /// llama.cpp's, dispatched on `general.architecture`.
+    Gguf(&'a Attributes),
+    /// HuggingFace's, dispatched on `config.json`'s `model_type`.
+    ///
+    /// Empty for a checkpoint with no config to read it from, which is an
+    /// answer and not a missing argument: it is exactly the case where no
+    /// family can be named, and no `FAMILIES` row is found for it.
+    HuggingFace(&'a str),
+}
+
+/// This checkpoint's tensors, as the artifact will hold them.
+///
+/// One entry per input name, in the order given. **Every import goes through
+/// here**, including the one that changes nothing -- because whether it
+/// changes nothing is now a property of a table, which can be edited, and not
+/// a property of the format, which cannot.
+///
+/// # Errors
+///
+/// A GGUF whose architecture has no pass, or a tensor no table has a name
+/// for. The HuggingFace arm fails only for a family whose table respells;
+/// see the module docs for why that is the same rule and not an exception.
+pub fn ingest(vocabulary: &Vocabulary<'_>, names: &[&str]) -> Result<Vec<Ingest>, Error> {
+    match vocabulary {
+        Vocabulary::Gguf(attributes) => gguf_ingest(attributes, names),
+        Vocabulary::HuggingFace(model_type) => hf_ingest(model_type, names),
+    }
+}
+
+/// This checkpoint's tensors, as the artifact will hold them.
+///
+/// # Why an unknown name may pass through here and never may in `gguf_ingest`
+///
+/// Not because HuggingFace is privileged. Because of what a pass-through
+/// COSTS in each direction, which is a fact about the tables and not about
+/// the formats.
+///
+/// A GGUF name that misses its table -- `blk.3.attn_q` -- passed through is a
+/// tensor under a name no catalog row can ever match, so there is no version
+/// of "lose nothing" available and the refusal is the only true answer.
+///
+/// A HuggingFace name that misses its table is already spelled the way the
+/// artifact spells it, PROVIDED the family's table does not respell. That
+/// proviso is checked, not assumed: [`Vocab::respells`] asks the table, and
+/// the moment one `pie` column is edited this function starts refusing what
+/// it cannot place, for that family, by name. It has to -- an artifact with
+/// `q_proj` respelled and `up_proj` passed through is half in each
+/// vocabulary and nothing downstream can tell which half.
+///
+/// So the rename that does not exist yet is what decides, and it throws the
+/// switch in the same edit that introduces it. Nobody has to remember.
+///
+/// # Errors
+///
+/// A tensor a respelling family's table has no row for.
+fn hf_ingest(model_type: &str, names: &[&str]) -> Result<Vec<Ingest>, Error> {
+    let family = hf_family(model_type);
+    let vocabs = family.map_or(&[][..], |f| f.vocabs);
+    let respells = vocabs.iter().any(Vocab::respells);
+    let generation = family.map_or("<generation>", |f| f.generation);
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        match vocabs.iter().find_map(|v| v.from_hf(name)) {
+            Some(pie) => out.push(Ingest::Rename(pie)),
+            None if respells => {
+                return Err(Error::Contract(format!(
+                    "`{model_type}` publishes `{name}`, and this build's table for it has no                      row -- so pie has no name of its own to store it under. The table respells                      at least one tensor, so passing the name through would leave the artifact                      half in each vocabulary. Add the row in                      `crates/model/src/{generation}/import.rs`"
+                )));
+            }
+            None => out.push(Ingest::Rename((*name).to_string())),
+        }
+    }
+    Ok(out)
 }
 
 /// This checkpoint's tensors, as the artifact will hold them.
@@ -355,7 +713,7 @@ pub fn gguf_ingest(attributes: &Attributes, names: &[&str]) -> Result<Vec<Ingest
             out.push(Ingest::Drop);
             continue;
         }
-        let Some(renamed) = (pass.name)(name) else {
+        let Some(renamed) = pass.vocab.from_gguf(name) else {
             return Err(Error::Contract(format!(
                 "`{architecture}` GGUF ingest has no name for `{name}`; the map in \
                  `crates/model/src/*/import.rs` predates this checkpoint"
@@ -427,8 +785,231 @@ pub fn can_ingest_gguf(architecture: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Ingest, can_ingest_gguf, gguf_ingest, gguf_rename};
+    use super::{FAMILIES, MODEL_TYPES, hf_family};
+    use crate::catalog::Deployed;
+    use crate::manifest::Observed;
+
+    /// Every generation the catalog gathers has a table here.
+    ///
+    /// Read from `catalog.rs`'s own `GENERATIONS` block rather than from a
+    /// list written twice, so a generation added there and forgotten here
+    /// fails instead of silently importing under no family's name.
+    ///
+    /// LOAD-BEARING TEXT: the `const GENERATIONS` block in `catalog.rs`.
+    #[test]
+    fn every_generation_the_catalog_gathers_has_a_naming_table() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/catalog.rs"),
+        )
+        .expect("catalog.rs");
+        let block = src
+            .split_once("const GENERATIONS")
+            .expect("the table")
+            .1
+            .split_once("];")
+            .expect("the table's end")
+            .0;
+        let gathered: Vec<&str> = block
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("crate::")?.strip_suffix("::rows,"))
+            .filter(|m| *m != "test_rows")
+            .collect();
+        assert!(
+            gathered.len() > 15,
+            "the generation block reader found {} modules, so its shape assumption broke",
+            gathered.len()
+        );
+        for generation in &gathered {
+            assert!(
+                FAMILIES.iter().any(|f| f.generation == *generation),
+                "{generation} is gathered by the catalog and has no row in `FAMILIES` --                  add `crates/model/src/{generation}/import.rs` and a row here"
+            );
+        }
+        for family in FAMILIES {
+            assert!(
+                gathered.contains(&family.generation),
+                "{} has a row in `FAMILIES` and is not gathered by the catalog",
+                family.generation
+            );
+        }
+    }
+
+    /// A family states the architecture its own rows advertise.
+    ///
+    /// The `arch` column is what a `model_type` resolves to, and the rows are
+    /// what the arch is a fact about. Two places, so a test.
+    #[test]
+    fn a_family_states_the_architecture_its_rows_advertise() {
+        for family in FAMILIES {
+            let mut advertised: Vec<&str> = (family.rows)()
+                .iter()
+                .filter_map(|row| row.deployment(Deployed::single()).ok())
+                .map(|d| d.advertised.arch)
+                .filter(|a| !a.is_empty())
+                .collect();
+            advertised.sort_unstable();
+            advertised.dedup();
+            let stated = if family.arch.is_empty() {
+                Vec::new()
+            } else {
+                vec![family.arch]
+            };
+            assert_eq!(
+                advertised, stated,
+                "{} advertises {advertised:?} and states {stated:?}",
+                family.generation
+            );
+        }
+    }
+
+    /// Every `model_type` names an architecture some generation advertises.
+    ///
+    /// The table came from `src/ops/model.rs`, where it was kept in sync with
+    /// the C++ loaders by hand and had drifted: it named `mixtral`, `kimi_k3`
+    /// and `qwen3_vl` architectures no row in this build advertises.
+    #[test]
+    fn every_model_type_names_an_architecture_a_generation_advertises() {
+        for (model_type, arch) in MODEL_TYPES {
+            assert!(
+                FAMILIES.iter().any(|f| f.arch == *arch),
+                "`{model_type}` maps to `{arch}`, which no generation advertises"
+            );
+            assert!(
+                hf_family(model_type).is_some(),
+                "`{model_type}` resolves to no table"
+            );
+        }
+    }
+
+    /// Every tensor a generation's rows ask for has a row in its table.
+    ///
+    /// This is what keeps the tables from being written from memory. A row's
+    /// name is the artifact's name lowered through [`Observed::logical`] --
+    /// the same lowering identification uses -- so a table entry is checked
+    /// against the catalog by putting it through that same funnel.
+    ///
+    /// The two substitutions are the holes: `{layer}` stands for a decoder
+    /// index, which `logical` templates back to `{}` once it is a number, and
+    /// `{expert}` for a routed expert's, which rows spell as a literal `0`.
+    #[test]
+    fn every_tensor_a_generations_rows_ask_for_has_a_row_in_its_table() {
+        for family in FAMILIES {
+            let covered: Vec<String> = family
+                .vocabs
+                .iter()
+                .flat_map(|v| v.0.iter())
+                .map(|m| Observed::logical(&m.pie.replace("{layer}", "7").replace("{expert}", "0")))
+                .collect();
+            for row in (family.rows)() {
+                for spec in row.manifest().tensors {
+                    let wanted = spec.name.trim_end_matches(".bias");
+                    assert!(
+                        covered.iter().any(|c| c == wanted),
+                        "{} asks for `{}` and `crates/model/src/{}/import.rs` has no row                          that lowers to it",
+                        row.id(),
+                        spec.name,
+                        family.generation
+                    );
+                }
+            }
+        }
+    }
+
+    use super::{Ingest, Vocabulary, can_ingest_gguf, gguf_ingest, gguf_rename, ingest};
     use model_loader::checkpoint::Attributes;
+
+    /// A HuggingFace checkpoint is answered, not skipped.
+    ///
+    /// The behaviour is the identity and always was; what this pins is that
+    /// it comes from the FAMILY's table. Two revisions ago `import` asked for
+    /// a GGUF pass, got `None` back and applied nothing. One revision ago
+    /// there was an arm, and it was one identity for every family at once --
+    /// which still said "pie's names are HuggingFace's" in a place no family
+    /// owned. Now `qwen2` answers out of `crate::qwen_2::import::VOCAB`.
+    #[test]
+    fn a_huggingface_checkpoint_is_answered_by_its_own_familys_table() {
+        let names = [
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.embed_tokens.weight",
+        ];
+        let out = ingest(&Vocabulary::HuggingFace("qwen2"), &names).expect("qwen2 has a table");
+        assert_eq!(
+            out,
+            vec![
+                Ingest::Rename(names[0].to_string()),
+                Ingest::Rename(names[1].to_string()),
+            ]
+        );
+        // And the table is the one that answered: a name qwen2 does not
+        // publish is not in it, and comes back only by the pass-through
+        // below.
+        assert!(
+            crate::qwen_2::import::VOCAB
+                .from_hf("model.layers.0.self_attn.q_proj.weight")
+                .is_some()
+        );
+    }
+
+    /// A name no table has passes through, and the same name refuses in GGUF.
+    ///
+    /// The asymmetry is the module doc's, and it is about what a
+    /// pass-through COSTS: a HuggingFace name is already spelled the way the
+    /// artifact spells it while no table respells, and `blk.3.attn_q` never
+    /// is. It is not about which format pie was written against.
+    #[test]
+    fn a_name_no_table_knows_passes_through_and_the_gguf_one_refuses() {
+        let names = ["something.no.family.publishes"];
+        assert_eq!(
+            ingest(&Vocabulary::HuggingFace("qwen2"), &names).expect("a pass-through"),
+            vec![Ingest::Rename(names[0].to_string())]
+        );
+        let attributes = Attributes::from_pairs([(
+            "general.architecture".to_string(),
+            model_loader::checkpoint::Attribute::Text("qwen2".to_string()),
+        )]);
+        assert!(ingest(&Vocabulary::Gguf(&attributes), &names).is_err());
+    }
+
+    /// A `model_type` no table names still imports.
+    ///
+    /// This is the capability the refusal would have cost. A checkpoint of a
+    /// family this build does not ship converts to an artifact, and
+    /// `pie model build` is what says it matches no row -- with the near-miss
+    /// candidates and the per-tensor reasons, which is a better message than
+    /// anything this function could write.
+    #[test]
+    fn a_family_this_build_does_not_ship_is_still_imported() {
+        let names = ["model.layers.0.self_attn.q_proj.weight"];
+        assert!(super::hf_family("something_new").is_none());
+        assert_eq!(
+            ingest(&Vocabulary::HuggingFace("something_new"), &names).expect("a pass-through"),
+            vec![Ingest::Rename(names[0].to_string())]
+        );
+    }
+
+    /// A respelling table refuses what it cannot place, and only then.
+    ///
+    /// The switch, exercised. No shipped table respells, so the refusal is
+    /// unreachable today -- which is exactly why it needs a test that reaches
+    /// it directly, or the day someone edits a `pie` column would be the day
+    /// they find out whether this half was ever written.
+    #[test]
+    fn a_respelling_table_refuses_the_name_it_cannot_place() {
+        use crate::shared::vocabulary::{Member, Vocab};
+        const RESPELT: Vocab = Vocab(&[Member {
+            pie: "layer.{layer}.attn.q",
+            hf: "model.layers.{layer}.self_attn.q_proj",
+            gguf: None,
+        }]);
+        assert!(RESPELT.respells());
+        assert_eq!(
+            RESPELT
+                .from_hf("model.layers.0.self_attn.q_proj.weight")
+                .as_deref(),
+            Some("layer.0.attn.q.weight")
+        );
+        assert_eq!(RESPELT.from_hf("model.layers.0.mlp.up_proj.weight"), None);
+    }
 
     #[test]
     fn a_qwen2_gguf_is_renamed_in_the_order_it_was_given() {

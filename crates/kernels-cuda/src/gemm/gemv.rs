@@ -1,5 +1,20 @@
+//! The GEMV host program: `out[n] = sum_k W[n][k] * x[k] + beta * out[n]`
+//! in bf16, for the single-row (decode) shape.
+//!
+//! [`gemv_bf16`] picks one of four instantiations — split-K under 4096
+//! output rows, row-per-warp above it, each at the unroll depth this device
+//! was measured for (2 on Blackwell and later, 4 below) — and refuses a K
+//! that is not a whole multiple of eight, or an operand that is not 16-byte
+//! aligned.
+
 use crate::jit::{ArgValue, Ctx, Launch, aligned16};
 use kernels::Refusal;
+use kernels::routine::{In, Out, Weight};
+// `#[kernels_macros::routine]` is written fully-qualified (this file imports
+// no `routine!`, so nothing would collide, but a reader arriving from
+// `mod.rs` should not have to check). The derived column is discussed once,
+// in `gemm/mod.rs`, where `ROUTINES` is; the launcher below's own marks are
+// argued locally because they describe this signature's own shape.
 
 /// Warps per block in the row-per-warp form — `gemv.cu:329`'s
 const WARPS: u32 = 4;
@@ -12,9 +27,7 @@ const MAX_BLOCKS: i64 = 2_147_483_647;
 
 /// How deep to unroll the row walk: 2 on Blackwell and later, 4 below.
 ///
-/// The device answers; an unknown one gets the conservative 4, which is what
-/// every pre-Blackwell part wants and what the probe used to fall back to at
-/// each of its four failure points.
+/// An unknown compute capability falls back to the conservative default (4).
 fn unroll_depth(ctx: &Ctx) -> i32 {
     if ctx.compute_capability_major().is_some_and(|major| major >= 10) { 2 } else { 4 }
 }
@@ -22,14 +35,29 @@ fn unroll_depth(ctx: &Ctx) -> i32 {
 /// Single-row bf16 GEMV: `out[n] = sum_k W[n][k] * x[k] + bias[n] + beta * out[n]`.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[kernels_macros::routine]
 pub fn gemv_bf16(
     ctx: &Ctx,
-    weight: *const std::ffi::c_void,
-    act: *const std::ffi::c_void,
-    bias: *const std::ffi::c_void,
-    out: *mut std::ffi::c_void,
-    n: i32,
-    k: i32,
+    // The only launcher in this family where `weight` precedes `act`;
+    // without this explicit `Weight<0, _>` mark, positional inference would
+    // derive `In(0)` for `weight` and `In(1)` for `act` -- backwards from
+    // every other signature here.
+    weight: Weight<0, *const std::ffi::c_void>,
+    // `InRow`/`OutRow` (width only, not a full `In`/`Out` region): this leg's
+    // row count is not a real operand extent (`dense.rs` refuses unless
+    // `m == 1`) and its caller is a tuner that never holds a `Facts` to
+    // resolve a region against, so only the width -- a real extent -- is
+    // taken. `n`/`k` below mirror the parent's `OutWidth(0)`/`InWidth(0)`
+    // marks in `gemm/mod.rs`.
+    act: In<0, std::ffi::c_void>,
+    // Same reason as `act`. `alias()` never touches an output, so stating
+    // `Out(0)` here carries no risk even in a family that declares
+    // `in_place`.
+    out: Out<0, std::ffi::c_void>,
+    // No source: `beta` is 0.0 or 1.0 depending on which symbol is stated
+    // (`act_x_w` vs `act_x_w_acc`); `dense.rs` refuses any other value, so a
+    // literal here would just be guessing at the same choice its caller
+    // already made.
     beta: f32,
 ) -> Result<(), Refusal> {
     /// The row count below which K is split INSIDE the block — `gemv.cu:317`'s
@@ -41,25 +69,30 @@ pub fn gemv_bf16(
     /// Warps per block in the split-K form on Blackwell — `gemv.cu:342`'s
     const SPLIT_WARPS_B: u32 = 4;
 
+    let n = out.width;
+    let k = act.width;
+
     if n <= 0 || k <= 0 || k % 8 != 0 {
         return Err(Refusal::Narrow { what: "n, k, or k in whole eights", at: i64::from(k) });
     }
-    for (p, what) in [(weight, "weight"), (act, "act"), (out.cast_const(), "out")] {
+    for (p, what) in [(weight.ptr, "weight"), (act.ptr, "act"), (out.ptr.cast_const(), "out")] {
         if p.is_null() {
             return Err(Refusal::Null { what });
         }
     }
-    for (p, what) in [(weight, "weight"), (act, "act")] {
+    for (p, what) in [(weight.ptr, "weight"), (act.ptr, "act")] {
         if !aligned16(p) {
             return Err(Refusal::Misaligned { what });
         }
     }
 
     let values = [
-        ArgValue::Ptr(weight.cast_mut()),
-        ArgValue::Ptr(act.cast_mut()),
-        ArgValue::Ptr(bias.cast_mut()),
-        ArgValue::Ptr(out),
+        ArgValue::Ptr(weight.ptr.cast_mut()),
+        ArgValue::Ptr(act.ptr.cast_mut()),
+        // Always null: `gemv_bf16` takes no bias parameter, but the kernel
+        // ABI still expects a pointer argument in this slot.
+        ArgValue::Ptr(std::ptr::null_mut()),
+        ArgValue::Ptr(out.ptr),
         ArgValue::I32(n),
         ArgValue::I32(k),
         ArgValue::F32(beta),

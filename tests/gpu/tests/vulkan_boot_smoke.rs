@@ -16,7 +16,7 @@
 //! tokenizer because the runtime parses one at boot unconditionally.
 //!
 //! ```text
-//! PIE_KERNELS_VULKAN_SPV_DIR=<abs>/out/spv PIE_VULKAN_ARTIFACT=/tmp/q4full.zt \
+//! PIE_VULKAN_ARTIFACT=/tmp/q4full.zt \
 //!   cargo test -p pie-gpu-tests --features driver-vulkan \
 //!   --test vulkan_boot_smoke -- --ignored --nocapture
 //! ```

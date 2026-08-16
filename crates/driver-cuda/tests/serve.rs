@@ -279,11 +279,22 @@ fn qwen3_fixture() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
         let p = e.ok()?.path();
         p.join("model.safetensors").is_file().then_some(p)
     })?;
-    let descriptor = std::path::PathBuf::from(
-        "/tmp/claude-0/-root--patissier-work-tart-alpha/\
-         7460e4c3-f305-45df-9603-2298b0c0c60e/scratchpad",
-    )
-    .join("qwen3_descriptor.json");
+    // THE SNAPSHOT'S OWN `config.json`.
+    //
+    // This was a hardcoded absolute path into an agent scratch directory --
+    // `/tmp/claude-0/-root--patissier-work-tart-alpha/<uuid>/scratchpad/
+    // qwen3_descriptor.json` -- which exists on no machine, including this
+    // one. So the `is_file()` guard below was always false, `qwen3_fixture`
+    // always answered `None`, and every test built on it printed
+    // "skipped: no cached Qwen3-0.6B or descriptor" and passed. A suite that
+    // skips and a suite that measures print the same `test result: ok`.
+    //
+    // `[model] config` wants the checkpoint's config, and the snapshot ships
+    // it -- `gpu_ptir_shell.rs` boots the same driver off
+    // `snap.join("config.json")` and loads the stock snapshot with it. So the
+    // descriptor file was never needed; only the path to it was ever
+    // unreachable.
+    let descriptor = snap.join("config.json");
     descriptor.is_file().then_some((snap, descriptor))
 }
 
@@ -300,6 +311,109 @@ fn qwen3_fixture() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
 /// about this device, and answering it means sizing the KV pool. This holds
 /// the payload against the type the engine deserializes it into, and holds
 /// the two fields a scheduler cannot work without.
+/// A scope this driver does not implement is REFUSED, not silently widened.
+///
+/// `ModelLoadDesc::component` had no reader in this crate: `load_model`
+/// forwarded `desc.snapshot_dir` to `load_impl` and dropped the rest, so
+/// asking for one component loaded the whole checkpoint. Asking gemma-4-26B
+/// for `Encode` -- a media tower of a couple of GiB -- staged a 48.1 GiB
+/// arena and failed on `cudaMalloc`, which reads as "this card is too small
+/// for the encoder" and is not what happened.
+///
+/// This asserts against `Full` succeeding in the test above, so it is the
+/// SCOPE being refused and not the fixture.
+#[test]
+fn load_model_refuses_a_component_scope_it_does_not_implement() {
+    let _gpu = gpu_guard();
+    let Some((snap, descriptor)) = qwen3_fixture() else {
+        eprintln!("skipped: no cached Qwen3-0.6B or descriptor");
+        return;
+    };
+    let boot = format!("[model]\nconfig = \"{}\"\n", descriptor.display());
+    let broker = engine_runtime();
+    let mut d = Shell::open(boot.as_bytes(), broker.clone()).expect("the driver creates");
+    for scope in [
+        driver_api::ModelComponent::Text,
+        driver_api::ModelComponent::Encode,
+    ] {
+        let load = driver_api::ModelLoadDesc {
+            snapshot_dir: snap.clone(),
+            runtime_quant: String::new(),
+            mxfp4_moe: driver_api::Mxfp4MoeRequest::Auto,
+            component: scope,
+        };
+        assert_eq!(
+            d.load_model(&load).err(),
+            Some(driver_api::PIE_STATUS_INVALID_ARGUMENT),
+            "{scope:?} is not implemented and has to say so"
+        );
+    }
+}
+
+/// A quantization this driver does not perform is REFUSED, not ignored.
+///
+/// `desc.runtime_quant` and `desc.mxfp4_moe` had no reader in this crate
+/// either -- outside the field declarations, every occurrence in the
+/// workspace is a test WRITING a default. So a worker config saying
+/// `runtime_quant = "fp8"` was accepted, quantized nothing, and ran bf16,
+/// while the worker's own documentation says fp8 "enable[s] per-channel
+/// symmetric quantization for supported projection weights".
+///
+/// `Mxfp4MoeRequest`'s doc says the explicit variants "pin a lowering and
+/// fail the load if the device cannot provide it". This device pins
+/// `native_mxfp4_moe: false`, so `NativeGemm` is precisely that case.
+///
+/// The values a working configuration already uses -- empty quant, `Auto`
+/// and `RoutedDecode` -- are asserted to still load, so this is the
+/// UNPROVIDABLE request being refused and not the request field.
+#[test]
+fn load_model_refuses_a_quantization_it_does_not_perform() {
+    let _gpu = gpu_guard();
+    let Some((snap, descriptor)) = qwen3_fixture() else {
+        eprintln!("skipped: no cached Qwen3-0.6B or descriptor");
+        return;
+    };
+    let boot = format!("[model]\nconfig = \"{}\"\n", descriptor.display());
+    let broker = engine_runtime();
+    let base = |quant: &str, moe| driver_api::ModelLoadDesc {
+        snapshot_dir: snap.clone(),
+        runtime_quant: quant.to_string(),
+        mxfp4_moe: moe,
+        component: driver_api::ModelComponent::Full,
+    };
+
+    let mut d = Shell::open(boot.as_bytes(), broker.clone()).expect("the driver creates");
+    for quant in ["fp8", "int8"] {
+        assert_eq!(
+            d.load_model(&base(quant, driver_api::Mxfp4MoeRequest::Auto))
+                .err(),
+            Some(driver_api::PIE_STATUS_INVALID_ARGUMENT),
+            "runtime_quant '{quant}' is not performed and has to say so"
+        );
+    }
+    for pinned in [
+        driver_api::Mxfp4MoeRequest::NativeGemm,
+        driver_api::Mxfp4MoeRequest::EagerBf16,
+    ] {
+        assert_eq!(
+            d.load_model(&base("", pinned)).err(),
+            Some(driver_api::PIE_STATUS_INVALID_ARGUMENT),
+            "{pinned:?} cannot be provided and has to say so"
+        );
+    }
+
+    // THE CONTROL. A refusal that fired on everything would pass the loop
+    // above while breaking every real boot.
+    for answered in [
+        driver_api::Mxfp4MoeRequest::Auto,
+        driver_api::Mxfp4MoeRequest::RoutedDecode,
+    ] {
+        let mut d = Shell::open(boot.as_bytes(), broker.clone()).expect("the driver creates");
+        d.load_model(&base("", answered))
+            .unwrap_or_else(|status| panic!("{answered:?} is answered, not refused: {status}"));
+    }
+}
+
 #[test]
 fn load_model_answers_capabilities_an_engine_can_parse() {
     let _gpu = gpu_guard();
@@ -4000,7 +4114,15 @@ fn an_extern_channel_registers_and_refuses_to_attach() {
     let ids: [u64; 1] = [21];
     let inst = InstanceBindingPlan {
         driver_id: 0,
-        program_id: 0,
+        // THE PROGRAM THAT WAS JUST REGISTERED.
+        //
+        // This said `program_id: 0`, and `bind_instance` refuses an unknown
+        // program with `PIE_STATUS_INVALID_ARGUMENT` several lines BEFORE it
+        // looks at the channels. So the test never reached the extern check
+        // it is named for: it read -1, asserted -3, and had been failing on
+        // an unregistered program the whole time. `reg_program` hands the id
+        // back through the out-parameter above, which nothing used.
+        program_id,
         requested_instance_id: 0,
         pacing_wait_id: 0,
         channel_ids: ids.to_vec(),
@@ -4033,7 +4155,7 @@ fn an_extern_channel_registers_and_refuses_to_attach() {
     let ids2: [u64; 1] = [22];
     let inst2 = InstanceBindingPlan {
         driver_id: 0,
-        program_id: 0,
+        program_id,
         requested_instance_id: 0,
         pacing_wait_id: 0,
         channel_ids: ids2.to_vec(),

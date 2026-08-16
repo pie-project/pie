@@ -246,7 +246,7 @@ pub struct DecodeGeometry {
     /// geometric ladder.
     ///
     /// No `rope_theta` expresses a rescaled ladder, which is why the driver
-    /// derives a TABLE and answers it as `Source::RopeFrequencies`; this is
+    /// derives a TABLE and answers it as `Source::Named(<keys::RopeFrequencies as keys::Fact>::KEY)`; this is
     /// the input to that derivation and [`crate::model::rope::frequencies`]
     /// is the whole of it.
     ///
@@ -1111,6 +1111,7 @@ mod tests {
                     sm_scale: 0.125,
                     rope_theta: 500_000.0,
                     rotary_dim: 0,
+                    q_gate: false,
                 })
                 .collect(),
             kv: KvStyle::Paged,

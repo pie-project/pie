@@ -1,19 +1,16 @@
 //! kimi_k2's per-backend binding facts.
 //!
-//! The SHAPE moved to `../spec.rs` (ungated: a row is written in it, and
-//! a row has to exist under every aspect). What a deployment BOUND — one
-//! fused latent GEMM instead of two, a YaRN rope the config asked for —
-//! is per-backend and known only when that backend's aspect is compiled,
-//! so it stays here.
+//! The SHAPE lives in `../spec.rs` (ungated). What a deployment BOUND — one
+//! fused latent GEMM instead of two, a YaRN rope the config asked for — is
+//! known only when that backend's aspect is compiled, so it stays here.
 
 use serde::{Deserialize, Serialize};
 
-/// The shape, re-exported so a declaration reaches its facts and the
-/// words they are stated in from one place.
+/// The shape, re-exported so a declaration reaches its facts from one place.
 pub use super::super::spec::{KimiFacts, KimiMlaFacts, KimiMoeFacts};
 
-/// The CUDA reading's deployment facts — the choices the hand-written
-/// pass makes from the BINDING and the config, resolved once at load.
+/// The CUDA reading's deployment facts — what the pass makes from the BINDING
+/// and the config, resolved once at load.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KimiCudaFacts {
     /// `Lw.q_kv_a_fused != nullptr`: one GEMM for the query's and the
@@ -26,6 +23,7 @@ pub struct KimiCudaFacts {
 }
 
 impl KimiCudaFacts {
+    /// The facts for the reference Kimi-K2 build, for tests and fixtures.
     pub fn kimi_k2_synthetic() -> Self {
         KimiCudaFacts {
             q_kv_a_fused: true,

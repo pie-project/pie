@@ -242,19 +242,33 @@ impl Declared {
     ///
     /// There a hole is a binding number with NO declaration at all, because
     /// `glslc` deletes the declaration of a buffer a variant never reads. The
-    /// driver has nothing to put at that number and the row says `Unbound`.
+    /// driver has nothing to put at that number, and a body asks for
+    /// [`crate::lowering::hold::Asked::Unbound`] at exactly those positions.
     ///
     /// `naga` deletes nothing, so a hole here is a binding that EXISTS and that
-    /// this entry point happens not to read -- the row still names a real
-    /// tensor for it and the driver still binds one. Measured over the whole
-    /// tree, 19 of the 480 entrypoints have at least one: `kv_append_paged`
+    /// this entry point happens not to read -- a body still asks for a real
+    /// operand at it and the driver still binds one. Measured over the whole
+    /// tree, 19 of the 481 entrypoints have at least one: `kv_append_paged`
     /// keeps six ring-ABI placeholder slots and every `sdpa_paged_*` declares
     /// an attention-sink buffer its non-sink variants do not read.
     ///
-    /// So this is a number a caller may use to size a MINIMUM -- every read
-    /// binding must be filled -- and never a number to subtract from an arity.
-    /// [`crate::dispatch::plan_one`] says at its own line what subtracting it
-    /// cost.
+    /// # A minimum to size, not a number to subtract
+    ///
+    /// Every binding the entry point READS must be filled, so this sizes a
+    /// floor. It is not something to take off an arity:
+    /// `driver-vulkan` closes its plan with `buffers + block == bindings -
+    /// holes()`, and that equality is a Vulkan COINCIDENCE -- there a hole and
+    /// an unbound ask are the same position, so the two counts move together.
+    /// Here they do not. The retirement in [`crate::dispatch`] keeps that
+    /// reasoning at length.
+    ///
+    /// It IS an accounting term, which is a different use and not a
+    /// contradiction: a hole is a slot the driver fills with
+    /// [`crate::binding::Slot::Nothing`], so `filled + holes == bindings` for
+    /// every rectangle, and `tests/arena.rs`'s
+    /// `what_the_plan_states_and_what_the_module_binds_account_for_each_other`
+    /// asserts exactly that. Balancing the books is allowed; lowering the bar
+    /// is not.
     #[must_use]
     pub fn holes(&self) -> usize {
         self.used.iter().filter(|u| !**u).count()
@@ -1012,147 +1026,69 @@ fn main(@builtin(workgroup_id) w: vec3<u32>) { out_[w.x] = 1u; }
         );
     }
 
-    /// And the module's own uniform block agrees with the layout a row-shaped
-    /// description derives.
-    ///
-    /// The disagreement this is for is silent: one side says where a driver
-    /// will write each scalar and the other says where the shader will read
-    /// them, the two are computed from different places, and a mismatch is a
-    /// plausible number rather than an error. `attn/kv_write.wgsl`'s own
-    /// comment states the case -- "`head_dim` at 0, then two 64-bit strides at
-    /// 8 and 16 -- NOT at 4 and 12" -- and ends it with *nothing at runtime
-    /// would report the mismatch, because a uniform buffer is just bytes*.
-    ///
-    /// # The rows are STATED here, and the sweep is gone with the table
-    ///
-    /// This walked `kernels_wgpu::KERNELS` and compared 24 entrypoints. The
-    /// table is empty, so there is no row left to walk and the `compared == 24`
-    /// floor is what said so -- it failed rather than passing over an empty
-    /// iterator, which is the only reason this is being rewritten instead of
-    /// having quietly stopped looking.
-    ///
-    /// What is stated here is ONE side of each comparison and the cheap one:
-    /// an operand list, transcribed from the row `attn` retired, which is
-    /// itself a transcription of the shader's `struct Params`. Both sides of
-    /// the answer are still computed by live code --
-    /// `kernels_wgpu::uniform_layout` derives the offsets from those kinds
-    /// alone, and this module's own walk reads them off the module `naga`
-    /// parsed -- so an alignment rule that stopped agreeing with WGSL still
-    /// fails here. The `want` run is pinned as well, because two computations
-    /// agreeing is worth less than two computations agreeing on the number the
-    /// specification names.
-    ///
-    /// The two entrypoints are the two shapes the arithmetic has, one file
-    /// apart: a narrow scalar in front of two 64-bit strides, which pads, and
-    /// three `i32`s, which do not. The paged row is also the one whose scalars
-    /// are INTERLEAVED with buffers -- six of which it does not even read --
-    /// so it is what says a storage operand cannot shift a uniform field.
-    ///
-    /// The routine plane packs the same block from the body's `ArgValue`s in
-    /// `crate::lowering::routine::bind`, under the same rule, and holds it
-    /// against `Declared::uniform_bytes` -- but only for SIZE, as
-    /// `routine::Unplanned::Scalars`. It never consults
-    /// `Declared::uniform_offsets`, so nothing on that plane compares a field's
-    /// PLACE against the struct a shader declares. The one other comparison
-    /// that did, `driver-wgpu/tests/arena.rs`'s
-    /// `every_launchs_scalars_land_where_its_module_reads_them`, asks
-    /// `kernels_wgpu::sig` for a row first and now counts every launch as
-    /// retired instead. That is why this was worth restating rather than
-    /// retiring with its table: a block of the right LENGTH with its fields in
-    /// the wrong places is a shader reading a stride where a head count
-    /// belongs, and a uniform buffer is bytes, so nothing reports it.
-    ///
-    /// And with no row to place from, `crate::binding::params_from` writes
-    /// each word AT `Declared::uniform_offsets` -- the reflection's answer is
-    /// the only statement left of where a scalar goes, which makes this the
-    /// check that it is where WGSL's rule puts it.
-    #[test]
-    fn a_stated_rows_uniform_layout_is_the_one_its_shader_declares() {
-        // `attn::kv_append`, as its row stated it. Only the operand KINDS and
-        // their order matter here: they are the whole of what a uniform layout
-        // is derived from.
-        let contiguous = kernels::kernel!(kv_append "kv_append",
-            file = Some("attn/kv_write.wgsl"),
-            launch = kernels::LaunchRule::PerHead,
-            operands = kernels::operands![
-                k_new: Buf <- kernels::Source::In(0),
-                v_new: Buf <- kernels::Source::In(1),
-                k_cache: BufMut <- kernels::Source::KvKeys,
-                v_cache: BufMut <- kernels::Source::KvValues,
-                pos: I32s <- kernels::Source::Positions,
-                head_dim: I32 <- kernels::Source::Param(0),
-                k_head_stride: Usize <- kernels::Source::KvHeadStride,
-                k_seq_stride: Usize <- kernels::Source::KvSeqStride,
-            ],
-            head_param = Some(0));
-        // And `attn::kv_append_paged`, whose `ring_*` operands belong to a
-        // shared ring ABI it never reads. They are buffers, so they take
-        // `@group(0)` entries and no uniform field, and the three scalars
-        // between them are still fields 0, 1 and 2.
-        let paged = kernels::kernel!(kv_append_paged "kv_append_paged",
-            file = Some("attn/kv_write.wgsl"),
-            launch = kernels::LaunchRule::PerHead,
-            operands = kernels::operands![
-                k_new: Buf <- kernels::Source::In(0),
-                v_new: Buf <- kernels::Source::In(1),
-                k_pages: BufMut <- kernels::Source::KvKeys,
-                v_pages: BufMut <- kernels::Source::KvValues,
-                ring_4: Buf,
-                head_dim: I32 <- kernels::Source::Param(0),
-                ring_6: Buf,
-                ring_7: Buf,
-                ring_8: Buf,
-                ring_9: Buf,
-                page_size: I32 <- kernels::Source::KvPageSize,
-                ring_11: Buf,
-                n_kv_heads: I32 <- kernels::Source::Param(1),
-                w_page: U32s <- kernels::Source::KvWritePage,
-                w_off: U32s <- kernels::Source::KvWriteOffset,
-                ring_15: Buf,
-            ],
-            head_param = Some(0),
-            heads_param = Some(1));
-
-        let mut compared = 0;
-        for (name, sig, want) in [
-            ("kv_append_bfloat16", &contiguous, [0u32, 8, 16]),
-            ("kv_append_paged_bfloat16", &paged, [0u32, 4, 8]),
-        ] {
-            let derived: Vec<u32> = kernels_wgpu::uniform_layout(sig)
-                .iter()
-                .map(|f| f.offset)
-                .collect();
-            assert_eq!(
-                derived, want,
-                "`{name}`'s operand kinds must derive the offsets WGSL's \
-                 alignment rule gives them"
-            );
-            let d = entrypoint(name, Capability::Baseline)
-                .unwrap_or_else(|e| panic!("`{name}` has no readable module: {e}"));
-            assert_eq!(
-                d.uniform_offsets, want,
-                "`{name}`: a driver writes its scalars at {want:?} and the \
-                 shader reads them at {:?}",
-                d.uniform_offsets
-            );
-            // And the block a shell will send is big enough, which is the
-            // WebGPU direction of the check -- over is fine, under is a
-            // binding `wgpu` refuses.
-            assert!(
-                kernels_wgpu::uniform_size(sig) >= d.uniform_bytes,
-                "`{name}`: the derived block is {} bytes and the shader's \
-                 struct needs {}",
-                kernels_wgpu::uniform_size(sig),
-                d.uniform_bytes
-            );
-            compared += 1;
-        }
-        assert_eq!(
-            compared, 2,
-            "both entrypoints of `attn/kv_write.wgsl` are compared, and a \
-             loop that compared neither would otherwise pass"
-        );
-    }
+    // RETIRED: A ROW HAD TO BE BUILT BEFORE THE TEST COULD BEGIN, and
+    // building one was the last thing this crate did with `kernels::kernel!`
+    // and `kernels::operands!`.
+    //
+    // It was `every_launchs_scalars_land_where_its_module_reads_them`,
+    // and it held `kernels_wgpu::uniform_layout`'s DERIVED offsets against
+    // the ones `naga` parses out of the shader, for the two entrypoints of
+    // `attn/kv_write.wgsl`. The operand lists it compared were transcribed
+    // from rows `attn` had already retired -- so one side of the comparison
+    // was a fixture typed into this file, and the row type it was typed into
+    // is going. A test that has to construct a `KernelSig` to have a subject
+    // asserts that this module can build a struct, not that anything states
+    // one.
+    //
+    // WHAT IT ASSERTED. Three offsets per entrypoint, pinned as LITERALS
+    // rather than as two computations agreeing: `[0, 8, 16]` for
+    // `kv_append_bfloat16`, where an `I32` is followed by two `Usize`s that
+    // WGSL declares `vec2<u32>` and eight-aligns, so the second field starts
+    // at 8 and not at 4 and the first leaves four bytes of padding behind it;
+    // and `[0, 4, 8]` for `kv_append_paged_bfloat16`, three `I32`s that do
+    // not pad. The paged entrypoint carried the second claim as well: its
+    // scalars are INTERLEAVED with ten storage operands, six of which belong
+    // to a ring ABI it never reads, and its fields are still 0, 1 and 2 --
+    // a `@group(0)` entry cannot shift a `@group(1)` field. It closed by
+    // requiring `uniform_size(sig) >= Declared::uniform_bytes`, which is the
+    // WebGPU direction (over is fine, under is a binding `wgpu` refuses), and
+    // by asserting `compared == 2`, so a loop that compared neither could not
+    // pass.
+    //
+    // WHERE THE CLAIM LIVES NOW. The offsets a driver writes at are held
+    // against the offsets a module reads at by
+    // `crates/driver-wgpu/tests/arena.rs`'s
+    // `every_launchs_scalars_land_where_its_module_reads_them`, over all 6680
+    // rectangles of every real lowering: `packed_offsets` walks WGSL's
+    // alignment rule over the `ArgValue`s `crate::lowering::routine::state`
+    // says a body passes, `Declared::uniform_offsets` is what `naga` parsed,
+    // and `routine::bind` -- the code between them -- is consulted by
+    // neither. It compares as a PREFIX, because a body may pass four words to
+    // a five-field struct, and it also holds the block's length against
+    // `Declared::uniform_bytes` and every declared field inside what the
+    // shell offers. The alignment rule itself is `routine::bind`'s packer,
+    // pinned byte for byte -- padding included -- by `lowering/routine.rs`'s
+    // `a_usize_scalar_is_eight_aligned_in_the_block`. The buffers-cannot-
+    // shift-fields shape is gone structurally rather than checked: a body
+    // hands back handles and `ArgValue`s in two lists that `Planner` splits
+    // by variant, which `a_planner_splits_buffers_from_scalars_by_variant`
+    // holds, so there is no interleaved run left to renumber.
+    //
+    // WHAT IS LOST. `kernels_wgpu::uniform_layout` and
+    // `kernels_wgpu::uniform_size` now have NO caller and no check in this
+    // crate. The successor compares what a BODY packs; this compared what the
+    // operand-kind derivation computes, and those are different functions.
+    // If that derivation's alignment arithmetic drifted, nothing on this side
+    // would notice -- only `kernels-wgpu`'s own suite, where `tests/gpu.rs`
+    // writes each field by the row's spelling through `uniform_layout()`,
+    // would still be looking.
+    //
+    // The literal run is lost with it. `[0, 8, 16]` was the SPECIFICATION's
+    // answer written down by hand, which is a third witness beside two
+    // computations; `every_launchs_scalars_land_where_its_module_reads_them`
+    // has only the two. And `kv_write.wgsl`'s two entrypoints are no longer
+    // singled out at all: they are covered exactly as far as some real text
+    // launches them, which that sweep counts rather than asserts per symbol.
 
     /// One file, two entry points, one axis apart.
     ///

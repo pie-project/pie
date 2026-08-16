@@ -2,44 +2,18 @@
 //!
 //! # Why this exists
 //!
-//! `model/text.rs` held `facts_from_with`, which rebuilt the model's own
-//! twenty-nine `LlamaLikeFacts` out of the projected geometry and NINE
-//! `has_tensor` probes:
+//! A tensor probe used to rebuild model facts (norm variant, fused QKV,
+//! attention bias, routing, sinks, per-layer scalars) from `has_tensor`
+//! checks, duplicating what the `model::catalog` row the checkpoint was
+//! matched to had already stated — and once got it wrong: a norm-variant
+//! probe read `(1 + w)` for a checkpoint whose gains are a plain multiplier,
+//! agreeing with MLX on the largest value while being off by a third
+//! everywhere else, a model that runs, never faults, and is quietly wrong.
 //!
-//! | probe | fact it decided |
-//! |---|---|
-//! | `layers.0.self_attn.q_norm.weight` | per-head q/k norms |
-//! | `layers.0.self_attn.qkv_proj.weight` | a fused QKV projection |
-//! | `layers.0.self_attn.q_proj.bias` | the Qwen-2 attention biases |
-//! | `layers.0.mlp.gate.weight` | a routed FFN |
-//! | `layers.0.mlp.shared_expert.gate_proj.weight` | a shared expert |
-//! | `layers.0.pre_feedforward_layernorm.weight` | the sandwich norm AND the norm variant |
-//! | `layers.0.self_attn.sinks` | attention sinks |
-//! | `per_layer_model_projection.weight` | gemma-4's per-layer embeddings |
-//! | `layers.0.mlp.experts.gate_proj.weight` | the expert bank's encoding |
-//!
-//! Eight of those nine are MODEL facts, and every one of them was already
-//! stated by the `model::catalog` row the checkpoint had been matched to.
-//! Deriving them a second time is not redundancy, it is a second answer: the
-//! norm-variant probe read `(1 + w)` for gemma-4 — whose gains are a plain
-//! multiplier — because gemma-4 ships the norm the probe asked about. The
-//! result agreed with MLX to three digits on its largest value and was off by
-//! a third on its ordinary ones, which is a model that runs, never faults and
-//! is quietly wrong.
-//!
-//! The ninth is an ENCODING, and it stays: `mlx-community/gpt-oss-20b-MXFP4-Q4`
-//! names 98 tensors as affine/64/4 and leaves the expert banks at the
-//! top-level mxfp4/32 default, and no row may state which format a publisher
-//! packed a bank in.
-//!
-//! That same checkpoint later added a TENTH, for the same reason. Its
-//! `quantization` block carries 122 overrides and not 98: the other 24 are
-//! the `mlp.router` gates at affine/64/**8**, a second affine point in one
-//! file. `layers.0.mlp.router.weight` is asked its point, and the alternative
-//! — a rule here about what a router's name looks like — would have been a
-//! model fact decided by a probe, which is the thing this file exists to
-//! prevent. Two probes, both encodings, is the invariant holding rather than
-//! bending.
+//! Two tensor questions remain, and both decide an ENCODING rather than a
+//! fact: which affine point the checkpoint's dense tensors and its router
+//! gate were each written at, since no row may state a format a publisher
+//! chose.
 //!
 //! # What it checks
 //!
@@ -47,12 +21,10 @@
 //!
 //! 1. Every question the load path puts to the tensors decides an ENCODING,
 //!    and each answer feeds a `MetalBinding` rather than a fact.
-//! 2. The "no Metal text for this row" refusal is REACHED BEFORE STAGING. The
-//!    placement is the whole value of that refusal — on the 31B gemma the
-//!    alternative is 17 GB of weights read to reach an answer identification
-//!    had already settled — and nothing in the type system holds a statement
-//!    in place. Moving it below `weights::load::load` is a two-line diff that
-//!    compiles, passes every other test, and costs a minute per refused load.
+//! 2. The "no Metal text for this row" refusal is REACHED BEFORE STAGING: on
+//!    the 31B gemma the alternative is 17 GB of weights read to reach an
+//!    answer identification had already settled, and nothing in the type
+//!    system holds the order in place.
 //!
 //! # What it does not check
 //!
@@ -64,9 +36,7 @@
 //!
 //! It reads files. `serve/load.rs` is on disk whether or not `metal-4`
 //! compiles it, so this runs in the portable half and the no-GPU job catches
-//! a re-introduced probe without a Mac — the same argument `layering.rs`
-//! makes for itself, and the reason neither is in `Cargo.toml`'s
-//! `required-features` list.
+//! a re-introduced probe without a Mac.
 
 use std::path::{Path, PathBuf};
 
@@ -94,11 +64,9 @@ fn load_path() -> (PathBuf, String) {
 
 /// Lines that are not comments, with their 1-based numbers.
 ///
-/// Comments are excluded for the reason `no_family_names.rs` excludes them:
-/// the paragraphs above the refusals in `serve/load.rs` QUOTE the probes they
-/// deleted, name the tensors they used to ask about, and would otherwise be
-/// counted as the thing they are recording the removal of. A doc that cannot
-/// mention what it replaced is a doc that gets written without the argument.
+/// Comments are excluded because the prose above the refusals in
+/// `serve/load.rs` quotes the tensor names it used to probe — a doc that
+/// cannot mention what it replaced could not carry this argument.
 fn code(text: &str) -> Vec<(usize, &str)> {
     text.lines()
         .enumerate()
@@ -113,18 +81,14 @@ const ENCODING_PROBE: &str = "loaded.mxfp4.contains";
 /// Every way `serve/load.rs` may mention the staged tensors, and what each
 /// one decides.
 ///
-/// `loaded` is the only handle that function has on the checkpoint's bytes —
-/// one `let` at line 192, one function in the file — so a list of the ways it
-/// is touched is a COMPLETE list of the questions this load asks. That is
-/// what makes the test below an instrument rather than a restatement: a new
-/// probe cannot reach the tensors without adding a line this list does not
-/// have.
+/// `loaded` is this function's only handle on the checkpoint's bytes — one
+/// `let`, one function — so this list is COMPLETE: a new probe cannot reach
+/// the tensors without adding a line this list does not have.
 ///
-/// Three of the six entries are not questions: the `let` that produces the
-/// handle, the move that gives it away, and the region walk. They are here
-/// because a list that only held questions would need a rule for what a
-/// question looks like, and the rule is what a new probe would be written to
-/// slip past. Every MENTION, adjudicated, has no such gap.
+/// Three of the six entries are not questions (the `let`, the move, the
+/// region walk); they are listed anyway so the rule is "every mention is
+/// adjudicated" rather than "every question looks like this", which is the
+/// rule a new probe would be written to slip past.
 const TENSOR_QUESTIONS: &[(&str, &str)] = &[
     (
         "loaded.affine_point(",
@@ -199,30 +163,21 @@ fn no_tensor_name_is_spelled_in_the_load_path() {
 /// time. The other test forbids a tensor NAME here; this one forbids a
 /// tensor QUESTION here, whatever it is spelled with.
 ///
-/// # Why "one question" became two, and why that is not a weakening
-///
-/// This test used to assert the count was exactly one. It was, until
-/// gpt-oss-20b-MXFP4-Q4 turned out to publish TWO affine points in one file:
-/// 98 dense tensors at 64/4 and 24 `mlp.router` gates at 64/**8**. A second
-/// question was the only honest answer, because the alternative is a rule
-/// about what a router's name looks like — which is a MODEL fact, decided
-/// here, which is the exact thing this file exists to prevent.
-///
-/// So the invariant was never the number. It is that each question's answer
-/// is an ENCODING: what format a publisher packed some bytes in, which no
-/// `model::catalog` row may state and none does. [`TENSOR_QUESTIONS`] carries
-/// that adjudication per question, in prose, next to the expression that asks
-/// it — so adding a third means writing down what it decides, and a probe
-/// that decides a model fact has nowhere to write itself down.
+/// The invariant is not how many questions there are, but that each one's
+/// answer is an ENCODING: what format a publisher packed some bytes in,
+/// which no `model::catalog` row may state and none does.
+/// [`TENSOR_QUESTIONS`] carries that adjudication per question, in prose,
+/// next to the expression that asks it — so adding a new question means
+/// writing down what it decides, and a probe that decides a model fact has
+/// nowhere to write itself down.
 ///
 /// # The narrow signature is still the guarantee
 ///
 /// Both encoding questions are passed to `binding::observed` as CLOSURES
 /// rather than answered here, and the assertion below pins them to the lines
-/// directly beneath that call. `observed` cannot see the geometry, so it
-/// cannot smuggle a model fact into a binding; a probe answered on its own
-/// line, before the call, would have the whole of `load_model` in scope and
-/// would lose that.
+/// directly beneath that call: `observed` cannot see the geometry, so it
+/// cannot smuggle a model fact into a binding, which a probe answered on its
+/// own line before the call would lose.
 #[test]
 fn every_tensor_question_the_load_asks_decides_an_encoding() {
     let (path, text) = load_path();
@@ -271,27 +226,22 @@ fn every_tensor_question_the_load_asks_decides_an_encoding() {
 
 /// The "no Metal text" refusal is reached before a byte is staged.
 ///
-/// # The placement is the whole value of the refusal
-///
 /// A row this build has no Metal text for is refused by `serve/load.rs`
-/// BEFORE `weights::load::load` reads the checkpoint. The old code's own
-/// message admitted what the other order costs — *"the checkpoint loaded, but
-/// nothing states its forward pass"* — and on `gemma-4-31b-it-4bit` that
-/// sentence is 17 GB of staging spent to reach an answer `catalog::identify`
-/// had settled before any of it started.
-///
-/// It is the same rule `weights::stage::fits_on_this_gpu` states for itself:
-/// asked before a byte is read is the only moment it can be asked usefully.
-/// Nothing in the type system holds either in place, which is what this test
-/// is for — the refusal and the staging call are two statements in one
-/// function, and swapping them compiles.
+/// BEFORE `weights::load::load` reads the checkpoint: on a 31B gemma
+/// checkpoint that ordering is the difference between an instant refusal and
+/// 17 GB of staging spent to reach an answer `catalog::identify` had already
+/// settled. The same rule `weights::stage::fits_on_this_gpu` states for
+/// itself — asked before a byte is read is the only moment it can be asked
+/// usefully — and nothing in the type system holds either ordering in place,
+/// which is what this test is for.
 ///
 /// The refusal is answered with `binding::ANY_ENCODING` rather than the real
-/// binding, and that is what MAKES the placement possible: the real binding
+/// binding, which is what MAKES the placement possible: the real binding
 /// needs `moe_mxfp4`, which needs the tensors, which needs the staging this
-/// gate exists to precede. It is sound because a row that refuses Metal
-/// refuses it for every encoding — which is not an argument left in prose,
-/// it is `binding::a_row_is_served_the_same_way_at_every_encoding`.
+/// gate exists to precede. Sound because a row that refuses Metal refuses it
+/// for every encoding —
+/// `binding::a_row_is_served_the_same_way_at_every_encoding` holds it, not
+/// prose.
 #[test]
 fn the_no_text_refusal_precedes_the_staging_call() {
     let (path, text) = load_path();
@@ -341,17 +291,13 @@ fn the_no_text_refusal_precedes_the_staging_call() {
 ///
 /// What stood at `serve/load.rs:217` rejected a checkpoint shipping
 /// `pre_feedforward_layernorm` while the projected geometry could only state
-/// a SiLU gate. Its message named its own repair — *"either an activation on
-/// `Deployment` or a `Variant::trace` that can be asked for a Metal text"* —
-/// and the second one exists: the row's text states the activation, this
-/// driver states none, and two statements that cannot disagree cannot
-/// contradict each other.
+/// a SiLU gate. The row's text now states the activation and this driver
+/// states none, so two statements that cannot disagree cannot contradict
+/// each other.
 ///
-/// Pinned because the deletion is the load-bearing half of this change and it
-/// leaves no symbol behind to reference. A reader who does not know why it
-/// went will re-add it the first time a gemma checkpoint is refused somewhere
-/// less obvious — and re-adding it means re-adding a tensor probe, which is
-/// what the two tests above are for.
+/// Pinned because the deletion leaves no symbol behind to reference: a
+/// reader who does not know why it went could re-add it, which means
+/// re-adding a tensor probe — the exact thing the two tests above forbid.
 #[test]
 fn the_gelu_contradiction_is_not_representable() {
     let (path, text) = load_path();

@@ -6,11 +6,15 @@
 // paid sixteen round trips per token to move sixteen vocabulary rows -- about
 // 3ms of a 23.5ms step, scaling linearly with the batch.
 //
-// The row is UNSTATED in the table, deliberately: this backend's channel-plane
-// interpreter never dispatches it, and a row is filled when a text names its
-// symbol. So the bindings are the sibling backends' -- source 0, destination 1,
-// params 2 -- and there is no `@group(1)`, because every scalar the copy needs
-// is a field of the params record.
+// Nothing in this tree dispatches it: the channel-plane interpreter does the
+// copy on the host. So the order below was taken from the sibling backends --
+// source 0, destination 1, params 2 -- rather than derived, and there is no
+// `@group(1)`, because every scalar the copy needs is a field of the params
+// record.
+//
+// `ptir::copy_logits_bf16`'s signature in `kernels-wgpu` is what states that
+// order now. It said "the row is UNSTATED in the table" until the tables were
+// deleted; the order did not change, only what writes it down.
 //
 // `common/bf16.inc.wgsl` is not included and nothing here widens a bf16: a copy
 // reproduces a bit pattern, and both tensors are `array<u32>` holding two bf16

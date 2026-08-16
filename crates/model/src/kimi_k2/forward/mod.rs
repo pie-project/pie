@@ -164,8 +164,7 @@ pub fn kimi_cuda(facts: &KimiFacts, cuda: &KimiCudaFacts, class: FireClass) -> F
                 facts.moe.moe_intermediate,
                 &format!("layer.{l}.experts"),
             );
-            let _ = up;
-            let act = dsl::cuda::swiglu(&gate, facts.moe.moe_intermediate, false);
+            let act = dsl::cuda::swiglu_pair(&gate, &up, facts.moe.moe_intermediate);
             let act_fp16 = dsl::cuda::bf16_to_fp16(&act);
             let route_out = dsl::cuda::wna16_down_decode(
                 &act_fp16,
@@ -177,8 +176,8 @@ pub fn kimi_cuda(facts: &KimiFacts, cuda: &KimiCudaFacts, class: FireClass) -> F
 
             let moe_out = if facts.moe.shared_intermediate > 0 {
                 let sgate = matmul(&m, &w.shared_gate);
-                let _sup = matmul(&m, &w.shared_up);
-                let sact = dsl::cuda::swiglu(&sgate, facts.moe.shared_intermediate, false);
+                let sup = matmul(&m, &w.shared_up);
+                let sact = dsl::cuda::swiglu_pair(&sgate, &sup, facts.moe.shared_intermediate);
                 let shared = matmul(&sact, &w.shared_down);
                 dsl::cuda::residual_add(&routed, &shared, facts.hidden)
             } else {

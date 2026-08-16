@@ -1,37 +1,14 @@
 //! A typed, shaped region of device memory, and the shape arithmetic that
 //! decides how large it is.
 //!
-//! Port of `DeviceTensor` in `kernels-cuda/csrc/src/tensor.hpp` -- the
-//! archive crate's header, deleted with it at `85c6c674b`. The C++ class
-//! fuses two things that fail in different ways and are testable by different
-//! means:
-//!
-//! * the **shape arithmetic** -- what `dtype` and what extents, hence how many
-//!   bytes -- which is pure host code, is where the interesting mistakes live,
-//!   and today can only be exercised by allocating on a GPU;
-//! * the **allocation** itself, which is a `cudaMalloc` and either works or
-//!   returns an error.
-//!
-//! They are split here into [`TensorSpec`] and [`DeviceTensor`]. The pools in
-//! [`crate::store`] build a `Vec<TensorSpec>` first and allocate from it
-//! second, so the layout of a KV cache -- which layers are real, which are
-//! aliases, which tiers a quantised format adds -- can be compared against the
-//! C++ exactly, on a machine with no CUDA device at all.
-//!
-//! # What the split buys
-//!
-//! The C++ `KvCache::allocate_per_layer` interleaves the decision and the
-//! `cudaMalloc`: the shape is an argument to a call whose result is a pointer,
-//! so nothing observable survives to be checked. The only way to ask "did this
-//! allocate the right thing" is to allocate it. Producing the specification as
-//! a value first makes that question answerable by comparing two vectors.
+//! Port of `DeviceTensor`, split into [`TensorSpec`] (pure shape arithmetic,
+//! where the interesting mistakes live) and [`DeviceTensor`] (the `cudaMalloc`)
+//! so the layout logic tests on a machine with no CUDA device.
 
 use crate::dtype::DType;
 use crate::error::{Error, Result};
 
 /// The dtype and extents of a tensor, with no memory behind it.
-///
-/// This is the half of `DeviceTensor` that can be wrong in an interesting way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorSpec {
     dtype: DType,
@@ -41,13 +18,8 @@ pub struct TensorSpec {
 }
 
 impl TensorSpec {
-    /// Build a spec, rejecting a negative extent as `DeviceTensor::allocate`
-    /// does.
-    ///
-    /// The C++ throws here rather than clamping, and it matters: a negative
-    /// extent reaching `numel_ *= static_cast<std::size_t>(d)` would wrap to a
-    /// number near `2^64` and the subsequent `cudaMalloc` would fail with an
-    /// unrelated message about an impossible size.
+    /// Build a spec. A negative extent is rejected, not clamped: it would wrap
+    /// near `2^64` and fail `cudaMalloc` with an unrelated message.
     pub fn new(dtype: DType, shape: impl Into<Vec<i64>>) -> Result<Self> {
         let shape = shape.into();
         let mut numel: u64 = 1;
@@ -90,11 +62,8 @@ impl TensorSpec {
         self.nbytes
     }
 
-    /// Whether this describes no memory at all.
-    ///
-    /// A zero-byte spec is the port of the C++'s default-constructed
-    /// `DeviceTensor`, which the cache classes push into their layer vectors
-    /// as a placeholder so that a slot index stays equal to a layer index.
+    /// Whether this describes no memory at all — the caches use a zero-byte
+    /// spec as a placeholder so a slot index stays equal to a layer index.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.nbytes == 0
@@ -103,15 +72,8 @@ impl TensorSpec {
 
 /// Device memory with a dtype and a shape.
 ///
-/// The C++ carries an `owns_memory_` flag and a hand-written move constructor
-/// that nulls the source, because a `DeviceTensor` may be either an owner or a
-/// borrowed view into someone else's allocation and the destructor has to tell
-/// them apart at runtime. Here ownership is the type: this struct owns, and a
-/// borrowed view is a `&DeviceTensor` or a raw pointer obtained from one, so
-/// the flag and the null-out have nothing to do.
-/// GATED — it OWNS device memory, which is the one thing in this file
-/// that needs a card. `TensorSpec` above it is arithmetic and stays
-/// portable, which is what the cache geometry actually asks for.
+/// Ownership is the type, not a runtime flag: this struct owns, a borrow is a
+/// `&DeviceTensor` or a raw pointer from one. Gated on `_cuda`.
 #[cfg(feature = "_cuda")]
 #[derive(Debug)]
 pub struct DeviceTensor {
@@ -121,12 +83,8 @@ pub struct DeviceTensor {
 
 #[cfg(feature = "_cuda")]
 impl DeviceTensor {
-    /// Allocate uninitialised device memory for `spec`.
-    ///
-    /// A zero-byte spec allocates nothing and yields a tensor whose pointer is
-    /// null, matching the C++'s `if (t.nbytes_ > 0)` guard. The cache classes
-    /// rely on that: they distinguish a real layer from an aliased one by
-    /// asking whether its tensor is empty.
+    /// Allocate uninitialised device memory for `spec`. A zero-byte spec yields
+    /// a null pointer, which the caches use to tell a real layer from an alias.
     pub fn allocate(alloc: &crate::device::Allocator, spec: TensorSpec) -> Result<Self> {
         let buffer = if spec.nbytes() == 0 {
             None

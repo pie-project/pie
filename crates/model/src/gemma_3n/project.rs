@@ -228,6 +228,7 @@ pub fn deployment(
                 },
                 // Full rotation at the head dim.
                 rotary_dim: 0,
+                q_gate: false,
             }
         })
         .collect();

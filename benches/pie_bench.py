@@ -48,6 +48,10 @@ EMBEDDED_CLI_DRIVERS: set[str] = {
     # Apple Silicon: the Metal driver is linked into the `pie` binary, and
     # there is no maturin `pie._engine` built for it, so drive the CLI.
     "metal",
+    # Vulkan is the same shape as Metal: `driver-vulkan` is linked into the
+    # `pie` binary behind a cargo feature and there is no maturin
+    # `pie._engine` carrying it, so the CLI is the only way in.
+    "vulkan",
     "vllm",
     "sglang",
     "tensorrt_llm",
@@ -146,18 +150,18 @@ def embedded_engine_identity() -> dict[str, str]:
 
     engine_path = Path(_engine.__file__).resolve()
     source_suffixes = {".c", ".cc", ".cpp", ".cu", ".cuh", ".h", ".hpp", ".rs"}
+    # `crates/`, because that is where the engine's sources live. This list
+    # used to name four pre-`crates/` paths that no longer exist, so the
+    # staleness guard was watching one file and any newer `.so` passed it.
     source_roots = [
-        ROOT / "driver",
-        ROOT / "interface",
-        ROOT / "runtime",
-        ROOT / "worker",
+        ROOT / "crates",
         ROOT / "sdk" / "server" / "python" / "src",
     ]
     # `driver-metal` is only in the dependency list on Apple-Silicon builds
     # (sdk/server/python/Cargo.toml), so on Linux its sources cannot have gone
     # into this .so. Counting them makes an origin/dev pull that touched only
     # the Metal driver look like a stale CUDA engine.
-    skip_roots = () if sys.platform == "darwin" else (ROOT / "driver" / "metal",)
+    skip_roots = () if sys.platform == "darwin" else (ROOT / "crates" / "driver-metal",)
     # `driver/*/bench` holds standalone microbenchmarks built directly with
     # nvcc; the engine's CMakeLists builds `tests/`, never `bench/`. Editing
     # one cannot change the .so, so counting them here only blocks the bench
@@ -331,6 +335,44 @@ def build_config(args: argparse.Namespace):
         # measure a starved engine against unstarved ones.
         fleet = max(1, args.concurrency) if args.mode != "latency" else 1
         driver_options["max_model_len"] = args.max_model_len * fleet
+    elif args.driver == "vulkan":
+        # Vulkan, anywhere there is a loader and an ICD. Its option table is
+        # THREE KEYS -- `kv_pages`, `ready_timeout`, `shutdown_timeout`
+        # (`worker::config::VulkanDriverOptions`) -- and that is not an
+        # oversight to be filled in later: this driver sizes nothing from a
+        # memory fraction and takes no batching caps, so the CUDA-shaped
+        # `gpu_mem_utilization`, `max_forward_tokens` and
+        # `max_forward_requests` have nowhere to go and passing them is a
+        # parse error naming the driver that refused them.
+        #
+        # `total_pages` is spelled `kv_pages` here for the reason the CUDA
+        # comment above gives about Metal: the value IS the pool, not a
+        # ceiling over a number derived from a fraction. `--max-model-len` is
+        # therefore also translated rather than forwarded -- see below.
+        driver_options = {
+            "ready_timeout": f"{int(args.server_startup_timeout)}s",
+        }
+        # `--device` defaults to `cuda:0`, which this driver's config validator
+        # rejects by name. It is not a selector either way -- the shell opens
+        # the first device the loader reports -- but `device` is required of
+        # every driver, so an untouched default is translated rather than
+        # forwarded. An explicit `--device` still wins.
+        if args.device == PIE_BENCH_DEFAULT_DEVICE:
+            device = ["vulkan:0"]
+        if getattr(args, "total_pages", 0):
+            driver_options["kv_pages"] = args.total_pages
+        else:
+            # The page size is the model text's, not a knob, so the honest
+            # translation of a per-request context length into a pool size
+            # needs the page size -- which an offline harness cannot read.
+            # 16 is what every llama-like text in this tree states, and the
+            # fleet multiplier is Metal's argument one line down: a shared
+            # pool divided by a client's concurrency is what each request
+            # actually gets, so sending the per-request number straight
+            # through would measure a starved engine against unstarved ones.
+            fleet = max(1, args.concurrency) if args.mode != "latency" else 1
+            pages = (args.max_model_len * fleet + 15) // 16
+            driver_options["kv_pages"] = max(1, pages)
     elif args.driver == "vllm":
         driver_options = {
             "gpu_memory_utilization": args.gpu_mem_util,
@@ -556,7 +598,9 @@ async def cli_pie_client(args: argparse.Namespace):
 
     pie_bin = Path(args.pie_bin)
     if not pie_bin.exists():
-        feature = "driver-metal" if args.driver == "metal" else "driver-cuda"
+        feature = {"metal": "driver-metal", "vulkan": "driver-vulkan"}.get(
+            args.driver, "driver-cuda"
+        )
         raise FileNotFoundError(
             f"missing {pie_bin}; build with: cargo build --release -p pie "
             f"--no-default-features --features {feature}"
@@ -1383,7 +1427,8 @@ def build_parser() -> argparse.ArgumentParser:
         )
         sp.add_argument("--device", default=PIE_BENCH_DEFAULT_DEVICE)
         sp.add_argument("--driver", default="cuda_native",
-                        choices=["cuda_native", "metal", "vllm", "sglang", "tensorrt_llm", "dummy"])
+                        choices=["cuda_native", "metal", "vulkan", "vllm", "sglang",
+                                 "tensorrt_llm", "dummy"])
         sp.add_argument("--default-token-limit", type=int, default=200_000)
         sp.add_argument("--default-endowment-pages", type=int, default=64)
         sp.add_argument("--admission-oversubscription-factor", type=float, default=4.0)

@@ -9,7 +9,8 @@
 
 use kernels::routine::Refusal;
 
-use crate::routine::{Bind, Buf, BufMut, Ctx, Env, Fire, Routine};
+use crate::routine::{keys, Ask, Bind, Buf, BufMut, Ctx, Fire, Routine};
+use crate::routine::{InSlot, OutSlot};
 
 /// `sample/argmax.metal:24` — "Grid{1024, n_rows, 1}, Threadgroup{1024,1,1}".
 ///
@@ -42,11 +43,11 @@ const GROUP_X: u32 = 1024;
 /// keep whatever it held and the loop would sample a stale token.
 pub fn argmax_logits(
     ctx: &Ctx<'_>,
-    logits: Buf,
-    next_token: BufMut,
-    params: Buf,
-    eos_flag: BufMut,
-    rows: Env<u32>,
+    logits: InSlot<0, Buf>,
+    next_token: OutSlot<0, BufMut>,
+    params: InSlot<1, Buf>,
+    eos_flag: OutSlot<1, BufMut>,
+    rows: Ask<keys::Rows, u32>,
 ) -> Result<(), Refusal> {
     if *rows == 0 {
         return Err(Refusal::Empty { what: "rows" });
@@ -118,7 +119,7 @@ mod tests {
     #[test]
     fn the_body_asks_for_the_entrypoint_and_the_order_the_shader_declares() {
         let seen = Seen::default();
-        argmax_logits(&seen, Buf(10), BufMut(11), Buf(12), BufMut(13), Env(7))
+        argmax_logits(&seen, InSlot::new(Buf(10)), OutSlot::new(BufMut(11)), InSlot::new(Buf(12)), OutSlot::new(BufMut(13)), Ask::new(7))
             .expect("seven rows is a launch");
 
         let calls = seen.0.borrow();
@@ -153,9 +154,9 @@ mod tests {
             args,
             &[
                 ArgValue::Buffer(10),
-                ArgValue::Buffer(11),
+                ArgValue::BufferMut(11),
                 ArgValue::Buffer(12),
-                ArgValue::Buffer(13),
+                ArgValue::BufferMut(13),
             ],
             "buffer(0..=3) in the shader's order -- logits, next_token, params, \
              eos_flag"
@@ -167,7 +168,7 @@ mod tests {
     fn an_empty_batch_is_refused_rather_than_dispatched() {
         let seen = Seen::default();
         assert_eq!(
-            argmax_logits(&seen, Buf(0), BufMut(1), Buf(2), BufMut(3), Env(0)),
+            argmax_logits(&seen, InSlot::new(Buf(0)), OutSlot::new(BufMut(1)), InSlot::new(Buf(2)), OutSlot::new(BufMut(3)), Ask::new(0)),
             Err(Refusal::Empty { what: "rows" })
         );
         assert!(

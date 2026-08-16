@@ -86,8 +86,7 @@ pub struct Gemma3nFacts {
     pub ple_width: u32,
     /// Activation sparsity: the gaussian top-k on the gate half. Zero
     /// means the layer takes the plain geglu.
-    pub sparsity_layers: u32,
-    pub altup: Gemma3nAltUpFacts,
+    pub sparsity_layers: u32,    pub altup: Gemma3nAltUpFacts,
     pub attn: Gemma3nAttnFacts,
     /// The SLIDING WINDOW each layer attends over, `-1` for none —
     /// read through [`model_ir::facts::window_left_at`], which is
@@ -112,6 +111,21 @@ impl Gemma3nFacts {
     /// The leading layers that apply the gaussian top-k before the geglu.
     pub fn is_sparse(&self, l: u32) -> bool {
         l < self.sparsity_layers
+    }
+
+    /// The `std_multiplier` a sparse layer's `gaussian_topk` thresholds at:
+    /// `gaussian_inverse_cdf(activation_sparsity)`.
+    ///
+    /// A CONSTANT and not a per-layer list, because
+    /// `activation_sparsity_pattern` is `0.95` across the leading run and
+    /// `0.0` after it in both published checkpoints, and WHERE the run ends
+    /// is already carried by [`Gemma3nFacts::is_sparse`] — the statement is
+    /// only emitted where that holds. Two encodings of one pattern is how
+    /// they come to disagree.
+    ///
+    /// `Φ⁻¹(0.95)`, to the precision an f32 keeps.
+    pub fn sparsity_std_mult(&self) -> f32 {
+        1.644_853_6
     }
 
     /// The six-layer synthetic. Uniform widths and no window: it pins

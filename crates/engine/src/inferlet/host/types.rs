@@ -1,8 +1,6 @@
-//! pie:core/types - error + blob type aliases.
-//!
-//! The hand-rolled async futures (future-string / future-blob) are gone:
-//! the async surface is now native component-model-async (`async func`),
-//! so `receive` / `receive-file` / `pull` await directly host-side.
+//! pie:core/types - error + blob type aliases. The async surface is native
+//! component-model-async (`async func`), so `receive` / `receive-file` /
+//! `pull` await directly host-side.
 
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;

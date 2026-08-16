@@ -153,6 +153,7 @@ fn geometric() -> Vec<(String, Lowered, driver_vulkan::dispatch::Geometry)> {
                         rotary_dims: facts.head_dim,
                         n_experts: facts.n_experts,
                         experts_per_token: facts.experts_per_token,
+            ..Default::default()
                     },
                 ));
             }
@@ -235,9 +236,6 @@ fn every_arena_offset_a_real_lowering_assigns_is_bindable() {
     );
 }
 
-/// Where the module directory is, when the shaders were built.
-const SPV_DIR: Option<&str> = option_env!("PIE_KERNELS_VULKAN_SPV_DIR");
-
 /// How a symbol's launch reaches its module: what the plan states, what the
 /// module declares, and whether the two account for each other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -269,6 +267,23 @@ enum Reaches {
     /// count of `DriverSupplies` is "what a Vulkan executor still owes", and
     /// a row that derives its own scalar owes nothing.
     RowDerives(u32),
+    /// The plan states at least as many OPERANDS as the module has real
+    /// bindings, and the two still did not match as a complete form. The
+    /// number is how many descriptors are surplus.
+    ///
+    /// Separated from [`Self::DriverSupplies`] for the reason that variant's
+    /// own neighbour gives: `real.saturating_sub(args)` reports this as a
+    /// driver owing zero resources, "which is true and says nothing". A zero
+    /// in the bucket that means "what a Vulkan executor still owes" reads as
+    /// *nothing is missing*, when what happened is that something is spare.
+    ///
+    /// The routed GEMMs are the case that forced it. A surplus is not a
+    /// defect -- a shader that declines a slot the statement carries fires
+    /// correctly, and `tests/device.rs` proves these two agree with the
+    /// matvec bit for bit -- but it is a fact about the calling convention,
+    /// and a kernel that started IGNORING an operand it used to read would
+    /// look exactly like this and must not land silently.
+    PlanOverstates(u32),
 }
 
 /// Every symbol the reachable texts launch, and how it must be called.
@@ -276,13 +291,27 @@ enum Reaches {
 /// Transcribed, so that a text that starts launching something new, or a
 /// shader that changes its binding count, is a failure here rather than a
 /// surprise in an executor that does not exist yet.
-/// The `_bm_32_bn_32` in the three GEMM symbols is `project::QMM_TILE`,
+/// The `_bm_32_bn_32` in the dense GEMM symbols is `project::QMM_TILE`,
 /// transcribed rather than interpolated: the tile moved from 16 to 32 for a
 /// 4.5x prefill win, and a table that formatted itself from the constant
 /// would have followed it without anyone reading the three lines that had to
-/// change.
+/// change. It earned that keep a second time when upstream swept the ROUTED
+/// tile's column axis and settled on `bn_64` -- the two routed rows below
+/// say 64 where the dense ones say 32, which is a difference no interpolated
+/// table could have shown.
 const REACHES: &[(&str, Reaches)] = &[
-    ("affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32", Reaches::Push),
+    // THE PRECAST TWINS, and not the plain ones. `qmm_fp16_precast` is
+    // stamped at `gs = 64, b = 4` alone, so every text quantised there now
+    // lowers `affine_qmm_t_fp16_precast` behind a staging cast and the plain
+    // `affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32` is launched by nothing.
+    // The 8-bit row below is untouched for exactly that reason, which is the
+    // check that this is a codec fact and not a lowering-wide one. Both
+    // twins reach their modules as `Push`: staging changes which buffer the
+    // activation arrives in, not how the call is made.
+    (
+        "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
+        Reaches::Push,
+    ),
     // The 8-bit twins, which arrived with a text upstream added rather than
     // with anything here. A point is `(group x bits)` and the bit width is
     // the checkpoint's, so a catalog row quantised at 8 bits names a symbol
@@ -292,7 +321,7 @@ const REACHES: &[(&str, Reaches)] = &[
     ("affine_qmm_t_bfloat16_gs_64_b_8_bm_32_bn_32", Reaches::Push),
     ("affine_qmv_fast_bfloat16_gs_64_b_8", Reaches::Push),
     (
-        "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_32_bn_32",
+        "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
         Reaches::Push,
     ),
     ("affine_qmv_fast_bfloat16_gs_64_b_4", Reaches::Push),
@@ -302,16 +331,38 @@ const REACHES: &[(&str, Reaches)] = &[
     // params at all, because a bias vector's length is the projection's width
     // and the trace already said that when it sized the output. Under the
     // table this row read it back with `Source::OutWidth(0)`; now the ARM
-    // `arm::add_bias` supplies it directly from `Facts::width` -- the result's
+    // `hold::add_bias` supplies it directly from `Facts::width` -- the result's
     // own width, which the trace holds. The reach is unchanged, because what
     // the module is short of is still one push word the plan does not carry;
     // only the thing that fills it moved from a row source to an arm.
     ("add_bias_bfloat16", Reaches::RowDerives(1)),
+    // The staging pass `qmm_fp16_precast` puts in front of a tiled GEMM: it
+    // reads bfloat rows and writes them back as `half` for
+    // `affine_qmm_t_fp16_precast` to multiply. Two descriptors, both the
+    // plan's, and a four-word push block of which the statement carries only
+    // three -- `k`, `n` and the row pitch. The fourth is `count`, which the
+    // PACKED form of this cast reads and this one does not; `hold::
+    // cast_qmm_input_strided_bfloat16_to_float16` fills it with `rows x
+    // pitch` so the word holds the number it is named for. That is the one
+    // word the statement does not state, which is what puts this row here
+    // and not in `Push`; the ROW COUNT the arm also supplies is not counted,
+    // because it steers the grid and never reaches the push block.
+    (
+        "cast_qmm_input_strided_bfloat16_to_float16",
+        Reaches::RowDerives(1),
+    ),
     ("residual_add_bfloat16", Reaches::Push),
     ("silu_mul_bfloat16", Reaches::Push),
     ("combine_sorted", Reaches::Buffer),
     ("gptoss_swiglu_bfloat16", Reaches::Buffer),
     ("rms_single_row_bfloat16", Reaches::Buffer),
+    // The pair of the line above, and it arrived by a text learning to say
+    // it rather than by this backend gaining anything. A post-norm landing
+    // used to be `rms_single_row` followed by `residual_add`, and every one
+    // of those norms was read by exactly one add: `norm::rms_residual` is
+    // that pair in one dispatch, and this crate had built it, armed it and
+    // never been asked for it. It reaches the same way its unfused half does.
+    ("rms_residual_bfloat16", Reaches::Buffer),
     ("route_gather", Reaches::Buffer),
     ("route_sort", Reaches::Buffer),
     ("router_topk_bfloat16", Reaches::Buffer),
@@ -325,6 +376,29 @@ const REACHES: &[(&str, Reaches)] = &[
     // weight; the module reads it at a slot of its own, and the statement
     // names it, so the reach is still complete.
     ("mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4", Reaches::Push),
+    // The TILED forms of the two routed matvecs above, which arrived when
+    // upstream wired `routed_qmm`. A mixture of experts used to take the
+    // matvec whatever its rectangle, so a prefill of many tokens fired one
+    // row at a time; the shared forward now picks the GEMM whenever
+    // `moe_tile` is `Some`. Nothing in this crate was taught either symbol --
+    // both reached a dispatch on the strength of what the statement carries,
+    // and `tests/device.rs` holds the routed GEMM to answering bit for bit
+    // the way the routed matvec does.
+    //
+    // `PlanOverstates(1)` and not `Push`: the statement carries one operand
+    // more than the module binds. Their matvec siblings are complete, so the
+    // surplus is the tiled form's own -- it declines a slot the routed shape
+    // states. Recorded as a NUMBER rather than waved through, because a
+    // kernel that quietly stopped reading an operand would present exactly
+    // this way and the count is what would move again.
+    (
+        "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_32_bn_64",
+        Reaches::PlanOverstates(1),
+    ),
+    (
+        "mxfp4_qmm_t_routed_bias_bfloat16_bm_32_bn_64",
+        Reaches::PlanOverstates(1),
+    ),
     (
         "embed_gather_mb_4bit_bfloat16_gs_64_b_4",
         Reaches::DriverSupplies(1),
@@ -447,11 +521,10 @@ fn every_symbol_a_real_text_launches_has_a_module() {
 /// has to supply, per symbol, measured rather than guessed at.
 #[test]
 fn what_the_plan_states_and_what_the_module_binds_account_for_each_other() {
-    let Some(dir) = SPV_DIR else {
+    if !kernels_vulkan::embedded() {
         eprintln!("no modules: build with `--features native` and `slangc` on PATH");
         return;
-    };
-    let dir = std::path::Path::new(dir);
+    }
     let mut seen: std::collections::BTreeMap<String, Reaches> = Default::default();
     let mut wrong = Vec::new();
 
@@ -473,14 +546,15 @@ fn what_the_plan_states_and_what_the_module_binds_account_for_each_other() {
             // that table is empty now, so it is read off the ROUTINE instead,
             // where the same fact lives as `Routine::in_place` -- a property
             // of the statement, not of a retired row, and stated on the
-            // routine for exactly that reason. `arm_for` is the join.
-            let aliases = driver_vulkan::arm::arm_for(symbol)
-                .map_or(0, |(routine, _)| routine.in_place.len());
+            // routine for exactly that reason. `routine_for` is the join.
+            let aliases =
+                driver_vulkan::hold::routine_for(symbol).map_or(0, |r| r.in_place.len());
             let args = args - u32::try_from(aliases).expect("a routine states few aliases");
-            let Ok(code) = std::fs::read(dir.join(format!("{symbol}.spv"))) else {
+            let Some(code) = kernels_vulkan::code(symbol, kernels_vulkan::Capability::Baseline)
+            else {
                 continue;
             };
-            let words = driver_vulkan::spirv::words(&code).expect("a built module is whole words");
+            let words = driver_vulkan::spirv::words(code).expect("a built module is whole words");
             let d = driver_vulkan::spirv::declared(&words).expect("a built module is well formed");
 
             // Asked in this order because the two are not exclusive in
@@ -503,6 +577,10 @@ fn what_the_plan_states_and_what_the_module_binds_account_for_each_other() {
                 // would otherwise report this as a driver owing zero
                 // resources, which is true and says nothing.
                 Reaches::RowDerives(d.push_offsets.len() as u32 - params)
+            } else if args >= real {
+                // Asked before `DriverSupplies` because `saturating_sub`
+                // reports this case as a driver owing zero resources.
+                Reaches::PlanOverstates(args - real)
             } else {
                 Reaches::DriverSupplies(real.saturating_sub(args))
             };
@@ -644,8 +722,19 @@ fn the_binder_this_crate_ships_resolves_every_operand_of_every_real_launch() {
     );
     // Stated so that a plan which stops producing arena operands -- or starts
     // producing far fewer -- cannot make the zero above true by emptiness.
+    // 15228 before the strided cast reached the card. Each staged activation
+    // is two more arena operands -- the bfloat rows it reads and the half
+    // rows it writes -- once per activation SOURCE per dense projection of
+    // every precasting text.
+    //
+    // 16444 until the slot wrappers and `Ask` stated their own provenance.
+    // That work did not change what a text launches; it changed what the
+    // signature SAYS about each operand, and an operand a row now spells as a
+    // slot is one this walk resolves rather than skips. The count moved UP,
+    // which is the direction that cannot make the zero above true by
+    // emptiness -- the check this number exists to defend.
     assert_eq!(
-        arena_operands, 15140,
+        arena_operands, 17148,
         "the texts produced a different number of arena operands than when this \
          was measured, so the zero above is about a different plan"
     );
@@ -655,8 +744,37 @@ fn the_binder_this_crate_ships_resolves_every_operand_of_every_real_launch() {
     // rectangle is refused nowhere and is wrong everywhere, and binding to the
     // end of the arena is refused nowhere and is the exact defect
     // `tests/device.rs` shows corrupting a neighbour. Both change this sum.
+    //
+    // 11_161_544_416, where it was 11_070_889_696 before the slot wrappers and
+    // `Ask` stated their own provenance. The plans launch the same rectangles;
+    // what moved is that an operand a row now spells as a slot is one this
+    // walk resolves rather than skips, so 704 more operands contribute their
+    // extents. Both this and the operand count above rose together and in
+    // proportion, which is what a widened census looks like -- an extent that
+    // got SHORTER is the dangerous direction, and nothing here got shorter.
+    //
+    // 11_070_889_696, where it was 10_501_906_144 before the strided cast
+    // reached the card: each staged activation binds its bfloat source and
+    // its half destination, and a `half` rectangle is the same element count
+    // at the same two bytes, so the pair adds twice the activation's extent
+    // per dense projection of every precasting text.
+    //
+    // 10_501_906_144, where it was 10_518_945_504 before a post-norm landing
+    // became one dispatch: 64 rectangles left these plans, and with them the
+    // arena ranges their `residual_add` halves used to bind. A fold shows up
+    // here as a fall, which is the shape of good news in this file.
+    //
+    // 10_518_945_504, where it was 2_982_826_080 before upstream taught
+    // `rectangle_rows` about `Dim::MoeAlignedRoutes`. A routed statement used
+    // to state one row per TOKEN, so its rectangle addressed a small fraction
+    // of the stack it actually reads; it now states the sorted stack, which
+    // is `top_k` routes a token with every touched expert's run rounded up to
+    // a whole tile. The extent grew three and a half times because the
+    // rectangle stopped understating itself, which is the direction this
+    // assertion exists to notice -- an extent that is too SHORT is the
+    // dangerous one, and it was short here.
     assert_eq!(
-        total, 2_982_826_080,
+        total, 11_161_544_416,
         "the arena ranges this binder produces cover a different number of \
          bytes than `rows x width x bytes` over these plans did when it was \
          measured"
@@ -743,11 +861,10 @@ fn an_arena_one_byte_short_of_what_the_plan_placed_refuses_what_runs_off_it() {
 /// which quietly makes one of them appear to fit is a failure.
 #[test]
 fn every_launchs_scalars_land_where_its_module_reads_them() {
-    let Some(dir) = SPV_DIR else {
+    if !kernels_vulkan::embedded() {
         eprintln!("no modules: build with `--features native` and `slangc` on PATH");
         return;
-    };
-    let dir = std::path::Path::new(dir);
+    }
     let mut pushed = 0u64;
     let mut blocked = 0u64;
     let mut owed: std::collections::BTreeSet<String> = Default::default();
@@ -755,10 +872,11 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
     for (text, low) in texts() {
         for launch in &low.launches {
             let symbol = &low.kernels[launch.kernel as usize];
-            let Ok(code) = std::fs::read(dir.join(format!("{symbol}.spv"))) else {
+            let Some(code) = kernels_vulkan::code(symbol, kernels_vulkan::Capability::Baseline)
+            else {
                 continue;
             };
-            let words = driver_vulkan::spirv::words(&code).expect("a built module is whole words");
+            let words = driver_vulkan::spirv::words(code).expect("a built module is whole words");
             let d = driver_vulkan::spirv::declared(&words).expect("a built module is well formed");
 
             match driver_vulkan::binding::params(&low, launch, &d) {
@@ -824,10 +942,15 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
         // short of NOTHING ELSE. Its two descriptors are both the plan's, and
         // the one word its module reads is the row width of its own output --
         // which the statement does not carry, because an `AddBias` states no
-        // params at all. `Source::OutWidth(0)` is how the row says where to
+        // params at all. `Source::Slot(Kind::OutWidth, 0)` is how the row says where to
         // read it and `binding::scalars` is what reads it, so this symbol
         // fires today; the five below still owe a Vulkan executor a resource.
         "add_bias_bfloat16",
+        // Not a resource but two NUMBERS, which is why it sits in this list
+        // and not among the paged rows below: the strided cast's push block
+        // has a `count` word its own walk never reads and a row count the
+        // statement has no reason to carry. See its row in `REACHES`.
+        "cast_qmm_input_strided_bfloat16_to_float16",
         "kv_append_paged_bfloat16",
         "neox_mb_bfloat16",
         "neox_freqs_mb_bfloat16",
@@ -876,7 +999,7 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
 /// a set of built modules and an arena, how many of its rectangles can be
 /// recorded?
 ///
-/// All 6680, across SIX texts in both fire classes. It began at 3180 of 3992
+/// All 7224, across SIX texts in both fire classes. It began at 3180 of 3992
 /// over three texts, and the 812 that refused were six symbols short of
 /// something nobody had built; each one leaving that list was a defect in
 /// this crate rather than a gap in a plan, and the list is now empty.
@@ -888,7 +1011,7 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
 /// of these hundred kernels is a `kernels-vulkan` routine plus a `driver-
 /// vulkan` arm, and a plan reaches its dispatch through
 /// `serve::plan_routine`, which resolves the routine and arm with
-/// `arm::arm_for(symbol)` and runs the body against a reflection of the built
+/// `hold::arm_for(symbol)` and runs the body against a reflection of the built
 /// modules. So this walk does too, which is why it hands `plan_routine` a
 /// `serve::Reflection` over a map of the `.spv` files rather than a row.
 ///
@@ -904,7 +1027,7 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
 /// so they are removed by name rather than left reading an empty table.
 ///
 /// What SURVIVES is every invariant a routine-path dispatch still has to
-/// honour, and it is asserted here rather than assumed: that all 6680
+/// honour, and it is asserted here rather than assumed: that all 7224
 /// rectangles plan; that no planned grid holds a zero; that a dispatch's
 /// operands plus the slot its scalar block takes are exactly the module's
 /// real bindings; that both halves of the parameter split occur; that the
@@ -930,30 +1053,19 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
 /// it needs a kernel variant, in both trees, and not a change here.
 #[test]
 fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
-    let Some(dir) = SPV_DIR else {
+    if !kernels_vulkan::embedded() {
         eprintln!("no modules: build with `--features native` and `slangc` on PATH");
         return;
-    };
-    let dir = std::path::Path::new(dir);
+    }
 
     // The built modules, keyed by file stem, which is what `serve::Modules`
     // asks a store to hold. A routine names an ENTRYPOINT and the reflection
     // reads the module out of this map -- the same lookup the driver does in
     // production, minus the device that turns bytes into a pipeline.
-    let mut modules: std::collections::BTreeMap<String, Vec<u8>> = Default::default();
-    for entry in std::fs::read_dir(dir).expect("the module directory reads") {
-        let path = entry.expect("a readable entry").path();
-        if path.extension().and_then(|e| e.to_str()) == Some("spv") {
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .expect("a module has a stem")
-                .to_owned();
-            modules.insert(stem, std::fs::read(&path).expect("a readable module"));
-        }
-    }
-    let reflection =
-        driver_vulkan::serve::Reflection::new(&modules, kernels_vulkan::Capability::Baseline);
+    let reflection = driver_vulkan::serve::Reflection::new(
+        &driver_vulkan::serve::Embedded,
+        kernels_vulkan::Capability::Baseline,
+    );
 
     /// An arena big enough that no weight or seam value is what refuses.
     const GENEROUS: u64 = 1 << 30;
@@ -995,7 +1107,8 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
                 driver_vulkan::binding::FireNumber::KvPageSize => PAGE_SIZE,
                 driver_vulkan::binding::FireNumber::KvHeadStride => 0x0022_2222,
                 driver_vulkan::binding::FireNumber::KvSeqStride => 0x0033_3333,
-                driver_vulkan::binding::FireNumber::AttentionMaskStride => 0,
+                driver_vulkan::binding::FireNumber::AttentionMaskStride
+                | driver_vulkan::binding::FireNumber::KvHistoryBucket => 0,
             })
         }
     }
@@ -1033,18 +1146,17 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
             launches += 1;
             let symbol = &low.kernels[launch.kernel as usize];
             // The join the table used to make: a plan's instantiated symbol
-            // to the routine and arm that serve it. `arm_for` reads no kernel
-            // row -- it matches a stem against `arm::LIVE` -- which is the
+            // to the routine that serves it. `routine_for` reads no kernel
+            // row -- it matches a stem against `hold::LIVE` -- which is the
             // whole point of the fork and the reason this walk still has a
             // subject with `KERNELS` empty.
-            let (routine, arm) = driver_vulkan::arm::arm_for(symbol)
-                .unwrap_or_else(|| panic!("{text}: no arm serves `{symbol}`"));
+            let routine = driver_vulkan::hold::routine_for(symbol)
+                .unwrap_or_else(|| panic!("{text}: nothing serves `{symbol}`"));
             match driver_vulkan::serve::plan_routine(
                 &low,
                 launch,
                 symbol,
                 routine,
-                arm,
                 arena,
                 &store,
                 geometry,
@@ -1056,8 +1168,9 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
                     // The same launch against a geometry of ZEROS, which is
                     // the nastiest input a caller can hand this seam. Under
                     // the table path a head-shaped ROW replaced the zeros
-                    // before a rule saw them; here a head-shaped ARM reads
-                    // `f.head_dim` and refuses when it is zero, and either way
+                    // before a rule saw them; here a head-shaped COLUMN asks
+                    // for `head_dim` and the binder refuses when it is zero,
+                    // and either way
                     // the finding is the same: no real rectangle can be
                     // driven to an empty grid from the outside. The ones that
                     // plan anyway take their dimensions from the lowering
@@ -1067,7 +1180,6 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
                         launch,
                         symbol,
                         routine,
-                        arm,
                         arena,
                         &store,
                         driver_vulkan::dispatch::Geometry::default(),
@@ -1111,11 +1223,10 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
                         // instantiate an axis and spell `affine_qmm_t_..._b_4`
                         // itself -- so the module to check it against is
                         // whatever it named, not the plan's symbol.
-                        let code = std::fs::read(dir.join(format!("{}.spv", d.symbol)))
-                            .unwrap_or_else(|e| {
-                                panic!("{text}: no module for `{}`: {e}", d.symbol)
-                            });
-                        let words = driver_vulkan::spirv::words(&code)
+                        let code =
+                            kernels_vulkan::code(&d.symbol, kernels_vulkan::Capability::Baseline)
+                                .unwrap_or_else(|| panic!("{text}: no module for `{}`", d.symbol));
+                        let words = driver_vulkan::spirv::words(code)
                             .expect("a built module is whole words");
                         let declared = driver_vulkan::spirv::declared(&words)
                             .expect("a built module is well formed");
@@ -1257,8 +1368,11 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
         }
     }
 
+    // 6616 before the strided cast reached the card, +608 for the staging
+    // dispatch that now precedes each dense projection of every precasting
+    // text. See `tests/device.rs`, which counts the same rectangles.
     assert_eq!(
-        launches, 6680,
+        launches, 7224,
         "a different number of rectangles is lowered"
     );
 
@@ -1271,22 +1385,27 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     // interleaved page size and its two pool planes, the paged decodes' head
     // width and page size, all supplied by the arm rather than derived from a
     // row.
-    assert_eq!(planned, 6680, "a different number of rectangles records");
     let expected: Vec<(String, u32)> = Vec::new();
     let got: Vec<(String, u32)> = refused.iter().map(|(k, v)| (k.clone(), *v)).collect();
     assert_eq!(got, expected, "a different set of rectangles refuses");
+    assert_eq!(planned, 7224, "a different number of rectangles records");
     assert_eq!(
         refused.values().sum::<u32>(),
         launches - planned,
         "the refusals and the successes do not account for every rectangle"
     );
 
-    // Both halves of the parameter split are exercised: 4448 dispatches push
+    // Both halves of the parameter split are exercised: 5056 dispatches push
     // their scalars and 1720 carry a block in a buffer slot. That BOTH occur
     // is the invariant -- a change that routed everything one way would leave
     // the other half untested while this test still passed -- and the exact
     // counts are pinned so a shift in the split shows as a diff here.
-    assert_eq!(pushed, 4448, "{pushed} pushed");
+    //
+    // 5056, where it was 4448: the 608 staging casts the precast lowering
+    // added all push. A four-word block fits the guaranteed 128 bytes with
+    // room to spare, so the cast never reaches the buffer path and the
+    // blocked count below does not move with it.
+    assert_eq!(pushed, 5056, "{pushed} pushed");
     assert_eq!(blocked, 1720, "{blocked} blocked");
 
     // ---- What retired with the table -------------------------------------
@@ -1351,31 +1470,57 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     // computed the wrong extent changes no other assertion in this file and
     // changes this one.
     //
-    // 48_780_882, where the table path measured 48_557_010. The difference is
+    // 36_474_730, where it was 34_252_138 before the strided cast reached the
+    // card. The cast walks a rectangle of `k` columns by `rows`, one lane an
+    // element, so it costs about as many workgroups as the GEMM it stages
+    // for saves nothing -- 2_222_592 over the six texts, or 6.5% more total
+    // work than these plans did without it. Worth stating plainly: staging
+    // is a PASS, and the whole of its return has to come out of the multiply
+    // that follows.
+    //
+    // 34_252_138, where it was 34_771_458 before the post-norm landing folded
+    // its `residual_add` into the norm that fed it. 16_640 workgroups is what
+    // 64 elementwise adds over these plans' rows came to -- small, because an
+    // add is one workgroup per row and a projection is one per tile, which is
+    // the whole reason the fold is worth doing for its DISPATCH count and not
+    // for its arithmetic.
+    //
+    // 34_771_458, where it was 48_780_882 before upstream wired the routed
+    // expert GEMM. The number FELL by a fifth, and that is the finding: a
+    // mixture of experts used to take the routed matvec whatever its
+    // rectangle, so a prefill fired one row of workgroups per token; the
+    // tiled form covers `QMM_TILE` rows at a time. Fewer workgroups for the
+    // same arithmetic is what a tile is for, and this is the only assertion
+    // in the file that can see it.
+    //
+    // 48_780_882, where the table path measured 48_557_010. That difference is
     // real and expected: a routine computes its grid in its own body from
     // `Facts` and the lowering rather than reading a `grid_param` slot, and a
     // handful of the per-head and paged kernels round their workgroup count up
     // where the row's stated extent rounded differently. Both are the same
     // rectangles reaching the same shaders; the arm's `div_ceil` is the
     // authority now, so this is its number and not the row's.
-    assert_eq!(workgroups, 48_780_882, "workgroups={workgroups}");
+    assert_eq!(workgroups, 36_474_730, "workgroups={workgroups}");
 
     // One dispatch per launch: no routine in these six texts fans a single
     // rectangle out to more than one `Dispatch`, so the two counts agree.
     // Stated because a body that split a launch in two would change this and
     // nothing else in the walk.
-    assert_eq!(dispatches, 6680, "dispatches={dispatches}");
+    assert_eq!(dispatches, 7224, "dispatches={dispatches}");
 
     // The widest grid in any single dimension, across every dispatch, is
-    // [3584, 25136, 64] -- the same extent the table walk measured, because
-    // the largest rectangle is the same one reaching the same shader. All
+    // [14040, 25136, 64]. The first axis was 3584 -- the same extent the
+    // table walk measured -- until the routed GEMM was wired: the widest x is
+    // now a routed expert tile grid over the sorted stack, which is taller
+    // than any dense projection's. The other two are unmoved, since neither
+    // the vocabulary nor the head axis is what routing widens. All
     // three are inside what Vulkan GUARANTEES a device will dispatch:
     // `maxComputeWorkGroupCount` is 65535 per axis at the specification's
     // floor, and a grid past it is undefined rather than refused, so a card
     // that ran the part that fits would return success over an output computed
     // for some of its rows. `Device::check` refuses either by name; this says
     // the refusal is not refusing work these texts do.
-    assert_eq!(widest_grid, [3584, 25136, 64], "the widest grid moved");
+    assert_eq!(widest_grid, [14040, 25136, 64], "the widest grid moved");
     for (axis, widest) in widest_grid.iter().enumerate() {
         assert!(
             *widest <= 65_535,
@@ -1387,7 +1532,7 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     // ---- The two grid-axis properties that moved from `rules.rs` ---------
     //
     // WASTE, the cheap direction: an axis a shader is never indexed by, handed
-    // more than one workgroup. Every one of the 6680 dispatches was checked as
+    // more than one workgroup. Every one of the 7224 dispatches was checked as
     // it was planned, against the module its ROUTINE named. None wastes a
     // group. The check that caught `Rule::Rms` on hardware once now answers
     // the same question for every rectangle six real texts state, with no GPU.
@@ -1423,8 +1568,10 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     // the two head widths these texts reach) are counted so a THIRD appearing
     // is a decision rather than an accident.
     //
-    // 26 distinct entrypoints are dispatched across the six texts and 50
-    // (entrypoint, axis) pairs are read; 2 are the excused decode rows and the
+    // 29 distinct entrypoints are dispatched across the six texts and 55
+    // (entrypoint, axis) pairs are read -- the last of each arrived with
+    // `rms_residual_bfloat16`, which reads one axis exactly as the
+    // `rms_single_row` it replaces does; 2 are the excused decode rows and the
     // other 48 reach more than one lane in at least one rectangle, so none is
     // flat.
     let mut flat: Vec<String> = Vec::new();
@@ -1455,14 +1602,21 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
         flat.len(),
         flat.join("\n")
     );
+    // 30 with the strided cast, which is the same arithmetic `REACHES` does:
+    // the precast lowering retired two dense symbols, named two staged ones
+    // in their place, and added the cast on top.
     assert_eq!(
         read_lanes.len(),
-        26,
+        30,
         "a different number of entrypoints is dispatched: {}",
         read_lanes.len()
     );
+    // 57, +2 for the strided cast's two axes: it is the only new SHAPE in
+    // the precast lowering. The staged GEMMs read exactly the axes the dense
+    // ones they replaced read, which is the check that staging changed where
+    // the activation comes from and not how the grid is walked.
     assert_eq!(
-        read_pairs, 50,
+        read_pairs, 57,
         "a different read-axis population: {read_pairs}"
     );
     assert_eq!(
@@ -1513,7 +1667,7 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
 /// changes which value lands where and this notices.
 #[test]
 fn every_pool_number_reaches_the_shader_through_the_arm_that_names_it() {
-    use driver_vulkan::arm::{Facts, Handles};
+    use driver_vulkan::hold::{Facts, Handles};
     use driver_vulkan::binding::{FireNumber, FireTable, Resolve};
     use driver_vulkan::device::{Bound, Buffer};
     use kernels_vulkan::routine::ArgValue;
@@ -1548,14 +1702,28 @@ fn every_pool_number_reaches_the_shader_through_the_arm_that_names_it() {
                 FireNumber::KvPageSize => PAGE,
                 FireNumber::KvHeadStride => HEAD,
                 FireNumber::KvSeqStride => SEQ,
-                FireNumber::AttentionMaskStride => 0,
+                FireNumber::AttentionMaskStride | FireNumber::KvHistoryBucket => 0,
             })
         }
     }
 
-    /// The scalar words an arm handed the shader, in order, discarding the
-    /// buffer handles. The strides ride as `Usize` and the page size as an
+    /// The scalar words the binder handed the shader, in order, discarding
+    /// the buffer handles. The strides ride as `Usize` and the page size as an
     /// `I32`, and either way it is the low 32 bits that reach the push block.
+    /// One routine's operands, bound the way a real fire binds them.
+    ///
+    /// Named by its stem rather than by a function, because the arm that used
+    /// to be that function no longer exists: what places these scalars now is
+    /// the routine's own column plus this driver's `named`, and the point of
+    /// this walk is that the pair still puts the right number in the right
+    /// slot.
+    fn bound(stem: &str, o: &mut Handles<'_, '_>, f: Facts) -> Vec<ArgValue> {
+        let r = driver_vulkan::hold::routine_for(stem)
+            .unwrap_or_else(|| panic!("nothing serves `{stem}`"));
+        driver_vulkan::bind::bind(r.args, r.sources, o, f)
+            .unwrap_or_else(|e| panic!("`{stem}` places its scalars: {e:?}"))
+    }
+
     fn scalars(values: &[ArgValue]) -> Vec<u32> {
         values
             .iter()
@@ -1569,8 +1737,9 @@ fn every_pool_number_reaches_the_shader_through_the_arm_that_names_it() {
     }
 
     // Two placeholder inputs -- the new keys and values every append names --
-    // and no results, weights or stated scalars: both arms below take their
-    // head width and counts from `Facts` when the statement carries none.
+    // and no results, weights or stated scalars: both routines below take
+    // their head width and counts from `Facts` when the statement carries
+    // none.
     let buf = Buffer::placeholder(1 << 20);
     let args = [Bound::whole(&buf), Bound::whole(&buf)];
     let ins = [0usize, 1];
@@ -1594,14 +1763,14 @@ fn every_pool_number_reaches_the_shader_through_the_arm_that_names_it() {
         layer: 0,
         requests: 4,
         tile: None,
+        ..Default::default()
     };
 
     // The paged append names `KvPageSize` and nothing else. Its answer must
     // reach the run, or the paged decodes it feeds read the cache at the
     // wrong page pitch -- silently, because nothing is out of bounds.
     let mut handles = Handles::new(&args, &ins, &outs, &weights, &params, &pool);
-    let paged = driver_vulkan::arm::kv_append_paged(&mut handles, facts)
-        .expect("the paged append places its scalars");
+    let paged = bound("kv_append_paged", &mut handles, facts);
     let run = scalars(&paged);
     assert!(
         run.contains(&PAGE),
@@ -1615,8 +1784,7 @@ fn every_pool_number_reaches_the_shader_through_the_arm_that_names_it() {
     // striding by heads where it should stride by positions, reading real
     // numbers from the wrong rows.
     let mut handles = Handles::new(&args, &ins, &outs, &weights, &params, &pool);
-    let contiguous = driver_vulkan::arm::kv_append(&mut handles, facts)
-        .expect("the contiguous append places its scalars");
+    let contiguous = bound("kv_append", &mut handles, facts);
     let run = scalars(&contiguous);
     let head_at = run
         .iter()
@@ -1632,15 +1800,15 @@ fn every_pool_number_reaches_the_shader_through_the_arm_that_names_it() {
          {seq_at}, which is the swap this check exists to catch: {run:?}"
     );
 
-    // All three witnessed, each by the arm that names it, and each a distinct
-    // value that arrived where the shader reads it. A resolver answering one
-    // number for all three, or an arm reaching for the wrong `FireNumber`,
-    // moves one of these and fails above.
+    // All three witnessed, each by the routine whose column names it, and
+    // each a distinct value that arrived where the shader reads it. A
+    // resolver answering one number for all three, or a `named` arm reaching
+    // for the wrong `FireNumber`, moves one of these and fails above.
     for (name, present) in [
         ("KvPageSize", scalars(&paged).contains(&PAGE)),
         ("KvHeadStride", run.contains(&HEAD)),
         ("KvSeqStride", run.contains(&SEQ)),
     ] {
-        assert!(present, "`{name}` reached no shader through any arm");
+        assert!(present, "`{name}` reached no shader through the binder");
     }
 }

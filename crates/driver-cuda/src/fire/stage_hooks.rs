@@ -1,36 +1,17 @@
-//! The stage-hook dispatch surface a model body threads through itself —
-//! gate-stage-hooks.
-//!
-//! Ports `model/stage_hooks.hpp`, which is header-only: the hooks struct,
-//! the sideband that crosses WITH each call, and the inline
-//! [`invoke_stage_hook`] guard chain the generated bodies call 1,916
-//! times.
-//!
-//! # Translations, stated
-//!
-//! * The C++ pairs a raw `context` pointer with a bare `execute` function
-//!   pointer — a manual vtable. The trait object IS that pair; a
-//!   [`StageHookExecute`] impl's `self` is the context. The same folding
-//!   carries `prepare_replay`/`verify_replay_capture`, which share the
-//!   context, as [`PrepareReplay`].
-//! * `sideband_arena` is NOT a field here. Rust needs the arena `&mut`
-//!   for a slot acquire, so it travels beside the hooks — the convention
-//!   `attn_score` and `page_mask` already established.
-//! * The ambient-compat overload (`ScopedStageHooks` and the point-first
-//!   `invoke_stage_hook`) is not ported: the C++ header's own comment
-//!   records that upstream-style qwen3_5 hooks are DORMANT this era
-//!   (re-port pending), and machinery for a path nothing exercises would
-//!   be unfalsifiable. When the qwen3_5 bodies re-port, their hooks
-//!   thread explicitly like everyone else's.
+//! The stage-hook dispatch surface a model body threads through itself. Ports
+//! the header-only `model/stage_hooks.hpp`: the hooks struct, the sideband that
+//! crosses with each call, and the inline [`invoke_stage_hook`] guard chain the
+//! generated bodies call. `sideband_arena` is not a field — Rust needs it `&mut`
+//! for a slot acquire, so it travels beside the hooks as `attn_score` and
+//! `page_mask` already do.
 
 use std::ffi::c_void;
 
 use super::attn_score::{AttentionObservation, AttentionScores};
 use super::page_mask::AttentionMaskSink;
 
-/// Where in the attention stage a hook fires.
-///
-/// Mirrors `model::StageHookPoint`, discriminants included.
+/// Where in the attention stage a hook fires. Mirrors `model::StageHookPoint`,
+/// discriminants included.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum StageHookPoint {
@@ -40,28 +21,25 @@ pub enum StageHookPoint {
     OnAttn = 2,
 }
 
-/// What crosses the model → dispatch boundary alongside the hook itself:
-/// the fire's KV geometry, the scores the layer just captured, and the
-/// destination a page-mask sink may write. Carried BY the call so a hook
-/// handed its sideband cannot read another fire's.
+/// What crosses the model → dispatch boundary with the hook: the fire's KV
+/// geometry, the layer's captured scores, and a page-mask sink's destination.
+/// Carried by the call so a hook cannot read another fire's sideband.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StageHookSideband<'a> {
-    /// The fire's KV geometry; filled from the hooks' own observation
-    /// when the call site leaves it `None`, so most sites never mention
-    /// it.
+    /// The fire's KV geometry; filled from the hooks' own observation when the
+    /// call site leaves it `None`.
     pub observation: Option<&'a AttentionObservation<'a>>,
-    /// The layer's captured scores, or `None` when nothing was captured —
-    /// the PTIR side then fails loudly instead of reading a stale row.
+    /// The layer's captured scores, or `None` when nothing was captured — the
+    /// PTIR side then fails loudly instead of reading a stale row.
     pub scores: Option<&'a AttentionScores>,
-    /// Where a program's `attn_page_mask` sink writes. Owned by the model
-    /// body; the dispatch only fills it — which is why it crosses as a
-    /// raw pointer, exactly as in the C++.
+    /// Where a program's `attn_page_mask` sink writes. Owned by the model body,
+    /// only filled by the dispatch — hence a raw pointer, as in the C++.
     pub mask_sink: *mut AttentionMaskSink,
 }
 
-/// The dispatch side of a hook — the C++ `context` + `execute` pair as
-/// one trait object. `&self` because a fire invokes hooks many times per
-/// body; a recording impl uses interior mutability.
+/// The dispatch side of a hook — the C++ `context` + `execute` pair as one trait
+/// object. `&self` because a fire invokes hooks many times; a recording impl
+/// uses interior mutability.
 pub trait StageHookExecute {
     /// One hook invocation. Argument order is the C++ fn pointer's.
     #[allow(clippy::too_many_arguments)]
@@ -78,19 +56,17 @@ pub trait StageHookExecute {
     );
 }
 
-/// The fire-level replay seam — `prepare_replay` and
-/// `verify_replay_capture`, which share the C++ context.
+/// The fire-level replay seam: `prepare_replay` and `verify_replay_capture`.
 pub trait PrepareReplay {
-    /// Hoist every attention-phase prepare to fire level; answer a
-    /// fingerprint of what a captured body would bake, or 0 when the fire
-    /// must take the legacy interleaved eager body.
+    /// Hoist every attention-phase prepare to fire level; return a fingerprint
+    /// of what a captured body would bake, or 0 when the fire must take the
+    /// eager body.
     fn prepare_replay(&self, stream: *mut c_void) -> u64;
     /// Assert the body consumed every prepared invocation.
     fn verify_replay_capture(&self);
 }
 
-/// The fire's hook set. Mirrors `model::StageHooks` — see the module docs
-/// for the two members that traveled.
+/// The fire's hook set. Mirrors `model::StageHooks`.
 #[derive(Default, Clone, Copy)]
 pub struct StageHooks<'a> {
     /// The fire's PTIR programs read `AttnScore` at `OnAttn`.
@@ -100,12 +76,11 @@ pub struct StageHooks<'a> {
     pub attn_score_window: u32,
     /// The fire's PTIR programs write `attn_page_mask` at `OnAttnProj`.
     pub wants_page_mask: bool,
-    /// How many LEADING request rows belong to no attention-stage
-    /// program — the hook-free fast-path prefix. `0` = no row is provably
-    /// hook-free.
+    /// Leading request rows belonging to no attention-stage program — the
+    /// hook-free prefix. `0` = no row is provably hook-free.
     pub hook_free_prefix_rows: u32,
-    /// Tier 2: the hook rows' own truncation; `u32::MAX` = full. The body
-    /// invokes hook stages only at layers below this.
+    /// The hook rows' own truncation; `u32::MAX` = full. The body invokes hook
+    /// stages only at layers below this.
     pub hook_rows_k: u32,
     /// The fire's KV geometry, set by the body-invocation choke point.
     pub observation: Option<&'a AttentionObservation<'a>>,
@@ -128,18 +103,16 @@ impl std::fmt::Debug for StageHooks<'_> {
     }
 }
 
-/// The C++ default: everything off, and `hook_rows_k` at FULL — a
-/// zero-default there would silently disable every hook.
+/// The C++ default: everything off, `hook_rows_k` at full — a zero-default
+/// would silently disable every hook.
 #[must_use]
 pub fn default_hooks<'a>() -> StageHooks<'a> {
     StageHooks { hook_rows_k: u32::MAX, ..StageHooks::default() }
 }
 
 impl<'a> StageHooks<'a> {
-    /// The slice the score captures read — what the C++ passes as
-    /// `StageHooks*` and `attn_score.cu` dereferences three fields of.
-    /// The captures were ported against this view before the full struct
-    /// existed; producing it here is what keeps that seam from drifting.
+    /// The slice the score captures read — what the C++ passes as `StageHooks*`
+    /// and `attn_score.cu` dereferences three fields of.
     #[must_use]
     pub const fn score_view(&self) -> super::attn_score::ScoreHookView<'a> {
         super::attn_score::ScoreHookView {
@@ -149,12 +122,10 @@ impl<'a> StageHooks<'a> {
     }
 }
 
-/// Invoke one stage hook, or nothing. Ports the inline
-/// `invoke_stage_hook`: null hooks and null execute cost one branch; a
-/// layer at or past `hook_rows_k` is refused centrally (a truncated hook
-/// lane's rows are frozen there, and an invocation would observe
-/// garbage); a sideband with no observation is filled from the hooks'
-/// own.
+/// Invoke one stage hook, or nothing. Null hooks or null execute cost one
+/// branch; a layer at or past `hook_rows_k` is skipped (its rows are frozen and
+/// an invocation would observe garbage); a sideband with no observation is
+/// filled from the hooks' own.
 #[allow(clippy::too_many_arguments)]
 pub fn invoke_stage_hook<'a>(
     hooks: Option<&StageHooks<'a>>,

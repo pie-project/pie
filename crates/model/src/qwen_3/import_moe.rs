@@ -59,31 +59,78 @@
 //! checkpoint states for itself. `output.weight` is mapped for the same
 //! reason -- `Qwen3-30B-A3B` publishes one, a tied variant would not, and
 //! GGUF states no tie key to read.
+use crate::shared::vocabulary::{Member, Vocab, gguf_member};
 
-/// The HuggingFace name for a GGUF tensor, or `None` if this map has none.
+/// Every tensor a Qwen3 mixture publishes, and what each vocabulary calls it.
 ///
-/// For a tensor [`is_stacked`] answers `true` for, the string returned is a
-/// TEMPLATE with a single `{}` where the instance index goes, and not a name.
-/// The two are answered by one function because they are one row of one
-/// table: `ffn_gate_exps` is the stacked spelling of `gate_proj` and there is
-/// no name for it that is not per-expert.
+/// `attn_norm` and `ffn_norm` are the pair worth reading twice: llama.cpp
+/// names a norm for what it PRECEDES and HuggingFace for where it SITS, so
+/// `ffn_norm` is `post_attention_layernorm` and NOT anything with "ffn" in
+/// it. Gemma is the family where copying that row would go wrong -- see
+/// `crate::gemma_3::import` -- and it is a row this family does share the
+/// meaning of, which is exactly why the table is spelled out here anyway.
 ///
-/// `None` is a refusal and not a skip. A tensor silently left out is a model
-/// that loads with a layer missing, and the caller turns this into an error
-/// naming the tensor.
-#[must_use]
-pub fn hf_name(gguf: &str) -> Option<String> {
-    let (stem, suffix) = match gguf.rsplit_once('.') {
-        Some((stem, tail @ ("weight" | "bias"))) => (stem, tail),
-        _ => return None,
-    };
-    let hf = match split_layer(stem) {
-        Some((layer, member)) => format!("model.layers.{layer}.{}", LAYER.get_member(member)?),
-        None if stem == "output" => "lm_head".to_string(),
-        None => format!("model.{}", MODEL.get_member(stem)?),
-    };
-    Some(format!("{hf}.{suffix}"))
-}
+/// `ffn_gate_inp` is the router and `mlp.gate` is what HuggingFace calls it:
+/// a `gate` that SELECTS experts, and not the `gate_proj` half of a gated
+/// MLP. The two are one edit apart and one is `[E, H]` while the other is
+/// `[I, H]`.
+///
+/// The three `_exps` rows carry `{expert}`, which survives translation as
+/// `Ingest::Unstack`'s template: llama.cpp publishes one `[E, I, H]` stack
+/// where the checkpoint publishes `E` separate tensors, and the count is the
+/// SOURCE's leading extent rather than anything this table should repeat.
+pub const VOCAB: Vocab = Vocab(&[
+    // ── Inside a decoder layer ───────────────────────────────────────
+    Member::gguf(
+        "model.layers.{layer}.self_attn.q_proj",
+        "blk.{layer}.attn_q",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.self_attn.k_proj",
+        "blk.{layer}.attn_k",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.self_attn.v_proj",
+        "blk.{layer}.attn_v",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.self_attn.o_proj",
+        "blk.{layer}.attn_output",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.self_attn.q_norm",
+        "blk.{layer}.attn_q_norm",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.self_attn.k_norm",
+        "blk.{layer}.attn_k_norm",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.input_layernorm",
+        "blk.{layer}.attn_norm",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.post_attention_layernorm",
+        "blk.{layer}.ffn_norm",
+    ),
+    Member::gguf("model.layers.{layer}.mlp.gate", "blk.{layer}.ffn_gate_inp"),
+    Member::gguf(
+        "model.layers.{layer}.mlp.experts.{expert}.gate_proj",
+        "blk.{layer}.ffn_gate_exps",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.mlp.experts.{expert}.up_proj",
+        "blk.{layer}.ffn_up_exps",
+    ),
+    Member::gguf(
+        "model.layers.{layer}.mlp.experts.{expert}.down_proj",
+        "blk.{layer}.ffn_down_exps",
+    ),
+    // ── Outside it ───────────────────────────────────────────────────
+    Member::gguf("model.embed_tokens", "token_embd"),
+    Member::gguf("model.norm", "output_norm"),
+    Member::gguf("lm_head", "output"),
+]);
 
 /// Whether llama.cpp published this tensor as one stack of many.
 ///
@@ -99,71 +146,18 @@ pub fn hf_name(gguf: &str) -> Option<String> {
 /// router apart into `E` rows.
 #[must_use]
 pub fn is_stacked(gguf: &str) -> bool {
-    let Some((stem, "weight")) = gguf.rsplit_once('.') else {
+    if !gguf.ends_with(".weight") {
         return false;
-    };
-    let Some((_, member)) = split_layer(stem) else {
-        return false;
-    };
-    matches!(member, "ffn_gate_exps" | "ffn_up_exps" | "ffn_down_exps")
-}
-
-/// `blk.7.attn_q` as `(7, "attn_q")`.
-///
-/// The index is parsed rather than matched so that a malformed `blk.x.` falls
-/// through to the unmapped case instead of being read as layer 0.
-fn split_layer(stem: &str) -> Option<(u32, &str)> {
-    let rest = stem.strip_prefix("blk.")?;
-    let (index, member) = rest.split_once('.')?;
-    Some((index.parse().ok()?, member))
-}
-
-/// A small ordered table, looked up by scan.
-struct Table(&'static [(&'static str, &'static str)]);
-
-impl Table {
-    fn get_member(&self, member: &str) -> Option<&'static str> {
-        self.0
-            .iter()
-            .find(|(gguf, _)| *gguf == member)
-            .map(|(_, hf)| *hf)
     }
+    matches!(
+        gguf_member(gguf),
+        Some((_, "ffn_gate_exps" | "ffn_up_exps" | "ffn_down_exps"))
+    )
 }
-
-/// The per-layer members, all twelve of them.
-///
-/// `attn_norm` and `ffn_norm` are the pair worth reading twice: llama.cpp
-/// names them for what they precede, HuggingFace for where they sit in the
-/// block, so `ffn_norm` is `post_attention_layernorm` and NOT anything with
-/// "ffn" in it. Gemma is the family where copying that row would go wrong --
-/// see `gemma_3::import` -- and it is a row this family does share the
-/// meaning of, which is exactly why the table is spelled out here anyway.
-///
-/// `ffn_gate_inp` is the router and `mlp.gate.weight` is what HuggingFace
-/// calls it: a `gate` that selects experts, and not the `gate_proj` half of
-/// a gated MLP. The two are one edit apart and one is `[E, H]` while the
-/// other is `[I, H]`.
-const LAYER: Table = Table(&[
-    ("attn_q", "self_attn.q_proj"),
-    ("attn_k", "self_attn.k_proj"),
-    ("attn_v", "self_attn.v_proj"),
-    ("attn_output", "self_attn.o_proj"),
-    ("attn_q_norm", "self_attn.q_norm"),
-    ("attn_k_norm", "self_attn.k_norm"),
-    ("attn_norm", "input_layernorm"),
-    ("ffn_norm", "post_attention_layernorm"),
-    ("ffn_gate_inp", "mlp.gate"),
-    ("ffn_gate_exps", "mlp.experts.{}.gate_proj"),
-    ("ffn_up_exps", "mlp.experts.{}.up_proj"),
-    ("ffn_down_exps", "mlp.experts.{}.down_proj"),
-]);
-
-/// The model-level tables. `output` is handled above, outside `model.`.
-const MODEL: Table = Table(&[("token_embd", "embed_tokens"), ("output_norm", "norm")]);
 
 #[cfg(test)]
 mod tests {
-    use super::{hf_name, is_stacked};
+    use super::{VOCAB, is_stacked};
 
     /// Every name a real Qwen3-MoE GGUF holds is mapped.
     ///
@@ -228,7 +222,7 @@ mod tests {
             ("output.weight", "lm_head.weight"),
         ];
         for (gguf, hf) in published {
-            assert_eq!(hf_name(gguf).as_deref(), Some(hf), "mapping {gguf}");
+            assert_eq!(VOCAB.from_gguf(gguf).as_deref(), Some(hf), "mapping {gguf}");
         }
     }
 
@@ -254,11 +248,17 @@ mod tests {
         ];
         for name in stacked {
             assert!(is_stacked(name), "{name} stacks");
-            assert!(hf_name(name).unwrap().contains("{}"), "{name} templates");
+            assert!(
+                VOCAB.from_gguf(name).unwrap().contains("{}"),
+                "{name} templates"
+            );
         }
         for name in flat {
             assert!(!is_stacked(name), "{name} does not stack");
-            assert!(!hf_name(name).unwrap().contains("{}"), "{name} is a name");
+            assert!(
+                !VOCAB.from_gguf(name).unwrap().contains("{}"),
+                "{name} is a name"
+            );
         }
     }
 
@@ -273,7 +273,7 @@ mod tests {
     fn the_router_is_one_tensor_and_stays_one() {
         assert!(!is_stacked("blk.0.ffn_gate_inp.weight"));
         assert_eq!(
-            hf_name("blk.0.ffn_gate_inp.weight").as_deref(),
+            VOCAB.from_gguf("blk.0.ffn_gate_inp.weight").as_deref(),
             Some("model.layers.0.mlp.gate.weight")
         );
     }
@@ -283,7 +283,9 @@ mod tests {
     fn the_layer_index_is_carried_through() {
         for layer in [0u32, 7, 47, 199] {
             assert_eq!(
-                hf_name(&format!("blk.{layer}.ffn_up_exps.weight")).as_deref(),
+                VOCAB
+                    .from_gguf(&format!("blk.{layer}.ffn_up_exps.weight"))
+                    .as_deref(),
                 Some(format!("model.layers.{layer}.mlp.experts.{{}}.up_proj.weight").as_str())
             );
         }
@@ -302,7 +304,7 @@ mod tests {
             "token_embd",                  // no suffix
             "rope_freqs.weight",           // llama's, and not published here
         ] {
-            assert_eq!(hf_name(unknown), None, "should not map {unknown}");
+            assert_eq!(VOCAB.from_gguf(unknown), None, "should not map {unknown}");
             assert!(!is_stacked(unknown), "should not unstack {unknown}");
         }
     }

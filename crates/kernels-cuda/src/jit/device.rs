@@ -1,30 +1,16 @@
 //! The device facilities a body needs that are not a launch.
 //!
 //! Scratch memory, the four attributes a geometry is computed from, and the
-//! host-to-device copy a plan upload is. Every one of them is a property of
-//! the DEVICE rather than of a call, which is why the memos below are
-//! process-wide statics and why [`Ctx`](crate::jit::Ctx) holds none of them
-//! as a field.
+//! host-to-device copy a plan upload is. Every one is a property of the DEVICE
+//! rather than of a call, which is why the memos below are process-wide
+//! statics and [`Ctx`](crate::jit::Ctx) holds none of them as a field.
 //!
-//! `pub(crate)` rather than private to `jit`, and the exception is worth
-//! naming. A routine BODY reaches all of this through a `Ctx` method, which
-//! is the surface the safety argument is written against. But FA2's device
-//! facts are read by `attn::fa2`'s planners, which run before any fire and
-//! have no `Ctx` to be given — a plan is built for a whole batch and a `Ctx`
-//! is per call. Those three call `attribute`'s memos directly.
+//! `pub(crate)` rather than private to `jit`: FA2's device facts are read by
+//! `attn::fa2`'s planners, which run before any fire and have no `Ctx`.
 //!
-//! `scratch.rs` until the FA2 host half descended into this crate. The file
-//! held the allocator and, beside it, two attribute memos that were already
-//! not scratch; the descent brought two more attributes and a `cudaMemcpyAsync`
-//! and the name stopped describing any of it.
-//!
-//! # Why the attributes are memoised and the scratch is not
-//!
-//! An attribute cannot change for the life of a process, so the first answer
-//! is the only answer and a `OnceLock` is exactly right. A scratch buffer
-//! CAN change — it grows — so it is a `Mutex<HashMap>` that reallocates, and
-//! the thing that must not change is the ADDRESS a launch was already handed,
-//! which is why growth never frees anything a pending launch could be using.
+//! The attributes are memoised and the scratch is not: an attribute cannot
+//! change for a process's life, while a scratch buffer grows -- so growth
+//! never frees anything a pending launch could still be using.
 
 use core::ffi::c_void;
 use std::collections::HashMap;
@@ -192,28 +178,12 @@ pub fn max_shared_memory_per_block_optin() -> Result<u32, Refusal> {
 
 /// One device's whole `cudaDeviceProp`, or `None` if the driver will not say.
 ///
-/// # Why this is a function at all, and why it is HERE
+/// A function because CUDA 12 renamed the entry point to `_v2` when
+/// `cudaDeviceProp` grew and CUDA 13 dropped the suffix again, so the SAME
+/// call is two `cudarc` symbols depending on which `cuda-1x` feature is on.
 ///
-/// CUDA 12 renamed the entry point to `_v2` when `cudaDeviceProp` grew; CUDA
-/// 13 dropped the suffix again and kept the wider struct. `cudarc` follows the
-/// headers, so the SAME call is two different symbols depending on which
-/// `cuda-1x` feature is on, and naming either one directly makes the crate
-/// build under exactly one of them. That `#[cfg]` pair is the whole body.
-///
-/// It was written twice, and the second copy is what the quantised router's
-/// descent found. `gemm::dense` had one (for the disk cache's `sm{major}
-/// {minor}` header line) and `driver-cuda`'s `bind/quant_gemm.rs` had another,
-/// byte-identical in its body and near-identical in its doc, because the two
-/// callers were in different CRATES and neither could see the other. The
-/// router moved into `gemm::quant`, the two copies landed in one directory,
-/// and one of them had to go. It goes to the module whose subject is *"the
-/// device facilities a body needs that are not a launch"*, rather than to
-/// whichever of the two siblings happened to be older.
-///
-/// Not memoised, unlike the attribute queries above. Those answer one integer
-/// each and are read per launch; this answers a kilobyte-wide struct and is
-/// read twice per process — once when a cuBLASLt context probes for FP8
-/// support, once when the dense tuner builds its cache header.
+/// Not memoised, unlike the attribute queries above: this answers a
+/// kilobyte-wide struct and is read twice per process.
 pub(crate) fn properties(ordinal: i32) -> Option<rt::cudaDeviceProp> {
     // SAFETY: `prop` is a live, writable `cudaDeviceProp` for the duration of
     // the call, which is the entry point's whole obligation. It is zeroed
@@ -249,21 +219,18 @@ fn attribute(which: rt::cudaDeviceAttr) -> Option<u32> {
 
 /// Copy `src` from host memory to `dst` on the device, on `stream`.
 ///
-/// The one host-to-device copy this crate makes, and it exists for one caller:
-/// the FA2 plan upload. A plan is computed on the host into a staging buffer
-/// and the kernels read it as an `int` arena, so the descent of that host half
-/// brought the copy with it -- `driver-cuda`'s `pie::write_raw_span` was
-/// added for exactly this call site and this is that function, one crate down.
+/// The one host-to-device copy this crate makes, for one caller: the FA2 plan
+/// upload, computed on the host into a staging buffer the kernels read as an
+/// `int` arena. An empty `src` is a no-op rather than a refusal.
 ///
-/// **Asynchronous, and the caller owns what that means.** `src` is host memory
-/// that must stay put until the copy retires. It is pageable rather than
-/// pinned, and for pageable memory `cudaMemcpyAsync` stages through a driver
-/// buffer before returning, so the borrow ends at return -- which is why this
-/// takes a slice rather than demanding a pinned allocation. A pinned source
-/// would be faster and would not have that property.
-///
-/// An empty `src` is a no-op rather than a refusal: a plan with no requests
-/// has nothing to upload and is not an error.
+/// **Asynchronous, and the caller owns what that means.** Under graph capture
+/// the copy is not performed: a node is recorded holding the SOURCE ADDRESS,
+/// and every replay reads whatever is at that address then. So `src` must be
+/// live at every replay of any graph this is captured into -- it must outlive
+/// the graph and must not have moved since. [`PinnedBytes`] is the type that
+/// says so (fixed capacity, refilled in place, never reallocated) and is what
+/// the FA2 plan caches hold; a `Vec` refilled with `clear`/`resize` is legal
+/// ONLY while nothing captures it.
 ///
 /// # Errors
 ///
@@ -271,15 +238,17 @@ fn attribute(which: rt::cudaDeviceAttr) -> Option<u32> {
 ///
 /// # Safety
 ///
-/// `dst` must address at least `src.len()` bytes of device memory, live until
-/// the copy retires on `stream`, and `stream` must be a live CUDA stream.
+/// `dst` must address at least `src.len()` bytes of device memory live until
+/// the copy retires on `stream`, `stream` must be a live CUDA stream, and
+/// `src` must remain at its address until every copy this issues or records
+/// has retired.
 pub unsafe fn upload(dst: *mut c_void, src: &[u8], stream: *mut c_void) -> Result<(), Refusal> {
     if src.is_empty() {
         return Ok(());
     }
-    // SAFETY: the caller's obligation on `dst` and `stream`; `src` is a live
-    // slice for the duration of the call, which is what a pageable source
-    // needs since the driver stages it before returning.
+    // SAFETY: the caller's obligation on `dst`, `stream` and the stability of
+    // `src` -- which under capture is a promise about every replay, not just
+    // about this call.
     let code = unsafe {
         rt::cudaMemcpyAsync(
             dst,
@@ -295,3 +264,4 @@ pub unsafe fn upload(dst: *mut c_void, src: &[u8], stream: *mut c_void) -> Resul
         Err(Refusal::Device { why: "the host-to-device copy failed" })
     }
 }
+

@@ -115,6 +115,23 @@ use std::collections::{BTreeMap, BTreeSet};
 /// wrong is silent, so each carries the reason it is not a measurement.
 const CONSTANT_BY_ARGUMENT: &[(&str, &str)] = &[
     (
+        "write_state",
+        "whether the fire advances recurrent state, and every class that \
+         still exists does. `FireClass` says THE REPAIR CLASSES ARE GONE: \
+         `FrozenVerify`, `CommitAdvance` and `StateOnly` were retired when \
+         the driver accepted PIE_RS_FLAG_FOLD, because a speculative \
+         decode writes to a buffer and folds only the accepted prefix, so \
+         nothing is ever wrong and nothing needs freezing. Decode and \
+         Prefill remain and both advance. THIS ENTRY MOVED HERE FROM \
+         `NOTHING_DELIVERS_IT`, and the move is what that list being \
+         COMPUTED is for: it sat there arguing that the ssm arms' \
+         `cx.gdn()?` was a constant `None` because the `GdnCtx`-to-`Gdn` \
+         conversion was never written. The conversion is written, so an \
+         arm can be handed this now — and the reason it stays a literal \
+         is the one above, which never depended on that plumbing. A false \
+         here would need a class to come back.",
+    ),
+    (
         "first_token",
         "`attn::write_kv_to_pages`' write origin, and `0` is a fact about \
          the REGION rather than about a checkpoint: a fire's rows begin at \
@@ -253,20 +270,6 @@ const NOTHING_DELIVERS_IT: &[(&str, &str)] = &[
          accessor as the half that already exists. Empty means every layer \
          reads zero, which that accessor's doc gives as \"keep everything\" \
          — the neutral answer, not a degraded one.",
-    ),
-    (
-        "write_state",
-        "whether the fire advances recurrent state, and every class that \
-         still exists does. `FireClass` says THE REPAIR CLASSES ARE GONE: \
-         `FrozenVerify`, `CommitAdvance` and `StateOnly` were retired when \
-         the driver accepted PIE_RS_FLAG_FOLD, because a speculative \
-         decode writes to a buffer and folds only the accepted prefix, so \
-         nothing is ever wrong and nothing needs freezing. Decode and \
-         Prefill remain and both advance. The ssm arms do read a \
-         `write_state` — the kernels crate's, off `cx.gdn()?` — and that \
-         query is a constant `None` too, because the `GdnCtx`-to-`Gdn` \
-         conversion was never written. A false here would need a class to \
-         come back.",
     ),
 ];
 

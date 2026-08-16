@@ -155,6 +155,14 @@
 mod capability;
 pub use crate::capability::Capability;
 
+/// The compiled SPIR-V, in the rlib.
+///
+/// Empty without `native`, because `native` is what runs `slangc`. See the
+/// module's own notes on why a directory was the wrong place for a deployment
+/// to find its kernels.
+pub mod module;
+pub use crate::module::{MODULES, code, embedded};
+
 // Named only by the doc links above, which rustdoc still has to resolve.
 #[allow(unused_imports)]
 use kernels::Axis;
@@ -304,6 +312,11 @@ pub fn retired_rows() -> &'static [&'static str] {
         "residual_add_strided",
         "rms_residual",
         "rms_residual_scaled",
+        // The hundred-and-first, and the first name added to this list that
+        // was never a `KERNELS` row: the table was already empty when the
+        // fused norm+rope was written, so "retired" is now simply the census
+        // of every kernel this crate has, and a new one joins it here.
+        "rms_rope",
         "rms_single_row",
         "rms_strided_head_row",
         "rms_strided_row",

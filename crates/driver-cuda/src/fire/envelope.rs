@@ -1,46 +1,9 @@
-//! Filling in the geometry a decode step does not carry, and translating the
-//! pages every step does.
-//!
-//! # What the wire sends, and what it leaves out
-//!
-//! A step arrives with its members partitioned into geometry classes. A `Host`
-//! member states its whole fire on the wire. A `DecodeEnvelope` member states
-//! almost none of it: which token, at which position, over how much cache were
-//! computed by the PREVIOUS fire's program and put on channels, and never came
-//! to the host at all. `DecodeEnvelope::template` in the engine fills the
-//! shape — one zero token, one zero position, `[0, 1]` — and leaves the KV
-//! tables EMPTY, because there is no host answer to put there.
-//!
-//! `admit` refuses that plan by name (`kv_indptr.len() < 2`), which is correct:
-//! it is not a fire until somebody resolves it. This is the somebody.
-//!
-//! # The three ports, and the four the class does not have
-//!
-//! `PIE_DECODE_ENVELOPE_PORTS` is `EmbedTokens | Positions | KvLen`, and that
-//! is the whole of what is read here. The PAGES are deliberately not a port of
-//! this class — `driver-vulkan`'s `envelope.rs` states the rule and
-//! `driver-api`'s `LaunchPlan::geometry_class` restates it: *"`DecodeEnvelope`'s
-//! contract is that pages are DERIVED from positions"*. So the pages a decode
-//! attends are its working set's first `ceil(len / page)`, and the write
-//! target is the ordinary `position / page`, `position % page` the host path
-//! already derives in `kv_and_arrays`.
-//!
-//! The program's own `Pages`, `PageIndptr`, `WSlot` and `WOff` channels are
-//! still CONSUMED where the port definition says they are
-//! (`tensor_ir::registry::Port::consumes`), because a descriptor port is not a
-//! stage op and nothing else will: their heads would never move while their
-//! tails did, and the epilogue's own `chan_put` would fail readiness some tens
-//! of tokens in.
-//!
-//! # The pages, and the bug that is invisible with one conversation
-//!
-//! `kv_page_indices` are indices into the request's own working set, and the
-//! frame's `kv_translation` says which physical page each one is. This driver
-//! did not apply it, which is right for one conversation and only for one: two
-//! working sets both start at logical page 0, so the second conversation would
-//! attend the first one's keys. Both branches below translate, and they have to
-//! be the same branch's arithmetic or a request's prefill and its decode would
-//! land on different pages.
+//! Fills in the geometry a decode step's wire tables don't carry — token,
+//! position and KV length, left on channels by the previous fire — and
+//! translates working-set pages to physical ones. Pages derive from positions,
+//! not a port, but `Pages`/`PageIndptr`/`WSlot`/`WOff` must still be drained or
+//! their rings wedge the epilogue. Both branches apply `kv_translation` with the
+//! same arithmetic, or two requests at logical page 0 collide.
 
 use driver_api::plan::LaunchPlan;
 use driver_api::submission::{FrameSubmission, StepSubmission};
@@ -56,21 +19,15 @@ pub(crate) enum Composed {
     Wire,
     /// The step, with every member's geometry known and every page physical.
     Ready(Box<StepSubmission>),
-    /// A descriptor channel holds nothing, so the program that fills it has
-    /// not run.
-    ///
-    /// Named rather than folded into a refusal because the two remedies are
-    /// opposite: this one is fixed by firing the producer, and the producer is
-    /// usually an EARLIER SLOT OF THIS FRAME — which `launch_impl` fires
-    /// first, so reaching this means the chain the guest built is not the chain
-    /// the driver walked.
+    /// A descriptor channel holds nothing yet, so the program that fills it has
+    /// not run — distinct from a refusal since the remedy differs: fire the
+    /// producer first.
     Early {
         /// The instance whose channel was empty.
         instance: u64,
         /// Its dense channel index.
         channel: u32,
-        /// The port that named it, so the message says WHICH descriptor is
-        /// missing rather than only where it would have come from.
+        /// The port that named it, so the message says which descriptor is missing.
         port: Port,
     },
 }
@@ -78,14 +35,9 @@ pub(crate) enum Composed {
 /// Why a step could not be composed.
 pub(crate) struct Refused(pub String);
 
-/// The geometry class of one member of a step.
-///
-/// An absent `sub_batch_indptr` is `Host`: `StepSubmission::validate` admits a
-/// step with no sub-batching, and a step with none has no other class it could
-/// be. A table that EXISTS and leaves this member out is `None` — refused
-/// rather than guessed, because guessing `Host` sends a device-resolved member
-/// down the path that reads geometry out of the wire plan, where it finds the
-/// empty tables the engine deliberately left.
+/// The geometry class of one member of a step. Absent `sub_batch_indptr` is
+/// `Host`; a member the table omits is `None`, not a guessed `Host` — that would
+/// route a device-resolved member down the wire-plan path into empty tables.
 fn class_of(step: &StepSubmission, member: usize) -> Option<u32> {
     if step.sub_batch_indptr.is_empty() {
         return Some(driver_api::local::PIE_GEOMETRY_CLASS_HOST);
@@ -112,12 +64,8 @@ fn translation(frame: &FrameSubmission, row: u32) -> &[u32] {
     }
 }
 
-/// One working-set page as the physical page it is placed in.
-///
-/// An EMPTY translation means the frame states none, and the only honest
-/// reading of that is that the pages it names are already physical — which is
-/// what this driver's own fixtures and the worker's single-request harness
-/// build.
+/// One working-set page as the physical page it is placed in. An empty
+/// translation means the frame states none, so pages are already physical.
 fn physical(segment: &[u32], logical: u32) -> Result<u32, Refused> {
     if segment.is_empty() {
         return Ok(logical);
@@ -135,13 +83,10 @@ fn physical(segment: &[u32], logical: u32) -> Result<u32, Refused> {
         })
 }
 
-/// Valid tokens in the last KV page of a span of `len`.
-///
-/// A length that is an exact multiple of the page size fills its last page
-/// rather than starting an empty one, which is what the `- 1` and `+ 1` are
-/// for. Identical to `driver::last_page_len` and to the engine's
-/// `geometry::last_page_len`, which is the point: the three describe one
-/// contract and a fire whose driver disagreed would attend a page short.
+/// Valid tokens in the last KV page of a span of `len`. An exact multiple fills
+/// its last page rather than starting an empty one (the `- 1` / `+ 1`). Must
+/// match `driver::last_page_len` and the engine's `geometry::last_page_len`, or
+/// a fire attends a page short.
 fn last_page_len(len: u32, page: u32) -> u32 {
     if page == 0 || len == 0 {
         0
@@ -150,12 +95,9 @@ fn last_page_len(len: u32, page: u32) -> u32 {
     }
 }
 
-/// A folded const port's cell as `u32` lanes.
-///
-/// A BIT reinterpretation for `i32`, not a numeric conversion, so a token id
-/// keeps its two's-complement pattern — the in-band `-1` skip the device
-/// classes spell is `0xffff_ffff` and not a saturation. Same reading as
-/// `driver::resolve`'s, and as the `memcpy` the device cells take below.
+/// A folded const port's cell as `u32` lanes. A bit reinterpretation for `i32`,
+/// not a numeric conversion, so the in-band `-1` skip stays `0xffff_ffff` rather
+/// than saturating.
 fn value_lanes(value: &driver::Value) -> Vec<u32> {
     match value {
         driver::Value::U32(v) => v.clone(),
@@ -216,15 +158,10 @@ impl Ports {
 }
 
 /// Resolve every device-class member of `step` and translate every member's
-/// pages, or say why not.
+/// pages, or say why not. `Composed::Wire` when nothing needed either.
 ///
-/// `Composed::Wire` when nothing needed either, which is the common frame and
-/// costs one pass over the roster.
-///
-/// # Errors
-///
-/// [`Refused`] naming what disagreed. A refusal here is a step that cannot be
-/// fired at all — the alternative is attending over pages the fire did not name.
+/// Returns [`Refused`] naming what disagreed — the alternative being attention
+/// over pages the fire did not name.
 pub(crate) fn compose(
     sites: Sites<'_>,
     frame: &FrameSubmission,
@@ -324,7 +261,7 @@ pub(crate) fn compose(
             continue;
         }
 
-        // ── A device-resolved member: read the three ports off its rings. ──
+        // A device-resolved member: read the three ports off its rings.
         let id = *frame.instance_ids.get(row as usize).ok_or_else(|| {
             Refused(format!(
                 "step member {member} names roster row {row} of {}",
@@ -355,13 +292,9 @@ pub(crate) fn compose(
             .get_mut(&id)
             .ok_or_else(|| Refused(format!("instance {id} has no ringed channels")))?;
 
-        // THE SEEDS FIRST, and this is what `Session::pull` could not do.
-        //
-        // `pull` runs inside `Session::fire`, which is the SAMPLER — after the
-        // forward. A decode's `Positions` and `KvLen` are host seeds on the
-        // FIRST fire and device-carried afterwards, so the seed has to reach
-        // the ring before the forward reads it or the first decode of every
-        // request reads a zeroed cell and attends one token of nothing.
+        // Seeds first: a decode's `Positions`/`KvLen` are host seeds on the
+        // first fire (device-carried after) and must reach the ring before the
+        // forward reads it, or the first decode reads a zeroed cell.
         let mut host: Vec<crate::program::channel::HostChannel> =
             Vec::with_capacity(instance.channel_ids.len());
         for channel in &instance.channel_ids {
@@ -378,14 +311,8 @@ pub(crate) fn compose(
         let cursors = rings
             .cursors(stream)
             .map_err(|why| Refused(format!("instance {id} cursors: {why}")))?;
-        // A PEEK at the committed front, which is what every backend's
-        // resolver reads. The take for the consuming ports happens once,
-        // below, after every port has been read — taking as we go would have
-        // a port that names the same channel twice read the next cell.
-        // A PEEK at the committed front, which is what every backend's
-        // resolver reads. The take for the consuming ports happens once,
-        // below, after every port has been read — taking as we go would have
-        // a second port on the same channel read the next cell.
+        // Peek at the committed front; the take happens once below after every
+        // port is read, or a second port on the same channel reads the next cell.
         let peek = |port: Port| -> Result<Option<Vec<u32>>, Composed> {
             if let Some(folded) = ports.folded(port) {
                 return Ok(Some(folded.to_vec()));
@@ -461,8 +388,7 @@ pub(crate) fn compose(
             positions.extend_from_slice(&position_ids[lo..hi]);
             qo.push(tokens.len() as u32);
             match readout.as_deref() {
-                // The rows the program NAMED, in its own per-lane numbering,
-                // which is the same convention the wire branch carries.
+                // The rows the program named, in its own per-lane numbering.
                 Some(rows) => {
                     for &r0 in rows {
                         if (r0 as usize) < hi - lo {
@@ -470,18 +396,14 @@ pub(crate) fn compose(
                         }
                     }
                 }
-                // No readout port is "each lane reads its own last row",
-                // which is the decode case this class exists for.
+                // No readout port means each lane reads its own last row — the decode case.
                 None => samples.push((hi - lo).saturating_sub(1) as u32),
             }
             sample_indptr.push(samples.len() as u32);
 
-            // THE SPAN, FROM THE POSITIONS. `driver-vulkan`'s `envelope.rs`
-            // argues the choice and it is not a preference: a row writes where
-            // its position says, so reading one page fewer than it writes is
-            // an attention over a page this fire itself filled. `kv_len` is
-            // read and CHECKED against it rather than used, because the two
-            // disagreeing is a program whose epilogue lost a step.
+            // The span comes from positions, not `kv_len`, which is only
+            // checked: trusting `kv_len` could serve a page this fire just
+            // filled, and a mismatch means the epilogue lost a step.
             let last = position_ids[lo..hi].iter().copied().max();
             let len = last.map_or(0, |p| p.saturating_add(1));
             if let Some(&stated) = kv_len.get(r)
@@ -501,11 +423,9 @@ pub(crate) fn compose(
             lens.push(last_page_len(len, page));
         }
 
-        // THE CONSUMING PORTS, ADVANCED — see `Rings::consume_front`. Every
-        // one the program bound, not only the ones read above: `WSlot` and
-        // `WOff` are not read by this class and are consumed by the port
-        // definition, so leaving them would fill their rings and wedge the
-        // epilogue's own put.
+        // Advance every consuming port the program bound, not just those read
+        // above: `WSlot`/`WOff` are unread here but must drain, or their rings
+        // wedge the epilogue.
         for &port in Port::ALL {
             if !port.consumes() {
                 continue;
@@ -535,10 +455,8 @@ pub(crate) fn compose(
     Ok(Composed::Ready(Box::new(out)))
 }
 
-/// The rows request `r` names in the wire plan's sampling table.
-///
-/// Empty for a plan with no table, which means every request reads out its own
-/// last row — the decode case.
+/// The rows request `r` names in the wire plan's sampling table. Empty for a
+/// plan with no table: every request reads out its own last row.
 fn sampling_rows(plan: &LaunchPlan, r: usize) -> &[u32] {
     let (Some(&lo), Some(&hi)) = (plan.sampling_indptr.get(r), plan.sampling_indptr.get(r + 1))
     else {
@@ -552,13 +470,9 @@ fn sampling_rows(plan: &LaunchPlan, r: usize) -> &[u32] {
         .unwrap_or(&[])
 }
 
-/// Which wire requests one member of a step owns.
-///
-/// An ABSENT CSR gives the whole step to the member, which is the
-/// single-member case. A CSR that EXISTS and does not describe this member is
-/// `None` rather than that same fallback: the two are different claims, and
-/// taking the fallback for the second hands one member every other member's
-/// rows.
+/// Which wire requests one member of a step owns. An absent CSR gives the whole
+/// step to the member (the single-member case); a CSR that exists but omits this
+/// member is `None`, not that fallback — else one member gets another's rows.
 pub(crate) fn member_requests(
     program_row_indptr: &[u32],
     member: usize,

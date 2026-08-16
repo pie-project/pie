@@ -407,6 +407,7 @@ fn gemma4_matches_transformers_on_real_weights() {
         kv_page_indptr_h: page_indptr_h.as_ptr(),
         num_requests: 1,
         num_pages_in_batch: 1,
+        max_pages_per_request: 0,
         first_token: 0,
         w_page_d: core::ptr::null(),
         w_off_d: core::ptr::null(),

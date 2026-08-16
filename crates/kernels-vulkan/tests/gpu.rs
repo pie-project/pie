@@ -1080,6 +1080,73 @@ macro_rules! gpu {
 // the tests
 // ---------------------------------------------------------------------------
 
+/// Whether this run measured anything at all, said out loud.
+///
+/// Every other test in this file opens the device through `gpu!()`, which
+/// prints `SKIP:` and returns when there is none. That is the right shape --
+/// a test that cannot run should not fail -- and it has one bad property: a
+/// run that proved 46 shaders and a run that touched no GPU whatsoever both
+/// print
+///
+/// ```text
+/// test result: ok. 48 passed
+/// ```
+///
+/// and `cargo test` hides a passing test's stdout, so the `SKIP:` lines that
+/// would have said which are not shown either. This was not hypothetical.
+/// Pointed at a box with a real NVIDIA card, this suite reported 48 passed --
+/// in 0.06 seconds, against a container whose `libGLX_nvidia.so.0` is a stub
+/// with no `vkCreateInstance` in it. Nothing in the output distinguished that
+/// from the 6.5 seconds the same 48 take when they run. Only the clock did.
+///
+/// This test is not gated, because its whole job is to run everywhere.
+/// `PIE_VULKAN_REQUIRE_DEVICE=1` turns the absence into a failure, and is
+/// what any job that installs a driver ON PURPOSE should set -- otherwise the
+/// install can silently stop working and the suite goes on reading green.
+///
+/// Both ways of measuring nothing are caught, because both produce the same
+/// vacuous green: a build without `native` (no SPIR-V to run) and a build
+/// with no device (nothing to run it on).
+#[test]
+fn the_runner_states_whether_it_has_a_device() {
+    let required = std::env::var_os("PIE_VULKAN_REQUIRE_DEVICE").is_some_and(|v| v != "0");
+    // Counted off this file rather than written down, so the number cannot
+    // become a lie the next time a test is added.
+    //
+    // The needle is split because an undivided one MATCHES ITSELF: this
+    // literal is in the text `include_str!` reads.
+    let needle = concat!("= gpu", "!();");
+    let gated = include_str!("gpu.rs").matches(needle).count();
+    assert!(
+        gated >= 40,
+        "found {gated} device-gated tests by reading this file, which is not what it contains"
+    );
+
+    let why = match unavailable() {
+        Some(why) => Some(why.to_string()),
+        None => shared_gpu().err(),
+    };
+    match why {
+        None => {
+            let gpu = shared_gpu().expect("just checked");
+            println!(
+                "VULKAN DEVICE: PRESENT ({}). The {gated} device-gated tests here measured real numbers.",
+                gpu.name
+            );
+        }
+        Some(why) => {
+            println!("VULKAN DEVICE: ABSENT ({why}).");
+            println!(
+                "All {gated} device-gated tests in this file skipped, so a green `--test gpu` here measured NOTHING."
+            );
+            assert!(
+                !required,
+                "PIE_VULKAN_REQUIRE_DEVICE is set and no device opened: {why}. A suite that silently skips is what this test exists to prevent"
+            );
+        }
+    }
+}
+
 /// What the device offers, against what the tiers claim to need.
 ///
 /// Not an assertion about any particular GPU -- it prints. The assertion is the
@@ -5827,4 +5894,453 @@ fn the_slotted_split_pair_follows_the_same_map() {
              other is not"
         );
     }
+}
+
+/// The flash decode agrees with the single-pass decode, split every way.
+///
+/// `sdpa_paged_decode_split` + `sdpa_paged_decode_combine` compute the same
+/// attention as `sdpa_paged_decode`, over a key range cut into `S` contiguous
+/// chunks whose partial `(max, sum_exp, weighted V)` the fold merges. The
+/// merge is algebraically exact and floating-point ASSOCIATIVE-ly different,
+/// which is why this checks against the same scalar softmax the single-pass
+/// test does rather than against the single-pass output: agreeing with the
+/// other shader to the last bit is not what is being claimed.
+///
+/// The split counts are chosen for their degenerate cases and not for their
+/// speed. `S = 64` against histories of 17, 5 and 32 keys hands MOST splits
+/// nothing at all: their `max` stays at `PIE_SDPA_NEG_INF`, their `sum_exp`
+/// stays zero, and the fold's weight for them is `exp(-3e38 - merged_max)`,
+/// which must be a clean zero and not a NaN. A row whose mask drops every key
+/// makes EVERY split empty, and then the merged sum is zero and the guarded
+/// divide has to answer zero rather than `0/0`.
+#[test]
+fn the_flash_decode_agrees_with_the_scalar_reference_at_every_split_count() {
+    let gpu = gpu!();
+
+    let head_dim = 64usize;
+    let page_size = 16usize;
+    let n_kv_heads = 2usize;
+    let gqa = 2usize;
+    let n_q_heads = n_kv_heads * gqa;
+    let rows = 3usize;
+    let scale = 0.125f32;
+
+    let lengths = [17usize, 5, 32];
+    let pages_per: Vec<usize> = lengths.iter().map(|l| l.div_ceil(page_size)).collect();
+    let total_pages: usize = pages_per.iter().sum();
+    let physical: Vec<u32> = {
+        let mut v: Vec<u32> = (0..total_pages as u32).collect();
+        v.reverse();
+        v
+    };
+    let mut indptr = vec![0u32];
+    for p in &pages_per {
+        indptr.push(indptr.last().unwrap() + *p as u32);
+    }
+
+    let slots = total_pages * page_size;
+    let kv_elems = slots * n_kv_heads * head_dim;
+    let kf: Vec<f32> = (0..kv_elems)
+        .map(|i| ((i % 31) as f32 - 15.0) / 40.0)
+        .collect();
+    let vf: Vec<f32> = (0..kv_elems)
+        .map(|i| ((i % 23) as f32 - 11.0) / 30.0)
+        .collect();
+    let qf: Vec<f32> = (0..rows * n_q_heads * head_dim)
+        .map(|i| ((i % 19) as f32 - 9.0) / 20.0)
+        .collect();
+    let positions: Vec<i32> = lengths.iter().map(|l| *l as i32 - 1).collect();
+    let req_of_token: Vec<i32> = (0..rows as i32).collect();
+    let sinks: Vec<f32> = (0..n_q_heads).map(|h| -0.5 + h as f32 * 0.75).collect();
+
+    // Row 2 masks everything off: the mask is enabled and every byte is zero.
+    // `attention_mask_stride` must then be wide enough for the widest row, so
+    // `keeps` reads the mask rather than falling out of bounds.
+    let mask_stride = 32usize;
+    let mut mask = vec![1u8; rows * mask_stride];
+    for kp in 0..mask_stride {
+        mask[2 * mask_stride + kp] = 0;
+    }
+    let enabled = vec![0u8, 0, 1];
+
+    let mut push = Vec::new();
+    push.extend_from_slice(&(gqa as i32).to_le_bytes());
+    push.extend_from_slice(&(page_size as i32).to_le_bytes());
+    push.extend_from_slice(&(n_kv_heads as i32).to_le_bytes());
+    push.extend_from_slice(&scale.to_le_bytes());
+    push.extend_from_slice(&(mask_stride as u32).to_le_bytes());
+    push.extend_from_slice(&0i32.to_le_bytes());
+
+    let q = bf16_read(&bf16_bytes(&qf));
+    let k = bf16_read(&bf16_bytes(&kf));
+    let v = bf16_read(&bf16_bytes(&vf));
+    let slot_of = |req: usize, kp: usize| {
+        let phys = physical[indptr[req] as usize + kp / page_size] as usize;
+        phys * page_size + kp % page_size
+    };
+
+    // The reference, once: with a sink and without, for every row and head.
+    let reference = |with_sink: bool| -> Vec<f32> {
+        let mut want = vec![0.0f32; rows * n_q_heads * head_dim];
+        for (row, &position) in positions.iter().enumerate() {
+            let q_pos = position as usize;
+            let kept: Vec<usize> = (0..=q_pos)
+                .filter(|kp| enabled[row] == 0 || mask[row * mask_stride + kp] != 0)
+                .collect();
+            for h in 0..n_q_heads {
+                let kv_head = h / gqa;
+                let q_base = (row * n_q_heads + h) * head_dim;
+                let scores: Vec<f32> = kept
+                    .iter()
+                    .map(|&kp| {
+                        let k_base = (slot_of(row, kp) * n_kv_heads + kv_head) * head_dim;
+                        (0..head_dim)
+                            .map(|d| scale * q[q_base + d] * k[k_base + d])
+                            .sum::<f32>()
+                    })
+                    .collect();
+                let mut hi = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                if with_sink {
+                    hi = hi.max(sinks[h]);
+                }
+                if !hi.is_finite() {
+                    continue; // every key masked and no sink: the shader answers zero
+                }
+                let exps: Vec<f32> = scores.iter().map(|s| (s - hi).exp()).collect();
+                let mut denom: f32 = exps.iter().sum();
+                if with_sink {
+                    denom += (sinks[h] - hi).exp();
+                }
+                for d in 0..head_dim {
+                    let acc: f32 = kept
+                        .iter()
+                        .zip(&exps)
+                        .map(|(&kp, e)| {
+                            let v_at = (slot_of(row, kp) * n_kv_heads + kv_head) * head_dim + d;
+                            e * v[v_at]
+                        })
+                        .sum();
+                    want[q_base + d] = if denom == 0.0 { 0.0 } else { acc / denom };
+                }
+            }
+        }
+        want
+    };
+
+    let plain_want = reference(false);
+    let sink_want = reference(true);
+
+    for splits in [2usize, 3, 8, 64] {
+        // Binding 3 is `out_` and binding 10 is `sinks`: a split writes
+        // neither, slangc drops both, and the descriptor set carries holes
+        // there. The buffers are still handed over so the indices line up.
+        let entries = splits * rows * n_q_heads;
+        let partial_floats = entries * (head_dim + 2);
+        let split_operands = vec![
+            bf16_bytes(&qf),
+            bf16_bytes(&kf),
+            bf16_bytes(&vf),
+            vec![0u8; 4],
+            positions.iter().flat_map(|p| p.to_le_bytes()).collect(),
+            req_of_token.iter().flat_map(|r| r.to_le_bytes()).collect(),
+            physical.iter().flat_map(|p| p.to_le_bytes()).collect(),
+            indptr.iter().flat_map(|p| p.to_le_bytes()).collect(),
+            mask.clone(),
+            enabled.clone(),
+            vec![0u8; 4],
+            // Poisoned, not zeroed. The driver never clears this buffer, so a
+            // split that skipped its write would be read as last token's
+            // numbers -- here, as a NaN that cannot hide in a tolerance.
+            std::iter::repeat_n(f32::NAN.to_le_bytes(), partial_floats)
+                .flatten()
+                .collect(),
+        ];
+        let after = gpu.dispatch(
+            &format!("sdpa_paged_decode_split_bfloat16_d_{head_dim}"),
+            Capability::Baseline,
+            &split_operands,
+            &push,
+            [n_q_heads as u32, rows as u32, splits as u32],
+        );
+
+        let fold_push: Vec<u8> = (splits as i32).to_le_bytes().to_vec();
+        let out_bytes = vec![0u8; rows * n_q_heads * head_dim * 2];
+        let folded = gpu.dispatch(
+            &format!("sdpa_paged_decode_combine_bfloat16_d_{head_dim}"),
+            Capability::Baseline,
+            &[out_bytes.clone(), vec![0u8; 4], after[11].clone()],
+            &fold_push,
+            [n_q_heads as u32, rows as u32, 1],
+        );
+        assert_close(
+            &bf16_read(&folded[0]),
+            &plain_want,
+            &format!("flash decode at {splits} splits"),
+        );
+
+        let folded = gpu.dispatch(
+            "sdpa_paged_decode_combine_sink_bfloat16_d_64",
+            Capability::Baseline,
+            &[out_bytes.clone(), bf16_bytes(&sinks), after[11].clone()],
+            &fold_push,
+            [n_q_heads as u32, rows as u32, 1],
+        );
+        assert_close(
+            &bf16_read(&folded[0]),
+            &sink_want,
+            &format!("flash decode with a sink at {splits} splits"),
+        );
+    }
+}
+
+/// The fused norm+rope answers what the two kernels it replaces answer.
+///
+/// This is the ONLY thing that makes the fusion shippable, and it is worth
+/// being precise about why the comparison is built the way it is. The two
+/// stages are run against the same input with the same push words and the
+/// same grids they get in production -- `rms_strided_head_row` at one
+/// workgroup per (head, token), then `neox_mb` at one thread per rotary pair
+/// -- and the fused kernel is run against a SECOND COPY of that input. Both
+/// sides therefore round through bf16 in the same places, which is what lets
+/// this be an equality-shaped assertion with a tolerance rather than a
+/// hand-waved "close enough": the fused form's only arithmetic difference is
+/// that it never stores the normed value before rotating it, so its `x1` and
+/// `x2` are one bf16 round LESS quantised than the reference's.
+///
+/// That difference is real and it is in the fused form's favour, so the
+/// tolerance is one-sided in principle and symmetric in practice; `axis` is
+/// 64 and the values are deliberately not smooth, because a ramp would hide a
+/// pair-indexing error -- `(i, i + half)` and `(2i, 2i+1)` agree on a ramp
+/// and on nothing else.
+#[test]
+fn rms_rope_answers_what_the_norm_and_the_rotation_answer() {
+    let gpu = gpu!();
+
+    let heads = 3usize;
+    let head_dim = 64usize;
+    let rows = 2usize;
+    let pitch = heads * head_dim;
+    let eps = 1e-5f32;
+    let scale = 1.0f32;
+    // `exp2(-d * base)` is how both kernels spell the geometric ladder, so
+    // this is log2 of the rope theta and not the theta.
+    let base = (10000.0f32).log2();
+
+    let x: Vec<f32> = (0..rows * pitch)
+        .map(|i| ((i * 37 % 71) as f32 - 35.0) / 16.0)
+        .collect();
+    let w: Vec<f32> = (0..head_dim).map(|i| 0.5 + (i % 13) as f32 / 32.0).collect();
+    let positions: Vec<u8> = [7i32, 11]
+        .iter()
+        .flat_map(|p| p.to_le_bytes())
+        .collect();
+
+    let mut params = Vec::new();
+    params.extend_from_slice(&eps.to_le_bytes());
+    params.extend_from_slice(&(head_dim as u32).to_le_bytes());
+    params.extend_from_slice(&1u32.to_le_bytes()); // w_stride
+    params.extend_from_slice(&0u32.to_le_bytes()); // plus_one
+    params.extend_from_slice(&1.0f32.to_le_bytes()); // gain
+
+    // Stage one: the per-head norm, out of place, exactly as the text states
+    // it today.
+    let normed = gpu.dispatch(
+        "rms_strided_head_row_bfloat16",
+        Capability::Baseline,
+        &[
+            bf16_bytes(&x),
+            bf16_bytes(&w),
+            vec![0u8; rows * pitch * 2],
+            params.clone(),
+        ],
+        &(pitch as i32).to_le_bytes(),
+        [1, heads as u32, rows as u32],
+    );
+
+    // Stage two: the rotation, in place on what stage one wrote.
+    let mut rope_push = Vec::new();
+    rope_push.extend_from_slice(&scale.to_le_bytes());
+    rope_push.extend_from_slice(&base.to_le_bytes());
+    rope_push.extend_from_slice(&(head_dim as i32).to_le_bytes());
+    let two_stage = gpu.dispatch(
+        "neox_mb_bfloat16",
+        Capability::Baseline,
+        &[normed[2].clone(), positions.clone()],
+        &rope_push,
+        [(head_dim / 2) as u32, heads as u32, rows as u32],
+    );
+
+    // The fused form, from the same input the first stage was given.
+    // `RmsRopeParams` is `RmsParams` with four fields appended, and the
+    // driver mints it as the statement's whole params run -- so the test
+    // builds it the same way, by extending the five the norm already states.
+    let mut fused_params = params.clone();
+    fused_params.extend_from_slice(&(pitch as u32).to_le_bytes());
+    fused_params.extend_from_slice(&(head_dim as u32).to_le_bytes()); // rotary
+    fused_params.extend_from_slice(&scale.to_le_bytes());
+    fused_params.extend_from_slice(&base.to_le_bytes());
+    let fused = gpu.dispatch(
+        "rms_rope_bfloat16",
+        Capability::Baseline,
+        &[
+            bf16_bytes(&x),
+            bf16_bytes(&w),
+            fused_params,
+            positions.clone(),
+        ],
+        &[],
+        [1, heads as u32, rows as u32],
+    );
+
+    let want = bf16_read(&two_stage[0]);
+    let got = bf16_read(&fused[0]);
+    // Not `assert_close`: the fused form legitimately differs by the one bf16
+    // round it does not do, which is up to half an ULP of a bf16 -- 0.4% --
+    // and a tolerance that tight on a rotation that mixes two channels is a
+    // flake waiting to happen. The bound is absolute against the input's own
+    // scale, and the argmax-style claim beside it is that no element moved by
+    // more than a rounding's worth.
+    let worst = want
+        .iter()
+        .zip(&got)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        worst < 0.05,
+        "the fused norm+rope and the two kernels it replaces disagree by {worst}"
+    );
+    // And it is not trivially right by writing nothing: a rotation at
+    // position 7 moves every channel, so an untouched buffer would match the
+    // INPUT rather than the reference.
+    let xq = bf16_read(&bf16_bytes(&x));
+    let moved = xq
+        .iter()
+        .zip(&got)
+        .filter(|(a, b)| (*a - *b).abs() > 0.05)
+        .count();
+    assert!(
+        moved > rows * pitch / 2,
+        "only {moved} of {} elements moved, so the fused kernel is not doing the work",
+        rows * pitch
+    );
+}
+
+/// The partial-rotary arm, which no shipped path exercises yet.
+///
+/// gemma-4 rotates a quarter of each full-attention head and leaves the rest
+/// alone, so the fused kernel has a branch that the qwen-shaped test above
+/// can never reach: channels at or above `rotary` must come out NORMED AND
+/// UNROTATED, not zero and not copied through unnormed. Both failure modes
+/// are live -- an early `return` on the tail would leave the norm's output in
+/// place (which happens to be right) while an early return placed before the
+/// store would leave the INPUT in place (which is wrong and would pass a
+/// sloppier assertion), so this checks the tail explicitly against the norm
+/// rather than only checking the whole buffer against the reference.
+///
+/// The reference gets partial rotary for free: `neox` reads its half-width
+/// off `gl_NumWorkGroups.x`, so dispatching a narrower grid rotates a prefix
+/// and leaves the tail untouched. That is the same definition the fused
+/// kernel is asked to honour, arrived at by a different mechanism.
+#[test]
+fn rms_rope_leaves_the_unrotated_tail_normed() {
+    let gpu = gpu!();
+
+    let heads = 2usize;
+    let head_dim = 64usize;
+    let rotary = 16usize;
+    let rows = 2usize;
+    let pitch = heads * head_dim;
+    let eps = 1e-5f32;
+    let scale = 1.0f32;
+    let base = (10000.0f32).log2();
+
+    let x: Vec<f32> = (0..rows * pitch)
+        .map(|i| ((i * 29 % 53) as f32 - 26.0) / 12.0)
+        .collect();
+    let w: Vec<f32> = (0..head_dim).map(|i| 0.75 + (i % 7) as f32 / 16.0).collect();
+    let positions: Vec<u8> = [3i32, 5].iter().flat_map(|p| p.to_le_bytes()).collect();
+
+    let mut params = Vec::new();
+    params.extend_from_slice(&eps.to_le_bytes());
+    params.extend_from_slice(&(head_dim as u32).to_le_bytes());
+    params.extend_from_slice(&1u32.to_le_bytes());
+    params.extend_from_slice(&0u32.to_le_bytes());
+    params.extend_from_slice(&1.0f32.to_le_bytes());
+
+    let normed = gpu.dispatch(
+        "rms_strided_head_row_bfloat16",
+        Capability::Baseline,
+        &[
+            bf16_bytes(&x),
+            bf16_bytes(&w),
+            vec![0u8; rows * pitch * 2],
+            params.clone(),
+        ],
+        &(pitch as i32).to_le_bytes(),
+        [1, heads as u32, rows as u32],
+    );
+    let just_normed = bf16_read(&normed[2]);
+
+    let mut rope_push = Vec::new();
+    rope_push.extend_from_slice(&scale.to_le_bytes());
+    rope_push.extend_from_slice(&base.to_le_bytes());
+    rope_push.extend_from_slice(&(head_dim as i32).to_le_bytes());
+    let two_stage = gpu.dispatch(
+        "neox_mb_bfloat16",
+        Capability::Baseline,
+        &[normed[2].clone(), positions.clone()],
+        &rope_push,
+        [(rotary / 2) as u32, heads as u32, rows as u32],
+    );
+
+    let mut fused_params = params.clone();
+    fused_params.extend_from_slice(&(pitch as u32).to_le_bytes());
+    fused_params.extend_from_slice(&(rotary as u32).to_le_bytes());
+    fused_params.extend_from_slice(&scale.to_le_bytes());
+    fused_params.extend_from_slice(&base.to_le_bytes());
+    let fused = gpu.dispatch(
+        "rms_rope_bfloat16",
+        Capability::Baseline,
+        &[
+            bf16_bytes(&x),
+            bf16_bytes(&w),
+            fused_params,
+            positions.clone(),
+        ],
+        &[],
+        [1, heads as u32, rows as u32],
+    );
+
+    let want = bf16_read(&two_stage[0]);
+    let got = bf16_read(&fused[0]);
+    let worst = want
+        .iter()
+        .zip(&got)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(worst < 0.05, "partial rotary disagrees by {worst}");
+
+    // The tail, stated separately and against the norm's own output, so that
+    // "the whole buffer matched" cannot be satisfied by two kernels making
+    // the same mistake past `rotary`.
+    for row in 0..rows {
+        for head in 0..heads {
+            for c in rotary..head_dim {
+                let at = row * pitch + head * head_dim + c;
+                assert!(
+                    (got[at] - just_normed[at]).abs() < 0.05,
+                    "channel {c} of head {head} is {} where the norm alone says {}",
+                    got[at],
+                    just_normed[at]
+                );
+            }
+        }
+    }
+    // And the head of the head really was rotated, or the tail check above is
+    // passing for the trivial reason that nothing happened at all.
+    let xq = bf16_read(&bf16_bytes(&x));
+    let moved = (0..rotary)
+        .filter(|c| (got[*c] - xq[*c]).abs() > 0.05)
+        .count();
+    assert!(moved > rotary / 2, "only {moved} rotary channels moved");
 }

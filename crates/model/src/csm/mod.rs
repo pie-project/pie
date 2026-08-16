@@ -385,3 +385,7 @@ mod tests {
         assert_eq!(tok.decode(&inst.cue(), false), "<|begin_of_text|>[1]");
     }
 }
+
+/// This generation's tensor names, in every vocabulary that spells them.
+#[cfg(feature = "contract")]
+pub mod import;

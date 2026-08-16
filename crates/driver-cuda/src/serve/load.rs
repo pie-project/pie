@@ -1,9 +1,8 @@
 //! Create, destroy, and everything that happens once per model.
 //!
-//! The verbs behind four of the thirteen exports: standing the shell up,
-//! reading a checkpoint onto the device, wiring trace names onto checkpoint
-//! names, answering what this deployment can do, and adopting a program.
-//! All of it happens before any fire; none of it happens again.
+//! Standing the shell up, reading a checkpoint onto the device, wiring trace
+//! names onto checkpoint names, answering what the deployment can do, and
+//! adopting a program — all before any fire, none of it again.
 
 use super::state::{LoadedModel, Shell, retire};
 use crate::fire::launch::sg_trace;
@@ -14,14 +13,8 @@ use driver_api::local::{
 };
 
 /// Stand the shell up.
-///
-/// It took a `*const PieDriverCreateDesc` and answered a `*mut PieDriver`
-/// plus a JSON blob through a second out-parameter, and every refusal below
-/// returned a bare null — a caller learned WHICH of nine causes only from
-/// stderr. It takes the bytes and the broker now, and answers `Result`.
 pub(crate) fn create_impl(config_bytes: &[u8], broker: CompletionBroker) -> Result<Shell, i32> {
-    // The boot TOML rides in the bytes. Three keys are read today:
-    // `[model] id`, `[model] config` and `[driver] runahead`.
+    // The boot TOML rides in the bytes.
     let boot = std::str::from_utf8(config_bytes)
         .ok()
         .and_then(|text| text.parse::<toml::Table>().ok())
@@ -30,36 +23,18 @@ pub(crate) fn create_impl(config_bytes: &[u8], broker: CompletionBroker) -> Resu
         .get("model")
         .and_then(|m| m.get("config")?.as_str())
         .map(std::path::PathBuf::from);
-    // WHAT THE PROCESS BOUNDARY CARRIES.
-    //
-    // One string. It used to carry a `pie.model/1` JSON document — the
-    // worker wrote it beside the boot TOML and named the PATH here, and
-    // this driver parsed it back with its own reader while
-    // `driver-metal` parsed the same document with a DIFFERENT reader
-    // into a different struct, under a different failure policy (facts
-    // swallowed a missing field with a default; the descriptor refused).
-    // One document, two readers, two answers.
-    //
-    // An id cannot do that. Both drivers link the same `const` table, so
-    // the worst a bad id can do is fail to resolve — loudly, at the
-    // door, with the nearest ids named. And it is OPTIONAL rather than
-    // required: absent, the driver identifies the checkpoint from its
-    // TENSORS, which is the answer that does not depend on anyone having
-    // written anything down.
+    // One string: a model id, not a document. Optional — absent, the checkpoint
+    // is identified from its tensors.
     let boot_model_id = boot
         .get("model")
         .and_then(|m| m.get("id")?.as_str())
         .map(str::to_owned);
-    // PER-DRIVER, not per-process, so a caller that wants asynchronous
-    // completions can ask for them without deciding for every other
-    // driver alive in the same process. The env var is the default the
-    // boot key overrides.
-    // ONE PARSE, and every knob in it. See `crate::boot`.
+    // Per-driver, not per-process, so one caller can opt into async completions
+    // without deciding for every driver in the process. One parse; see `crate::boot`.
     let cfg = crate::boot::Boot::from_boot(Some(&boot));
     let runahead = cfg.runahead;
-    // An unrecognised spelling is refused rather than defaulted: silently
-    // giving bf16 to a caller who asked for fp8 is the kind of wrong
-    // answer that reads as a slightly worse model.
+    // An unrecognised spelling is refused, not defaulted: quietly giving bf16 to
+    // a caller who asked fp8 reads as a slightly worse model.
     let kv_format = match crate::layout::KvCacheFormat::from_name(
         boot.get("driver")
             .and_then(|d| d.get("kv_cache_dtype")?.as_str())
@@ -71,16 +46,8 @@ pub(crate) fn create_impl(config_bytes: &[u8], broker: CompletionBroker) -> Resu
             return Err(PIE_STATUS_INVALID_ARGUMENT);
         }
     };
-    // The pages can be written in every catalogued format — `kv_paged.cu`
-    // switches on the scheme — but only `attn::attention_naive_paged`
-    // READS one back. The fire path's prefill and decode are FlashInfer's
-    // `_bf16` entry points, which take the view and ignore its scheme, so
-    // a non-native format today would be appended correctly and attended
-    // to as though the bytes were bf16.
-    //
-    // That is a wrong answer rather than a crash, so it is refused here.
-    // Lifting it is a kernel change (a scheme-aware attention fast path),
-    // not a plumbing one, and the plumbing should not wait for it.
+    // The fire path's attention is FlashInfer's bf16 entry point, which ignores
+    // the scheme, so a non-native format would be attended as bf16 — refused.
     if !kv_format.is_native_bf16() {
         eprintln!(
             "[driver-cuda] create: kv_cache_dtype '{}' can be written but not \
@@ -97,9 +64,6 @@ pub(crate) fn create_impl(config_bytes: &[u8], broker: CompletionBroker) -> Resu
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(default)
     };
-    // `[batching] calibrate_planner`, which is where it is DOCUMENTED
-    // and where the C++ reads it. This site read `[driver]`, so the key
-    // every doc in the tree names had no effect.
     let calibrating = cfg.calibrating;
     let device_ordinal = boot
         .get("driver")
@@ -108,43 +72,27 @@ pub(crate) fn create_impl(config_bytes: &[u8], broker: CompletionBroker) -> Resu
         .unwrap_or(0);
     let tp_size = driver_u32("tp_size", 1).max(1);
     let tp_rank = driver_u32("tp_rank", 0).min(tp_size - 1);
-    // BIND THE DEVICE HERE, on the thread that will fire.
-    //
-    // `cudaSetDevice` is per-THREAD, so binding it only inside `load_model`
-    // would leave every later call on whatever device the thread last had --
-    // which is device 0, which is why the hardwiring was invisible. Doing it
-    // at create is what makes `[driver] device` mean anything.
+    // Bind the device on the thread that will fire: `cudaSetDevice` is
+    // per-thread, so binding only in `load_model` would strand later calls on 0.
     if let Err(e) = crate::device::Device::bind(device_ordinal) {
         eprintln!("[driver-cuda] create: cannot bind CUDA device {device_ordinal}: {e}");
         return Err(PIE_STATUS_INVALID_ARGUMENT);
     }
 
-    // The key a tensor-parallel group finds itself by. See
-    // `Shell::tp_group_id`: `layout::rendezvous` needs one and this driver
-    // supplied none, so the plan reduction it already calls was inert.
+    // The key a tensor-parallel group finds itself by; see `Shell::tp_group_id`.
     let tp_group_id = boot
         .get("driver")
         .and_then(|d| d.get("tp_group_id")?.as_str())
         .unwrap_or_default()
         .to_owned();
 
-    // A GROUP OF MORE THAN ONE IS STILL REFUSED, and the refusal now NAMES
-    // WHAT IT IS WAITING ON rather than restating a claim about the tree.
-    //
-    // The LAYOUT half of tensor parallelism works, and so does everything
-    // around the collective now: `bind/arms/comm.rs` binds both `comm::`
-    // symbols and all three `dist::` ones, `build_tp_plane` below constructs
-    // a `CustomAllReduce` out of `layout::rendezvous::tp_host_allgather`, and
-    // `Shell::all_reduce` holds it for the fires. What is missing is one
-    // thing and it is the last one: DEVICE TEXT. See `tp_serving_refusal`.
+    // A group of more than one is still refused, naming what it waits on. See
+    // `tp_serving_refusal`.
     if let Err(why) = tp_serving_refusal(tp_size, &tp_group_id) {
         eprintln!("[driver-cuda] create: {why}");
         return Err(PIE_STATUS_INVALID_ARGUMENT);
     }
-    // The facts were PARSED here, out of a `CAPS_JSON` that was not a
-    // `DeviceFacts` — see `state::device_facts` for what that cost. Stating
-    // them removes the only failure this function had that no input could
-    // avoid.
+    // Stated, not parsed from a `CAPS_JSON`: see `state::device_facts`.
     Ok(Shell {
         facts: super::state::device_facts(),
         boot_config,
@@ -191,76 +139,27 @@ pub(crate) fn create_impl(config_bytes: &[u8], broker: CompletionBroker) -> Resu
     })
 }
 
-/// World sizes the P2P plane's CONSTRUCTOR takes —
-/// `fire::all_reduce::CustomAllReduce::initialise`, which refuses anything
-/// outside `2 <= w <= 8` with `w % 2 == 0`.
+/// World sizes the P2P plane's constructor (`CustomAllReduce::initialise`)
+/// admits: `2 <= w <= 8`, `w % 2 == 0`.
 const CONSTRUCTIBLE_WORLD_SIZES: &[u32] = &[2, 4, 6, 8];
 
-/// The fused landing's world size, and it is a single value —
-/// `custom_all_reduce.cu:308` builds a fusion workspace only for two, and
-/// `Plane::can_fuse_residual_rmsnorm` refuses anything else.
+/// The fused landing's world size — a single value: the fusion workspace is
+/// built only for two (`Plane::can_fuse_residual_rmsnorm` refuses anything else).
 const FUSED_WORLD_SIZE: u32 = 2;
 
-/// Why this build refuses to SERVE a tensor-parallel group, or `Ok(())`.
+/// Why this build refuses to serve a tensor-parallel group, or `Ok(())`.
 ///
-/// # Why this is a function and why it reads a constant from `kernels-cuda`
+/// The blocking conditions are read from [`kernels_cuda::comm::CAN_LAUNCH`],
+/// not restated here. The ceilings: launchable device text, a
+/// [`CONSTRUCTIBLE_WORLD_SIZES`] world size, and a `[driver] tp_group_id` —
+/// without one the ranks never meet in `layout::rendezvous` and each builds a
+/// plane pointing at its own memory, every reduction a silent no-op. The fused
+/// landing is [`FUSED_WORLD_SIZE`] only, a warning: the plain reduction still
+/// serves at 4, 6 and 8.
 ///
-/// The refusal it replaced was a paragraph, and the paragraph had already
-/// gone stale in three places: it said the collective rows *"were declared in
-/// the ARCHIVE crate's `src/gemm.rs`"* (deleted), that they are *"the live
-/// kernels crate's `src/not_yet_crossed.rs`'s now"* (also deleted — they are
-/// `comm::ROUTINES` and `dist::ROUTINES`), and that there is *"no
-/// `CustomAllReduce` handle to pass"* (there is one; [`build_tp_plane`] makes
-/// it). Every one of those was a hand-written second account of a fact owned
-/// somewhere else, and each drifted when its owner moved.
-///
-/// So the blocking condition is read from the thing that knows it.
-/// [`kernels_cuda::comm::CAN_LAUNCH`] is the launch half's statement about
-/// itself, pinned to its own bodies by `the_bodies_agree_with_can_launch`.
-/// Flipping it here is not possible; flipping it there requires the bodies to
-/// agree.
-///
-/// # The ceilings, in the order a caller can act on them
-///
-/// 1. **No device text** — `CAN_LAUNCH == false`. **This no longer fires**:
-///    `csrc/src/attn/flashinfer/comm/` holds both headers, `comm::ROOT`
-///    compiles them, and the constant is `true`. The branch stays because the
-///    whole point of reading it is that this file does not decide it — the
-///    launch half does, and it can say `false` again for a reason this file
-///    should not be enumerating.
-/// 2. **The world size the plane can be built for** —
-///    [`CONSTRUCTIBLE_WORLD_SIZES`], which is what
-///    `CustomAllReduce::initialise` admits AND what vllm's plain kernels are
-///    instantiated at (`comm::PLAIN_NRANKS`). The two sets are the same
-///    `{2, 4, 6, 8}`, which is why one constant answers both.
-/// 3. **The fused landing is world size two only** —
-///    [`FUSED_WORLD_SIZE`]. A model text that states
-///    `comm::all_reduce_residual_rmsnorm_bf16` at any other width gets
-///    `Decline::FusionWorldSize` at its first fire. This is a warning rather
-///    than a refusal because the plain reduction still serves at 4, 6 and 8,
-///    and which of the two a checkpoint lowers to is the model's call.
-/// 4. **A group key** — `[driver] tp_group_id`. Without one the ranks cannot
-///    find each other in `layout::rendezvous`, and a group whose members
-///    never meet would bootstrap N planes each pointing at their own memory:
-///    every reduction a no-op, silently.
-///
-/// # WHAT THIS FUNCTION DOES NOT CHECK, AND CANNOT
-///
-/// That a reduction produces the right sum. `CAN_LAUNCH` means there is
-/// device text and a template-id for it, and `kernels_cuda::comm`'s own
-/// header says at length that no launch in it has ever run on more than one
-/// device — the box it was written on has one GPU. So a `tp_size = 2`
-/// deployment that gets past this function is the FIRST thing in this
-/// repository to fire a collective, and that is what an operator is agreeing
-/// to. It is not stated in the returned message because there is no message
-/// on the `Ok` path; it is stated here, where somebody widening this gate
-/// will read it.
-///
-/// What is NOT here is the per-message ceiling — 8 MiB, the 16-byte multiple,
-/// the NCCL crossover. Those are `CustomAllReduce::can_handle`'s, they are
-/// answered per fire, and `bind/arms/comm.rs` falls back rather than failing
-/// on them. A load-time gate on a per-message limit would refuse deployments
-/// that never send a message that large.
+/// Not checked: that a reduction sums correctly. The per-message ceiling (8
+/// MiB, the 16-byte multiple, the NCCL crossover) is `CustomAllReduce::can_handle`'s,
+/// answered per fire, with `bind/arms/comm.rs` falling back rather than failing.
 ///
 /// # Errors
 ///
@@ -309,45 +208,20 @@ pub(crate) fn tp_serving_refusal(tp_size: u32, tp_group_id: &str) -> Result<(), 
 
 /// Build this rank's P2P all-reduce plane, and publish it for the bind arms.
 ///
-/// # Where the pieces come from
-///
-/// * **The all-gather** is `layout::rendezvous::tp_host_allgather`, keyed on
-///   `[driver] tp_group_id`, which is the same key `tp_min_plan` reduces the
-///   memory plan on. The ranks of a TP group are threads of one process, so
-///   an in-process barrier IS the bootstrap collective — that is the shape
-///   `HostAllgather` was designed for and the reason its constructor takes a
-///   callback rather than an `NcclComm&`.
-/// * **`group_devices`** is gathered rather than configured. `[driver]
-///   device` is one rank's ordinal and `CustomAllReduce` needs every rank's,
-///   indexed by rank; the first all-gather round supplies exactly that, so
-///   there is no second config key to keep consistent with the first.
-///   `enable_peer_access`'s doc warns these must be real ORDINALS and never
-///   rank indices — a mistake that works on every single-group box and
-///   corrupts the second group on a four-GPU one — and gathering the ordinal
-///   each rank actually bound is what makes that unmistakable.
-/// * **`same_process: true`**, because they are. Raw pointers cross instead
-///   of `cudaIpcMemHandle_t`s, which is what `custom_all_reduce.cu:264-272`
-///   is for.
-/// * **The fusion extents** are the fire ceiling this driver advertises and
-///   the model's FULL hidden width. Full, not this rank's shard: every rank
-///   holds a partial sum of the whole vector, which is what makes the
-///   collective a sum rather than a concatenation.
+/// `group_devices` is gathered (`tp_host_allgather`, an in-process barrier —
+/// TP ranks are threads), not configured, and must be real device ordinals,
+/// never rank indices, or the second group on a multi-GPU box corrupts. The
+/// fusion extents use the model's full hidden width, not this rank's shard:
+/// each rank holds a partial sum of the whole vector, so the collective is a
+/// sum, not a concatenation.
 ///
 /// # Errors
 ///
-/// The sentence to print. Every failure is a device or configuration one —
-/// unavailable peer access, a failing IPC exchange, an exhausted `RankData`
-/// slab — and each already names itself through `crate::error::Error`.
+/// The sentence to print; each failure names itself through `crate::error::Error`.
 ///
 /// # Unexercised
 ///
-/// **This has never run**, and the reason narrowed. It used to be that
-/// [`tp_serving_refusal`] refused `tp_size > 1` before any caller reached it,
-/// because `kernels_cuda::comm::CAN_LAUNCH` was `false`; both all-reduce
-/// headers are internalised now and that constant is `true`, so a group with
-/// a key at a world size in [`CONSTRUCTIBLE_WORLD_SIZES`] does reach here.
-/// What has not changed is the box: it has one GPU, so nothing here has met a
-/// second rank.
+/// Never run: the box has one GPU, so nothing here has met a second rank.
 pub(crate) fn build_tp_plane(
     tp_size: u32,
     tp_rank: u32,
@@ -368,7 +242,7 @@ pub(crate) fn build_tp_plane(
             )
         })?;
 
-    // ROUND ONE: every rank's device ordinal, so `group_devices` is what the
+    // Round one: every rank's device ordinal, so `group_devices` is what the
     // ranks actually bound rather than what a config file claims.
     let mut ordinals = vec![0u8; 4 * tp_size as usize];
     gather(&device_ordinal.to_ne_bytes(), &mut ordinals);
@@ -377,11 +251,7 @@ pub(crate) fn build_tp_plane(
         .map(|w| i32::from_ne_bytes([w[0], w[1], w[2], w[3]]))
         .collect();
 
-    let ag = HostAllgather {
-        rank,
-        world_size: world,
-        gather,
-    };
+    let ag = HostAllgather { rank, world_size: world, gather };
     let cfg = Config {
         same_process: true,
         group_devices,
@@ -394,24 +264,11 @@ pub(crate) fn build_tp_plane(
 }
 
 /// Teardown, as a destructor.
-///
-/// It was `destroy_impl(driver: *mut PieDriver)`, called by a
-/// `pie_cuda_destroy` export and doing `Box::from_raw` to take the shell
-/// back. Nothing leaks the shell any more, so the compiler runs this at the
-/// end of the owner's scope and the export has nothing left to do.
 impl Drop for Shell {
     fn drop(&mut self) {
         let shell = self;
-        // EVERY QUEUED FIRE FIRST, because they may still be writing.
-        //
-        // A fire that is on the stream when the driver is dropped will run
-        // its stream-ordered callback against a `ChannelState` copy, and the
-        // frees below would take that memory back underneath it. Waiting is
-        // the only correct answer here: unlike the reclaim in `step_impl`
-        // there is no later call to defer to.
-        //
-        // It also frees the channels those fires were holding for a
-        // `close_channel` that arrived while they were queued.
+        // Every queued fire first: a fire still on the stream runs its callback
+        // against a `ChannelState` the frees below would reclaim underneath it.
         for fire in std::mem::take(&mut shell.in_flight) {
             let _ = fire.done.synchronize();
             retire(fire);
@@ -422,23 +279,23 @@ impl Drop for Shell {
         if let Some(swap) = &shell.swap {
             swap.free();
         }
-        // The handle is the DRIVER's, so its destructor is the driver's
-        // too — `CublasHandle` asserts it was released rather than dropped.
+        // The driver owns the handle; `CublasHandle` asserts it was released,
+        // not dropped.
         if let Some(mut h) = shell.cublas.take() {
             h.release(&mut crate::device::cublas::LiveCublas);
         }
         if let Some(mut scratch) = shell.scratch.take() {
             let mut sops = crate::fire::attention_workspace::LiveStagingOps;
             scratch.ws.release(&mut sops);
-            // The prefill plan's own workspace, released beside the
-            // decode plans'. `AttentionWorkspace` has no working `Drop`
-            // -- every CUDA call goes through `StagingOps` and `Drop` has
-            // no `&mut O` -- so a workspace nobody releases is a pinned
-            // host leak and a debug assert.
+            // `AttentionWorkspace` has no working `Drop` (CUDA calls need
+            // `&mut O`), so an unreleased workspace is a pinned-host leak.
             scratch.prefill_ws.release(&mut sops);
+            // The peel tail's own workspace, released for the same reason.
+            scratch.tail_ws.release(&mut sops);
             drop(scratch.decode_plan);
             drop(scratch.decode_plan_full);
             drop(scratch.prefill_plan);
+            drop(scratch.tail_plan);
         }
     }
 }
@@ -450,20 +307,8 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
     let meta = parse_checkpoint_metadata(snapshot)
         .map_err(|e| crate::Error::invalid("load_model: checkpoint parse", format!("{e:?}")))?;
 
-    // The checkpoint's own `config.json`: embedded in an artifact, else
-    // the boot TOML's path.
-    //
-    // ONE FIELD IS READ OUT OF IT. This used to be a `pie.model/1`
-    // descriptor — ~40 numbers, normalized by 845 lines from a
-    // 136-field schema — parsed back here into a resident `HfConfig`
-    // that the load path, the launch path, the cost model and the
-    // capability report all read from. Every one of those numbers is a
-    // catalog row's now.
-    //
-    // What is left is the declared quantization, and it stays because
-    // it is the one thing a row genuinely cannot state: Qwen3-8B is one
-    // model and four downloads, and a group size is not an extent of
-    // any tensor.
+    // The checkpoint's own `config.json`: embedded, else the boot TOML's path.
+    // Only the declared quantization is read out — a catalog row can't state it.
     let config_json = match read_meta(&meta, model::encoding::CONFIG_OBJECT) {
         Ok(Some(bytes)) => {
             String::from_utf8(bytes).map_err(|e| i32::from(crate::Error::from(e)))?
@@ -484,70 +329,37 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
         }
     };
 
-    // WHICH MODEL THIS IS, asked of the TENSORS — unless pie wrote them.
-    //
-    // The config above no longer DECIDES anything: the row that authors
-    // the contract, projects the deployment and speaks the chat template
-    // is matched here, once, against the checkpoint's own tensor names
-    // and extents.
-    //
-    // Identification and validation are the same operation, which is the
-    // point. A config that lies about its geometry used to be believed
-    // by the derivation and contradicted by an assertion several frames
-    // later, if at all. A checkpoint is now a known model or it is not.
-    //
-    // The exception is an artifact `pie model build` produced, whose
-    // tensors are post-transform and match no manifest by construction.
-    // It carries the row this same identification settled at build time.
-    // See `catalog::identify_artifact`.
+    // Which model this is, asked of the tensors, not the config: identification
+    // and validation are one operation — a checkpoint is a known model or not.
     let chosen = state
         .boot_model_id
         .as_ref()
         .map_or(model::catalog::Override::None, |id| {
             model::catalog::Override::Id(id.clone())
         });
-    let attributes =
-        model_loader::checkpoint::read::parse_checkpoint_attributes(snapshot).unwrap_or_default();
-    let row = model::catalog::identify_artifact(&attributes, &meta, &chosen)
+    let row = model::catalog::identify(&meta, &chosen)
         .map_err(|e| crate::Error::unsupported("load_model: identify", e.to_string()))?;
 
-    // What the FILES say about how the numbers are stored, which is not
-    // part of what model this is: Qwen3-8B is one row and four
-    // downloads.
+    // How the numbers are stored — not part of what model this is.
     let encoding = model::encoding::Encoding::from_config_json(&config_json)
         .map_err(|e| crate::Error::invalid("load_model: config", e.to_string()))?;
 
-    // THE LOAD IS `model-loader`'s PLAN, EXECUTED ONTO THE DEVICE.
-    //
-    // What this replaced: a loop that read each checkpoint tensor into a
-    // host `Vec`, uploaded it, and then read three of them BACK off the
-    // device to concatenate a `qkv` and uploaded that — three round trips
-    // for bytes a plan lays out once, and a thousand `cudaMalloc`s where
-    // a resident plan wants one arena.
-    //
-    // The plan also decides what the driver used to decide by hand: which
-    // encodings are loadable (a transform outside `CUDA_TILE_MAP_MASK` is
-    // refused when the plan COMPILES, with the tensor named, rather than
-    // mis-bound at launch), and which projections are fused.
+    // The load is `model-loader`'s plan, executed onto the device: it decides
+    // which encodings are loadable (a transform outside `CUDA_TILE_MAP_MASK` is
+    // refused at compile, not mis-bound at launch) and which projections fuse.
     let target = crate::weights::plan::cuda_storage_target(state.tp_rank, state.tp_size);
     let (plan, _moe) =
         crate::weights::plan::compile_load_plan_for(snapshot, &meta, &target, row, &encoding)
             .map_err(|e| crate::Error::unsupported("load_model: load plan", e))?;
     let alloc = crate::device::Allocator::new();
-    // ALREADY an `Error`, and the site was throwing it away: the old
-    // line matched on nothing and returned `PIE_STATUS_EXHAUSTED` for
-    // every staging failure, so a missing tensor and a full arena
-    // reported the same thing.
-    // `Error::from` spelled out because `?` does not chain two of them,
-    // and the orphan rule forbids the shortcut: `From<LoaderError> for
-    // i32` would be an impl on a primitive this crate does not own.
+    // `Error::from` spelled out because `?` won't chain two of them: the orphan
+    // rule forbids `From<LoaderError> for i32` on a primitive this crate lacks.
     let staged = crate::weights::stage::stage_plan_weights(&plan, snapshot, &alloc)
         .map_err(crate::Error::from)?;
 
     let mut model = LoadedModel {
         id: row.id(),
-        // Filled below, once the checkpoint view can be built — the
-        // derivation reads the weight map, which needs the model.
+        // Filled below once the checkpoint view exists; it reads the weight map.
         deployment: model::deployment::Deployment::empty(),
         load_caps: Vec::new(),
         weights: staged.spans,
@@ -558,45 +370,19 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
     };
     wire_trace_names(&mut model);
 
-    // ONCE, at load, and never again. See `LoadedModel::deployment`.
-    //
-    // A PROJECTION of the matched row rather than a derivation from a
-    // parsed config. The eleven `*_facts_from_hf` functions this
-    // replaces read the same numbers out of the same checkpoint, one
-    // family at a time, keyed on a `model_type` string that a second
-    // table keyed differently.
+    // Once, at load; see `LoadedModel::deployment`. From the matched row.
     model.deployment = row
         .deployment(model::catalog::Deployed {
-            // This driver, named. See the note at the trace call in
-            // `fire/launch.rs`: the row serves both backends, so which
-            // one is asking is the caller's to state.
+            // The row serves both backends; the caller states which asks.
             backend: model::catalog::Backend::Cuda,
             tp_size: state.tp_size,
             layer_scalars: &model.layer_scalars,
         })
         .map_err(|e| i32::from(crate::Error::from(e)))?;
 
-    // A KV SHAPE THIS SHELL HAS NO POOL FOR IS REFUSED AT LOAD, not at
-    // its first fire — and it is a MATCH now, which is §8 row 7.
-    //
-    // This used to ask `unbuilt_kv_store()`, a vtable method returning
-    // `Option<&'static str>`: a family that forgot to implement it
-    // answered `None` and loaded. A `match` on `KvStyle` cannot forget,
-    // because a new variant fails to compile here until someone decides
-    // what this shell does with it.
-    //
-    // The MLA and DSv4 caches are ported and waiting for a forward path.
-    // Until there is one, saying so at the door is the honest answer:
-    // otherwise the checkpoint loads, reports itself healthy through
-    // `capabilities_json`, and dies inside a walk on a
-    // `DispatchRefusal` — late, quiet, and the exact shape gpt-oss
-    // failed in before its wiring landed.
-    // THE REFUSAL CARRIES WHAT HAPPENED. This said it twice, on two
-    // channels — the reason to stderr and `-1` to the caller — which is
-    // exactly the defect §3.4 names: "an engine cannot learn which
-    // layer, which kernel, or which fire refused, only that something
-    // did." `Error::Unsupported` carries the sentence, and
-    // `serve::status_of` is the one place that logs it.
+    // A KV shape this shell has no pool for is refused at load, not at first
+    // fire: the `match` on `KvStyle` cannot forget a variant. MLA and
+    // compressed planes are ported but have no forward path yet.
     if let Some(what) = match &model.deployment.kv {
         model::deployment::KvStyle::Paged => None,
         model::deployment::KvStyle::Mla { .. } => Some(
@@ -616,27 +402,15 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
         .into());
     }
 
-    // THE GQA RATIO, refused at LOAD rather than discovered at launch.
-    //
-    // The same argument as the `KvStyle` match above, for the same
-    // reason, at the same door: FlashInfer's decode instantiates a fixed
-    // set of group sizes and reports anything else by THROWING, and a
-    // throw crossing the C ABI is undefined behaviour. The shim prints
-    // and dies, because a launcher signature has nowhere to put a
-    // failure. This return does.
-    //
-    // It is asked HERE rather than in `model` because it is not a fact
-    // about the checkpoint — it is a fact about what this build
-    // instantiated, and `super::DECODE_GQA_GROUPS` is where this crate
-    // states it. `model` states the shape; the driver states the set.
+    // The GQA ratio, refused at load: FlashInfer's decode instantiates a fixed
+    // set of group sizes and reports anything else by throwing, and a throw
+    // across the C ABI is undefined behaviour. `DECODE_GQA_GROUPS` is this build's.
     model
         .deployment
         .servable_by(super::DECODE_GQA_GROUPS)
         .map_err(|why| -> i32 {
-            // The refusal's OWN sentence, plus the numbers. `servable_by`
-            // distinguishes a fractional ratio from an uninstantiated
-            // one, and collapsing them here would report a malformed
-            // shape as a missing kernel.
+            // `servable_by` distinguishes a fractional ratio from an
+            // uninstantiated one, so a malformed shape isn't a missing kernel.
             crate::error::Error::Unsupported {
                 what: format!(
                     "{why}: {} q heads over {} kv heads; this build \
@@ -649,56 +423,25 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
             .into()
         })?;
 
-    // A NEW RESIDENCY, so every cache keyed on the old one is dropped.
-    //
-    // Replacing `state.model` frees the previous `LoadedModel`'s weight
-    // arena, and a captured graph bakes addresses into it. Both caches
-    // were keyed on the LAYER COUNT, so a second 32-layer checkpoint hit
-    // the first one's entries — a replay into freed memory, with every
-    // pointer looking exactly as valid as it did.
-    //
-    // Bumped AND cleared, which is belt to that braces: the counter makes
-    // the key honest for anything that outlives this line, and the clear
-    // returns the memory rather than leaving entries no key can reach.
+    // A new residency drops every cache keyed on the old one. Replacing
+    // `state.model` frees the previous weight arena a captured graph baked
+    // addresses into, so a same-depth reload would replay into freed memory.
     state.load_generation += 1;
     state.lowerings.clear();
     state.supergraph = crate::fire::recordings::Recordings::new();
-    // AND THE P2P PLANE, for a reason the paragraph above already covers
-    // once: the fusion workspace's `hidden` is compared for EQUALITY, so a
-    // plane built for the previous checkpoint declines every fused fire of
-    // the next one — and if the two happen to share a hidden size, it does
-    // something worse and reduces through buffers sized for a different
-    // token ceiling. Dropped here rather than reused, which is safe because
-    // every rank reloads together and rebuilds together, below.
+    // And the P2P plane: the fusion workspace's `hidden` is compared for
+    // equality, so a plane built for the previous checkpoint declines (or
+    // mis-reduces) the next one's fused fires. Safe to drop — ranks rebuild.
     state.all_reduce = None;
     state.model = Some(model);
-    // AFTER the model is stored, because a calibration boot fires through the
-    // ordinary path and that path reads `state.model`.
+    // After the model is stored: a calibration boot fires the ordinary path.
     let caps = capabilities_json(state, snapshot)?;
     state.model.as_mut().expect("just stored").load_caps = caps;
 
-    // THE P2P PLANE, BUILT ONCE, HERE.
-    //
-    // Not in `create`, because the fusion workspace's stride is BAKED at
-    // construction — `Plane::can_fuse_residual_rmsnorm` compares `hidden` for
-    // EQUALITY, not against a bound — so it cannot be sized before the
-    // checkpoint says what `hidden` is. And after the caps, because the other
-    // extent it needs is the token ceiling this driver ADVERTISES: sizing the
-    // workspace for anything smaller would decline fires a caller is entitled
-    // to send, and for anything larger would reserve memory no fire can use.
-    // `calibrate_planner` reads the published caps for exactly this reason,
-    // one line down.
-    //
-    // Once, not per fire: the addresses this allocates are what every peer's
-    // mapping points at, so a plane rebuilt mid-serve is a set of addresses
-    // no rank could agree on twice.
-    //
-    // REACHABLE, AND NEVER TAKEN. `tp_serving_refusal` used to turn
-    // `tp_size > 1` away at `create` on `comm::CAN_LAUNCH`, so `state.tp_size`
-    // was 1 here in every configuration the build accepted. That gate is gone
-    // -- the headers are vendored -- and this branch is now what a `tp_size =
-    // 2` deployment with a group key runs. It has still never been taken,
-    // because taking it needs two GPUs.
+    // The P2P plane, built once here — not in `create`: its stride is baked at
+    // construction, so it needs the checkpoint's `hidden` and the advertised
+    // token ceiling (hence after the caps). These addresses are what every
+    // peer's mapping points at, so a rebuild mid-serve is unagreed. Needs two GPUs.
     if state.tp_size > 1 && state.all_reduce.is_none() {
         let hidden = state
             .model
@@ -737,22 +480,10 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
     Ok(())
 }
 
-/// The calibration sweep: time the reachable fire shapes and write the
-/// fastest to the profile cache the next boot reads.
-///
-/// `[batching] calibrate_planner` turns it on. It runs at LOAD, after the
-/// weights are resident and the caps are published, because a probe fires
-/// through the ordinary path and that path reads `state.model`.
-///
-/// WHY THIS COULD NOT BE WRITTEN BEFORE, and it was not about calibration:
-/// a shape the driver cannot bind is the probe's ANSWER, and until today
-/// the fence seam asserted on a CUDA error and took the process with it.
-/// `StagingOps`'s pair reports now, so `None` from a timer is a point the
-/// sweep skips rather than a crash.
-///
-/// Failures here are NOTED AND SWALLOWED. A calibration boot that cannot
-/// measure still has a model loaded and an analytic plan to serve with;
-/// refusing the load would turn a missing optimisation into an outage.
+/// The calibration sweep: time the reachable fire shapes and cache the fastest
+/// for the next boot. `[batching] calibrate_planner` turns it on. Runs at load,
+/// after weights and caps, because a probe fires the ordinary path. Failures
+/// are swallowed: a boot that cannot measure still serves analytically.
 fn calibrate_planner(state: &mut Shell) {
     use crate::layout::calibrate::{Ceiling, Point, StepTimer, sweep};
     use crate::serve::state::{InstanceEntry, ProgramEntry};
@@ -760,10 +491,8 @@ fn calibrate_planner(state: &mut Shell) {
     let Some(model) = state.model.as_ref() else {
         return;
     };
-    // THE CEILING IS WHAT THE DRIVER JUST ADVERTISED, not what the planner
-    // computed. Those differ: `capabilities_json` publishes the lattice's
-    // rectangle, and a caller may not exceed it. Sweeping above the
-    // advertisement would measure shapes no scheduler will ever send.
+    // The ceiling is what the driver just advertised: sweeping above it would
+    // measure shapes no scheduler will send.
     let Ok(caps) = serde_json::from_slice::<driver_api::DriverCapabilities>(&model.load_caps)
     else {
         eprintln!("[driver-cuda] calibrate: the caps did not parse; nothing to sweep around");
@@ -787,11 +516,8 @@ fn calibrate_planner(state: &mut Shell) {
         budget_bytes: 0,
     };
 
-    /// Times one point by firing a synthetic batch of that shape.
-    ///
-    /// It reports `None` for a shape it cannot fire, which is what makes
-    /// this a probe: the ladder walks DOWN from the ceiling and the first
-    /// points are the ones most likely to be declined.
+    /// Times one point by firing a synthetic batch of that shape. `None` for a
+    /// shape it cannot fire — the ladder starts at the ceiling, likeliest to decline.
     struct FireTimer<'a> {
         state: &'a mut Shell,
         instances: Vec<u64>,
@@ -827,10 +553,8 @@ fn calibrate_planner(state: &mut Shell) {
         sm_count: 0,
         kv_cache_dtype: state.kv_format.name().to_owned(),
         tp_size: i32::try_from(state.tp_size).unwrap_or(1),
-        // THE ROW, not its family. A cache keyed on `"qwen3"` plus a
-        // hidden size was keyed on a shape summary; keyed on the id it
-        // is keyed on the model, and the four extents below stay as a
-        // guard against a build whose row moved under a stale file.
+        // The row, not its family: keyed on the id keys the model; the four
+        // extents below guard against a row that moved under a stale file.
         model_type: model.id.to_owned(),
         hidden_size: i32::try_from(model.deployment.shape.hidden).unwrap_or(0),
         num_hidden_layers: i32::try_from(model.deployment.layers).unwrap_or(0),
@@ -840,8 +564,7 @@ fn calibrate_planner(state: &mut Shell) {
     };
 
     // ONE probe program and as many instances as the widest point needs.
-    // Registration is a map insert, so it costs nothing to make the full
-    // set up front and hand each point a prefix of it.
+    // Registration is a map insert, so the full set up front costs nothing.
     let probe_program = state.next_id;
     state.next_id += 1;
     state.programs.insert(
@@ -875,9 +598,8 @@ fn calibrate_planner(state: &mut Shell) {
     };
     let outcome = sweep(ceiling, &template, &mut timer);
 
-    // THE PROBE LEAVES NOTHING BEHIND. Its instances hold KV pages and its
-    // program is not one the engine registered; a serving boot that
-    // inherited them would be serving a rectangle nobody asked for.
+    // The probe leaves nothing behind: its instances hold KV pages and its
+    // program is not one the engine registered.
     for id in &timer.instances {
         state.instances.remove(id);
     }
@@ -918,16 +640,9 @@ fn calibrate_planner(state: &mut Shell) {
 
 /// Fire one synthetic batch shaped like `point` and wait for it to retire.
 ///
-/// The batch is `R` requests of `tokens_per_request` tokens each, every
-/// request a fresh prefill from position zero over pages of its own. That is
-/// the shape the planner's rectangle DESCRIBES — `max_forward_tokens` is a
-/// prefill width and `max_forward_requests` a decode one — so a batch that
-/// fills both axes at once is the worst case each point must survive.
-///
-/// SYNCHRONOUS, which is the whole point: the sweep is timing wall clock,
-/// and a fire that returns before the device has finished has been timed at
-/// the speed of the enqueue rather than of the step. `owes: None` makes
-/// `step_impl` synchronize before it returns.
+/// `R` requests of `tokens_per_request` tokens, each a fresh prefill over its
+/// own pages — both axes at once, the worst case. Synchronous by design
+/// (`owes: None`): a fire that returned early would time the enqueue, not the step.
 fn synthetic_fire(
     state: &mut Shell,
     point: crate::layout::calibrate::Point,
@@ -945,9 +660,8 @@ fn synthetic_fire(
         return Err(PIE_STATUS_INVALID_ARGUMENT);
     }
     let page = usize::try_from(page_size).unwrap_or(16).max(1);
-    // Pages this batch needs if every request gets its own run. A point
-    // whose footprint exceeds the pool is not a candidate — refusing here
-    // is cheaper than firing into an allocator that will refuse anyway.
+    // Pages this batch needs if every request runs alone. A footprint past the
+    // pool is not a candidate — cheaper to refuse here than in the allocator.
     let pages_each = per.div_ceil(page);
     let pages_total = reqs * pages_each;
     if pages_total > usize::try_from(total_pages).unwrap_or(0) {
@@ -973,9 +687,8 @@ fn synthetic_fire(
         sub_batch_indptr.push(u32::try_from(r + 1).unwrap_or(0));
         sub_batch_class.push(driver_api::local::PIE_GEOMETRY_CLASS_HOST);
         for t in 0..per {
-            // TOKEN ZERO for every row. The sweep is timing a SHAPE, and
-            // which token sits in a slot changes nothing about the work —
-            // every kernel this fires is dense. Zero is in every vocabulary.
+            // Token zero for every row: the sweep times a shape and every
+            // kernel is dense, so the token in a slot changes nothing.
             token_ids.push(0);
             position_ids.push(u32::try_from(t).unwrap_or(0));
         }
@@ -1017,25 +730,17 @@ fn synthetic_fire(
     crate::fire::launch::step_impl(state, &frame, step, None)
 }
 
-/// Answer the trace names a launch will ask for, from `model`'s tables.
+/// Answer the trace names a launch will ask for, from `model`'s tables. Most
+/// naming is family knowledge (`model::shared::weight_names`); two need the driver.
 ///
-/// The driver's whole part in naming, and it is deliberately small: which
-/// trace name means which published tensor is FAMILY knowledge and lives in
-/// `model::shared::weight_names`, beside the DSL that invents the trace names and the
-/// contract author that invents the published ones. What is left here is the
-/// two things only a driver can answer.
+/// Whether a join is a rename or nothing: a checkpoint shipping pre-joined
+/// projections (Phi-3) has its contract split them, so the halves are adjacent
+/// in the arena (the plan wrote them in file order). The driver checks
+/// contiguity rather than assumes: a GEMM handed a discontiguous operand reads
+/// what lies between.
 ///
-/// **Whether a join is a rename or nothing.** A checkpoint that ships its
-/// projections pre-joined (Phi-3) has its contract SPLIT them, so
-/// `Projections::Fused` has nothing to fuse and the halves are merely
-/// adjacent. They are adjacent IN THE ARENA — the plan wrote them once, in
-/// file order — so the fused operand exists and only wants a name. Only the
-/// driver holds the addresses that decide it, and it checks rather than
-/// assumes: a GEMM handed a discontiguous operand reads what lies between.
-///
-/// **Reading a load-time scalar to the host.** gemma-4's per-layer
-/// `layer_scalar` is one bf16 on the device; `model` says which tensors they
-/// are and in what order, and the copy is CUDA's.
+/// And reading a load-time scalar to the host: gemma-4's `layer_scalar` is one
+/// bf16 on device; `model` says which and in what order.
 fn wire_trace_names(model: &mut LoadedModel) {
     let Some(row) = model::catalog::find(model.id) else {
         return; // no row, no names; the load already refused
@@ -1095,27 +800,12 @@ fn wire_trace_names(model: &mut LoadedModel) {
 
 /// What `load_model` answers: a `driver_api::DriverCapabilities` document.
 ///
-/// **This used to be a five-field summary of the checkpoint** —
-/// `{"model_type":…,"hidden":…,"layers":…,"vocab":…,"weights":…}` — which is
-/// not a capability payload and which `DriverCapabilities` rejects outright,
-/// field by field, at `unknown field \`model_type\``. So no engine could load
-/// a model through this driver; the ABI tests call `pie_cuda_load_model`
-/// directly and pass `null` for the caps, so nothing here noticed.
-///
-/// # The KV pool is SIZED HERE, and that is the substance
-///
-/// `total_pages` is what a scheduler admits against, so answering it is
-/// answering how much context this device holds. The budget comes from
-/// `layout::memory_planner::budget_for` — the ported planner's own reserve
-/// arithmetic, which until now had no live caller — measured AFTER the
-/// weights are resident, so `cudaMemGetInfo`'s free figure already has them
-/// subtracted.
-///
-/// What the budget then has to cover is the KV pool and the fire's
-/// activations. The activation share is a fraction rather than a computed
-/// arena, because the arena is a property of the LOWERING and no fire has
-/// been lowered yet; a fifth is the C++'s own rule of thumb and it is stated
-/// here rather than hidden in a constant.
+/// The KV pool is sized here. `total_pages` is what a scheduler admits against.
+/// The budget (`memory_planner::budget_for`) is measured after weights are
+/// resident, so `cudaMemGetInfo`'s free figure already subtracts them. It
+/// covers the KV pool and the fire's activations; the activation share is a
+/// fifth (the C++'s rule of thumb), not a computed arena, because no fire has
+/// been lowered yet.
 fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Vec<u8>, i32> {
     use crate::layout::memory_planner::{
         DeviceMemory, DeviceProps, ModelCosts, ModelShape, NoProfiles, PlannerConfig,
@@ -1124,24 +814,11 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
     use crate::layout::model_costs::{CheckpointCosts, DiskProfiles};
 
     let model = state.model.as_ref().expect("the model is stored");
-    // NO `HfConfig` READ ON THIS PATH.
-    //
-    // Three reads used to survive here — `model_type`,
-    // `max_position_embeddings`, and whether the checkpoint carries
-    // `gemma_vision`/`gemma_audio` — and they were the reason the driver
-    // kept a whole parsed `config.json` resident for the life of a load.
-    // They are `Deployment::advertised` now, off the same row that
-    // authored the contract and traced the forward, so the model a
-    // program is told about and the model this driver fires cannot be
-    // two different models.
-    //
-    // CLONED for the same reason `model_tp` and `model_id` are copied:
-    // the planner below wants `state` back.
+    // No `HfConfig` read: a program and this driver fire off the same row, so
+    // they can't be two models. Cloned because the planner wants `state` back.
     let deployment = model.deployment.clone();
     let model_tp = model.tp_size;
-    // Copied out beside `model_tp` for the same reason: `&'static str`,
-    // so this ends the borrow of `state` rather than extending it across
-    // the planner below.
+    // Copied out (`&'static str`) to end the borrow of `state` before the planner.
     let model_id = model.id;
     let device = crate::device::Device::bind(state.device_ordinal)?;
     let (free, total) = device.memory_info()?;
@@ -1151,48 +828,25 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
         memory_profile: "auto".to_owned(),
         max_forward_tokens: 0,
         max_forward_requests: 0,
-        // PINNED, and this is a coupling rather than a preference: the fire
-        // path builds 16-token pages by construction (`page_size: usize = 16`
-        // in `step_impl` and in `resize_pool`). Letting the lattice sweep page
-        // sizes would have it answer a geometry the driver does not build.
+        // Pinned, a coupling not a preference: the fire path builds 16-token
+        // pages, so sweeping page sizes would answer a geometry it never builds.
         kv_page_size: 16,
-        // The driver's OWN format, so the planner sizes the pages the
-        // driver will actually allocate. It was hardwired while the shell
-        // could only build bf16; now that the format is a boot key, a
-        // hardwired planner would under-count a quantized cache by up to
-        // 4x and hand back a page budget the device cannot hold.
+        // The driver's own format, so the planner sizes the pages it allocates:
+        // a bf16 planner under-counts a quantized cache up to 4x.
         kv_cache_dtype: state.kv_format.name().to_owned(),
         tp_size: i32::try_from(model_tp).unwrap_or(1),
         mtp_num_drafts: 0,
-        // FALSE EVEN WHEN CALIBRATING, and the divergence is deliberate.
-        //
-        // `calibrating` makes the planner build the CEILING of the feasible
-        // region — the largest rectangle whose `arena + persistent` fits the
-        // budget — on the reasoning that a bigger arena can run a smaller
-        // shape. That holds when the arena is the only limit. It is not here:
-        // the attention workspace is a FIXED 32 MB the shell allocates, and a
-        // fire wider than it supports fails inside CUDA rather than returning
-        // a status. On an L40S the ceiling is N=65536, whose logits buffer
-        // alone is twenty gigabytes and whose fire aborts.
-        //
-        // So the sweep explores at or below the shape the driver is built to
-        // fire, which is the scored pick. It measures which of the REACHABLE
-        // shapes is fastest — a smaller claim than the C++'s and a true one.
+        // False even when calibrating: the attention workspace is a fixed 32 MB
+        // and a fire wider than it supports fails inside CUDA rather than
+        // returning a status, so the sweep stays at the reachable shapes.
         calibrating: false,
         rs_slot_mult: 1,
-        // THE KEY THE RANKS ACTUALLY RENDEZVOUS ON. This was `String::new()`,
-        // which is precisely the value `rendezvous::tp_min_plan` reads as
-        // "no group to reconcile with" — so the cross-rank plan agreement
-        // this driver calls was wired up and inert, and two ranks could leave
-        // the planner with different `max_requests` and deadlock at the first
-        // collective rather than failing here. One key, both rendezvous.
+        // The key both rendezvous read: `String::new()` reads as "no group",
+        // leaving cross-rank plan agreement inert — a deadlock risk.
         nccl_unique_id_hex: state.tp_group_id.clone(),
     };
-    // THE ROW'S OWN NUMBERS, so the pool the planner sizes and the
-    // pool the fire builds come from one statement of the shape. Both
-    // of these read a resident `HfConfig` — a second parse of the
-    // checkpoint, whose disagreements with the first never surfaced as
-    // an error, only as a KV pool a few thousand pages short.
+    // The row's own numbers, so the pool the planner sizes and the one the fire
+    // builds share one shape — a second parse could leave the pool pages short.
     let costs = CheckpointCosts::new(&deployment, model_tp);
     let shape = ModelShape {
         hidden_size: i32::try_from(deployment.shape.hidden).unwrap_or(0),
@@ -1212,13 +866,8 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
         free_bytes: free as u64,
         total_bytes: total as u64,
     };
-    // MEASURED AFTER THE WEIGHTS ARE RESIDENT, so `cudaMemGetInfo`'s free
-    // figure already has them subtracted and the budget is what is left.
-    // A MEASUREMENT BEATS THE SCORE, when there is one. `DiskProfiles` reads
-    // the cache a calibration boot writes; a machine that has never
-    // calibrated has no file, which is a miss and not an error, and the
-    // planner falls back to the analytic pick. `NoProfiles` is the honest
-    // stand-in when no cache directory can even be derived.
+    // A measurement beats the score: `DiskProfiles` reads the calibration
+    // cache; no file is a miss, and the planner falls back to the analytic pick.
     let disk = DiskProfiles::discover("").ok();
     let profiles: &dyn ProfileSource = disk.as_ref().map_or(&NoProfiles, |d| d);
     let planned = plan(
@@ -1238,22 +887,10 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
         eprintln!("[driver-cuda] {note}");
     }
 
-    // PAGES AGAINST WHAT THE ARENA LEAVES, and this is a deliberate
-    // divergence from the planner's own rule.
-    //
-    // The planner sizes pages against the FULL budget, and says why: "the
-    // arena is a transient graph workspace that is freed between fires, while
-    // the KV pool is the resident one". That was true of the C++. It is not
-    // true here — `Scratch` keeps the arena, the named seam buffers and
-    // the descriptor arrays for the life of the driver, because a captured
-    // graph bakes the addresses it recorded and a freed arena can never be
-    // replayed into. Persistence is the precondition for the supergraph and
-    // for run-ahead, and it is not negotiable.
-    //
-    // So the two resident allocations share one budget, and charging only one
-    // of them would advertise a page count whose pool cannot be built: on
-    // qwen3-0.6B the full-budget figure is 22,016 pages against a budget the
-    // arena also has to come out of.
+    // Pages against what the arena leaves, not the full budget: `Scratch` keeps
+    // the arena, seam buffers and descriptor arrays for the driver's life — a
+    // captured graph bakes their addresses and a freed arena can't be replayed
+    // into. Both resident allocations share one budget; charging one over-counts.
     let per_page = planned.plan.kv_page_bytes.max(1);
     let resident_arena = costs
         .arena_bytes(
@@ -1270,9 +907,8 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
         abi_version: driver_api::PIE_DRIVER_ABI_VERSION,
         total_pages: u32::try_from(total_pages).unwrap_or(u32::MAX),
         kv_page_size: u32::try_from(planned.plan.kv_page_size).unwrap_or(16),
-        // THE LATTICE'S ANSWER, not a stated ceiling. These are what a
-        // scheduler batches under, and the arena the planner chose is sized
-        // for exactly this rectangle — a fire wider than it has no workspace.
+        // The lattice's answer, not a stated ceiling: the arena is sized for
+        // exactly this rectangle — a wider fire has no workspace.
         max_forward_tokens: u32::try_from(planned.plan.capacity.max_forward_tokens).unwrap_or(0),
         max_forward_requests: u32::try_from(planned.plan.capacity.max_forward_requests)
             .unwrap_or(0),
@@ -1287,10 +923,8 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
         hidden_size: deployment.shape.hidden,
         rs_cache_required: costs.has_linear_state(),
         snapshot_dir: snapshot.display().to_string(),
-        // No swap pool, no elastic accounting, no MTP or value head, and no
-        // sink this shell honours yet. Every one of these is a claim a
-        // program BINDS against, so a false advertisement is a program that
-        // runs as a silent no-op rather than one that is refused.
+        // No swap pool, elastic accounting, MTP, value head, or sink yet. Each
+        // is a claim a program binds against, so a false one is a silent no-op.
         swap_pool_size: 0,
         kv_copy_domain_mask: 0,
         rs_cache_slots: 0,
@@ -1303,68 +937,23 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
         has_kv_envelopes: false,
         has_attn_score: false,
         has_attn_page_mask: false,
-        // TRUE, and it is the region table that makes it safe to say:
-        // a fire marks its adapter rows, the `HasLora` guard states the
-        // correction, and a lane that does not resolve degrades to the
-        // arm's no-op rather than to a wrong answer.
+        // True, made safe by the region table: a lane that does not resolve
+        // degrades to the arm's no-op, not a wrong answer.
         has_lora: true,
         model_site_summary: driver_api::ModelSiteSummary::default(),
-        // EXACTLY THE THREE PORTS `fire::envelope::compose` READS, and not
-        // one bit more.
-        //
-        // `PIE_DECODE_ENVELOPE_PORTS` is `EmbedTokens | Positions | KvLen`.
-        // Those three come off the instance's channel rings before the
-        // forward; everything else a decode needs — its pages, its page CSR,
-        // its write descriptor — the class DERIVES from the positions, which
-        // is the class's own contract (`LaunchPlan::geometry_class`).
-        //
-        // `PIE_DEVICE_GEOMETRY_PORTS` is deliberately NOT here. That claim
-        // wins the pool-owned device-geometry class, whose members state their
-        // own pages, page CSR, write descriptor and dense mask cell in-graph;
-        // `compose` reads none of those and would hand the fire the pages the
-        // program did not choose. `driver-vulkan`'s own note on widening this
-        // mask is the rule: "widening the claim alone would have been the
-        // silent version of the bug".
-        //
-        // At `0` the engine classified this driver's decode loops as `Host`
-        // and they died at `EmbedTokens is not host-derivable: channel 0 has
-        // no host-known value` — the whole of what this claim buys.
+        // Exactly the three ports `fire::envelope::compose` reads —
+        // `EmbedTokens | Positions | KvLen`; the rest a decode derives from the
+        // positions. `DEVICE_GEOMETRY_PORTS` is deliberately absent: it wins the
+        // pool-owned class this driver does not build. At 0 the decode is `Host`.
         device_geometry_port_mask: driver_api::PIE_DECODE_ENVELOPE_PORTS,
-        // FALSE, and it is a different question from the mask above.
-        //
-        // `pipeline::fire` reads it to decide whether a frame slot may consume
-        // a channel an earlier slot of the same frame publishes — and only for
-        // a pass whose `devgeo` is set, which is the pool-owned class this
-        // driver does not claim. A decode ENVELOPE is not covered by that rule
-        // at all, so the bench's chained frame is admitted with this at
-        // `false` and flipping it would buy nothing this driver can use.
-        //
-        // What it would CLAIM is that `launch` converts one step, fires it,
-        // and only then converts the next. That is in fact what `launch_impl`
-        // now does — `compose_step` runs inside `step_impl`, per step, after
-        // the previous step has synchronized — so the day this driver serves
-        // the pool-owned class, this is the line to revisit. Until it does,
-        // saying `true` would advertise a class it refuses by name.
+        // False, a different question from the mask: it only matters for the
+        // pool-owned `devgeo` class this driver does not claim, so a decode
+        // envelope is unaffected. Saying true would advertise a refused class.
         resolves_geometry_per_step: false,
-        // TRUE WHEN THIS CHECKPOINT HAS A TOWER `pie_cuda_encode` SERVES,
-        // and it was hardwired false while four GPU tests fired the entry
-        // point and passed.
-        //
-        // That is the failure a false negative makes: the worker refuses
-        // to build an encode executor at all when this is clear
-        // (`worker/src/executor/mod.rs:1341`), so gemma-4's vision and
-        // audio towers — ported, bound, and matching HF's embeddings to
-        // cosine — were unreachable through the engine. The tests never
-        // saw it because they call the entry directly, which is exactly
-        // the seam a capability is supposed to cover.
-        //
-        // Asked of the CHECKPOINT rather than stated of the driver: the
-        // encode arms refuse a deployment with no `gemma_vision` /
-        // `gemma_audio`, so answering true without one would advertise a
-        // call that is guaranteed to fail. Qwen3-VL is deliberately NOT
-        // here — its tower (`tower::qwen3_vl::scatter`) writes into the
-        // fire's hidden rows rather than handing host rows back, so it is
-        // an in-fire path and not an encode one.
+        // True when this checkpoint has a tower `pie_cuda_encode` serves. A
+        // false negative makes the worker build no encode executor, so gemma-4's
+        // towers go unreachable. Qwen3-VL is deliberately absent — its tower
+        // writes the fire's hidden rows in-fire, not through encode.
         supports_media_encode: deployment.advertised.media_encode,
         kv_handle: None,
         // This driver compiles its own PTIR through NVRTC; nothing upstream
@@ -1375,10 +964,6 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
 }
 
 /// Adopt one non-empty launch package and compile what it generates.
-///
-/// Split out so the id lifecycle above reads as the lifecycle: the empty
-/// case, the dedup case and the id assignment are all one paragraph, and
-/// the thing that can fail is one call.
 pub(crate) fn adopt_and_compile(
     state: &mut Shell,
     id: u64,
@@ -1389,10 +974,8 @@ pub(crate) fn adopt_and_compile(
     let plan = driver::adopt_launch_package(package)
         .map_err(|error| crate::Error::unsupported("register_program", error))?;
 
-    // The compile, when there is a device to compile FOR. `load_model`
-    // binds it; a registration that arrives first is not an error, and
-    // guessing an architecture would produce a cubin for the wrong GPU
-    // rather than a diagnostic.
+    // The compile, when there is a device to compile for (`load_model` binds
+    // it). A registration arriving first is fine — guessing arch mis-targets.
     if plan.executable && state.model.is_some() {
         let target = ptir_target(state.device_ordinal)?;
         let versions = driver::Versions::from_compiler(desc.emitter_version);
@@ -1423,10 +1006,8 @@ pub(crate) fn adopt_and_compile(
             }
         }
     } else if !plan.executable {
-        // Recorded rather than refused: an unexecutable plan is a fact
-        // about the program that the launch needing it must be able to
-        // report, and losing the reason here would leave that launch with
-        // nothing to say.
+        // Recorded rather than refused: a launch needing this unexecutable plan
+        // must be able to report why, so the reason is kept.
         eprintln!(
             "[driver-cuda] register_program: program {:#018x} adopted but is \
              not executable by this driver: {}",
@@ -1441,16 +1022,11 @@ pub(crate) fn adopt_and_compile(
 
 /// What the compile cache needs to know about the GPU it is compiling for.
 ///
-/// Read per registration rather than cached on the shell because the two
-/// numbers that matter are cheap and the one that is not — the NVRTC
-/// version — is a `dlopen`'d call the loader has already resolved by the
-/// second registration. Caching it would trade nothing for a field that
-/// can go stale against a runtime swap.
+/// Read per registration, not cached: the cheap numbers stay fresh, and the
+/// NVRTC version would go stale against a runtime swap.
 pub(crate) fn ptir_target(ordinal: i32) -> Result<crate::program::Target, i32> {
-    // THE CUDA ERROR ALREADY IS one of ours — `Device::bind` and
-    // `compute_capability` return `crate::Error::Driver`, and the old
-    // lines logged it and then replaced it with a status that says
-    // nothing about which call failed.
+    // The CUDA error already is one of ours — `Device::bind` and
+    // `compute_capability` return `crate::Error::Driver`.
     let device = crate::device::Device::bind(ordinal)?;
     let (major, minor) = device.compute_capability()?;
     let nvrtc = crate::program::compile::version().map_err(|error| {
@@ -1460,10 +1036,8 @@ pub(crate) fn ptir_target(ordinal: i32) -> Result<crate::program::Target, i32> {
     Ok(crate::program::Target {
         major,
         minor,
-        // The ordinal, widened. A stable per-GPU id is what the identity
-        // wants and what stops one machine's cache answering for another
-        // family; with one device bound per process the ordinal IS that
-        // id, and it is the number the C++ used.
+        // The ordinal, widened: a stable per-GPU id, and with one device bound
+        // per process the ordinal is that id.
         device: u64::try_from(device.ordinal()).unwrap_or(0),
         nvrtc,
     })
@@ -1475,36 +1049,17 @@ mod tests {
 
     #[test]
     fn a_single_rank_needs_no_collective_and_is_never_refused() {
-        assert!(
-            tp_serving_refusal(1, "").is_ok(),
-            "one rank reduces nothing"
-        );
-        assert!(
-            tp_serving_refusal(0, "").is_ok(),
-            "and neither does a mis-stated zero"
-        );
+        assert!(tp_serving_refusal(1, "").is_ok(), "one rank reduces nothing");
+        assert!(tp_serving_refusal(0, "").is_ok(), "and neither does a mis-stated zero");
     }
 
-    /// The refusal has to NAME what it is waiting on, because the sentence it
-    /// replaced named three things that had all moved. This asserts on the
-    /// content rather than merely on `is_err`, which is the only way a
-    /// message can be kept true by a test.
-    ///
-    /// **The subject changed when `CAN_LAUNCH` flipped.** It used to assert
-    /// that a two-rank group IS refused and that the message names the
-    /// missing device text; both headers are vendored now, so a two-rank
-    /// group with a key is admitted and the sentence that named their absence
-    /// is gone. What is still checkable is the shape: the first ceiling that
-    /// bites names the value it read.
+    /// Asserts on the message content, not just `is_err`: the first ceiling that
+    /// bites must name the value it read.
     #[test]
     fn a_group_is_refused_by_the_condition_that_actually_blocks_it() {
-        // A key is what a two-rank group is missing now, and the refusal says
-        // so rather than reaching for something further down.
+        // A two-rank group's missing piece is the key, and the refusal says so.
         let why = tp_serving_refusal(2, "").expect_err("a group with no key cannot rendezvous");
-        assert!(
-            why.contains("tp_group_id"),
-            "names the value it read: {why}"
-        );
+        assert!(why.contains("tp_group_id"), "names the value it read: {why}");
         assert!(
             !why.contains("CAN_LAUNCH"),
             "there IS device text, so that is not what blocks it: {why}"
@@ -1513,8 +1068,7 @@ mod tests {
             !why.contains("no `CustomAllReduce` handle to pass"),
             "the claim that had already gone stale: {why}"
         );
-        // And a fully configured two-rank group is admitted, which is the
-        // whole of what vendoring the headers bought at this layer.
+        // And a fully configured two-rank group is admitted.
         assert!(
             tp_serving_refusal(2, "group-a").is_ok(),
             "two ranks with a key is what `CAN_LAUNCH` being true admits"
@@ -1550,9 +1104,9 @@ mod tests {
                 "the plane can be built at {size} and vllm has no kernel for it"
             );
         }
-        // The fused landing's set is a DIFFERENT one, and six is the value
-        // that shows it: the plane builds, the plain kernel exists, and
-        // flashinfer never instantiated a fused launcher for it.
+        // The fused landing's set is a different one; six shows it: the plane
+        // builds and the plain kernel exists, but flashinfer instantiated no
+        // fused launcher for it.
         assert!(!kernels_cuda::comm::NRANKS.contains(&6));
         assert!(kernels_cuda::comm::NRANKS.contains(&16));
         assert!(!CONSTRUCTIBLE_WORLD_SIZES.contains(&16));

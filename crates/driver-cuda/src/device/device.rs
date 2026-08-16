@@ -1,53 +1,30 @@
-//! Device selection.
+//! Device selection: an explicit name for the primary context every other
+//! call in this crate assumes.
 //!
-//! The C++ shell has no context type: it calls `cudaSetDevice` at the handful
-//! of places that need one and relies on the primary context the runtime
-//! creates lazily. This module is that, made explicit -- not a new abstraction,
-//! just a name for the thing every other call in this crate already assumes.
-//!
-//! # Why binding is not enough
-//!
-//! `cudaSetDevice` only records a thread-local ordinal. It does not create the
-//! primary context, and the driver API calls this crate makes for virtual
-//! memory ([`crate::device::PhysicalPool`], [`crate::device::Arena`]) fail with
-//! `CUDA_ERROR_INVALID_CONTEXT` when none is current. So [`Device::bind`]
-//! forces the context into existence before returning, and the driver-API
-//! layers above it can stop caring how the runtime API's laziness works.
-//!
-//! # Threads
-//!
-//! The binding is thread-local, which is a property of the CUDA runtime and
-//! not something this type hides. A [`Device`] is a token saying "this thread
-//! is bound"; sending one to another thread would be a lie, so it is neither
-//! [`Send`] nor [`Sync`].
+//! `cudaSetDevice` only records a thread-local ordinal, not the primary
+//! context, so the driver-API VMM calls fail with `CUDA_ERROR_INVALID_CONTEXT`
+//! until one exists; [`Device::bind`] forces it. The binding is thread-local,
+//! so [`Device`] is neither [`Send`] nor [`Sync`].
 
 use crate::error::{Error, Result};
 use cudarc::runtime::sys as rt;
 use std::marker::PhantomData;
 
-/// The CUDA major version this build's bindings describe.
-///
-/// Public because whether the loaded runtime matches it is the difference
-/// between "this build cannot run here" and "something is broken", and callers
-/// -- a launcher choosing a driver, a test deciding whether to skip -- need to
-/// tell those apart without parsing an error message.
+/// The CUDA major version this build's bindings describe. Public so a caller
+/// can tell "this build cannot run here" from "something is broken".
 pub const COMPILED_MAJOR: i32 = if cfg!(feature = "cuda-13") { 13 } else { 12 };
 
 /// A bound CUDA device, with its primary context live on the current thread.
 #[derive(Debug)]
 pub struct Device {
     ordinal: i32,
-    /// Makes the type `!Send`/`!Sync`: the binding this represents is
-    /// thread-local, so the token has to be too.
+    /// Makes the type `!Send`/`!Sync`: the binding is thread-local.
     _not_send: PhantomData<*const ()>,
 }
 
 impl Device {
-    /// How many CUDA devices the driver can see.
-    ///
-    /// Returns `Ok(0)` rather than an error when there is no driver or no
-    /// device, because "no GPU here" is a normal answer to this question --
-    /// it is what a caller asks in order to decide whether to proceed.
+    /// How many CUDA devices the driver can see. `Ok(0)`, not an error, when
+    /// there is no driver or device: "no GPU here" is a normal answer.
     pub fn count() -> Result<i32> {
         let mut n = 0;
         // SAFETY: `n` is a valid, writable `i32` for the duration of the call.
@@ -78,12 +55,10 @@ impl Device {
                 code,
             });
         }
-        // `cudaSetDevice` is lazy. Freeing a null pointer is the cheapest
-        // runtime call that is defined to succeed, and forcing it here is what
-        // makes the driver-API calls elsewhere in this crate legal.
-        //
-        // SAFETY: freeing a null pointer is explicitly a no-op that returns
-        // `cudaSuccess`; its only effect is primary-context creation.
+        // `cudaSetDevice` is lazy; freeing a null pointer is the cheapest call
+        // that forces the primary context the driver-API calls need.
+        // SAFETY: freeing null is a no-op returning `cudaSuccess`; its only
+        // effect is primary-context creation.
         let code = unsafe { rt::cudaFree(std::ptr::null_mut()) };
         if code != rt::cudaError::cudaSuccess {
             return Err(Error::Runtime {
@@ -105,10 +80,6 @@ impl Device {
     }
 
     /// Compute capability, as `(major, minor)`.
-    ///
-    /// # Errors
-    ///
-    /// If the attribute query fails.
     pub fn compute_capability(&self) -> Result<(i32, i32)> {
         Ok((
             self.attribute(rt::cudaDeviceAttr::cudaDevAttrComputeCapabilityMajor)?,
@@ -117,51 +88,26 @@ impl Device {
     }
 
     /// Streaming-multiprocessor count.
-    ///
-    /// # Errors
-    ///
-    /// If the attribute query fails.
     pub fn sm_count(&self) -> Result<i32> {
         self.attribute(rt::cudaDeviceAttr::cudaDevAttrMultiProcessorCount)
     }
 
-    /// `cudaDevAttrMaxSharedMemoryPerMultiprocessor`, in bytes.
-    ///
-    /// `prefill.cuh:4213-4215` reads it, and
-    /// [`kernels_cuda::attn::fa2::geometry::Device`] carries it because the FA2 prefill
-    /// geometry snaps `NUM_MMA_KV` down against it. It lives here rather than
-    /// beside the launcher for §7's reason: `device/` is the only place this
-    /// driver spells a vendor attribute name.
-    ///
-    /// # Errors
-    ///
-    /// If the attribute query fails.
+    /// `cudaDevAttrMaxSharedMemoryPerMultiprocessor`, in bytes. The FA2 prefill
+    /// geometry snaps `NUM_MMA_KV` down against it.
     pub fn max_shared_memory_per_sm(&self) -> Result<i32> {
         self.attribute(rt::cudaDeviceAttr::cudaDevAttrMaxSharedMemoryPerMultiprocessor)
     }
 
-    /// `cudaDevAttrMaxSharedMemoryPerBlockOptin`, in bytes.
-    ///
-    /// `prefill.cuh:4216-4218`. The OPT-IN limit, not
-    /// `cudaDevAttrMaxSharedMemoryPerBlock`: the FA2 prefill kernels raise
-    /// their dynamic allocation past the default 48 KB, so the default limit
-    /// would refuse geometries the device will actually run.
-    ///
-    /// # Errors
-    ///
-    /// If the attribute query fails.
+    /// `cudaDevAttrMaxSharedMemoryPerBlockOptin`, in bytes: the opt-in limit,
+    /// not `cudaDevAttrMaxSharedMemoryPerBlock`. FA2 prefill raises its dynamic
+    /// allocation past the default 48 KB, which the plain limit would refuse.
     pub fn max_shared_memory_per_block_optin(&self) -> Result<i32> {
         self.attribute(rt::cudaDeviceAttr::cudaDevAttrMaxSharedMemoryPerBlockOptin)
     }
 
     /// Whether this device supports the virtual-memory management API that
-    /// [`crate::device::Arena`] is built on.
-    ///
-    /// # Errors
-    ///
-    /// If the attribute query fails.
-    /// Only the driver API exposes this one; the runtime's `cudaDeviceAttr`
-    /// has no equivalent enumerator.
+    /// [`crate::device::Arena`] is built on. Only the driver API exposes it;
+    /// the runtime's `cudaDeviceAttr` has no equivalent enumerator.
     pub fn supports_vmm(&self) -> Result<bool> {
         use cudarc::driver::sys as dr;
         let mut dev: dr::CUdevice = 0;
@@ -193,10 +139,6 @@ impl Device {
     }
 
     /// Free and total device memory, in bytes.
-    ///
-    /// # Errors
-    ///
-    /// If the query fails.
     pub fn memory_info(&self) -> Result<(usize, usize)> {
         let mut free = 0usize;
         let mut total = 0usize;
@@ -212,27 +154,15 @@ impl Device {
     }
 
     /// Whether the loaded runtime's major version is the one this build's
-    /// bindings describe.
-    ///
-    /// [`Device::bind`] refuses when this is `false`, because the runtime API
-    /// is not ABI-compatible across major versions and proceeding would
-    /// segfault inside the driver. Exposed separately so a caller can tell
-    /// "this binary is not the right one for this machine" -- a configuration
-    /// fact, and a reason to skip or to exec a sibling build -- apart from a
-    /// device that is genuinely broken.
-    ///
-    /// # Errors
-    ///
-    /// If the runtime version query fails.
+    /// bindings describe. [`Device::bind`] refuses when `false`: the runtime
+    /// API is not ABI-compatible across majors, so proceeding would segfault
+    /// inside the driver. Exposed separately to tell a wrong-build mismatch
+    /// from a broken device.
     pub fn runtime_major_matches() -> Result<bool> {
         Ok(Self::runtime_version()? / 1000 == COMPILED_MAJOR)
     }
 
     /// The loaded runtime's version, as CUDA reports it (e.g. `13000`).
-    ///
-    /// # Errors
-    ///
-    /// If the query fails.
     pub fn runtime_version() -> Result<i32> {
         let mut v = 0;
         // SAFETY: `v` is a valid, writable `i32`.
@@ -264,15 +194,10 @@ impl Device {
 /// Refuse to run against a CUDA runtime whose major version differs from the
 /// one this build's bindings describe.
 ///
-/// This is not defensiveness about a hypothetical. The symbol
-/// `cudaGraphAddNode` takes five parameters in `libcudart.so.12` and six in
-/// `libcudart.so.13`, and because this crate resolves symbols by name at
-/// runtime, the mismatch is not a link error -- it is a call that passes five
-/// arguments to a six-parameter function, so the driver reads its
-/// `nodeParams` pointer out of an uninitialised register and the process dies
-/// with a segfault nowhere near the cause.
-///
-/// Checking once, at bind time, converts that into a sentence.
+/// `cudaGraphAddNode` takes five parameters in `libcudart.so.12`, six in
+/// `.so.13`. Symbols resolve by name, so a mismatch is a five-arg call to a
+/// six-parameter function that reads `nodeParams` from an uninitialised
+/// register and segfaults far from the cause. Checked once at bind time.
 fn check_runtime_major() -> Result<()> {
     let version = Device::runtime_version()?;
     let major = version / 1000;

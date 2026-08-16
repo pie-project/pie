@@ -23,6 +23,40 @@ pub enum ArgValue {
     Bool(bool),
     /// A one-byte host enumerator.
     U8(u8),
+    /// A device address WITH the shape the statement gave it.
+    ///
+    /// # Why this is a value kind and not three
+    ///
+    /// A statement places a region: an address, a row count and a pitch,
+    /// which arrive together and describe one thing. The old signatures took
+    /// them apart -- `y: *mut bf16` next to `#[source(OutWidth(0))] width:
+    /// i32` -- and paid for it in the only currency this file cares about,
+    /// which is that the two halves could then be bound from different
+    /// places. Forty-seven parameters existed to carry back a number the
+    /// pointer beside them already implied.
+    ///
+    /// So the binder mints one of these for every operand it resolves, and
+    /// the SIGNATURE decides how much of it to keep: `In<0, bf16>`
+    /// takes all three, a bare `*const bf16` takes the address and drops the
+    /// rest (`jit/abi.rs`'s `ptr_abi!`). Nothing is lost by minting it for a
+    /// launcher that does not ask.
+    ///
+    /// # It never reaches a launch
+    ///
+    /// This is a BINDER value, not a kernel argument. A `__global__`
+    /// parameter is one cell; a region is three, and which of them the kernel
+    /// wants is the body's business. Bodies destructure and push
+    /// [`ArgValue::Ptr`] and [`ArgValue::I32`] themselves, so [`Bound::new`]
+    /// never sees one -- and [`ArgValue::cell`] panics rather than guessing,
+    /// exactly as it does for [`ArgValue::Bytes`].
+    Region {
+        /// The device address.
+        ptr: *mut c_void,
+        /// Rows in this launch's rectangle.
+        rows: i32,
+        /// Elements per row. Zero where the statement gave none.
+        width: i32,
+    },
     /// A by-value aggregate — a struct the kernel takes whole.
     ///
     /// # Safety
@@ -52,6 +86,7 @@ impl ArgValue {
             ArgValue::I64(_) => "an i64",
             ArgValue::Bool(_) => "a bool",
             ArgValue::U8(_) => "a u8 enumerator",
+            ArgValue::Region { .. } => "a region",
             ArgValue::Bytes { .. } => "a by-value aggregate",
         }
     }
@@ -77,6 +112,9 @@ impl ArgValue {
             ArgValue::I64(v) => v as u64,
             ArgValue::Bool(v) => u64::from(v),
             ArgValue::U8(v) => u64::from(v),
+            ArgValue::Region { .. } => {
+                panic!("a region has no cell; a body pushes its parts instead")
+            }
             ArgValue::Bytes { .. } => {
                 panic!("an aggregate has no cell; the launch copies it instead")
             }

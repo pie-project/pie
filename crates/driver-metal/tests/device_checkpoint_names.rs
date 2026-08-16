@@ -661,8 +661,18 @@ fn check_projection_widths(
         //
         // `q_heads` stays stack-wide because there is no per-layer q count to
         // read, and every q_proj agreed.
+        // The Q GATE doubles the first of the two. `Qwen3NextAttention`
+        // projects `2 * q_heads * head_dim` and splits each head's row
+        // into a query and a per-head output gate -- so a reader holding
+        // the ungated width takes half of every Q and the tensor is
+        // present, correctly spelled and exactly twice as wide, which is
+        // the shape of the gemma-4 defect this whole gate exists for.
+        let q_lanes = if layer.q_gate { 2 } else { 1 };
         for (role, heads) in [
-            (format!("layer.{l}.q_proj"), deployment.shape.q_heads),
+            (
+                format!("layer.{l}.q_proj"),
+                q_lanes * deployment.shape.q_heads,
+            ),
             (format!("layer.{l}.k_proj"), layer.kv_heads),
         ] {
             let Some(got) = width_of(&role) else { continue };

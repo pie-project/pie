@@ -184,7 +184,7 @@ pub fn gemma3n_cuda(facts: &Gemma3nFacts, class: FireClass) -> ForwardPlan {
             let kv = dsl::Kv::at(t, l);
             dsl::cuda::write_kv_to_pages(&kk, &v, &kv);
             dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
-            let o = dsl::cuda::attention_for(class, &q, &kv, window_left)
+            let o = dsl::cuda::attention_for(class, &q, &kv, window_left, facts.attn.head_dim)
                 .expect("a plain attention statement produces its value");
             let o = dsl::attention_landing(&o, &w.o_proj, l);
             let o = dsl::cuda::rmsnorm(&o, &w.post_attn_norm);
@@ -197,7 +197,7 @@ pub fn gemma3n_cuda(facts: &Gemma3nFacts, class: FireClass) -> ForwardPlan {
             let gate = matmul(&m, &w.gate_proj);
             let up = matmul(&m, &w.up_proj);
             let gate = if facts.is_sparse(l) {
-                dsl::cuda::gaussian_topk(&gate, facts.intermediate(l))
+                dsl::cuda::gaussian_topk(&gate, facts.intermediate(l), facts.sparsity_std_mult())
             } else {
                 gate
             };
@@ -231,7 +231,13 @@ pub fn gemma3n_cuda(facts: &Gemma3nFacts, class: FireClass) -> ForwardPlan {
                     continue;
                 }
                 let win = dsl::select(&streams, s);
-                dsl::cuda::residual_add(&win, &ple, facts.hidden);
+                // `let _`, because the K-1 per-stream PLE adds are IN PLACE
+                // and the value the statement produces is `win` again.
+                // `builder!` blanket-`#[must_use]`s what it generates
+                // (`model-dsl/src/cuda/mod.rs:278`), which is right for a
+                // surface where dropping a result is normally a lost launch;
+                // this is the one site on the surface where it is not.
+                let _ = dsl::cuda::residual_add(&win, &ple, facts.hidden);
             }
         }
 

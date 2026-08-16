@@ -35,12 +35,16 @@
 //!
 //! Here `kernels_wgpu::entrypoint_source(symbol, tier)` IS the module, embedded
 //! in the rlib by `include_str!`, expanded and compiled in this process by
-//! `naga`. So **[`crate::shell::Shell::open`] takes no module argument at all**,
-//! there is no directory to find, no `OUT_DIR` to relay, and no build script in
-//! this crate where its sibling has one whose only job is to pass
-//! `DEP_PIE_KERNELS_VULKAN_SPV_DIR` along. That is not a convenience; it is the
-//! deployment story this backend exists for, and it is worth saying loudly
+//! `naga`. So **[`crate::shell::Shell::open`] takes no module argument at
+//! all**, and there is no directory to find. That is not a convenience; it is
+//! the deployment story this backend exists for, and it is worth saying loudly
 //! because it is invisible in a diff — the argument that is not there.
+//!
+//! `driver-vulkan` now says the same thing. Its `Shell::open` lost its module
+//! argument too, its build script — whose only job was to relay
+//! `DEP_PIE_KERNELS_VULKAN_SPV_DIR` — is deleted, and its store is called
+//! [`Embedded`] as well. The two arrived from opposite ends: this crate never
+//! had a directory, that one had to be talked out of the one it had.
 //!
 //! [`Modules`] survives as a seam with exactly one implementation that matters,
 //! [`Embedded`], which is what every caller uses. It is a trait rather than a
@@ -174,6 +178,23 @@ pub struct Fire<'a, R: Resolve> {
     /// thousand submissions with a device wait on each. Not a setting to leave
     /// on.
     pub one_at_a_time: bool,
+    /// Record only the FIRST `n` rectangles of the plan, or all of them.
+    ///
+    /// # What a truncated fire is for
+    ///
+    /// It is the only way to see an intermediate value on this backend. A
+    /// fire's arena is allocated, written by every rectangle in turn, read for
+    /// its readout and dropped inside one function, so the whole of what is
+    /// observable is the LAST thing written to each offset — and once a
+    /// computation has gone wrong, everything after it has gone wrong too.
+    ///
+    /// Stopping after `n` makes the arena's end state the state AT `n`. A
+    /// caller that walks `n` finds the rectangle a value first went wrong at,
+    /// which is a question no readback of a whole fire can answer.
+    ///
+    /// The answer is a MEASUREMENT and not a fire: a truncated plan computes
+    /// nothing anybody wants, and its readout is whatever the arena held.
+    pub prefix: Option<usize>,
 }
 
 // Derived `Clone` and `Copy` would bound `R: Copy`, and a resolver is a pool or
@@ -355,7 +376,12 @@ pub fn fire<R: Resolve<Buffer = Buffer>, M: Modules>(
         geometry,
         tier,
         one_at_a_time,
+        prefix,
     } = what;
+    let launches = match prefix {
+        Some(n) => &lowered.launches[..n.min(lowered.launches.len())],
+        None => &lowered.launches[..],
+    };
 
     // Pass one. Nothing here touches the device except to allocate the scalar
     // blocks, which must outlive the submission.
@@ -384,7 +410,7 @@ pub fn fire<R: Resolve<Buffer = Buffer>, M: Modules>(
     // returns an owned `String`, so this map borrows nothing from `modules`.
     let mut seen: std::collections::BTreeMap<&str, crate::device::Read> =
         std::collections::BTreeMap::new();
-    for (at, launch) in lowered.launches.iter().enumerate() {
+    for (at, launch) in launches.iter().enumerate() {
         let symbol = lowered.kernels[launch.kernel as usize].as_str();
         if seen.contains_key(symbol) {
             continue;
@@ -398,7 +424,6 @@ pub fn fire<R: Resolve<Buffer = Buffer>, M: Modules>(
                 source: hit.source.clone(),
                 tier: hit.tier,
                 declared: hit.declared.clone(),
-                sig: hit.sig,
             };
             seen.insert(symbol, hit);
             continue;
@@ -426,7 +451,6 @@ pub fn fire<R: Resolve<Buffer = Buffer>, M: Modules>(
                 source: source.clone(),
                 tier: at_tier,
                 declared: declared.clone(),
-                sig: crate::dispatch::row_of(kernels_wgpu::KERNELS, symbol),
             },
         );
         seen.insert(
@@ -435,28 +459,22 @@ pub fn fire<R: Resolve<Buffer = Buffer>, M: Modules>(
                 source,
                 tier: at_tier,
                 declared,
-                sig: crate::dispatch::row_of(kernels_wgpu::KERNELS, symbol),
             },
         );
     }
 
-    for (at, launch) in lowered.launches.iter().enumerate() {
+    for (at, launch) in launches.iter().enumerate() {
         let symbol = lowered.kernels[launch.kernel as usize].as_str();
         // Present by construction: the pass above inserted every symbol this
         // loop can name, and refused the fire if it could not.
         let read = &seen[symbol];
-        let (source, at_tier, declared, sig) =
-            (read.source.clone(), read.tier, &read.declared, read.sig);
+        let (source, at_tier, declared) = (read.source.clone(), read.tier, &read.declared);
         let planned_one = crate::dispatch::plan_one(
             lowered,
             launch,
-            kernels_wgpu::KERNELS,
             Built {
                 module: crate::geometry::Module::loaded(symbol, declared),
                 declared,
-                // Once per SYMBOL, not once per launch: `sig_in` walks the
-                // table twice and this loop runs 452 times over ten symbols.
-                sig,
             },
             Sources {
                 arena,
@@ -535,6 +553,28 @@ pub fn fire<R: Resolve<Buffer = Buffer>, M: Modules>(
 /// of the lowering, which is now cached, and of the ARENA, which is still a
 /// fresh allocation every step — so caching them means giving the arena a
 /// lifetime first.
+///
+/// # That was tried anyway, and here is the hit rate
+///
+/// A cache in `Device`, one entry per dispatch POSITION, keyed on the resolved
+/// binding list — buffer, offset and length per slot, which folds the shadow
+/// scratch in — plus the pipeline and the uniform bytes. It hit **0 of 10,000
+/// dispatches**, and the misses say exactly why:
+///
+/// ```text
+/// BINDMISS at 118: pipeline true slots true uniform true resolved false
+///    slot 3: buffer false off 31488 vs 31488 len 2048 vs 2048
+/// ```
+///
+/// Decode against decode, everything matches but the HANDLE: same pipeline,
+/// same slots, same uniform block, same offsets, same lengths, different
+/// allocation. The geometry is already perfectly stable and the arena is not,
+/// which is the sentence above measured rather than reasoned.
+///
+/// So the order is fixed: give the arena a lifetime and the cache follows for
+/// free, at 100% instead of 0%. And the prize is the 2.05 ms named above — not
+/// the tens of milliseconds a decode's per-launch average suggests, which is
+/// the mistake this note existed to prevent and which was made again anyway.
 fn record(
     device: &Device,
     pipelines: &mut Pipelines,
@@ -599,7 +639,11 @@ fn record(
                     bytes,
                     at: ParamSlot::Uniform,
                 } => bytes.as_slice(),
-                _ => &[],
+                // A storage block does not exclude a uniform one: the GDN
+                // prefill pair takes `GdnCoreParams` as a buffer and its two
+                // rectangle scalars as a `@group(1)` block. `Dispatch::uniform`
+                // is empty for everything else.
+                _ => d.uniform.as_slice(),
             },
             groups: d.groups,
         });
@@ -640,10 +684,34 @@ fn record(
 /// A fire's distributions, off the arena and widened.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Logits {
-    /// How many distributions: one per readout, so [`Frame::readouts`] and
-    /// [`Lowered::n_requests`] and this are the same number.
+    /// How many distributions: **one per ROW OF THE FIRE**, not one per
+    /// readout.
     ///
-    /// [`Frame::readouts`]: crate::resources::Frame::readouts
+    /// This doc said *"one per readout, so `Frame::readouts` and
+    /// `Lowered::n_requests` and this are the same number"* and that was not
+    /// what the code did — [`logits`] sets this from `exit.rows`, the fire's
+    /// row count. Measured rather than argued: a 512-token prefill of one turn
+    /// hands back `rows = 512` and 77,791,232 values, 296.8 MB as `f32`, of
+    /// which the caller wants one row. [`crate::turns::Step::readout_of`]'s
+    /// doc had it right all along — *"every row samples"*.
+    ///
+    /// # The optimisation this description was hiding
+    ///
+    /// Narrowing the readback to the rows [`crate::turns::Step::readouts_of`]
+    /// names is worth ~180 ms of an 815 ms 512-row prefill in release
+    /// (`driver-wgpu`'s `where_a_prefills_time_goes_across_its_plan` measures
+    /// a fire that records ZERO rectangles and still pays it). llama.cpp
+    /// computes prompt logits for the last token of a batch rather than all of
+    /// them, and turns in 40,400 tok/s against this backend's 628.
+    ///
+    /// It is a semantic change to a public type, so here is its blast radius,
+    /// counted rather than guessed. Seventeen call sites reach a row THROUGH
+    /// `readout_of`/`readouts_of` and would keep working under a remap —
+    /// including [`crate::frames`]'s own, which is the only one inside this
+    /// crate's `src`. Five index by fire row directly and would each need
+    /// reading: `tests/serving.rs` at the raw-`values` slice and at the
+    /// `map(|&at| ...)` gather, and `tests/hybrid_probe.rs` at its
+    /// `map_while` walk, its `picked` row and its span gather.
     pub rows: usize,
     /// Elements in one distribution, which is the vocabulary.
     pub vocab: usize,

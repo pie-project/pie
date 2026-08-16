@@ -1,45 +1,13 @@
-//! `Deployment` — everything a driver needs to serve a checkpoint, with
-//! no family name in it.
+//! `Deployment` — everything a driver needs to serve a checkpoint, with no
+//! family name in it.
 //!
-//! # Why this is a type and not a trait
+//! A type and not a trait: the thirteen questions a `Box<dyn PlannedFamily>`
+//! answered had exceptions that were all one family, and `facts_from_hf` ran
+//! at the admission of every fire. Gemma-4's two head dims are now
+//! `attention[l].head_dim` differing between layers, and a `Vec` of per-layer
+//! facts has no opinion about which family produced it.
 //!
-//! The drivers used to ask a `Box<dyn PlannedFamily>` thirteen
-//! questions, and its own doc comments named the exception in the
-//! method: `pins_attention_values()` said *"Only gemma-4 does"*, and
-//! `decode_plan_head_dims()` existed because gemma-4's two layer kinds
-//! disagree. Then the callers undid the abstraction to get the name
-//! back — `let is_gemma4 = family.planless_prefill();` appears twice in
-//! the CUDA shell and once in its transfer path.
-//!
-//! Wrapping a family name in a virtual predicate and then recovering the
-//! name at the call site means **the axis was the family all along**.
-//!
-//! It also cost at run time. `facts_from_hf` was called from the
-//! admission of EVERY fire, allocating a box and cloning per-layer
-//! `Vec`s — while the lowering it feeds is cached precisely because it
-//! costs 3.3 ms. The expensive answer was cached; its input was
-//! rederived.
-//!
-//! # What changes about gemma-4
-//!
-//! Its two head dims stop being an exception and become
-//! `attention[l].head_dim` differing between layers, which is what they
-//! are. A `Vec` of per-layer facts has no opinion about which family
-//! produced it.
-//!
-//! # Why it lives HERE
-//!
-//! `crates/model/tests/one_normalizer.rs` states the rule: *"what a
-//! driver reads is the answer, never the question."* The drivers obeyed
-//! the letter — they read `pie.model/1`, not `config.json` — while the
-//! answer was still SHAPED like the question and they still switched on
-//! it: 33 `FACTS_ROWS` rows and 11 derivations in the CUDA shell alone,
-//! against the 25 `model_type` conditionals of the C++ normalizer that
-//! test was written to hunt.
-//!
-//! A `Deployment` with no family name in it is a type a driver
-//! **cannot** branch on. That is the difference between a guard that
-//! must be remembered and one that cannot be routed around.
+//! It lives here because a driver reads the answer, never the question.
 
 use std::collections::BTreeMap;
 
@@ -59,9 +27,8 @@ pub struct LayerAttention {
     pub window: i32,
     /// Which layer's KV pages this layer reads.
     ///
-    /// Its own index for the ordinary case. Gemma-4's trailing layers
-    /// name an earlier one and own no pages themselves — which is a
-    /// fact about a LAYER, and was a fact about a family.
+    /// Its own index for the ordinary case; gemma-4's trailing layers name
+    /// an earlier one and own no pages themselves.
     pub kv_source: u32,
     /// The attention scale. Usually `1/sqrt(head_dim)`; gemma-4 runs
     /// `1.0` because its q/k norms carry the scaling.
@@ -73,34 +40,36 @@ pub struct LayerAttention {
     pub rotary_dim: u32,
     /// The kv-head COUNT for this layer.
     ///
-    /// A head shape is two numbers. This struct stated the width and
-    /// left the count on the stack-wide `Geometry`, which is right for
-    /// every family whose layers agree — and gemma-4's do not. The
-    /// driver refused the whole generation over exactly this absence:
-    /// *"`LayerAttention` states no per-layer kv-head count to go with
-    /// them; the second shape's K would be paged at the first shape's
-    /// width"*. The rows that have one shape repeat it, which is the
-    /// same answer they were giving implicitly.
+    /// A head shape is two numbers, and a stack-wide count is wrong for any
+    /// stack whose layers disagree: the second shape's K would be paged at
+    /// the first shape's width. Rows with one shape repeat it.
     pub kv_heads: u32,
+    /// Whether this layer's Q projection also carries a per-head OUTPUT
+    /// GATE, doubling its published width.
+    ///
+    /// `Qwen3NextAttention` projects `2 * q_heads * head_dim` and splits
+    /// the result per head into a query and a gate, then multiplies the
+    /// attention's output by `sigmoid(gate)` before landing it. Twelve
+    /// families do not, so this is `false` for all of them.
+    ///
+    /// It is stated because a projection WIDTH is the one attention
+    /// fact a name gate cannot check: every tensor is present and
+    /// correctly spelled, and a reader holding the ungated width takes
+    /// half of each Q. That is the gemma-4 defect `kv_heads` was added
+    /// to this struct for, one field over.
+    pub q_gate: bool,
 }
 
 /// Which gate the MLP applies to its first projection.
 ///
-/// A `Deployment` STATED NO ACTIVATION AT ALL, and a driver that
-/// receives a shape rather than a text has nowhere else to learn it. So
-/// every checkpoint reaching a backend was served with a SiLU gate,
-/// which for a gemma is a few percent at the origin that diverges from
-/// there: finite, plausible, never faulting, and wrong. `driver-metal`
-/// caught one class of it by asking the TENSORS — a stack shipping
-/// `pre_feedforward_layernorm` norms both ways round and therefore
-/// gates with a GELU — and refused, naming what would lift the refusal:
-/// *"either an activation on `Deployment` or a `Variant::trace` that
-/// can be asked for a Metal text"*. This is the first of those.
+/// A driver that receives a shape rather than a text has nowhere else to
+/// learn this, and serving a GELU stack on SiLU is a few percent at the
+/// origin that diverges from there: finite, plausible, never faulting, wrong.
 ///
-/// The clamp is on the variant rather than beside it, because a limit
-/// of zero and a limit of seven are not two settings of one gate: gpt-
-/// oss's is a different function, and a row holding `0.0` in a field
-/// nothing reads cannot be told from one that forgot to fill it.
+/// The clamp is on the variant rather than beside it, because a limit of zero
+/// and a limit of seven are not two settings of one gate — gpt-oss's is a
+/// different function, and a row holding `0.0` in a field nothing reads
+/// cannot be told from one that forgot to fill it.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum MlpGate {
     /// `silu(gate) * up` — llama's, and most of the catalog's.
@@ -120,11 +89,9 @@ pub enum MlpGate {
 
 /// What kind of KV this deployment needs.
 ///
-/// AN ENUM, so a shape the driver has no pool for is an
-/// `unimplemented!` ARM rather than a row in a registry that loads
-/// successfully and dies at its first fire. That was a real defect:
-/// the MLA lineage registered in `FACTS_ROWS`, answered `facts_from_hf`
-/// happily, and had no forward path at all.
+/// AN ENUM, so a shape the driver has no pool for is an `unimplemented!` arm
+/// rather than a row in a registry that loads successfully and dies at its
+/// first fire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KvStyle {
     /// Ordinary paged K and V.
@@ -140,10 +107,8 @@ pub enum KvStyle {
     /// A per-layer COMPRESSED KV plane, stated as one compression ratio
     /// per layer.
     ///
-    /// Named for the shape and not for the generation that introduced it.
-    /// This was `Dsv4`, which put a checkpoint generation into a vocabulary
-    /// whose own doc says "nothing in it is a string naming a family" — and
-    /// a driver matching on it had to spell that generation to ask a
+    /// Named for the shape and not for the generation that introduced it: a
+    /// driver matching on it must not have to spell a family name to ask a
     /// question about a KV layout.
     CompressedPlane {
         /// One ratio per layer; `None` for an uncompressed layer.
@@ -154,17 +119,9 @@ pub enum KvStyle {
 impl KvStyle {
     /// Whether THIS BUILD provisions a store this style can live in.
     ///
-    /// A capability question, not a shape one: the style is a fact about
-    /// the model and this answer is a fact about the binary, and keeping
-    /// them separable is why it is a method rather than a variant.
-    ///
-    /// It lives here because it was written three times — byte-identical
-    /// bodies in `glm_5`, `kimi_k2` and `kimi_k3`, one per MLA family —
-    /// and three copies of one question is how the copies drift. Worse,
-    /// only some callers asked: `deployment()` consulted it and `trace()`
-    /// did not, so glm-5 refused at the door and traced a fire anyway,
-    /// which is precisely the "loads successfully and dies at its first
-    /// fire" failure this enum's own doc says it exists to prevent.
+    /// A capability question, not a shape one: the style is a fact about the
+    /// model and this answer is a fact about the binary, and keeping them
+    /// separable is why it is a method rather than a variant.
     #[must_use]
     pub fn has_a_store_in_this_build(&self) -> bool {
         match self {
@@ -176,14 +133,9 @@ impl KvStyle {
     /// The refusal a build with no store for this style owes its caller,
     /// or `None` when one exists.
     ///
-    /// Beside the predicate because it answers the same question, and the
-    /// reason both are here is the reason the predicate is: the sentence
-    /// was written FOUR times — once per MLA family, in four cosmetic
-    /// variations of "this build provisions no store" — and four
-    /// spellings of one refusal is four places for one of them to go
-    /// stale. It is keyed on the STYLE and not on the family because the
-    /// missing store is a property of the shape: a compressed KV plane
-    /// has nowhere to live regardless of which vendor shipped it.
+    /// Keyed on the STYLE and not on the family: the missing store is a
+    /// property of the shape, and a compressed KV plane has nowhere to live
+    /// regardless of which vendor shipped it.
     #[must_use]
     pub fn store_refusal(&self) -> Option<Refusal> {
         match self {
@@ -227,22 +179,11 @@ pub struct RecurrentShape {
     pub conv_k: i32,
     /// mamba's B/C group count, or `0` for a gated-delta stack.
     ///
-    /// The one number of a mamba mixer that NO tensor extent carries:
-    /// the checkpoint ships `2 * n_groups * state_size` rows of B and C
-    /// fused into one bank, so a loader holding the tensors knows only
-    /// their PRODUCT. `NemotronMambaFacts::n_groups` says exactly that,
-    /// and says it because a wrong factorization cuts a group in half.
-    ///
-    /// It gets its own field because it had been travelling as
-    /// [`Self::k_h`] — nemotron's projection wrote `k_h: m.n_groups`,
-    /// and every kernel that reads `k_h` is a GATED-DELTA kernel that no
-    /// mamba row dispatches, so the name was free and the value rode it.
-    /// The launch then filled `GdnCtx::n_groups` with the literal `0`
-    /// beside the `k_h` holding the real count. Two statements of one
-    /// quantity with the live reader on the empty one:
-    /// `selective_scan_update` scanned at zero groups, and the grouped
-    /// gated norm computed its `group_size` as
-    /// `Source::Div(Width(In(0)), Gdn("n_groups"))` — a divide by zero.
+    /// The one number of a mamba mixer that NO tensor extent carries: the
+    /// checkpoint ships `2 * n_groups * state_size` rows of B and C fused
+    /// into one bank, so a loader holding the tensors knows only their
+    /// PRODUCT. Its own field rather than riding [`Self::k_h`], because
+    /// `GdnCtx::n_groups` divides by it — at zero, that is a divide by zero.
     pub n_groups: i32,
 }
 
@@ -259,11 +200,9 @@ pub enum PrefillStyle {
 
 /// Where a layer's norm sits relative to its projections.
 ///
-/// It is on the deployment rather than inside a family's facts because
-/// a DRIVER needs it: an adapter's staging reads the projection input,
-/// and which buffer that is depends on this. `Pre` ships one input
-/// norm; `Post` (olmo2) ships `post_attention` and `post_feedforward`
-/// instead.
+/// A DRIVER needs it: an adapter's staging reads the projection input, and
+/// which buffer that is depends on this. `Pre` ships one input norm; `Post`
+/// (olmo2) ships `post_attention` and `post_feedforward` instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NormPlacement {
     /// The norm precedes the projections; the input is the normed value.
@@ -286,12 +225,8 @@ pub enum AttnOutput {
 /// The geometry a launch path reads, once, off the value it was already
 /// holding.
 ///
-/// Nine numbers. `driver-cuda` read every one of them off `model.hf` —
-/// a `HfConfig` kept resident purely so a kernel could ask how many
-/// heads there are — and these nine are exactly what it asked for.
-/// Nothing here is derived: they are the row's own numbers, in the
-/// row's own units, with the one exception named on
-/// [`Self::head_dim_kernel`].
+/// Nothing here is derived: they are the row's own numbers, in the row's own
+/// units, with the one exception named on [`Self::head_dim_kernel`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Geometry {
     /// Residual width.
@@ -304,52 +239,33 @@ pub struct Geometry {
     pub head_dim: u32,
     /// The width a kernel was instantiated at, when it differs.
     ///
-    /// The ONE derived number, and it is here because sixteen executor
-    /// sites re-derived it from config and a shape is not something a
-    /// boolean gives: phi-3's 96-wide heads run on the 128-wide kernel,
-    /// so a buffer sized `heads * head_dim` is too small by a third.
-    /// Equal to [`Self::head_dim`] when nothing was padded, so a reader
-    /// that wants "the width to allocate" can always use this one.
+    /// The ONE derived number: phi-3's 96-wide heads run on the 128-wide
+    /// kernel, so a buffer sized `heads * head_dim` is too small by a third.
+    /// Equal to [`Self::head_dim`] when nothing was padded, so a reader that
+    /// wants the width to allocate can always use this one.
     pub head_dim_kernel: u32,
     /// The dense MLP's inner width.
     pub intermediate: u32,
     /// One EXPERT's inner width, or `0` for a dense stack.
     ///
-    /// Separate from [`Self::intermediate`] because the two are
-    /// genuinely different numbers on a mixture and the forward
-    /// workspace is ONE buffer both layer kinds share — so what it must
-    /// hold is the wider of them. A planner given only the dense width
-    /// under-sizes a mixture whose experts are wider, which does not
-    /// fail: it moves bytes out of the KV pool, quietly.
+    /// Separate from [`Self::intermediate`] because the forward workspace is
+    /// ONE buffer both layer kinds share, so what it must hold is the wider.
+    /// A planner given only the dense width under-sizes a mixture whose
+    /// experts are wider, and that moves bytes out of the KV pool quietly.
     pub moe_intermediate: u32,
     /// How many experts one token visits, or `0` for a dense stack.
     ///
-    /// Beside [`Self::moe_intermediate`] because a mixture is not
-    /// described by a width alone: the router ranks the experts and this
-    /// is how deep down that ranking a token goes. Every consumer of the
-    /// width needs it, and until it was stated here no consumer could
-    /// have it — [`crate::catalog::LoadShape`] counts the experts, this
-    /// struct gives one expert's width, and the top-k was known only to
-    /// the row's own facts, which no driver receives.
-    ///
-    /// A driver's alternative was to guess. driver-metal refused instead,
-    /// and its refusal named this field before it existed: "a mixture
-    /// fired at the wrong top-k routes each token to almost the right
-    /// experts and returns fluent nonsense". That is the same class as
-    /// serving a GEGLU stack on SiLU — finite, plausible, never faulting.
+    /// A mixture is not described by a width alone: the router ranks the
+    /// experts and this is how deep down that ranking a token goes. A mixture
+    /// fired at the wrong top-k routes each token to almost the right experts
+    /// and returns fluent nonsense.
     pub experts_per_token: u32,
     /// The dense FFN a routed layer runs BESIDE the bank, gated by one
-    /// sigmoid scalar per token. Zero means the routing has none, and it
-    /// is `n_shared_experts * moe_intermediate` rather than one expert's
-    /// width — the rows already fold the count in.
-    ///
-    /// Here for the same reason as [`Self::experts_per_token`]: every
-    /// routed row states it (glm-5 1408, kimi-k2 2048, kimi-k3 1024,
-    /// qwen3.5 under the name `shared_expert_intermediate`) and none of
-    /// it reached a driver, so driver-metal's `shared_intermediate` had
-    /// to be derived — and the only proxies available were "equal to
-    /// `moe_intermediate`", which is false for kimi-k2, or "zero", which
-    /// silently drops a whole FFN from every token.
+    /// sigmoid scalar per token. Zero means the routing has none, and it is
+    /// `n_shared_experts * moe_intermediate` rather than one expert's width —
+    /// the rows already fold the count in. Stated because there is no proxy:
+    /// equal to `moe_intermediate` is false for kimi-k2, and zero drops a
+    /// whole FFN from every token.
     pub shared_intermediate: u32,
     /// The logit dimension.
     ///
@@ -361,38 +277,20 @@ pub struct Geometry {
 
 /// The attention head dims a build INSTANTIATES.
 ///
-/// `kernels.def`'s `PIE_ATTN_HEAD_DIM` rows on the CUDA side, and the
-/// same four points on the Metal side — `kernels-metal`'s
-/// `sdpa_paged_decode` axis declares `d_64`, `d_128`, `d_256` and
-/// `d_512`. It is a property of the BINARY, not of any checkpoint, which
-/// is why no row states it.
+/// `kernels.def`'s `PIE_ATTN_HEAD_DIM` rows on the CUDA side, and the same
+/// four points on the Metal side. A property of the BINARY, not of any
+/// checkpoint, which is why no row states it.
 ///
-/// # Why it lives HERE
-///
-/// It lived in `shared::llama_like::project` because llama-like wrote it
-/// down first, and four families that are not llama-like — gemma-2,
-/// gemma-3, gemma-3n and qwen-3.5 — reached into that module for it. A
-/// table about the binary filed under one model family is the shape
-/// `shared`'s own rule forbids: what belongs there is *about models in
-/// general*, and this is not about models at all.
-///
-/// Beside [`Geometry`] because [`Geometry::head_dim_alloc`] is the
-/// CONSUMER's half of this same question. One file answers "what width
-/// does a head actually run at", from both ends, so a producer that pads
-/// and a consumer that allocates cannot disagree — which they did:
-/// `driver-metal` allocated `head_dim_alloc()` (128 for phi-3, with a
-/// comment naming phi-3) while the Metal text named
-/// `sdpa_paged_decode_bfloat16_d_96`, a kernel no build declares.
+/// Beside [`Geometry`] because [`Geometry::head_dim_alloc`] is the CONSUMER's
+/// half of this same question, so a producer that pads and a consumer that
+/// allocates cannot disagree.
 pub const ATTN_HEAD_DIMS: &[u32] = &[64, 128, 256, 512];
 
-/// Smallest instantiated head dim that can hold `head_dim`, or
-/// `head_dim` itself when none can — the caller then surfaces the
-/// dispatch error rather than silently mis-sizing.
+/// Smallest instantiated head dim that can hold `head_dim`, or `head_dim`
+/// itself when none can — the caller then surfaces the dispatch error rather
+/// than silently mis-sizing.
 ///
-/// The result is never less than `head_dim`: the filter is `d >=
-/// head_dim` and the fallback is `head_dim`. Callers used to `.max()` it
-/// anyway, in four places, which is what a contract a function cannot
-/// state looks like from the outside.
+/// The result is never less than `head_dim`, so callers need no `.max()`.
 #[must_use]
 pub fn round_up_attn_head_dim(head_dim: u32) -> u32 {
     ATTN_HEAD_DIMS
@@ -404,11 +302,9 @@ pub fn round_up_attn_head_dim(head_dim: u32) -> u32 {
 }
 
 impl Geometry {
-    /// The zeros that go with [`Deployment::empty`].
-    ///
-    /// A shape no fire can take, so a driver that forgot to fill it in
-    /// refuses at its first admission rather than serving a stack it
-    /// never derived.
+    /// The zeros that go with [`Deployment::empty`]: a shape no fire can
+    /// take, so a driver that forgot to fill it in refuses at its first
+    /// admission rather than serving a stack it never derived.
     pub const EMPTY: Self = Self {
         hidden: 0,
         q_heads: 0,
@@ -422,11 +318,10 @@ impl Geometry {
         vocab: 0,
     };
 
-    /// Heads per KV group — the GQA ratio a decode kernel is
-    /// instantiated for.
+    /// Heads per KV group — the GQA ratio a decode kernel is instantiated for.
     ///
-    /// Zero KV heads answers 0 rather than dividing, because
-    /// [`Self::EMPTY`] must be askable.
+    /// Zero KV heads answers 0 rather than dividing, because [`Self::EMPTY`]
+    /// must be askable.
     #[must_use]
     pub const fn gqa_group(&self) -> u32 {
         // `match` rather than `unwrap_or`, which is not const yet.
@@ -449,9 +344,8 @@ impl Geometry {
 
     /// The widest MLP any layer in the stack asks for.
     ///
-    /// The forward workspace is sized from this, and it is a `max`
-    /// rather than a choice because a mixture's layers share the buffer
-    /// with its dense ones.
+    /// The forward workspace is sized from this: a `max` rather than a choice
+    /// because a mixture's layers share the buffer with its dense ones.
     #[must_use]
     pub const fn widest_mlp(&self) -> u32 {
         if self.moe_intermediate > self.intermediate {
@@ -462,45 +356,28 @@ impl Geometry {
     }
 }
 
-/// How a stack rescales its rope frequency ladder, for the stacks that
-/// do.
+/// How a stack rescales its rope frequency ladder, for the stacks that do.
 ///
 /// # Why this is a `Deployment` field and not a derivation
 ///
-/// It was neither, for a while, and that was a bug with a blast radius.
-/// `driver-metal` read four numbers off the `pie.model/1` descriptor —
-/// `rope_scaling.{factor, low_freq_factor, high_freq_factor,
-/// original_max_position_embeddings}` — and built its decode ladder from
-/// them. Deleting the descriptor deleted the only path those numbers
-/// travelled, and `DecodeGeometry` kept the four fields while nothing
-/// filled them: every Llama-3.1/3.2/3.3 would have run with a factor of
-/// zero, which the derivation reads as "no rescaling". That model does
-/// not fail. It attends with the wrong wavelengths past its original
-/// 8192 and degrades — fluently, which is the worst way.
+/// A factor of zero reads as "no rescaling", so a stack whose numbers never
+/// arrive attends with the wrong wavelengths past its original context and
+/// degrades fluently. And it is a per-CHECKPOINT fact, not a per-generation
+/// one: Llama-3.2's 1B and 3B rescale by `32.0` where 3.1's 8B and 70B
+/// rescale by `8.0`, from the same `rope_theta` and the same original
+/// context.
 ///
-/// The row states it because it is a per-CHECKPOINT fact and not a
-/// per-generation one: Llama-3.2's 1B and 3B rescale by `32.0` where
-/// 3.1's 8B and 70B rescale by `8.0`, from the same `rope_theta` and the
-/// same original context. A generation constant would have to be wrong
-/// for one of them.
-///
-/// `None` is a statement, not a default: it says this stack uses its
-/// `rope_theta` ladder unrescaled, which is what every Qwen, Gemma,
-/// Mistral, Phi and OLMo-2 row means.
+/// `None` is a statement, not a default: this stack uses its `rope_theta`
+/// ladder unrescaled.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RopeScaling {
     /// A piecewise rescaling by wavelength band (`rope_type: "llama3"`).
     ///
     /// Wavelengths shorter than the high-frequency cut pass through
     /// untouched, those longer than the low-frequency cut are divided by
-    /// `factor`, and the band between them interpolates. The two cuts
-    /// are expressed as divisors of `original_max_position`, which is
-    /// why they are factors and not lengths.
-    ///
-    /// Named for the method, not the lineage that published it first: the
-    /// `rope_type` string stays `"llama3"` because that is what the config
-    /// format says, but a driver deriving the ladder is doing piecewise
-    /// interpolation and nothing more.
+    /// `factor`, and the band between them interpolates. The two cuts are
+    /// expressed as divisors of `original_max_position`, which is why they
+    /// are factors and not lengths.
     Piecewise {
         /// The divisor applied to the low-frequency end.
         factor: f32,
@@ -527,25 +404,18 @@ pub enum RopeScaling {
         beta_fast: f32,
         /// Low-rotation end of the ramp.
         beta_slow: f32,
-        /// The logit scale. HF computes `0.1 * ln(factor) + 1` when a
-        /// config omits it, which is exactly what OLMo-3 states
-        /// explicitly — so a row that omits it is stating the same
-        /// number the formula gives, and
-        /// `an_omitted_attention_factor_is_the_formula_not_a_guess`
-        /// checks that against OLMo-3's published value.
+        /// The logit scale. HF computes `0.1 * ln(factor) + 1` when a config
+        /// omits it, which is what OLMo-3 states explicitly — so a row that
+        /// omits it states the same number the formula gives.
         attention_factor: f32,
         /// The context the checkpoint was trained at.
         original_max_position: u32,
         /// Whether the ramp's ends snap to whole channels.
         ///
-        /// HF's `find_correction_range` floors and ceils by default and
-        /// takes the flag off the config. Most rows omit it and mean
-        /// `true`; every gpt-oss writes `truncate: false`, which moves the
-        /// ramp from `(8, 18)` to `(8.09, 17.40)` on its own numbers and
-        /// three percent of channel 12. A driver that assumed either
-        /// value would serve the other family a ladder nobody trained,
-        /// and the error is the kind that degrades fluently rather than
-        /// failing, so the row states it.
+        /// HF's `find_correction_range` floors and ceils by default. Most
+        /// rows omit the flag and mean `true`; every gpt-oss writes
+        /// `truncate: false`, which moves the ramp from `(8, 18)` to
+        /// `(8.09, 17.40)` and three percent of channel 12.
         truncate: bool,
     },
 }
@@ -560,28 +430,15 @@ pub struct Deployment {
     pub layers: u32,
     /// RMSNorm epsilon.
     ///
-    /// Beside [`Self::shape`] and for the same reason: the launch path
-    /// read it off a resident `HfConfig`. A CONSTANT of the checkpoint —
-    /// `1e-6` for most of the llama lineage, `1e-5` for the qwen-2
-    /// generation, `1e-6` for gemma — and one no tensor extent carries,
+    /// A CONSTANT of the checkpoint — `1e-6` for most of the llama lineage,
+    /// `1e-5` for the qwen-2 generation — and one no tensor extent carries,
     /// so a row must state it.
     pub norm_eps: f32,
     /// The geometry a driver's LAUNCH path reads.
     ///
-    /// Here for a reason worth stating, because it looks like scope
-    /// creep and is the opposite. `driver-cuda`'s `fire/launch.rs` read
-    /// thirty of these numbers off a parsed `config.json` it was holding
-    /// (`model.hf.num_attention_heads`, `model.hf.head_dim_kernel`,
-    /// `model.hf.intermediate_size`, …) — which meant the driver kept a
-    /// whole normalized config resident for the life of a model, and
-    /// meant a fire's geometry came from a DIFFERENT reading of the
-    /// checkpoint than the one its trace was built from. Two readers,
-    /// one document, no one holding them together: the same shape of
-    /// defect as the three registries.
-    ///
-    /// It is a projection of the row like everything else here, so a
-    /// launch and a trace cannot disagree about how many heads there
-    /// are.
+    /// A projection of the row like everything else here, so a launch and a
+    /// trace cannot disagree about how many heads there are — and so no
+    /// driver keeps a normalized config resident to answer them.
     pub shape: Geometry,
     /// Per-layer attention facts.
     pub attention: Vec<LayerAttention>,
@@ -598,46 +455,22 @@ pub struct Deployment {
     /// ATTENTION-logit softcap — `cap * tanh(score / cap)` applied to
     /// the scores, not to the readout — or `0.0` for none.
     ///
-    /// gemma-2's `attn_logit_softcapping`, which every published row
-    /// states as `50.0` against the readout's `30.0`. Two caps, two
-    /// numbers, two places in the fire, and the shape said so all
-    /// along: [`Gemma2AttnFacts::attn_logit_softcap`] carried the
-    /// measurement and its doc explained that this one rides "as a
-    /// DISPATCH parameter, not a launch: the attention kernel takes
-    /// it".
+    /// gemma-2's `attn_logit_softcapping`, which every published row states as
+    /// `50.0` against the readout's `30.0`. Two caps, two numbers, two places
+    /// in the fire; this one rides as a DISPATCH parameter, reaching the
+    /// kernel as `logits_soft_cap` on every flashinfer entry point.
     ///
-    /// The kernel does take it —
-    /// `logits_soft_cap: F32 <- Source::Attn("logits_soft_cap")` on
-    /// every flashinfer entry point. What no one had written was the
-    /// other end: `AttnCtx::logits_soft_cap` was the literal `0.0`, so
-    /// a gemma-2 with the cap and a gemma-2 without it attended
-    /// IDENTICALLY. `facts_are_read` had the field on its unread list
-    /// and called it "exactly the defect the file is named for".
-    ///
-    /// It is a `Deployment` field rather than an argument to
-    /// `attention_for` because the cap is one number for the whole
-    /// fire, like `sm_scale` and the window beside it in `AttnCtx` —
-    /// and because a trace that had to pass it at every layer is a
-    /// trace that can forget it at one.
-    ///
-    /// [`Gemma2AttnFacts::attn_logit_softcap`]: crate::gemma_2::spec::Gemma2AttnFacts::attn_logit_softcap
+    /// A `Deployment` field rather than an argument to `attention_for`,
+    /// because the cap is one number for the whole fire — like `sm_scale` and
+    /// the window beside it in `AttnCtx` — and a trace that had to pass it at
+    /// every layer is a trace that can forget it at one.
     pub attn_logit_softcap: f32,
     /// Per-layer-embedding width, `0` for a stack without one.
     ///
-    /// UNSIGNED, and it was `i32` — which cost a refusal. Every producer
-    /// holds a `u32` (`gemma_4::spec`'s `ple_dim`, `gemma_3n`'s
-    /// `ple_width`) and reached this field through
-    /// `i32::try_from(..).unwrap_or(0)`, so a width that did not fit
-    /// became `0` — and `0` is this field's word for "this stack has no
-    /// per-layer embeddings". A gemma-3n served with its PLE path
-    /// silently switched off is finite, plausible and wrong, which is
-    /// the failure class `norm_unit_offset` two fields down exists to
-    /// describe.
-    ///
-    /// Nothing ever produced a negative value, so the sign bought
-    /// nothing and the conversion that reached it lost a refusal.
-    /// Contrast [`LayerAttention::window`], where `-1` is load-bearing
-    /// and the signedness is earned.
+    /// UNSIGNED: `0` is this field's word for "this stack has no per-layer
+    /// embeddings", and a narrowing conversion that produced it would switch
+    /// the PLE path off silently. Contrast [`LayerAttention::window`], where
+    /// `-1` is load-bearing and the signedness is earned.
     pub ple_dim: u32,
     /// Where the norm sits — read by anything that needs to name the
     /// projection input, which today is the adapter staging.
@@ -645,77 +478,44 @@ pub struct Deployment {
     /// Whether the norm's gain is stored as an OFFSET FROM ONE, so that
     /// firing it means `(1 + w) * x` rather than `w * x`.
     ///
-    /// A fact of its own, and stated rather than derived, because the
-    /// only other place to read it from is the norm PLACEMENT — and that
-    /// reading is wrong for exactly one published stack. gemma-1, -2 and
-    /// -3 pair the sandwich with the offset, so "sandwiched" answered
-    /// "offset" correctly for years; gemma-4 publishes the sandwich and
-    /// stores a plain multiplier, and this repo's CUDA text has said so
-    /// since it was written — "PLAIN, despite the family name"
-    /// (`gemma_4/forward/mod.rs`).
+    /// Stated rather than derived: the only other place to read it from is
+    /// the norm PLACEMENT, and gemma-4 publishes the sandwich while storing a
+    /// plain multiplier. Inferring it does not fail loudly — `(1 + w)/w` is
+    /// 1.002 where `w` is 444 and 1.38 where `w` is 2.6, so the largest gains
+    /// agree to three digits while the ordinary ones are off by a third.
     ///
-    /// It did not fail loudly when it was inferred. `(1 + w)/w` is 1.002
-    /// where `w` is 444 and 1.38 where `w` is 2.6, so the norm's LARGEST
-    /// gains agreed to three digits while its ordinary ones were off by a
-    /// third — a whole generation served finite, plausible, wrong
-    /// numbers. That is the cost of deriving it, and the reason it is a
-    /// field.
-    ///
-    /// `false` for every non-gemma row: those checkpoints store the
-    /// multiplier directly. They are not merely *unaffected* — a driver
-    /// that reads this without first asking whether the stack is a gemma
-    /// gets the true answer for them too.
+    /// `false` for every non-gemma row, which is the true answer for them
+    /// rather than a default.
     pub norm_unit_offset: bool,
     /// Whether V is RMS-normed, per head, on its way to the KV pool.
     ///
-    /// `true` for gemma-4 alone. Not implied by the per-head QK norm --
-    /// **gemma-3 carries `q_norm` and `k_norm` and has no V norm at all** --
-    /// so a driver cannot read it off the norms it can already see.
-    ///
-    /// A ROW'S ANSWER rather than a probe, for a reason no other norm here
-    /// has: the module ships NO PARAMETER. MLX calls it `RMSNormNoScale`, so
-    /// a checkpoint contains nothing to ask about, and `has_tensor` answers
-    /// no for a stack that does this and for a stack that does not.
+    /// Not implied by the per-head QK norm — gemma-3 carries `q_norm` and
+    /// `k_norm` and has no V norm at all. A ROW'S ANSWER rather than a probe
+    /// because the module ships NO PARAMETER, so a checkpoint contains
+    /// nothing `has_tensor` could be asked about.
     pub v_norm: bool,
     /// Which gate this stack's MLP applies. See [`MlpGate`].
     pub mlp_gate: MlpGate,
     /// Whether the router renormalizes over the SELECTED experts.
     ///
     /// HF's `norm_topk_prob`. True softmaxes the k chosen logits so the
-    /// routing weights sum to one; false softmaxes over ALL the experts
-    /// and then selects, so they sum to less than one and scale the
-    /// routed FFN's whole contribution down with them. Both produce
-    /// weights, neither faults, and the difference is a few percent of
-    /// every routed token.
+    /// routing weights sum to one; false softmaxes over ALL the experts and
+    /// then selects, so they sum to less than one and scale the routed FFN's
+    /// whole contribution down with them. Both produce weights, neither
+    /// faults, and the difference is a few percent of every routed token.
     ///
-    /// Here rather than on [`Geometry`] for [`Self::mlp_gate`]'s reason:
-    /// it is a CONVENTION the stack was trained under, not a size. And
-    /// here at all because `driver-cuda`'s launch hardcoded
-    /// `moe_norm_topk: false` beside a dozen fields it read off this
-    /// struct — the archive crate `kernels-cuda`'s `topk_sigmoid_bias`
-    /// and its two siblings took it as `Source::Ctx`, so every routed
-    /// CUDA fire in the workspace routed on unnormalized weights
-    /// whatever its row said.
-    ///
-    /// A DENSE stack states `true` and nothing reads it, the same way a
-    /// dense row states it for the Metal text: "this one has no router"
-    /// is part of the measurement, and a row added later should have to
-    /// answer.
+    /// A CONVENTION the stack was trained under, not a size, which is why it
+    /// is here rather than on [`Geometry`]. A dense stack states `true` and
+    /// nothing reads it: a row added later should have to answer.
     pub norm_topk_prob: bool,
-    /// `routed_scaling_factor` — what the routing weights are multiplied
-    /// by once the router has produced them.
+    /// `routed_scaling_factor` — what the routing weights are multiplied by
+    /// once the router has produced them.
     ///
     /// The other half of [`Self::norm_topk_prob`]; the pair is only
-    /// meaningful together, because the scaling is what pays for weights
-    /// that were never renormalized. DeepSeek-V3 publishes 2.5 against a
-    /// `norm_topk_prob` of false, GLM-4.5 publishes 2.5 against true, and
-    /// the families with neither key want 1.0.
-    ///
-    /// `driver-cuda` launched every mixture at 1.0. Three routers read it
-    /// off the launch context — `topk_sqrtsoftplus`, `topk_sigmoid_bias`
-    /// and `topk_sigmoid`, which is deepseek-v4, nemotron-h, and glm5
-    /// with both kimis — so a DeepSeek row's routed contribution arrived
-    /// at two-fifths of its trained size.
+    /// meaningful together, because the scaling is what pays for weights that
+    /// were never renormalized. DeepSeek-V3 publishes 2.5 against a
+    /// `norm_topk_prob` of false, GLM-4.5 publishes 2.5 against true, and the
+    /// families with neither key want 1.0.
     pub routed_scaling: f32,
     /// Named scalar constants the forward refers to by name.
     pub scales: BTreeMap<String, f32>,
@@ -725,13 +525,9 @@ pub struct Deployment {
     /// How the rope ladder is rescaled, `None` for the stacks that use
     /// their [`LayerAttention::rope_theta`] ladder as-is.
     ///
-    /// Beside `rope_theta` in meaning but not in placement, because it
-    /// is a property of the STACK: no checkpoint here rescales one layer
-    /// and not another, while gemma-3 and gemma-4 genuinely do run two
-    /// different bases. Putting it per-layer would invite a shape no
-    /// published model has.
-    ///
-    /// See [`RopeScaling`] for the regression that put it here.
+    /// A property of the STACK and not of a layer: no checkpoint here
+    /// rescales one layer and not another, while gemma-3 and gemma-4 do run
+    /// two different bases.
     pub rope_scaling: Option<RopeScaling>,
     /// The media encoders this row ships, empty for a text-only stack.
     pub towers: Towers,
@@ -739,19 +535,14 @@ pub struct Deployment {
 
 /// The encoder stacks that run BESIDE the decoder.
 ///
-/// A tower is not a layer of the model: it takes waveform or pixels and
-/// hands back rows the decoder embeds, on its own kernels, at its own
-/// depth. It is here because a `Deployment` is what a driver fires and
-/// the driver fires these too — the alternative was the resident
-/// `HfConfig` these 21 numbers used to be read from, which is the thing
-/// this refactor exists to delete.
+/// A tower is not a layer of the model: it takes waveform or pixels and hands
+/// back rows the decoder embeds, on its own kernels, at its own depth. It is
+/// here because a `Deployment` is what a driver fires and the driver fires
+/// these too.
 ///
-/// Both are `Option` and both are `None` on every text-only row, which
-/// is the ordinary case. A driver's encode entry refuses on `None`
-/// rather than defaulting, because a default tower would be a *plausible
-/// shape for a stack that does not exist* — the exact failure mode the
-/// old `GemmaAudioConfig::default()` had, where a checkpoint with no
-/// audio block was handed gemma-4's own 12 layers.
+/// Both are `None` on every text-only row. A driver's encode entry refuses on
+/// `None` rather than defaulting, because a default tower is a plausible
+/// shape for a stack that does not exist.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Towers {
     /// The audio front-end, `None` when the row ships none.
@@ -762,10 +553,7 @@ pub struct Towers {
 
 /// A conformer audio encoder's shape.
 ///
-/// Fourteen numbers, which is every field of the old
-/// `GemmaAudioConfig` that a driver actually read. The fifteenth was
-/// `use_clipped_linears`, parsed, normalized, carried across the process
-/// boundary and read by nobody.
+/// Fourteen numbers: every field of a conformer config a driver reads.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AudioTower {
     /// Conformer blocks.
@@ -800,11 +588,8 @@ pub struct AudioTower {
 
 /// A vision encoder's shape.
 ///
-/// Seven numbers, again the ones a driver reads. `patch_size`,
-/// `head_dim`, `num_key_value_heads`, `soft_tokens_per_image` and
-/// `use_clipped_linears` were parsed and never asked for; the patch grid
-/// and token count that the host DOES need come from
-/// [`crate::multimodal`], which computes them rather than being told.
+/// Seven numbers, again the ones a driver reads. The patch grid and token
+/// count the host needs come from [`crate::multimodal`], which computes them.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VisionTower {
     /// Transformer blocks.
@@ -826,76 +611,44 @@ pub struct VisionTower {
 /// The three answers a driver puts in its capabilities that are facts
 /// about the MODEL rather than about the device.
 ///
-/// Here rather than on [`Variant`](crate::catalog::Variant) as three
-/// more required methods, and here rather than left where they were,
-/// which was a resident `HfConfig` the driver kept for the life of a
-/// load in order to answer them. Those three reads — `model_type`,
-/// `max_position_embeddings`, and whether `gemma_vision`/`gemma_audio`
-/// are present — were the last thing keeping a parsed `config.json`
-/// alive inside `driver-cuda`, and the last two are why the
-/// 845-line normalizer could not be deleted.
+/// Here rather than on [`Variant`](crate::catalog::Variant) as three more
+/// required methods, so that answering them costs a driver no resident
+/// parsed config.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Advertised {
     /// The family label a GUEST PROGRAM matches on.
     ///
-    /// Not a dispatch key — that is the whole point of the catalog —
-    /// but still a real value, because `engine`'s `model.arch_name()` is
-    /// a host function inferlets call and `VisionArch::from_arch_name`
-    /// selects an image front-end from it. It is a FAMILY, deliberately
-    /// coarser than an id: `qwen3` names twelve checkpoints of six
-    /// shapes, and a program asking "is this a gemma" wants the coarse
-    /// answer.
+    /// Not a dispatch key — that is the whole point of the catalog — but
+    /// still a real value, because `engine`'s `model.arch_name()` is a host
+    /// function inferlets call and `VisionArch::from_arch_name` selects an
+    /// image front-end from it. Deliberately coarser than an id.
     ///
-    /// Stated by the row rather than read off a config, so the string a
-    /// program sees and the row a driver loaded cannot be about
-    /// different models.
-    ///
-    /// Matched WHOLE by every consumer. `VisionArch::from_arch_name`
-    /// used to accept a substring, which made `qwen3` — this
-    /// generation's own label — select the Qwen3-VL front-end belonging
-    /// to `qwen3_5`. A coarse label is still an exact one.
+    /// Matched WHOLE by every consumer: a substring match makes `qwen3`
+    /// select the front-end belonging to `qwen3_5`.
     pub arch: &'static str,
-    /// The published context ceiling, `0` when the row does not state
-    /// one.
+    /// The published context ceiling, `0` when the row does not state one.
     ///
-    /// A TRAINING-time fact and not a deployment one, which is why it
-    /// sits here and not beside [`Deployment::shape`]: nothing in a fire
-    /// reads it, and a driver serving a shorter context than this is
-    /// serving correctly.
+    /// A TRAINING-time fact and not a deployment one: nothing in a fire reads
+    /// it, and a driver serving a shorter context than this is serving
+    /// correctly.
     pub max_model_len: u32,
-    /// Whether this row ships a tower the driver's encode entry point
-    /// serves.
+    /// Whether this row ships a tower the driver's encode entry point serves.
     ///
-    /// The bug this replaced: it was hardwired `false` while four GPU
-    /// tests fired the entry point and passed. The worker refuses to
-    /// build an encode executor at all when this is clear, so gemma-4's
-    /// vision and audio towers — ported, bound, and matching HF's
-    /// embeddings to cosine — were unreachable through the engine. The
-    /// tests never saw it because they call the entry directly, which is
-    /// exactly the seam a capability is supposed to cover.
+    /// The worker refuses to build an encode executor at all when this is
+    /// clear, so a row that ships towers and states `false` has them
+    /// unreachable through the engine.
     ///
-    /// Qwen3-VL is deliberately NOT this: its tower writes into the
-    /// fire's hidden rows rather than handing host rows back, so it is
-    /// an in-fire path and not an encode one.
+    /// Qwen3-VL is deliberately NOT this: its tower writes into the fire's
+    /// hidden rows rather than handing host rows back, so it is an in-fire
+    /// path and not an encode one.
     pub media_encode: bool,
 }
 
 impl Deployment {
     /// This plan, or the refusal its KV store draws.
     ///
-    /// The four MLA generations each wrote this `match` out, which is one
-    /// duplication past the one [`KvStyle::store_refusal`] was hoisted to
-    /// end: that call removed four spellings of one SENTENCE and left
-    /// four spellings of what to DO with it. The four were identical, and
-    /// the arm that lets a load proceed was unreachable in every one of
-    /// them — every glm-5, deepseek-v4, kimi-k2 and kimi-k3 row plans an
-    /// `Mla` or a `CompressedPlane`, and this build provisions neither,
-    /// so the `Ok` was four copies of a line no row could take.
-    ///
-    /// Here it is reachable, because a `Deployment` with a paged layout
-    /// is one any dense family builds — which is the point: the arm 53 of
-    /// the 59 rows depend on is now walked by a test rather than by
-    /// nothing.
+    /// One place rather than one per MLA generation, and reachable here: a
+    /// `Deployment` with a paged layout is one any dense family builds.
     #[must_use = "the refusal is the whole result; dropping it deploys a \
                   row whose store does not exist"]
     pub fn provisioned(self) -> Result<Self, Refusal> {
@@ -908,19 +661,16 @@ impl Deployment {
     /// A placeholder for a driver that must build its model value before
     /// it can derive one.
     ///
-    /// Zero layers, which is a shape no fire can take — so a driver that
-    /// forgot to fill it in refuses at its first admission rather than
-    /// serving a stack it never derived.
+    /// Zero layers, a shape no fire can take, so a driver that forgot to fill
+    /// it in refuses at its first admission.
     #[must_use]
     pub fn empty() -> Self {
         Self {
             layers: 0,
             norm_eps: 0.0,
-            // The routing convention of a stack with no layers. False,
-            // not true, so this is not the value any real row wants:
-            // `empty()` exists to be refused, and a driver that served
-            // off it would route on unnormalized weights rather than on
-            // the convention half the catalog happens to use.
+            // False, not true, so this is not the value any real row wants:
+            // `empty()` exists to be refused, and a driver that served off it
+            // would route on unnormalized weights.
             norm_topk_prob: false,
             routed_scaling: 1.0,
             shape: Geometry::EMPTY,
@@ -930,9 +680,8 @@ impl Deployment {
             prefill: PrefillStyle::Planned,
             attn_output: AttnOutput::StatedArgs,
             logit_softcap: 0.0,
-            // No attention cap either. A stack with no layers has
-            // nothing to cap, and `0.0` reads as "none" both here and
-            // at `AttnCtx`.
+            // A stack with no layers has nothing to cap, and `0.0` reads as
+            // "none" both here and at `AttnCtx`.
             attn_logit_softcap: 0.0,
             ple_dim: 0,
             norm: NormPlacement::Pre,
@@ -948,10 +697,8 @@ impl Deployment {
 
     /// The distinct decode head dims this stack needs plans for.
     ///
-    /// `None` when every layer agrees, which is the ordinary case.
-    /// `Some((a, b))` when two kinds disagree — which used to be
-    /// `decode_plan_head_dims()`, a method that existed because
-    /// gemma-4 has two, and is now a question about the `Vec`.
+    /// `None` when every layer agrees, which is the ordinary case;
+    /// `Some((a, b))` when two kinds disagree.
     #[must_use]
     pub fn decode_head_dims(&self) -> Option<(u32, u32)> {
         let first = self.attention.first()?.head_dim;
@@ -965,16 +712,13 @@ impl Deployment {
 
     /// The FULL-attention layers' head shape, when it differs.
     ///
-    /// `None` when every layer agrees, which is the ordinary case and
-    /// the answer that lets a driver read one shape everywhere.
-    /// `Some((head_dim, kv_heads, rotary_dim))` for a stack whose
-    /// windowed and unwindowed layers are shaped differently — gemma-4,
-    /// and so far only gemma-4.
+    /// `None` when every layer agrees; `Some((head_dim, kv_heads,
+    /// rotary_dim))` for a stack whose windowed and unwindowed layers are
+    /// shaped differently.
     ///
-    /// Keyed on the WINDOW rather than on "the shape that differs",
-    /// because the driver's `global_*` fields mean the full layers'
-    /// shape specifically: a page is sized per layer, and the layer
-    /// that reads the whole context is the one that has to be right.
+    /// Keyed on the WINDOW rather than on the shape that differs, because a
+    /// page is sized per layer and the layer that reads the whole context is
+    /// the one that has to be right.
     #[must_use]
     pub fn full_attention_shape(&self) -> Option<(u32, u32, u32)> {
         let first = self.attention.first()?;
@@ -996,26 +740,19 @@ impl Deployment {
 
     /// CAN THIS BUILD SERVE THIS STACK — asked at load, not at launch.
     ///
-    /// FlashInfer's decode instantiates a fixed set of GQA group sizes
-    /// and reports anything else by THROWING. A throw crossing the C
-    /// ABI is undefined behaviour: the generated shim prints the message
-    /// before it dies, and printing is all it can do, because a
-    /// launcher signature has nowhere to put a failure. A LOAD does —
-    /// it returns a status code — so the question has to be asked here.
+    /// FlashInfer's decode instantiates a fixed set of GQA group sizes and
+    /// reports anything else by THROWING. A throw crossing the C ABI is
+    /// undefined behaviour and a launcher signature has nowhere to put a
+    /// failure; a LOAD returns a status code, so the question is asked here.
     ///
-    /// This was `refuse_unservable_gqa`, and it sat inside the llama
-    /// lineage's derivation as though it were a property of that
-    /// lineage. It is a property of the BUILD, so it takes the set as an
-    /// ARGUMENT: `model` states the shape, the driver states what it
-    /// instantiated, and neither one has to know the other's answer.
-    /// The live proof that it is not one lineage's business is
-    /// Qwen3.6-27B — 24 query heads over 4 kv heads is a group of six,
-    /// and it reaches the same dispatch from a different generation.
+    /// A property of the BUILD, so it takes the set as an ARGUMENT: `model`
+    /// states the shape, the driver states what it instantiated, and neither
+    /// has to know the other's answer.
     ///
-    /// The ratio itself is [`Geometry::gqa_group`] and is NOT restated
-    /// here. What this adds is the divisibility question, which that one
-    /// cannot answer: it truncates, so 14 over 4 reads as 3 — a group
-    /// every build instantiates, for a stack no build can run.
+    /// The ratio itself is [`Geometry::gqa_group`]. What this adds is
+    /// divisibility, which that one cannot answer: it truncates, so 14 over 4
+    /// reads as 3 — a group every build instantiates, for a stack no build
+    /// can run.
     ///
     /// # Errors
     ///
@@ -1074,18 +811,9 @@ mod tests {
 
     /// Two towers that compare unequal must also PRINT unequal.
     ///
-    /// `Debug` is the only way one of these reaches a human -- there is no
-    /// `Display`, and nothing formats them but a diagnostic. The two tests
-    /// above are exactly that: they say "these rows ship different encoders"
-    /// and then print both. If `Debug` omitted a field, two towers differing
-    /// only in that field would render identically, and the failure would read
-    /// as a contradiction -- an assertion that two things differ, beside two
-    /// lines that are the same.
-    ///
-    /// So the property is stated over every field, one at a time: perturb one
-    /// number and both the comparison and the rendering must notice. That is
-    /// also the only thing that exercises a derived `Debug` at all, since
-    /// `assert_eq!` formats only when it fails.
+    /// `Debug` is the only way one of these reaches a human, so a field it
+    /// omitted would make two differing towers render identically. Perturb
+    /// one number at a time: both the comparison and the rendering notice.
     #[test]
     fn a_tower_that_differs_in_one_field_prints_differently() {
         let v = VisionTower {
@@ -1241,10 +969,9 @@ mod tests {
             );
         }
 
-        // And what a guest matches on. `Advertised` derives `Default`, which
-        // nothing else in this file reaches: it is what an unstated row would
-        // advertise, and the empty label is the point -- a program matching on
-        // it matches nothing rather than matching a family by accident.
+        // And what a guest matches on. `Advertised::default()` is what an
+        // unstated row advertises, and the empty label is the point: a program
+        // matching on it matches nothing rather than a family by accident.
         let d = Advertised::default();
         assert_eq!(d.arch, "");
         assert_eq!(d.max_model_len, 0);
@@ -1296,17 +1023,15 @@ mod tests {
             sm_scale: 1.0,
             rope_theta: 10_000.0,
             rotary_dim: 0,
+            q_gate: false,
         }
     }
 
     fn stack(dims: &[u32]) -> Deployment {
         Deployment {
             layers: dims.len() as u32,
-            // The two the launch path reads. This helper existed before
-            // either was a field and went on compiling only because the
-            // struct had not grown them yet; they are stated here rather
-            // than defaulted so a `stack()` is a whole `Deployment` and
-            // the tests below exercise the same value a driver holds.
+            // The two the launch path reads, stated rather than defaulted so
+            // a `stack()` is a whole `Deployment`.
             norm_eps: 1e-5,
             norm_topk_prob: true,
             routed_scaling: 1.0,
@@ -1337,10 +1062,8 @@ mod tests {
         }
     }
 
-    /// The exception that stopped being one. `decode_plan_head_dims()`
-    /// existed as a vtable method because gemma-4 has two layer kinds;
-    /// it is a question about a `Vec` now, and a uniform stack answers
-    /// `None` without anyone having to know which family it is.
+    /// A uniform stack answers `None` without anyone having to know which
+    /// family it is.
     #[test]
     fn two_head_dims_is_a_property_of_the_layers_not_of_a_family() {
         assert_eq!(stack(&[128, 128, 128]).decode_head_dims(), None);
@@ -1368,9 +1091,8 @@ mod tests {
         assert_eq!(mixed.theta_by_layer().len(), 2);
     }
 
-    /// The MLA orphan, as a type. It used to be a row in `FACTS_ROWS`
-    /// that loaded successfully and died at its first fire; a driver
-    /// matching on `KvStyle` has to write the arm or refuse.
+    /// The MLA orphan, as a type: a driver matching on `KvStyle` has to
+    /// write the arm or refuse.
     #[test]
     fn an_unservable_kv_shape_is_a_variant_rather_than_a_registry_row() {
         let mut d = stack(&[128]);
@@ -1419,14 +1141,8 @@ mod tests {
 
     /// The layout every deployable row in this build uses answers NOTHING.
     ///
-    /// [`KvStyle::store_refusal`] is asked of a row before the pager is
-    /// sized, and the two refusing arms are walked by
-    /// `tests/advertised_matches_what_is_shipped.rs` -- five of the six
-    /// rows that cannot deploy here are refused by exactly this call.
-    /// The arm that lets a load PROCEED was never taken in a test, which
-    /// is the arm 53 of the 59 rows depend on: a `Some` here stops the
-    /// load, so a paged layout that ever answered one would ground the
-    /// entire build while every existing test still passed.
+    /// A `Some` here stops the load, so a paged layout that ever answered one
+    /// would ground the entire build.
     #[test]
     fn the_paged_layout_is_the_one_that_refuses_nothing() {
         assert!(
@@ -1438,12 +1154,8 @@ mod tests {
 
     /// A plan whose store exists is handed back whole.
     ///
-    /// The arm four MLA families copied and none of them could take.
-    /// What it must NOT do is edit the plan on the way through -- a
-    /// caller reads the returned value, so a `provisioned` that
-    /// reconstructed rather than returned would be a second place for a
-    /// deployment to be assembled, and the four callers each hand it a
-    /// plan they built field by field.
+    /// It must NOT edit the plan on the way through: a `provisioned` that
+    /// reconstructed would be a second place for a deployment to be assembled.
     #[test]
     fn a_paged_plan_passes_through_provisioned_unchanged() {
         let mut paged = Deployment::empty();
@@ -1476,11 +1188,9 @@ mod tests {
 
     /// Both refusals name the store they cannot provision.
     ///
-    /// A `Refusal` is carried across the FFI as TEXT -- `driver-cuda`
-    /// turns it into `Error::Unsupported { what: e.to_string() }` -- so
-    /// the sentence is the whole diagnosis a user gets. Two layouts that
-    /// refuse with the same words leave the reader unable to tell a
-    /// missing MLA store from a missing compressed plane.
+    /// A `Refusal` is carried across the FFI as TEXT, so the sentence is the
+    /// whole diagnosis a user gets: two layouts refusing with the same words
+    /// leave the reader unable to tell them apart.
     #[test]
     fn the_two_refusing_layouts_do_not_refuse_with_the_same_sentence() {
         let mla = KvStyle::Mla {
@@ -1499,19 +1209,11 @@ mod tests {
 
     /// The variant no row in this build can produce.
     ///
-    /// `Refusal` has two arms and `driver-cuda` maps them to two
-    /// DIFFERENT errors: `Unsupported` becomes `Error::Unsupported`, a
-    /// statement about the build, and `Malformed` becomes
-    /// `Error::invalid("deployment", ..)`, a statement about the
-    /// checkpoint. Nothing in this crate constructs the second one --
-    /// `crates/model/src/csm/project.rs` even asserts a deployment is
-    /// NOT `Malformed`, which is a claim that cannot fail today.
-    ///
-    /// The variant is kept, not deleted: a checkpoint that contradicts
-    /// its own declared type is a real category and the driver already
-    /// routes it away from the build's own limits. What was missing is
-    /// that its sentence had never been formatted, so the message a user
-    /// would see the first time a row does produce one was unread text.
+    /// `driver-cuda` maps the two arms to two DIFFERENT errors: `Unsupported`
+    /// is a statement about the build, `Malformed` about the checkpoint.
+    /// Nothing in this crate constructs the second one, and it is kept
+    /// because a checkpoint contradicting its own declared type is a real
+    /// category — so its sentence is checked here rather than left unread.
     #[test]
     fn the_refusal_arm_no_row_reaches_still_says_something_a_reader_can_use() {
         let malformed = Refusal::Malformed("a stack of 0 layers").to_string();
@@ -1534,16 +1236,9 @@ mod tests {
 
     /// `full_attention_shape` answers only when the two shapes DIFFER.
     ///
-    /// The driver's `global_*` fields mean the full layers' shape
-    /// specifically, and a `Some` makes the driver size its pages twice.
-    /// A uniform stack that answered `Some` would have it allocate a
-    /// second geometry identical to the first.
-    ///
-    /// The empty case is guarded TWICE and this test cannot tell which
-    /// guard held: `first()?` and the `find(..)?` below it both answer
-    /// `None` on a stack with no layers, so removing the first one is an
-    /// equivalent mutation. It is stated here anyway because `None` is
-    /// the answer, not because this test pins the reason.
+    /// A `Some` makes the driver size its pages twice, so a uniform stack
+    /// that answered `Some` would have it allocate a second geometry
+    /// identical to the first.
     #[test]
     fn a_stack_whose_windowed_and_full_layers_agree_states_no_second_shape() {
         assert_eq!(
@@ -1606,10 +1301,8 @@ mod tests {
 
     /// A ratio that does not divide is not a build question.
     ///
-    /// No instantiation set contains a fractional group, so widening the
-    /// set cannot fix it — which is why `gqa_group` answers `None`
-    /// rather than truncating, and why the refusal says something
-    /// different.
+    /// No instantiation set contains a fractional group, so widening the set
+    /// cannot fix it, and the refusal says something different.
     #[test]
     fn a_fractional_ratio_is_refused_by_every_build() {
         let mut d = stack(&[128]);
@@ -1630,10 +1323,8 @@ mod tests {
 
     /// Zero kv heads is refused rather than dividing by zero.
     ///
-    /// `Geometry::gqa_group` answers 0 so that `EMPTY` stays askable,
-    /// and 0 is in no instantiation set — but the refusal comes from the
-    /// divisibility arm, so the sentence says the shape is wrong rather
-    /// than that a kernel is missing.
+    /// `gqa_group` answers 0 so `EMPTY` stays askable, but the refusal comes
+    /// from the divisibility arm, so the sentence says the shape is wrong.
     #[test]
     fn a_stack_that_states_no_kv_heads_does_not_divide_by_zero() {
         let mut d = stack(&[128]);
@@ -1657,10 +1348,9 @@ mod tests {
         assert!(d.servable_by(&[]).is_err());
     }
 
-    /// A stack with no layers is a stack no build can serve, which is
-    /// the whole of what `empty()` is for: it is the value a projection
-    /// that refused hands back, and every question asked of it has to
-    /// answer without a first layer to read.
+    /// A stack with no layers is a stack no build can serve, which is what
+    /// `empty()` is for: every question asked of it answers without a first
+    /// layer to read.
     #[test]
     fn the_empty_stack_answers_every_question_and_is_served_by_nobody() {
         let e = Deployment::empty();
@@ -1682,10 +1372,8 @@ mod tests {
         );
     }
 
-    /// gemma-4's accessor, and the reason it is keyed on the WINDOW
-    /// rather than on "the shape that differs": a page is sized per
-    /// layer, and the layer that reads the whole context is the one
-    /// that has to be right.
+    /// Keyed on the WINDOW: a page is sized per layer, and the layer that
+    /// reads the whole context is the one that has to be right.
     #[test]
     fn the_full_layers_shape_is_reported_only_when_it_differs() {
         // Every layer unwindowed and identical: one shape serves.
@@ -1719,15 +1407,13 @@ mod tests {
         assert_eq!(all_windowed.full_attention_shape(), None);
     }
 
-    /// The three per-layer tables do not share an elision rule, and the
-    /// difference is not an oversight.
+    /// The three per-layer tables do not share an elision rule.
     ///
-    /// `windows` is always full length: a window of `-1` is as much a
-    /// binding as `512`, and the fire path indexes it. `theta_by_layer`
-    /// elides on UNIFORMITY. `rotary_by_layer` elides on the SENTINEL —
-    /// `0` means "rotate the whole head", so a stack where every layer
-    /// states a partial width of 64 gets a full table even though the
-    /// values agree.
+    /// `windows` is always full length: a window of `-1` is as much a binding
+    /// as `512`, and the fire path indexes it. `theta_by_layer` elides on
+    /// UNIFORMITY. `rotary_by_layer` elides on the SENTINEL — `0` means
+    /// "rotate the whole head", so a stack whose layers all state 64 gets a
+    /// full table even though the values agree.
     #[test]
     fn the_per_layer_tables_elide_by_three_different_rules() {
         let uniform = stack(&[128, 128]);
@@ -1771,27 +1457,17 @@ mod tests {
 
 /// Why a checkpoint cannot be served.
 ///
-/// An ENUM rather than an ABI status, because this crate has no ABI. A
-/// driver maps it to whatever its own boundary speaks — which is the
-/// point of §4: the derivation used to return `PIE_STATUS_UNSUPPORTED`,
-/// the engine's vocabulary, from a crate that has no engine.
-///
-/// Both variants carry a reason, and `Unsupported` did not used to. It
-/// was returned from nine sites in the old derivation and reached the
-/// operator as "no deployment derivation for this model type" — a
-/// sentence that names neither the model nor the thing that is missing,
-/// for nine unrelated causes (a KV store this build did not
-/// instantiate, a family with no forward text, an expert bank the
-/// tracer has no kernel for). A row that refuses now has to say what it
-/// wanted.
+/// An ENUM rather than an ABI status, because this crate has no ABI: a driver
+/// maps it to whatever its own boundary speaks. Both variants carry a reason,
+/// because one sentence for nine unrelated causes names neither the model nor
+/// the thing that is missing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
     /// This build cannot serve the row: it has no forward text for it,
     /// or no kernel for a shape the row states.
     ///
-    /// A statement about the BUILD, not about the checkpoint — the
-    /// checkpoint is fine and a differently-configured pie would serve
-    /// it. That is why it is separate from [`Self::Malformed`].
+    /// A statement about the BUILD, not about the checkpoint, which is why it
+    /// is separate from [`Self::Malformed`].
     Unsupported(&'static str),
     /// A row exists and the checkpoint contradicts it.
     Malformed(&'static str),

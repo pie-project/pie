@@ -1,5 +1,25 @@
 // Gated RMSNorm for GDN: `out = w * rmsnorm(x) * silu(z)`.
 //
+// ## The gate goes AFTER the norm, and that was checked rather than assumed
+//
+// It is the obvious thing to doubt, because the two orders are not a
+// rearrangement: `silu(z)` is a per-CHANNEL vector, so
+//
+//     rmsnorm(x * silu(z))  !=  rmsnorm(x) * silu(z)
+//
+// They differ by `rms(x) / rms(x * silu(z))`, a scalar per HEAD and a
+// different one for each, and sixteen heads then meet in one output
+// projection -- so the wrong order reweights the heads against each other by
+// an input-dependent amount while staying finite, plausible and correctly
+// shaped. Exactly the kind of defect the qwen3.5 hunt was looking for.
+//
+// It is not this one. `kernels-cuda`'s `rmsnorm_gated` accumulates
+// `local += v*v` over `x` ALONE and applies `sg` in the second pass, and
+// `kernels-metal`'s `gated_rms_body` takes `rms_inv_from_lane_sum(xi*xi, ...)`
+// the same way. Written the other way round here and measured: the answer
+// moved and did not improve. Reverted, and recorded, because the next reader
+// will wonder the same thing.
+//
 // The math is Metal's GDN epilogue, including the numerically stable sigmoid
 // and the RAW gate-norm weight -- no gemma `1 + w` here, which is the one thing
 // about this kernel that reads like a mistake and is not: `ops/gated_delta.cpp`
@@ -24,8 +44,9 @@
 // between them barriers, and a lane that returned in front of a barrier would
 // hang the ones that did not.
 //
-// The buffers are the sibling kernels' order -- the row is UNSTATED, so the
-// Metal signature is the only written description of the call there is -- and
+// The buffers are the sibling kernels' order -- the Metal signature was the
+// only written description of the call when this was ported, and
+// `norm::gated_rms`'s own signature is one now -- and
 // the strided form's `row_pitch` is the one field of the uniform block, where
 // Vulkan puts it in a push block WebGPU does not have.
 

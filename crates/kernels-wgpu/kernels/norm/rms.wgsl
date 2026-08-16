@@ -21,10 +21,11 @@
 // is the one field of the `@group(1) @binding(0)` uniform block, while
 // `RmsParams` stays a STORAGE buffer at binding 3 -- the row says `params: Buf`
 // and a struct is a struct. `src/lib.rs` states the rule:
-// `kernels_wgpu::bindings` picks the storage and uniform runs, and
-// `kernels_wgpu::uniform_layout` gives this row's scalar offset. The strided
-// pair is UNSTATED, so its buffers follow the sibling kernels' order and its
-// scalar follows `norm/residual_add.wgsl`.
+// The ROUTINE's signature picks the storage and uniform runs: buffers in the
+// order the body asks for them, scalars as the fields of the `@group(1)` block
+// `driver-wgpu::lowering::routine::bind` packs. The strided pair's buffers
+// follow the sibling kernels' order and its scalar follows
+// `norm/residual_add.wgsl`.
 //
 // **Every bf16 index.** WGSL has no 16-bit storage type, so `x`, `w`, `out`
 // and the residual cross as `array<u32>` with TWO values per word

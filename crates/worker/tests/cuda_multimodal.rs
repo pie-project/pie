@@ -28,7 +28,7 @@
 //! shipped + complete (this builds green vs the SDK + drives the real path);
 //! hardware validation needs a >24G GPU (or a driver-supported smaller / fp8
 //! vision checkpoint). Run there:
-//!   cargo test -p pie-worker --features driver-cuda --test cuda_multimodal -- --ignored --nocapture
+//!   cargo test -p pie-worker --features driver-cuda-13 --test cuda_multimodal -- --ignored --nocapture
 
 mod common;
 
@@ -129,7 +129,7 @@ fn extract_u64(json: &str, field: &str) -> Option<u64> {
 /// Vision splice: encode a local image with the bound model's vision tower,
 /// splice the soft-token KV, then answer about it with ordinary text generation.
 #[test]
-#[ignore = "real-hardware + VRAM-blocked on 24G: gemma-4-E4B (15G) + vision encoder exceeds a 24G 4090 (max-fit gpu_mem 0.97 + fp8 KV still yields no viable forward layout); needs a >24G GPU. Splice code is shipped + builds green. Run with --features driver-cuda + a local gemma-4-E4B snapshot on a >24G GPU."]
+#[ignore = "real-hardware + VRAM-blocked on 24G: gemma-4-E4B (15G) + vision encoder exceeds a 24G 4090 (max-fit gpu_mem 0.97 + fp8 KV still yields no viable forward layout); needs a >24G GPU. Splice code is shipped + builds green. Run with --features driver-cuda-13 + a local gemma-4-E4B snapshot on a >24G GPU."]
 fn cuda_native_image_splice_conditions_generation() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {

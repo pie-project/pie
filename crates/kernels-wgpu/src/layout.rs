@@ -62,7 +62,8 @@ pub static ENTRYPOINTS: &[&str] = &[
 // statements of one fact is what this refactor is against, so the row goes
 // when the family does, and not one commit later.
 
-use crate::routine::{Bind, Buf, BufMut, Ctx, Env, Fire, I32s, InPacked, Routine, U32s};
+use crate::routine::{keys, Ask, Bind, Block, Buf, BufMut, Ctx, Fire, I32s, InPacked, Param, ParamF32, Routine, U32s};
+use crate::routine::{InSlot, OutSlot, Weight};
 use kernels::routine::Refusal;
 use kernels::shader::{elementwise, elementwise_rows};
 
@@ -87,12 +88,12 @@ use kernels::shader::{elementwise, elementwise_rows};
 /// nothing and reports success.
 pub fn ple_combine(
     ctx: &Ctx,
-    proj: Buf,
-    token: Buf,
-    out: BufMut,
-    params: Buf,
-    width: Env<i32>,
-    rows: Env<i32>,
+    proj: InSlot<0, Buf>,
+    token: InSlot<1, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     if *width <= 0 {
         return Err(Refusal::Empty { what: "width" });
@@ -205,17 +206,17 @@ static EMBED_GATHER_SCALED_MB: [&str; 6] = [
 /// affine point the shader tree does not carry.
 pub fn embed_gather_4bit(
     ctx: &Ctx,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    id: I32s,
-    out: BufMut,
-    hidden: i32,
-    group: Env<i32>,
-    bits: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    id: Ask<keys::TokenIds, I32s>,
+    out: OutSlot<0, BufMut>,
+    hidden: Param<0, i32>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
 ) -> Result<(), Refusal> {
     let rows = 1;
-    let lanes = elementwise(hidden, rows)?;
+    let lanes = elementwise(*hidden, rows)?;
     ctx.dispatch(
         Fire {
             module: "layout/embed_gather.wgsl",
@@ -233,17 +234,17 @@ pub fn embed_gather_4bit(
 /// As [`embed_gather_4bit`].
 pub fn embed_gather_mb_4bit(
     ctx: &Ctx,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    id: I32s,
-    out: BufMut,
-    hidden: i32,
-    rows: Env<i32>,
-    group: Env<i32>,
-    bits: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    id: Ask<keys::TokenIds, I32s>,
+    out: OutSlot<0, BufMut>,
+    hidden: Param<0, i32>,
+    rows: Ask<keys::Rows, i32>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
 ) -> Result<(), Refusal> {
-    let lanes = elementwise_rows(hidden, *rows)?;
+    let lanes = elementwise_rows(*hidden, *rows)?;
     ctx.dispatch(
         Fire {
             module: "layout/embed_gather.wgsl",
@@ -262,17 +263,17 @@ pub fn embed_gather_mb_4bit(
 /// As [`embed_gather_4bit`].
 pub fn embed_gather_scaled_4bit(
     ctx: &Ctx,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    id: I32s,
-    out: BufMut,
-    hidden: i32,
-    embed_scale: f32,
-    group: Env<i32>,
-    bits: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    id: Ask<keys::TokenIds, I32s>,
+    out: OutSlot<0, BufMut>,
+    hidden: Param<0, i32>,
+    embed_scale: ParamF32<1>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
 ) -> Result<(), Refusal> {
-    let lanes = elementwise(hidden, 1)?;
+    let lanes = elementwise(*hidden, 1)?;
     ctx.dispatch(
         Fire {
             module: "layout/embed_gather.wgsl",
@@ -298,18 +299,18 @@ pub fn embed_gather_scaled_4bit(
 /// As [`embed_gather_4bit`].
 pub fn embed_gather_scaled_mb_4bit(
     ctx: &Ctx,
-    w: Buf,
-    scales: Buf,
-    biases: Buf,
-    id: I32s,
-    out: BufMut,
-    hidden: i32,
-    embed_scale: f32,
-    rows: Env<i32>,
-    group: Env<i32>,
-    bits: Env<i32>,
+    w: Weight<0, Buf>,
+    scales: Weight<1, Buf>,
+    biases: Weight<2, Buf>,
+    id: Ask<keys::TokenIds, I32s>,
+    out: OutSlot<0, BufMut>,
+    hidden: Param<0, i32>,
+    embed_scale: ParamF32<1>,
+    rows: Ask<keys::Rows, i32>,
+    group: Ask<keys::QuantGroup, i32>,
+    bits: Ask<keys::QuantBits, i32>,
 ) -> Result<(), Refusal> {
-    let lanes = elementwise_rows(hidden, *rows)?;
+    let lanes = elementwise_rows(*hidden, *rows)?;
     ctx.dispatch(
         Fire {
             module: "layout/embed_gather.wgsl",
@@ -342,13 +343,13 @@ pub fn embed_gather_scaled_mb_4bit(
 /// [`Refusal::Empty`] for an empty rectangle.
 pub fn row_gather(
     ctx: &Ctx,
-    input: Buf,
-    out: BufMut,
-    rows: U32s,
-    params: Buf,
-    count: InPacked,
-    width: Env<i32>,
-    row_count: Env<i32>,
+    input: InSlot<0, Buf>,
+    out: OutSlot<0, BufMut>,
+    rows: Ask<keys::SamplingIndices, U32s>,
+    params: Block<Buf>,
+    count: Ask<keys::RequestCount, InPacked>,
+    width: Ask<keys::Width, i32>,
+    row_count: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     let lanes = elementwise_rows(*width, *row_count)?;
     ctx.dispatch(
@@ -408,6 +409,13 @@ mod ported {
     /// rectangle, so they were a fact about the launch that the row pointed at
     /// and did not carry. The signature carries them, and their `Env`
     /// provenance says who supplies them.
+    ///
+    /// THREE now, not two. The per-layer embedding table joined them: it is
+    /// the FIRE's and no statement places it as an operand, and marking it
+    /// `Env` is what stops `model-ir::kernels::arity_problem` counting it
+    /// against the operands a statement placed. Only the first THREE arguments
+    /// are the row's operands after that -- the count below is what says so,
+    /// and it moved because the meaning did.
     #[test]
     fn the_routines_row_is_its_signature_and_names_the_two_that_were_not_operands() {
         let row = ROUTINES
@@ -426,8 +434,8 @@ mod ported {
                 .iter()
                 .filter(|(_, p)| *p == Provenance::Env)
                 .count(),
-            2,
-            "the two the statement does not supply"
+            3,
+            "the three the statement does not supply"
         );
     }
 
@@ -441,7 +449,15 @@ mod ported {
     #[test]
     fn the_body_asks_for_the_elementwise_grid() {
         let to = Recorder::default();
-        ple_combine(&to, Buf(0), Buf(1), BufMut(2), Buf(3), Env(64), Env(7))
+        ple_combine(
+            &to,
+            InSlot { ptr: Buf(0) },
+            InSlot { ptr: Buf(1) },
+            OutSlot { ptr: BufMut(2) },
+            Block::new(Buf(3)),
+            Ask::new(64),
+            Ask::new(7),
+        )
             .expect("it dispatches");
 
         let seen = to.seen.borrow();
@@ -573,15 +589,58 @@ mod ported {
 
         let to = Recorder::default();
         let (b, m) = (Buf(0), BufMut(1));
-        ple_combine(&to, b, b, m, b, Env(W), Env(R)).expect("dispatches");
-        embed_gather_4bit(&to, b, b, b, I32s(2), m, W, Env(64), Env(4)).expect("dispatches");
-        embed_gather_mb_4bit(&to, b, b, b, I32s(2), m, W, Env(R), Env(64), Env(4))
+        ple_combine(
+            &to,
+            InSlot { ptr: b },
+            InSlot { ptr: b },
+            OutSlot { ptr: m },
+            Block::new(b),
+            Ask::new(W),
+            Ask::new(R),
+        )
+        .expect("dispatches");
+        embed_gather_4bit(
+            &to,
+            Weight { ptr: b },
+            Weight { ptr: b },
+            Weight { ptr: b },
+            Ask::new(I32s(2)),
+            OutSlot { ptr: m }, Param::new(W), Ask::new(64), Ask::new(4)).expect("dispatches");
+        embed_gather_mb_4bit(
+            &to,
+            Weight { ptr: b },
+            Weight { ptr: b },
+            Weight { ptr: b },
+            Ask::new(I32s(2)),
+            OutSlot { ptr: m }, Param::new(W), Ask::new(R), Ask::new(64), Ask::new(4))
             .expect("dispatches");
-        embed_gather_scaled_4bit(&to, b, b, b, I32s(2), m, W, 1.0, Env(64), Env(4))
+        embed_gather_scaled_4bit(
+            &to,
+            Weight { ptr: b },
+            Weight { ptr: b },
+            Weight { ptr: b },
+            Ask::new(I32s(2)),
+            OutSlot { ptr: m }, Param::new(W), ParamF32::new(1.0), Ask::new(64), Ask::new(4))
             .expect("dispatches");
-        embed_gather_scaled_mb_4bit(&to, b, b, b, I32s(2), m, W, 1.0, Env(R), Env(64), Env(4))
+        embed_gather_scaled_mb_4bit(
+            &to,
+            Weight { ptr: b },
+            Weight { ptr: b },
+            Weight { ptr: b },
+            Ask::new(I32s(2)),
+            OutSlot { ptr: m }, Param::new(W), ParamF32::new(1.0), Ask::new(R), Ask::new(64), Ask::new(4))
             .expect("dispatches");
-        row_gather(&to, b, m, U32s(3), b, InPacked(1), Env(W), Env(R)).expect("dispatches");
+        row_gather(
+            &to,
+            InSlot { ptr: b },
+            OutSlot { ptr: m },
+            Ask::new(U32s(3)),
+            Block::new(b),
+            Ask::new(InPacked(1)),
+            Ask::new(W),
+            Ask::new(R),
+        )
+        .expect("dispatches");
 
         let seen = to.seen.borrow();
         let order = [
@@ -602,7 +661,7 @@ mod ported {
             // until Stage 3 retired them; stated here because the claim is
             // about the BODY and a deleted row is not a reason to stop making
             // it. `driver-wgpu`'s
-            // `the_routine_path_plans_what_the_table_path_planned` compared
+            // `every_launchs_scalars_land_where_its_module_reads_them` compared
             // all six against their rows before those rows went.
             let rule = match *name {
                 // The single-row gathers pass `rows = 1` themselves, so their
@@ -638,7 +697,15 @@ mod ported {
         let to = Recorder::default();
         for (w, r, what) in [(0, 7, "width"), (64, 0, "rows")] {
             assert_eq!(
-                ple_combine(&to, Buf(0), Buf(1), BufMut(2), Buf(3), Env(w), Env(r)),
+                ple_combine(
+                    &to,
+                    InSlot { ptr: Buf(0) },
+                    InSlot { ptr: Buf(1) },
+                    OutSlot { ptr: BufMut(2) },
+                    Block::new(Buf(3)),
+                    Ask::new(w),
+                    Ask::new(r),
+                ),
                 Err(Refusal::Empty { what }),
                 "`dispatch_workgroups(0, 1, 1)` is legal WebGPU that runs \
                  nothing and reports success"

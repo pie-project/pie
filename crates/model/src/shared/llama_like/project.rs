@@ -44,7 +44,7 @@ pub fn manifest(f: &LlamaLikeFacts) -> Manifest {
         .with(TensorSpec::required("norm", [hidden]))
         // TIED vs UNTIED as presence, which is the only way a manifest
         // can tell them apart: every extent agrees.
-        .either(!f.tied_embeddings, "lm_head", [vocab, hidden])
+        .tie(f.tied_embeddings, "lm_head", [vocab, hidden])
         .with(TensorSpec::required(
             "layer.{}.self_attn.q_proj",
             [q, hidden],
@@ -158,6 +158,7 @@ pub fn deployment(f: &LlamaLikeFacts, row: RowScalars) -> Deployment {
             rope_theta,
             // Full rotation at the head dim.
             rotary_dim: 0,
+            q_gate: false,
         })
         .collect();
     Deployment {
@@ -248,132 +249,115 @@ pub fn cuda_facts(
 /// The GEMM tile this build's Metal shaders were STAMPED at.
 ///
 /// A property of the BINARY and not of any checkpoint, exactly as
-/// [`ATTN_HEAD_DIMS`] is. `affine_qmm_t` is instantiated over
-/// `(group × bits × bm × bn)`, so a batched projection's SYMBOL carries
-/// a tile; `16` is the narrowest row rung `qmm_bm` can pick — the one a
-/// short window fires — and `32` is the only column tile the residual
-/// variant is instantiated at. Neither number is a row's to state nor a
-/// load's to observe, because the shaders were stamped before either
-/// existed, which is why this is a `const` here and not a field of
-/// [`MetalBinding`].
+/// [`ATTN_HEAD_DIMS`] is: `affine_qmm_t` is instantiated over
+/// `(group × bits × bm × bn)`, so a batched projection's SYMBOL carries a
+/// tile. Neither number is a row's to state nor a load's to observe, which is
+/// why this is a `const` here and not a field of [`MetalBinding`].
 ///
-/// A symbol whose tile is WRONG does not fail: it reads the wrong bytes.
-/// A symbol with no tile at all does not resolve, which is the better
-/// failure and the one the runtime compiler reports by listing what the
-/// shader does export — which is why `qmm_tile` is stated rather than
-/// left at the serde default of `(0, 0)`.
+/// A symbol whose tile is WRONG reads the wrong bytes; a symbol with no tile
+/// at all does not resolve, which is the better failure -- so `qmm_tile` is
+/// stated rather than left at the serde default of `(0, 0)`.
 ///
-/// # What 16 costs on Vulkan, measured
-///
-/// Reported here rather than changed, because this constant is shared by
-/// every backend and the evidence comes from one of them.
-///
-/// `kernels-vulkan` compiles cooperative-matrix builds of `affine_qmm_t` at
-/// row tiles of 32 and 64 and NONE at 16 — `quant/qmm_t.comp`'s header says
-/// a 16-row tile does not amortise a 16x16x16 matrix operation, which was
-/// tested by generating the missing builds and measuring them: no win, so
-/// the header is right.
-///
-/// The `TokensMultipleOf(tile)` guard in `forward/mod.rs` makes the two arms
-/// directly comparable: a prompt the tile divides takes the tiled GEMM and
-/// one token shorter takes the GEMV, at almost identical work. Minimum of
-/// seven runs each, real 4-bit qwen3-0.6b through `driver-vulkan::Shell`, on
-/// an RTX 4090:
-///
-/// | rows | GEMV | GEMM, tile 16 | tile 32 | tile 64 |
-/// |---|---|---|---|---|
-/// | 15/16 | 20 ms | 107 ms | | |
-/// | 31/32 | 34 ms | | 52 ms | |
-/// | 63/64 | 62 ms | | | 90 ms |
-/// | 127/128 | 146 ms | 350 ms | 111 ms | 126 ms |
-/// | 511/512 | **632 ms** | **1449 ms** | **420 ms** | **416 ms** |
-///
-/// At 512 rows the tile that ships is **2.3x slower than having no GEMM at
-/// all**, and a tile of 32 or 64 is **1.5x faster than having none**. So
-/// `(16, 32)` is the one setting that gets neither half: no
-/// cooperative-matrix build to compile into, and a loss to the matrix-vector
-/// path it exists to replace. This is an argument for a WIDER tile, not a
-/// narrower one.
-///
-/// An earlier version of this table, and a 56.1 / 39.4 / 6.8 s comparison of
-/// the three tiles at 1536 tokens, are struck from it. They were taken before
-/// `driver-vulkan` read its answers through the copy engine, and a readback
-/// of uncached write-combined VRAM was nine tenths of every one of those
-/// numbers — a measurement of the memcpy and not of the kernel. See
-/// `driver_vulkan::device::Device::read_at`.
-///
-/// The tradeoff is not free. A wider tile means more prompts the guard sends
-/// down the GEMV arm — but the table says that arm is faster than the tile-16
-/// GEMM anyway at every size measured, so `(32, 32)` is not a gamble against
-/// the short-prompt case: it is faster than the old setting whether the guard
-/// passes or fails.
-///
-/// # And what widening it was worth, once the readback stopped hiding it
-///
-/// Taken, and here is the measurement that decided it. Same card, same 4-bit
-/// qwen3-0.6B, a 1024-token prefill through `driver-vulkan::Shell` with the
-/// tile overridden and everything else held — best of three after a warm-up:
-///
-/// | tile | 1024-token prefill |
-/// |---|---|
-/// | `(16, 32)`, as shipped | 2563 ms |
-/// | `(32, 32)` | **565 ms** |
-/// | `(64, 32)` | 580 ms |
-///
-/// **4.5x.** Phase-profiled, the dispatches were 2694 ms of a 2799 ms step at
-/// the old tile, so this is nearly the whole of a prefill and not a corner of
-/// it. The same prompt one token SHORTER — which the `TokensMultipleOf` guard
-/// sends down the GEMV arm — took 1054 ms, so the old tile was also 2.6x
-/// slower than firing no GEMM at all.
-///
-/// Widths other than 1024 were an open question when that table was taken,
-/// and 32 wins or ties at all of them. Same card, same model, same method,
-/// after the driver's readback, lowering cache, table reuse and barrier
-/// analysis had all landed:
-///
-/// | width | `(32, 32)` | `(64, 32)` |
-/// |---|---|---|
-/// | 256 | **122 ms** | 134 ms |
-/// | 512 | **246 ms** | 258 ms |
-/// | 1024 | **558 ms** | 565 ms |
-/// | 2048 | 1488 ms | 1484 ms |
-///
-/// 64 is behind by a tenth on short prompts, level by 2048, and refuses more
-/// prompts at the guard. There is no width where it pays.
-///
-/// What the 4.5x actually BUYS is the cooperative-matrix tier, and that is
-/// measurable on its own: the same 1024-token prefill at `(32, 32)` with the
-/// tiered modules stripped from the store — the only thing changed — takes
-/// **2592 ms** against 570. So the tile is not faster arithmetic; it is the
-/// instantiation point at which the hardware's matrix units become
-/// nameable at all.
-///
-/// It stayed at 16 for as long as it did because the number that would have
-/// shown this was buried: every prefill timing this repository had taken
-/// included a readback of every row the fire computed, through an uncached
-/// mapping of write-combined VRAM, and that memcpy was most of the wall time.
-///
-/// # Why one constant is still enough
-///
-/// This is shared by every backend, which is what held the change back. It
-/// turns out not to be a per-backend question after all:
-///
-/// * `kernels-metal`, `kernels-wgpu` and `kernels-vulkan` all declare
-///   `TILE_M` as `_bm_16 | _bm_32 | _bm_64`, so `(32, 32)` resolves in all
-///   three exactly as `(16, 32)` did.
-/// * All three ALSO hand-list a `bm_32_bn_32_wm_1_wn_2` build beside the
-///   templated ones and hand-list nothing at `bm_16` — so 32 is the point
-///   each of those trees was tuned for, and 16 was the point none of them
-///   was.
-/// * The CUDA backend does not read this field: it resolves its GEMM without
-///   `dsl::metal::affine_gemm_point`, so nothing there moves.
-///
-/// The measurement is from one backend and the argument above is why it
-/// generalises. A backend that later wants its own tile has somewhere to put
-/// it — `qmm_tile` is already a field on [`MetalBinding`] rather than read
-/// from this constant at the point of use — so this is a default and not a
-/// hard-coding.
+/// 32 rather than 16 because 16 has no cooperative-matrix build to compile
+/// into. Measured on an RTX 4090 with 4-bit qwen3-0.6B, a 1024-token prefill
+/// takes 2563 ms at `(16, 32)` and 565 ms at `(32, 32)`; 64 is a tenth behind
+/// on short prompts and refuses more prompts at the `TokensMultipleOf` guard.
+/// `kernels-metal`, `kernels-wgpu` and `kernels-vulkan` all declare `TILE_M`
+/// as `_bm_16 | _bm_32 | _bm_64` and all hand-list a `bm_32` build, so 32
+/// resolves in every tree; the CUDA backend does not read this field. A
+/// backend wanting its own tile has `qmm_tile` on [`MetalBinding`].
 pub const QMM_TILE: (u32, u32) = (32, 32);
+
+/// Whether this build's dense GEMM stages its activation to `half`.
+///
+/// See [`LlamaLikeMetalFacts::qmm_fp16_precast`] for what the staging buys.
+/// Spelled `(group, bits)` to read like `Tuning::fp16_gemm_format`, which is
+/// the driver's half of the same question.
+///
+/// The condition is the CODEC's, not the family's: `qmm_t.metal` stamps
+/// `affine_qmm_t_fp16_precast` at `gs = 64, b = 4` and at nothing else, so
+/// any other quantization has no symbol to name and has to take the
+/// emulated `bfloat` tiles.
+///
+/// Not gated on the device here. A trace is authored once and read on
+/// whatever machine loads it, and the family-9 parts where the `bfloat`
+/// matrix unit is real are also the parts where the staging pass is pure
+/// cost — that half of the choice is `Tuning::fp16_qmm`'s, on the driver
+/// side, where the device is a thing that can be asked.
+///
+/// [`LlamaLikeMetalFacts::qmm_fp16_precast`]:
+///     crate::shared::llama_like::forward::LlamaLikeMetalFacts::qmm_fp16_precast
+#[must_use]
+pub const fn qmm_fp16_precast(group: u32, bits: u32) -> bool {
+    bits == 4 && group == 64
+}
+
+/// The ROUTED GEMM's tile this build stamps, which is deliberately narrower
+/// than [`QMM_TILE`].
+///
+/// See [`LlamaLikeMetalFacts::moe_tile`] for why the two differ: a routed
+/// tile's rows are ONE EXPERT'S share of the fire, so the row tile is also
+/// the sort's padding block and a wide one pads more than it amortises. A
+/// prefill of 128 tokens at top-4 over 128 experts stacks 512 rows across
+/// 128 runs — four rows a run on average, which `bm = 16` rounds to sixteen
+/// and `bm = 64` would round to sixty-four.
+///
+/// `bm = 32` is measured, not assumed. On gemma-4-26b-a4b (128 experts,
+/// top-8) a 128-token prefill runs 397 tok/s at `bm = 16`, **421** at 32
+/// and 371 at 64: sixteen pays too many tiles for the weight traffic and
+/// sixty-four pads too many rows into the arithmetic. gpt-oss (32 experts,
+/// top-4) is flat across all three, so nothing else in the tree argues
+/// for a different point.
+///
+/// `bn` is measured too, and it does NOT follow the row tile's argument.
+/// The column tile is not the sort's padding block — it tiles the expert's
+/// own output width, which is whole — so widening it only trades tiles for
+/// register reuse. A 128-token prefill, tok/s:
+///
+/// | `(bm, bn)` | gemma-4-26b-a4b | gpt-oss-20b | Qwen3.6-35B-A3B |
+/// |---|---|---|---|
+/// | (16, 32) | 408.5 | | |
+/// | (32, 16) | 395.5 | | |
+/// | (32, 32) | 433.4 | 477.3 | 297.0 |
+/// | (32, 64) | **436.7** | **479.1** | 296.9 |
+/// | (64, 32) | 382.1 | | |
+///
+/// The gemma-4 pair is three repeats each and does not overlap
+/// (433.2/433.3/433.6 against 436.4/436.5/437.1). It is under one percent,
+/// and it is free: the wider symbol is already instantiated. A3B is flat
+/// because its expert width (768) leaves the wider tile with the same tile
+/// count it had at 32.
+///
+/// The DENSE tile does not want the same point. Swept on the same model
+/// with the routed tile held at (32, 64): (32, 32) 436.9, (32, 64) 431.7,
+/// (16, 32) 417.4, (64, 32) 420.0, (64, 64) 414.9. A dense GEMM's rows are
+/// the whole batch rather than one expert's share of it, so it is already
+/// wide enough that a wider tile only costs occupancy.
+///
+/// # The padding argument above is the right answer for the wrong reason
+///
+/// Everything before this paragraph reasons about `bm` as a padding block,
+/// and the reasoning does not survive being measured. Cutting the fire at
+/// the MoE block's boundaries (`tier_one_prefill_then_decode` documents the
+/// method) prices one layer's three routed GEMMs at 5.7 ms with `bm = 32`
+/// and **6.2 ms with `bm = 16`** -- half the padded arithmetic, nine percent
+/// SLOWER. If padding were what `bm` bought, that number could not exist.
+///
+/// What the same cut says when the token count moves instead: 2.6 ms at
+/// n=32, 5.7 at 128, 15.8 at 512. That fits a per-touched-expert term of
+/// 2.33 ms -- 428 MB of expert weights a layer at 184 GB/s, which is this
+/// machine's real bandwidth -- plus a per-REAL-row term of 3.37 ms. No
+/// padding term is needed to fit it, because the padded rows ride along with
+/// a weight fetch that was going to happen anyway.
+///
+/// So `bm = 32` wins on arithmetic intensity and not on padding: at
+/// `(16, 32)` a lane holds two accumulator fragments where `(32, 32)` gives
+/// it four, and the tile becomes loader-bound. `(16, 64)` restores the four
+/// -- 8 rows x 32 columns a simdgroup, one A fragment against four B -- and
+/// it recovers most but not all of the loss (430.4 against 436.7), which is
+/// the cleanest statement of the axis there is: the row tile is bought for
+/// what a lane accumulates, and the sort's padding is nearly free.
+pub const ROUTED_QMM_TILE: (u32, u32) = (32, 64);
 
 /// Why a SHARDED load has no Metal text here.
 ///
@@ -458,48 +442,18 @@ pub const NO_METAL_NORMED_LANDING_BIAS: &str = "this row publishes a bias on its
 
 /// What this build's Metal kernels cannot run, asked of the FACTS.
 ///
-/// Three refusals, and none of them is about a row: they are about the
-/// KERNEL SET. A width `sdpa_paged.metal` never instantiated, an affine
-/// point `quant/qmv.metal` never stamped the routed matvec at, a shard
-/// count no Metal deployment has — each is a gap in the same one
-/// sentence for every family that lowers this text.
+/// Three refusals about the KERNEL SET rather than about a row: a width
+/// `sdpa_paged.metal` never instantiated, an affine point `quant/qmv.metal`
+/// never stamped the routed matvec at, and a shard count no Metal deployment
+/// has. One function rather than three lines in [`trace`] because `gemma_3`
+/// and `gemma_4` reach [`llama_like_metal`] directly; a row that reaches an
+/// unstamped width unrefused meets `model-compiler`'s abort on an undeclared
+/// launch instead of a sentence.
 ///
-/// # Why it is a function and not three lines in `trace`
-///
-/// It WAS three lines in [`trace`], and [`trace`] is not the only door
-/// to [`llama_like_metal`]. `gemma_3` and `gemma_4` reach the text
-/// directly, because each overrides part of the projection that builds
-/// its facts, and each carried the shard check alone — so a gemma row
-/// at a width the shader has no symbol for did not get refused by name.
-/// It PANICKED: `model-compiler` validates a declaration against the
-/// kernel rows and aborts on an undeclared launch, which is why
-/// [`NO_METAL_HEAD_DIM`] exists at all rather than being left to fail at
-/// pipeline construction.
-///
-/// What the two doors were missing was LATENT rather than live, and
-/// the measurement is worth keeping because the obvious reading was
-/// wrong. Every gemma row published today runs at head width 256,
-/// which the shader stamps; and gemma-4's only routed row,
-/// `gemma-4-26b-a4b`, is refused EARLIER and in its own words — this
-/// build cannot load a routed gemma-4 block — so the affine point was
-/// never asked of it. Nothing was being mis-served. What was
-/// true is that two doors could not have SAID so, and the first row to
-/// land at an unstamped width would have met `model-compiler`'s abort
-/// instead of a sentence.
-///
-/// One function, three callers, and
-/// `catalog_backends::no_door_serves_a_routed_bank_at_an_unstamped_point`
-/// asserts the property the ladder is for, rather than that each door
-/// holds a copy of it.
-///
-/// # Both head dims, not the first one
-///
-/// [`trace`] asked `f.head_dim` because twelve families have one shape.
-/// gemma-4 has two — 256 sliding against 512 full — and the text names
-/// `sdpa_paged_decode_bfloat16_d_<width>` for EACH, so a stack whose
-/// second shape is off the axis names a symbol nothing exports just as
-/// surely as its first. `global_head_dim` is zero when the stack has one
-/// shape, which is why zero is skipped rather than refused.
+/// BOTH head dims are checked. gemma-4 has two -- 256 sliding against 512
+/// full -- and the text names `sdpa_paged_decode_bfloat16_d_<width>` for each.
+/// `global_head_dim` is zero when the stack has one shape, which is why zero
+/// is skipped rather than refused.
 ///
 /// # Errors
 ///
@@ -540,45 +494,17 @@ pub fn metal_kernel_refusal(
 
 /// The row's own numbers, which [`LlamaLikeFacts`] does not hold.
 ///
-/// They are gathered here rather than added to the shape because twelve
-/// generations share that struct and a field on it is a field every one
-/// of them restates.
+/// Gathered here rather than added to the shape because twelve generations
+/// share that struct and a field on it is a field every one of them restates.
+/// [`deployment`] and [`trace`] both take this struct, so the row is read
+/// once and spent twice: a row that FIRED at one theta and PAGED at another
+/// would otherwise compile.
 ///
-/// # One struct, because a row is read once
-///
-/// [`deployment`] took `rope_theta`, `norm_eps` and `sliding_window` as
-/// three loose arguments while [`trace`] took the same three off this
-/// struct, and every generation filled both from the same fields of
-/// itself. That is two readings of one document — the defect the
-/// catalog exists to end — and it was live: nothing held the two
-/// call sites together, so a row that FIRED at one theta and PAGED at
-/// another would have compiled. Both now take this, so the row is
-/// stated once and spent twice.
-///
-/// # The Metal text reads more of it than the CUDA one
-///
-/// `llama_like_cuda` names no epsilon and no rotary base: the CUDA
-/// driver carries both on its own `fwd_cfg`. `llama_like_metal` names
-/// all three — its norms take `RmsParams`, its rope takes a base, and
-/// its attention takes a window — because a Metal statement carries
-/// every scalar its kernel reads. That asymmetry is not a gap in one
-/// of the texts; it is what "a text is written for a backend" means.
-/// It is also why this struct was called `MetalRow`, which stopped
-/// being true the moment [`deployment`] read it — the deployment is
-/// what CUDA's launch reads its `moe_norm_topk` off.
-///
-/// # It carries no `forward` gate, for that same reason
-///
-/// It had one, left from when only the texts read it, and that gate
-/// outlived its truth by exactly the change the paragraph above
-/// describes: [`deployment`] is not gated, `Variant::deployment` is not
-/// gated, and every generation's `fn row` that feeds them is not gated
-/// either. So `--no-default-features --features contract` did not
-/// compile this crate at all — sixteen unresolved names, all this one.
-/// Nothing caught it because no consumer asks for `contract` without
-/// `forward`, and feature unification handed one to every build that
-/// did. The gate is gone rather than spread to the callers: a scalar a
-/// row STATES is not an aspect, and the twin in `gemma_4` never had one.
+/// `llama_like_cuda` names no epsilon and no rotary base -- the CUDA driver
+/// carries both on its own `fwd_cfg` -- while `llama_like_metal` names all
+/// three, because a Metal statement carries every scalar its kernel reads.
+/// Not gated on `forward`: [`deployment`] and the `fn row` that feeds it are
+/// not gated either.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RowScalars {
     /// `rope_theta`, the rotary base every layer of this row rotates at.
@@ -607,14 +533,11 @@ pub struct RowScalars {
     pub window: i32,
     /// The row states a rope RESCALING, so no base expresses its ladder.
     ///
-    /// llama-3's piecewise `rope_scaling` and OLMo-3's YaRN. The table
-    /// itself is the DRIVER's — derived at load and answered as
-    /// `Source::RopeFrequencies` — and this only says which form the
-    /// statement takes. Nothing carried it for the length of this
-    /// refactor: `driver-metal` read the four numbers off the deleted
-    /// `pie.model/1` descriptor, and a factor of zero reads as "no
-    /// rescaling", so every llama-3 would have attended past its trained
-    /// 8192 with the wrong wavelengths — degrading rather than failing.
+    /// llama-3's piecewise `rope_scaling` and OLMo-3's YaRN. The table itself
+    /// is the DRIVER's -- derived at load and answered as
+    /// `Source::Named(<keys::RopeFrequencies as keys::Fact>::KEY)` -- and this
+    /// only says which form the statement takes. A factor of zero reads as "no
+    /// rescaling", so getting it wrong degrades rather than fails.
     pub rope_rescaled: bool,
     /// Whether the router renormalizes over the SELECTED experts.
     ///
@@ -642,62 +565,21 @@ pub struct RowScalars {
 
 /// The METAL binding facts for this load.
 ///
-/// The twin of [`cuda_facts`], and the split is the whole point: six
-/// fields come from `bind` because a LOAD observed them, one is this
-/// build's stamp ([`QMM_TILE`]), and the rest are the [`MetalRow`]
-/// scalars a Metal text names and `LlamaLikeFacts` does not hold.
+/// The twin of [`cuda_facts`]: six fields come from `bind` because a LOAD
+/// observed them, one is this build's stamp ([`QMM_TILE`]), and the rest are
+/// the [`RowScalars`] a Metal text names and `LlamaLikeFacts` does not hold.
 ///
-/// # Why it takes no `LlamaLikeFacts`
+/// It takes no [`LlamaLikeFacts`] because `LlamaLikeMetalFacts` has no shape
+/// vocabulary at all -- the Metal text is handed the row's facts directly
+/// beside these (`llama_like_metal(f, &metal_facts(..), class)`) and reads
+/// every extent off them. `cuda_facts` needs its own because its `tp_size`
+/// NARROWS those extents, and the narrowed widths have to be stated where the
+/// text will read them.
 ///
-/// It used to, and never read it — the parameter was a claim that the
-/// SHAPE matters to this projection, and it does not: a shape reaches
-/// the Metal text as `llama_like_metal`'s own first argument, and what
-/// is built here is the BINDING beside it. `cuda_facts` genuinely reads
-/// one (it pads the head dim), which is why the asymmetry is real and
-/// worth the two signatures differing.
-///
-/// # What this replaces
-///
-/// `driver-metal`'s `facts_from_with`, which rebuilt the model's own
-/// facts from nine tensor probes: whether a `pre_feedforward_layernorm`
-/// exists decided the norm placement AND the `(1 + w)` fold, whether a
-/// `q_norm` exists decided the qk-norm, whether a `layer_scalar` exists
-/// decided gemma's per-layer scale, and `embed_scale` was keyed off the
-/// first of those. Every one of those questions is answered by the row
-/// that matched the checkpoint, and answering them twice is how a
-/// gemma came to be read as a llama — the `(1 + w)` became `w` and two
-/// norms per layer were dropped, with nothing faulting.
-///
-/// # The zeros are STATED
-///
-/// Nine of the fields below are gemma's or gpt-oss's and are zero or
-/// false for every row this projection serves. They are written out one
-/// at a time with the reason, and [`LlamaLikeMetalFacts`] deliberately
-/// has no `Default` impl to fall through to, for the reason the
-/// fixtures give: a row is a MEASUREMENT of a real checkpoint, and
-/// "this one has no per-layer embeddings" is part of the measurement. A
-/// default body is a claim about every row that has not been written
-/// yet.
-///
-/// # It takes no [`LlamaLikeFacts`]
-///
-/// The twin above takes them and this does not, and the asymmetry is
-/// the split's, not an omission. `LlamaLikeMetalFacts` has no shape
-/// vocabulary at all — no hidden, no head count, no width — because
-/// the Metal text is handed the row's facts DIRECTLY beside these
-/// (`llama_like_metal(f, &metal_facts(..), class)`) and reads every
-/// extent off them. `cuda_facts` needs its own because its `tp_size`
-/// NARROWS those extents, and the narrowed widths have to be stated
-/// somewhere the text will read instead of the row.
-///
-/// So the three `false`s below are not the row's answers withheld:
-/// each is a claim about what a checkpoint PUBLISHED, and the manifest
-/// is where this family makes that claim. `gate_up_fused` is the load's
-/// binding, `v_from_k` is a manifest
-/// requirement, and `dense_beside_moe` is the routed/dense exclusion
-/// the manifest already enforces — a mixture's SHARED expert is a
-/// different structure, stated by `shared_intermediate` and emitted by
-/// the text off the row's facts without passing through here.
+/// The zeros are STATED one at a time with their reason, and
+/// [`LlamaLikeMetalFacts`] deliberately has no `Default` to fall through to:
+/// a row is a MEASUREMENT of a real checkpoint, and "this one has no
+/// per-layer embeddings" is part of the measurement.
 ///
 /// [`LlamaLikeMetalFacts`]: super::forward::facts::LlamaLikeMetalFacts
 #[must_use]
@@ -725,6 +607,7 @@ pub fn metal_facts(
         paged_multi_batch: bind.paged_multi_batch,
         qmm_multi_batch: bind.qmm_multi_batch,
         add_bias: bind.add_bias,
+        fused_qk_rope: bind.fused_qk_rope,
         // The checkpoint's own affine format. MLX stores the pair beside
         // the packed weight as `.scales` and `.biases`, which is a
         // zero-point layout, and the GROUP is asked of the load rather
@@ -738,31 +621,20 @@ pub fn metal_facts(
             zero_point: true,
         },
         affine_bits: bind.quant_bits,
-        // The expert bank's OWN format, when the loader left it in the
-        // checkpoint's MXFP4. `None` is "the same as the dense
-        // projections", which is every checkpoint this family serves —
-        // and reading a bank with the dense format is not a near miss:
-        // every scale comes from the wrong offset, and the fire that did
-        // it produced 909,207 NaNs beginning at the first routed
-        // projection of layer 0.
         // The ROUTER GATE's own format, when the checkpoint published it
         // wider than the stack it routes. `None` is "the same as the dense
         // projections", which is every checkpoint but gpt-oss's -- and
         // getting it wrong is the QUIET failure: a bank read at the wrong
         // format is 909,207 NaNs, and a gate read at the wrong width is a
         // fluent model routing every token to almost the right experts.
-        router_repr: (bind.router_quant_group != 0).then_some(
-            model_dsl::WeightRepr::Scaled {
-                layout: model_dsl::ScaleLayout::PerGroup,
-                group: bind.router_quant_group,
-                axis: 0,
-                zero_point: true,
-            },
-        ),
+        router_repr: (bind.router_quant_group != 0).then_some(model_dsl::WeightRepr::Scaled {
+            layout: model_dsl::ScaleLayout::PerGroup,
+            group: bind.router_quant_group,
+            axis: 0,
+            zero_point: true,
+        }),
         router_bits: bind.router_quant_bits,
-        moe_repr: bind
-            .moe_mxfp4
-            .then_some(model_dsl::WeightRepr::Mxfp4Marlin),
+        moe_repr: bind.moe_mxfp4.then_some(model_dsl::WeightRepr::Mxfp4Marlin),
         // FOUR by the format's own definition — MXFP4 is a four-bit
         // mantissa under a shared block exponent — so it is a constant
         // and not a second thing for the load to observe. It is read
@@ -773,6 +645,14 @@ pub fn metal_facts(
         moe_bits: 4,
         // ── what this BUILD stamped ──
         qmm_tile: QMM_TILE,
+        qmm_fp16_precast: qmm_fp16_precast(bind.quant_group, bind.quant_bits),
+        // False at the codec that would allow it. See the fact: this family's
+        // routed checkpoint reordered a next-layer top-k under half rounding
+        // in `llama_numerics_test`, and a reordered top-k is a different
+        // model and not a tolerance. gemma-4 asks for true from its own
+        // projector because its mixture did not move.
+        routed_qmm_fp16: false,
+        moe_tile: Some(ROUTED_QMM_TILE),
         // ── what the ROW states ──
         //
         // FALSE, and it is the row's answer rather than a policy: this
@@ -901,11 +781,8 @@ pub fn metal_facts(
         // and diverge from there.
         activation: super::forward::facts::Activation::SiluMul,
         // Whether the driver hands over a frequency TABLE instead of a
-        // base. True for llama-3's piecewise rescaling and OLMo-3's
-        // YaRN, which no `rope_theta` expresses — see [`RowScalars`] for
-        // the bug this closes, which is that nothing carried either for
-        // the length of this refactor and a zero factor reads as "no
-        // rescaling".
+        // base. True for llama-3's piecewise rescaling and OLMo-3's YaRN,
+        // which no `rope_theta` expresses.
         rope_freq_table: row.rope_rescaled,
         // The window, as the per-layer list the text reads through
         // `window_left_at`. EMPTY when the row attends the whole
@@ -1241,6 +1118,7 @@ mod tests {
             paged_multi_batch: true,
             qmm_multi_batch: true,
             add_bias: false,
+            fused_qk_rope: false,
         }
     }
 
@@ -1510,10 +1388,7 @@ mod tests {
         assert_eq!(uniform.moe_repr, None);
 
         let split = metal_facts(qwen3_row(), Deployed::metal(&mixed), &mixed);
-        assert_eq!(
-            split.moe_repr,
-            Some(model_dsl::WeightRepr::Mxfp4Marlin)
-        );
+        assert_eq!(split.moe_repr, Some(model_dsl::WeightRepr::Mxfp4Marlin));
         assert_eq!(
             split.moe_bits, 4,
             "MXFP4 is four bits by the format's own name"
@@ -1708,5 +1583,27 @@ mod tests {
             )
             .is_ok()
         );
+    }
+}
+#[cfg(test)]
+mod fp16_precast_tests {
+    /// Both arms of the staged-GEMM predicate, which no fixture pair states.
+    ///
+    /// See `LlamaLikeMetalFacts::qmm_fp16_precast`'s entry in `EXCUSED`: every
+    /// Metal row this catalog ships is g64/b4, so the three fact fixtures
+    /// agree and the census cannot see the false arm. It is reachable —
+    /// `affine_qmm_t_fp16_precast` is stamped at ONE codec — and this is
+    /// where that is written down.
+    #[test]
+    fn the_staged_gemm_is_the_g64_b4_codecs_alone() {
+        assert!(super::qmm_fp16_precast(64, 4), "the stamped codec");
+        // The 8-bit affine snapshots `mlx-community` publishes of these same
+        // rows. `instantiate_qmm_t_fp16_precast` takes a tile and nothing
+        // else, so there is no `_b_8` precast symbol to name.
+        assert!(!super::qmm_fp16_precast(64, 8), "no 8-bit precast is stamped");
+        // g128/b4 and g32/b4 pack to the same extents as g64 and would
+        // resolve to a symbol that reads every scale from the wrong offset.
+        assert!(!super::qmm_fp16_precast(128, 4));
+        assert!(!super::qmm_fp16_precast(32, 4));
     }
 }

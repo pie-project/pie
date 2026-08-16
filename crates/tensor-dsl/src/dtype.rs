@@ -15,7 +15,6 @@ pub const i32: DType = DType::I32;
 /// dimension and index type.
 #[allow(non_upper_case_globals)]
 pub const u32: DType = DType::U32;
-/// The one-byte boolean scalar type ([`DType::Bool`]); the dtype of
-/// comparison and mask results.
+/// The one-byte boolean scalar type ([`DType::Bool`]); comparisons and masks.
 #[allow(non_upper_case_globals)]
 pub const bool: DType = DType::Bool;

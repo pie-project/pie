@@ -33,8 +33,6 @@
 //! Not a sampler, and not a tokenizer. A `Step` comes back with its
 //! distributions, as it does one layer down.
 
-use std::collections::BTreeMap;
-
 use kernels_vulkan::Capability;
 use model_ir::trace::ForwardPlan;
 
@@ -333,7 +331,7 @@ impl std::error::Error for Unresized {}
 /// other -- see [`Shell::open`] for which pairs, and what being out of step
 /// looks like.
 pub struct Shell {
-    modules: BTreeMap<String, Vec<u8>>,
+    modules: Box<dyn crate::serve::Modules + Send + Sync>,
     pipelines: Pipelines,
     pool: Pool,
     book: Book,
@@ -342,6 +340,18 @@ pub struct Shell {
     /// above because it holds no device object: a lowering is launches,
     /// symbols and offsets.
     lowerings: crate::turns::Lowerings,
+    /// The arena buffer, kept between steps. It DOES hold a device object,
+    /// which is why [`Shell`]'s `Drop` releases it beside the pool and the
+    /// weights.
+    arenas: crate::turns::Arenas,
+    /// The last fire, kept so the next step need not plan or record one.
+    ///
+    /// Holds no device object of its own -- a `Buffer` is plain data and the
+    /// recording lives on the [`Device`] -- so nothing here has to be
+    /// released. What makes it safe to hold across a step is stated in
+    /// [`crate::replay`], and it is the device's own counters rather than
+    /// anything this struct's drop order could promise.
+    plans: crate::replay::Plans,
     text: Text,
     tier: Capability,
     /// LAST, so that it outlives every buffer above it even if the [`Drop`]
@@ -366,16 +376,18 @@ impl Shell {
     /// The tier is the best the device loads, from
     /// [`Device::tiers`](crate::device::Device::tiers).
     ///
+    /// The modules are `kernels-vulkan`'s, out of the rlib. There is no
+    /// parameter for them and no directory to name: a store used to be the
+    /// caller's to supply, which made every deployment answer "where are the
+    /// kernels" for itself and made the engine's seam carry a path that named
+    /// a `target/` tree. See [`Embedded`](crate::serve::Embedded).
+    ///
     /// # Errors
     ///
     /// [`Unopened`].
-    pub fn open(
-        text: Text,
-        deployment: Deployment,
-        modules: BTreeMap<String, Vec<u8>>,
-    ) -> Result<Self, Unopened> {
+    pub fn open(text: Text, deployment: Deployment) -> Result<Self, Unopened> {
         let device = Device::open().map_err(Unopened::Absent)?;
-        Self::on(device, text, deployment, modules)
+        Self::on(device, text, deployment)
     }
 
     /// As [`Shell::open`], on a device the caller already has.
@@ -386,11 +398,42 @@ impl Shell {
     /// # Errors
     ///
     /// As [`Shell::open`], minus [`Unopened::Absent`].
-    pub fn on(
+    pub fn on(device: Device, text: Text, deployment: Deployment) -> Result<Self, Unopened> {
+        Self::on_with(device, text, deployment, Box::new(crate::serve::Embedded))
+    }
+
+    /// As [`Shell::on`], serving from a store the caller states.
+    ///
+    /// Not for deployments — a server has exactly one answer to where its
+    /// kernels are and [`Shell::on`] is it. This exists for the tier tests,
+    /// which build a store with the cooperative-matrix modules REMOVED so that
+    /// the baseline and the tiered run can be compared on one device. A store
+    /// that can be narrowed is the only way to ask "is the tier actually
+    /// running", and that question was once answered by inference and was
+    /// wrong for 146 modules.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shell::on`].
+    pub fn open_with(
+        text: Text,
+        deployment: Deployment,
+        modules: Box<dyn crate::serve::Modules + Send + Sync>,
+    ) -> Result<Self, Unopened> {
+        let device = Device::open().map_err(Unopened::Absent)?;
+        Self::on_with(device, text, deployment, modules)
+    }
+
+    /// As [`Shell::open_with`], on a device the caller already has.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shell::on`].
+    pub fn on_with(
         device: Device,
         text: Text,
         deployment: Deployment,
-        modules: BTreeMap<String, Vec<u8>>,
+        modules: Box<dyn crate::serve::Modules + Send + Sync>,
     ) -> Result<Self, Unopened> {
         text.servable()?;
         let shape = Shape {
@@ -425,6 +468,8 @@ impl Shell {
             pool,
             weights,
             lowerings: crate::turns::Lowerings::default(),
+            arenas: crate::turns::Arenas::default(),
+            plans: crate::replay::Plans::new(),
             text,
             // Best first, and a device always reports at least `Baseline`.
             tier: device
@@ -468,6 +513,8 @@ impl Shell {
             pool: &mut self.pool,
             weights: &self.weights,
             lowerings: &mut self.lowerings,
+            arenas: &mut self.arenas,
+            plans: &mut self.plans,
         };
         serving.step(
             &self.device,
@@ -528,28 +575,13 @@ impl Shell {
     ///
     /// # Why this grows the pool first, and only for destinations
     ///
-    /// Because this pool is elastic and grows ON DEMAND: [`Self::admit`]
-    /// raises it to the highest page a frame NAMES, so the pool holds what
-    /// the frames so far have needed and not what the scheduler is entitled
-    /// to hand out. A copy plan is the other way a page number arrives, and
-    /// it did not carry that reasoning -- so a plan whose destination sat one
-    /// page above the last frame's high-water mark was REFUSED, by a check
-    /// that was right about the pool and wrong about what the pool could be.
-    ///
-    /// `prefix-tree-kv-cache` is what found it, in the curated sweep and only
-    /// there: it needs a destination past the pages its own prefills had
-    /// grown the pool to, and it failed with "page move 0's destination names
-    /// page 3 row 0, and the pool has 3 pages of 16 rows" while passing
-    /// whenever it ran alone. A driver that answers differently depending on
-    /// which requests preceded it is the shape of defect a per-test suite
-    /// cannot see.
-    ///
-    /// DESTINATIONS only. A source above the pool is still refused, and must
-    /// be: this pool only ever grows on demand, so a page number the pool has
-    /// never held is a page nothing has ever written. Growing for it would
-    /// turn a refusal into a copy of freshly zeroed memory -- the same
-    /// history-shaped silence the `Stranded` check exists to prevent, arrived
-    /// at from the other side.
+    /// The pool is elastic and grows ON DEMAND to the highest page a frame
+    /// NAMES ([`Self::admit`]); a copy plan's destination can name a page one
+    /// past that high-water mark, so this grows the pool for it rather than
+    /// refusing. DESTINATIONS only: a source above the pool is still refused,
+    /// because growing for it would turn a refusal into a copy of freshly
+    /// zeroed memory -- the same silence the `Stranded` check exists to
+    /// prevent, arrived at from the other side.
     ///
     /// # Errors
     ///
@@ -580,42 +612,24 @@ impl Shell {
     /// # Which pool
     ///
     /// The KV one, and only it. The engine's trim task asks about three --
-    /// KV, recurrent state and workspace -- on every tick, and the other two
-    /// have no storage here. They are ANSWERED rather than refused, because
-    /// "resize the thing that holds nothing" is satisfied by doing nothing,
-    /// and a refusal would make the trim task log a failure every tick for a
-    /// question it was right to ask. `driver-metal` says the same, for the
-    /// same reason, and its note adds the one that matters: ignoring the id
-    /// instead would resize the KV pool to the state pool's target, which is
-    /// a high-water mark of zero.
+    /// KV, recurrent state and workspace -- on every tick; the other two have
+    /// no storage here, so they are ANSWERED rather than refused (resizing
+    /// nothing is satisfied by doing nothing). `driver-metal` does the same,
+    /// for the same reason.
     ///
     /// # But only down to nothing
     ///
-    /// "Satisfied by doing nothing" is only true when nothing is what was
-    /// asked for. This answered EVERY target on those ids with `Ok(())`,
-    /// including a request for storage, and the engine does not treat that
-    /// answer as advisory: `bootstrap`'s trim task records the target in
-    /// `applied` on success and then SKIPS that pool on every later tick,
-    /// because a target it has already reached is not worth re-sending. So a
-    /// blanket `Ok` did not merely mislay one request, it permanently
-    /// convinced the engine that a pool with no bytes behind it was holding
-    /// the pages it asked for.
+    /// A target of zero is `Ok`, since zero is what this backend genuinely
+    /// holds for those two pools. Anything above zero on them (or on an id
+    /// this driver has never heard of) is [`Unresized::Absent`]: a blanket
+    /// `Ok` there would let the engine believe a pool with no bytes behind it
+    /// was holding pages it asked for, and `bootstrap`'s trim task never
+    /// re-asks a target it believes it already reached.
     ///
-    /// That is the failure the capability literal refuses one seam away, in
-    /// those same words -- a sink that would "bind and then run as a silent
-    /// no-op, which is worse than a refusal at the door". It is worth no less
-    /// here. A target of zero is still `Ok`, because zero is what this
-    /// backend genuinely holds in both of those pools and what the trim task
-    /// actually asks for -- workspace is asked for `0` on every tick, and
-    /// state is not asked at all while `rs_cache_slot_bytes` is zero. Anything
-    /// above zero, on those ids or on an id this driver has never heard of,
-    /// is [`Unresized::Absent`]: a refusal the trim task retries next tick
-    /// rather than a success it stops questioning.
-    ///
-    /// The plan's `map_ranges` and `unmap_ranges` are not read. They describe
-    /// a sparse pool's commits, and this pool is not sparse -- see
-    /// [`crate::resources::Pool::resize`] for why it does not need to be.
-    /// `target_pages` is the whole of what this backend can act on.
+    /// The plan's `map_ranges`/`unmap_ranges` are not read: they describe a
+    /// sparse pool's commits, and this pool is not sparse (see
+    /// [`crate::resources::Pool::resize`]). `target_pages` is the whole of
+    /// what this backend can act on.
     ///
     /// # Errors
     ///
@@ -855,6 +869,8 @@ impl Shell {
             pool: &mut self.pool,
             weights: &self.weights,
             lowerings: &mut self.lowerings,
+            arenas: &mut self.arenas,
+            plans: &mut self.plans,
         };
         serving
             .over(
@@ -1011,6 +1027,16 @@ impl Shell {
         &self.pool
     }
 
+    /// The plan cache: what it did, and its two switches.
+    ///
+    /// `&mut` because a caller's only reasons to reach it are to turn reuse
+    /// off, to turn the per-fire diff on, or to read the counters -- and the
+    /// first two are settings of a cache rather than of a process. See
+    /// [`crate::replay`].
+    pub fn plans(&mut self) -> &mut crate::replay::Plans {
+        &mut self.plans
+    }
+
     /// Who owns which page.
     #[must_use]
     pub fn book(&self) -> &Book {
@@ -1043,6 +1069,7 @@ impl Drop for Shell {
     fn drop(&mut self) {
         self.weights.release(&self.device);
         self.pool.release(&self.device);
+        self.arenas.release(&self.device);
         self.pipelines.clear(&self.device);
     }
 }

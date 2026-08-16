@@ -25,7 +25,7 @@
 //! `#[ignore]`, driver-cuda. Run both polarities; the second invocation
 //! gates. Since cutover step 4(a) the DEFAULT is the declared executor,
 //! so the disarmed run is the one that needs the env:
-//!   cargo test -p pie-gpu-tests --no-default-features --features driver-cuda \
+//!   cargo test -p pie-gpu-tests --no-default-features --features driver-cuda-13 \
 //!     --test cuda_declared_forward_parity -- --ignored --nocapture
 //!   PIE_DECLARED_FORWARD=0 cargo test ... --test cuda_declared_forward_parity ...
 

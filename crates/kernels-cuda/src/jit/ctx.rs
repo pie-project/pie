@@ -1,7 +1,19 @@
+//! What a routine body launches through: the backend marker, one launch's
+//! geometry, and the per-call context.
+//!
+//! [`Cuda`] names this backend to the `kernels` machinery; [`Launch`] is a
+//! grid, a block, dynamic shared memory and the cooperative flag; [`Ctx`]
+//! holds only borrowed per-call state — the stream, the engine's cuBLAS
+//! handle if one was lent, and this rank's [`Plane`] if the fire is a
+//! collective's. Device-wide facts (scratch, multiprocessor count, compute
+//! capability) are process-wide statics in `jit/device.rs`, reached through
+//! methods here.
+
 use core::ffi::c_void;
 
-use kernels::routine::{Backend, Refusal};
+use kernels::routine::{Backend, Extent, Refusal};
 
+use crate::comm::Plane;
 use crate::jit::{ArgValue, Root};
 
 /// This backend, as the machinery names it.
@@ -14,6 +26,17 @@ pub struct Cuda;
 impl Backend for Cuda {
     type Value = ArgValue;
     type Ctx<'a> = Ctx;
+
+    fn region(value: &ArgValue, _at: usize) -> Result<Extent, Refusal> {
+        match *value {
+            ArgValue::Region { rows, width, .. } => Ok(Extent { rows, width }),
+            // `Absent`, not `Kind`: the value carries no `Ty` mismatch, just
+            // no width/rows to report, so the position argument goes unused.
+            _ => Err(Refusal::Absent {
+                what: "a region's shape: the bound value carries only an address",
+            }),
+        }
+    }
 }
 
 /// One launch's geometry.
@@ -26,10 +49,7 @@ pub struct Launch {
     /// Dynamic shared memory, in bytes.
     pub smem: u32,
     /// Every block of this grid must be resident at once — `grid.sync()`.
-    ///
-    /// A per-LAUNCH attribute rather than a property of the kernel, which is
-    /// why it lives here: `cuLaunchKernelEx` takes it, and the same entry
-    /// point could in principle be launched either way.
+    /// A per-launch attribute: the same entry point can be launched either way.
     pub cooperative: bool,
 }
 
@@ -55,9 +75,7 @@ impl Launch {
 
     /// The same launch with `bytes` of dynamic shared memory.
     ///
-    /// There is no `smem_opt_in` beside it. The >48 KiB opt-in is not a
-    /// decision an author makes -- it follows from the number -- and stating
-    /// it twice is what let the two disagree.
+    /// No separate `smem_opt_in`: the >48 KiB opt-in follows from `bytes`.
     #[must_use]
     pub const fn smem(mut self, bytes: u32) -> Self {
         self.smem = bytes;
@@ -85,28 +103,20 @@ impl Launch {
 
 /// What a routine body launches through.
 ///
-/// The whole of what it HOLDS is two pointers: the stream the call was made
-/// on, and the engine's cuBLAS handle when the caller had one to lend. Both
-/// are per-call, which is why they are fields.
-///
-/// It also ANSWERS for the scratch allocator, the multiprocessor count and
-/// the compute capability, and those are not fields and must not become
-/// fields. Each is a property of the device rather than of a call, so each is
-/// a process-wide static in `jit/device.rs` reached through a method here.
-/// Copying one into every `Ctx` would make a per-call value out of a
-/// per-device fact, and the way that fails is a `Ctx` built on one stream
-/// answering with another device's multiprocessor count.
-///
-/// The distinction is worth the paragraph because the two halves read the
-/// same at a call site — `ctx.stream()` and `ctx.multiprocessors()` — and
-/// only one of them is something the caller could have got wrong.
+/// Holds only per-call BORROWED state as fields: the stream, the engine's
+/// cuBLAS handle (if lent), and this rank's plane (if the fire is a
+/// collective's). The scratch allocator, multiprocessor count and compute
+/// capability are device-wide facts, not per-call, so they stay process-wide
+/// statics in `jit/device.rs` reached through a method here instead.
 pub struct Ctx {
     stream: *mut c_void,
     cublas: *mut c_void,
+    comm: Option<Plane>,
 }
 
 impl Ctx {
-    /// A context for one call, on `stream`, with no cuBLAS handle.
+    /// A context for one call, on `stream`, with no cuBLAS handle and no
+    /// plane.
     ///
     /// # Safety
     ///
@@ -115,17 +125,14 @@ impl Ctx {
     /// asynchronous and ends when the stream is synchronised.
     #[must_use]
     pub const unsafe fn on(stream: *mut c_void) -> Self {
-        Self { stream, cublas: core::ptr::null_mut() }
+        Self { stream, cublas: core::ptr::null_mut(), comm: None }
     }
 
     /// The same context, carrying the engine's cuBLAS handle.
     ///
-    /// **Carried, not owned, and that is deliberate.** The plan had `Ctx` mint
-    /// its own per-device handles; the engine's is configured with
-    /// `CUBLAS_TENSOR_OP_MATH`, and `driver-cuda/src/device/cublas.rs` records
-    /// the argument against a second one — it would be a second place for the
-    /// math mode to be true, and `cublasDestroy` costs 3.2 ms. So the one
-    /// handle the engine already makes and destroys is the one that crosses.
+    /// Carried, not owned: a second handle would be a second place the
+    /// `CUBLAS_TENSOR_OP_MATH` math mode must hold, and `cublasDestroy` costs
+    /// 3.2 ms, so the engine's own handle is the one that crosses.
     ///
     /// # Safety
     ///
@@ -136,6 +143,27 @@ impl Ctx {
     #[must_use]
     pub const unsafe fn with_cublas(mut self, handle: *mut c_void) -> Self {
         self.cublas = handle;
+        self
+    }
+
+    /// The same context, carrying this rank's tensor-parallel plane.
+    ///
+    /// Carried, not owned: the `Plane` is a `Copy` handle (eight peer
+    /// `Signal*` slots, a `RankData*` and a fusion workspace address, each a
+    /// mapping of another process' allocation via `cudaIpcOpenMemHandle`).
+    /// The owning lifecycle — registering buffers and closing the mappings
+    /// in `Drop` — stays in the shell; a second owner here would close IPC
+    /// mappings peers are still reducing through, which hangs rather than
+    /// merely costing.
+    ///
+    /// # Safety
+    ///
+    /// `plane` must describe a live P2P plane whose peers stay mapped for as
+    /// long as this value is used to launch — which outlives the launch,
+    /// a collective being asynchronous like anything else on a stream.
+    #[must_use]
+    pub const unsafe fn with_comm(mut self, plane: Plane) -> Self {
+        self.comm = Some(plane);
         self
     }
 
@@ -157,6 +185,24 @@ impl Ctx {
             return Err(Refusal::Absent { what: "a cuBLAS handle" });
         }
         Ok(self.cublas)
+    }
+
+    /// This rank's tensor-parallel plane.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Absent`] if this context was built without one, which is
+    /// every context `call()` makes and every context a single-rank
+    /// deployment builds.
+    ///
+    /// `comm`'s bodies do not forward this `Refusal`: they answer
+    /// `Decline::NoInstance`, which `bind/arms/comm.rs` routes to NCCL on —
+    /// an absent plane is a routing answer, not a failure.
+    pub fn comm(&self) -> Result<Plane, Refusal> {
+        let Some(plane) = self.comm else {
+            return Err(Refusal::Absent { what: "a tensor-parallel plane" });
+        };
+        Ok(plane)
     }
 
     /// A device scratch buffer of at least `bytes`, kept under `name`.
@@ -223,41 +269,23 @@ impl Ctx {
     /// not yet.
     ///
     /// `instantiation` is the C++ expression NVRTC is asked to lower — the
-    /// fully qualified template-id, not a label. It is written in the body
-    /// because choosing it IS the body's job.
+    /// fully qualified template-id, not a label — chosen by the caller.
     ///
     /// # Errors
     ///
-    /// [`Refusal::Empty`] for a grid with a zero axis, and
-    /// [`Refusal::Device`] if the compile, the load or the launch refused —
-    /// the detail goes to the log, once per instantiation, because a refusing
-    /// kernel is fired once per layer per token.
+    /// [`Refusal::Empty`] for a grid with a zero axis; [`Refusal::Undeclared`]
+    /// if `file` names nothing the binary carries (caught at `cargo test` by
+    /// `every_instantiation_compiles`, not here); [`Refusal::Device`] if the
+    /// compile, the load or the launch refused — the detail goes to the log,
+    /// once per instantiation, because a refusing kernel is fired once per
+    /// layer per token.
     ///
     /// # Safety
     ///
-    /// Every [`ArgValue::Ptr`] must address device memory live and large
-    /// enough for the parameter the kernel reads it as. Nothing here checks
-    /// that and nothing can: it is the same obligation every `<<<>>>` carried.
-    /// Fire one instantiation out of one carried file.
-    ///
-    /// The file and the template-id are the two things a launch is, and both
-    /// are named here rather than reached by path. A `static ROOT` beside a
-    /// `mod inst` used to hold them; that is one indirection per launch for
-    /// two strings that only ever have one reader, and `Root` is derivable
-    /// from the file's name in full — see [`Root::new`] and `CONFIGURED`.
-    ///
-    /// # Errors
-    ///
-    /// [`Refusal::Undeclared`] if `file` names nothing the binary carries.
-    /// That is a compile error at a `Root::new`, and here it cannot be: the
-    /// name arrives as an argument. `every_instantiation_compiles` reads these
-    /// literals out of the source and puts each through NVRTC, so the miss is
-    /// caught at `cargo test` rather than at the first fire on a GPU.
-    ///
-    /// # Safety
-    ///
-    /// Every pointer in `args` must address live device memory of the extent
-    /// the kernel reads it as, and must stay live across the launch.
+    /// Every [`ArgValue::Ptr`] in `args` must address live device memory of
+    /// the extent the kernel reads it as, and must stay live across the
+    /// launch. Nothing here checks that; it is the same obligation every
+    /// `<<<>>>` carried.
     pub unsafe fn launch(
         &self,
         file: &'static str,

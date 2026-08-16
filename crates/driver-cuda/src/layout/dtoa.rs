@@ -1,46 +1,13 @@
 //! `nlohmann::json`'s double formatter, digit for digit.
 //!
-//! # Why this is not `format!("{v}")`
-//!
-//! Both this and Rust's `{}` produce a decimal string that parses back to the
-//! same `f64`, so for *reading* they are interchangeable. They are not
-//! interchangeable for *writing*, and the planner profile cache is a file the
-//! C++ and this crate both write.
-//!
-//! Rust's formatter emits the shortest correctly-rounded representation.
-//! `nlohmann` uses **Grisu2**, which is fast and always round-trips but is not
-//! always shortest and does not always pick the closest representative when it
-//! is. Measured over 200,000 values drawn from the range these fields actually
-//! hold (milliseconds and tokens/second, 0..100000), the two disagree on 144 --
-//! about 0.07% -- in two distinct ways:
-//!
-//! | value | `nlohmann` (Grisu2) | Rust `{}` (shortest) |
-//! |---|---|---|
-//! | `46934.815584012416` | `46934.815584012416` | `46934.81558401242` |
-//! | `72972.67707126706`  | `72972.67707126706`  | `72972.67707126705` |
-//!
-//! The first is an extra digit; the second is the same digit count with a
-//! different last digit. Over arbitrary finite bit patterns the rate is 0.14%.
-//!
-//! Neither difference changes the value that comes back. What it changes is
-//! whether the two implementations produce the same *file*, and that is worth
-//! keeping: this cache is read-merge-rewritten by whichever process calibrates
-//! next, so a formatter that disagreed would rewrite entries it did not touch,
-//! turning every write into a spurious whole-file diff and making it
-//! impossible to tell a real change from a re-serialisation.
-//!
-//! # Provenance
-//!
-//! Ported from `nlohmann/json.hpp`'s `dtoa_impl`, itself an implementation of
-//! Loitsch's Grisu2 ("Printing Floating-Point Numbers Quickly and Accurately
-//! with Integers", PLDI 2010). The structure is deliberately kept
-//! recognisable against that source rather than made idiomatic, because the
-//! only property that matters here is agreeing with it exactly.
-//!
-//! Every `u64` operation the C++ performs on unsigned types is spelled
-//! `wrapping_*` here. C++ defines unsigned overflow as wrapping and the
-//! algorithm relies on it in the rounding loop; Rust would otherwise panic in
-//! debug builds on inputs that the C++ handles silently.
+//! Not `format!("{v}")`: Rust emits the shortest round-tripping decimal while
+//! `nlohmann` uses Grisu2, and the two disagree on ~0.1% of values. Both
+//! round-trip, but the profile cache is a file the C++ and this crate both
+//! read-merge-rewrite, so a disagreeing formatter would rewrite untouched
+//! entries and make every write a spurious whole-file diff. Kept recognisable
+//! against `nlohmann/json.hpp`'s `dtoa_impl` (Grisu2); unsigned ops are
+//! `wrapping_*` because the rounding loop relies on C++ unsigned wraparound
+//! (Rust would panic in debug).
 
 use std::fmt::Write as _;
 
@@ -79,7 +46,7 @@ impl DiyFp {
         let p2_hi = p2 >> 32;
 
         let mut q = p0_hi + p1_lo + p2_lo;
-        // Round, ties up. The C++ writes this as `1 << (64 - 32 - 1)`.
+        // Round, ties up.
         q += 1u64 << 31;
 
         let h = p3
@@ -119,7 +86,7 @@ struct Boundaries {
     plus: DiyFp,
 }
 
-/// IEEE-754 binary64 constants, named as the C++ names them.
+/// IEEE-754 binary64 constants.
 const PRECISION: i32 = 53;
 /// `max_exponent - 1 + (PRECISION - 1)` = `1024 - 1 + 52`.
 const BIAS: i32 = 1075;
@@ -409,8 +376,7 @@ fn format_buffer(out: &mut String, digits: &[u8], decimal_exponent: i32) {
     let s = |d: &[u8]| String::from_utf8_lossy(d).into_owned();
 
     if k <= n && n <= MAX_FMT_EXP {
-        // digits[000].0 -- an integral value still gets a fractional part, so
-        // that what is read back is unambiguously a double.
+        // digits[000].0 — integral values still get a `.0` to read back as double.
         out.push_str(&s(digits));
         #[expect(clippy::cast_sign_loss, reason = "guarded by k <= n")]
         for _ in 0..((n - k) as usize) {
@@ -465,9 +431,8 @@ fn append_exponent(out: &mut String, e: i32) {
 
 /// Append `v` exactly as `nlohmann::json::dump()` would.
 ///
-/// Non-finite values become `null`, which is what `dump` emits: JSON has no
-/// way to spell an infinity, and `nlohmann` chose the lossy encoding over
-/// throwing.
+/// Non-finite values become `null`, as `dump` emits (JSON cannot spell
+/// infinity, and `nlohmann` chose the lossy encoding over throwing).
 pub fn write_f64(out: &mut String, v: f64) {
     if !v.is_finite() {
         out.push_str("null");
@@ -501,8 +466,7 @@ mod tests {
 
     #[test]
     fn integral_values_keep_a_fractional_part() {
-        // `1` would read back as an integer, and the schema's readers are
-        // type-strict about that distinction elsewhere.
+        // `1` would read back as an integer; the schema's readers are type-strict.
         assert_eq!(f(0.0), "0.0");
         assert_eq!(f(1.0), "1.0");
         assert_eq!(f(100.0), "100.0");
@@ -511,18 +475,14 @@ mod tests {
 
     #[test]
     fn negative_zero_keeps_its_sign() {
-        // The sign is taken from the sign bit, not from a comparison, because
-        // `-0.0 == 0.0`.
+        // Sign from the sign bit, not a comparison, since `-0.0 == 0.0`.
         assert_eq!(f(-0.0), "-0.0");
         assert_ne!(f(-0.0), f(0.0));
     }
 
     #[test]
     fn the_fixed_point_window_matches_nlohmanns() {
-        // 10^15 is the first value printed in scientific notation and 10^-4
-        // the last printed in fixed point -- the boundaries are `digits10`
-        // and -4, and getting either off by one would be invisible on typical
-        // values and wrong on the edges.
+        // 10^15 is the first scientific value and 10^-4 the last fixed-point one.
         assert_eq!(f(1e14), "100000000000000.0");
         assert_eq!(f(1e15), "1e+15");
         assert_eq!(f(1e-4), "0.0001");
@@ -557,15 +517,9 @@ mod tests {
         reason = "the extra digits are the subject"
     )]
     fn grisu2_is_reproduced_where_it_differs_from_shortest() {
-        // The four values from the module docs. These are the whole reason
-        // this file exists: Rust's own formatter gets each of them "right"
-        // and disagrees with the C++.
-        //
-        // `excessive_precision` is waived on this function and must NOT be
-        // silenced by shortening the literals: what clippy calls excess is
-        // exactly the digits Grisu2 emits and Rust's formatter drops, so a
-        // "tidied" literal would still be the same f64 but would stop showing
-        // what the assertion is about.
+        // The values from the module docs, where Rust's formatter disagrees
+        // with Grisu2. Do not "tidy" these literals: the excess digits are the
+        // subject, not a mistake.
         assert_eq!(f(46934.815584012416), "46934.815584012416");
         assert_eq!(f(72972.67707126706), "72972.67707126706");
         assert_eq!(f(27453.918300648482), "27453.918300648482");

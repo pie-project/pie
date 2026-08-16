@@ -53,21 +53,47 @@ fn pairs() -> Vec<(&'static str, Root, &'static [Layout])> {
     ]
 }
 
+/// Run `f`, answering `None` if it panics, without printing a crash report.
+///
+/// `cudarc`'s loader is `fallback-dynamic-loading` and nothing here has a
+/// `DT_NEEDED` on `libnvrtc` or `libcuda`: the first call `dlopen`s the
+/// library and PANICS through `cudarc::panic_no_lib_found` if no candidate
+/// name resolves. So none of the `Result`s below can report a library that is
+/// simply not installed, and the three skips they guard were unreachable on a
+/// box with no CUDA -- which FAILED this test instead. Catching is what makes
+/// them reachable. `every_instantiation_compiles.rs` carries the same helper
+/// for the same reason.
+fn quietly<R>(f: impl FnOnce() -> R + std::panic::UnwindSafe) -> Option<R> {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let out = std::panic::catch_unwind(f);
+    std::panic::set_hook(hook);
+    out.ok()
+}
+
 #[test]
 fn every_measured_layout_matches_its_header() {
-    let Ok(have) = nvrtc::version() else {
+    let Some(have) = quietly(nvrtc::version).and_then(Result::ok) else {
         eprintln!("SKIPPED: libnvrtc will not load, so nothing here can be compiled");
         return;
     };
-    let arch = kernels_cuda::jit::cache::arch().unwrap_or("compute_89");
+    // `sm_XY` and not `compute_XY`: `jit::nvrtc::options` refuses a virtual
+    // architecture, so the fallback that used to read `compute_89` failed
+    // every root on the arch string alone whenever no device answered.
+    let arch = quietly(kernels_cuda::jit::cache::arch).flatten().unwrap_or("sm_89");
     // `attention_mla_fa2` asks for relocatable device code, so its compile
     // ends in `cuLink` against `libcudadevrt.a` — a driver call, which answers
     // `CUDA_ERROR_INVALID_CONTEXT` on a thread that has not forced the primary
     // context. The other three roots need no device at all.
-    if let Err(why) = kernels_cuda::jit::cache::bind_context() {
-        eprintln!("SKIPPED: no usable context, and one root device-links ({why})");
-        return;
-    }
+    //
+    // Which is why this is a PARTITION and not a return. It used to be a
+    // return, and that cost the whole test: on the CI runner this step was
+    // built for -- NVRTC from a wheel, no driver -- all four roots were
+    // dropped because one of them links, so the step ran in 0.01 s and
+    // asserted nothing while reading green. Its sibling
+    // `every_instantiation_compiles` had the same shape and was split for the
+    // same reason; this one was missed.
+    let linkable = matches!(quietly(kernels_cuda::jit::cache::bind_context), Some(Ok(())));
 
     let pairs = pairs();
     let asserted: usize =
@@ -80,7 +106,12 @@ fn every_measured_layout_matches_its_header() {
 
     let wanted = [TYPECHECK_ENTRY.to_owned()];
     let mut failed = Vec::new();
+    let mut deferred = Vec::new();
     for (what, root, layouts) in &pairs {
+        if root.needs_device_runtime() && !linkable {
+            deferred.push(format!("{what} ({})", root.name));
+            continue;
+        }
         let job = nvrtc::Job {
             name: root.name,
             source: typecheck_tu(root.text, layouts),
@@ -95,6 +126,23 @@ fn every_measured_layout_matches_its_header() {
             failed.push(format!("── {what} ({}) ──\n{why}\n", root.name));
         }
     }
+
+    // Named rather than counted, and after the compiles rather than instead of
+    // them: a run that skipped one root and a run that skipped every root must
+    // not print the same thing.
+    if !deferred.is_empty() {
+        eprintln!(
+            "SKIPPED {} of {} root(s), which device-link and so need a context this \
+             machine has no device to give: {}",
+            deferred.len(),
+            pairs.len(),
+            deferred.join(", ")
+        );
+    }
+    assert!(
+        deferred.len() < pairs.len(),
+        "every root here device-links, so this run compiled NOTHING"
+    );
 
     assert!(
         failed.is_empty(),

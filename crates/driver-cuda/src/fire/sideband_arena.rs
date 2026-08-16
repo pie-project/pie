@@ -1,51 +1,20 @@
-//! The grow-only device arena behind the attention hooks' sidebands.
-//!
-//! Three independent single-slot regions — the per-layer score capture, the
-//! per-fire page mask, and the hook-graph prepare pass's score rows. Before it
-//! existed those were `cudaMallocAsync`/`cudaFreeAsync` churn on the hot path,
-//! ~90 alloc/free pairs on a 28-layer hook fire.
-//!
-//! "Allocation" is a capacity check: the caller carves its own sub-buffers as
-//! offsets into the returned block. A fire needing more than the region has
-//! grows it — stream-synced free, then realloc — which is rare after warmup
-//! because the ladder doubles from 64 KiB.
-//!
-//! # The address-stability precondition
-//!
-//! While a region's capacity suffices, the address it hands out is **stable**.
-//! That is what lets a captured hook fire replay against the same sideband
-//! pointers, and it is the property [`SidebandArena`] exists to provide.
-//!
-//! The C++ header offers `generation()` as the invalidation signal for it, and
-//! **nothing reads it** — that was checked across the whole repository before
-//! this port kept it. It is not a hole: `pipeline/dispatch.cu`'s hook-graph
-//! fingerprint mixes every arena address it baked (`mask_plan.keep`,
-//! `out_indices`, `out_indptr`, `out_last_lens`, the stride, `score_rows_base`)
-//! and recaptures when any of them moves, which is a strictly stronger check
-//! than a counter — it notices a region that moved *without* the counter
-//! moving, which the out-of-memory path in [`SidebandArena::acquire`] can
-//! produce. The counter is kept because it is cheap, is the documented
-//! contract, and is what the trace output reports; it should not be relied on
-//! alone.
+//! The grow-only device arena behind the attention hooks' sidebands: three
+//! single-slot regions, growth a free-then-realloc keeping the address stable
+//! while capacity suffices. `generation()` is offered but nothing reads it —
+//! the hook-graph fingerprint is strictly stronger and used instead.
 
 use std::ffi::c_void;
 
-/// Which sideband a slot belongs to.
-///
-/// Discriminants match the C++ `HookSidebandArena::Region`, which indexes its
-/// slot array with them.
+/// Which sideband a slot belongs to. The discriminants index the slot array.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Region {
-    /// One slot, re-acquired every layer. Decode and prefill score captures
-    /// are mutually exclusive within a layer and layers run in sequence, so at
-    /// most one capture is live at a time.
+    /// One slot, re-acquired every layer: decode and prefill captures are
+    /// mutually exclusive and layers run in sequence, so at most one is live.
     Score = 0,
-    /// One slot, acquired once per fire by the page mask and held for the
-    /// whole layer loop.
+    /// One slot, acquired once per fire and held for the whole layer loop.
     Mask = 1,
     /// One slot, acquired transiently by the hook-graph prepare pass: the
-    /// folded-offset device CSR plus one padded row per score-reading (layer,
-    /// lane).
+    /// folded-offset device CSR plus one padded row per score-reading (layer, lane).
     ScoreRows = 2,
 }
 
@@ -53,8 +22,7 @@ impl Region {
     /// Every region, in slot order.
     pub const ALL: [Region; 3] = [Region::Score, Region::Mask, Region::ScoreRows];
 
-    /// The spelling the C++ `region_name` uses, which the trace output and the
-    /// parity transcript both carry.
+    /// The spelling the trace output carries.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -65,37 +33,26 @@ impl Region {
     }
 }
 
-/// Why an [`SidebandArena::acquire`] handed back nothing.
-///
-/// The C++ returns a bare `nullptr` for all four, leaving the caller's refusal
-/// path to treat "you asked for zero bytes" and "the device is out of memory"
-/// as the same event. They are named here because they are not the same event:
-/// one is a caller bug, one is an upstream bug, and two are resource failures
-/// that leave the slot in *different* states.
+/// Why an [`SidebandArena::acquire`] handed back nothing — named separately
+/// because the four variants leave the slot in different states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// The region is already held. Overlapping acquisition is a bug upstream;
-    /// the second caller is refused rather than handed the same bytes.
+    /// The region is already held; the second caller is refused rather than
+    /// handed the same bytes.
     Busy,
-    /// Zero bytes were asked for. The slot is left alone — in particular it is
-    /// **not** marked busy, so the next real acquire still succeeds.
+    /// Zero bytes were asked for; the slot is left alone, not marked busy.
     ZeroBytes,
-    /// The pre-growth stream sync failed. Nothing was freed; the region keeps
-    /// whatever block and capacity it had.
+    /// The pre-growth stream sync failed; nothing was freed, so the slot
+    /// keeps its old block.
     SyncFailed,
-    /// The replacement allocation failed. The old block was **already freed**
-    /// by the time this was discovered, so the region is now empty and its
-    /// previous address is dangling. See the module docs: the generation does
-    /// not move across this, and the fingerprint is what notices.
+    /// The replacement alloc failed after the old block was freed, so the
+    /// region is empty; the generation does not move — the fingerprint notices.
     AllocFailed,
 }
 
-/// The device-memory operations the arena needs.
-///
-/// A trait rather than a direct call into [`crate::cuda`] because the growth
-/// path frees the old block before it learns whether a replacement exists, and
-/// that ordering is only testable against an allocator that can be told to
-/// fail on cue.
+/// The device-memory operations the arena needs. A trait, not a direct CUDA
+/// call, so the free-before-realloc ordering is testable against a
+/// fail-on-cue allocator.
 pub trait DeviceMemory {
     /// Allocate `bytes` of device memory, or `None` on failure.
     fn alloc(&mut self, bytes: usize) -> Option<*mut c_void>;
@@ -105,21 +62,10 @@ pub trait DeviceMemory {
     fn synchronize(&mut self) -> bool;
 }
 
-/// The live [`DeviceMemory`] (retirement plan phase B): the same three CUDA
-/// calls the C++ arena makes — raw `cudaMalloc`/`cudaFree`, and
-/// `cudaStreamSynchronize` before a growth frees the block in flight
-/// (`hook_sideband_arena.cpp`). The stream lives HERE because the seam
-/// folded the C++ carve's per-call stream parameter into the ops value: the
-/// executor points one of these at the fire's stream before acquiring.
-///
-/// GATED: the only thing in this file that calls CUDA. `ArenaOps` above
-/// it is a trait and `SidebandArena` is arithmetic over it, which is what
-/// lets the arena's growth rule be proved without a card.
-///
-/// Raw `cudaMalloc`, deliberately NOT [`crate::device::Allocator`]: the C++
-/// arena frees unconditionally after its own explicit synchronize, and the
-/// capture-safe deferral would reorder exactly the free-then-realloc dance
-/// the oracle pinned.
+/// The live [`DeviceMemory`]: raw `cudaMalloc`/`cudaFree` plus a
+/// `cudaStreamSynchronize` before a growth frees the in-flight block. Raw
+/// rather than [`crate::device::Allocator`], whose capture-safe deferral
+/// would reorder the free-then-realloc dance.
 #[cfg(feature = "_cuda")]
 #[derive(Debug, Clone, Copy)]
 pub struct LiveDeviceMemory<'a> {
@@ -144,14 +90,10 @@ impl DeviceMemory for LiveDeviceMemory<'_> {
         (ok && !raw.is_null()).then_some(raw)
     }
 
-    // The seam's method is safe by design — the arena passes back only
-    // pointers this impl's `alloc` handed out, and the recorders that share
-    // the trait never touch memory at all. Marking one impl `unsafe` would
-    // have to change the trait every oracle drives.
+    // Safe by design: passes back only pointers this impl's `alloc` handed out.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn free(&mut self, ptr: *mut c_void) {
-        // The C++ ignores the status here, on both the growth and teardown
-        // paths; a failed free on a dying arena has nowhere to report to.
+        // A failed free on a dying arena has nowhere to report to.
         let _ = unsafe { cudarc::runtime::sys::cudaFree(ptr) };
     }
 
@@ -176,10 +118,7 @@ impl Default for Slot {
     }
 }
 
-/// The growth ladder: powers of two from 64 KiB.
-///
-/// Keeps growths logarithmic in the largest fire ever seen, so the "rare after
-/// warmup" claim is structural rather than hopeful.
+/// The growth ladder: powers of two from 64 KiB, logarithmic in the largest fire seen.
 #[must_use]
 pub fn round_capacity(bytes: usize) -> usize {
     let mut cap: usize = 64 * 1024;
@@ -189,10 +128,8 @@ pub fn round_capacity(bytes: usize) -> usize {
     cap
 }
 
-/// Grow-only device arena for the hook sidebands.
-///
-/// Confined to the single lane thread that runs fires; nothing here is
-/// thread-safe, which is why it is not `Sync`.
+/// Grow-only device arena for the hook sidebands. Confined to the single lane
+/// thread that runs fires; nothing here is thread-safe, hence not `Sync`.
 #[derive(Debug)]
 pub struct SidebandArena {
     slots: [Slot; 3],
@@ -225,17 +162,9 @@ impl SidebandArena {
         }
     }
 
-    /// The region's base pointer with at least `bytes` of capacity, growing
-    /// the backing allocation when this fire needs more.
-    ///
-    /// Note the order of the checks, which is load-bearing: the busy test
-    /// comes **before** the size test, so an overlapping acquisition is
-    /// refused without first triggering a growth that the refused caller would
-    /// have paid for and not used.
-    ///
-    /// # Errors
-    ///
-    /// See [`Refusal`]. Each variant leaves the slot in a different state.
+    /// The region's base pointer with at least `bytes` of capacity. The check
+    /// order is load-bearing: busy before size, so an overlapping acquire is
+    /// refused without triggering an unused growth.
     pub fn acquire<M: DeviceMemory>(
         &mut self,
         mem: &mut M,
@@ -250,8 +179,7 @@ impl SidebandArena {
             return Err(Refusal::ZeroBytes);
         }
         if bytes > self.slots[index].capacity {
-            // Growth path: retire everything in flight that may still read the
-            // old block, then free+realloc.
+            // Growth path: retire in-flight readers of the old block, then free+realloc.
             let new_capacity = round_capacity(bytes);
             if !mem.synchronize() {
                 return Err(Refusal::SyncFailed);
@@ -276,18 +204,13 @@ impl SidebandArena {
         Ok(self.slots[index].base)
     }
 
-    /// Release the region's slot.
-    ///
-    /// Frees nothing — the backing allocation is reused by the next acquire.
+    /// Release the region's slot; the backing is reused by the next acquire, not freed.
     pub fn release(&mut self, region: Region) {
         self.slots[region as usize].busy = false;
     }
 
-    /// Bumped on every successful growth.
-    ///
-    /// See the module docs before depending on this: a failed growth moves the
-    /// region without moving the counter, and the hook-graph fingerprint — not
-    /// this — is what the engine actually invalidates against.
+    /// Bumped on every successful growth. A failed growth moves the region
+    /// without moving this — the hook-graph fingerprint is what invalidates.
     #[must_use]
     pub const fn generation(&self) -> u64 {
         self.generation
@@ -305,14 +228,8 @@ impl SidebandArena {
         self.slots[region as usize].capacity
     }
 
-    /// Fire boundary for the trace counters.
-    ///
-    /// Returns the finished fire's counts, if there was one — each acquire is
-    /// a `cudaMallocAsync` the pre-arena code would have issued, and growths
-    /// are the only real device allocations left, so the ratio is the evidence
-    /// the arena is doing its job. The C++ prints this behind
-    /// `PIE_SIDEBAND_TRACE`; returning it instead lets the caller decide, and
-    /// lets a test read it without capturing stderr.
+    /// Fire boundary for the trace counters; returns the finished fire's
+    /// counts, if any. The acquires-to-grows ratio is evidence the arena works.
     pub fn begin_fire(&mut self) -> Option<FireCounts> {
         let finished = (self.fire_index > 0).then_some(FireCounts {
             fire: self.fire_index,
@@ -328,14 +245,8 @@ impl SidebandArena {
         finished
     }
 
-    /// Free every block, leaving the arena empty.
-    ///
-    /// The C++ does this in `~HookSidebandArena`. Rust cannot: `Drop` has no
-    /// access to the allocator, and inventing a global one to make `Drop` work
-    /// would reintroduce exactly the ambient state the trait removed. Callers
-    /// own the arena's lifetime and must call this; the alternative — an owned
-    /// allocator handle — was rejected because the arena is constructed beside
-    /// `Workspace` at engine scope and outlives no allocator it could hold.
+    /// Free every block, leaving the arena empty. Not a `Drop`, since `Drop`
+    /// has no access to the allocator — callers must call this themselves.
     pub fn destroy<M: DeviceMemory>(&mut self, mem: &mut M) {
         for slot in &mut self.slots {
             if !slot.base.is_null() {
@@ -459,8 +370,7 @@ mod tests {
         assert_eq!(arena.acquire(&mut mem, Region::Score, 1024).unwrap(), first);
     }
 
-    /// The case the module docs single out: the region moves and the counter
-    /// does not.
+    /// The case the module docs single out: the region moves, the counter does not.
     #[test]
     fn a_failed_alloc_empties_the_region_without_bumping_the_generation() {
         let mut mem = FakeMemory::new();

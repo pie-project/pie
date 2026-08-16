@@ -36,7 +36,7 @@ use kernels::Ty;
 use kernels::routine::{Provenance, Refusal, Routine};
 use kernels_metal::routine::{ArgValue, Encode, Fire, Metal};
 
-use crate::lowering::arm::{self, Arm, Staged};
+use crate::lowering::hold::Staged;
 
 use crate::lowering::dispatch::{Dispatch, ParamSlot, Touches};
 use crate::lowering::executor::{BoundArg, Slice};
@@ -191,7 +191,7 @@ fn lay_out(
         // but zero.
         if staged.block
             == Some(match *value {
-                ArgValue::Buffer(handle) => handle,
+                ArgValue::Buffer(handle) | ArgValue::BufferMut(handle) => handle,
                 _ => u32::MAX,
             })
         {
@@ -205,7 +205,7 @@ fn lay_out(
             continue;
         }
         match *value {
-            ArgValue::Buffer(handle) => {
+            ArgValue::Buffer(handle) | ArgValue::BufferMut(handle) => {
                 let bound = handles
                     .get(handle as usize)
                     .ok_or(Refusal::Absent { what: "a buffer" })?;
@@ -305,12 +305,13 @@ fn scalar(
     *at += bytes;
 }
 
-/// What a dispatch reads and what it may write, off the SIGNATURE.
+/// What a dispatch reads and what it may write, off the VALUES.
 ///
 /// The direction was always there and this used to throw it away: a routine
 /// spells a written buffer `BufMut` or `F32sMut` and a read one `Buf`,
 /// `I32s`, `U32s`, `U8s`, `F32s`. So a launch's writes are exactly the
-/// handles at the mutable positions, and every other bound handle is a read.
+/// handles bound at the mutable arguments, and every other bound handle is a
+/// read.
 ///
 /// The conservative answer this replaces -- every operand as both -- was
 /// honest and expensive. `Touches` decides whether an encoder may run two
@@ -318,23 +319,46 @@ fn scalar(
 /// dispatches that never meet, and on a decode where the routine path now
 /// carries every launch that is a barrier per launch rather than per hazard.
 ///
+/// # It read the SIGNATURE at the value's position, and those are two lists
+///
+/// `types[i]` is the i-th PARAMETER; `values[i]` is the i-th BUFFER SLOT.
+/// They are the same list only for a routine whose entrypoint numbers its
+/// buffers with no holes. Twenty-three do not: an entrypoint that declares
+/// buffers at 2, 3, 6, 7, 8 and 10 fills the holes with a `pad` taken once in
+/// the signature and bound five times in the dispatch, and every argument
+/// after the first hole then read its neighbour's type.
+///
+/// `gdn_core_recurrent_prefill` is the one that showed. Its `core_out` sits
+/// at slot 3 and the signature's fourth entry is `pre_q`, so the scan's only
+/// real output was declared a READ; `mixed`, bound at the `pad` in slot 1,
+/// was declared a WRITE in its place. The encoder saw no hazard between the
+/// scan and the `gated_rms` that consumes it, ran them at once, and qwen3.6
+/// answered a two-token prompt differently every time it was asked --
+/// thirteen logits apart, from the same program fired twice.
+/// `qmm_splitk_reduce` declared its `y` the same way and
+/// `cast_qmm_input_bfloat16_to_float16` declared `half_out` not at all.
+///
+/// `ShaderValue::buffer_mut` exists precisely so the direction rides on the
+/// value, and Metal had taken its default. It does not any more:
+/// [`ArgValue::BufferMut`] is what a `BufMut` or `F32sMut` argument produces,
+/// at whatever slot the routine binds it to.
+///
 /// It stays conservative in the direction that matters. A handle bound to
 /// nothing is a zero-length slice, which meets nothing; a scalar contributes
-/// neither. What it will not do is silently under-report a write, because a
-/// `BufMut` in the signature is the same fact the shader's `device T*`
-/// states and the cross-backend gate compares.
-fn directed(args: &[BoundArg], types: &[(Ty, Provenance)]) -> Touches {
+/// neither; a `pad` is a read, which costs a barrier and never loses one.
+fn directed(args: &[BoundArg], values: &[ArgValue]) -> Touches {
     let mut touches = Touches::default();
     for (i, arg) in args.iter().enumerate() {
         if arg.slice.bytes == 0 {
             continue;
         }
-        match types.get(i).map(|(ty, _)| *ty) {
-            Some(Ty::BufMut | Ty::F32sMut) => touches.writes.push(arg.slice),
-            // A slot the signature does not reach is the staged parameter
-            // block, which the encoder writes and no other launch reads.
-            Some(_) => touches.reads.push(arg.slice),
-            None => {}
+        match values.get(i) {
+            Some(ArgValue::BufferMut(_)) => touches.writes.push(arg.slice),
+            // Everything else that reached a slot is a read. A scalar binds
+            // no slice and a `pad` binds a real one, which is why this is
+            // conservative in the direction that costs a barrier and never in
+            // the one that loses a hazard.
+            _ => touches.reads.push(arg.slice),
         }
     }
     touches
@@ -365,14 +389,16 @@ impl Encode for Planner<'_> {
             });
         }
 
-        let (args, param_slots, params) = lay_out(args, self.types, self.handles, self.staged)?;
+        // `bound` is what the slots hold; `args` is what the routine SAID.
+        // The direction comes off the latter -- see `ArgValue::BufferMut`.
+        let (bound, param_slots, params) = lay_out(args, self.types, self.handles, self.staged)?;
         self.out.borrow_mut().push(Dispatch {
             symbol: fire.entrypoint,
             file: fire.file,
             grid: fire.lanes,
             threadgroup: fire.group,
-            touches: directed(&args, self.types),
-            args,
+            touches: directed(&bound, args),
+            args: bound,
             param_slots,
             params,
             layers: self.layers.clone(),
@@ -397,41 +423,35 @@ impl Encode for Planner<'_> {
 /// name. Where it does not, the shader ships under a prefix the routine does
 /// not carry: every `affine_*` quant entrypoint is spelled from a routine
 /// called `qmm_t` or `qmv_fast`.
-const LIVE: &[(&[Routine<Metal>], &[(&str, &str, Arm)])] = &[
+const LIVE: &[(&[Routine<Metal>], &[(&str, &str)])] = &[
     (
         kernels_metal::ssm::ROUTINES,
         &[
-            ("gdn_core", "gdn_core", arm::gdn_core as Arm),
+            ("gdn_core", "gdn_core"),
             (
                 "gdn_core_recurrent",
                 "gdn_core_recurrent",
-                arm::gdn_core_recurrent as Arm,
             ),
             (
                 "gdn_core_recurrent_prefill",
                 "gdn_core_recurrent_prefill",
-                arm::gdn_core_recurrent_prefill as Arm,
             ),
             (
                 "gdn_core_recurrent_slotted",
                 "gdn_core_recurrent_slotted",
-                arm::gdn_core_recurrent_slotted as Arm,
             ),
             (
                 "gdn_core_slotted",
                 "gdn_core_slotted",
-                arm::gdn_core_slotted as Arm,
             ),
-            ("gdn_prep", "gdn_prep", arm::gdn_prep as Arm),
+            ("gdn_prep", "gdn_prep"),
             (
                 "gdn_prep_prefill",
                 "gdn_prep_prefill",
-                arm::gdn_prep_prefill as Arm,
             ),
             (
                 "gdn_prep_slotted",
                 "gdn_prep_slotted",
-                arm::gdn_prep_slotted as Arm,
             ),
         ],
     ),
@@ -440,7 +460,6 @@ const LIVE: &[(&[Routine<Metal>], &[(&str, &str, Arm)])] = &[
         &[(
             "copy_logits_bf16",
             "copy_logits_bf16",
-            arm::copy_logits_bf16 as Arm,
         )],
     ),
     (
@@ -449,120 +468,99 @@ const LIVE: &[(&[Routine<Metal>], &[(&str, &str, Arm)])] = &[
             (
                 "combine_sorted",
                 "combine_sorted",
-                arm::combine_sorted as Arm,
             ),
             (
                 "mxfp4_qmm_t_routed_bias",
                 "mxfp4_qmm_t_routed_bias",
-                arm::mxfp4_qmm_t_routed_bias as Arm,
             ),
             (
                 "mxfp4_qmv_routed_bias",
                 "mxfp4_qmv_routed_bias",
-                arm::mxfp4_qmv_routed_bias as Arm,
             ),
             (
                 "qmm_t_routed",
                 "affine_qmm_t_routed",
-                arm::qmm_t_routed as Arm,
             ),
             (
                 "qmm_t_routed_fp16",
                 "affine_qmm_t_routed_fp16",
-                arm::qmm_t_routed_fp16 as Arm,
             ),
-            ("qmv_routed", "affine_qmv_routed", arm::qmv_routed as Arm),
+            ("qmv_routed", "affine_qmv_routed"),
             (
                 "qmv_routed_bias",
                 "affine_qmv_routed_bias",
-                arm::qmv_routed_bias as Arm,
             ),
-            ("route_gather", "route_gather", arm::route_gather as Arm),
-            ("route_sort", "route_sort", arm::route_sort as Arm),
-            ("router_topk", "router_topk", arm::router_topk as Arm),
+            ("route_gather", "route_gather"),
+            ("route_sort", "route_sort"),
+            ("router_topk", "router_topk"),
             (
                 "router_topk_scaled",
                 "router_topk_scaled",
-                arm::router_topk_scaled as Arm,
             ),
             (
                 "shared_expert_combine",
                 "shared_expert_combine",
-                arm::shared_expert_combine as Arm,
             ),
             (
                 "shared_expert_combine_strided",
                 "shared_expert_combine_strided",
-                arm::shared_expert_combine_strided as Arm,
             ),
         ],
     ),
     (
         kernels_metal::attn::ROUTINES,
         &[
-            ("gate", "gate", arm::gate as Arm),
-            ("kv_append", "kv_append", arm::kv_append as Arm),
+            ("gate", "gate"),
+            ("kv_append", "kv_append"),
             (
                 "kv_append_paged",
                 "kv_append_paged",
-                arm::kv_append_paged as Arm,
             ),
-            ("logit_softcap", "logit_softcap", arm::logit_softcap as Arm),
-            ("q_gate_split", "q_gate_split", arm::q_gate_split as Arm),
+            ("logit_softcap", "logit_softcap"),
+            ("q_gate_split", "q_gate_split"),
             (
                 "sdpa_paged_decode",
                 "sdpa_paged_decode",
-                arm::sdpa_paged_decode as Arm,
             ),
             (
                 "sdpa_paged_decode_sink",
                 "sdpa_paged_decode_sink",
-                arm::sdpa_paged_decode_sink as Arm,
             ),
             (
                 "sdpa_paged_mma",
                 "sdpa_paged_mma",
-                arm::sdpa_paged_mma as Arm,
             ),
             (
                 "sdpa_paged_mma_sink",
                 "sdpa_paged_mma_sink",
-                arm::sdpa_paged_mma_sink as Arm,
             ),
             (
                 "sdpa_paged_tiled",
                 "sdpa_paged_tiled",
-                arm::sdpa_paged_tiled as Arm,
             ),
             (
                 "sdpa_paged_tiled_sink",
                 "sdpa_paged_tiled_sink",
-                arm::sdpa_paged_tiled_sink as Arm,
             ),
             (
                 "sdpa_paged_tiled_strided",
                 "sdpa_paged_tiled_strided",
-                arm::sdpa_paged_tiled_strided as Arm,
             ),
             (
                 "sdpa_vector_decode",
                 "sdpa_vector_decode",
-                arm::sdpa_vector_decode as Arm,
             ),
             (
                 "sdpa_vector_decode_sink",
                 "sdpa_vector_decode_sink",
-                arm::sdpa_vector_decode_sink as Arm,
             ),
             (
                 "sdpa_vector_decode_swa",
                 "sdpa_vector_decode_swa",
-                arm::sdpa_vector_decode_swa as Arm,
             ),
             (
                 "split_qkv_bf16",
                 "split_qkv_bf16",
-                arm::split_qkv_bf16 as Arm,
             ),
         ],
     ),
@@ -572,211 +570,174 @@ const LIVE: &[(&[Routine<Metal>], &[(&str, &str, Arm)])] = &[
             (
                 "cast_qmm_input_bfloat16_to_float16",
                 "cast_qmm_input_bfloat16_to_float16",
-                arm::cast_qmm_input_bfloat16_to_float16 as Arm,
             ),
             (
                 "cast_qmm_input_strided_bfloat16_to_float16",
                 "cast_qmm_input_strided_bfloat16_to_float16",
-                arm::cast_qmm_input_strided_bfloat16_to_float16 as Arm,
             ),
             (
                 "encode_u4_bf16",
                 "affine_encode_u4_bf16",
-                arm::encode_u4_bf16 as Arm,
             ),
             (
                 "encode_u4_f32",
                 "affine_encode_u4_f32",
-                arm::encode_u4_f32 as Arm,
             ),
             (
                 "mxfp4_dequant_bf16",
                 "mxfp4_dequant_bf16",
-                arm::mxfp4_dequant_bf16 as Arm,
             ),
             (
                 "qmm_splitk_reduce",
                 "qmm_splitk_reduce",
-                arm::qmm_splitk_reduce as Arm,
             ),
             (
                 "qmm_splitk_reduce_f32",
                 "qmm_splitk_reduce_f32",
-                arm::qmm_splitk_reduce_f32 as Arm,
             ),
-            ("qmm_t", "affine_qmm_t", arm::qmm_t as Arm),
+            ("qmm_t", "affine_qmm_t"),
             (
                 "qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4",
                 "affine_qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4",
-                arm::qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4 as Arm,
             ),
             (
                 "qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2",
                 "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2",
-                arm::qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2 as Arm,
             ),
             (
                 "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2",
                 "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2",
-                arm::qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2 as Arm,
             ),
             (
                 "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1",
                 "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1",
-                arm::qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1 as Arm,
             ),
             (
                 "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4",
                 "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4",
-                arm::qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4 as Arm,
             ),
-            ("qmm_t_bias", "affine_qmm_t_bias", arm::qmm_t_bias as Arm),
+            ("qmm_t_bias", "affine_qmm_t_bias"),
             (
                 "qmm_t_bias_fp16_precast",
                 "affine_qmm_t_bias_fp16_precast",
-                arm::qmm_t_bias_fp16_precast as Arm,
             ),
             (
                 "qmm_t_fp16_precast",
                 "affine_qmm_t_fp16_precast",
-                arm::qmm_t_fp16_precast as Arm,
             ),
             (
                 "qmm_t_residual",
                 "affine_qmm_t_residual",
-                arm::qmm_t_residual as Arm,
             ),
             (
                 "qmm_t_residual_fp16_precast",
                 "affine_qmm_t_residual_fp16_precast",
-                arm::qmm_t_residual_fp16_precast as Arm,
             ),
             (
                 "qmm_t_splitk",
                 "affine_qmm_t_splitk",
-                arm::qmm_t_splitk as Arm,
             ),
             (
                 "qmm_t_splitk_f32",
                 "affine_qmm_t_splitk_f32",
-                arm::qmm_t_splitk_f32 as Arm,
             ),
             (
                 "qmm_t_splitk_fp16_precast",
                 "affine_qmm_t_splitk_fp16_precast",
-                arm::qmm_t_splitk_fp16_precast as Arm,
             ),
             (
                 "qmm_t_splitk_fp16_precast_f32",
                 "affine_qmm_t_splitk_fp16_precast_f32",
-                arm::qmm_t_splitk_fp16_precast_f32 as Arm,
             ),
             (
                 "qmm_t_strided",
                 "affine_qmm_t_strided",
-                arm::qmm_t_strided as Arm,
             ),
             (
                 "qmm_t_strided_fp16_precast",
                 "affine_qmm_t_strided_fp16_precast",
-                arm::qmm_t_strided_fp16_precast as Arm,
             ),
             (
                 "qmm_t_strided_fp16_precast_residual",
                 "affine_qmm_t_strided_fp16_precast_residual",
-                arm::qmm_t_strided_fp16_precast_residual as Arm,
             ),
             (
                 "qmm_t_strided_residual",
                 "affine_qmm_t_strided_residual",
-                arm::qmm_t_strided_residual as Arm,
             ),
-            ("qmv_fast", "affine_qmv_fast", arm::qmv_fast as Arm),
+            ("qmv_fast", "affine_qmv_fast"),
             (
                 "qmv_fast_residual",
                 "affine_qmv_fast_residual",
-                arm::qmv_fast_residual as Arm,
             ),
-            ("qmv_tail", "affine_qmv_tail", arm::qmv_tail as Arm),
+            ("qmv_tail", "affine_qmv_tail"),
             (
                 "qmv_tail_bias",
                 "affine_qmv_tail_bias",
-                arm::qmv_tail_bias as Arm,
             ),
             (
                 "qmv_wide_strided",
                 "affine_qmv_wide_strided",
-                arm::qmv_wide_strided as Arm,
             ),
         ],
     ),
     (
         kernels_metal::norm::ROUTINES,
         &[
-            ("add_bias", "add_bias", arm::add_bias as Arm),
-            ("gated_rms", "gated_rms", arm::gated_rms as Arm),
+            ("add_bias", "add_bias"),
+            ("gated_rms", "gated_rms"),
             (
                 "gated_rms_strided",
                 "gated_rms_strided",
-                arm::gated_rms_strided as Arm,
             ),
             (
                 "layer_scalar_mul",
                 "layer_scalar_mul",
-                arm::layer_scalar_mul as Arm,
             ),
-            ("residual_add", "residual_add", arm::residual_add as Arm),
+            ("residual_add", "residual_add"),
             (
                 "residual_add_strided",
                 "residual_add_strided",
-                arm::residual_add_strided as Arm,
             ),
-            ("rms_residual", "rms_residual", arm::rms_residual as Arm),
+            ("rms_residual", "rms_residual"),
             (
                 "rms_residual_scaled",
                 "rms_residual_scaled",
-                arm::rms_residual_scaled as Arm,
             ),
             (
                 "rms_single_row",
                 "rms_single_row",
-                arm::rms_single_row as Arm,
             ),
             (
                 "rms_strided_head_row",
                 "rms_strided_head_row",
-                arm::rms_strided_head_row as Arm,
             ),
             (
                 "rms_strided_row",
                 "rms_strided_row",
-                arm::rms_strided_row as Arm,
             ),
             (
                 "vnorm_single_row",
                 "vnorm_single_row",
-                arm::vnorm_single_row as Arm,
             ),
         ],
     ),
     (
         kernels_metal::rope::ROUTINES,
         &[
-            ("neox_decode", "neox_decode", arm::neox_decode as Arm),
-            ("neox_mb", "neox_mb", arm::neox_mb as Arm),
+            ("neox_decode", "neox_decode"),
+            ("neox_mb", "neox_mb"),
             (
                 "neox_prop_decode",
                 "neox_prop_decode",
-                arm::neox_prop_decode as Arm,
             ),
-            ("neox_prop_mb", "neox_prop_mb", arm::neox_prop_mb as Arm),
+            ("neox_prop_mb", "neox_prop_mb"),
             (
                 "neox_freqs_decode",
                 "neox_freqs_decode",
-                arm::neox_freqs_decode as Arm,
             ),
-            ("neox_freqs_mb", "neox_freqs_mb", arm::neox_freqs_mb as Arm),
-            ("neox_strided", "neox_strided", arm::neox_strided as Arm),
+            ("neox_freqs_mb", "neox_freqs_mb"),
+            ("neox_strided", "neox_strided"),
         ],
     ),
     (
@@ -785,43 +746,38 @@ const LIVE: &[(&[Routine<Metal>], &[(&str, &str, Arm)])] = &[
             (
                 "embed_gather_4bit",
                 "embed_gather_4bit",
-                arm::embed_gather_4bit as Arm,
             ),
             (
                 "embed_gather_mb_4bit",
                 "embed_gather_mb_4bit",
-                arm::embed_gather_mb_4bit as Arm,
             ),
             (
                 "embed_gather_scaled_4bit",
                 "embed_gather_scaled_4bit",
-                arm::embed_gather_scaled_4bit as Arm,
             ),
             (
                 "embed_gather_scaled_mb_4bit",
                 "embed_gather_scaled_mb_4bit",
-                arm::embed_gather_scaled_mb_4bit as Arm,
             ),
-            ("ple_combine", "ple_combine", arm::ple_combine as Arm),
-            ("row_gather", "row_gather", arm::row_gather as Arm),
+            ("ple_combine", "ple_combine"),
+            ("row_gather", "row_gather"),
         ],
     ),
     (
         kernels_metal::mlp::ROUTINES,
         &[
-            ("geglu_tanh", "geglu_tanh", arm::geglu_tanh as Arm),
+            ("geglu_tanh", "geglu_tanh"),
             (
                 "geglu_tanh_strided",
                 "geglu_tanh_strided",
-                arm::geglu_tanh_strided as Arm,
             ),
-            ("gptoss_swiglu", "gptoss_swiglu", arm::gptoss_swiglu as Arm),
-            ("silu_mul", "silu_mul", arm::silu_mul as Arm),
+            ("gptoss_swiglu", "gptoss_swiglu"),
+            ("silu_mul", "silu_mul"),
         ],
     ),
     (
         kernels_metal::sample::ROUTINES,
-        &[("argmax_logits", "argmax_logits", arm::argmax_logits as Arm)],
+        &[("argmax_logits", "argmax_logits")],
     ),
 ];
 
@@ -834,18 +790,17 @@ const LIVE: &[(&[Routine<Metal>], &[(&str, &str, Arm)])] = &[
 ///
 /// The pair is the routine and the ARM that feeds it: a signature says what a
 /// routine takes and in what order, and never where any of it comes from.
-/// See [`crate::lowering::arm`].
+/// See [`crate::lowering::hold`].
 ///
 /// Answers for every routine this backend builds. A family reaches [`LIVE`]
 /// only once its arms are written, and all ten have; a routine ADDED without
 /// one answers `None` here, which
 /// `every_routine_this_backend_builds_has_an_arm` refuses.
 #[must_use]
-pub fn arm_for(name: &str) -> Option<(&'static Routine<Metal>, Arm)> {
+pub fn arm_for(name: &str) -> Option<&'static Routine<Metal>> {
     LIVE.iter().find_map(|(routines, arms)| {
-        let arm = arms.iter().find(|(n, _, _)| *n == name)?.2;
-        let routine = routines.iter().find(|r| r.name == name)?;
-        Some((routine, arm))
+        arms.iter().find(|(n, _)| *n == name)?;
+        routines.iter().find(|r| r.name == name)
     })
 }
 
@@ -867,7 +822,7 @@ pub fn arm_for(name: &str) -> Option<(&'static Routine<Metal>, Arm)> {
 /// what follows a stem is either nothing or an underscore. Without that rule
 /// `rms_norm` would claim `rms_norm_gated`'s symbols by prefix alone.
 #[must_use]
-pub fn crossed(symbol: &str) -> Option<(&'static Routine<Metal>, Arm)> {
+pub fn crossed(symbol: &str) -> Option<&'static Routine<Metal>> {
     let claims = |stem: &str| {
         symbol
             .strip_prefix(stem)
@@ -890,12 +845,10 @@ pub fn crossed(symbol: &str) -> Option<(&'static Routine<Metal>, Arm)> {
         .max();
     LIVE.iter()
         .flat_map(|(routines, arms)| arms.iter().map(move |arm| (routines, arm)))
-        .filter(|(_, (_, stem, _))| claims(stem))
-        .max_by_key(|(_, (_, stem, _))| stem.len())
-        .filter(|(_, (_, stem, _))| dark.is_none_or(|d| stem.len() > d))
-        .and_then(|(routines, (name, _, arm))| {
-            Some((routines.iter().find(|r| r.name == *name)?, *arm))
-        })
+        .filter(|(_, (_, stem))| claims(stem))
+        .max_by_key(|(_, (_, stem))| stem.len())
+        .filter(|(_, (_, stem))| dark.is_none_or(|d| stem.len() > d))
+        .and_then(|(routines, (name, _))| routines.iter().find(|r| r.name == *name))
 }
 
 /// Every stem this backend crosses, with the routine it names.
@@ -909,7 +862,7 @@ pub fn crossed(symbol: &str) -> Option<(&'static Routine<Metal>, Arm)> {
 #[must_use]
 pub fn stems() -> impl Iterator<Item = (&'static str, &'static Routine<Metal>)> {
     LIVE.iter().flat_map(|(routines, arms)| {
-        arms.iter().filter_map(move |(name, stem, _)| {
+        arms.iter().filter_map(move |(name, stem)| {
             Some((*stem, routines.iter().find(|r| r.name == *name)?))
         })
     })
@@ -1061,6 +1014,59 @@ mod tests {
         assert_eq!(d.op, 7, "likewise");
     }
 
+    /// A body whose entrypoint numbers its buffers with HOLES, which is the
+    /// shape twenty-three shipped routines have.
+    ///
+    /// `pad` is taken once and bound at every hole, so the dispatch list and
+    /// the parameter list are different lists: `out` is the signature's
+    /// second entry and the dispatch's fourth. See [`directed`].
+    fn holed(ctx: &Ctx<'_>, pad: Buf, out: BufMut, x: Buf, width: u32) -> Result<(), Refusal> {
+        ctx.dispatch(
+            Fire {
+                entrypoint: "holed_bfloat16",
+                file: "norm/scale.metal",
+                lanes: [width, 1, 1],
+                group: [32, 1, 1],
+            },
+            &[pad.v(), pad.v(), x.v(), out.v(), width.v()],
+        )
+    }
+
+    static HOLED: std::sync::LazyLock<Routine<Metal>> =
+        std::sync::LazyLock::new(|| kernels_metal::routine!(holed));
+
+    /// A padded routine still says which buffer it WRITES.
+    ///
+    /// The direction used to come from the signature indexed at the value's
+    /// position, which for a padded body is a different argument entirely:
+    /// this one's `out` landed on `x`'s type and was declared a read, while
+    /// the `pad` in slot 1 was declared a write. An encoder reading that runs
+    /// this dispatch alongside the one that consumes `out`, and the answer
+    /// stops being the same twice -- which is exactly what qwen3.6 did until
+    /// `ArgValue::BufferMut` existed.
+    #[test]
+    fn a_body_with_pad_slots_still_declares_the_buffer_it_writes() {
+        let handles = [handle(0x1000, 64), handle(0x2000, 64), handle(0x3000, 64)];
+        let planner = Planner::new(&HOLED, &handles, NO_BLOCK, 0..1, 0);
+        holed(&planner, Buf(0), BufMut(1), Buf(2), 64).expect("a launch");
+        let plan = planner.finish();
+        let d = &plan[0];
+        assert_eq!(
+            d.touches.writes,
+            vec![handles[1].slice],
+            "the one mutable argument, at the slot the BODY bound it to"
+        );
+        assert!(
+            !d.touches.writes.contains(&handles[0].slice),
+            "`pad` is read-only however many holes it fills"
+        );
+        assert!(
+            d.touches.reads.contains(&handles[2].slice)
+                && d.touches.reads.contains(&handles[0].slice),
+            "everything else that reached a slot is a read"
+        );
+    }
+
     /// A refusal leaves no dispatch behind.
     #[test]
     fn a_body_that_refuses_does_not_reach_the_plan() {
@@ -1142,7 +1148,7 @@ mod tests {
     #[test]
     fn every_arm_names_a_routine_that_exists() {
         for (routines, arms) in LIVE {
-            for (name, _, _) in *arms {
+            for (name, _) in *arms {
                 assert!(
                     routines.iter().any(|r| r.name == *name),
                     "{name}: an arm for a routine this family does not have \
@@ -1211,8 +1217,9 @@ mod tests {
     /// the other's seam, and an argument can be the right kind in the right
     /// slot of the wrong list.
     #[test]
-    fn every_arm_fills_the_argument_list_its_routine_declares() {
-        use crate::lowering::arm::{Facts, Handles};
+    fn every_routine_states_the_argument_list_it_declares() {
+        use crate::lowering::dispatch::Geometry;
+        use crate::lowering::hold::{Facts, Handles};
         use crate::lowering::executor::{FireTable, Resolver};
         use kernels_metal::routine::ArgValue;
 
@@ -1263,7 +1270,7 @@ mod tests {
             | Ty::U8s
             | Ty::U8sMut
             | Ty::F32s
-            | Ty::F32sMut => matches!(v, ArgValue::Buffer(_)),
+            | Ty::F32sMut => matches!(v, ArgValue::Buffer(_) | ArgValue::BufferMut(_)),
             Ty::I32 => matches!(v, ArgValue::I32(_)),
             // `InPacked` carries a `u32`'s value and is not a `u32`: it is a
             // FIELD of the preceding params struct, which is why it has a kind
@@ -1284,33 +1291,48 @@ mod tests {
         // `Refusal::Empty` and a zero axis makes a head count a division by it.
         let params: Vec<Option<u32>> = (1..=16).map(Some).collect();
         let facts = Facts {
+            geometry: Geometry {
+                q_heads: 8,
+                kv_heads: 2,
+                head_dim: 64,
+                rotary_dims: 64,
+                n_experts: 8,
+                experts_per_token: 2,
+                ..Geometry::default()
+            },
             rows: 4,
             width: 64,
             in_width: 64,
-            q_heads: 8,
-            kv_heads: 2,
-            head_dim: 64,
-            rotary_dims: 64,
-            n_experts: 8,
-            experts_per_token: 2,
-            group: 64,
-            bits: 4,
             tile: Some((32, 32)),
+            point: (64, 4),
             layer: 0,
             requests: 2,
         };
 
         let mut wrong: Vec<String> = Vec::new();
         for (routines, arms) in LIVE {
-            for (name, stem, arm) in *arms {
+            for (name, stem) in *arms {
                 let Some(routine) = routines.iter().find(|r| r.name == *name) else {
                     wrong.push(format!("  {stem} -> `{name}`: no routine of that name"));
                     continue;
                 };
+                for (at, source) in routine.sources.iter().enumerate() {
+                    if source.is_none() {
+                        wrong.push(format!(
+                            "  {stem} -> `{name}`: argument {at} has no source, \
+                             so no signature says where it comes from"
+                        ));
+                    }
+                }
                 let mut resolver = Everything;
                 let mut handles =
                     Handles::new(&args, &ins, &outs, &weights, &params, &mut resolver);
-                let built = match arm(&mut handles, facts) {
+                let built = match crate::lowering::bind::bind(
+                    routine.args,
+                    routine.sources,
+                    &mut handles,
+                    facts,
+                ) {
                     Ok(built) => built,
                     Err(why) => {
                         wrong.push(format!("  {stem} -> `{name}`: refused: {why}"));
@@ -1319,7 +1341,7 @@ mod tests {
                 };
                 if built.len() != routine.args.len() {
                     wrong.push(format!(
-                        "  {stem} -> `{name}`: the arm hands {} value(s), the \
+                        "  {stem} -> `{name}`: the binder hands {} value(s), the \
                          routine takes {}",
                         built.len(),
                         routine.args.len()
@@ -1330,7 +1352,7 @@ mod tests {
                     if !fits(*ty, *value) {
                         wrong.push(format!(
                             "  {stem} -> `{name}`: argument {at} is {ty:?} and \
-                             the arm bound {}",
+                             the binder bound {}",
                             value.kind()
                         ));
                     }
@@ -1339,9 +1361,11 @@ mod tests {
         }
         assert!(
             wrong.is_empty(),
-            "an arm and its routine disagree about the call between them. \
-             Until this test existed the disagreement was a `Refusal` at \
-             dispatch, which names the arity but not the arm:\n{}",
+            "a routine and its own signature disagree about the call between \
+             them. This ran against ninety-one hand-written arms while STAGES \
+             2 through 6 moved what they knew into the signatures; it runs \
+             against `bind` now, so a disagreement here is a routine that \
+             cannot dispatch at all:\n{}",
             wrong.join("\n")
         );
     }
@@ -1355,7 +1379,7 @@ mod tests {
     /// `rms_norm_gated` without an underscore boundary to stop it.
     #[test]
     fn the_longest_stem_wins_and_a_stem_may_not_end_mid_word() {
-        let by = |symbol: &str| crossed(symbol).map(|(r, _)| r.name);
+        let by = |symbol: &str| crossed(symbol).map(|r| r.name);
         assert_eq!(
             by("affine_qmm_t_splitk_bfloat16_gs_64_b_4"),
             Some("qmm_t_splitk"),
@@ -1390,13 +1414,167 @@ mod tests {
     #[test]
     fn every_stem_finds_its_own_routine() {
         for (_, arms) in LIVE {
-            for (name, stem, _) in *arms {
+            for (name, stem) in *arms {
                 let got = crossed(stem)
                     .unwrap_or_else(|| panic!("`{stem}` resolves nothing"))
-                    .0
                     .name;
                 assert_eq!(got, *name, "`{stem}` resolves the wrong routine");
             }
         }
     }
+
+
+
+    /// Every source in the column is one the binder has a case for --
+    /// including the halves a full statement never reaches.
+    ///
+    /// # Why the other gate cannot ask this
+    ///
+    /// `every_routine_states_the_argument_list_it_declares` binds each
+    /// routine against a statement carrying every scalar, so every chain
+    /// takes its FIRST half and the second is never evaluated. That is the
+    /// shape of statement every deployment in the suite produces, which is
+    /// why a missing case in the second half is invisible until a model that
+    /// states nothing arrives.
+    ///
+    /// Binding the whole routine with no scalars does not work either: a
+    /// required `Param<N, T>` refuses first, `bind` stops at it, and every
+    /// argument after it -- including the chain -- goes unevaluated. Twenty-
+    /// one routines refuse that way, which is enough to hide any number of
+    /// unanswerable sources behind them.
+    ///
+    /// So each argument is bound ALONE, on a one-element slice of the
+    /// routine's own columns. Nothing masks anything, every chain takes its
+    /// fallback, and the real `bind` is what runs -- so this asks about the
+    /// binder rather than about a second list that describes it.
+    ///
+    /// # What is a failure and what is not
+    ///
+    /// `Refusal::Absent` is the honest answer to "the statement does not
+    /// carry this scalar", and with no scalars most routines produce
+    /// several. `Refusal::Unstated` is the binder saying it has NO CASE, and
+    /// that is the failure -- a source in the column no code path answers.
+    ///
+    /// It found one on landing. `keys::RotaryWidth` is the fallback of seven
+    /// `ParamOr<3, ..>` sites, `arm.rs` answered it from `Facts::rotary_dims`,
+    /// and `bind::named` had no case for it.
+    #[test]
+    fn every_source_in_the_column_is_one_the_binder_answers() {
+        use crate::lowering::executor::{FireTable, Resolver};
+        use crate::lowering::dispatch::Geometry;
+        use crate::lowering::hold::{Facts, Handles};
+
+        const SOMEWHERE: Slice = Slice {
+            address: 0x1_0000,
+            bytes: 1 << 20,
+        };
+
+        struct Everything;
+
+        impl Resolver for Everything {
+            fn weight(&mut self, _: &str) -> Option<Slice> {
+                Some(SOMEWHERE)
+            }
+            fn named(&mut self, _: model_ir::trace::ValueId) -> Option<Slice> {
+                Some(SOMEWHERE)
+            }
+            fn kv(&mut self, _: u16, _: bool) -> Option<Slice> {
+                Some(SOMEWHERE)
+            }
+            fn slab(&mut self, _: u16, _: &'static str) -> Option<Slice> {
+                Some(SOMEWHERE)
+            }
+            fn fire(&mut self, _: FireTable) -> Option<Slice> {
+                Some(SOMEWHERE)
+            }
+            fn pool(&mut self, _: FireTable) -> Option<u32> {
+                Some(16)
+            }
+        }
+
+        let args: Vec<BoundArg> = (0..24)
+            .map(|i: u64| handle(0x1_0000 + i * 0x1000, 64))
+            .collect();
+        let ins: Vec<usize> = (0..8).collect();
+        let outs: Vec<usize> = (8..16).collect();
+        let weights: Vec<usize> = (16..24).collect();
+        // THE POINT OF THE TEST: no scalars, so every chain falls through to
+        // the half a shipped statement never reaches.
+        let params: Vec<Option<u32>> = Vec::new();
+        let facts = Facts {
+            geometry: Geometry {
+                q_heads: 8,
+                kv_heads: 2,
+                head_dim: 64,
+                v_heads: 2,
+                v_dim: 64,
+                rotary_dims: 32,
+                n_experts: 8,
+                experts_per_token: 2,
+                ..Geometry::default()
+            },
+            rows: 4,
+            width: 64,
+            in_width: 64,
+            // Present, so that `TileM`/`TileN` reach their number rather than
+            // the `Unstated` that a device stating no tile deserves.
+            tile: Some((32, 32)),
+            point: (64, 4),
+            layer: 0,
+            requests: 2,
+        };
+
+        let mut unanswered: Vec<String> = Vec::new();
+        let mut asked = 0usize;
+        for (routines, arms) in LIVE {
+            for (name, _stem) in *arms {
+                let Some(routine) = routines.iter().find(|r| r.name == *name) else {
+                    continue;
+                };
+                for at in 0..routine.args.len() {
+                    let mut resolver = Everything;
+                    let mut handles =
+                        Handles::new(&args, &ins, &outs, &weights, &params, &mut resolver);
+                    asked += 1;
+                    let one = crate::lowering::bind::bind(
+                        &routine.args[at..=at],
+                        &routine.sources[at..=at],
+                        &mut handles,
+                        facts,
+                    );
+                    if let Err(Refusal::Unstated { what }) = one {
+                        unanswered.push(format!("  {name} argument {at}: {what}"));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            unanswered.is_empty(),
+            "a source in the column has no case in `bind`, so the argument \
+             refuses whenever that source is reached -- which for the second \
+             half of a chain is only on the deployments that state \
+             nothing:\n{}",
+            unanswered.join("\n")
+        );
+
+        // A FLOOR, because a gate that asks nothing looks like a gate that
+        // passes. This one would ask nothing if `LIVE` emptied or if the
+        // `find` stopped matching, and it has happened twice on this ladder.
+        let total: usize = LIVE
+            .iter()
+            .flat_map(|(routines, arms)| {
+                arms.iter()
+                    .filter_map(|(name, _)| routines.iter().find(|r| r.name == *name))
+            })
+            .map(|routine| routine.args.len())
+            .sum();
+        assert_eq!(asked, total, "every argument of every routine is asked");
+        assert!(
+            asked > 900,
+            "only {asked} arguments asked; the column is 1,000-odd"
+        );
+        println!("arguments asked: {asked}");
+    }
+
 }

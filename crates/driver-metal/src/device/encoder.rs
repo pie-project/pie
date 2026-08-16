@@ -507,8 +507,8 @@ impl<'ctx> Stepper<'ctx> {
     /// RESETS it first. Resetting an allocator whose command buffer is still
     /// executing is a use-after-free, so a caller may have at most
     /// `ALLOCATOR_COUNT - 1` steps outstanding. This checks rather than
-    /// trusting: the step two back must have passed, and if it has not this
-    /// waits for it.
+    /// trusting: the step that last drew from this allocator must have
+    /// passed, and if it has not this waits for it.
     ///
     /// One in flight while one runs is exactly the shape run-ahead wants; a
     /// deeper pipeline wants more allocators, and that is the constant to
@@ -523,18 +523,37 @@ impl<'ctx> Stepper<'ctx> {
         F: FnOnce(&mut StepEncoder<'_>) -> Result<()>,
     {
         self.preflight()?;
-        // The allocator this step is about to reset was last used by the step
-        // `ALLOCATOR_COUNT` back. Nothing may reset it while its buffer runs.
-        let reused = self
-            .committed
-            .checked_sub(crate::device::context::ALLOCATOR_COUNT as u64);
-        if let Some(value) = reused {
+        // Nothing may reset an allocator while a buffer drawn from it runs.
+        if let Some(value) = Self::drawn_from_the_same_allocator(self.committed) {
             self.await_value(value)?;
         }
         let allocator = self.allocator();
         allocator.reset();
         let buffer = self.encode_one(allocator, encode)?;
         Ok(self.commit(std::slice::from_ref(&buffer)))
+    }
+
+    /// The timeline value of the last step that drew from the allocator a
+    /// step entering at `committed` is about to reset, if there was one.
+    ///
+    /// The arithmetic is one step subtler than it looks, and getting it wrong
+    /// is silent. A step entering at `c` encodes against `allocator(c)` --
+    /// index `c % ALLOCATOR_COUNT` -- and signals `c + 1`. So the previous
+    /// step to draw on that index is the one that ENTERED at `c - N`, and the
+    /// value it signalled is `c - N + 1`, not `c - N`. Waiting for `c - N`
+    /// clears the step BEFORE the one that actually holds the allocator, and
+    /// at `N = 2` and `c = 2` that is a wait for value 0, which a shared
+    /// event satisfies the instant it is asked because it starts there.
+    ///
+    /// Callers that end every submit in a wait never notice, because for them
+    /// everything up to `committed` has retired anyway. Run-ahead is what
+    /// makes it real, and run-ahead is the only reason this function exists.
+    const fn drawn_from_the_same_allocator(committed: u64) -> Option<u64> {
+        let span = crate::device::context::ALLOCATOR_COUNT as u64;
+        match committed.checked_sub(span) {
+            Some(entered) => Some(entered + 1),
+            None => None,
+        }
     }
 
     /// Whether the GPU has passed `value`. Does not block.
@@ -1088,6 +1107,12 @@ impl<'ctx> Stepper<'ctx> {
     }
 
     /// Wait for the event to reach `value`, or wedge.
+    ///
+    /// The wedge message carries the last commit feedback the GPU delivered.
+    /// A timeout on its own cannot tell a hang apart from a fault: a command
+    /// buffer that errors never signals its event either, and the only place
+    /// the reason exists is the feedback handler. Reading it here is the
+    /// difference between "the GPU stopped" and "the GPU stopped BECAUSE".
     fn await_value(&mut self, value: u64) -> Result<()> {
         let probe_ms = u64::try_from(WAIT_PROBE.as_millis()).unwrap_or(u64::MAX);
         for _ in 0..WAIT_PROBES {
@@ -1096,11 +1121,20 @@ impl<'ctx> Stepper<'ctx> {
             }
         }
         self.wedged = true;
+        let reported = match self.feedback.latest() {
+            Some(f) if f.failed() => format!(
+                "; the GPU last reported step {}: {}",
+                f.step,
+                f.error.unwrap_or_default()
+            ),
+            Some(f) => format!("; the GPU last completed step {} without error", f.step),
+            None => "; the GPU reported nothing at all".to_owned(),
+        };
         Err(Error::Create {
             what: "step",
             message: format!(
                 "the GPU did not reach event {value} within {} ms; this context is abandoned \
-                 because its command buffers may still be running",
+                 because its command buffers may still be running{reported}",
                 probe_ms * u64::from(WAIT_PROBES)
             ),
         })
@@ -1171,4 +1205,51 @@ fn issue(
     mapping_queue.signalEvent_value(as_event, value);
     step_queue.waitForEvent_value(as_event, value);
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Stepper;
+    use crate::device::context::ALLOCATOR_COUNT;
+
+    /// The first `ALLOCATOR_COUNT` steps draw on allocators nobody has used,
+    /// so there is nothing to wait for and the wait must not be invented.
+    #[test]
+    fn the_first_steps_wait_for_no_one() {
+        for committed in 0..ALLOCATOR_COUNT as u64 {
+            assert_eq!(
+                Stepper::drawn_from_the_same_allocator(committed),
+                None,
+                "step entering at {committed} resets an allocator no step has drawn on"
+            );
+        }
+    }
+
+    /// The value waited for is the one the previous user of THIS allocator
+    /// signalled, which is a step later than the count back.
+    ///
+    /// The regression this pins: `committed - ALLOCATOR_COUNT` waits for the
+    /// step before the holder, and at the first wrap that is value zero --
+    /// which a shared event starts at, so the wait was no wait at all.
+    #[test]
+    fn a_step_waits_for_the_one_holding_its_allocator() {
+        let span = ALLOCATOR_COUNT as u64;
+        assert_eq!(
+            Stepper::drawn_from_the_same_allocator(span),
+            Some(1),
+            "the first wrap must wait for value 1, never for 0"
+        );
+        for committed in span..span + 8 {
+            let waited = Stepper::drawn_from_the_same_allocator(committed)
+                .expect("a wrapped step has a predecessor");
+            // The step that signalled `waited` entered at `waited - 1`, and
+            // that is the same allocator index this one is about to reset.
+            assert_eq!(
+                (waited - 1) % span,
+                committed % span,
+                "waited for a step that drew on a different allocator"
+            );
+            assert!(waited <= committed, "waited for a step not yet committed");
+        }
+    }
 }

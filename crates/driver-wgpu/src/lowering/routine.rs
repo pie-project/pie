@@ -80,6 +80,26 @@ pub enum Unplanned {
     /// handle for it — and refused by name rather than by `buffers` silently
     /// coming out one entry short.
     Blocks,
+    /// The body wants a per-layer RECURRENT slab and this driver holds none.
+    ///
+    /// Separate from [`Unplanned::NoCache`] because the consequence differs:
+    /// a KV cache the driver lacks is a deployment that cannot attend, while a
+    /// recurrent carry it lacks is a scan that would read zero, write nothing
+    /// back, and answer fluently and wrongly. Both refuse; only one of them
+    /// would have been quiet.
+    ///
+    /// Every `ssm` arm declines here today, on this backend and on
+    /// `driver-metal`, because neither allocates a slab. That is what keeps
+    /// the gated DeltaNet honestly DARK rather than silently wrong, and
+    /// `tests/hybrid_probe.rs` reads the decline by name.
+    NoSlab {
+        /// Which operand of the body asked.
+        at: usize,
+        /// The rectangle's layer.
+        layer: u16,
+        /// The slab's name, as the kernel knows it.
+        which: &'static str,
+    },
     /// The body asked for a KV LAYER this fire does not hold.
     ///
     /// The table path refuses the same thing as `Unbindable::NoKvCache`; this
@@ -124,6 +144,11 @@ impl std::fmt::Display for Unplanned {
             }
             Self::Silent => write!(f, "the body stated no dispatch"),
             Self::Blocks => write!(f, "the body bound two parameter blocks"),
+            Self::NoSlab { at, layer, which } => write!(
+                f,
+                "the body's operand {at} wants layer {layer}'s `{which}` slab, \
+                 which this driver allocates none of"
+            ),
             Self::NoCache { at, layer, values } => write!(
                 f,
                 "the body's operand {at} wants layer {layer}'s {}, which this \
@@ -346,7 +371,30 @@ pub fn bind<'a, B>(
         // never reaches `ctx.dispatch`, so `mlp`'s three gated activations
         // pass no scalars at all and the run is the statement's alone.
         let mut run: Vec<u8> = scalars.iter().flat_map(|w| w.to_le_bytes()).collect();
-        run.extend_from_slice(&bytes);
+        // WHERE THE BODY'S SCALARS GO, when the module declares a uniform
+        // block BESIDE the storage one. They are two different things and the
+        // shader reads them from two different places: `ssm/gdn_prep.wgsl`'s
+        // prefill pair takes `GdnCoreParams` as the `@group(0)` pointer the
+        // statement assembled and `row_pitch`/`n_scan` as the two fields of
+        // its `@group(1)` block. Appending them to the storage run leaves the
+        // uniform empty, which `Device::check_bindable` refuses by name.
+        //
+        // Every other kernel here declares one or the other, which is why the
+        // run took the whole of both until now: `row_gather`'s derived request
+        // count really is the last field of its storage struct.
+        let mut uniform = Vec::new();
+        if declared.uniform_bytes > 0 {
+            if bytes.len() > declared.uniform_bytes as usize {
+                return Err(Unplanned::Scalars {
+                    stated: bytes.len(),
+                    room: declared.uniform_bytes,
+                });
+            }
+            uniform = bytes;
+            uniform.resize(declared.uniform_bytes as usize, 0);
+        } else {
+            run.extend_from_slice(&bytes);
+        }
         let local = declared.local;
         return Ok(Dispatch {
             symbol,
@@ -355,6 +403,7 @@ pub fn bind<'a, B>(
                 bytes: run,
                 at: ParamSlot::Storage(u32::try_from(at).expect("a small binding number")),
             },
+            uniform,
             block_at: Some(at),
             groups: [
                 stated.lanes[0].div_ceil(local[0].max(1)),
@@ -390,6 +439,9 @@ pub fn bind<'a, B>(
         symbol,
         buffers,
         params,
+        // The uniform rides `params` on this path; the field is for the
+        // dispatch that has a storage block TOO.
+        uniform: Vec::new(),
         // `ParamSlot::Uniform` is a bind group of its own and takes no place
         // in the buffer list, which is what `None` says here.
         block_at: None,
@@ -422,12 +474,11 @@ pub fn bind<'a, B>(
 /// in the fire.
 pub fn plan<'a, R: crate::binding::Resolve>(
     routine: &'static Routine<Wgpu>,
-    arm: super::arm::Arm,
     lowered: &'a model_compiler::lower::Lowered,
     launch: &Launch,
     declared: &Declared,
     sources: crate::dispatch::Sources<'a, R>,
-    facts: super::arm::Facts,
+    facts: super::hold::Facts,
 ) -> Result<Vec<Dispatch<'a, R::Buffer>>, Unplanned> {
     let crate::dispatch::Sources {
         arena,
@@ -450,8 +501,32 @@ pub fn plan<'a, R: crate::binding::Resolve>(
             numbers.insert(which, n);
         }
     }
-    let mut handles = super::arm::Handles::with_numbers(args, results(routine), scalars, &numbers);
-    let taken_args = arm(&mut handles, facts).map_err(Unplanned::Refused)?;
+    // TWO PASSES, and the first one exists because a TYPE cannot tell a
+    // statement's result from a recurrent slab: both are `F32sMut`. Counting
+    // the routine's writable arguments -- which `results` does and which this
+    // used -- overcounts by one for every GDN kernel, because
+    // `new_conv_state` is writable and is not one of the statement's outputs.
+    // The split then steals an input, and the arm asks for a `b_gate` the
+    // statement "does not carry".
+    //
+    // The SIGNATURE can tell them apart, because it says which is which: a
+    // result is an `OutSlot` and a slab is a `Held<NewConvState, _>`. So the
+    // binder runs once over an undivided statement purely to count the asks,
+    // and once over the split that count implies. `driver-metal` reached the
+    // same shape after the same defect and records it at its own call site.
+    let asked = {
+        let mut probe = super::hold::Handles::undivided(args, scalars);
+        // A refusal HERE is not the answer: the counting pass may fail for a
+        // reason the split pass would too, and the split pass is the one whose
+        // refusal names the operand. So this one is swallowed and the count it
+        // reached is used, which is the number of results it managed to ask
+        // for before stopping.
+        let _ = super::bind::bind(routine.args, routine.sources, &mut probe, facts);
+        probe.asked_results()
+    };
+    let mut handles = super::hold::Handles::with_numbers(args, asked, scalars, &numbers);
+    let taken_args = super::bind::bind(routine.args, routine.sources, &mut handles, facts)
+        .map_err(Unplanned::Refused)?;
     let stated = state(routine, &taken_args)?;
 
     // The operands the BODY asked for, resolved in the order it asked. Not
@@ -461,14 +536,14 @@ pub fn plan<'a, R: crate::binding::Resolve>(
     let mut bounds = Vec::with_capacity(handles.asked().len());
     for (at, arg) in handles.asked().iter().enumerate() {
         match arg {
-            super::arm::Asked::Operand(arg) => {
+            super::hold::Asked::Operand(arg) => {
                 let bound = crate::binding::resolve(arg, launch, arena, resolver, min_offset)
                     .map_err(|why| Unplanned::Operand { at, why })?;
                 bounds.push(Placed::Buffer(bound));
             }
-            super::arm::Asked::Params => bounds.push(Placed::Params),
-            super::arm::Asked::Unbound => bounds.push(Placed::Nothing),
-            super::arm::Asked::Kv { values } => {
+            super::hold::Asked::Params => bounds.push(Placed::Params),
+            super::hold::Asked::Unbound => bounds.push(Placed::Nothing),
+            super::hold::Asked::Kv { values } => {
                 // The layer is the RECTANGLE's, read here rather than carried
                 // by the arm: `reorder` takes `launch.layers.start` for
                 // `Source::KvKeys` and an arm holding its own number could
@@ -481,7 +556,16 @@ pub fn plan<'a, R: crate::binding::Resolve>(
                 })?;
                 bounds.push(Placed::Buffer(crate::binding::Bound::whole(held)));
             }
-            super::arm::Asked::Table(which) => {
+            super::hold::Asked::Slab(which) => {
+                // The rectangle's layer, for `Asked::Kv`'s reason.
+                let layer = launch.layers.start;
+                let held =
+                    resolver
+                        .slab(layer, which)
+                        .ok_or(Unplanned::NoSlab { at, layer, which })?;
+                bounds.push(Placed::Buffer(crate::binding::Bound::whole(held)));
+            }
+            super::hold::Asked::Table(which) => {
                 let held = resolver
                     .table(*which)
                     .ok_or(Unplanned::Absent { at, what: *which })?;
@@ -507,16 +591,13 @@ pub fn plan<'a, R: crate::binding::Resolve>(
 /// `an_armed_symbol_is_reached_through_the_spelling_a_plan_uses` is what says
 /// the census holds none.
 #[must_use]
-pub fn armed(symbol: &str) -> Option<(&'static Routine<Wgpu>, super::arm::Arm)> {
+pub fn armed(symbol: &str) -> Option<&'static Routine<Wgpu>> {
     // By STEM, not by name. A plan spells `silu_mul_bfloat16` and the routine
     // is called `silu_mul`; the registry knows which prefix of a symbol names
     // a kernel, and it is the only thing that can, because this fork answers
     // before any row is looked up.
-    let (stem, arm) = super::arm::crossed(symbol)?;
-    let routine = kernels_wgpu::routines()
-        .into_iter()
-        .find(|r| r.name == stem)?;
-    Some((routine, arm))
+    let stem = super::hold::crossed(symbol)?;
+    kernels_wgpu::routines().into_iter().find(|r| r.name == stem)
 }
 
 /// How many of a statement's widthed operands are RESULTS.
@@ -704,7 +785,7 @@ mod tests {
     /// says so rather than dispatching it.
     #[test]
     fn a_body_that_refuses_is_reported_with_its_own_refusal() {
-        let (routine, _) = armed("argmax_logits").expect("the one armed symbol");
+        let routine = armed("argmax_logits").expect("the one armed symbol");
         let args = vec![
             ArgValue::Buffer(0),
             ArgValue::Buffer(1),
@@ -737,7 +818,7 @@ mod tests {
             width: 64,
             bytes: 2,
         }];
-        let mut o = super::super::arm::Handles::over(&args, 1);
+        let mut o = super::super::hold::Handles::over(&args, 1);
         let _ = o.output(0).expect("the one operand");
         let keys = o.kv(false);
         let values = o.kv(true);
@@ -748,7 +829,7 @@ mod tests {
         assert!(
             matches!(
                 o.asked().get(2),
-                Some(super::super::arm::Asked::Kv { values: true })
+                Some(super::super::hold::Asked::Kv { values: true })
             ),
             "and the second is recorded as the VALUES half"
         );
@@ -780,7 +861,7 @@ mod tests {
             width: 64,
             bytes: 2,
         }];
-        let mut o = super::super::arm::Handles::over(&args, 1);
+        let mut o = super::super::hold::Handles::over(&args, 1);
         let _ = o.output(0).expect("the one operand");
         let table = o.table(crate::binding::FireTable::RopeFrequencies);
         assert!(
@@ -790,7 +871,7 @@ mod tests {
         assert!(
             matches!(
                 o.asked().get(1),
-                Some(super::super::arm::Asked::Table(
+                Some(super::super::hold::Asked::Table(
                     crate::binding::FireTable::RopeFrequencies
                 ))
             ),
@@ -810,6 +891,111 @@ mod tests {
         assert!(
             said.contains("operand 1") && said.contains("RopeFrequencies"),
             "the refusal names the position AND the table: {said}"
+        );
+    }
+
+    /// Every gated-DeltaNet arm declines its recurrent slab, BY NAME.
+    ///
+    /// The family is DARK on this backend and on `driver-metal`, and this is
+    /// what makes that a statement rather than an accident. Neither driver
+    /// allocates a slab, so `Resolve::slab` answers `None` and `plan` refuses
+    /// with [`Unplanned::NoSlab`].
+    ///
+    /// **The alternative is what this backend used to do.** Its arms took
+    /// `conv_state` from `input(1)` and `new_conv_state` from `output(3)`,
+    /// because `Handles` had no slab door — and the statement `model-dsl`
+    /// actually emits carries FOUR weights and THREE outputs, so `input(1)` is
+    /// `a_gate` and `output(3)` does not exist. `gates` read `a_gate`/`b_gate`
+    /// as `weight(4)`/`weight(5)`, which `driver-metal`'s own comment records
+    /// as a defect it fixed: a weight handle there binds a per-head buffer the
+    /// shader strides BY TOKEN, so row zero reads the right gate and every row
+    /// after it reads past the end.
+    ///
+    /// A refusal is the only honest answer while the carry does not exist: a
+    /// scan handed a null one reads zero, writes nothing back, and returns a
+    /// fluent result no output check catches.
+    #[test]
+    fn every_gdn_arm_declines_the_slab_this_driver_does_not_hold() {
+        let mut declined = Vec::new();
+        for point in kernels_wgpu::entrypoints() {
+            if !point.starts_with("gdn_") {
+                continue;
+            }
+            let Some(stem) = super::super::hold::crossed(&point) else {
+                panic!("`{point}` is claimed by no crossed stem");
+            };
+            let routine = kernels_wgpu::routines()
+                .into_iter()
+                .find(|r| r.name == stem)
+                .unwrap_or_else(|| panic!("`{stem}` names no routine"));
+            let args: Vec<model_compiler::lower::Arg> = (0..8)
+                .map(|n| model_compiler::lower::Arg::Arena {
+                    at: n * 256,
+                    width: 256,
+                    bytes: 256,
+                })
+                .collect();
+            // A WHOLE `GdnCoreParams` and the scan's tile after it, because
+            // that is what the statements carry and the arms read: `Dv` at 1
+            // and `Hv` at 3 size the grid, and the prefill scan's `(lanes,
+            // vrows)` at 11 and 12 pick which compiled shape fires. Four ones
+            // left every arm refusing, and the guard below is what said so
+            // rather than the suite going quietly green over nothing.
+            let mut o = super::super::hold::Handles::with_scalars(
+                &args,
+                3,
+                // Dk, Dv, Hk, Hv, conv_dim, Kc, q_off, k_off, v_off, eps,
+                // inv_sqrt_dk, then lanes and vrows.
+                &[128, 128, 4, 4, 1024, 4, 0, 512, 1024, 0, 0, 32, 4],
+            );
+            let facts = super::super::hold::facts(
+                &point,
+                4,
+                crate::dispatch::Geometry {
+                    q_heads: 4,
+                    kv_heads: 4,
+                    head_dim: 64,
+                    rotary_dims: 64,
+                    n_experts: 0,
+                    experts_per_token: 0,
+                    ..Default::default()
+                },
+                4,
+                256,
+                256,
+            );
+            // The arm may refuse for its own reasons; what matters is that
+            // when it SUCCEEDS it recorded a slab ask, so `plan` will refuse.
+            if crate::lowering::bind::bind(routine.args, routine.sources, &mut o, facts).is_ok() {
+                let asked = o.asked();
+                let slab = asked
+                    .iter()
+                    .position(|a| matches!(a, super::super::hold::Asked::Slab(_)));
+                let at = slab.unwrap_or_else(|| {
+                    panic!(
+                        "`{point}`'s arm filled every operand without asking \
+                         for a recurrent slab, which means it took the carry \
+                         from somewhere that is not one"
+                    )
+                });
+                // The refusal `plan` will raise for that ask, constructed here
+                // so this test NAMES it: `Resolve::slab` answers `None` on
+                // this driver, so the ask cannot become a binding.
+                let why = Unplanned::NoSlab {
+                    at,
+                    layer: 0,
+                    which: "conv_state",
+                };
+                assert!(
+                    why.to_string().contains("allocates none of"),
+                    "the refusal should say the driver holds no slab: {why}"
+                );
+                declined.push(point.clone());
+            }
+        }
+        assert!(
+            !declined.is_empty(),
+            "no gdn arm was exercised, so this checked nothing"
         );
     }
 
@@ -843,21 +1029,22 @@ mod tests {
         );
     }
 
-    /// RETIRED with `Unplanned::Both`, which turned out to be the wrong rule.
-    ///
-    /// It asserted that a body binding a storage block AND passing scalars is
-    /// refused, on the reasoning that the block IS the statement's run.
-    /// `layout::row_gather` does exactly that on purpose — its request count
-    /// is a FIELD of the struct, and the table path appends the same number to
-    /// the same run — so the refusal was rejecting a correct body. `bind` now
-    /// appends the body's scalars to the statement's run, and the 24
-    /// `row_gather` rectangles of
-    /// `the_routine_path_plans_what_the_table_path_planned` agree with the row
-    /// on every byte.
+    // RETIRED with `Unplanned::Both`, which turned out to be the wrong rule.
+    //
+    // It asserted that a body binding a storage block AND passing scalars is
+    // refused, on the reasoning that the block IS the statement's run.
+    // `layout::row_gather` does exactly that on purpose -- its request count
+    // is a FIELD of the struct, and the table path appends the same number to
+    // the same run -- so the refusal was rejecting a correct body. `bind` now
+    // appends the body's scalars to the statement's run, and the 24
+    // `row_gather` rectangles of
+    // `every_launchs_scalars_land_where_its_module_reads_them` agree with the
+    // row on every byte.
 
-    /// asked for nothing, and a caller that took that for done would run a
-    /// launch that writes nothing and reports success — which is the same
-    /// failure a zero grid is, arrived at from the other side.
+    /// A body that stated no dispatch asked for nothing, and a caller that
+    /// took that for done would run a launch that writes nothing and reports
+    /// success — which is the same failure a zero grid is, arrived at from
+    /// the other side.
     #[test]
     fn a_body_that_states_no_dispatch_is_not_taken_for_done() {
         // An untouched planner has nothing to state, and that is exactly the
@@ -868,7 +1055,7 @@ mod tests {
         // two are told apart by which error comes back, not by the
         // recording, so both have to be empty for that distinction to mean
         // anything.
-        let (routine, _) = armed("argmax_logits").expect("the one armed symbol");
+        let routine = armed("argmax_logits").expect("the one armed symbol");
         let planner = Planner::new();
         (routine.body)(
             &planner,
@@ -896,11 +1083,17 @@ mod tests {
         static QUIET: Routine<Wgpu> = Routine {
             name: "says_nothing",
             args: &[],
+            // Empty beside an empty `args`, which is the pair's own rule: all
+            // three are DERIVED from the body's arguments, and this body has
+            // none.
+            sides: &[],
+            sources: &[],
             spelling: &[],
             body: says_nothing,
             whole: false,
             depth_prefix_plan: false,
             in_place: &[],
+            derived: &[],
         };
         assert_eq!(state(&QUIET, &[]), Err(Unplanned::Silent));
     }
@@ -939,7 +1132,7 @@ mod tests {
     /// `Handles::over` just takes the last `n` as outputs.
     #[test]
     fn a_routine_states_how_many_of_its_operands_are_results() {
-        let (argmax, _) = armed("argmax_logits").expect("the one armed symbol");
+        let argmax = armed("argmax_logits").expect("the one armed symbol");
         assert_eq!(results(argmax), 2, "next_token and eos_flag");
 
         // The case metal's narrower count would miss.
@@ -1002,7 +1195,7 @@ mod tests {
             }
         }
 
-        let (routine, arm) = armed("argmax_logits").expect("the one armed symbol");
+        let routine = armed("argmax_logits").expect("the one armed symbol");
         // Four ARENA operands, against an arena of no bytes. Weights would
         // not do: `Handles` puts them in their own list, so `argmax`'s asks
         // for two inputs and two outputs would refuse before anything reached
@@ -1037,7 +1230,6 @@ mod tests {
         };
         let out = plan(
             routine,
-            arm,
             &lowered,
             &launch,
             &declared(0, [1, 1, 1]),
@@ -1049,7 +1241,7 @@ mod tests {
                 resolver: &Empty,
                 min_offset: 256,
             },
-            super::super::arm::facts("x", 7, crate::dispatch::Geometry::default(), 1, 1024, 1024),
+            super::super::hold::facts("x", 7, crate::dispatch::Geometry::default(), 1, 1024, 1024),
         );
         assert!(
             matches!(out, Err(Unplanned::Operand { at: 0, .. })),
@@ -1060,9 +1252,9 @@ mod tests {
     /// The armed symbols are crossed, and reached through the spelling a
     /// plan actually uses.
     ///
-    /// [`armed`] is [`super::super::arm::crossed`] plus one lookup: the
+    /// [`armed`] is [`super::super::hold::crossed`] plus one lookup: the
     /// registry answers a ROUTINE NAME, and this finds the routine carrying
-    /// it. `arm.rs`'s `the_armed_stems_are_the_ones_registered_and_nothing_
+    /// it. `hold.rs`'s `the_armed_stems_are_the_ones_registered_and_nothing_
     /// else` owns the first half over the whole census. What is only
     /// checkable here is the JOIN, and it fails quietly: a stem whose
     /// `routine:` override names a body `kernels_wgpu::routines()` does not
@@ -1111,7 +1303,7 @@ mod tests {
             ),
             ("sdpa_paged_decode_bfloat16_d_128", "sdpa_paged_decode"),
         ] {
-            let (routine, _) = armed(symbol)
+            let routine = armed(symbol)
                 .unwrap_or_else(|| panic!("`{symbol}` is a symbol this backend plans"));
             assert_eq!(
                 routine.name, body,
@@ -1152,7 +1344,7 @@ mod tests {
         let points = kernels_wgpu::entrypoints();
         let lost: Vec<&String> = points
             .iter()
-            .filter(|p| super::super::arm::crossed(p).is_some() && armed(p).is_none())
+            .filter(|p| super::super::hold::crossed(p).is_some() && armed(p).is_none())
             .collect();
         assert!(
             lost.is_empty(),

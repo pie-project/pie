@@ -77,6 +77,7 @@ pub const LIBRARY: &[Header] = &[
     Header { name: "attn/dsa_indexer.cuh", text: include_str!("../kernels/attn/dsa_indexer.cuh") },
     Header { name: "attn/dsv4_compress.cuh", text: include_str!("../kernels/attn/dsv4_compress.cuh") },
     Header { name: "attn/fa2.cuh", text: include_str!("../kernels/attn/fa2.cuh") },
+    Header { name: "attn/fa4.cuh", text: include_str!("../kernels/attn/fa4.cuh") },
     Header { name: "attn/head_dim_pad.cuh", text: include_str!("../kernels/attn/head_dim_pad.cuh") },
     Header { name: "attn/kimi_mla.cuh", text: include_str!("../kernels/attn/kimi_mla.cuh") },
     Header { name: "attn/kv_paged.cuh", text: include_str!("../kernels/attn/kv_paged.cuh") },

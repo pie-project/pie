@@ -1,44 +1,13 @@
 //! One fire after another, over the same cache.
 //!
-//! Everything below this is per-fire: [`fire`] runs a lowering once, [`Frame`]
-//! describes one moment, [`logits`] reads one answer. A server is none of those.
-//! It is the same pool, the same weights and the same pipeline cache carried
-//! across thousands of fires while conversations arrive, grow and leave — and
-//! the parts that can only be wrong ACROSS fires live here because there is
-//! nowhere else they could live.
-//!
-//! There are four of them, and each was reachable before this module existed:
-//!
-//! 1. A conversation's pages must be its own from its first fire to its last.
-//!    [`Book`] answers that; a caller that grew a request by hand did not.
-//! 2. A conversation's positions must continue. A test that writes `(0..n)` and
-//!    re-fires from scratch is a prefill repeated, not a decode.
-//! 3. A deployment needs BOTH plans. A text traced at `FireClass::Prefill`
-//!    states tiled GEMMs where the same text traced at `FireClass::Decode`
-//!    states matrix-vector products, so a deployment carrying one plan answers a
-//!    prompt one row at a time with the decode kernel. The divergence starts at
-//!    SIXTEEN rows, the tile height; below that the two plans lower identically.
-//! 4. The lowering is per-fire and the pipelines are not. A step that rebuilt
-//!    its pipelines would be correct and unusably slow — and slower here than on
-//!    either sibling, because `wgpu::Device::create_shader_module` runs a whole
-//!    shader compiler where `vkCreateShaderModule` copies a blob.
-//!
-//! # What a step is not
-//!
-//! It does not sample. [`Step::logits`] is a distribution and the token that
-//! comes back next fire is the caller's to choose: the temperature, the top-k
-//! and the seed belong to a request, and a driver that owned them would own the
-//! request too.
-//!
-//! It does not keep the arena. Each step allocates one and drops it, because
-//! `Lowered::arena_bytes` depends on the row count and the row count changes
-//! every step. A server that fired the same shape repeatedly would want to keep
-//! the largest and reuse it; nothing here does, and the cost is one allocation
-//! per fire rather than one per token.
-//!
-//! [`fire`]: crate::serve::fire
-//! [`logits`]: crate::serve::logits
-//! [`Frame`]: crate::resources::Frame
+//! Everything below this is per-fire; what lives here is what can only be
+//! wrong ACROSS fires: a conversation's pages must be its own from its first
+//! fire to its last ([`Book`] answers that), its positions must continue
+//! rather than restart, and a deployment needs BOTH plans — a text traced at
+//! `FireClass::Prefill` states tiled GEMMs where `FireClass::Decode` states
+//! matrix-vector products. Pipelines outlive the per-fire lowering because
+//! `wgpu::Device::create_shader_module` runs a whole shader compiler. A step
+//! does not sample, and does not keep the arena.
 
 use model_compiler::lower::{Fire as LowerFire, Uncovered};
 use model_ir::trace::ForwardPlan;
@@ -57,38 +26,36 @@ pub struct Turn {
     pub who: u64,
     /// The tokens to append, in order.
     ///
-    /// One for a decode, many for a prefill. The distinction is not a mode here
-    /// — both produce a lowering from the same code path, which is what makes a
-    /// mixed batch expressible at all.
-    ///
-    /// The consequence a caller must not miss: a turn of four tokens produces
-    /// FOUR distributions, and only the last has seen the whole prompt.
-    /// [`Step::readout_of`] says which one that is.
+    /// One for a decode, many for a prefill; both produce a lowering from the
+    /// same code path, which is what makes a mixed batch expressible. A turn
+    /// of four tokens produces FOUR distributions and only the last has seen
+    /// the whole prompt — [`Step::readout_of`] says which one that is.
     pub tokens: Vec<u32>,
 }
 
 /// What a deployment keeps between fires.
 ///
-/// One struct rather than three arguments, and the grouping is the point: these
-/// are exactly the things a step MUTATES or reads that outlive it, and a caller
-/// holding them apart can pass a book from one deployment and a pool from
-/// another. They are borrows because a server owns them — the pipeline cache is
-/// deliberately NOT here, since it belongs to the device rather than to the
-/// model and two deployments on one device should share it.
+/// One struct rather than three arguments, so that a caller cannot pass a book
+/// from one deployment and a pool from another. The pipeline cache is
+/// deliberately NOT here: it belongs to the device, and two deployments on one
+/// device should share it.
 pub struct Held<'a> {
     /// Who owns which page.
     pub book: &'a mut Book,
     /// The cache and the per-fire tables.
     pub pool: &'a mut Pool,
+    /// The gated DeltaNet's carry, for a deployment that opened one.
+    ///
+    /// Travels with the pool and the book because it belongs to the same thing
+    /// they do — one deployment's per-layer state.
+    pub recurrent: Option<&'a crate::resources::RecurrentPool>,
     /// The checkpoint.
     pub weights: &'a Weights,
     /// Lowerings already derived, by fire shape.
     ///
-    /// Beside the pool and the book because it belongs to the same thing they
-    /// do — a deployment. A lowering is the graph of ONE text, so a cache
-    /// passed from a different deployment would run the other model's graph
-    /// over these weights; holding it here means it travels with the two it
-    /// must agree with.
+    /// Held beside the pool and the book because a lowering is the graph of
+    /// ONE text: a cache from another deployment would run the other model's
+    /// graph over these weights.
     pub lowerings: &'a mut crate::lowering::cached::Lowerings,
 }
 
@@ -118,6 +85,13 @@ pub enum Unstepped {
     /// over zero rows is not a thing this crate has ever produced and a server
     /// asking for one has lost track of its own queue.
     Nothing,
+    /// A request named a recurrent slot past the end of the pool.
+    NoSlot {
+        /// The slot the frame named.
+        slot: u32,
+        /// How many the pool holds.
+        slots: u32,
+    },
 }
 
 impl std::fmt::Display for Unstepped {
@@ -130,6 +104,10 @@ impl std::fmt::Display for Unstepped {
             Self::Unfired(e) => write!(f, "{e}"),
             Self::Unread(e) => write!(f, "{e}"),
             Self::Nothing => write!(f, "a step of no turns"),
+            Self::NoSlot { slot, slots } => write!(
+                f,
+                "a request's carry is in recurrent slot {slot} and the pool holds {slots}"
+            ),
         }
     }
 }
@@ -151,26 +129,18 @@ pub struct Step {
     pub rows: usize,
     /// Which row of [`Step::logits`] is each turn's answer.
     ///
-    /// Needed rather than obvious, and for two reasons at once. Every row
-    /// samples — see [`Serving::step`] for why — so a prefill of four tokens
-    /// produces FOUR distributions of which a caller wants the last. And the
-    /// frame reorders rows, so even for one-token turns the row order is not the
-    /// turn order.
-    ///
+    /// Every row samples — see [`Serving::step`] — so a prefill of four tokens
+    /// produces four distributions, and the frame reorders rows, so the row
+    /// order is not the turn order even for one-token turns.
     /// `logits.row(step.readout_of[i])` is turn `i`'s distribution.
     ///
     /// A turn naming SEVERAL readout rows has all of them in
-    /// [`Step::readouts_of`]; this stays its LAST, which is what a caller
-    /// wanting one answer means and what every decode wants.
+    /// [`Step::readouts_of`]; this stays its LAST.
     pub readout_of: Vec<usize>,
     /// Every row turn `i` reads out, in fire-row order.
     ///
-    /// One entry per turn, and each is the whole span rather than a single
-    /// row. A decode names one and this is a one-element vector; a
-    /// speculative verifier names one per drafted token, and answering it
-    /// with the last row alone is a different fire from the one it asked for
-    /// -- which is why this driver used to refuse such a request by name.
-    ///
+    /// One entry per turn, each the whole span rather than a single row: a
+    /// decode names one, a speculative verifier names one per drafted token.
     /// Built from the frame's own `sampling_indptr`, so it is the placement
     /// after seriation and not the plan's numbering.
     pub readouts_of: Vec<Vec<usize>>,
@@ -181,6 +151,32 @@ pub struct Step {
     /// evidence that a step restages is that it calls `stage`, and a control
     /// that staged only on a conversation's first step did not fire.
     pub positions: Vec<u32>,
+    /// The whole ARENA this fire computed in, when one was asked for.
+    ///
+    /// Empty unless [`Serving::keep_arena`] is set, because a fire's arena is
+    /// megabytes and a readback is a device stall.
+    ///
+    /// # Why a driver exposes this at all
+    ///
+    /// A fire's activations are unobservable from outside it. `fire_over`
+    /// allocates the arena, fires, reads the readout's own range and drops it
+    /// inside one function, so a caller that wants to know WHERE a computation
+    /// first went wrong has only the last value in the chain to look at — and
+    /// "the logits are NaN" is the same sentence for a bad embedding and a bad
+    /// lm head.
+    ///
+    /// That is not hypothetical. `tests/hybrid_probe.rs` spent a long
+    /// investigation bisecting an odd-row NaN by ZEROING WEIGHTS, one
+    /// subsystem at a time, because switching a branch off and re-firing was
+    /// the only instrument available. It got as far as one MLP block and
+    /// stopped there, and the thing it could not do was read the value between
+    /// two kernels.
+    ///
+    /// `Lowered::value_offset` says where every traced value lives, so with
+    /// the bytes beside it a caller can name the first one that is not finite.
+    /// That is the difference between "somewhere in these five kernels" and a
+    /// kernel.
+    pub arena: Vec<u8>,
     /// Pipelines the cache held after this step.
     ///
     /// Here so that "the second step builds nothing" is a number a test can
@@ -202,72 +198,49 @@ pub struct Serving<'a> {
     ///
     /// **Two plans and not one, because the class is not cosmetic.** A text
     /// traced at `FireClass::Decode` states `affine_qmv_fast` for its
-    /// projections, and traced at `FireClass::Prefill` states
-    /// `affine_qmm_t_..._bm_16_bn_32` instead — the tiled GEMM, the largest
-    /// kernel family in the tree. A deployment carrying only the decode plan
-    /// therefore answers a sixty-four-token prompt with sixty-four
-    /// matrix-VECTOR products, one per row. Correct, and the wrong kernel.
+    /// projections; traced at `FireClass::Prefill` it states the tiled GEMM.
+    /// A deployment carrying only the decode plan answers a sixty-four-token
+    /// prompt with sixty-four matrix-vector products: correct, and the wrong
+    /// kernel.
     ///
-    /// Not an `Option` with a fallback. A fallback would make the slow path the
-    /// quiet default, which is exactly the defect this field exists to stop.
-    /// Tracing a plan is host-side and cheap, so a deployment that only ever
-    /// decodes pays one trace it does not use.
+    /// Not an `Option` with a fallback, which would make the slow path the
+    /// quiet default. Tracing a plan is host-side and cheap.
     ///
-    /// # The PLAN switches at two rows; the KERNEL does not, and I got that
-    /// wrong
-    ///
-    /// [`Serving::over`] takes this plan for any step of more than one row,
-    /// and this file used to claim that therefore a two-row step runs the
-    /// tiled GEMM. **It does not.** Measured by counting what a real step
-    /// dispatches:
-    ///
-    /// | step | projection kernels |
-    /// |---|---|
-    /// | 1 row | `affine_qmv_fast` x141, `..._residual` x56 |
-    /// | 2 rows | `affine_qmv_fast` x141, `..._residual` x56 |
-    /// | 32 rows | `affine_qmm_t` x140, `..._residual` x56 |
-    ///
-    /// The plan is only a TEXT. Which kernel it lowers to is decided by
-    /// `model`'s `TokensMultipleOf(tile)` guard, and that is not a threshold:
-    /// a row count takes the GEMM only when the tile DIVIDES it. Two rows is
-    /// not a multiple of 32, so it lowers to the matvec out of the prefill
-    /// text.
-    ///
-    /// The prediction that caught this: if two rows took the GEMM, a two-row
-    /// step would cost about what a thirty-two-row step costs, because the
-    /// GEMM computes a whole tile whatever `m` is. Measured, 34.4 ms for one
-    /// row, 35.5 ms for two, 234 ms for thirty-two. The middle number is the
-    /// one that says the claim was wrong.
-    ///
-    /// # What the kernels really cost, which stands
-    ///
-    /// `kernels_wgpu`'s `how_long_a_decodes_kernels_take`, both families over
-    /// one 1024x1024 affine plane, llvmpipe:
-    ///
-    /// | rows | `affine_qmv_fast` | `affine_qmm_t` (bm 32) |
-    /// |---|---|---|
-    /// | 1 | 0.025 ms | 0.335 ms |
-    /// | 32 | 0.062 ms | 0.315 ms |
-    /// | 128 | 0.282 ms | 0.335 ms |
-    /// | 256 | 0.498 ms | 0.346 ms |
-    /// | 512 | 1.019 ms | 0.422 ms |
-    ///
-    /// The GEMM costs the same for one row as for thirty-two because it
-    /// computes a whole tile either way, and the crossover is near 150 rows.
-    /// `crates/model`'s own table, measured on a 4090 through
-    /// `driver-vulkan`, puts it in the same place: GEMV 34 ms against tile-32
-    /// GEMM 52 ms at 32 rows, and the GEMM ahead only from 128. Two
-    /// backends, two adapters, the same shape -- which is worth more than
-    /// either number.
-    ///
-    /// So the tile choice is a real question and `crates/model` is where it
-    /// is already being asked, with better data than this backend can take.
-    ///
+    /// The PLAN switches at two rows; the KERNEL does not. `model`'s
+    /// `TokensMultipleOf(tile)` guard takes the GEMM only when the tile
+    /// DIVIDES the row count, so a two-row step lowers to the matvec out of
+    /// the prefill text. Measured, the GEMM costs the same for one row as
+    /// for thirty-two — it computes a whole tile either way — and the
+    /// crossover against the matvec is near 150 rows on both this backend
+    /// and `driver-vulkan`.
     pub prefill: &'a ForwardPlan,
     /// The model's shape, for the launch rules that need it.
     pub geometry: Geometry,
     /// The tier every pipeline is built at.
     pub tier: Capability,
+    /// Record only the first `n` rectangles of each fire.
+    ///
+    /// A DIAGNOSTIC and the third instrument this backend's numerical hunts
+    /// have needed: it makes the arena's end state the state AT `n`, which is
+    /// the only way to see a value between two kernels. See
+    /// [`crate::serve::Fire::prefix`].
+    pub prefix: Option<usize>,
+    /// Submit every dispatch on its own command buffer, with a device wait
+    /// between them, instead of recording them all into one pass.
+    ///
+    /// Ruinously slow and a DIAGNOSTIC. `crate::serve::Fire::one_at_a_time`
+    /// has always existed and nothing could reach it, so the claim its own doc
+    /// makes — that `wgpu` inserts the barriers and a disagreement between the
+    /// two paths therefore cannot be a missing one — had never been tested
+    /// against a real text.
+    pub one_at_a_time: bool,
+    /// Read the whole arena back after each fire and hand it to the caller on
+    /// [`Step::arena`].
+    ///
+    /// Off by default and a DIAGNOSTIC: the arena is megabytes, the readback
+    /// is a device stall, and a server has no use for it. See [`Step::arena`]
+    /// for what it is for.
+    pub keep_arena: bool,
 }
 
 impl Serving<'_> {
@@ -278,21 +251,16 @@ impl Serving<'_> {
     ///
     /// - grow before framing, or the frame describes pages the book has not
     ///   handed out;
-    /// - frame before lowering, because the lowering's row count, arena size and
-    ///   readout all come from the frame's seriation;
-    /// - stage before firing, or the fire reads the PREVIOUS step's tables —
-    ///   which is the failure that looks like a model that has forgotten the
-    ///   last token;
+    /// - frame before lowering, because the lowering's row count, arena size
+    ///   and readout all come from the frame's seriation;
+    /// - stage before firing, or the fire reads the PREVIOUS step's tables;
     /// - read before the arena is dropped.
     ///
     /// # Errors
     ///
-    /// [`Unstepped`]. **A refused growth leaves the book untouched**, so a
-    /// caller that evicts and retries gets the same answer it would have got had
-    /// it evicted first. A failure after the growth does NOT roll it back: the
-    /// pages are the conversation's, the fire that was going to use them did
-    /// not run, and rolling back would lose a history that is still on the
-    /// device.
+    /// [`Unstepped`]. **A refused growth leaves the book untouched.** A
+    /// failure after the growth does NOT roll it back: the pages are the
+    /// conversation's and the history is still on the device.
     pub fn step<M: Modules>(
         &self,
         device: &Device,
@@ -320,20 +288,15 @@ impl Serving<'_> {
 
     /// One step over requests the CALLER allocated, touching no book.
     ///
-    /// The engine's scheduler already owns eviction, prefix sharing and the
-    /// copy plans that move pages between conversations, and it hands a driver
-    /// a page CSR naming physical pages it chose. [`Serving::step`]'s
-    /// allocator is the right one for a server built on this crate alone and
-    /// the WRONG one for that caller: two allocators handing out page 7 is not
-    /// an error anybody sees, because attention then reads another
-    /// conversation's keys and the model answers fluently.
+    /// The engine's scheduler owns eviction, prefix sharing and the copy plans,
+    /// and hands a driver a page CSR naming physical pages it chose.
+    /// [`Serving::step`]'s allocator is the wrong one for that caller: two
+    /// allocators handing out page 7 is not an error anybody sees, because
+    /// attention then reads another conversation's keys and the model answers
+    /// fluently. So this exists in order that [`crate::frames`] never touches
+    /// [`crate::pages::Book`]; it is literally the same fire as `step`.
     ///
-    /// So this exists in order that [`crate::frames`] does not have to touch
-    /// [`crate::pages::Book`]. It is the same fire as `step` — literally, they
-    /// share a body — differing only in who decided which pages.
-    ///
-    /// `tokens` is parallel to `requests`: one slice of token ids per request,
-    /// in the same order.
+    /// `tokens` is parallel to `requests`: one slice of token ids per request.
     ///
     /// # Errors
     ///
@@ -372,114 +335,56 @@ impl Serving<'_> {
     ) -> Result<Step, Unstepped> {
         let shape = held.pool.shape();
         let frame = Frame::of(shape, requests).map_err(Unstepped::Unstageable)?;
+        // A SLOT THIS POOL DOES NOT HOLD, refused rather than dispatched.
+        //
+        // `wgpu` clamps an out-of-bounds storage read instead of trapping, so
+        // a slot past the slab resolves to some other conversation's carry and
+        // the fire answers fluently with it. That is the failure this whole
+        // table was found by, one level down: the difference between a state
+        // nobody wrote and a state somebody else did is invisible in the
+        // output.
+        if let Some(pool) = held.recurrent.as_ref()
+            && let Some(&slot) = frame
+                .recurrent_slots
+                .iter()
+                .find(|&&s| s >= pool.shape().slots)
+        {
+            return Err(Unstepped::NoSlot {
+                slot,
+                slots: pool.shape().slots,
+            });
+        }
         // EVERY ROW SAMPLES, and this is a workaround with a name.
         //
-        // A frame's own seriation marks only the rows a request reads out, so a
-        // prefill of four tokens lowers to `n_requests = 1` and an arena sized
-        // for ONE row of logits. The texts, though, spell their epilogue as
-        // plain `OpKind::Launch` ops rather than `OpKind::LmHead`, so
-        // `Lowerer::epilogue` -- which would emit them over `0..sampled` --
-        // never runs, and the generic path emits them over the whole token
-        // window. The head then writes `rows * vocab` into an arena holding
-        // `1 * vocab`, and `binding::extent` refuses the fire.
+        // A frame's seriation marks only the rows a request reads out, so a
+        // prefill of four tokens would lower to `n_requests = 1` and an arena
+        // sized for ONE row of logits. The texts spell their epilogue as plain
+        // `OpKind::Launch` ops rather than `OpKind::LmHead`, so
+        // `Lowerer::epilogue` never runs and the generic path emits the head
+        // over the whole token window: `rows * vocab` written into an arena
+        // holding `1 * vocab`, which `binding::extent` refuses.
         //
-        // Not one text's quirk: the shell every text goes through reaches
-        // `lm_head` directly rather than the generic `logits()` that emits
-        // `OpKind::LmHead`, so nothing this suite produces reaches
-        // `Lowerer::epilogue` at all and the workaround is universal.
-        //
-        // The cost is real and is paid knowingly: the lm head runs over every
-        // token in a prefill instead of once per request, which for a long
-        // prompt is most of the fire. It is not a policy choice -- it is the only
-        // shape this text lowers into consistently, and it stops being needed the
-        // day the shell names its epilogue.
-        //
-        // # HOW MUCH, and how far the removal gets (measured 2026-08-16)
-        //
-        // `driver-metal` has since measured the same waste on its own side and
-        // fixed it: a 2048-token prefill of Llama-3.2-1B spent 904 ms of 2184
-        // computing 2047 distributions nobody reads, 41% of the fire, and
-        // removing it took prefill from 938 to 1640 tok/s. So the prize here is
-        // large and is not hypothetical.
-        //
-        // Half the fix has already landed in the SHARED lowering:
-        // `model-compiler`'s `rectangle_rows` now narrows a statement whose
-        // output is `Requests`-shaped to the sampled rows, from a full window.
-        // Deleting the two overrides below WORKS to that extent -- the logits
-        // arena comes back one row of `vocab` instead of `rows * vocab`, which
-        // is the whole point.
-        //
-        // Two things then have to move with it, and the second is not done:
-        //
-        // 1. The read-out NUMBERING. `readouts_of` and `last_row_of` answer
-        //    fire rows, and the epilogue writes one logits row per SAMPLED row
-        //    once it is narrowed, so they have to answer positions in the
-        //    compacted block -- which `sampling_indptr` already gives, since a
-        //    turn's entries are exactly `[t]..[t+1]`. Written and verified to
-        //    compile; it is not the blocker.
-        // 2. The GATHER AND HEAD CHAIN, which is where it stops -- and the
-        //    plan is NOT the problem. Dumped with both changes applied, a
-        //    32-row prefill sampling row 31 lowers to exactly what it should:
-        //
-        //        seriation   rows=32 sampling_indices=[31] indptr=[0, 1]
-        //        lowered     n_requests=1  readout { at: 2048, rows: 1,
-        //                                           vocab: 151936, bytes: 2 }
-        //        launch 448  affine_qmm_t_residual ... rows=0..32
-        //        launch 450  row_gather_bfloat16      rows=0..1
-        //        launch 451  affine_qmv_fast          rows=0..1
-        //
-        //    The body still covers the stream, the gather and the head are
-        //    one-row rectangles, and the readout is one row of vocab. That is
-        //    the whole point of the fix, arrived at.
-        //
-        //    What comes back is wrong anyway, and the reason is now known.
-        //
-        //    THE OPERAND EXTENT. `binding::extent` measures an `Arg::Arena` as
-        //    `launch.rows * width * bytes` -- the rectangle the launch WRITES.
-        //    For every other statement in the tree that is also the rectangle
-        //    it reads, so nothing had ever forced the two apart. A GATHER is
-        //    where they part: its output is one row per SAMPLED row and its
-        //    input is the whole stream.
-        //
-        //    So with the launch narrowed to `rows=0..1`, `row_gather`'s input
-        //    binds 1 * 1024 * 2 = 2048 bytes at the stream's base, and the
-        //    shader reads `input_[rows[0] * pitch + c]` -- row 31. WGSL
-        //    bounds-clamps an out-of-range read to ZERO, so the gathered row
-        //    is zeros, the head projects zeros, every logit is equal, and
-        //    argmax returns the last index. That is the 151935 exactly.
-        //
-        //    Everything either side of it is right, and was checked rather
-        //    than assumed: the head reads `Arena { at: 0 }`, which is the
-        //    gather's own output, and the gather reads `Arena { at: 65536 }`,
-        //    which is the stream.
-        //
-        //    The fix is therefore not in `model-compiler` and not in the
-        //    shader: it is that an operand whose row space is not the launch's
-        //    has to say so. `Arg::Arena` carries `width` and `bytes` and no
-        //    row count, so today it cannot. Whoever takes it decides whether
-        //    the lowering states the input's own rows or the driver learns
-        //    that a gather's input spans the stream -- and the same question
-        //    is waiting in `kernels-metal`, whose `sample_rows` does this by
-        //    hand.
-        //
-        // Reverted rather than left half-done: the suite is 19/19 with the
-        // overrides and 9/19 without them, and a serving path that computes a
-        // plausible wrong token is worse than one that is slow.
+        // The cost is paid knowingly — the lm head runs over every token of a
+        // prefill — and it stops being needed the day the shell names its
+        // epilogue. Narrowing the statement is not enough on its own:
+        // `binding::extent` measures an `Arg::Arena` as the rectangle the
+        // launch WRITES, and a gather's input spans the stream while its
+        // output is one row per sampled row. With the launch narrowed, the
+        // gather binds one row, WGSL bounds-clamps the out-of-range read to
+        // zero, and the head projects zeros into an argmax of the last index.
+        // `Arg::Arena` carries no row count, so an operand whose row space is
+        // not the launch's cannot yet say so.
         let mut rows = frame.seriation();
         for row in &mut rows {
             row.samples = true;
         }
         // One row is a decode, more than one is a prefill -- including a BATCH
-        // of one-token turns, which is not a slip. Four rows want a tiled GEMM
-        // as much as a four-token prompt does; the row count is what the kernel
-        // choice actually depends on, and the name of the class is only how the
-        // text spells it.
-        // ONE binding, two uses, deliberately. `prefill` picks the text AND
-        // is half the cache key, and a cache keyed on a different rule than
-        // the one that chose the plan would serve one text's graph for the
-        // other -- 452 launches over the wrong rectangles, with nothing to
-        // look at afterwards. Deriving both from the same `let` is what makes
-        // that unstateable rather than merely unlikely.
+        // of one-token turns, since the row count is what the kernel choice
+        // depends on.
+        //
+        // ONE binding, two uses, deliberately: `prefill` picks the text AND is
+        // half the cache key, and a cache keyed on a different rule than the
+        // one that chose the plan would serve one text's graph for the other.
         let prefill = frame.rows() > 1;
         let plan = if prefill { self.prefill } else { self.plan };
         // Derived on the first step of a shape and kept: `lower` is a pure
@@ -504,17 +409,11 @@ impl Serving<'_> {
         // AND THE TABLE MUST SAY THE SAME THING THE LOWERING WAS TOLD.
         //
         // `Pool::stage` writes `SamplingIndices` from the frame, which names
-        // only the rows a request reads out -- one entry for a prefill of four.
-        // The lowering above was told every row samples, so its `row_gather`
-        // reads `n_requests` entries, which is four. Left alone that is a
-        // sixteen-byte read of a four-byte binding.
-        //
-        // On this backend that is quieter than on either sibling and not louder:
-        // WGSL requires the implementation to bounds-check every access against
-        // the BOUND range, so the three rows past the end read as ZERO rather
-        // than as whatever the allocator put after the table. Three rows of
-        // zeros gathered into the hidden state is a plausible tensor, and the
-        // model that produces it says something.
+        // only the rows a request reads out, while the lowering above was told
+        // every row samples -- so `row_gather` would read four entries of a
+        // one-entry binding. WGSL bounds-checks against the BOUND range, so
+        // the rows past the end read as ZERO: a plausible tensor, and a model
+        // that says something.
         let identity: Vec<u32> = (0..frame.rows() as u32).collect();
         held.pool
             .state(
@@ -538,6 +437,7 @@ impl Serving<'_> {
         let model = Model {
             weights: held.weights,
             pool: held.pool,
+            recurrent: held.recurrent,
         };
         let ran = fire(
             device,
@@ -552,7 +452,8 @@ impl Serving<'_> {
                 resolver: &model,
                 geometry: self.geometry,
                 tier: self.tier,
-                one_at_a_time: false,
+                one_at_a_time: self.one_at_a_time,
+                prefix: self.prefix,
             },
         );
         // The arena is dropped when this function returns, on both paths, which
@@ -561,8 +462,18 @@ impl Serving<'_> {
         // here can free it early either -- the read below still names it.
         let fired = ran.map_err(Unstepped::Unfired)?;
         let logits = logits(device, &arena, low).map_err(Unstepped::Unread)?;
+        // AFTER the fire and before the arena is dropped, which is the only
+        // window it exists in.
+        let kept = if self.keep_arena {
+            device
+                .read_at(&arena, 0, low.arena_bytes as u64)
+                .map_err(Unstepped::Failed)?
+        } else {
+            Vec::new()
+        };
         Ok(Step {
             logits,
+            arena: kept,
             fired,
             rows: frame.rows(),
             positions: frame.positions.clone(),
@@ -573,20 +484,12 @@ impl Serving<'_> {
     }
 }
 
-/// The last row each turn contributes, by row order.
-///
-/// Every row samples, so the readout's rows ARE the fire's rows in order, and a
-/// turn's answer is the distribution of its last token — the only one that has
-/// seen the whole prompt.
-///
-/// A turn with no row gets zero. That cannot happen for a turn a step grew, and
-/// answering with a row that exists beats a panic in a server loop.
 /// Every row each turn reads out, by turn order.
 ///
 /// The frame's `sampling_indptr` is the CSR and `sampling_indices` the rows,
 /// both already in fire-row placement, so this is a regrouping and not a
-/// derivation -- which is the point: a second derivation would be a second
-/// chance to disagree with `Frame::of` about whose rows are whose.
+/// derivation -- a second derivation would be a second chance to disagree
+/// with `Frame::of` about whose rows are whose.
 ///
 /// A turn the frame has no boundary for gets an empty span rather than a
 /// guess. It cannot happen for a turn a step grew.
@@ -618,20 +521,12 @@ pub const NO_ROW: usize = usize::MAX;
 /// The last fire row each turn contributed, or [`NO_ROW`] for a turn that
 /// contributed none.
 ///
-/// # Why an ownerless turn is not row zero
-///
-/// It used to be: the vector started at `0` and only turns that owned a token
-/// overwrote their slot, so a turn with no rows kept row 0 -- the FIRST
-/// turn's. `frames::serve` reads this as the fallback when a request's
-/// read-out span is empty, so such a turn would have been handed another
-/// conversation's distribution and returned its token. That is the
-/// `driver-metal` defect `member_requests` exists to prevent, reached through
-/// a different door.
-///
-/// [`NO_ROW`] is not a row, so the bound check in `serve` refuses it by name
-/// instead. **No real plan reaches this**: a probe over the whole curated
-/// suite counted zero ownerless turns, which is why this is a value and not a
-/// new code path.
+/// Not row zero for an ownerless turn: `frames::serve` reads this as the
+/// fallback when a request's read-out span is empty, so a zero would hand
+/// that turn the FIRST turn's distribution and return its token. [`NO_ROW`]
+/// is not a row, so the bound check in `serve` refuses it by name. No real
+/// plan reaches it — a probe over the curated suite counted zero ownerless
+/// turns.
 #[must_use]
 fn last_row_of(turns: usize, request_of_token: &[u32]) -> Vec<usize> {
     let mut last = vec![NO_ROW; turns];
@@ -646,18 +541,13 @@ fn last_row_of(turns: usize, request_of_token: &[u32]) -> Vec<usize> {
 /// Lay the turns' tokens out in the frame's row order.
 ///
 /// Separate and pure because the device loop cannot reach it: a version that
-/// gave every row its turn's FIRST token passes every one-token step unchanged,
-/// so the claim has to be made where a multi-token turn can be stated without a
-/// model.
+/// gave every row its turn's FIRST token passes every one-token step
+/// unchanged, so the claim has to be stated where a multi-token turn can be.
 ///
 /// `request_of_token` is the frame's, so a row belongs to `turns[which]`; the
 /// running count per turn is what makes the second row of a conversation its
-/// second token rather than its first.
-///
-/// A row past a turn's tokens gets zero rather than panicking. It cannot happen
-/// — the frame is built from the same turns — and a driver that aborted a server
-/// on an arithmetic slip it could survive is worse than one that fires a wrong
-/// token.
+/// second token. A row past a turn's tokens gets zero rather than panicking,
+/// because aborting a server on an arithmetic slip it could survive is worse.
 #[must_use]
 fn place(tokens: &[&[u32]], request_of_token: &[u32]) -> Vec<u32> {
     let mut taken = vec![0usize; tokens.len()];
@@ -684,13 +574,10 @@ mod tests {
         }
     }
 
-    /// What `place` now takes, since it serves the engine's path too.
+    /// What `place` takes, since it serves the engine's path too.
     ///
-    /// A [`Turn`] carries WHO it belongs to and the engine's frames carry no
-    /// such thing — their requests are already the scheduler's — so the shared
-    /// body speaks in token slices. These tests still build turns, because the
-    /// property they hold is about a conversation's tokens landing on that
-    /// conversation's rows.
+    /// The engine's frames carry no [`Turn`] — their requests are already the
+    /// scheduler's — so the shared body speaks in token slices.
     fn tokens_of(turns: &[Turn]) -> Vec<&[u32]> {
         turns.iter().map(|t| t.tokens.as_slice()).collect()
     }
@@ -733,11 +620,8 @@ mod tests {
             vec![4, 2],
             "and it follows the frame's order, not the turns'"
         );
-        // A turn that contributed no rows. This used to answer `0` -- the
-        // FIRST turn's row -- and `frames::serve` reads exactly this as the
-        // fallback when a request's read-out span is empty, so the turn would
-        // have returned another conversation's token. The test named the case
-        // and pinned the wrong answer.
+        // A turn that contributed no rows. Answering `0` handed it the FIRST
+        // turn's row, which `frames::serve` reads as its fallback.
         assert_eq!(last_row_of(3, &[0, 1]), vec![0, 1, NO_ROW]);
     }
 

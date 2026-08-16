@@ -1,8 +1,9 @@
 //! Default `config.toml` emitted by `pie config init`.
 //!
-//! The highest-priority compiled flavor (cuda → metal → vulkan → wgpu →
-//! dummy) picks the `[driver]` block, so the generated file works without a
-//! follow-up edit.
+//! The highest-priority compiled flavor (cuda → metal → vulkan → wgpu) picks
+//! the `[driver]` block, so the generated file works without a follow-up edit.
+//! A binary carrying none of them has no block to write and says so, rather
+//! than writing a file it knows will not parse.
 //!
 //! Five live sections, plus a commented `[cluster]` for distributed
 //! deployments. What the file no longer has is as much the point as what it
@@ -10,27 +11,48 @@
 //! present only because three role libs each parsed their own), no `worker.`
 //! prefixing all 44 keys, and no `[model.driver.options]` four levels down.
 
+use anyhow::{Result, bail};
 use worker::driver_ffi;
 
 /// Render the default `config.toml`.
-pub fn default_config_content() -> String {
+///
+/// Fallible for one reason: `[driver]` is a required section and every
+/// `DriverKind` the schema accepts names a driver that has to be compiled in.
+/// A binary built with no `driver-*` feature therefore has nothing true to
+/// put there. It used to write `type = "dummy"`, which was honest while an
+/// always-present interpreter flavor existed; that flavor was deleted for
+/// being a paper-over (see `worker::driver_ffi::Flavor`) and this template
+/// kept writing its name, so `pie config init` produced a config that failed
+/// to parse on the next command. Refusing says the same thing one step
+/// earlier and names the rebuild that fixes it.
+pub fn default_config_content() -> Result<String> {
     let flavor = driver_ffi::default_flavor();
-    let driver_block = match flavor {
-        #[cfg(feature = "driver-cuda")]
-        Some(driver_ffi::Flavor::Cuda) => CUDA_DRIVER_BLOCK,
+    let driver_block: Option<&str> = match flavor {
+        #[cfg(feature = "_driver-cuda")]
+        Some(driver_ffi::Flavor::Cuda) => Some(CUDA_DRIVER_BLOCK),
         #[cfg(feature = "driver-metal")]
-        Some(driver_ffi::Flavor::Metal) => METAL_DRIVER_BLOCK,
+        Some(driver_ffi::Flavor::Metal) => Some(METAL_DRIVER_BLOCK),
         #[cfg(feature = "driver-vulkan")]
-        Some(driver_ffi::Flavor::Vulkan) => VULKAN_DRIVER_BLOCK,
+        Some(driver_ffi::Flavor::Vulkan) => Some(VULKAN_DRIVER_BLOCK),
         #[cfg(feature = "driver-wgpu")]
-        Some(driver_ffi::Flavor::Wgpu) => WGPU_DRIVER_BLOCK,
+        Some(driver_ffi::Flavor::Wgpu) => Some(WGPU_DRIVER_BLOCK),
         // `default_flavor` answers `None` when this binary carries no driver,
         // and `worker` may compile `Flavor::Cuda`/`Metal` while this crate's
         // matching `driver-*` arm is cfg'd off (workspace feature-unification
-        // can desync the two). Both land here.
-        _ => DUMMY_DRIVER_BLOCK,
+        // can desync the two). Both land here, and both mean the same thing to
+        // the operator: this binary cannot serve, so a config naming a driver
+        // would be a guess.
+        _ => None,
     };
-    let model_block = match flavor {
+    let Some(driver_block) = driver_block else {
+        bail!(
+            "this pie binary carries no driver, so there is no `[driver]` \
+             section to write and the config would not parse. Rebuild with \
+             --features set to one of driver-cuda-13, driver-cuda-12, \
+             driver-metal, driver-vulkan or driver-wgpu."
+        );
+    };
+    let model_block: &str = match flavor {
         // Metal's llama path binds `.weight`/`.scales`/`.biases` for every
         // matvec and has no unquantized kernel, so the stock bf16 default
         // imports fine and then cannot bind at load. A default has to run.
@@ -44,7 +66,20 @@ pub fn default_config_content() -> String {
         Some(driver_ffi::Flavor::Wgpu) => MLX_MODEL_BLOCK,
         _ => DEFAULT_MODEL_BLOCK,
     };
-    format!("{HEADER}{model_block}{driver_block}{TAIL}")
+    Ok(format!("{HEADER}{model_block}{driver_block}{TAIL}"))
+}
+
+/// The same template rendered against CUDA whatever this binary carries.
+///
+/// Tests of everything *around* the driver block — the schema accepting the
+/// document, the retired sections staying gone, the section budget — need a
+/// document, not this binary's driver. Asking for the compiled flavor would
+/// make them pass or fail on which features the test run happened to enable,
+/// which is how the parseability test came to be red under `cargo test -p
+/// pie --lib`: no feature, no flavor, no config.
+#[cfg(test)]
+pub(crate) fn config_content_with_any_driver() -> String {
+    format!("{HEADER}{DEFAULT_MODEL_BLOCK}{CUDA_DRIVER_BLOCK}{TAIL}")
 }
 
 const HEADER: &str = r#"# Pie configuration, written by `pie config init`. Edit freely.
@@ -140,7 +175,9 @@ network_allowed_hosts = ["*"]  # wasi:sockets only — wasi:http resolves names
 # max_outstanding_per_partner = 4
 "#;
 
-#[cfg(feature = "driver-cuda")]
+// `test` as well as the feature: `config_content_with_any_driver` renders
+// this block regardless of what the test run compiled.
+#[cfg(any(feature = "_driver-cuda", test))]
 const CUDA_DRIVER_BLOCK: &str = r#"
 [driver]
 # Which keys are valid here depends on `type`: the common ones below, plus
@@ -187,7 +224,6 @@ type = "vulkan"
 device = ["vulkan:0"]
 activation_dtype = "bfloat16"
 kv_pages = 1024
-# kernels = "/path/to/spv"  # else PIE_KERNELS_VULKAN_SPV_DIR
 "#;
 
 #[cfg(feature = "driver-wgpu")]
@@ -203,21 +239,9 @@ type = "wgpu"
 device = ["gpu:0"]
 activation_dtype = "bfloat16"
 # The one knob this backend reads. No `kv_page_size` (16, fixed by the
-# kernels), no `kv_cache_dtype` (bf16, the only one it stores), and no
-# `kernels` -- the shaders are inside the binary.
+# kernels) and no `kv_cache_dtype` (bf16, the only one it stores). The shaders
+# are inside the binary, as the Vulkan block's SPIR-V now is too.
 kv_pages = 1024
-"#;
-
-const DUMMY_DRIVER_BLOCK: &str = r#"
-[driver]
-# Which keys are valid here depends on `type`: the common ones below, plus
-# whatever the named driver accepts. A key it does not know is a parse error
-# naming the driver that rejected it.
-type = "dummy"
-device = ["cpu"]
-activation_dtype = "bfloat16"
-vocab_size = 151936
-arch_name = "qwen3"
 "#;
 
 #[cfg(test)]
@@ -228,30 +252,65 @@ mod tests {
     fn default_config_is_parseable() {
         // The template is the first config almost anyone has, so one that does
         // not parse is the worst possible first impression.
-        let content = default_config_content();
+        let content = config_content_with_any_driver();
         worker::Config::parse(&content).expect("generated config must parse");
+    }
+
+    #[test]
+    fn a_binary_with_a_driver_writes_a_config_that_parses() {
+        // The test above pins the template's shape against a driver block it
+        // chooses. This one pins the block this binary would actually write,
+        // which is the only one an operator ever sees -- and it is a no-op
+        // exactly when there is no driver to write about.
+        let Ok(content) = default_config_content() else {
+            return;
+        };
+        worker::Config::parse(&content).expect("generated config must parse");
+    }
+
+    #[test]
+    fn a_binary_without_a_driver_refuses_instead_of_writing_one() {
+        // The negative control for the arm above, and the bug it fixes: a
+        // driverless build used to write `type = "dummy"` -- a name the schema
+        // stopped accepting when the dummy driver was deleted -- so `pie
+        // config init` succeeded and every command after it failed to parse
+        // the file it had just written.
+        if driver_ffi::default_flavor().is_some() {
+            return;
+        }
+        let err = default_config_content().expect_err("driverless must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("carries no driver"),
+            "unhelpful refusal: {msg}"
+        );
+        assert!(msg.contains("driver-cuda-13"), "no fix named: {msg}");
     }
 
     #[test]
     fn it_names_the_driver_this_binary_actually_has() {
         // The whole promise of picking a block per flavor is that `pie config
         // init` produces a file that runs. A missing match arm does not fail to
-        // compile -- it falls into the catch-all and writes the dummy driver,
-        // which parses perfectly and then generates random tokens. That is
-        // exactly what happened to Metal, so the invariant is checked rather
-        // than assumed: the template's `type` is the flavor this binary has.
-        let expected = match driver_ffi::default_flavor() {
-            #[cfg(feature = "driver-cuda")]
-            Some(driver_ffi::Flavor::Cuda) => "cuda_native",
+        // compile -- it falls into the catch-all, which is how Metal once came
+        // to be handed the dummy driver's block: it parsed perfectly and then
+        // generated random tokens. The catch-all refuses now, so the same slip
+        // costs a refusal rather than nonsense, and the invariant is still
+        // checked rather than assumed: the template's `type` is this binary's.
+        let expected: Option<&str> = match driver_ffi::default_flavor() {
+            #[cfg(feature = "_driver-cuda")]
+            Some(driver_ffi::Flavor::Cuda) => Some("cuda_native"),
             #[cfg(feature = "driver-metal")]
-            Some(driver_ffi::Flavor::Metal) => "metal",
+            Some(driver_ffi::Flavor::Metal) => Some("metal"),
             #[cfg(feature = "driver-vulkan")]
-            Some(driver_ffi::Flavor::Vulkan) => "vulkan",
+            Some(driver_ffi::Flavor::Vulkan) => Some("vulkan"),
             #[cfg(feature = "driver-wgpu")]
-            Some(driver_ffi::Flavor::Wgpu) => "wgpu",
-            _ => "dummy",
+            Some(driver_ffi::Flavor::Wgpu) => Some("wgpu"),
+            // No flavor, no claim to check -- the refusal is pinned by
+            // `a_binary_without_a_driver_refuses_instead_of_writing_one`.
+            _ => None,
         };
-        let content = default_config_content();
+        let Some(expected) = expected else { return };
+        let content = default_config_content().expect("a flavor means a config");
         assert!(
             content.contains(&format!("type = \"{expected}\"")),
             "template does not select the compiled flavor {expected:?}"
@@ -260,7 +319,7 @@ mod tests {
 
     #[test]
     fn the_retired_sections_are_gone_from_it() {
-        let content = default_config_content();
+        let content = config_content_with_any_driver();
         for retired in ["[controller]", "[gateway]", "[worker", "[model.driver"] {
             assert!(
                 !content.contains(retired),
@@ -274,7 +333,7 @@ mod tests {
         // Five live, plus a commented `[cluster]`. Section count is what this
         // format was redesigned to bring down; a test is cheaper than noticing
         // later that it crept back.
-        let live = content_sections(&default_config_content());
+        let live = content_sections(&config_content_with_any_driver());
         assert!(live <= 5, "template has {live} live sections");
     }
 

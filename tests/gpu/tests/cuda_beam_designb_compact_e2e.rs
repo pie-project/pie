@@ -25,7 +25,7 @@
 //! `move` mode (identical code, geometry and klen; the only difference is the
 //! physical KV relocation) — and asserts the two token vectors are byte-identical.
 //!
-//!   PIE_PTIR_TRACE=1 cargo test -p pie-gpu-tests --features driver-cuda \
+//!   PIE_PTIR_TRACE=1 cargo test -p pie-gpu-tests --features driver-cuda-13 \
 //!     --test cuda_beam_designb_compact_e2e -- --ignored --nocapture
 
 mod common;

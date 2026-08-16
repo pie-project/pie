@@ -8,12 +8,12 @@
 //!
 //! Shares the `common` cuda harness with the Lane-C CAS-dedup and Lane-D
 //! fold-parity tests (`boot_cuda()` + `spawn_text()`). Run explicitly:
-//!   cargo test -p pie-worker --features driver-cuda --test cuda_forward -- --ignored --nocapture
+//!   cargo test -p pie-worker --features driver-cuda-13 --test cuda_forward -- --ignored --nocapture
 
 mod common;
 
 #[test]
-#[ignore = "real-hardware: needs an RTX GPU + --features driver-cuda + a local model snapshot; one boot per process"]
+#[ignore = "real-hardware: needs an RTX GPU + --features driver-cuda-13 + a local model snapshot; one boot per process"]
 fn cuda_native_text_and_device_geometry_decode() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {

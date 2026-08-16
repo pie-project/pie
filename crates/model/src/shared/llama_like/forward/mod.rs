@@ -129,22 +129,20 @@ pub fn llama_like(facts: &LlamaLikeFacts) -> ForwardPlan {
 /// elements). A deployment with no threshold — no registered P2P
 /// buffers, or no custom all-reduce at all — states the NCCL arm alone,
 /// which is the truth rather than a guard whose predicate never holds.
-fn all_reduce(
-    t: &model_dsl::Trace,
-    x: &Val,
-    hidden: u32,
-    cuda: &LlamaLikeCudaFacts,
-) -> Val {
+fn all_reduce(t: &model_dsl::Trace, x: &Val, hidden: u32, cuda: &LlamaLikeCudaFacts) -> Val {
     if cuda.all_reduce_p2p_max_rows == 0 {
         return cuda::all_reduce_out(x, hidden);
     }
     let shape = (Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16);
     let (g, v) = dsl::guarded_value(t, x.layer(), shape);
+    // Both discards are the guard's doing: an arm's statement lands in `v`,
+    // which `guarded_value` minted before either arm ran, so the `Val` a
+    // builder hands back here is a second name for something already held.
     g.arm(GuardPred::TokensLE(cuda.all_reduce_p2p_max_rows), || {
-        cuda::all_reduce_p2p(x, hidden);
+        let _ = cuda::all_reduce_p2p(x, hidden);
     })
     .otherwise(|| {
-        cuda::all_reduce_out(x, hidden);
+        let _ = cuda::all_reduce_out(x, hidden);
     });
     v
 }
@@ -177,7 +175,7 @@ fn shard_divides(f: &LlamaLikeFacts, tp: u32) -> bool {
 /// Two statements say it instead.
 fn mlp(x: &Val, w: &dsl::Layer, intermediate: u32, packed: bool) -> Val {
     if packed {
-        cuda::swiglu(&matmul(x, &w.gate_up), intermediate, true)
+        cuda::swiglu(&matmul(x, &w.gate_up), intermediate)
     } else {
         cuda::swiglu_pair(
             &matmul(x, &w.gate_proj),
@@ -369,34 +367,150 @@ fn llama_like_metal_text(
         // `qmv` unguarded wrote row zero of a three-row prefill and left the
         // rest as the arena's zeros, which reads as a model with no
         // distribution rather than as a wrong one.
-        let gemm_at = |x: &Val, w: &MatW, pt: &str, gpt: &str| {
-            if !(multi_batch && metal.qmm_multi_batch) {
+        // `gemm_fits` is the COLUMN half of the tiled GEMM's contract, which
+        // the guard below cannot state: `TokensMultipleOf` is about the fire
+        // and `qmm_t.metal` asks for `N % BN == 0` too. See its doc.
+        // The FP16 staging pass, once per ACTIVATION and not once per
+        // projection.
+        //
+        // q, k and v are three projections of one normed activation and
+        // gate/up are two of another, so a cast per projection would pay
+        // five times for two conversions. The C++ driver this replaced spells
+        // the same grouping as a kind test -- `llama_fp16_cast_before` is
+        // true for q, o, gate and down and false for k, v and up -- and a
+        // memo on the value's identity says it without a kind list, because
+        // the text already knows which projections share an `x`: they were
+        // handed the same one.
+        //
+        // Keyed on the SSA id and never cleared. Ids are unique for the whole
+        // trace, so an entry cannot be stale; the map is as long as the model
+        // has distinct projection sources, which is two per layer.
+        //
+        // OUTSIDE the guard, deliberately. A guard arm records no value of
+        // its own -- `region_out` returns `None` inside one and every launch
+        // in the arm binds the GUARD's output buffer -- so a cast written
+        // there would write half-precision activations over the projection's
+        // result. The cast has a shape of its own, so it needs a statement of
+        // its own, and that statement has to be outside.
+        //
+        // Which means a decode pays for it. At one token the guard is false
+        // and every projection takes the `qmv` arm, which reads the bf16 `x`
+        // and never looks at the half-precision copy -- so a 28-layer decode
+        // records 112 casts nothing reads, 20% of the step's fires.
+        //
+        // That is worth knowing and NOT worth fixing AT BATCH ONE, which is
+        // the unusual part. `driver-vulkan` was made to skip exactly these
+        // fires and the step did not move: 2.769 ms against 2.777, inside the
+        // spread of either. Every one of them shares a stage with the
+        // projection beside it, and a fire that shares a stage with another
+        // fire is free -- see the `hazards` doc in
+        // `driver-vulkan/src/device.rs` for why the currency is the stage and
+        // not the fire. Giving the cast a guard of its own would buy host
+        // time and arena pressure, both already small, and no device time.
+        //
+        // # AT BATCH EIGHT IT IS REAL AND STILL DEAD -- SO IT IS NOW GUARDED
+        //
+        // The paragraph above was measured at one token and is true there and
+        // nowhere else. A batched decode has M>1, so it is planned on the
+        // PREFILL lane -- and this cast is on that lane in earnest, 112 fires
+        // a step.
+        //
+        // And nothing reads them there either. `affine_qmm_t_*` fires ZERO
+        // times at batch eight, because the projection guard is
+        // `TokensMultipleOf(32)` and no batch a scheduler gathers is a
+        // multiple of 32, so every projection takes the `qmv` arm exactly as
+        // it does at one token -- while the cast, being outside the guard,
+        // fires anyway. At batch one the waste is free because the stage
+        // hides it. At batch eight the cast is doing real work on eight rows
+        // and there is no stage to hide behind.
+        //
+        // So the fix that was correctly declined at batch one is taken here,
+        // and the shape of it is the same as the problem: the cast is emitted
+        // only when the GEMM arm can actually run, which is the guard's own
+        // predicate. It cannot go INSIDE that arm for the reason three
+        // paragraphs up, so it gets a guard of its OWN carrying the same
+        // predicate -- `dsl::metal::cast_qmm_input_when`, whose `otherwise`
+        // region is empty because nothing reads the buffer when the predicate
+        // fails.
+        //
+        // What it is worth, A/B on the shipped build, two runs each,
+        // interleaved: -0.029 ms at batch one, -0.066 at two, -0.164 at four,
+        // -0.107 at eight. Reproducible and outside the spread, and three to
+        // five times SMALLER than the per-symbol timestamps predicted -- they
+        // charge two timestamps a dispatch and so overprice 112 short fires,
+        // and some of these casts still share a stage with the projection
+        // beside them even at batch eight. The full correction is in
+        // `device.rs`'s `hazards` doc under "where the batched step's extra
+        // 5.04 ms actually goes".
+        let staged: std::cell::RefCell<
+            std::collections::HashMap<model_ir::trace::ValueId, Val>,
+        > = std::cell::RefCell::new(std::collections::HashMap::new());
+        let stage = |x: &Val| -> Val {
+            if let Some(v) = staged.borrow().get(&x.key()) {
+                return v.clone();
+            }
+            let v = dsl::metal::cast_qmm_input_when(x, GuardPred::TokensMultipleOf(tile));
+            staged.borrow_mut().insert(x.key(), v.clone());
+            v
+        };
+        // Whether the batched arm multiplies in `half`. See
+        // `LlamaLikeMetalFacts::qmm_fp16_precast`.
+        let precast = metal.qmm_fp16_precast;
+        // `staged` is the POINT's and not the deployment's, for the same
+        // reason `pt` is a parameter: one projection in this stack may not
+        // share the stack's codec. The router gate is 8-bit where the
+        // projections are 4 (`LlamaLikeMetalFacts::router_repr`), and
+        // `affine_qmm_t_fp16_precast` is stamped at `gs = 64, b = 4` alone --
+        // so a text that staged by deployment named
+        // `affine_qmm_t_fp16_precast_bfloat16_gs_64_b_8_bm_32_bn_32` for the
+        // gate. `builder`'s signature check refused it, which is the failure
+        // worth having and the one that made this a parameter.
+        let gemm_at = |x: &Val, w: &MatW, pt: &str, gpt: &str, staged: bool| {
+            if !(multi_batch
+                && metal.qmm_multi_batch
+                && dsl::metal::gemm_fits(w.width, metal.qmm_tile))
+            {
                 return dsl::metal::qmv(x, w, pt);
             }
             let shape = (Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16);
+            let half = staged.then(|| stage(x));
             let (g, v) = dsl::guarded_value(x.trace(), w.layer, shape);
-            g.arm(GuardPred::TokensMultipleOf(tile), || {
-                dsl::metal::qmm(x, w, gpt);
+            g.arm(GuardPred::TokensMultipleOf(tile), || match &half {
+                Some(h) => {
+                    dsl::metal::qmm_fp16(h, w, gpt);
+                }
+                None => {
+                    dsl::metal::qmm(x, w, gpt);
+                }
             })
             .otherwise(|| {
                 dsl::metal::qmv(x, w, pt);
             });
             v
         };
-        let gemm = |x: &Val, w: &MatW| gemm_at(x, w, &point, &gemm_point);
+        let gemm = |x: &Val, w: &MatW| gemm_at(x, w, &point, &gemm_point, precast);
         // The residual-fused twin, guarded the same way and for the same
         // reason: `affine_qmm_t_residual` is that tiling with an epilogue.
         let gemm_add = |x: &Val, w: &MatW, residual: &Val| {
             if !metal.fuse_residual_gemv {
                 return dsl::metal::residual_add(&gemm(x, w), residual);
             }
-            if !(multi_batch && metal.qmm_multi_batch) {
+            if !(multi_batch
+                && metal.qmm_multi_batch
+                && dsl::metal::gemm_fits(w.width, metal.qmm_tile))
+            {
                 return dsl::metal::qmv_residual(x, w, residual, &point);
             }
             let shape = (Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16);
+            let half = precast.then(|| stage(x));
             let (g, v) = dsl::guarded_value(x.trace(), w.layer, shape);
-            g.arm(GuardPred::TokensMultipleOf(tile), || {
-                dsl::metal::qmm_residual(x, w, residual, &gemm_point);
+            g.arm(GuardPred::TokensMultipleOf(tile), || match &half {
+                Some(h) => {
+                    dsl::metal::qmm_residual_fp16(h, w, residual, &gemm_point);
+                }
+                None => {
+                    dsl::metal::qmm_residual(x, w, residual, &gemm_point);
+                }
             })
             .otherwise(|| {
                 dsl::metal::qmv_residual(x, w, residual, &point);
@@ -538,6 +652,13 @@ fn llama_like_metal_text(
                     },
                     &dsl::metal::affine_point(repr, metal.router_bits),
                     &dsl::metal::affine_gemm_point(repr, metal.router_bits, metal.qmm_tile),
+                    crate::shared::llama_like::project::qmm_fp16_precast(
+                        match repr {
+                            model_dsl::WeightRepr::Scaled { group, .. } => group,
+                            _ => 0,
+                        },
+                        metal.router_bits,
+                    ),
                 ),
             };
             let logits = if f.router_bias && metal.add_bias {
@@ -549,9 +670,7 @@ fn llama_like_metal_text(
                 &logits,
                 f.n_experts,
                 k,
-                metal
-                    .router_expert_scale
-                    .then_some(&w.router_expert_scale),
+                metal.router_expert_scale.then_some(&w.router_expert_scale),
                 metal.norm_topk_prob,
             );
             // The SORTED stack: one row per `(token, expert-slot)` route,
@@ -560,14 +679,36 @@ fn llama_like_metal_text(
             // here is a count -- `dsl::metal::route_sort` states the extent
             // and the lowering resolves it.
             //
-            // `row_expert` is the operand the projections below take. It is
-            // the sort's answer to "which expert does sorted row `p` read",
-            // and it was discarded here while the projections were handed
-            // the router's `[Tokens, k]` choice instead -- a list indexed by
-            // PAIR being read at a SORTED position.
-            let (perm, row_expert, _tile_expert, inv) =
-                dsl::metal::route_sort(&ids, f.n_experts, k, f.hidden);
-            let rows = dsl::metal::route_gather(x, &perm, f.n_experts, k, f.hidden);
+            // `row_expert` is the operand the MATVEC takes. It is the sort's
+            // answer to "which expert does sorted row `p` read", and it was
+            // discarded here while the projections were handed the router's
+            // `[Tokens, k]` choice instead -- a list indexed by PAIR being
+            // read at a SORTED position.
+            //
+            // `tile_expert` is the GEMM's, and was discarded outright: it
+            // was `_tile_expert` for as long as this text had no batched
+            // arm to hand it to.
+            //
+            // WHICH ARM, and the block that goes with it. A decode routes
+            // one token, so `k` rows over `n_experts` banks is one live row
+            // in a tile of sixteen and the matvec is right. A prefill routes
+            // `tokens * k`, and reading each expert's bank once per row
+            // there is what held gpt-oss's prefill flat at 166 tok/s from 32
+            // tokens to 2048. The sort's block must be the GEMM's row tile
+            // or a tile spans two experts and gets one of their banks.
+            //
+            // `moe_tile` may also be `None`, which takes the matvec in a
+            // prefill too. That is a family opting out of the batched arm,
+            // not a tile choice; qwen3.6 is the one that does.
+            let tile = if class == FireClass::Prefill {
+                metal.moe_tile
+            } else {
+                None
+            };
+            let block = tile.map_or(dsl::metal::ROUTE_BLOCK_MATVEC, |t| t.0);
+            let (perm, row_expert, tile_expert, inv) =
+                dsl::metal::route_sort(&ids, f.n_experts, k, f.hidden, block);
+            let rows = dsl::metal::route_gather(x, &perm, f.n_experts, k, f.hidden, block);
             // The bank's OWN format, which need not be the dense one --
             // gpt-oss stores 98 tensors affine/64/4, its expert banks
             // mxfp4/32, and its 24 router gates affine/64/**8**: three
@@ -582,45 +723,52 @@ fn llama_like_metal_text(
             } else {
                 metal.affine_bits
             };
-            // `k * moe_intermediate` and not `moe_intermediate`: each of
-            // these values is a whole token's `k` expert results end to end,
-            // and the activation between them is elementwise over all of it.
-            // Told one result's width it covered a `k`th of the stack.
+            // ONE projection, either arm. The matvec's value is
+            // `[Tokens, width * k]` and the GEMM's is `[stack, width]`, and
+            // those are the same bytes in the same order whenever nothing is
+            // padded -- which is exactly when the matvec runs.
+            let project = |x: &Val, m: &dsl::MatW, in_vec: u32| {
+                if let Some(tile) = tile {
+                    dsl::metal::routed_qmm(
+                        x,
+                        &row_expert,
+                        &tile_expert,
+                        &bank(m),
+                        f.n_experts,
+                        k,
+                        in_vec,
+                        bits,
+                        tile,
+                        metal.routed_qmm_fp16 && bits == 4,
+                    )
+                } else {
+                    dsl::metal::routed_qmv(x, &row_expert, &bank(m), k, in_vec, false, bits)
+                }
+            };
+            // `k * moe_intermediate` and not `moe_intermediate` FOR THE
+            // MATVEC: each of its values is a whole token's `k` expert
+            // results end to end, and the activation between them is
+            // elementwise over all of it. Told one result's width it covered
+            // a `k`th of the stack.
             //
-            // The projections read one run at a time, and say so with their
-            // own `in_vec`: `hidden` into the bank, `moe_intermediate` out
-            // of it.
+            // The GEMM's rows are already the stack, one result each, so its
+            // width is one run. The activation reads which it got off the
+            // operand's own row axis -- see `dsl::metal::rows_of`.
+            //
+            // The projections read one run at a time either way, and say so
+            // with their own `in_vec`: `hidden` into the bank,
+            // `moe_intermediate` out of it.
             let h = activate(
-                &dsl::metal::routed_qmv(
-                    &rows,
-                    &row_expert,
-                    &bank(&w.expert_gate),
-                    k,
-                    f.hidden,
-                    false,
-                    bits,
-                ),
-                &dsl::metal::routed_qmv(
-                    &rows,
-                    &row_expert,
-                    &bank(&w.expert_up),
-                    k,
-                    f.hidden,
-                    false,
-                    bits,
-                ),
-                f.moe_intermediate * k,
+                &project(&rows, &w.expert_gate, f.hidden),
+                &project(&rows, &w.expert_up, f.hidden),
+                if tile.is_some() {
+                    f.moe_intermediate
+                } else {
+                    f.moe_intermediate * k
+                },
             );
             let routed = dsl::metal::combine_sorted(
-                &dsl::metal::routed_qmv(
-                    &h,
-                    &row_expert,
-                    &bank(&w.expert_down),
-                    k,
-                    f.moe_intermediate,
-                    false,
-                    bits,
-                ),
+                &project(&h, &w.expert_down, f.moe_intermediate),
                 &weights,
                 &inv,
                 k,
@@ -883,7 +1031,60 @@ fn llama_like_metal_text(
             } else {
                 (q, k, v)
             };
-            let (q, k) = if f.qk_norm == QkNorm::Off {
+            // The per-head q/k norm and the rotation that always follows it,
+            // as ONE dispatch. Four conditions, and not one of them is a
+            // preference:
+            //
+            // `metal.fused_qk_rope` is the deployment saying it has the
+            // kernel. Only `driver-vulkan` does.
+            //
+            // `QkNorm::PerHead` because the fused kernel norms a HEAD -- its
+            // base is `row * row_pitch + head * axis_size`. The `Global`
+            // convention norms the whole row against a `[heads * head_dim]`
+            // weight and is different arithmetic, not a different shape.
+            //
+            // `!rope_freq_table` because a rescaled ladder is a TABLE, and the
+            // arm of the fused family that reads one is compiled and has no
+            // routine. llama-3's piecewise rescaling and YaRN's are not bases.
+            //
+            // `!k_is_v` is the one that would corrupt an answer rather than
+            // refuse a launch. A gemma-4 full-attention layer takes V FROM the
+            // K projection and both values name the same buffer; it works
+            // today only because the separate norm is OUT of place, so K's
+            // normed value is a new allocation and V still names the raw
+            // projection. The fused kernel is in place -- it has to be, the
+            // rotation reads what the norm just wrote -- so fusing there would
+            // norm AND rotate V as a side effect of doing it to K. Nothing
+            // downstream would say so: V would still be a plausible tensor.
+            let k_is_v = metal.v_from_k && window < 0;
+            let fused_qk_rope = metal.fused_qk_rope
+                && f.qk_norm == QkNorm::PerHead
+                && !metal.rope_freq_table
+                && !k_is_v;
+            let (q, k) = if fused_qk_rope {
+                let rotary = metal.rotary_dim_at(l, f.head_dim);
+                let theta = metal.rope_theta_at(l);
+                (
+                    dsl::metal::rms_rope(
+                        &q,
+                        &w.q_norm,
+                        head_dim,
+                        metal.rms_eps,
+                        theta,
+                        1.0,
+                        rotary,
+                    ),
+                    dsl::metal::rms_rope(
+                        &k,
+                        &w.k_norm,
+                        head_dim,
+                        metal.rms_eps,
+                        theta,
+                        1.0,
+                        rotary,
+                    ),
+                )
+            } else if f.qk_norm == QkNorm::Off {
                 (q, k)
             } else {
                 (
@@ -909,21 +1110,26 @@ fn llama_like_metal_text(
             // llama-3's piecewise rescaling and YaRN's are not bases, so no
             // theta expresses them. The driver derives the table at load and
             // answers it; the text only says which form.
-            let (q, k) = dsl::metal::rope(
-                &q,
-                &k,
-                multi_batch,
-                metal.rope_theta_at(l),
-                1.0,
-                head_dim,
-                // The rotation's EXTENT, which is not always the head. gemma-4
-                // rotates a quarter of each full-attention head and all of
-                // each sliding one, so this is per layer like the shape above
-                // -- and it reaches the GRID rather than the kernel, through
-                // the row's `grid_param`.
-                metal.rotary_dim_at(l, f.head_dim),
-                metal.rope_freq_table,
-            );
+            let (q, k) = if fused_qk_rope {
+                // Already rotated, by the statement that normed them.
+                (q, k)
+            } else {
+                dsl::metal::rope(
+                    &q,
+                    &k,
+                    multi_batch,
+                    metal.rope_theta_at(l),
+                    1.0,
+                    head_dim,
+                    // The rotation's EXTENT, which is not always the head.
+                    // gemma-4 rotates a quarter of each full-attention head
+                    // and all of each sliding one, so this is per layer like
+                    // the shape above -- and it reaches the GRID rather than
+                    // the kernel, through the row's `grid_param`.
+                    metal.rotary_dim_at(l, f.head_dim),
+                    metal.rope_freq_table,
+                )
+            };
             // A shared layer appends nothing: its source already did.
             if !shares_kv {
                 dsl::metal::kv_append(&k, &v, &w.kv, paged, head_dim, kv_heads);
@@ -932,23 +1138,59 @@ fn llama_like_metal_text(
             // logit that joins the softmax without a value behind it.
             // gpt-oss's, and a deployment without them names none.
             let sink = metal.attn_sinks.then(|| format!("layer.{l}.attn_sinks"));
-            let a = dsl::metal::sdpa(
-                &q,
-                &w.kv,
-                q_w,
-                head_dim,
-                paged,
-                f.q_heads / kv_heads.max(1),
-                kv_heads,
-                window,
-                // The attention SINK this layer has, if any: a per-head
-                // learned logit that joins the softmax without a value behind
-                // it. gpt-oss's, and a deployment without them names none.
-                sink.as_deref(),
-                metal.attn_scale,
-                multi_batch,
-            )
-            .expect("a plain attention statement produces its value");
+            let attend = |mb: bool| {
+                dsl::metal::sdpa(
+                    &q,
+                    &w.kv,
+                    q_w,
+                    head_dim,
+                    paged,
+                    f.q_heads / kv_heads.max(1),
+                    kv_heads,
+                    window,
+                    // The attention SINK this layer has, if any: a per-head
+                    // learned logit that joins the softmax without a value
+                    // behind it. gpt-oss's, and a deployment without them
+                    // names none.
+                    sink.as_deref(),
+                    metal.attn_scale,
+                    mb,
+                )
+            };
+            // A BATCHED DECODE IS NOT A SMALL PREFILL, and until this guard
+            // the text had no way to say so. `multi_batch` is `class !=
+            // Decode`, so eight sequences each advancing by one token are
+            // planned on the prefill lane and reach `sdpa_paged_tiled` -- a
+            // 32-row query tile holding eight rows that belong to eight
+            // DIFFERENT sequences with eight different key runs, so the tile
+            // shares nothing and pays its staging for nothing. Measured at
+            // 50.63 us a fire against the decode pair's 15.09 at batch eight,
+            // and 644.98 at a long context.
+            //
+            // `GuardPred::WindowOne` is exactly the missing question -- "is
+            // every row a one-token query window", which is what
+            // `FireClass::Decode` meant and could not say about a fire it did
+            // not classify. A mixed fire answers false and takes the tiled
+            // arm, which serves a one-token row as its degenerate case, so
+            // the fallback is correct rather than merely safe.
+            //
+            // The projections are NOT guarded this way and must not be: their
+            // gate is `TokensMultipleOf`, a question about the tile, and a
+            // batched decode fails it for a real reason. This one is about
+            // the SHAPE OF THE QUERY WINDOW, which the batch does not change.
+            let a = if multi_batch {
+                let shape = (Shape(vec![Dim::Tokens, Dim::Const(q_w)]), DType::BF16);
+                let (g, v) = dsl::guarded_value(q.trace(), Some(l), shape);
+                g.arm(GuardPred::WindowOne, || {
+                    attend(false);
+                })
+                .otherwise(|| {
+                    attend(true);
+                });
+                v
+            } else {
+                attend(false).expect("a plain attention statement produces its value")
+            };
 
             // The attention landing, and the bias the checkpoint may publish
             // on it. Stated once and used by all three norm arms, because
@@ -962,12 +1204,31 @@ fn llama_like_metal_text(
             // catalog could take.
             let land = |a: &Val| gemm(a, &w.o_proj);
             if post_norm {
-                let o = dsl::metal::rms_norm(&land(&a), &w.attn_norm, f.hidden, metal.rms_eps);
-                y = dsl::metal::residual_add(&o, &y);
+                // NORM AND LANDING IN ONE. Every `rms_norm` in this arm is
+                // read by exactly one `residual_add` and by nothing else, and
+                // `rms_residual` is that pair: the threadgroup that computed
+                // the row's inverse RMS still holds every element of the row,
+                // so the add costs one more load and no synchronisation. What
+                // it saves is a DISPATCH, and three quarters of them carry a
+                // barrier -- 845 of gemma-4's 1080. See `rms_norm_residual`.
+                y = dsl::metal::rms_norm_residual(
+                    &land(&a),
+                    &w.attn_norm,
+                    &y,
+                    None,
+                    f.hidden,
+                    metal.rms_eps,
+                );
                 let h = gated(&y, &y, &w);
                 let ffn = if owes_down { gemm(&h, &w.down) } else { h };
-                let d = dsl::metal::rms_norm(&ffn, &w.mlp_norm, f.hidden, metal.rms_eps);
-                y = dsl::metal::residual_add(&d, &y);
+                y = dsl::metal::rms_norm_residual(
+                    &ffn,
+                    &w.mlp_norm,
+                    &y,
+                    None,
+                    f.hidden,
+                    metal.rms_eps,
+                );
             } else if sandwich {
                 // gemma's FOUR norms. The stream was normed on the way IN
                 // (`x`, above, from `attn_norm`); each sub-layer's output is
@@ -984,8 +1245,16 @@ fn llama_like_metal_text(
                 // Nothing here can fuse the residual into the projection
                 // (`gemm_add`): a norm sits between them. That is arithmetic,
                 // not a missed optimisation.
-                let o = dsl::metal::rms_norm(&land(&a), &w.post_attn_norm, f.hidden, metal.rms_eps);
-                y = dsl::metal::residual_add(&o, &y);
+                // See the `post_norm` arm above for why the pair is one
+                // statement. gemma-4 is the row the kernel was written for.
+                y = dsl::metal::rms_norm_residual(
+                    &land(&a),
+                    &w.post_attn_norm,
+                    &y,
+                    None,
+                    f.hidden,
+                    metal.rms_eps,
+                );
                 if mixture_beside_dense {
                     // ── gemma-4's MIXTURE layer: two FFNs, side by side. ──
                     //
@@ -1013,22 +1282,41 @@ fn llama_like_metal_text(
 
                     let x2 = dsl::metal::rms_norm(&y, &w.mlp_norm_2, f.hidden, metal.rms_eps);
                     let g2 = gated(&x2, &y, &w);
-                    let h2 = dsl::metal::rms_norm(&g2, &w.post_mlp_norm_2, f.hidden, metal.rms_eps);
 
-                    // The JOIN, then the norm, then the residual. Each of
-                    // the three is a different statement and the order is
-                    // the reference's: norming before the add would norm
-                    // two values that are meant to be normed as a sum.
-                    let joined = dsl::metal::residual_add(&h1, &h2);
-                    let d =
-                        dsl::metal::rms_norm(&joined, &w.post_mlp_norm, f.hidden, metal.rms_eps);
-                    y = dsl::metal::residual_add(&d, &y);
+                    // The JOIN, then the norm, then the residual: three adds
+                    // in the reference and two statements here, because the
+                    // routed leg's OUT norm is what the join reads. Norming
+                    // before the join would norm two values that are meant to
+                    // be normed as a sum -- that is still true, and folding
+                    // `h1` into `post_mlp_norm_2`'s epilogue does not do it.
+                    let joined = dsl::metal::rms_norm_residual(
+                        &g2,
+                        &w.post_mlp_norm_2,
+                        &h1,
+                        None,
+                        f.hidden,
+                        metal.rms_eps,
+                    );
+                    y = dsl::metal::rms_norm_residual(
+                        &joined,
+                        &w.post_mlp_norm,
+                        &y,
+                        None,
+                        f.hidden,
+                        metal.rms_eps,
+                    );
                 } else {
                     let x = dsl::metal::rms_norm(&y, &w.mlp_norm, f.hidden, metal.rms_eps);
                     let h = gated(&x, &x, &w);
                     let ffn = if owes_down { gemm(&h, &w.down) } else { h };
-                    let d = dsl::metal::rms_norm(&ffn, &w.post_mlp_norm, f.hidden, metal.rms_eps);
-                    y = dsl::metal::residual_add(&d, &y);
+                    y = dsl::metal::rms_norm_residual(
+                        &ffn,
+                        &w.post_mlp_norm,
+                        &y,
+                        None,
+                        f.hidden,
+                        metal.rms_eps,
+                    );
                 }
             } else {
                 // The one arm that FUSES the residual into the landing, so
@@ -1052,7 +1340,6 @@ fn llama_like_metal_text(
                     dsl::metal::residual_add(&h, &y)
                 };
             }
-
 
             // ── gemma's per-layer tail. ──
             //
@@ -1261,6 +1548,11 @@ fn llama_like_cuda_text(
         } else {
             0
         };
+
+        // The width the attention SCHEDULES are planned at, which is the width
+        // the dispatch runs at: a padded deployment plans on the padded one, or
+        // the plan and the launch disagree about the page.
+        let plan_head_dim = if pad_to == 0 { f.head_dim } else { pad_to };
 
         let fused_post = cuda_of(FireClass::Decode).is_some_and(|c| c.decode_fused_post)
             && f.fused_qkv
@@ -1527,7 +1819,7 @@ fn llama_like_cuda_text(
                                     // plain-decode requests, ragged qo.
                                     if c.force_prefill_path {
                                         cuda::dequant_only(&w.kv);
-                                        cuda::attention_flashinfer_prefill(q, &w.kv, window_left);
+                                        cuda::attention_flashinfer_prefill(q, &w.kv, window_left, plan_head_dim);
                                     } else {
                                         dsl::guarded(m.trace())
                                             .arm(GuardPred::WindowOne, || {
@@ -1549,14 +1841,16 @@ fn llama_like_cuda_text(
                                                             q,
                                                             &w.kv,
                                                             window_left,
-                                                        );
+                                                        plan_head_dim,
+);
                                                     })
                                                     .otherwise(|| {
                                                         cuda::attention_flashinfer_decode(
                                                             q,
                                                             &w.kv,
                                                             window_left,
-                                                        );
+                                                        plan_head_dim,
+);
                                                     });
                                             })
                                             .otherwise(|| {
@@ -1565,7 +1859,8 @@ fn llama_like_cuda_text(
                                                     q,
                                                     &w.kv,
                                                     window_left,
-                                                );
+                                                plan_head_dim,
+);
                                             });
                                     }
                                 });
@@ -1574,7 +1869,8 @@ fn llama_like_cuda_text(
                                         q,
                                         &w.kv,
                                         window_left,
-                                    );
+                                    plan_head_dim,
+);
                                 });
                             });
                         };
@@ -1582,7 +1878,7 @@ fn llama_like_cuda_text(
                             // The split's row offsets are logical-width
                             // and the padded staging is not, so this
                             // deployment keeps the fire-level word.
-                            cuda::attention_flashinfer_prefill_custom(q, &w.kv, window_left);
+                            cuda::attention_flashinfer_prefill_custom(q, &w.kv, window_left, plan_head_dim);
                         } else if c.xqa_decode {
                             // XQA's prepare is fire-wide (R-shaped), so a
                             // window-one fire cannot peel; a ragged one
@@ -1595,7 +1891,8 @@ fn llama_like_cuda_text(
                                         q,
                                         &w.kv,
                                         window_left,
-                                    );
+                                    plan_head_dim,
+);
                                 },
                                 || peeled(q),
                             );
@@ -1617,7 +1914,7 @@ fn llama_like_cuda_text(
                             // the prefill dispatch — there is nothing
                             // left for a guard to choose between.
                             cuda::dequant_only(&w.kv);
-                            cuda::attention_flashinfer_prefill(q, &w.kv, window_left);
+                            cuda::attention_flashinfer_prefill(q, &w.kv, window_left, plan_head_dim);
                         } else {
                             dsl::guarded(m.trace())
                                 .arm(GuardPred::WindowOne, || {
@@ -1627,14 +1924,16 @@ fn llama_like_cuda_text(
                                                 q,
                                                 &w.kv,
                                                 window_left,
-                                            );
+                                            plan_head_dim,
+);
                                         })
                                         .otherwise(|| {
                                             cuda::attention_flashinfer_decode(
                                                 q,
                                                 &w.kv,
                                                 window_left,
-                                            );
+                                            plan_head_dim,
+);
                                         });
                                 })
                                 .otherwise(|| {
@@ -1648,14 +1947,16 @@ fn llama_like_cuda_text(
                                                 q,
                                                 &w.kv,
                                                 window_left,
-                                            );
+                                            plan_head_dim,
+);
                                         })
                                         .otherwise(|| {
                                             cuda::attention_flashinfer_prefill(
                                                 q,
                                                 &w.kv,
                                                 window_left,
-                                            );
+                                            plan_head_dim,
+);
                                         });
                                 });
                         }
@@ -1873,6 +2174,103 @@ mod tests {
             OpKind::Launch { weights, .. } => weights.iter().any(|w| w == weight),
             _ => false,
         })
+    }
+
+    /// The fused per-head norm+rope replaces TWO statements, and only
+    /// where all four of its conditions hold.
+    ///
+    /// This is the test the `fused_qk_rope` fact is stated both ways by:
+    /// no shipped Metal binding turns it on -- there is no `.metal` kernel
+    /// behind the symbol, only a census name so `model-ir` can check a
+    /// Vulkan text -- so a fixture stating `true` would describe a Metal
+    /// deployment that does not exist. The fact reaches production through
+    /// `engine`'s Vulkan backend alone.
+    ///
+    /// Four claims, because a fusion that fires where it must not is worse
+    /// than one that never fires: the wrong arm here produces a plausible
+    /// tensor and no check downstream can see it.
+    #[test]
+    fn the_fused_qk_norm_rope_replaces_the_pair_and_only_when_it_may() {
+        let f = LlamaLikeFacts::qwen3_0_6b();
+        assert_eq!(
+            f.qk_norm,
+            QkNorm::PerHead,
+            "this fixture is the one the fusion is for"
+        );
+        let apart = LlamaLikeMetalFacts::synthetic();
+        assert!(!apart.fused_qk_rope && !apart.rope_freq_table && !apart.v_norm);
+        let fused = LlamaLikeMetalFacts {
+            fused_qk_rope: true,
+            ..apart.clone()
+        };
+
+        let separate = llama_like_metal(&f, &apart, FireClass::Decode);
+        let together = llama_like_metal(&f, &fused, FireClass::Decode);
+
+        // The pair it replaces: two per-head norms and two rotations,
+        // gone, and two fused statements in their place.
+        assert_eq!(runs(&together, "rms_rope_bfloat16"), 2);
+        assert_eq!(runs(&separate, "rms_rope_bfloat16"), 0);
+        assert_eq!(
+            runs(&separate, "neox_mb_bfloat16") - runs(&together, "neox_mb_bfloat16"),
+            2,
+            "the fused text still rotates separately: {:?}",
+            metal_kernels(&together)
+        );
+        assert_eq!(
+            // The same symbol the two BLOCK norms use, so this reads as a
+            // difference and not as a count: a decode row is one row, and
+            // `dsl::metal::rms_norm` states the single-row form for it.
+            runs(&separate, "rms_single_row_bfloat16")
+                - runs(&together, "rms_single_row_bfloat16"),
+            2,
+            "the fused text still norms separately: {:?}",
+            metal_kernels(&together)
+        );
+        // Four statements out, two in, so the layer is two shorter. Stated
+        // on the LENGTH as well as the counts, because a fusion that added
+        // a statement elsewhere would satisfy every count above.
+        assert_eq!(
+            metal_kernels(&separate).len() - metal_kernels(&together).len(),
+            2
+        );
+
+        // A GLOBAL qk-norm is different arithmetic -- the whole row against
+        // a `[heads * head_dim]` weight -- and the fused base is per head.
+        let mut global = f.clone();
+        global.qk_norm = QkNorm::Global;
+        assert_eq!(
+            runs(&llama_like_metal(&global, &fused, FireClass::Decode), "rms_rope_bfloat16"),
+            0
+        );
+
+        // A rescaled ladder is a TABLE, and the fused family's table arm is
+        // compiled with no routine behind it.
+        let table = LlamaLikeMetalFacts {
+            rope_freq_table: true,
+            ..fused.clone()
+        };
+        assert_eq!(
+            runs(&llama_like_metal(&f, &table, FireClass::Decode), "rms_rope_bfloat16"),
+            0
+        );
+
+        // And the one that would corrupt rather than refuse: a layer that
+        // takes V FROM the K projection. The fused kernel is in place, so
+        // it would norm and rotate V as a side effect of doing it to K.
+        // `window < 0` is the full-attention arm, which is what `synthetic`
+        // states for every layer.
+        let k_is_v = LlamaLikeMetalFacts {
+            v_from_k: true,
+            ..fused.clone()
+        };
+        let plan = llama_like_metal(&f, &k_is_v, FireClass::Decode);
+        assert_eq!(
+            runs(&plan, "rms_rope_bfloat16"),
+            0,
+            "the fusion fired on a k-eq-v layer and rotated V: {:?}",
+            metal_kernels(&plan)
+        );
     }
 
     /// The three activations are three different kernels, and the fact is
@@ -2161,10 +2559,28 @@ mod tests {
         // `mlp_norm_2`, `post_mlp_norm_2` and the ROUTER's. A count, because
         // the tensors are the only thing that distinguishes them and a text
         // that reused one would still be at the right width.
+        //
+        // BOTH spellings, because a norm whose value is read by exactly one
+        // residual add is one statement -- `rms_residual` -- and which of the
+        // seven take that form is not this gate's subject. It counts norms,
+        // not dispatches; the one below it counts what the fusion is for.
+        let norms =
+            |t: &ForwardPlan| runs(t, "rms_single_row_bfloat16") + runs(t, "rms_residual_bfloat16");
         assert_eq!(
-            runs(&two, "rms_single_row_bfloat16") - runs(&one, "rms_single_row_bfloat16"),
+            norms(&two) - norms(&one),
             4,
             "the two legs' extra norms and the router's:\n  beside: {:?}",
+            metal_kernels(&two)
+        );
+        // What the fusion is for: gemma-4's three landings are three
+        // statements and not six. A text that spelled them as `rms_norm`
+        // then `residual_add` would still be arithmetically right and would
+        // pay three more barriers a layer, which is the thing that made a
+        // 128-token prefill 0.73x of the C++ shell.
+        assert_eq!(
+            runs(&two, "residual_add_bfloat16"),
+            0,
+            "a sandwich lands through the norm's epilogue:\n  beside: {:?}",
             metal_kernels(&two)
         );
         for w in [
@@ -2790,21 +3206,39 @@ mod metal_tests {
         // pool with a contiguous kernel's arithmetic -- real memory, wrong
         // tokens, no bounds check anywhere.
         //
-        // The lane is what picks the SHAPE, and only the shape. M=1 takes
-        // the vector kernel because a tile of 32 query rows is 31 rows of
-        // wasted grid at one row; M>1 takes the tiled one because the vector
-        // kernel re-reads the whole key run per query row, and that read is
-        // 39% of prefill time at n = 2048 by the shader's own measurement.
+        // The lane picks the SHAPE. M=1 takes the per-row kernel because a
+        // tile of 32 query rows is 31 rows of wasted grid at one row; a
+        // multi-token fire takes the tiled one because the per-row kernel
+        // re-reads the whole key run per query row, and that read is 39% of
+        // prefill time at n = 2048 by the shader's own measurement.
         //
         // The two also disagree about their scalars: the paged row reads
         // `Param(1)` as `n_kv_heads` and the contiguous row reads it as `n`,
-        // the key count. One statement cannot supply both, which is a second
-        // reason the choice cannot be per-lane.
-        assert!(count(&mb, &tiled) > 0, "the M>1 lane must take {tiled}");
+        // the key count. One statement cannot supply both, which is why the
+        // paged/contiguous choice cannot be per-lane.
+        //
+        // BOTH ATTENTION ARMS ARE IN THE M>1 TEXT NOW, for the same reason
+        // both projection arms are: the lane is not a fine enough question.
+        // `multi_batch` is `class != Decode`, so a batch of eight sequences
+        // each advancing by ONE token lands here -- and it is a decode in
+        // every way that matters to attention, since each of the eight rows
+        // is a one-token query window over its own key run. Handing it the
+        // tiled kernel put eight rows in a 32-row tile that shares nothing
+        // between them: 50.63 us a fire against the decode pair's 15.09, and
+        // 644.98 at a long context.
+        //
+        // So the text states the pair under `GuardPred::WindowOne` and the
+        // FIRE picks, exactly as `TokensMultipleOf` does for the projections.
+        // A Rust `if` cannot: `class` is known at trace time and the window
+        // shape is not.
+        assert!(
+            count(&mb, &tiled) > 0,
+            "the M>1 text carries {tiled} for a real multi-token fire"
+        );
         assert_eq!(
             count(&mb, &paged),
-            0,
-            "the M>1 lane must not walk {paged}, one threadgroup per row"
+            facts.layers as usize,
+            "and {paged} beside it, once a layer, for the batched decode"
         );
         assert!(
             count(&fold, &paged) > 0,

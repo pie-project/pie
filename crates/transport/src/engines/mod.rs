@@ -1,14 +1,6 @@
-//! Pluggable data-plane engines.
-//!
-//! Backends are asymmetric, so the mover is too:
-//!   * co-located prefill+decode → [`local`] (device-to-device copy, zero
-//!     network) — the minimal baseline,
-//!   * cuda/rocm cross-node → `nixl` (RDMA/TCP/NVMe via NIXL), deferred behind
-//!     `feature = "nixl"`,
-//!   * metal/vulkan never participate (single-node; NIXL is Linux-only).
-//!
-//! All engines satisfy [`crate::core::Engine`]; the [`crate::registry`] binds a
-//! handle to one and dispatches.
+//! Pluggable data-plane engines: [`local`] for co-located prefill+decode
+//! (device-to-device copy), `nixl` for cuda/rocm cross-node behind
+//! `feature = "nixl"`. All satisfy [`crate::core::Engine`].
 
 pub mod local;
 

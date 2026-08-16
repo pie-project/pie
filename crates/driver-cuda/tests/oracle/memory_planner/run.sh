@@ -1,7 +1,8 @@
 #!/bin/bash
 # Regenerate the golden for tests/memory_planner_parity.rs.
 #
-# Compiles the REAL store/memory_planner.cpp -- all 1,221 lines -- and sweeps
+# Compiles the REAL store/memory_planner.cpp -- all 1,221 lines, restored from
+# git now that the C++ tree is deleted -- and sweeps
 # `plan_cuda_memory` over a grid of device shapes, model shapes and configs.
 # Only the function's external inputs are stubbed: the three CUDA queries, the
 # ~14 model workspace formulas, and the profile-cache read. Everything the
@@ -24,8 +25,28 @@ trap 'rm -rf "$WORK"' EXIT
 # is therefore COPIED verbatim into a tree whose neighbours are the stubs. `cp`
 # is what keeps this honest: the copy is made at build time from the shipping
 # source, so it cannot drift the way a checked-in duplicate would.
+#
+# The shipping source is GONE -- `4569b9e4b` deleted `crates/driver-cuda/csrc`
+# when the planner was ported to Rust -- so it is restored from git instead of
+# copied out of the tree. `oracle_census.rs` records this oracle as dead for
+# that reason and it is not: the file is two `git show`s away, the stub tree
+# survived, and the whole thing builds with plain `g++` and no CUDA.
+#
+# `e7cd33cf1` is the last revision whose includes match the stub tree, which
+# is what makes it the right one rather than the newest one: `bb7c2231a` adds
+# `#include "attention_workspace.hpp"`, a header the stubs do not have, and
+# the build stops there. It is also the 1,221 lines this file's header claims.
+# Confirmed by reproducing `GOLDEN_FNV1A64` exactly.
+CPP_REV="${MP_ORACLE_REV:-e7cd33cf1}"
+CPP_DIR="crates/driver-cuda/csrc/src/store"
+
 mkdir -p "$WORK/store"
-cp "$SRC/store/memory_planner.cpp" "$SRC/store/memory_planner.hpp" "$WORK/store/"
+if [[ -f "$SRC/store/memory_planner.cpp" ]]; then
+  cp "$SRC/store/memory_planner.cpp" "$SRC/store/memory_planner.hpp" "$WORK/store/"
+else
+  git -C "$ROOT" show "$CPP_REV:$CPP_DIR/memory_planner.cpp" > "$WORK/store/memory_planner.cpp"
+  git -C "$ROOT" show "$CPP_REV:$CPP_DIR/memory_planner.hpp" > "$WORK/store/memory_planner.hpp"
+fi
 cp -r "$HERE/stub/." "$WORK/"
 
 # The ONE edit made to the source, and it flips a switch the author left in.

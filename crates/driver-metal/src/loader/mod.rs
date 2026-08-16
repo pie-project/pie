@@ -1,10 +1,6 @@
-//! The checkpoint loader's portable half: heap planning.
-//!
-//! Everything here is offset arithmetic over
-//! [`DecodeGeometry`](crate::batch::DecodeGeometry), compiled and tested on
-//! any host. The Metal side — allocating the heap, binding the argument
-//! tables, staging tensors — layers on top and stays under
-//! `gpu/weights/`. The ledger is `.wiki/driver/progress-metal.md`.
+//! The checkpoint loader's portable half: heap planning — offset arithmetic
+//! over [`DecodeGeometry`](crate::batch::DecodeGeometry); the Metal side (heap
+//! allocation, argument tables, tensor staging) layers on top under `gpu/weights/`.
 
 mod plan;
 mod slab;

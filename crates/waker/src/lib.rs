@@ -1,45 +1,18 @@
 //! # X0 — the tensor-waker substrate (Runtime–Driver Boundary, B9–B12)
 //!
-//! The host-side dual of contract **C2**: the driver waits on words at device
-//! cut points; the *host* parks futures on the same ring indices and is woken
-//! by the driver (or the mock) through this table. This module is the whole
-//! foundation X1–X4 build on: it owns every [`Waker`], hands the other side
-//! of the boundary nothing but opaque `u64` slot ids, and closes the
-//! register/commit race without a lock shared across the boundary.
+//! Host-side dual of contract **C2**: futures park on the same ring indices
+//! the driver cuts on, woken by the driver (or mock) through this table. Owns
+//! every [`Waker`]; the far side of the boundary sees only opaque `u64` ids.
 //!
-//! ## Locked decisions realized here
-//!
-//! - **B9 — epoch-tagged registration.** A waiter reads the channel's ring
-//!   index (head or tail — whichever its condition watches), and registers
-//!   `(waker, observed_epoch)`. The committer wakes when the ring index
-//!   *passes* the registered epoch ([`WakerTable::wake_past`]). The race
-//!   (commit lands between the waiter's observation and its registration) is
-//!   closed by the **register-then-recheck protocol**: `register` publishes
-//!   the waker *first*, then the caller re-checks its condition — either the
-//!   committer sees the published waker, or the re-check sees the committed
-//!   index. [`WaitFuture`] encodes the protocol so callers cannot get it
-//!   wrong; hand-rolled pollers MUST follow it (documented on
-//!   [`WakerTable::register`]).
-//! - **B10 — C++ never holds a `Waker`.** The FFI surface is
-//!   [`pie_wake`]/[`pie_wake_past`]: opaque `u64` in, `0/1` out, callable
-//!   from any thread, never unwinds. All waker memory lives in this table.
-//!   Slots are **generation-tagged** (id = `generation << 32 | index`), so a
-//!   stale id held by C++ after a channel died is a harmless no-op.
-//! - **SPSC ⇒ two fixed slots per host-visible channel** (one reader-waiter,
-//!   one writer-waiter — [`ChannelWakers`]): no waiter lists, no thundering
-//!   herd, O(1) memory per channel.
-//! - **B12 — sweep on poison/close/abort.** [`WakerTable::sweep`] /
-//!   [`ChannelWakers::sweep`] wake every registered slot of the touched
-//!   channels unconditionally (ignoring epochs), so a blocked
-//!   `take().await?` re-polls, observes the poison, and resolves to `Err` —
-//!   it never hangs.
-//!
-//! Spurious wakes are permitted everywhere (the futures contract); the epoch
-//! filter exists to keep them *rare* (the `wakes-per-fire` probe), never to
-//! guarantee their absence.
-//!
-//! Mock-first: nothing here touches CUDA. The mock driver calls the same
-//! `pie_wake*` exports the C++ driver will.
+//! - **B9**: a waiter registers `(waker, observed_epoch)`; the committer wakes
+//!   it once the ring index *passes* that epoch ([`WakerTable::wake_past`]).
+//!   The register/commit race is closed by register-then-recheck — callers
+//!   MUST follow the protocol on [`WakerTable::register`] ([`WaitFuture`] does).
+//! - **B10**: C++ only ever holds an opaque, generation-tagged `u64`
+//!   ([`pie_wake`]/[`pie_wake_past`]), so a stale id after a channel dies is a no-op.
+//! - **B12**: `sweep` wakes every slot of a poisoned/closed/aborted channel
+//!   unconditionally, so a blocked `take().await?` resolves to `Err`, not a hang.
+//! Spurious wakes are permitted; mock and real driver share the `pie_wake*` FFI.
 
 mod ffi;
 mod r#loom;

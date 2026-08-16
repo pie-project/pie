@@ -1,11 +1,15 @@
 // qwen3.5's gated attention: the [query|gate] split, and the gate multiply.
 //
-// Both rows are UNSTATED — the table names no operands for `gate` or
-// `q_gate_split` — so there is no `bindings()` answer to derive these numbers
-// from, and the contract below is the one `kernels-vulkan`'s `attn/gate.comp`
-// states, with its push block moved to `@group(1) @binding(0)` per this
-// backend's ABI. A driver launching an unstated row follows the lowered plan's
-// own argument order (`.wiki/new-driver/vulkan.md` §13); the ORDER is what has
+// Nothing derived these numbers: neither kernel's row named any operands, so
+// the contract below is the one `kernels-vulkan`'s `attn/gate.comp` states,
+// with its push block moved to `@group(1) @binding(0)` per this backend's ABI.
+// `attn::gate` and `attn::q_gate_split`'s signatures are what state it now.
+//
+// NOTE that `gate`'s second buffer is the GATE and not the tensor: its
+// statement is in-place on operand 0, so the tensor arrives twice and reading
+// the first input would bind one address at both slots. `driver-metal` and
+// `driver-vulkan` both did until this backend's crossing compared the three
+// arms. The ORDER is what has
 // to match, and it is the order below.
 //
 // The gate multiply uses MLX's stable sigmoid in f32 and narrows once, at the

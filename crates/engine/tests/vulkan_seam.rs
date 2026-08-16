@@ -16,19 +16,22 @@
 //! # Why it skips
 //!
 //! `PIE_VULKAN_ARTIFACT` names `.zt` artifacts built for this backend,
-//! colon-separated, and `PIE_KERNELS_VULKAN_SPV_DIR` names the module
-//! directory. Without either,
-//! this prints and returns: a test that passed on a machine with no artifact
-//! would report the absence of the checkpoint as the presence of a working
-//! load.
+//! colon-separated. Without it this prints and returns: a test that passed on
+//! a machine with no artifact would report the absence of the checkpoint as
+//! the presence of a working load.
+//!
+//! It named `PIE_KERNELS_VULKAN_SPV_DIR` beside it, for the module directory.
+//! There is no directory: the modules are in `driver-vulkan`'s rlib, so a
+//! build either has them or was built without `kernels-vulkan/native`, and
+//! `open::vulkan` fails at its first pipeline rather than at its boot config.
 
 #![cfg(feature = "driver-vulkan")]
 
 use engine::driver::backend::open;
 
 /// The boot TOML `worker::embedded_driver::write_vulkan_startup_toml` writes.
-fn boot(modules: &str) -> Vec<u8> {
-    format!("[model]\nkernels = \"{modules}\"\nkv_pages = 64\n").into_bytes()
+fn boot() -> Vec<u8> {
+    b"[model]\nkv_pages = 64\n".to_vec()
 }
 
 fn env(key: &str) -> Option<String> {
@@ -57,16 +60,13 @@ const MEASURED: &[(&str, &str, u32, u32)] = &[
 /// answer that row's four.
 #[test]
 fn the_seam_loads_an_artifact_and_answers_with_the_checkpoint_s_own_shape() {
-    let (Some(modules), Some(artifacts)) = (
-        env("PIE_KERNELS_VULKAN_SPV_DIR"),
-        env("PIE_VULKAN_ARTIFACT"),
-    ) else {
-        eprintln!("SKIP: PIE_KERNELS_VULKAN_SPV_DIR and PIE_VULKAN_ARTIFACT name the inputs");
+    let Some(artifacts) = env("PIE_VULKAN_ARTIFACT") else {
+        eprintln!("SKIP: PIE_VULKAN_ARTIFACT names the inputs");
         return;
     };
     let mut seen: Vec<String> = Vec::new();
     for artifact in artifacts.split(':').filter(|a| !a.is_empty()) {
-        let Ok(mut backend) = open::vulkan(&boot(&modules)) else {
+        let Ok(mut backend) = open::vulkan(&boot()) else {
             eprintln!("SKIP: no Vulkan device");
             return;
         };

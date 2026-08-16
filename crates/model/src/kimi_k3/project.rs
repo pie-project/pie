@@ -115,7 +115,7 @@ pub fn manifest(f: &KimiK3Facts, tied_embeddings: bool) -> Manifest {
         .with(TensorSpec::required("norm", [hidden]))
         // TIED vs UNTIED as presence, which is the only way a manifest
         // can tell them apart: every extent agrees.
-        .either(!tied_embeddings, "lm_head", [vocab, hidden])
+        .tie(tied_embeddings, "lm_head", [vocab, hidden])
         .with(TensorSpec::required("layer.{}.input_layernorm", [hidden]))
         .with(TensorSpec::required(
             "layer.{}.post_attention_layernorm",
@@ -368,6 +368,7 @@ fn plan(f: &KimiK3Facts, rope_theta: f32, norm_eps: f32, advertised: Advertised)
             // contain.
             rope_theta: if f.is_full_attn(l) { 0.0 } else { rope_theta },
             rotary_dim: 0,
+            q_gate: false,
         })
         .collect();
 

@@ -1078,7 +1078,7 @@ fn validate_kv_cache_dtype(value: &str) -> Result<()> {
 #[serde(rename_all = "snake_case")]
 pub enum DriverKind {
     /// Native CUDA driver — embedded as a static lib in `worker`
-    /// (requires `--features driver-cuda`).
+    /// (requires `--features driver-cuda-13`).
     CudaNative,
     /// Native MLX + Metal driver for Apple Silicon — embedded as a static
     /// lib in `worker` (requires `--features driver-metal`, macOS only).
@@ -1278,7 +1278,7 @@ impl Default for MetalDriverOptions {
 ///
 /// Short, and deliberately so. Every other driver's options table grew from
 /// what its C++ reads; this one states exactly the two keys the Vulkan seam
-/// looks up in the boot TOML (`[model] kernels` and `[model] kv_pages`) plus
+/// looks up in the boot TOML (`[model] kv_pages`) plus
 /// the two timeouts the worker itself honours. A knob here that the driver
 /// does not read would be a setting an operator can spell and nothing obeys.
 ///
@@ -1289,13 +1289,6 @@ impl Default for MetalDriverOptions {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VulkanDriverOptions {
-    /// Directory of compiled SPIR-V modules, as `kernels-vulkan`'s build
-    /// script wrote it.
-    ///
-    /// Absent, the driver falls back to `PIE_KERNELS_VULKAN_SPV_DIR` and
-    /// refuses if that is unset too. Nothing generates these at serve time:
-    /// a driver consumes modules rather than producing them.
-    pub kernels: Option<PathBuf>,
     /// KV pages to allocate. Pages, not tokens: the page size is the text's.
     pub kv_pages: u32,
     /// How long to wait for the driver's caps handshake before giving up.
@@ -1307,7 +1300,6 @@ pub struct VulkanDriverOptions {
 impl Default for VulkanDriverOptions {
     fn default() -> Self {
         Self {
-            kernels: None,
             kv_pages: 1024,
             ready_timeout: Duration::from_secs(120),
             shutdown_timeout: Duration::from_secs(5),
@@ -1318,21 +1310,13 @@ impl Default for VulkanDriverOptions {
 impl VulkanDriverOptions {
     fn validate(&self) -> Result<()> {
         validate_kv_pages(self.kv_pages)?;
-        if let Some(dir) = &self.kernels {
-            ensure!(
-                dir.is_dir(),
-                "[model.driver.options] kernels = {dir:?} is not a directory. It \
-                 is where `kernels-vulkan`'s build script wrote the compiled \
-                 SPIR-V modules."
-            );
-        }
         Ok(())
     }
 }
 
 /// `[model.driver.options]` for `type = "wgpu"` (the WebGPU shell).
 ///
-/// One key, where the Vulkan table above states four, and the difference is a
+/// One key, where the Vulkan table above states three, and the difference is a
 /// description of the backend. There is no `kernels` directory because there
 /// is nothing to ship beside the binary — `kernels-wgpu` embeds the WGSL in
 /// its rlib and `naga` compiles it in this process — so `[model] kv_pages` is

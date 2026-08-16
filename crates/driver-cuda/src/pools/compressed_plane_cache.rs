@@ -1,20 +1,10 @@
 //! The DeepSeek-V4 compressor state cache.
 //!
-//! Port of `driver-cuda/csrc/src/store/dsv4_compress_cache.{cpp,hpp}`.
-//! The widths live in [`crate::layout::compressed_plane_geometry`]; this is the allocation
-//! manifest built on top of them.
-//!
-//! Three things about this cache are unusual enough to be worth stating up
-//! front, because each one is load-bearing and none is obvious from the
-//! shapes:
-//!
-//! 1. **It is sparse.** Only layers with `ratio > 0` allocate. A non-
-//!    compressing layer still occupies a slot in the table, so the layer index
-//!    stays an index rather than a search, but that slot holds nothing.
-//! 2. **It is always BF16**, hardcoded, with no dtype parameter -- unlike
-//!    every other cache in `store/`. The compressor's projections are consumed
-//!    by a kernel that has no dequantisation path.
-//! 3. **It is zeroed at allocation, best-effort.** See [`ZeroPlan`].
+//! The allocation manifest over [`crate::layout::compressed_plane_geometry`],
+//! with three quirks not obvious from the shapes: it is sparse (only `ratio > 0`
+//! layers allocate; others keep a slot so the index stays an index), always
+//! BF16 (the compressor kernel has no dequant path), and zeroed best-effort at
+//! allocation (see [`ZeroPlan`]).
 
 use crate::dtype::DType;
 use crate::error::{Error, Result};
@@ -48,18 +38,11 @@ impl CompressLayer {
 
 /// What the allocator should try to zero, and how to react when it cannot.
 ///
-/// The tensors live in the elastic KV arena, which *reserves* virtual address
-/// space without committing physical pages, so writing the whole range is
-/// expected to fail whenever the reservation is larger than the commitment.
-/// The C++ therefore swallows the error, clears the sticky flag with
-/// `cudaGetLastError`, and moves on -- `dsv4_zero_compress_pages` re-zeros the
-/// pages a request actually touches once they are backed.
-///
-/// The detail that is easy to get wrong: on failure the C++ **`break`s out of
-/// the layer's tensor loop**, it does not `continue`. So a layer whose
-/// `state_kv` memset fails leaves `state_score` and `comp_kv` untouched, while
-/// the *next* layer starts the attempt over. [`ZeroPlan::stop_layer_on_failure`]
-/// records that.
+/// The tensors live in the elastic KV arena (address space reserved but pages
+/// uncommitted), so a full-range memset is expected to fail; it is swallowed
+/// and touched pages are re-zeroed once backed. On failure the C++ `break`s the
+/// layer's tensor loop, not `continue`: a layer whose `state_kv` memset fails
+/// leaves `state_score`/`comp_kv` untouched, and the next layer starts over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ZeroPlan {
     /// A failed memset abandons the rest of *this layer* only.
@@ -87,35 +70,16 @@ pub struct CompressedPlaneLayout {
 impl CompressedPlaneLayout {
     /// Plan the cache for a model.
     ///
-    /// Returns an empty layout -- not an error -- when the model does not
-    /// compress or the page geometry is degenerate. That is the C++'s
-    /// `return cache;` on a default-constructed value, and it is why the
-    /// happy path here is infallible while
-    /// [`crate::pools::mla_cache::MlaCacheLayout::plan`] validates: a V4
-    /// compressor cache is optional, an MLA cache is the model's only KV
-    /// storage.
-    ///
-    /// `page_size_` is assigned *after* that early return, so a rejected
-    /// layout reports `page_size() == 0` even when a positive page size was
-    /// passed -- but a model with zero layers is *not* rejected, so it keeps
-    /// the page size it was given while holding nothing.
+    /// Returns an empty layout, not an error, when the model does not compress
+    /// or the page geometry is degenerate — a V4 compressor cache is optional.
+    /// `page_size` is assigned after that early return, so a rejected layout
+    /// reports `page_size() == 0`, while a zero-layer model keeps its page size.
     ///
     /// # Errors
     ///
-    /// The C++ has no validation here at all, so the two ways to fail are
-    /// both incidental and both reached through something else:
-    ///
-    /// * a negative `num_hidden_layers` reaches `layers_.resize(size_t(L))`,
-    ///   which sign-extends to a length near `2^64` and throws
-    ///   `std::length_error`. The text of that throw is a libstdc++ artifact,
-    ///   so this reports its own message under the call name
-    ///   `"compressed_plane_cache"`; only the rejection is part of the contract.
-    /// * a negative `head_dim` reaches `DeviceTensor::allocate`, which
-    ///   rejects a negative extent rather than wrapping it.
-    ///
-    /// Both are reported rather than clamped because clamping would turn a
-    /// malformed config into a silently empty cache, and an empty compressor
-    /// cache is indistinguishable from a model that does not compress.
+    /// Reported, not clamped, to stay distinct from a non-compressing model:
+    /// * negative `num_hidden_layers` (would sign-extend into a huge `resize`);
+    /// * negative `head_dim` (rejected by `DeviceTensor::allocate`).
     pub fn plan(
         ratios: &[i32],
         num_hidden_layers: i32,
@@ -139,12 +103,8 @@ impl CompressedPlaneLayout {
                 layers.push(None);
                 continue;
             }
-            // Computed as `int`, exactly as the C++ does, so a negative
-            // `head_dim` stays negative and is refused by the tensor rather
-            // than wrapping into a colossal allocation.
-            // `compressed_plane_geometry::state_width` returns an unsigned width and is
-            // the right thing everywhere the config has already been
-            // validated; this path is the one that has not.
+            // `int` math like the C++: a negative `head_dim` stays negative and
+            // is refused by the tensor, not wrapped into a colossal allocation.
             let width = compressor_coff(ratio) as i32 * head_dim;
             let spec = |w: i32| {
                 TensorSpec::new(
@@ -168,15 +128,10 @@ impl CompressedPlaneLayout {
         self.page_size
     }
 
-    /// Whether the layer table itself is empty.
-    ///
-    /// Not the same question as "does this cache hold anything". A model with
-    /// `head_dim == 0` allocates a zero-byte tensor per compressing layer, so
-    /// the table is populated, `is_empty()` is false, and yet
-    /// [`Self::has_layer`] is false everywhere -- because the C++'s
-    /// `has_layer` tests the tensor's *pointer*, and a zero-byte allocation
-    /// returns null. Anything that gates on `empty()` to decide whether the
-    /// compressor can run is asking the wrong question.
+    /// Whether the layer table itself is empty — not "does this cache hold
+    /// anything". A `head_dim == 0` model populates the table with zero-byte
+    /// tensors, so `is_empty()` is false yet [`Self::has_layer`] is false
+    /// everywhere. Gate the compressor on `has_layer`, not this.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.layers.is_empty()
@@ -188,10 +143,8 @@ impl CompressedPlaneLayout {
         self.layers.len()
     }
 
-    /// Whether layer `li` has memory the compressor can write to.
-    ///
-    /// False for an out-of-range index, for a non-compressing layer, and for
-    /// a layer whose tensors came out zero-byte.
+    /// Whether layer `li` has memory the compressor can write to. False for an
+    /// out-of-range index, a non-compressing layer, or zero-byte tensors.
     #[must_use]
     pub fn has_layer(&self, li: usize) -> bool {
         self.layer(li).is_some_and(|l| l.state_kv.nbytes() > 0)
@@ -203,12 +156,8 @@ impl CompressedPlaneLayout {
         self.layers.get(li).and_then(Option::as_ref)
     }
 
-    /// The stored row width of layer `li`.
-    ///
-    /// Zero for a non-compressing layer and for an out-of-range index. The
-    /// C++ accessor is *not* bounds-checked -- it indexes the vector directly,
-    /// unlike `has_layer` immediately above it in the same header -- so an
-    /// out-of-range read there is undefined rather than zero.
+    /// The stored row width of layer `li`. Zero for a non-compressing layer or
+    /// an out-of-range index (the C++ accessor is unchecked, UB out of range).
     #[must_use]
     pub fn state_width(&self, li: usize) -> i32 {
         self.layer(li).map_or(0, |l| l.state_width)
@@ -230,21 +179,10 @@ impl CompressedPlaneLayout {
             .collect()
     }
 
-    /// Run the best-effort zeroing pass.
-    ///
-    /// Calls `memset(layer, name, nbytes)` for each tensor that has bytes,
-    /// skipping the zero-byte ones exactly as the C++'s
-    /// `nbytes() == 0 || data() == nullptr` guard does -- the two clauses are
-    /// the same condition, since a zero-byte allocation returns null.
-    ///
-    /// `memset` returns whether it succeeded. A failure abandons **the rest
-    /// of that layer** and nothing more: the C++ `break`s the inner loop, so
-    /// the next layer starts the attempt over. That asymmetry is the reason
-    /// this is a method taking a closure rather than a list the caller walks
-    /// -- the control flow is the behaviour, and a caller that iterated
-    /// [`Self::allocation_order`] itself would get it wrong by default.
-    ///
-    /// See [`ZeroPlan`] for why failure is expected rather than exceptional.
+    /// Run the best-effort zeroing pass: `memset(layer, name, nbytes)` per
+    /// non-zero-byte tensor. A failure abandons the rest of that layer only, so
+    /// the next layer starts over — hence this owns the control flow. See
+    /// [`ZeroPlan`] for why it fails.
     pub fn zero_pass(&self, mut memset: impl FnMut(usize, &'static str, u64) -> bool) {
         for (li, layer) in self.compressing() {
             for (name, spec) in layer.tensors() {
@@ -406,7 +344,6 @@ mod tests {
             n += 1;
             n != 1
         });
-        // The first layer stops after its failure; the second runs in full.
         assert_eq!(
             seen,
             vec![

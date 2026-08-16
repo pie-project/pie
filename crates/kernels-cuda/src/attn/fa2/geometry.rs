@@ -199,9 +199,15 @@ impl Occupancy {
     }
 }
 
-/// `prefill.cuh:72-96` — `get_num_warps_q`.
+/// `prefill.cuh:79-87` — `get_num_warps_q`. The `== 32` arm is the archive's
+/// own, carrying its comment: `return 1;  // HEAD_DIM_VO >= 512`. It reaches
+/// the same answer as the `else` by a different route and for a different
+/// reason, which is why the duplicate stays rather than folding into
+/// `cta_tile_q > 16 && cta_tile_q != 32`.
+#[allow(clippy::if_same_then_else)]
 const fn num_warps_q(cta_tile_q: u32) -> u32 {
     if cta_tile_q == 32 {
+        // `HEAD_DIM_VO >= 512`.
         1
     } else if cta_tile_q > 16 {
         4
@@ -215,9 +221,13 @@ const fn num_warps_kv(cta_tile_q: u32) -> u32 {
     4 / num_warps_q(cta_tile_q)
 }
 
-/// `prefill.cuh:87-96` — `get_num_mma_q`.
+/// `prefill.cuh:94-101` — `get_num_mma_q`. As [`num_warps_q`], the `== 32`
+/// arm is the archive's `return 2;  // HEAD_DIM_VO >= 512` and not a fold of
+/// the `> 64` one.
+#[allow(clippy::if_same_then_else)]
 const fn num_mma_q(cta_tile_q: u32) -> u32 {
     if cta_tile_q == 32 {
+        // `HEAD_DIM_VO >= 512`.
         2
     } else if cta_tile_q > 64 {
         2
@@ -280,9 +290,10 @@ impl PrefillGeometry {
 
         let use_repack = kv.0 == 1 && head_dim != 64 && head_dim <= 256 && cta_tile_q > 16;
         let kv_shared = num_mma_d_vo > 16
-            && num_mma_d_vo % num_warps_kv_ == 0
+            && num_mma_d_vo.is_multiple_of(num_warps_kv_)
             && (kv.0 == 2 || cta_tile_q > 16);
-        let vo_split_dispatch = num_mma_d_vo > 16 && num_mma_d_vo % num_warps_kv_ == 0;
+        let vo_split_dispatch =
+            num_mma_d_vo > 16 && num_mma_d_vo.is_multiple_of(num_warps_kv_);
 
         let per_mma_kv =
             (if kv_shared {
@@ -387,7 +398,7 @@ impl PrefillGeometry {
         n.div_ceil(16) * 16
         }
 
-        let kv_share_shape = head_dim / 16 > 16 && (head_dim / 16) % num_warps_kv == 0;
+        let kv_share_shape = head_dim / 16 > 16 && (head_dim / 16).is_multiple_of(num_warps_kv);
         let vo_split = kv_share_shape;
         let v_share_active = kv_share_shape && (kv.0 == 2 || cta_tile_q > 16);
 

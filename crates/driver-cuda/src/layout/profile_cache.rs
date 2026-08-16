@@ -1,48 +1,8 @@
-//! The on-disk cache of **measured** planner shapes.
+//! On-disk cache of measured planner shapes.
 //!
-//! `plan_cuda_memory` scores its candidate lattice analytically, and a score
-//! is a model of how a shape will perform. Where the model disagreed with
-//! reality the C++ tree accumulated per-(model, GPU) overrides with
-//! hand-measured constants baked in. This cache is the mechanism that replaces
-//! those constants with the driver's own measurement: the calibrator times the
-//! real forward step across the shape ladder and stores the winner here, and
-//! the planner reads it back and selects by evidence instead of by score.
-//!
-//! Reader and writer share [`ProfileKey`] deliberately. The key has twelve
-//! fields, and if the two sides built it independently a single disagreement
-//! would make every lookup miss silently -- the cache would look empty rather
-//! than broken.
-//!
-//! # Divergences from the C++, and why
-//!
-//! `planner_profile_cache_lookup` documents itself as *"Never throws: a
-//! corrupt cache degrades to 'no measurement'"*. It does not achieve that.
-//! `nlohmann::json::value(key, default)` throws `type_error.302` when the key
-//! is present with an incompatible type, and the lookup calls it outside any
-//! `try`. Verified against nlohmann directly:
-//!
-//! | stored | C++ | here |
-//! |---|---|---|
-//! | `"version": 2` | 2 | same |
-//! | `"version": 2.0` | 2 -- a float version *passes* | same |
-//! | `"version": "2"` | **throws** | [`Lookup::Unusable`] |
-//! | `"version": null` | **throws** | [`Lookup::Unusable`] |
-//! | `"policy_profile": 7` | **throws** | [`Lookup::Unusable`] |
-//! | `"budget_bytes": -1` | `18446744073709551615` | same |
-//! | `"budget_bytes": 1.5` | `1` | same |
-//! | `"budget_bytes": null` | **throws** | [`Lookup::Unusable`] |
-//!
-//! Where the C++ is well-defined this matches it, quirks included -- the
-//! silent wrap of a negative budget to `u64::MAX` is reproduced rather than
-//! fixed, because the two implementations have to agree about a file they
-//! share. Where the C++ throws, this returns the degradation the C++ header
-//! promises, since an exception escaping into `plan_cuda_memory` is the one
-//! behaviour nothing downstream is written to survive.
-//!
-//! Note also that the key fields are compared **type-strictly** (a
-//! `sm_count` of `132.0` does not match `132`) while the plan fields are
-//! read **leniently** (a `kv_page_size` of `16.0` reads as `16`). That
-//! inconsistency is in the C++ and is preserved.
+//! The calibrator times candidate shapes and the planner later reuses the
+//! winner for the same [`ProfileKey`]. Corrupt or incompatible files degrade
+//! to [`Lookup::Miss`] or [`Lookup::Unusable`]; C++ JSON quirks are preserved.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,12 +12,7 @@ use serde_json::{Map, Value};
 use super::json::dump_pretty;
 use super::profile_key::{ProfileKey, ProfileShape, SCHEMA_VERSION, StoredField};
 
-/// How far the planner budget may drift from the one a cached shape was
-/// measured under before the shape stops applying.
-///
-/// Loose enough to absorb ordinary boot-to-boot variation in what the device
-/// reports free; tight enough that a requantized checkpoint or a stray process
-/// holding gigabytes is a miss rather than a silently stale answer.
+/// Allowed fractional drift from the measured planner budget.
 pub const BUDGET_TOLERANCE: f64 = 0.05;
 
 /// One measured point on the shape ladder, kept beside the selection so an
@@ -70,32 +25,22 @@ pub struct ShapeSample {
     pub max_forward_requests: i32,
     /// Tokens per request in the synthetic batch.
     pub tokens_per_request: i32,
-    /// Mean measured step time.
+    /// Mean measured step time, in ms.
     pub step_ms: f64,
-    /// Standard deviation across repeats.
+    /// Step-time standard deviation, in ms.
     pub step_ms_stddev: f64,
-    /// Derived throughput.
+    /// Derived throughput, in tokens/s.
     pub tokens_per_s: f64,
 }
 
-/// What a lookup found.
-///
-/// Three outcomes, because the C++ has three and expresses them through a
-/// return value and an out-parameter that callers can and do read
-/// independently. Collapsing "no entry" and "cache is broken" into one
-/// `Option` would lose the distinction that decides whether anything gets
-/// logged.
+/// Result of reading a cached shape.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Lookup {
     /// An entry for this key, readable and at the expected schema version.
     Hit(ProfileShape),
-    /// No entry for this key. Includes "no cache file", which is the ordinary
-    /// first-boot case and is not worth a word to the user.
+    /// No entry for this key, including the absent-file first-boot case.
     Miss,
-    /// A cache exists but cannot be trusted: unparseable, or written at a
-    /// schema version whose fields may not mean what they say. The string is
-    /// for the operator, and the caller should proceed as if it were a
-    /// [`Lookup::Miss`].
+    /// A cache exists but cannot be trusted; proceed as for [`Lookup::Miss`].
     Unusable(String),
 }
 
@@ -120,17 +65,9 @@ impl Lookup {
 }
 
 impl ProfileShape {
-    /// Does a shape measured under its recorded budget still describe a
-    /// machine whose budget is now `budget`?
+    /// Whether the recorded budget is close enough to `budget`.
     ///
-    /// A shape is only an answer to the budget it was measured under. The key
-    /// pins the device and the model, and neither notices that this boot has
-    /// materially more or less memory to give -- another process holding VRAM,
-    /// or a checkpoint requantized offline. Unchecked this fails in the quiet
-    /// direction: with a *larger* budget the measured shape is still feasible,
-    /// so it is selected and the extra memory is simply never used.
-    ///
-    /// A recorded budget of zero means "not recorded", and always applies.
+    /// A zero recorded budget means "not recorded" and always applies.
     #[must_use]
     pub fn applies_at(&self, budget: u64) -> bool {
         if self.budget_bytes == 0 {
@@ -139,8 +76,7 @@ impl ProfileShape {
         self.drift_from(budget) <= BUDGET_TOLERANCE
     }
 
-    /// The fractional distance from the recorded budget, as the C++ computes
-    /// it: divided by the **measured** budget, not by the current one.
+    /// Fractional distance from the recorded budget, divided by the measured budget.
     #[must_use]
     pub fn drift_from(&self, budget: u64) -> f64 {
         if self.budget_bytes == 0 {
@@ -155,16 +91,9 @@ impl ProfileShape {
     }
 }
 
-/// Where the cache lives.
+/// Derive the cache path from the configured directory, XDG, or `$HOME`.
 ///
-/// The same derivation the module and tuning caches use: the configured cache
-/// directory when the engine sent one, else XDG, else `$HOME/.cache`. `None`
-/// when none of those is set, which is a real configuration on a locked-down
-/// host and is why the C++ returns an empty path rather than guessing.
-///
-/// `env` is a parameter rather than a call to [`std::env::var`] so this is
-/// testable without mutating the process environment -- which is unsound to do
-/// from a test harness that runs threads in parallel.
+/// `env` is injected so tests need not mutate process-global environment.
 pub fn cache_path(configured_dir: &str, env: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
     if !configured_dir.is_empty() {
         return Some(Path::new(configured_dir).join("cuda_memory_profiles.json"));
@@ -188,17 +117,9 @@ pub fn cache_path(configured_dir: &str, env: impl Fn(&str) -> Option<String>) ->
     None
 }
 
-/// The planner budget this boot computed, published so the calibrator can
-/// record what its sweep ran inside.
+/// Planner budget for this boot, published for the calibrator.
 ///
-/// A process-wide global for the same reason the C++ makes it a file-static:
-/// `plan_cuda_memory` derives the budget and the calibrator stores the result,
-/// and there is no object both of them hold. Written once, before anything
-/// reads it.
-///
-/// The C++ is a bare `std::size_t`, which is a data race the moment two
-/// threads touch it. An atomic costs nothing here -- the value is read once
-/// per calibration -- and removes the question.
+/// Atomic because the planner and calibrator may be reached from different threads.
 static PLANNER_BUDGET_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Publish the budget the planner settled on.
@@ -217,9 +138,7 @@ pub fn planner_budget_bytes() -> u64 {
 pub enum StoreError {
     /// Neither a configured cache directory nor `$XDG_CACHE_HOME` nor `$HOME`.
     NoCacheDir,
-    /// A filesystem operation failed. `what` names the step, so the message
-    /// says which of create/open/write/rename went wrong rather than leaving
-    /// the errno to be interpreted.
+    /// A filesystem operation failed; `what` names the step.
     Io {
         /// The step that failed.
         what: &'static str,
@@ -253,32 +172,14 @@ impl std::error::Error for StoreError {
     }
 }
 
-/// An exclusive advisory lock, held on a sibling `.lock` file.
-///
-/// On the sibling rather than on the cache itself because [`ProfileCache::store`]
-/// replaces the cache by `rename`, and a lock held on the replaced inode would
-/// stop excluding anything the moment the rename landed.
+/// Exclusive advisory lock held on a sibling `.lock` file.
 struct CacheLock {
-    /// Dropping the file releases the lock, which is why there is no
-    /// `Drop` impl below any more.
+    /// Dropping the file releases the lock.
     _file: std::fs::File,
 }
 
 impl CacheLock {
-    /// Open the sibling and take the lock.
-    ///
-    /// NO `unsafe`, and that is the point rather than a detail. This was
-    /// `libc::open` + `libc::flock` + a `Drop` calling `libc::close`,
-    /// with three SAFETY comments carrying the argument that the
-    /// descriptor is opened once, locked once and closed once. All three
-    /// are now the type's: `File` owns the descriptor, `File::lock`
-    /// takes the same advisory lock, and dropping the file releases and
-    /// closes it.
-    ///
-    /// It is the only `unsafe` `layout/` had, and removing it is what
-    /// lets this half of the crate carry `#![forbid(unsafe_code)]` —
-    /// §8 row 11's thesis, held by the compiler on the half where it is
-    /// reachable today.
+    /// Open the sibling lock file and take the lock.
     fn acquire(cache_path: &Path) -> Result<Self, StoreError> {
         let mut name = cache_path
             .file_name()
@@ -288,9 +189,6 @@ impl CacheLock {
         name.push_str(".lock");
         let lock_path = cache_path.parent().unwrap_or(Path::new(".")).join(name);
 
-        // The error carries the OS's own, not `last_os_error()` — which
-        // is what the `libc` version had to read, and what a `File`
-        // returns directly.
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -324,8 +222,7 @@ impl ProfileCache {
         Self { path: path.into() }
     }
 
-    /// The cache at the location [`cache_path`] derives, reading the real
-    /// environment.
+    /// The cache at the location [`cache_path`] derives from the real environment.
     ///
     /// # Errors
     /// [`StoreError::NoCacheDir`] when no cache directory can be derived.
@@ -341,13 +238,7 @@ impl ProfileCache {
         &self.path
     }
 
-    /// Read the whole document, tolerating every failure mode.
-    ///
-    /// A cache that cannot be parsed must not take the process down: it is an
-    /// optimisation record, and the planner's analytic score is a complete
-    /// fallback. Returns the empty object plus a complaint when the file
-    /// exists but is not usable JSON; the empty object with no complaint when
-    /// it is simply absent.
+    /// Read the whole document; malformed JSON becomes an empty map plus a complaint.
     fn read_document(&self) -> (Map<String, Value>, Option<String>) {
         let empty = Map::new();
         if self.path.as_os_str().is_empty() || !self.path.exists() {
@@ -355,22 +246,18 @@ impl ProfileCache {
         }
         let text = match std::fs::read_to_string(&self.path) {
             Ok(t) => t,
-            // The C++ returns an empty document with no error when the stream
-            // fails to open, and only reports parse failures.
+            // Open failures are treated like a missing cache.
             Err(_) => return (empty, None),
         };
         match serde_json::from_str::<Value>(&text) {
             Ok(Value::Object(map)) => (map, None),
-            // Valid JSON that is not an object: the C++ discards it silently.
+            // Non-object JSON is ignored.
             Ok(_) => (empty, None),
             Err(e) => (empty, Some(e.to_string())),
         }
     }
 
-    /// The measured shape for `key`.
-    ///
-    /// Never fails: see the module docs for the three outcomes and for where
-    /// this deliberately differs from the C++.
+    /// The measured shape for `key`, or why it cannot be used.
     #[must_use]
     pub fn lookup(&self, key: &ProfileKey) -> Lookup {
         let (root, complaint) = self.read_document();
@@ -381,14 +268,10 @@ impl ProfileCache {
             return Lookup::Miss;
         };
 
-        // Read the version before the emptiness check, matching the C++'s
-        // evaluation order -- so a badly typed version is reported even when
-        // there is nothing it could have applied to.
+        // Version is checked before emptiness to preserve C++ evaluation order.
         let version = match root.get("version") {
             None => Some(0),
-            // A boolean version reads as 0 or 1, and then fails the schema
-            // check with that number in the message. Odd, but it is what the
-            // C++ does, and the outcome -- refusal -- is the same.
+            // Boolean versions read as 0 or 1, then fail the schema check.
             Some(Value::Bool(b)) => Some(i64::from(*b)),
             Some(Value::Number(n)) => n.as_i64().or_else(|| {
                 #[expect(
@@ -405,10 +288,7 @@ impl ProfileCache {
                     .to_owned(),
             );
         };
-        // A document with entries but the wrong version was written by another
-        // build (or by hand). Its fields may not mean what they say, so refuse
-        // it loudly rather than matching the subset that happens to line up --
-        // a wrong `max_forward_tokens` is worse than none.
+        // Wrong-version entries may have changed field meanings; refuse them.
         if version != i64::from(SCHEMA_VERSION) && !entries.is_empty() {
             return Lookup::Unusable(format!(
                 "schema version {version}, expected {SCHEMA_VERSION}; \
@@ -440,22 +320,13 @@ impl ProfileCache {
         Lookup::Miss
     }
 
-    /// Replace (or append) the entry for `key`, preserving every other entry.
+    /// Replace or append the entry for `key`, preserving other entries.
     ///
-    /// Serialised and atomic. An exclusive `flock` on a sibling `.lock` file
-    /// covers the whole read -> merge -> rename, so two processes calibrating
-    /// at once cannot drop each other's entries; the rename itself means a
-    /// concurrent reader observes either the old document or the new one and
-    /// never a partial write.
-    ///
-    /// `now_unix_secs` is a parameter rather than a clock read so the output
-    /// is reproducible under test. The C++ takes it from
-    /// `system_clock::now()`.
+    /// The sibling lock covers read-merge-rename; `rename` keeps readers from
+    /// observing a partial file. `now_unix_secs` is injected for tests.
     ///
     /// # Errors
-    /// [`StoreError`] when a directory cannot be created, the lock cannot be
-    /// taken, or the write or rename fails. A cache that exists but cannot be
-    /// parsed is **not** an error: like the C++, it is discarded and replaced.
+    /// [`StoreError`] when directory creation, locking, writing, or renaming fails.
     pub fn store(
         &self,
         key: &ProfileKey,
@@ -473,18 +344,10 @@ impl ProfileCache {
             source,
         })?;
 
-        // `rename` makes the replacement atomic for readers but does nothing
-        // for read-modify-write against another writer: two processes
-        // calibrating at once would both read the pre-existing document and
-        // the second rename would drop the first one's entry. One process per
-        // GPU on a multi-GPU host sharing $HOME is exactly the case the
-        // "preserve every other entry" contract exists for.
+        // The lock prevents concurrent writers from losing each other's entries.
         let _lock = CacheLock::acquire(&self.path)?;
 
-        // Deliberately ignoring the complaint: the C++ passes `nullptr` here,
-        // so an unparseable cache is discarded and replaced rather than
-        // blocking the write. The entries it held are lost, which is the
-        // right trade for a file whose only content is re-derivable.
+        // Unparseable caches are discarded on write; the data is re-derivable.
         let (mut root, _) = self.read_document();
         root.insert("version".to_owned(), Value::from(SCHEMA_VERSION));
         if !root.get("entries").is_some_and(Value::is_array) {
@@ -509,8 +372,7 @@ impl ProfileCache {
 
         let text = dump_pretty(&Value::Object(root), 2);
 
-        // The temp name carries a clock component as well as the pid, because
-        // two containers sharing a $HOME mount can present the same pid.
+        // Include a timestamp so same-pid containers sharing $HOME do not collide.
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
@@ -559,23 +421,7 @@ fn stored_field(map: &Map<String, Value>, name: &str) -> StoredField {
     }
 }
 
-/// Read the `plan` object, reproducing `nlohmann::value()`'s exact tolerances.
-///
-/// Those tolerances are not uniform, and the asymmetry is not guessable -- it
-/// was measured. `value(key, 0)` deduces `int`, which is *not* nlohmann's
-/// `number_integer_t` (that is `int64_t`), so it takes a generic arithmetic
-/// path that accepts booleans and truncates floats. `value<std::size_t>(key,
-/// 0)` names `number_unsigned_t` exactly and takes a stricter path that
-/// throws on a boolean while still accepting a float or a negative.
-///
-/// | stored | `int` field | `size_t` field | string field |
-/// |---|---|---|---|
-/// | `16` | 16 | 16 | throws |
-/// | `-5` | -5 | wraps to `u64::MAX - 4` | throws |
-/// | `16.9` | 16 | 16 | throws |
-/// | `true` | **1** | **throws** | throws |
-/// | `null` | throws | throws | throws |
-/// | `"16"` | throws | throws | verbatim |
+/// Read the `plan` object with the same lenient numeric conversions as C++.
 fn read_shape(plan: &Map<String, Value>) -> Result<ProfileShape, String> {
     let string = |name: &str| -> Result<String, String> {
         match plan.get(name) {
@@ -587,11 +433,10 @@ fn read_shape(plan: &Map<String, Value>) -> Result<ProfileShape, String> {
     let int = |name: &str| -> Result<i32, String> {
         match plan.get(name) {
             None => Ok(0),
-            // A boolean reads as 0 or 1 here but not in `unsigned` below.
+            // Booleans are accepted for signed int fields only.
             Some(Value::Bool(b)) => Ok(i32::from(*b)),
             Some(Value::Number(n)) => {
-                // `get<int>()` truncates a float toward zero and narrows an
-                // out-of-range value by `static_cast`, which wraps.
+                // C++ truncates floats and narrows by `static_cast`.
                 #[expect(
                     clippy::cast_possible_truncation,
                     reason = "deliberately mirrors nlohmann's narrowing static_cast"
@@ -615,10 +460,7 @@ fn read_shape(plan: &Map<String, Value>) -> Result<ProfileShape, String> {
                 if let Some(u) = n.as_u64() {
                     Ok(u)
                 } else if let Some(i) = n.as_i64() {
-                    // A negative budget wraps to a colossal one. Preserved
-                    // rather than fixed: it is what the C++ reads, and the
-                    // drift check then rejects the entry, so the quirk
-                    // happens to fail safe.
+                    // Negative budgets wrap as in C++; drift checking rejects them.
                     #[expect(
                         clippy::cast_sign_loss,
                         reason = "deliberately mirrors the C++'s wrap to SIZE_MAX"
@@ -664,9 +506,7 @@ fn kind(v: &Value) -> &'static str {
     }
 }
 
-/// Build the entry object. Zero and empty fields are **omitted**, so a cache
-/// written by a calibrator that only swept `max_forward_tokens` does not pin
-/// the fields it never measured.
+/// Build the entry object, omitting zero and empty plan fields.
 fn build_entry(
     key: &ProfileKey,
     shape: &ProfileShape,
@@ -722,10 +562,7 @@ fn build_entry(
         })
         .collect();
 
-    // The key is serialised through `ProfileKey::to_json` and reparsed rather
-    // than built field by field here, so there is exactly one definition of
-    // what a stored key looks like and the writer cannot drift from the
-    // reader.
+    // Reparse `ProfileKey::to_json` so reader and writer share one key format.
     let key_value: Value =
         serde_json::from_str(&key.to_json()).unwrap_or_else(|_| Value::Object(Map::new()));
 
@@ -792,9 +629,7 @@ mod tests {
 
     #[test]
     fn an_empty_env_var_counts_as_unset() {
-        // `getenv` returning "" is not the same as returning null, and the
-        // C++ checks `xdg[0] != '\0'` explicitly. Without this an exported
-        // but empty XDG_CACHE_HOME would put the cache at `/pie/...`.
+        // Empty XDG_CACHE_HOME is treated as unset.
         let env = |k: &str| match k {
             "XDG_CACHE_HOME" => Some(String::new()),
             "HOME" => Some("/home/u".to_owned()),
@@ -808,7 +643,6 @@ mod tests {
 
     #[test]
     fn a_missing_cache_is_a_miss_and_not_a_complaint() {
-        // First boot is the common case and must be silent.
         let c = ProfileCache::at("/nonexistent/dir/cuda_memory_profiles.json");
         assert_eq!(c.lookup(&key()), Lookup::Miss);
     }
@@ -825,8 +659,7 @@ mod tests {
 
     #[test]
     fn drift_is_measured_against_the_recorded_budget() {
-        // Asymmetric on purpose: the C++ divides by the measured budget, so
-        // the window is not symmetric in absolute bytes around it.
+        // The window is asymmetric because the denominator is the measured budget.
         let s = ProfileShape {
             budget_bytes: 1000,
             ..shape()

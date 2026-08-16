@@ -19,7 +19,7 @@
 //! job at a time) with:
 //!   PIE_COMPILER_LAUNCHER=env CUDACXX=/usr/local/cuda/bin/nvcc \
 //!   CPM_SOURCE_CACHE=$HOME/.cache/pie-cpm CARGO_BUILD_JOBS=2 \
-//!   cargo test -j2 -p pie-gpu-tests --features driver-cuda \
+//!   cargo test -j2 -p pie-gpu-tests --features driver-cuda-13 \
 //!     --test programmable_sampler_4090 -- --ignored --nocapture --test-threads=1
 
 mod common;

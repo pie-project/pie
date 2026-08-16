@@ -59,7 +59,7 @@ pub fn manifest(f: &Qwen35HybridFacts) -> Manifest {
     let m = Manifest::new(f.layers)
         .with(TensorSpec::required("embed_tokens", [vocab, hidden]))
         .with(TensorSpec::required("norm", [hidden]))
-        .either(!f.tied_embeddings, "lm_head", [vocab, hidden])
+        .tie(f.tied_embeddings, "lm_head", [vocab, hidden])
         // The full-attention block.
         .with(TensorSpec::required(
             "layer.{}.self_attn.q_proj",
@@ -242,6 +242,14 @@ pub fn deployment(f: &Qwen35HybridFacts, rope_theta: f32, norm_eps: f32) -> Depl
             // read `rotary_dim` out of the family's own facts, which is
             // the second reading this table exists to remove.
             rotary_dim: a.rotary_dim,
+            // EVERY layer, including the recurrent ones that have no Q
+            // at all. `Qwen3NextAttention.q_proj` publishes
+            // `2 * q_heads * head_dim` and `q_gate_split` cuts each
+            // head's row into a query and its output gate; a GDN layer
+            // publishes no `q_proj` for anything to be wrong about.
+            // Stating it per layer and answering the same everywhere is
+            // what keeps a reader from having to know which is which.
+            q_gate: true,
         })
         .collect();
     Deployment {
@@ -388,36 +396,138 @@ pub fn cuda_facts(
     }
 }
 
-/// Why this build has no Metal text for a qwen-3.5 row.
+/// The METAL binding facts for this row.
 ///
-/// A `const` so the test that asserts the refusal NAMES the missing
-/// thing compares against the same string the caller is shown, rather
-/// than against a paraphrase that can drift away from it — the shape
-/// `csm::project::NO_TRACE` set for the same reason.
+/// Every field is a LOAD's answer or a checkpoint's, in the shape
+/// [`Qwen35MetalFacts`] states them. The two that are neither:
 ///
-/// Its forward is `qwen3_5_hybrid_cuda`, which interleaves
-/// gated DeltaNet layers with attention and states two SERVICE classes
-/// beside the two shaped ones. `llama_like_metal` has neither the
-/// recurrent layer kind nor the service classes.
+/// `norm_topk_prob` is the reference's `scores / scores.sum()` over the
+/// chosen k, which `router_topk` computes as a softmax over the k rather
+/// than over all 256 -- the same number by a shorter route.
 ///
-/// A `Refusal::Unsupported` and not a `Malformed`: the checkpoint is
-/// fine, and a pie whose Metal half had this text would serve the same
-/// row unchanged. What is missing is a TEXT in this build, which is a
-/// fact about the build.
+/// `attn_scale` is `head_dim ** -0.5` off the MODEL's head width and not
+/// the pool's padded one. `Qwen3NextAttention.scale` is built from
+/// `args.head_dim`, and a scale derived from a rounded-up allocation
+/// would divide by a width no reference has.
 ///
-/// Stating it is the whole of what replaces `driver-metal`'s
-/// `LLAMA_LIKE` — an eleven-entry table of architecture STRINGS,
-/// reduced by a punctuation-stripping `canonical()`, consulted before
-/// any text was traced and free to disagree with what the tracer would
-/// actually do. It listed `gpt_oss`, which no publication of reaches a
-/// Metal device here, and omitted `gemma3`, whose text it models. A row
-/// that answers for itself cannot disagree with a list, because there
-/// is no list.
-pub const NO_METAL: &str = "qwen-3.5 has no Metal text in this build: its forward is \
-     `qwen3_5_hybrid_cuda`, which interleaves gated DeltaNet layers with \
-     attention and states two service classes beside the two shaped ones, and \
-     the one Metal text here (`llama_like_metal`) has neither and takes a \
-     different shape; the CUDA backend serves this row";
+/// [`Qwen35MetalFacts`]: super::forward::metal::Qwen35MetalFacts
+#[must_use]
+pub fn metal_facts(
+    f: &Qwen35HybridFacts,
+    rope_theta: f32,
+    norm_eps: f32,
+    bind: &crate::catalog::MetalBinding,
+) -> super::forward::metal::Qwen35MetalFacts {
+    use model_dsl::{ScaleLayout, WeightRepr};
+    super::forward::metal::Qwen35MetalFacts {
+        proj_repr: WeightRepr::Scaled {
+            layout: ScaleLayout::PerGroup,
+            group: bind.quant_group,
+            axis: 0,
+            zero_point: true,
+        },
+        affine_bits: bind.quant_bits,
+        moe_repr: bind.moe_mxfp4.then_some(WeightRepr::Mxfp4Marlin),
+        moe_bits: 4,
+        // What this BUILD stamps, shared with the llama-like family because
+        // the tile is a property of the kernel tree and not of the model.
+        moe_tile: Some(crate::shared::llama_like::project::ROUTED_QMM_TILE),
+        // The gate's OWN format, when the checkpoint published it wider
+        // than the stack it routes. `mlx-community` lists `mlp.gate` and
+        // `mlp.shared_expert_gate` at eight bits for every layer of both
+        // qwen3.6 builds, inside a four-bit stack.
+        router_repr: (bind.router_quant_group != 0).then_some(WeightRepr::Scaled {
+            layout: ScaleLayout::PerGroup,
+            group: bind.router_quant_group,
+            axis: 0,
+            zero_point: true,
+        }),
+        router_bits: bind.router_quant_bits,
+        qmm_tile: crate::shared::llama_like::project::QMM_TILE,
+        qmm_fp16_precast: crate::shared::llama_like::project::qmm_fp16_precast(
+            bind.quant_group,
+            bind.quant_bits,
+        ),
+        // The routed bank's codec and not the stack's, which are the same
+        // here whenever the checkpoint ships no MXFP4 expert set: the routed
+        // projections read `moe_repr.unwrap_or(proj_repr)`, and an MXFP4
+        // stack has its own kernel that stages its tiles already.
+        routed_qmm_fp16: !bind.moe_mxfp4
+            && crate::shared::llama_like::project::qmm_fp16_precast(
+                bind.quant_group,
+                bind.quant_bits,
+            ),
+        qmm_multi_batch: bind.qmm_multi_batch,
+        fuse_residual_gemv: bind.fuse_residual_gemv,
+        rms_eps: norm_eps,
+        rope_theta,
+        attn_scale: 1.0 / (f.attn.head_dim as f32).sqrt(),
+        norm_topk_prob: true,
+    }
+}
+
+/// The kernel set's refusals for a Metal load of this row.
+///
+/// Three, and none of them is a property of the row: each names a point
+/// `kernels-metal` does not instantiate. Stated at the door so an
+/// off-axis load arrives as a sentence rather than aborting inside
+/// `model-compiler` with an unbound symbol.
+///
+/// The GDN half asks nothing here. `gdn_core` and `gdn_prep` take `Dk`,
+/// `Dv`, `Hk`, `Hv`, `conv_dim` and `Kc` as RUNTIME scalars in
+/// `GdnCoreParams` -- there is no template constant among them -- so
+/// every recurrent geometry this family publishes reaches the same
+/// three symbols. The attention half does not have that property, which
+/// is the whole of the second check.
+///
+/// # Errors
+///
+/// The llama-like set's own three sentences, which say the same things
+/// about the same shaders and are therefore not restated here.
+pub fn metal_kernel_refusal(
+    f: &Qwen35HybridFacts,
+    load: Deployed<'_>,
+    bind: &crate::catalog::MetalBinding,
+) -> Result<(), crate::deployment::Refusal> {
+    use crate::deployment::Refusal;
+    use crate::shared::llama_like::project as ll;
+
+    if load.tp_size > 1 {
+        return Err(Refusal::Unsupported(ll::NO_METAL_SHARD));
+    }
+    // `sdpa_paged_*_bfloat16_d_<width>` is compiled at a list of widths
+    // and the full-attention layers name one of them by head width.
+    if !ll::METAL_SDPA_HEAD_DIMS.contains(&f.attn.head_dim) {
+        return Err(Refusal::Unsupported(ll::NO_METAL_HEAD_DIM));
+    }
+    // The expert bank, when there is one. `affine_qmv_routed` exists at
+    // exactly (64, 4) because `AffineQ::group_size` is a template
+    // constant; a bank at another group read by that kernel takes every
+    // scale from the wrong offset.
+    if matches!(f.mlp, Qwen35MlpKind::Moe(_))
+        && !bind.moe_mxfp4
+        && (bind.quant_group, bind.quant_bits) != ll::METAL_ROUTED_AFFINE
+    {
+        return Err(Refusal::Unsupported(ll::NO_METAL_ROUTED_ENCODING));
+    }
+    Ok(())
+}
+
+/// Trace this row's METAL text for one fire class.
+#[must_use]
+pub fn trace_metal(
+    f: &Qwen35HybridFacts,
+    class: model_ir::trace::FireClass,
+    rope_theta: f32,
+    norm_eps: f32,
+    bind: &crate::catalog::MetalBinding,
+) -> model_ir::trace::ForwardPlan {
+    super::forward::metal::qwen3_5_hybrid_metal(
+        f,
+        &metal_facts(f, rope_theta, norm_eps, bind),
+        class,
+    )
+}
 
 /// Trace this row's CUDA text for one fire class.
 #[must_use]

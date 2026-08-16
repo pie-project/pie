@@ -1,21 +1,13 @@
 //! Why a compile or a launch did not happen.
 //!
-//! # Three variants, and the three that went with the unit world
-//!
-//! This enum used to have six. `Unknown { symbol }` said *"no unit hosts the
-//! symbol"*, `Missing { unit, symbol }` said *"the cubin loaded and the ROW's
-//! entry is not in it"*, and `Geometry { symbol, why }` said *"the ROW's
-//! launch rule could not be evaluated over these dims"*. All three name
-//! something that no longer exists — a unit, a row, a `LaunchRule` the
-//! runtime evaluates — and none of the three was ever constructed after the
-//! per-symbol JIT landed: a routine body computes its own geometry as an
-//! expression, and [`crate::routine`] answers "nothing declares this" as a
-//! [`kernels::Refusal`] before a compile is ever asked for.
-//!
-//! They are deleted rather than kept for symmetry, because an unconstructible
-//! variant of a public error type is a promise to a matcher that the promise
-//! can never be kept to: a caller writing an arm for `Error::Geometry` is
-//! writing dead code that reads as a handled case.
+//! Three variants. `Unknown`, `Missing` and `Geometry` went with the unit
+//! world: each named something that no longer exists — a unit, a row, a
+//! `LaunchRule` the runtime evaluates — and none was constructible after the
+//! per-symbol JIT landed, since a routine body computes its own geometry and
+//! [`crate::routine`] answers "nothing declares this" as a
+//! [`kernels::Refusal`] before a compile is asked for. They are deleted rather
+//! than kept for symmetry: an unconstructible variant of a public error type
+//! makes a caller's match arm dead code that reads as a handled case.
 
 /// Why a compile or a launch did not happen.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,10 +44,8 @@ impl std::fmt::Display for Error {
     }
 }
 
-/// No variant wraps another error, so there is no source to hand back.
-///
-/// [`Error::Compile`] and [`Error::Driver`] both carry a `String` that came
-/// from NVRTC or from `CUresult`, and neither of those is a Rust error to
-/// chain to. The impl exists so that a caller may treat this as a
-/// `Box<dyn Error>`, which several of `driver-cuda`'s fire paths do.
+/// No variant wraps another error, so there is no source to hand back: both
+/// carrying variants hold a `String` from NVRTC or `CUresult`, neither of
+/// which is a Rust error to chain to. The impl exists so a caller may treat
+/// this as a `Box<dyn Error>`, which several `driver-cuda` fire paths do.
 impl std::error::Error for Error {}

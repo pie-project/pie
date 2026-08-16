@@ -187,6 +187,14 @@ fn not_served() -> BTreeMap<&'static str, &'static str> {
 /// is what noticed the excuse had gone stale rather than letting it
 /// silently skip half a comparison.
 fn identified_but_unfired() -> BTreeMap<&'static str, &'static str> {
+    // EMPTY, and that is a measurement rather than an omission: every
+    // row this build identifies also deploys. The one entry that used
+    // to be here was `google--gemma-4-26B-A4B-it`, excused because
+    // neither `attention_k_eq_v` nor a routed gemma-4 block was traced.
+    // Both are traced now -- on Metal; `Gemma4::trace` still refuses
+    // `attention_k_eq_v` on CUDA, which is a fact about one backend's
+    // text and not about the door. So the differential compares its
+    // deployment like every other row's.
     BTreeMap::new()
 }
 

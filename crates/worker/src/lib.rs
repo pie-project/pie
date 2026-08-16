@@ -1,25 +1,19 @@
 //! `worker` library — engine boot path + supporting modules.
 //!
-//! The `pie` CLI binary (`src/main.rs`) is one consumer; the upcoming
-//! `pie-server` pyo3 wheel under `sdk/server/python/` is another.
-//! Both link against this lib, so the engine boot logic
-//! ([`engine::start_engine`]) has a single source of truth.
-//!
-//! Modules are `pub` so external callers (the pyo3 wheel) can reach
-//! the surface they need — `engine::start_engine`, `config::Config`,
-//! and native-driver bootstrap helpers.
+//! The `pie` CLI binary and the `pie-server` pyo3 wheel both link against this
+//! lib, so [`engine::start_engine`] has a single source of truth. Modules are
+//! `pub` so the wheel can reach the surface it needs.
 
 /// The process-wide allocator for every engine entry point.
 ///
 /// Declared here rather than in each binary because `#[global_allocator]` is
-/// resolved at link time across the whole graph, and `worker` is the one
-/// crate the CLI, the standalone worker and the pyo3 wheel all link.
+/// resolved at link time across the whole graph, and `worker` is the one crate
+/// the CLI, the standalone worker and the pyo3 wheel all link.
 ///
-/// This is a measured change, not a preference. The scheduler loop is a
-/// single thread whose pass time is the critical path for every process hop
-/// at a cohort boundary (CONTENTION_FOLLOWUP.md §20.23), and retiring a wave
-/// frees 512 `LaunchPlan`s — thirty-odd `Vec`s each. Under glibc malloc those
-/// frees cost 2.93 ms per pass; under mimalloc, 0.77 ms.
+/// Measured, not preferred: retiring a wave frees 512 `LaunchPlan`s, thirty-odd
+/// `Vec`s each, on the single scheduler thread whose pass time is the critical
+/// path at a cohort boundary — 2.93 ms per pass under glibc malloc, 0.77 ms
+/// under mimalloc.
 #[global_allocator]
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -40,10 +34,8 @@ mod lifecycle;
 mod link;
 mod preflight;
 
-// Frozen crate-root public API (Seam 1) — these stay stable through the internal
-// §8 `serve/*`→`link/` + `engine.rs` reorg, so `bin/worker` / `bin/pie` / the
-// pyo3 wheel code against the top-level paths and the reorg moves impls
-// underneath without reworking them.
+// Frozen crate-root public API (Seam 1): `bin/worker`, `bin/pie` and the pyo3
+// wheel code against these top-level paths, so impls can move underneath.
 pub use config::Config;
 pub use controller_api::Role;
 pub use engine::{WorkerHandle, run, run_with};

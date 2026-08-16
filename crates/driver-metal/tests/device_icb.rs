@@ -236,8 +236,8 @@ fn read(handle: &driver_metal::device::Handle) -> Vec<u32> {
 fn a_whole_fire_records_and_replays_faster_than_it_encodes() {
     use driver_metal::bind::encode::{Params, Pipelines, commands, encode};
     use driver_metal::device::{Regions, Stepper, record};
-    use driver_metal::lowering::dispatch::{Geometry, plan};
     use driver_metal::lowering::dispatch::table_width;
+    use driver_metal::lowering::dispatch::{Geometry, plan};
     use driver_metal::lowering::executor::{Frame, Slice};
     use model::shared::llama_like::forward::facts::{LlamaLikeFacts, LlamaLikeMetalFacts};
     use model::shared::llama_like::forward::llama_like_metal;

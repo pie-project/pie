@@ -117,10 +117,11 @@ fn nothing_this_crate_needs_to_build_compiles_c() {
 
     // The second claim, and the reason the first one is not the whole test.
     //
-    // Five workspace crates do have build scripts, and three of them declare
-    // a native library -- which is exactly what a driver depending on
-    // `kernels-cuda` would need. `driver-vulkan` depends on all three and
-    // enables the feature on none, and each script does nothing without it.
+    // Workspace crates do have build scripts, and some declare a native
+    // library -- which is exactly what a driver depending on `kernels-cuda`
+    // would need. What matters is that none of them compiles C in the DEFAULT
+    // build: `kernels-vulkan`'s runs `slangc` only under `native`, which is
+    // this crate's `native` and not its default.
     //
     // The evidence is not this list. It is that this suite RUNS on a machine
     // with no CUDA and no Metal and no `slangc` in the default builds: if any
@@ -128,7 +129,20 @@ fn nothing_this_crate_needs_to_build_compiles_c() {
     // The list is here so that a fourth appearing is a decision somebody makes
     // rather than one that happens.
     let want: BTreeSet<&str> = [
-        // Reads `DEP_PIE_KERNELS_VULKAN_SPV_DIR`. No compiler, no C.
+        // Reads `DEP_PIE_KERNELS_VULKAN_SPV_DIR` and re-emits it as a rustc
+        // env. No compiler, no C.
+        //
+        // This row was REMOVED when the modules moved into `kernels-vulkan`'s
+        // rlib, on the reasoning that a script relaying a module DIRECTORY
+        // has no directory left to relay. That is true of the crate's own
+        // code and of `tests/arena.rs` and `tests/device.rs`, which read the
+        // modules as data -- and it is not true of `tests/planbench.rs`,
+        // which still resolves them through
+        // `option_env!("PIE_KERNELS_VULKAN_SPV_DIR")` and can only see that
+        // env because this script sets it. So `crates/driver-vulkan/build.rs`
+        // was never deleted and the row is back: this list is the crates
+        // whose builds could compile C, and a script that exists is on it
+        // whether or not the reason it exists has shrunk to one test.
         "driver-vulkan",
         // `kernels-cuda` STOOD HERE, described as *"the CUDA table crate
         // `model-compiler` reads its rows from"*, whose script wrote into
@@ -145,9 +159,11 @@ fn nothing_this_crate_needs_to_build_compiles_c() {
         // whose builds could compile C, not the crates that are depended on.
         // The Metal shader build, behind `native`, and macOS-only besides.
         "kernels-metal",
-        // slangc over the shader tree, behind `native`. This crate depends on
-        // it with `default-features = false` precisely so a driver consumes
-        // modules rather than producing them.
+        // slangc over the shader tree, and the `include_bytes!` table it
+        // embeds, both behind `native`. This crate's own `native` turns it on;
+        // its default half takes the crate with `default-features = false` and
+        // gets the signature table with no toolchain behind it, which is what
+        // keeps THIS test runnable on a machine with no `slangc`.
         "kernels-vulkan",
         // `model-compiler` STOOD HERE, described as *"content-hashes its own
         // `.rs` files to fingerprint the tracer"*. That script is `model-dsl`'s

@@ -24,9 +24,14 @@ pub use tune::Objective;
 
 /// The generated default config, for tests in this module's children that
 /// need a document the schema accepts.
+///
+/// Rendered against a driver block of the template's choosing rather than
+/// this binary's, so that a test run with no `driver-*` feature still has a
+/// document to parse. What these tests are about is the schema, not the
+/// device.
 #[cfg(test)]
 pub(crate) fn default_config_for_test() -> String {
-    default_config_content()
+    template::config_content_with_any_driver()
 }
 
 #[derive(Subcommand, Debug)]
@@ -116,8 +121,8 @@ fn init(global: &bootstrap::GlobalArgs, force: bool) -> Result<Answer> {
         std::fs::create_dir_all(parent)
             .map_err(|e| anyhow!("create parent dir {parent:?}: {e}"))?;
     }
-    std::fs::write(&cfg_path, default_config_content())
-        .map_err(|e| anyhow!("write {cfg_path:?}: {e}"))?;
+    let content = default_config_content()?;
+    std::fs::write(&cfg_path, content).map_err(|e| anyhow!("write {cfg_path:?}: {e}"))?;
     let did = format!("config written to {}", crate::ui::short_path(&cfg_path));
     // Writing a config file does not install anything. This used to fetch the
     // Python-WASM runtime here, and told you to rerun `pie config init
@@ -344,13 +349,13 @@ fn driver_kind(file: &toml::Value) -> worker::config::DriverKind {
 /// at all follow from it, so guessing the other one would offer a reader
 /// fields their build cannot honour.
 fn default_driver_kind() -> worker::config::DriverKind {
-    #[cfg(all(feature = "driver-metal", not(feature = "driver-cuda")))]
+    #[cfg(all(feature = "driver-metal", not(feature = "_driver-cuda")))]
     {
         return worker::config::DriverKind::Metal;
     }
     #[cfg(all(
         feature = "driver-vulkan",
-        not(feature = "driver-cuda"),
+        not(feature = "_driver-cuda"),
         not(feature = "driver-metal")
     ))]
     {
@@ -358,7 +363,7 @@ fn default_driver_kind() -> worker::config::DriverKind {
     }
     #[cfg(all(
         feature = "driver-wgpu",
-        not(feature = "driver-cuda"),
+        not(feature = "_driver-cuda"),
         not(feature = "driver-metal"),
         not(feature = "driver-vulkan")
     ))]

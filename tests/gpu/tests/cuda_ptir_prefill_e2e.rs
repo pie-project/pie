@@ -20,7 +20,7 @@
 //! characterized garbage. It goes fully green once the driver prefill path lands
 //! and the continuation is coherent (human-eval `text=…`).
 //!
-//!   PIE_COMPILER_LAUNCHER=env cargo test -p pie-gpu-tests --features driver-cuda \
+//!   PIE_COMPILER_LAUNCHER=env cargo test -p pie-gpu-tests --features driver-cuda-13 \
 //!     --test cuda_ptir_prefill_e2e -j6 -- --ignored --nocapture
 
 mod common;

@@ -31,8 +31,8 @@ use crate::layout::region::Region as _;
 use crate::layout::shader::Request;
 use crate::program::Compiler;
 
-use crate::lowering::dispatch::{Dispatch, pipelines_needed};
 use crate::lowering::dispatch::merge;
+use crate::lowering::dispatch::{Dispatch, pipelines_needed};
 use crate::lowering::executor::Slice;
 
 /// The scalars a fire's statements state, in one device buffer.
@@ -346,6 +346,11 @@ pub fn encode_one(
 /// barrier here is the ORDERING, not the flush, and this stays on the
 /// conservative one.
 ///
+/// Measured a third time on a PREFILL, where the barrier count is highest and
+/// the case for a cheaper flush strongest -- gpt-oss-20b over 128 tokens, 460
+/// barriers in the fire: 268.0 ms either way, to the tenth of a millisecond.
+/// Three sweeps, three times the same answer; the flush is free on this part.
+///
 /// [`Visibility::ExecutionOnly`]: crate::device::Visibility::ExecutionOnly
 const VISIBILITY: crate::device::Visibility = crate::device::Visibility::Device;
 
@@ -406,9 +411,88 @@ pub fn encode(
     dispatches: &[Dispatch<'_>],
 ) -> Result<()> {
     let mut hazards = Hazards::default();
+    let mut tally: std::collections::BTreeMap<&'static str, usize> = Default::default();
     let mut n = 0;
+    // `PIE_METAL_MAX_DISPATCH=N` encodes only the first N dispatches of a
+    // fire. A truncated fire computes the wrong answer on purpose: this
+    // exists to BISECT a fire that wedges the GPU, by asking which prefix
+    // still retires. It is what put the Qwen3.6-35B-A3B stall on one
+    // dispatch -- 845 retires, 846 does not -- and the harness drives it
+    // through `PIE_BENCH_CUT_PREFILL` and `PIE_BENCH_CUT_DECODE`.
+    //
+    // Read per fire rather than once, because the harness sets and unsets it
+    // around individual fires to truncate one and leave the others whole.
+    let limit = std::env::var("PIE_METAL_MAX_DISPATCH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(usize::MAX);
+    // `PIE_METAL_MIN_DISPATCH=M` drops the first M instead, so a bisect can
+    // ask the other question: whether a dispatch stalls because of what it
+    // IS, or because of the command buffer that has accumulated in front of
+    // it. Together the pair encodes any window `M..N`.
+    let skip = std::env::var("PIE_METAL_MIN_DISPATCH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let barrier_all = std::env::var_os("PIE_METAL_BARRIER_ALL").is_some();
+    // `PIE_METAL_BARRIER_NONE=1` orders NOTHING, which is an incorrect
+    // execution and the only way to price the ordering. Half of a 128-token
+    // prefill is the GPU waiting on the dispatch in front of it rather than
+    // working, and that claim needs a number a reader can reproduce rather
+    // than a paragraph. The pair with `PIE_METAL_BARRIER_ALL` brackets the
+    // real fire: every barrier, the tracker's, and none.
+    //
+    // Never in serving. Its answers are wrong -- read the logits after one
+    // and they are NaN as often as not.
+    let barrier_none = std::env::var_os("PIE_METAL_BARRIER_NONE").is_some();
+    // `PIE_METAL_TOUCHES=lo..hi` prints what each dispatch in the window
+    // DECLARES, next to whether the tracker barriered before it. A race the
+    // tracker misses is a span a statement touches and does not declare, and
+    // the two readings sit side by side here.
+    let window = std::env::var("PIE_METAL_TOUCHES").ok().and_then(|v| {
+        let (a, b) = v.split_once("..")?;
+        Some(a.parse::<usize>().ok()?..b.parse::<usize>().ok()?)
+    });
+    let dispatches = &dispatches[..dispatches.len().min(limit)];
     for (index, dispatch) in dispatches.iter().enumerate() {
-        if hazards.races(dispatch) {
+        // Skipped INSIDE the loop, not by slicing: `index` is the row this
+        // dispatch owns in the argument table and in the staged scalars, so
+        // a window that renumbered from zero would bind the wrong operands
+        // and prove nothing.
+        if index < skip {
+            continue;
+        }
+        // `PIE_METAL_BARRIER_ALL=1` barriers after every dispatch, which is
+        // the ARBITER for `hazards.races`. That predicate reads
+        // `dispatch.touches`, and a span a statement touches but does not
+        // declare is a race the tracker cannot see -- the failure looks like
+        // a kernel that does not repeat, and no amount of reading the kernel
+        // finds it. Two runs, one with this set, settle which it is.
+        if let Some(w) = &window {
+            if w.contains(&index) {
+                let f = |set: &[Slice]| -> Vec<String> {
+                    set.iter()
+                        .map(|s| format!("{:#x}+{}", s.address, s.bytes))
+                        .collect()
+                };
+                eprintln!(
+                    "  [{index:>4}] {} reads {:?} writes {:?}{}",
+                    dispatch.symbol,
+                    f(&dispatch.touches.reads),
+                    f(&dispatch.touches.writes),
+                    if hazards.races(dispatch) {
+                        "  BARRIER"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+        let why = hazards.why(dispatch);
+        if !barrier_none && (barrier_all || why.is_some()) {
+            if let Some(w) = why {
+                *tally.entry(w).or_insert(0usize) += 1;
+            }
             encoder.barrier(VISIBILITY);
             hazards.clear();
             n += 1;
@@ -421,7 +505,10 @@ pub fn encode(
         n += 1;
     }
     if std::env::var_os("PIE_METAL_BARRIER_COUNT").is_some() {
-        eprintln!("barriers {n} of {} dispatches", dispatches.len());
+        eprintln!(
+            "barriers {n} of {} dispatches {tally:?}",
+            dispatches.len()
+        );
     }
     Ok(())
 }
@@ -451,19 +538,49 @@ impl Hazards {
     /// offsets. **WAR** is a statement overwriting a slot the previous one is
     /// still reading, which the arena's reuse makes just as reachable.
     fn races(&self, dispatch: &Dispatch<'_>) -> bool {
+        self.why(dispatch).is_some()
+    }
+
+    /// WHICH hazard fired, which is a different question from whether one did.
+    ///
+    /// The distinction decides whether a barrier is removable. **RAW** is a
+    /// real edge: the next dispatch reads what this one wrote and no amount
+    /// of renaming or reordering makes it not so. **WAW** and **WAR** are
+    /// FALSE dependencies -- they exist because the arena reuses offsets, and
+    /// a wider arena that handed out a fresh slot would erase them.
+    ///
+    /// So the split prices the arena-renaming idea before anyone builds it.
+    /// On gemma-4-26b-a4b's 128-token prefill, 990 dispatches take 755
+    /// barriers and they break down RAW 694, WAR 55, WAW 5. Renaming reaches
+    /// EIGHT PERCENT of the barriers, and a barrier is worth about ten
+    /// microseconds here (measured: the norm fusion removed ninety of them
+    /// and moved the fire 0.3%), so the whole idea is worth half a
+    /// millisecond of a 293 ms fire. It is closed.
+    ///
+    /// What the same number says positively: the fire is a genuine chain. A
+    /// reordering pass cannot pack independent dispatches into bigger groups
+    /// because 92% of the edges are real. The only way to shorten the chain
+    /// is to MERGE its nodes -- fuse siblings that read the same operand into
+    /// one dispatch -- which is a model-text change and not an encoder one.
+    ///
+    /// `PIE_METAL_BARRIER_COUNT=1` prints the tally.
+    fn why(&self, dispatch: &Dispatch<'_>) -> Option<&'static str> {
         if self.reads.len() + self.writes.len() >= Self::CAP {
-            return true;
+            return Some("CAP");
         }
-        dispatch
+        let raw = dispatch.touches.reads.iter().any(|r| hits(r, &self.writes));
+        let waw = dispatch
             .touches
             .writes
             .iter()
-            .any(|w| hits(w, &self.writes) || hits(w, &self.reads))
-            || dispatch
-                .touches
-                .reads
-                .iter()
-                .any(|r| hits(r, &self.writes))
+            .any(|w| hits(w, &self.writes));
+        let war = dispatch.touches.writes.iter().any(|w| hits(w, &self.reads));
+        match (raw, waw, war) {
+            (true, _, _) => Some("RAW"),
+            (_, true, _) => Some("WAW"),
+            (_, _, true) => Some("WAR"),
+            _ => None,
+        }
     }
 
     fn clear(&mut self) {
@@ -487,9 +604,8 @@ fn hits(slice: &Slice, set: &[Slice]) -> bool {
         return false;
     }
     let end = slice.address.saturating_add(slice.bytes);
-    set.iter().any(|s| {
-        slice.address < s.address.saturating_add(s.bytes) && s.address < end
-    })
+    set.iter()
+        .any(|s| slice.address < s.address.saturating_add(s.bytes) && s.address < end)
 }
 
 /// Lower a fire's dispatches into the commands a recording is made of.

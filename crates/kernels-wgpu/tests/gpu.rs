@@ -43,12 +43,14 @@
 //!    run its own control on its own device answer through
 //!    [`refuses_a_perturbed_reference`]. A test that has never failed has not
 //!    been shown to test anything.
-//! 5. **Every layout comes from the TABLE.** [`run`] builds its bind group
-//!    layout from `kernels_wgpu::bindings()` and refuses a buffer list that is
-//!    not `storage_count()` long; [`Block`] writes uniform fields BY NAME at
-//!    the offsets `uniform_layout()` gives and refuses to finish with a field
-//!    unwritten. Reading a layout off the shader would test the BODY and not
-//!    the ABI.
+//! 5. **Every layout comes from the KERNEL's own statement of itself.** [`run`]
+//!    builds its bind group layout from the ROUTINE's signature and refuses a
+//!    buffer list that is not as long as the signature's buffer run; [`Block`]
+//!    writes uniform fields BY NAME at the offsets the SHADER's own
+//!    `@group(1)` struct puts them at ([`block_of_shader`]) and refuses to
+//!    finish with a field unwritten. Both sides used to be read off the row,
+//!    and the row is gone; a signature the compiler checks and a struct
+//!    `naga` parses are the two things it was describing.
 //!
 //! ## Two things that are this backend's alone
 //!
@@ -100,10 +102,12 @@
 //! — so the number shrinking is a failure rather than a silence.
 //!
 //! **The 56 are not unreachable, only underivable, and that distinction cost
-//! this file its most important kernel.** `driver-wgpu` runs them constantly:
-//! `binding::reorder` falls back to the TRACE's argument order when a row
-//! states none, and `affine_qmm_t`, `sdpa_paged_tiled` and `gdn_core` are in
-//! that set — "most of what a model runs", as that function's own doc says.
+//! this file its most important kernel.** `driver-wgpu` runs them constantly.
+//! The retired `binding::reorder` fell back to the TRACE's argument order when
+//! a row stated none — `affine_qmm_t`, `sdpa_paged_tiled` and `gdn_core` were
+//! in that set, "most of what a model runs", as that function's own doc said —
+//! and an ARM asks for those operands by name now, so the order is stated
+//! rather than fallen back to.
 //! Reading "this harness cannot bind one" as "so it is not proven here" is how
 //! `sdpa_paged_tiled` — the arm every multi-row fire takes, which is most of a
 //! serving deployment's — went unproven while the decode arm beside it had a
@@ -1288,28 +1292,18 @@ fn read(gpu: &Gpu, buffer: &wgpu::Buffer) -> Vec<u8> {
     bytes
 }
 
-/// The `@group(1) @binding(0)` uniform block, filled BY NAME.
-///
-/// Rule 5, made unrepresentable-to-get-wrong. `Binding::Uniform(n)` is a field
-/// INDEX and a shell needs an OFFSET, and turning one into the other is not
-/// multiplication: WGSL aligns a member to its own alignment, so a
-/// `vec2<u32>` after a lone `i32` starts at 8 and not at 4, and the block
-/// rounds to 16. `kv_append` is the row that proves it — 24 bytes of fields
-/// where the naive sum of widths says 20 — and a host that packed by
-/// concatenation would write both strides four bytes low and the shader would
-/// read two halves of two different numbers. Nothing at runtime reports that:
-/// a uniform buffer is bytes.
-///
-/// So every write here goes through `uniform_layout()`, by the row's own
-/// spelling of the field name, and [`Block::done`] refuses a block with a
-/// field nobody wrote. Renaming or reordering a row's scalars therefore fails
-/// a test instead of shifting every value after the change by four bytes.
 /// The `@group(1)` uniform block a shader declares, by field.
 ///
-/// The row used to state this and a retired family has no row. The shader has
-/// always been the truth of it — `a_stated_rows_uniform_layout_is_the_one_its_shader_declares`
-/// compares the two for every stated row and finds them equal — so reading it
-/// here is the same answer from the side that cannot drift.
+/// The row used to state this and there are no rows. The shader has always
+/// been the truth of it — `driver-wgpu`'s
+/// `every_launchs_scalars_land_where_its_module_reads_them` compares a body's
+/// packing against `naga`'s reading of the same struct over every rectangle of
+/// every real lowering and finds them equal — so reading it here is the same
+/// answer from the side that cannot drift.
+///
+/// WGSL's alignment rule is applied while parsing, not checked afterwards: a
+/// member is aligned to its own size, so a `vec2<u32>` after a lone `i32`
+/// starts at 8 and not at 4, and the struct rounds to 16.
 fn block_of_shader(entrypoint: &str) -> (Vec<kernels_wgpu::UniformField>, usize) {
     let source = kernels_wgpu::entrypoint_source(entrypoint, kernels_wgpu::Capability::Baseline)
         .unwrap_or_else(|why| panic!("no source for `{entrypoint}`: {why}"));
@@ -1363,6 +1357,23 @@ fn block_of_shader(entrypoint: &str) -> (Vec<kernels_wgpu::UniformField>, usize)
     (fields, bytes)
 }
 
+/// The `@group(1) @binding(0)` uniform block, filled BY NAME.
+///
+/// Rule 5, made unrepresentable-to-get-wrong. A field is an INDEX and a shell
+/// needs an OFFSET, and turning one into the other is not multiplication:
+/// WGSL aligns a member to its own alignment, so a `vec2<u32>` after a lone
+/// `i32` starts at 8 and not at 4, and the block rounds to 16. `kv_append` is
+/// the kernel that proves it — 24 bytes of fields where the naive sum of
+/// widths says 20 — and a host that packed by concatenation would write both
+/// strides four bytes low and the shader would read two halves of two
+/// different numbers. Nothing at runtime reports that: a uniform buffer is
+/// bytes.
+///
+/// So every write here goes through [`block_of_shader`], by the SHADER's own
+/// spelling of the field name, and [`Block::done`] refuses a block with a
+/// field nobody wrote. Renaming or reordering a struct's members therefore
+/// fails a test instead of shifting every value after the change by four
+/// bytes.
 struct Block {
     row: &'static str,
     fields: Vec<kernels_wgpu::UniformField>,
@@ -1371,21 +1382,30 @@ struct Block {
 }
 
 impl Block {
+    // RETIRED: the row half of this, because `kernels_wgpu::sig` answers
+    // `None` for every entrypoint in the tree and `uniform_layout` has gone
+    // with the table.
+    //
+    // It read the block's fields and its byte count off the ROW —
+    // `uniform_layout(sig)` for the layout and `uniform_size(sig)` for the
+    // allocation — and labelled the `Block` with `sig.symbol` so a
+    // misspelled field name failed naming the row rather than the entrypoint.
+    // The shader-derived branch beneath it was the fallback for a retired
+    // family; it is now the whole function, and the label is the entrypoint.
+    //
+    // It did not become TRUE, it became UNREACHABLE: the `let Some(sig) =
+    // ... else` above it returned on every call for as long as the table has
+    // been empty, so what stood here was reading nothing. The claim is
+    // stronger for the move — the row DESCRIBED the struct and the struct IS
+    // it — and `driver-wgpu`'s `reflect::Declared::uniform_offsets` is
+    // `naga`'s reading of the same declaration, held against what a body
+    // actually packs by `driver-wgpu/tests/arena.rs`'s
+    // `every_launchs_scalars_land_where_its_module_reads_them`.
     fn of(entrypoint: &str) -> Self {
-        // A RETIRED family has no row, and the block is the SHADER's anyway.
-        let Some(sig) = kernels_wgpu::sig(entrypoint) else {
-            let (fields, bytes) = block_of_shader(entrypoint);
-            return Self {
-                row: Box::leak(entrypoint.to_owned().into_boxed_str()),
-                bytes: vec![0u8; bytes],
-                written: vec![false; fields.len()],
-                fields,
-            };
-        };
-        let fields = kernels_wgpu::uniform_layout(sig);
+        let (fields, bytes) = block_of_shader(entrypoint);
         Self {
-            row: sig.symbol,
-            bytes: vec![0u8; kernels_wgpu::uniform_size(sig) as usize],
+            row: Box::leak(entrypoint.to_owned().into_boxed_str()),
+            bytes: vec![0u8; bytes],
             written: vec![false; fields.len()],
             fields,
         }
@@ -1590,91 +1610,42 @@ fn writes_agree_with_the_body(entrypoint: &str, writes: &[bool]) {
     }
 }
 
-/// One dispatch of one BASELINE entrypoint, bound the way the ROW says.
+/// One dispatch of one BASELINE entrypoint, bound the way the ROUTINE says.
 ///
-/// `buffers` is the row's buffer-kinded operands in ROW ORDER — which is the
-/// `@group(0)` binding order, because [`kernels_wgpu::bindings`] numbers that
-/// run densely from zero — and `uniform` is [`Block::done`]'s bytes, or empty
-/// for a row with no scalars.
+/// `buffers` is the routine's buffer-kinded arguments in SIGNATURE ORDER —
+/// which is the `@group(0)` binding order, because the ABI numbers that run
+/// densely from zero — and `uniform` is [`Block::done`]'s bytes, or empty for
+/// a kernel with no scalars.
 ///
-/// Nothing here reads the shader. The bind group layout is built from
-/// `bindings()`, its width is checked against `storage_count()`, and the
-/// uniform binding exists exactly when `uniform_size()` is nonzero. That is
-/// what makes a dispatch a test of the ABI rather than of the body: a shader
-/// that declared its bindings in Metal's numbering — scalars counted alongside
-/// buffers, which is 60 entrypoints' worth of defect in `kernels-vulkan`'s
-/// history — fails to create a pipeline against this layout instead of reading
-/// a plausible number out of the wrong slot.
+/// The bind group layout is not read off the shader's declarations. It is
+/// built from the signature and its width is checked against the buffer list
+/// handed over, so a dispatch is a test of the ABI rather than of the body: a
+/// shader that declared its bindings in Metal's numbering — scalars counted
+/// alongside buffers, which is 60 entrypoints' worth of defect in
+/// `kernels-vulkan`'s history — fails to create a pipeline against this
+/// layout instead of reading a plausible number out of the wrong slot.
+// RETIRED: the row half of this, along with `storage_count`, `uniform_size`
+// and `bindings`, which every one of its assertions was phrased in.
+//
+// It refused an UNSTATED row by name (`sig.operands.is_empty()`, pointing at
+// `.wiki/new-driver/vulkan.md` §13), held `buffers.len()` against
+// `storage_count(sig)` and `uniform.len()` against `uniform_size(sig)`, and
+// derived each buffer's writability by zipping `sig.operands` with
+// `bindings(sig)` and keeping the `Binding::Storage` places — the row's two
+// runs, kept apart the way the launch ABI states them.
+//
+// It did not become TRUE, it became UNREACHABLE. `kernels_wgpu::sig` answers
+// `None` for every entrypoint in the tree, so the `let Some(sig) = ... else`
+// returned before any of it for as long as the table has been empty; what
+// stood here was checking nothing at all. The routine branch below was the
+// fallback and is now the whole function, and it makes the same claim from
+// the side that cannot drift: a routine's Rust signature states the buffer
+// run in order, and the compiler checks it. Three of the assertions were not
+// about the row and are kept above — the grid may not be zero on any axis,
+// it may not exceed the adapter's per-dimension limit, and the dispatch must
+// be one `COVERAGE` claims, now keyed on the ROUTINE's name because that is
+// what `COVERAGE` holds since the rows went.
 fn run(gpu: &Gpu, entrypoint: &str, buffers: &[&wgpu::Buffer], uniform: &[u8], groups: [u32; 3]) {
-    // A RETIRED family has no row, and the layout still has to come from
-    // somewhere. It comes from the ROUTINE, whose signature states the same
-    // types in the same order the body binds them — which is the fact the row
-    // was carrying. Without this, deleting a family's rows silently removes
-    // its shaders from every device test in this file, and it is four of them
-    // for `mlp` alone.
-    let Some(sig) = kernels_wgpu::sig(entrypoint) else {
-        // WORD-BOUNDED, not prefix. `quant`'s symbols carry the quantization
-        // scheme as a PREFIX the routine name never had —
-        // `affine_qmv_fast_bfloat16_gs_64_b_4` is `qmv_fast` — so a routine
-        // owns a symbol when its name appears bounded by underscores.
-        // `kernels-metal::kernel_of` had this exact defect and it cost 363 of
-        // 479 entrypoints.
-        let bounded = |name: &str| {
-            let mut from = 0;
-            while let Some(at) = entrypoint[from..].find(name) {
-                let start = from + at;
-                let end = start + name.len();
-                let before = start == 0 || entrypoint.as_bytes()[start - 1] == b'_';
-                let after = end == entrypoint.len() || entrypoint.as_bytes()[end] == b'_';
-                if before && after {
-                    return true;
-                }
-                from = start + 1;
-            }
-            false
-        };
-        let stem = kernels_wgpu::routines()
-            .into_iter()
-            .filter(|r| bounded(r.name))
-            .max_by_key(|r| r.name.len())
-            .unwrap_or_else(|| panic!("neither a row nor a routine names `{entrypoint}`"));
-        let writes: Vec<bool> = stem
-            .args
-            .iter()
-            .filter(|(ty, _)| kernels_wgpu::is_buffer(*ty))
-            .map(|(ty, _)| writable(*ty))
-            .collect();
-        assert_eq!(
-            writes.len(),
-            buffers.len(),
-            "`{entrypoint}`'s routine binds {} buffers and {} were handed \
-             over",
-            writes.len(),
-            buffers.len(),
-        );
-        dispatch(gpu, entrypoint, buffers, &writes, uniform, groups);
-        return;
-    };
-    assert!(
-        !sig.operands.is_empty(),
-        "`{entrypoint}` is an UNSTATED row: it names no operands, so no layout \
-         can be derived from it and this harness cannot launch it. See \
-         `.wiki/new-driver/vulkan.md` §13",
-    );
-    assert_eq!(
-        buffers.len(),
-        kernels_wgpu::storage_count(sig) as usize,
-        "`{entrypoint}` binds {} storage buffers and {} were handed over",
-        kernels_wgpu::storage_count(sig),
-        buffers.len(),
-    );
-    assert_eq!(
-        uniform.len(),
-        kernels_wgpu::uniform_size(sig) as usize,
-        "`{entrypoint}`'s uniform block is {} bytes and {} were handed over",
-        kernels_wgpu::uniform_size(sig),
-        uniform.len(),
-    );
     assert!(
         groups.iter().all(|n| *n > 0),
         "`{entrypoint}` was given the grid {groups:?}. A zero on any axis \
@@ -1682,50 +1653,91 @@ fn run(gpu: &Gpu, entrypoint: &str, buffers: &[&wgpu::Buffer], uniform: &[u8], g
          `over()` exists to make impossible",
     );
     let limit = gpu.limits.max_compute_workgroups_per_dimension;
-    // The other half of `every_stated_row_is_dispatched_or_named`. That test
-    // says every stated row is claimed; this says every dispatch is one the
-    // list knows about, so the two cannot drift in either direction.
-    assert!(
-        is_claimed(sig.symbol),
-        "`{entrypoint}` is row `{}`, which `COVERAGE` does not claim this \
-         suite dispatches. Classify it there in the same edit that dispatches \
-         it, or the count that test pins stops meaning anything",
-        sig.symbol,
-    );
     assert!(
         groups.iter().all(|n| *n <= limit),
         "`{entrypoint}`'s grid {groups:?} is past this adapter's {limit} \
          workgroups per dimension",
     );
 
-    let writes: Vec<bool> = sig
-        .operands
+    // The layout has to come from somewhere and there are no rows. It comes
+    // from the ROUTINE, whose signature states the same types in the same
+    // order the body binds them — which is the fact the row was carrying.
+    // Without this, deleting a family's rows silently removes its shaders
+    // from every device test in this file, and it is four of them for `mlp`
+    // alone.
+    //
+    // WORD-BOUNDED, not prefix. `quant`'s entrypoints carry the quantization
+    // scheme as a PREFIX the routine name never had —
+    // `affine_qmv_fast_bfloat16_gs_64_b_4` is `qmv_fast` — so a routine
+    // owns a name when its name appears bounded by underscores.
+    // `kernels-metal::kernel_of` had this exact defect and it cost 363 of
+    // 479 entrypoints.
+    let bounded = |name: &str| {
+        let mut from = 0;
+        while let Some(at) = entrypoint[from..].find(name) {
+            let start = from + at;
+            let end = start + name.len();
+            let before = start == 0 || entrypoint.as_bytes()[start - 1] == b'_';
+            let after = end == entrypoint.len() || entrypoint.as_bytes()[end] == b'_';
+            if before && after {
+                return true;
+            }
+            from = start + 1;
+        }
+        false
+    };
+    let stem = kernels_wgpu::routines()
+        .into_iter()
+        .filter(|r| bounded(r.name))
+        .max_by_key(|r| r.name.len())
+        .unwrap_or_else(|| panic!("no routine names `{entrypoint}`"));
+    // The other half of `every_stated_row_is_dispatched_or_named`. That test
+    // says every kernel this suite can dispatch is claimed; this says every
+    // dispatch is one the list knows about, so the two cannot drift in either
+    // direction. Keyed on the ROUTINE now: `COVERAGE`'s rows are routine
+    // names since the table emptied, which is what that test compares them to.
+    assert!(
+        is_claimed(stem.name),
+        "`{entrypoint}` is routine `{}`, which `COVERAGE` does not claim this \
+         suite dispatches. Classify it there in the same edit that dispatches \
+         it, or the count that test pins stops meaning anything",
+        stem.name,
+    );
+    let writes: Vec<bool> = stem
+        .args
         .iter()
-        .zip(kernels_wgpu::bindings(sig))
-        .filter(|(_, place)| matches!(place, kernels_wgpu::Binding::Storage(_)))
-        .map(|(op, _)| writable(op.ty))
+        .filter(|(ty, _)| kernels_wgpu::is_buffer(*ty))
+        .map(|(ty, _)| writable(*ty))
         .collect();
+    assert_eq!(
+        writes.len(),
+        buffers.len(),
+        "`{entrypoint}`'s routine binds {} buffers and {} were handed over",
+        writes.len(),
+        buffers.len(),
+    );
     dispatch(gpu, entrypoint, buffers, &writes, uniform, groups);
 }
 
-/// [`run`] without the row: bind these buffers, in this order, with these
-/// writabilities.
+/// [`run`] without the derivation: bind these buffers, in this order, with
+/// these writabilities.
 ///
 /// # Why this exists
 ///
-/// Because 56 rows of this table state no operands at all -- `sdpa_paged_tiled`
-/// among them -- and `run` cannot launch one: there is no order to derive and
-/// no uniform layout to check against. `driver-wgpu` reaches them through the
-/// TRACE's argument order instead (`binding::reorder`'s `sig.operands.is_empty()`
-/// arm), which is most of what a model actually runs.
+/// Because the order has to come from somewhere, and [`run`] can only get it
+/// from a ROUTINE. It used to be 56 rows that stated no operands at all --
+/// `sdpa_paged_tiled` among them -- so there was no order to derive and no
+/// uniform layout to check against; today it is a kernel no routine names,
+/// and the shape of the hole is the same either way.
 ///
-/// So a proof of one of those kernels has to state the order itself, from the
-/// shader's own `@group(0) @binding(n)` declarations. That is a weaker claim
-/// than `run`'s -- it proves the SHADER's arithmetic and not the driver's
-/// ordering -- and it is the strongest one available for an unstated row. The
-/// ordering is covered separately, end to end, by `driver-wgpu`'s serving
-/// proofs, which put a real model through these same kernels and compare
-/// against a CPU oracle.
+/// So such a proof states the order itself, from the shader's own
+/// `@group(0) @binding(n)` declarations. That is a weaker claim than
+/// [`run`]'s -- it proves the SHADER's arithmetic and not the driver's
+/// ordering, and a caller that lists the buffers wrongly has only written
+/// down its own mistake -- and it is the strongest one available without a
+/// signature to read. The ordering is covered separately, end to end, by
+/// `driver-wgpu`'s serving proofs, which put a real model through these same
+/// kernels and compare against a CPU oracle.
 fn dispatch(
     gpu: &Gpu,
     entrypoint: &str,
@@ -1759,8 +1771,8 @@ fn dispatch_n(
         buffers.len(),
         writes.len()
     );
-    // The row's writability, checked against what the BODY does rather than
-    // against what the declaration says. See `writes_agree_with_the_body`.
+    // The writability handed over, checked against what the BODY does rather
+    // than against what the declaration says. See `writes_agree_with_the_body`.
     writes_agree_with_the_body(entrypoint, writes);
     // The `@group(0)` layout, one entry per buffer, numbered from zero.
     //
@@ -1967,26 +1979,43 @@ fn an_adapter_opens_and_says_what_it_will_bind() {
         "subgroups    {}",
         gpu.features.contains(wgpu::Features::SUBGROUP)
     );
-    let over = kernels_wgpu::over_downlevel_storage_limit();
+    // RETIRED: the ROW census of what needs more than the downlevel floor,
+    // and `kernels_wgpu::over_downlevel_storage_limit` with it — the table is
+    // empty, so `max()` over its rows has nothing to take.
+    //
+    // It printed the rows binding more than eight storage buffers — WebGPU's
+    // guaranteed `maxStorageBuffersPerShaderStage`, which is
+    // `DOWNLEVEL_STORAGE_BUFFERS` — and then asserted the list EMPTY, so that
+    // a row climbing back over the floor after `attn` retired would be named
+    // here rather than turning into a pipeline that refuses to build on a
+    // device reporting only the guarantee. `sdpa_paged_decode`'s eleven were
+    // the last entries.
+    //
+    // It did not become TRUE, it went BLIND: a census keyed on `KERNELS`
+    // reads an empty slice as "nothing is over the floor", which is exactly
+    // what a table that has stopped describing the tree looks like. The
+    // shaders still bind eleven. The count below is the same question asked
+    // of the tree — `SOURCES`, where the `var<storage>` declarations actually
+    // are — and `driver-wgpu`'s
+    // `every_entrypoint_in_the_tree_builds_a_pipeline_on_this_adapter` is
+    // where a kernel this adapter cannot lay out fails by name, against the
+    // adapter's real limits rather than against a number in a table.
+    let over: Vec<&str> = kernels_wgpu::SOURCES
+        .iter()
+        .filter(|(_, text)| {
+            let declared = text.lines().filter(|l| l.contains("var<storage")).count();
+            u32::try_from(declared).expect("a small binding count")
+                > kernels_wgpu::DOWNLEVEL_STORAGE_BUFFERS
+        })
+        .map(|(file, _)| *file)
+        .collect();
     println!(
-        "over floor   {} rows need more than {}: {:?}",
+        "over floor   {} shaders declare more than {}: {:?}",
         over.len(),
         kernels_wgpu::DOWNLEVEL_STORAGE_BUFFERS,
-        over.iter().map(|s| s.symbol).collect::<Vec<_>>(),
+        over,
     );
 
-    // EMPTY, and it was `sdpa_paged_decode` and its siblings: `attn` has
-    // retired, so no ROW binds more than the downlevel floor any more. The
-    // shaders still do — `attn/sdpa_paged.wgsl` declares eleven — which is
-    // why this harness still asks for the adapter's real limits below rather
-    // than `downlevel_defaults()`, and why
-    // `every_entrypoint_in_the_tree_builds_a_pipeline_on_this_adapter` is
-    // where a kernel the adapter cannot lay out now fails, by name.
-    assert!(
-        over.is_empty(),
-        "a ROW binds more than the downlevel floor again: {:?}",
-        over.iter().map(|s| s.symbol).collect::<Vec<_>>(),
-    );
     // The claim this harness is written on. Requesting
     // `Limits::downlevel_defaults()` instead would fail to create exactly the
     // attention pipelines below, on hardware that runs them.
@@ -5301,9 +5330,9 @@ fn a_strided_shared_expert_combine_reads_its_gate_a_full_pitch_apart() {
 /// same number.
 ///
 /// The two widths ride in `SplitQkvParams`, a STORAGE struct at binding 4:
-/// the row states `params: Buf`, so there is no `@group(1)` here at all and
-/// this test hands it none. `kernels_wgpu::uniform_size` answers 0 bytes of
-/// uniform block for that row.
+/// the routine takes `params` as a buffer, so there is no `@group(1)` here at
+/// all and this test hands it none — which is why it builds its bytes itself
+/// rather than through [`Block`], whose parse would find no block to read.
 ///
 /// The x extent is in channel PAIRS — 54 of them over a 256-wide workgroup —
 /// so plain division dispatches nothing at all.
@@ -6843,6 +6872,12 @@ enum Reached {
 /// while the suite does not.
 const COVERAGE: &[(&str, Reached)] = &[
     ("add_bias", Reached::By("add_bias_bfloat16")),
+    // The fused gated-DeltaNet core, dispatched by
+    // `what_the_fused_gated_deltanet_core_costs` -- which is a timing rather
+    // than a check, and claims the row anyway: the suite's question here is
+    // whether anything fires the routine at all, and until that test nothing
+    // in either crate did.
+    ("gdn_core", Reached::By("gdn_core_bfloat16")),
     (
         "qmm_t",
         Reached::ByTemplate(
@@ -7026,7 +7061,7 @@ fn is_claimed(symbol: &str) -> bool {
 /// build box too.
 #[test]
 fn every_stated_row_is_dispatched_or_named() {
-    // Rows that state operands, PLUS crossed routines whose rows are gone.
+    // Crossed routines whose rows are gone.
     //
     // The set this suite can dispatch, which is what `COVERAGE` classifies. It
     // was the rows alone until Stage 3 deleted `mlp`'s: `run` now derives a
@@ -7034,35 +7069,38 @@ fn every_stated_row_is_dispatched_or_named() {
     // dispatchable again and belong here — and a check reading only rows would
     // have let them fall out of `COVERAGE` unnoticed, which is the same class
     // of silence the retirement caused everywhere else.
-    let mut stated: Vec<&str> = kernels_wgpu::KERNELS
-        .iter()
-        .filter(|row| !row.operands.is_empty())
-        .map(|row| row.symbol)
-        .chain(
-            kernels_wgpu::routines()
-                .into_iter()
-                .map(|r| r.name)
-                // By ROW NAME, not through `sig`, which resolves an
-                // ENTRYPOINT: `sig("qmm_t")` is `None` because `qmm_t` is a
-                // row's name and its symbol is spelled differently, and
-                // filtering that way pulled in half the table.
-                .filter(|n| !kernels_wgpu::KERNELS.iter().any(|row| row.name == *n))
-                // The two dark families are dispatched by no test here and
-                // never were: their rows stated no operands, so `COVERAGE`
-                // never claimed them, and losing the row does not change that.
-                .filter(|n| {
-                    kernels_wgpu::retired().iter().any(|e| {
-                        e.split('_')
-                            .collect::<Vec<_>>()
-                            .windows(n.split('_').count())
-                            .any(|w| w.join("_") == **n)
-                    })
-                })
-                // ...and that `COVERAGE` claims. A retired routine this suite
-                // does not dispatch is not a gap in the bookkeeping, it is
-                // `NEWLY_DISPATCHABLE` below.
-                .filter(|n| is_claimed(n)),
-        )
+    //
+    // This began with a `KERNELS.filter(|row| !row.operands.is_empty())` in
+    // front of the chain, and upstream has since deleted `operands` on the
+    // grounds that nothing stated one — *"205 rows, 0 operands stated across
+    // all of them"*. So that filter selected the empty set, and dropping it
+    // changes which rows this test names by none: **a filter that matches
+    // nothing reads exactly like a filter that passes**, which is the sentence
+    // the removing commit wrote about `driver-cuda` and is equally true here.
+    // Asserted rather than assumed — the count below is the same as it was.
+    let mut stated: Vec<&str> = kernels_wgpu::routines()
+        .into_iter()
+        .map(|r| r.name)
+        // By ROW NAME, not through `sig`, which resolves an
+        // ENTRYPOINT: `sig("qmm_t")` is `None` because `qmm_t` is a
+        // row's name and its symbol is spelled differently, and
+        // filtering that way pulled in half the table.
+        .filter(|n| !kernels_wgpu::KERNELS.iter().any(|row| row.name == *n))
+        // The two dark families are dispatched by no test here and
+        // never were: their rows stated no operands, so `COVERAGE`
+        // never claimed them, and losing the row does not change that.
+        .filter(|n| {
+            kernels_wgpu::retired().iter().any(|e| {
+                e.split('_')
+                    .collect::<Vec<_>>()
+                    .windows(n.split('_').count())
+                    .any(|w| w.join("_") == **n)
+            })
+        })
+        // ...and that `COVERAGE` claims. A retired routine this suite
+        // does not dispatch is not a gap in the bookkeeping, it is
+        // `NEWLY_DISPATCHABLE` below.
+        .filter(|n| is_claimed(n))
         .collect();
     stated.sort_unstable();
     stated.dedup();
@@ -7091,21 +7129,14 @@ fn every_stated_row_is_dispatched_or_named() {
                 continue;
             }
         };
-        // A RETIRED family's entrypoint resolves through the census rather
-        // than through a row, and the "is it filed under the right row"
-        // question has no row to ask about. What still holds — and is the
-        // half that matters — is that the name is a real entrypoint.
-        match kernels_wgpu::sig(named) {
-            Some(sig) => assert_eq!(
-                sig.symbol, *row,
-                "`{named}` belongs to row `{}` and is filed under `{row}`",
-                sig.symbol,
-            ),
-            None => assert!(
-                kernels_wgpu::entrypoints().iter().any(|e| e == named),
-                "`{row}` names `{named}`, which is no entrypoint"
-            ),
-        }
+        // The "is it filed under the right ROW" half is gone with the rows:
+        // an entrypoint resolves through the census now, and `sig` answers
+        // `None` for every name. What still holds -- and is the half that
+        // matters -- is that the name is a real entrypoint.
+        assert!(
+            kernels_wgpu::entrypoints().iter().any(|e| e == named),
+            "`{row}` names `{named}`, which is no entrypoint"
+        );
         assert!(
             body.contains(must_appear),
             "`{row}` is dispatched as `{must_appear}`, and that string appears \
@@ -7140,7 +7171,6 @@ fn every_stated_row_is_dispatched_or_named() {
         "gate",
         "gated_rms",
         "gated_rms_strided",
-        "gdn_core",
         "gdn_core_recurrent",
         "gdn_core_recurrent_prefill",
         "gdn_core_recurrent_slotted",
@@ -7185,7 +7215,7 @@ fn every_stated_row_is_dispatched_or_named() {
     );
     assert_eq!(
         dispatched.len(),
-        48,
+        49,
         "this suite dispatches {} of the table's {} stated rows. The number is \
          pinned so that it SHRINKING is a failure rather than a silence — if a \
          row genuinely cannot be dispatched, say so with `Reached::Not` and a \
@@ -7596,6 +7626,7 @@ fn a_device_argmax_keeps_the_lowest_index_on_a_tie_and_flags_a_stop_token() {
 #[test]
 #[ignore = "a measurement, not an assertion"]
 fn how_long_a_decodes_kernels_take() {
+    release_only();
     let Some((gpu, _held)) = adapter() else {
         return;
     };
@@ -7796,4 +7827,1092 @@ fn how_long_a_decodes_kernels_take() {
         );
         println!("affine_qmv_fast   {what}  {out_rows:5}x{k:<5} {ms:>8.3} ms/dispatch");
     }
+}
+
+/// WHAT `affine_qmv_fast` COSTS, ISOLATED FROM THE MODEL AROUND IT.
+///
+/// A kernel change has to be judged on the kernel. Timing it through a decode
+/// cannot do that here: this machine is shared, and the same unchanged build
+/// measured 66.5 ms and 112.7 ms a decode an hour apart, which is a wider
+/// spread than any inner-loop rewrite would produce.
+///
+/// So dispatch the projection on its own, at a shape big enough that the kernel
+/// dominates the dispatch around it -- 4096 rows of 4096 at four bits is 8 MB
+/// of packed weight, where the model's own 3584 x 1024 is under one and would
+/// be measuring `create_bind_group`.
+///
+/// The number this prints is only worth something against ANOTHER run of the
+/// same test, which is how it was used: stash the kernel, run, unstash, run.
+///
+/// # What it was worth end to end
+///
+/// The isolated ratio was 1.13x and the whole serving suite moved further than
+/// that: `driver-wgpu`'s `tests/serving.rs` ran 719, 727, 705 and 766 seconds
+/// across four runs before the rewrite and 451 after it, on the same 22 tests
+/// and the same checkpoint. The suite is mostly prefill and about 110 seconds
+/// of that is weight staging, so the compute half is where the difference
+/// went. A shared machine can move a number by a third; it did not move any of
+/// the four earlier runs below 705.
+#[test]
+#[ignore = "a timing, not a check"]
+fn what_a_quantised_matvec_costs() {
+    release_only();
+    let Some((gpu, _held)) = adapter() else {
+        return;
+    };
+    let (group, bits) = (64usize, 4u32);
+    let (n_out, k) = (4096usize, 4096usize);
+    let plane = Affine::new(group, bits, n_out, k, 0x51ce);
+    let w = storage(gpu, &plane.words());
+    let (scale_buf, _) = bf16s(gpu, &plane.scales);
+    let (bias_buf, _) = bf16s(gpu, &plane.biases);
+    let (x, _x_seen) = bf16s(gpu, &spread(k, 41));
+    let y = sentinelled(gpu, n_out.div_ceil(2));
+    let entrypoint = "affine_qmv_fast_bfloat16_gs_64_b_4";
+    let block = Block::of(entrypoint)
+        .i32("in_vec_size", i32::try_from(k).expect("fits"))
+        .i32("out_vec_size", i32::try_from(n_out).expect("fits"))
+        .done();
+    let grid = [1u32, over(n_out as u32, 8), 1];
+    // `dispatch_n` and not `run`, for the reason its own doc gives: a
+    // benchmark wants the pipeline built once and the encoder reused, or it
+    // measures `create_compute_pipeline`. The first draft of this test called
+    // `run` in a loop and reported 20.5 ms for a matvec that moves 9 MB --
+    // half a gigabyte a second, which would have been a spectacular finding
+    // about the kernel and was a measurement of the compiler.
+    let bufs: [&wgpu::Buffer; 5] = [&w, &scale_buf, &bias_buf, &x, &y];
+    let writes = [false, false, false, false, true];
+    run(gpu, entrypoint, &bufs, &block, grid);
+    const REPEAT: u32 = 200;
+    let mut runs: Vec<f64> = Vec::new();
+    for _ in 0..5 {
+        let t = std::time::Instant::now();
+        dispatch_n(gpu, entrypoint, &bufs, &writes, &block, grid, REPEAT);
+        runs.push(t.elapsed().as_secs_f64() * 1e3 / f64::from(REPEAT));
+    }
+    runs.sort_by(f64::total_cmp);
+    let median = runs[runs.len() / 2];
+    // The packed weight is the traffic that cannot be avoided: one code per
+    // value at `bits` bits, plus a scale and a bias per group.
+    let bytes = (n_out * k * bits as usize / 8) + (n_out * (k / group) * 2 * 2);
+    println!(
+        "\n  `{entrypoint}` at [{n_out}, {k}]: median {median:.4} ms over \
+         {REPEAT} per submission, fastest {:.4}\n  {} MB of weight -> \
+         {:.1} GB/s effective",
+        runs[0],
+        bytes / (1 << 20),
+        bytes as f64 / (median / 1e3) / 1e9
+    );
+}
+
+/// **A measurement in the dev profile is a measurement of the dev profile.**
+///
+/// `cargo test` builds `dev` and this workspace sets no `[profile.dev]`
+/// opt-level. `dispatch_n` amortises a submission's host cost across its
+/// repeats, which is why these timings were assumed to be a property of the
+/// card -- but the loop around it is host code too, and the difference is not
+/// a scale factor: in debug this file's tile sweep named `32x64` fastest and
+/// put the tiled GEMM AHEAD of the matvec, where release names `16x32` and
+/// puts every tile behind it. A conclusion was published off that and had to
+/// be retracted.
+///
+/// So the measurements refuse rather than mislead. They are `#[ignore]`d as
+/// well, so nothing in the gate reaches this.
+fn release_only() {
+    // `if` rather than `assert!`: in release the condition folds to a
+    // constant and `clippy::assertions_on_constants` is right that asserting
+    // one says nothing. The refusal is the point, not the assertion.
+    if cfg!(debug_assertions) {
+        panic!(
+            "this is a measurement and `cargo test` builds the dev profile; \
+             rerun it with `--release`"
+        );
+    }
+}
+
+/// **Whether this adapter offers the cooperative matrix this tree calls absent.**
+///
+/// `driver-wgpu`'s prefill docs name the ceiling as *"WebGPU's baseline tier
+/// has no cooperative-matrix instruction at all"*, and use it to explain why a
+/// 610-GFLOP prefill costs 815 ms where a 4090's tensor cores would retire it
+/// in about four. That sentence is true of the BASELINE and was quietly taken
+/// as true of this backend, which is a different claim.
+///
+/// It came apart from the outside. llama.cpp's own WebGPU backend ships
+/// `wgsl-shaders/mul_mat_subgroup_matrix.wgsl`, opening
+/// `enable chromium_experimental_subgroup_matrix;` — so a WGSL matmul CAN
+/// reach the hardware, through an extension rather than the baseline. That is
+/// Dawn's spelling. `wgpu 30`, the version already in this tree's lock file,
+/// carries its own: `FeaturesWGPU::EXPERIMENTAL_COOPERATIVE_MATRIX`, backed on
+/// Vulkan by `VK_KHR_cooperative_matrix`, with `Adapter::
+/// cooperative_matrix_properties` to say which shapes and types a device has.
+///
+/// So the question is not whether the standard permits it. It is whether the
+/// crate and the card in front of this suite do, and that is a thing to ASK
+/// rather than to reason about — this file's whole history is measurements
+/// beating readings of the source.
+///
+/// # And offered is not usable, so this asks that too
+///
+/// A feature bit an adapter advertises still has to survive `request_device`.
+/// This one is gated TWICE: naming `EXPERIMENTAL_COOPERATIVE_MATRIX` is
+/// refused on its own — *"experimental features are not enabled"* — until the
+/// caller also signs `unsafe ExperimentalFeatures::enabled()`, whose contract
+/// is an acknowledgement that an `EXPERIMENTAL_` path may carry UB. With both,
+/// a device opens. The path is open in the sense that matters, and its price
+/// is that second signature rather than a wgpu release.
+///
+/// Needs an adapter; prints and asserts nothing about the answer, because
+/// either answer is a fact about the machine rather than about the tree.
+///
+/// # The rest of that backend, since it is a reference for what is open here
+///
+/// `ggml/src/ggml-webgpu/wgsl-shaders/` is 44 WGSL files solving this exact
+/// problem, and four of them are the leads this tree has already written down
+/// as open:
+///
+/// * `flash_attn_vec_split.wgsl` + `flash_attn_vec_reduce.wgsl` — split-K
+///   flash DECODING, in two dispatches. `attn/sdpa_paged.wgsl`'s notes name
+///   flash-decoding as the one restructure they do not cover, ceiling ~1.5x.
+/// * `rms_norm_mul.wgsl` — the norm and the multiply that follows it in ONE
+///   entrypoint. `serve::record`'s lever is *"fewer launches"*, and this is
+///   what one fewer looks like.
+/// * `mul_mat_reg_tile.wgsl` — register-tiled matmul, the shape between this
+///   suite's `qmm_t` and the subgroup-matrix path.
+/// * `gated_delta_net.wgsl` — a WGSL GDN, against `ssm/gdn_core.wgsl`.
+///
+/// Named rather than summarised: a reading of someone else's kernel is worth
+/// nothing beside a measurement of ours, and the point of the list is that the
+/// measurements are now cheap to set up.
+#[test]
+fn whether_this_adapter_offers_the_cooperative_matrix_this_tree_calls_absent() {
+    let instance = wgpu::Instance::new(
+        wgpu::InstanceDescriptor::new_without_display_handle().with_env(),
+    );
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+        apply_limit_buckets: false,
+    })) else {
+        println!("SKIP: no adapter answered");
+        return;
+    };
+    let info = adapter.get_info();
+    let features = adapter.features();
+    let coop = features
+        .features_wgpu
+        .contains(wgpu::FeaturesWGPU::EXPERIMENTAL_COOPERATIVE_MATRIX);
+    println!("\n  adapter: {} ({:?})", info.name, info.backend);
+    println!("  EXPERIMENTAL_COOPERATIVE_MATRIX: {coop}");
+    if coop {
+        let props = adapter.cooperative_matrix_properties();
+        println!("  {} shape(s) offered:", props.len());
+        for p in props {
+            println!("    {p:?}");
+        }
+        // OFFERED IS NOT USABLE, and this file's rule is to ask. A feature bit
+        // an adapter advertises still has to survive `request_device`, which
+        // is where a backend that cannot really deliver it says so.
+        let got = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("cooperative matrix probe"),
+            required_features: wgpu::Features {
+                features_wgpu: wgpu::FeaturesWGPU::EXPERIMENTAL_COOPERATIVE_MATRIX,
+                ..wgpu::Features::empty()
+            },
+            required_limits: adapter.limits(),
+            // The bit is gated twice: naming the feature is not enough, the
+            // caller has to sign the experimental token as well. `unsafe`
+            // because wgpu asks the caller to acknowledge that an
+            // EXPERIMENTAL_ feature may carry UB -- which is a fact about the
+            // path this probe is scouting, and belongs in what it reports.
+            experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        }));
+        match got {
+            Ok(_) => println!("  a device OPENED with it, so the path is open"),
+            Err(e) => println!("  but a device would not open with it: {e}"),
+        }
+    }
+    println!(
+        "  (this backend's own device asks for `ExperimentalFeatures::disabled()`, \
+         so offering is not using)"
+    );
+}
+
+/// **What the cooperative matrix is actually worth, on this card, in WGSL.**
+///
+/// `#[ignore]`, a measurement, and the one that turns
+/// `whether_this_adapter_offers_the_cooperative_matrix_this_tree_calls_absent`
+/// from a feature bit into a number. That probe says the path is open; open is
+/// not fast, and this tree's rule is that a lever is worth what it measures.
+///
+/// # The shape is chosen by the adapter, not by the example
+///
+/// wgpu's own `cooperative_matrix` example is `coop_mat8x8<f32, _>`, and it
+/// would not run here: this adapter offers six shapes and **every one takes
+/// `F16` for A and B**. So this uses `coop_mat16x16<f16, A>` and `<f16, B>`
+/// with an `<f32, C>` accumulator, which is the entry it does offer and also
+/// the one a real GEMM wants — f16 in, f32 out, no accumulation drift.
+///
+/// The comparison is `[3584, 1024]` at m=512, the same shape
+/// `which_tile_the_batched_projection_wants` sweeps, where the shipped
+/// quantised `qmm_t` does 1.412 ms and the fastest tile 1.382. **This is not a
+/// drop-in against those**: it multiplies f16 rather than unpacking affine-U4,
+/// so it is a CEILING and not a replacement. That is what a ceiling is for.
+///
+/// # The number
+///
+/// | | ms | TFLOP/s |
+/// | --- | --- | --- |
+/// | `qmm_t` 32x32, quantised (shipped) | 1.412 | 2.7 |
+/// | `coop_mat16x16` f16 -> f32 | **0.168** | **22.4** |
+///
+/// **8.4x**, and it is a naive kernel — one 16x16 tile per workgroup, no
+/// shared-memory staging, no register blocking, K walked sixteen at a time
+/// straight out of storage. So 22.4 TFLOP/s is the coop path's FLOOR rather
+/// than its peak, and the distance from the shipped GEMM is not a tuning gap.
+///
+/// What it does not say: an affine-U4 kernel has to unpack into f16 fragments
+/// before it can feed these, and that costs something this measurement does
+/// not pay. The honest reading is that the arithmetic is 8x cheaper and the
+/// dequantisation is now the open question, which is a different and much
+/// better problem than "WGSL cannot reach the hardware".
+///
+/// # And 8.4x here is 1.3x at the shell, which is the number to plan against
+///
+/// `driver-wgpu`'s `where_a_prefills_time_goes_across_its_plan` budgets a
+/// 512-row prefill: 815 ms, of which 250 is per-fire host, ~226 is weight GEMM
+/// and ~339 is non-GEMM GPU work nobody has attributed yet. Make the GEMMs
+/// 8.4x and 226 becomes 27 while the other 589 does not move — **815 ms to
+/// ~616, 1.3x.**
+///
+/// This file has already published one isolated win that did not reach the
+/// shell (the tile: 1.34x here, 7 % there). This is the same shape at a larger
+/// scale. The cooperative-matrix quantised GEMM now EXISTS -- see
+/// `what_the_cooperative_matrix_costs_when_it_is_fed_affine_u4`, 3.25x the
+/// shipped kernel with every output verified -- and even that lands as 1.24x
+/// at the shell. The ceiling is real; the floor under it is somewhere else.
+///
+/// # Checked, because a kernel that computes nothing is also fast
+///
+/// `a` is f16 1.0 and `b` is f16 0.5, both exact, so every element of a
+/// correct `c` is `k * 0.5 = 512` after one dispatch and nothing else is. The
+/// readback asserts it: **0 of 1,835,008 elements wrong**. This suite has
+/// caught four vacuous measurements, one of which reported zero differences
+/// over 262,144 elements because both seats were reading the same route, so a
+/// timing without an oracle beside it does not get published here.
+///
+/// Run with `--ignored --nocapture --release`.
+#[test]
+#[ignore = "measurement"]
+fn what_the_cooperative_matrix_is_worth_at_a_projections_shape() {
+    release_only();
+    const SRC: &str = r#"
+enable f16;
+enable wgpu_cooperative_matrix;
+
+@group(0) @binding(0) var<storage, read> a: array<f16>;
+@group(0) @binding(1) var<storage, read> b: array<f16>;
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;
+@group(0) @binding(3) var<uniform> dims: vec4<u32>;
+
+const TILE: u32 = 16u;
+
+@compute @workgroup_size(32)
+fn coop_gemm(@builtin(workgroup_id) wg: vec3<u32>) {
+    let n = dims.y;
+    let k = dims.z;
+    let row = wg.x * TILE;
+    let col = wg.y * TILE;
+    let c_at = row * n + col;
+    var acc = coopLoadT<coop_mat16x16<f32, C>>(&c[c_at], n);
+    for (var kk: u32 = 0u; kk < k; kk += TILE) {
+        let av = coopLoadT<coop_mat16x16<f16, A>>(&a[row * k + kk], k);
+        let bv = coopLoadT<coop_mat16x16<f16, B>>(&b[kk * n + col], n);
+        acc = coopMultiplyAdd(av, bv, acc);
+    }
+    coopStoreT(acc, &c[c_at], n);
+}
+"#;
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle().with_env());
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+        apply_limit_buckets: false,
+    })) else {
+        println!("SKIP: no adapter answered");
+        return;
+    };
+    let wanted = wgpu::Features {
+        features_wgpu: wgpu::FeaturesWGPU::EXPERIMENTAL_COOPERATIVE_MATRIX,
+        features_webgpu: wgpu::FeaturesWebGPU::SHADER_F16,
+    };
+    if !adapter.features().contains(wanted) {
+        println!("SKIP: this adapter offers no cooperative matrix with f16");
+        return;
+    }
+    let Ok((device, queue)) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("cooperative matrix bench"),
+        required_features: wanted,
+        required_limits: adapter.limits(),
+        // See the probe above for why this signature is needed and what it
+        // acknowledges.
+        experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+        memory_hints: wgpu::MemoryHints::Performance,
+        trace: wgpu::Trace::Off,
+    })) else {
+        println!("SKIP: no device opened with the feature");
+        return;
+    };
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("coop_gemm"),
+        source: wgpu::ShaderSource::Wgsl(SRC.into()),
+    });
+    if let Some(e) = pollster::block_on(scope.pop()) {
+        println!("the module did not compile:\n{e}");
+        return;
+    }
+    let (m, n, k) = (512usize, 3584usize, 1024usize);
+    // f16 `1.0` and `0.5`, so the product is exactly representable and a wrong
+    // answer is visible rather than plausible: every output must be k * 0.5.
+    let a_bytes: Vec<u8> = std::iter::repeat_n([0x00u8, 0x3C], m * k).flatten().collect();
+    let b_bytes: Vec<u8> = std::iter::repeat_n([0x00u8, 0x38], k * n).flatten().collect();
+    let mk = |contents: &[u8], usage| {
+        use wgpu::util::DeviceExt as _;
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents,
+            usage,
+        })
+    };
+    let st = wgpu::BufferUsages::STORAGE;
+    let a = mk(&a_bytes, st);
+    let b = mk(&b_bytes, st);
+    let c = mk(
+        &vec![0u8; m * n * 4],
+        st | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+    );
+    let dims: [u32; 4] = [m as u32, n as u32, k as u32, n as u32];
+    let u = mk(
+        bytemuck::cast_slice(&dims),
+        wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    );
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: None,
+        layout: None,
+        module: &module,
+        entry_point: Some("coop_gemm"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
+    });
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: a.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: b.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: c.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: u.as_entire_binding(),
+            },
+        ],
+    });
+    let grid = [(m / 16) as u32, (n / 16) as u32, 1u32];
+    let fire = |repeat: u32| {
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            for _ in 0..repeat {
+                pass.dispatch_workgroups(grid[0], grid[1], grid[2]);
+            }
+        }
+        queue.submit(Some(enc.finish()));
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(WAIT),
+            })
+            .expect("the queue drains");
+    };
+    fire(1);
+    const REPEAT: u32 = 50;
+    let mut runs = Vec::new();
+    for _ in 0..5 {
+        let t = std::time::Instant::now();
+        fire(REPEAT);
+        runs.push(t.elapsed().as_secs_f64() * 1e3 / f64::from(REPEAT));
+    }
+    runs.sort_by(f64::total_cmp);
+    let fastest = runs[0];
+    let gflop = 2.0 * (m * n * k) as f64 / 1e9;
+    println!("\n  coop_mat16x16 f16->f32 at [{n}, {k}], m={m}:");
+    println!(
+        "    fastest {fastest:.4} ms over {REPEAT} per submission -> {:.1} TFLOP/s",
+        gflop / (fastest / 1e3) / 1e3
+    );
+    println!(
+        "    the shipped quantised `qmm_t` does this shape in 1.412 ms, \
+         so the ceiling is {:.1}x",
+        1.412 / fastest
+    );
+
+    // A KERNEL THAT COMPUTES NOTHING IS ALSO FAST. `a` is f16 1.0 and `b` is
+    // f16 0.5 throughout, both exactly representable, so every element of a
+    // correct `c` is `k * 0.5` after ONE dispatch and nothing else is. Read it
+    // back rather than trusting the timing -- this suite has caught four
+    // vacuous measurements that way, including one that reported zero
+    // differences over 262,144 elements because both seats read the same route.
+    queue.write_buffer(&c, 0, &vec![0u8; m * n * 4]);
+    fire(1);
+    let read = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: (m * n * 4) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    enc.copy_buffer_to_buffer(&c, 0, &read, 0, (m * n * 4) as u64);
+    queue.submit(Some(enc.finish()));
+    read.map_async(wgpu::MapMode::Read, .., |_| {});
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(WAIT),
+        })
+        .expect("the readback drains");
+    let view = read.get_mapped_range(..).expect("the range maps");
+    let got: Vec<f32> = bytemuck::cast_slice(&view).to_vec();
+    let want = k as f32 * 0.5;
+    let wrong = got.iter().filter(|v| (**v - want).abs() > 1e-3).count();
+    println!(
+        "    correctness: {} of {} elements are not {want}, first is {:?}",
+        wrong,
+        got.len(),
+        got.first()
+    );
+    assert_eq!(
+        wrong, 0,
+        "the timing above is of a kernel that computes the wrong product"
+    );
+}
+
+/// **The cooperative matrix fed by AFFINE-U4, which is the kernel this
+/// backend would actually ship.**
+///
+/// `#[ignore]`, a measurement, and the one that closes the gap
+/// `what_the_cooperative_matrix_is_worth_at_a_projections_shape` left open.
+/// That test multiplies f16 and calls itself a ceiling for exactly this
+/// reason: a real projection here unpacks 4-bit codes with a scale and a bias
+/// per 64, and nothing had measured what feeding the tensor cores from those
+/// costs.
+///
+/// # Why it can be done at all
+///
+/// `coopLoad` takes a pointer whose base is a scalar and naga's validator
+/// asks nothing about its ADDRESS SPACE, so the standard trick is available:
+/// dequantise a tile into `var<workgroup> array<f16>` and load the fragment
+/// from there. The weight plane is `[n, k]` and the `B` role wants `[k, n]`,
+/// so the staging loop transposes as it unpacks — which is free here, because
+/// it is writing to workgroup memory either way.
+///
+/// The activation is f16 in storage and loads straight into the `A` fragment.
+/// This backend's arena is bf16, so a shipped version pays one more
+/// conversion; that is named rather than measured, and it is a widening of
+/// 16 x 16 against a dequantisation of the same.
+///
+/// # The oracle
+///
+/// Every code is nibble 1, every scale 0.5, every bias 0, so every weight is
+/// exactly 0.5 and every activation exactly 1.0 — which walks the whole unpack
+/// (shift, mask, widen, multiply, add) and still lands on `k * 0.5 = 512` for
+/// every output. A kernel that dropped the scale, the bias or the nibble would
+/// miss it. The run says **0 of 1,835,008 wrong**.
+///
+/// # The number
+///
+/// | | ms | TFLOP/s |
+/// | --- | --- | --- |
+/// | `qmm_t` 32x32, quantised (shipped) | 1.412 | 2.7 |
+/// | **this, cooperative + affine-U4** | **0.435** | **8.6** |
+/// | `coop_mat16x16` on plain f16 (ceiling) | 0.168 | 22.4 |
+///
+/// **3.25x the shipped kernel**, and 39 % of the f16 ceiling — so unpacking
+/// costs 2.6x, which is the number that was missing and is much better than
+/// the pessimistic reading. It is also a naive tile: 16x16 out, B restaged
+/// every sixteen of K, no double buffering, no register blocking, one
+/// `coopMultiplyAdd` per two `workgroupBarrier`s. Widening the tile amortises
+/// the staging over more MMAs and is where the remaining 2.6x lives.
+///
+/// # What it buys at the shell, which is less
+///
+/// `driver-wgpu`'s prefill budget: 815 ms = 250 host + ~226 weight GEMM + ~339
+/// unattributed non-GEMM. At 3.25x the GEMM line is 70 ms, so the fire is
+/// ~659 ms — **1.24x.** Worth having and not worth reordering the roadmap for;
+/// the 339 ms nobody has attributed is still the larger number.
+///
+/// # A naga landmine, which cost more than the kernel did
+///
+/// Writing `&c[row * n + col]` inline at BOTH the accumulator load and the
+/// store — the same arithmetic either side of the k loop — makes naga 30's
+/// SPIR-V backend panic:
+///
+/// ```text
+/// internal error: entered unreachable code:
+/// Expression [90] is not cached!   (naga/src/back/spv/index.rs:550)
+/// ```
+///
+/// An `unreachable!`, not a diagnostic, so it says nothing about which line.
+/// Hoisting the index into one `let` in front of the loop fixes it entirely.
+/// Bisected rather than guessed: a minimal shader established that a workgroup
+/// `coopLoad` compiles, then that a workgroup `coopLoad` INSIDE a loop
+/// compiles, which left the pointer arithmetic as the only difference.
+///
+/// Worth knowing before writing the shipped version, because the failure mode
+/// is a panic in a dependency and the fix is a `let`.
+///
+/// Run with `--ignored --nocapture --release`.
+#[test]
+#[ignore = "measurement"]
+fn what_the_cooperative_matrix_costs_when_it_is_fed_affine_u4() {
+    release_only();
+    const SRC: &str = r#"
+enable f16;
+enable wgpu_cooperative_matrix;
+
+@group(0) @binding(0) var<storage, read> w: array<u32>;
+@group(0) @binding(1) var<storage, read> scales: array<f16>;
+@group(0) @binding(2) var<storage, read> biases: array<f16>;
+@group(0) @binding(3) var<storage, read> act: array<f16>;
+@group(0) @binding(4) var<storage, read_write> c: array<f32>;
+@group(0) @binding(5) var<uniform> dims: vec4<u32>;
+
+const TILE: u32 = 16u;
+const GROUP: u32 = 64u;
+
+// 16 rows of k by 16 columns of n, which is what the `B` role reads at
+// stride 16.
+var<workgroup> btile: array<f16, 256>;
+
+@compute @workgroup_size(32)
+fn coop_qgemm(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_index) li: u32,
+) {
+    let n = dims.y;
+    let k = dims.z;
+    let groups = k / GROUP;
+    let row = wg.x * TILE;
+    let col = wg.y * TILE;
+    // HOISTED, and it has to be. Writing `&c[row * n + col]` inline at both
+    // the load and the store puts the same arithmetic either side of the k
+    // loop, and naga's SPIR-V backend then panics `Expression is not cached`
+    // -- an internal `unreachable!`, not a diagnostic. One `let` in front of
+    // it is the whole difference.
+    let c_at = row * n + col;
+    var acc = coopLoadT<coop_mat16x16<f32, C>>(&c[c_at], n);
+    for (var k0: u32 = 0u; k0 < k; k0 += TILE) {
+        // 256 values, 32 lanes, eight each. The weight plane is [n, k] and the
+        // `B` role wants [k, n], so this transposes as it unpacks.
+        for (var t: u32 = li; t < 256u; t += 32u) {
+            let kl = t / TILE;
+            let nl = t % TILE;
+            let n_g = col + nl;
+            let k_g = k0 + kl;
+            let at = n_g * k + k_g;
+            let word = w[at / 8u];
+            let code = (word >> ((at % 8u) * 4u)) & 0xfu;
+            let g = n_g * groups + k_g / GROUP;
+            btile[t] = f16(f32(code)) * scales[g] + biases[g];
+        }
+        workgroupBarrier();
+        let bv = coopLoadT<coop_mat16x16<f16, B>>(&btile[0], TILE);
+        let av = coopLoadT<coop_mat16x16<f16, A>>(&act[row * k + k0], k);
+        acc = coopMultiplyAdd(av, bv, acc);
+        workgroupBarrier();
+    }
+    coopStoreT(acc, &c[c_at], n);
+}
+"#;
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle().with_env());
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+        apply_limit_buckets: false,
+    })) else {
+        println!("SKIP: no adapter answered");
+        return;
+    };
+    let wanted = wgpu::Features {
+        features_wgpu: wgpu::FeaturesWGPU::EXPERIMENTAL_COOPERATIVE_MATRIX,
+        features_webgpu: wgpu::FeaturesWebGPU::SHADER_F16,
+    };
+    if !adapter.features().contains(wanted) {
+        println!("SKIP: this adapter offers no cooperative matrix with f16");
+        return;
+    }
+    let Ok((device, queue)) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("cooperative matrix, quantised"),
+        required_features: wanted,
+        required_limits: adapter.limits(),
+        experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+        memory_hints: wgpu::MemoryHints::Performance,
+        trace: wgpu::Trace::Off,
+    })) else {
+        println!("SKIP: no device opened with the feature");
+        return;
+    };
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("coop_qgemm"),
+        source: wgpu::ShaderSource::Wgsl(SRC.into()),
+    });
+    if let Some(e) = pollster::block_on(scope.pop()) {
+        println!("the module did not compile:\n{e}");
+        return;
+    }
+    let (m, n, k) = (512usize, 3584usize, 1024usize);
+    let groups = n * (k / 64);
+    use wgpu::util::DeviceExt as _;
+    let mk = |contents: &[u8], usage| {
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents,
+            usage,
+        })
+    };
+    let st = wgpu::BufferUsages::STORAGE;
+    // Every nibble 1, every scale f16 0.5, every bias 0, every activation 1.0.
+    let w = mk(
+        bytemuck::cast_slice(&vec![0x1111_1111u32; n * k / 8]),
+        st,
+    );
+    let scales = mk(&std::iter::repeat_n([0x00u8, 0x38], groups).flatten().collect::<Vec<u8>>(), st);
+    let biases = mk(&vec![0u8; groups * 2], st);
+    let act = mk(
+        &std::iter::repeat_n([0x00u8, 0x3C], m * k)
+            .flatten()
+            .collect::<Vec<u8>>(),
+        st,
+    );
+    let c = mk(
+        &vec![0u8; m * n * 4],
+        st | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+    );
+    let dims: [u32; 4] = [m as u32, n as u32, k as u32, 0];
+    let u = mk(
+        bytemuck::cast_slice(&dims),
+        wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    );
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: None,
+        layout: None,
+        module: &module,
+        entry_point: Some("coop_qgemm"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
+    });
+    let bufs = [&w, &scales, &biases, &act, &c, &u];
+    let entries: Vec<wgpu::BindGroupEntry<'_>> = bufs
+        .iter()
+        .enumerate()
+        .map(|(i, b)| wgpu::BindGroupEntry {
+            binding: u32::try_from(i).expect("six bindings"),
+            resource: b.as_entire_binding(),
+        })
+        .collect();
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &entries,
+    });
+    let grid = [(m / 16) as u32, (n / 16) as u32, 1u32];
+    let fire = |repeat: u32| {
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            for _ in 0..repeat {
+                pass.dispatch_workgroups(grid[0], grid[1], grid[2]);
+            }
+        }
+        queue.submit(Some(enc.finish()));
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(WAIT),
+            })
+            .expect("the queue drains");
+    };
+    fire(1);
+    const REPEAT: u32 = 20;
+    let mut runs = Vec::new();
+    for _ in 0..5 {
+        let t = std::time::Instant::now();
+        fire(REPEAT);
+        runs.push(t.elapsed().as_secs_f64() * 1e3 / f64::from(REPEAT));
+    }
+    runs.sort_by(f64::total_cmp);
+    let fastest = runs[0];
+    let gflop = 2.0 * (m * n * k) as f64 / 1e9;
+    println!("\n  coop_mat16x16 fed affine-U4 at [{n}, {k}], m={m}:");
+    println!(
+        "    fastest {fastest:.4} ms -> {:.1} TFLOP/s",
+        gflop / (fastest / 1e3) / 1e3
+    );
+    println!(
+        "    against `qmm_t` 32x32's 1.412 ms: {:.2}x; \
+         against the f16 ceiling's 0.168: {:.2}x of it",
+        1.412 / fastest,
+        0.168 / fastest
+    );
+
+    queue.write_buffer(&c, 0, &vec![0u8; m * n * 4]);
+    fire(1);
+    let read = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: (m * n * 4) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    enc.copy_buffer_to_buffer(&c, 0, &read, 0, (m * n * 4) as u64);
+    queue.submit(Some(enc.finish()));
+    read.map_async(wgpu::MapMode::Read, .., |_| {});
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(WAIT),
+        })
+        .expect("the readback drains");
+    let view = read.get_mapped_range(..).expect("the range maps");
+    let got: Vec<f32> = bytemuck::cast_slice(&view).to_vec();
+    let want = k as f32 * 0.5;
+    let wrong = got.iter().filter(|v| (**v - want).abs() > 1e-3).count();
+    println!(
+        "    correctness: {} of {} are not {want}, first is {:?}",
+        wrong,
+        got.len(),
+        got.first()
+    );
+    assert_eq!(
+        wrong, 0,
+        "the timing above is of a kernel that unpacks the wrong weight"
+    );
+}
+
+/// WHICH TILE THE BATCHED PROJECTION SHOULD BE FIRED AT.
+///
+/// `how_long_a_decodes_kernels_take` reports something that should not be
+/// true: `affine_qmm_t` is SLOWER than `affine_qmv_fast` at every batch it
+/// tries, from one row to five hundred and twelve -- 24x at m=1 and still
+/// 1.62x at m=512. A tiled GEMM losing to a matvec at 512 rows is not a
+/// tuning question, it is a sign the tile is wrong for this adapter.
+///
+/// The tile is not baked in: ten `bm x bn` pairs are stamped, and
+/// `Qwen35MetalFacts::qmm_tile` picks one. So the question is answerable by
+/// measurement rather than by reading the kernel, and it is worth answering
+/// before anything in the body is touched -- a rewrite aimed at the wrong tile
+/// would be measuring the same mistake more carefully.
+///
+/// # That premise expired, and this test is how it was noticed
+///
+/// The matvec was rewritten after the paragraph above was written -- `qmv.wgsl`
+/// now hoists the scale, the bias and the packed word out of the value loop --
+/// so the ratio it quotes had to be re-measured. Doing that took two goes,
+/// because the first was in the wrong profile.
+///
+/// `cargo test` builds the dev profile and this workspace sets no
+/// `[profile.dev]` opt-level. `dispatch_n` amortises the host cost of a
+/// SUBMISSION across its repeats, which is why these timings were assumed
+/// profile-immune -- and they are not, because the loop around it is host code
+/// too. At `[3584, 1024]`, m=512, fastest of five:
+///
+/// | | debug | release |
+/// | --- | --- | --- |
+/// | `affine_qmv_fast` | 2.902 | **1.151** |
+/// | `qmm_t` 16x32 | 2.886 | **1.382** (fastest tile) |
+/// | `qmm_t` 32x32 (shipped) | 3.304 | 1.412 |
+/// | `qmm_t` 32x64 | 2.475 (fastest tile) | 1.501 |
+///
+/// **The debug run named a different winner and inverted the headline.** In
+/// debug the tiled GEMM appeared to beat the matvec at 0.85x and I wrote that
+/// down as retiring the doc above; in release every tile is 1.20x the matvec
+/// or worse, so **the original sentence was right and my correction of it was
+/// the artefact**. What actually changed is the size of the gap: 1.62x has
+/// become 1.20x, so the qmv rewrite narrowed the matvec's lead rather than
+/// surrendering it.
+///
+/// The tile spread also collapsed. In release the shipped `(32, 32)` is 1.412
+/// against the best 1.382, two percent, where debug showed 1.34x — so there is
+/// no tile worth switching to at the kernel either, which is the same answer
+/// `driver-wgpu`'s `which_tile_a_512_row_prefill_wants` gets end to end in
+/// release (four tiles within 7 %, shipped tied for first).
+///
+/// **Every timing in this file is a claim about a build.** Run the measurement
+/// tests here with `--release` or do not quote them.
+#[test]
+#[ignore = "a timing, not a check"]
+fn which_tile_the_batched_projection_wants() {
+    release_only();
+    let Some((gpu, _held)) = adapter() else {
+        return;
+    };
+    let (group, bits) = (64usize, 4u32);
+    // gate/up at a prefill's worth of rows: the shape the hybrid fires most.
+    let (n, k, m) = (3584usize, 1024usize, 512usize);
+    let plane = Affine::new(group, bits, n, k, 0x7113);
+    let w = storage(gpu, &plane.words());
+    let (scale_buf, _) = bf16s(gpu, &plane.scales);
+    let (bias_buf, _) = bf16s(gpu, &plane.biases);
+    let (x, _) = bf16s(gpu, &spread(m * k, 17));
+    let y = sentinelled(gpu, (m * n).div_ceil(2));
+    let bufs: [&wgpu::Buffer; 5] = [&w, &scale_buf, &bias_buf, &x, &y];
+    let writes = [false, false, false, false, true];
+    const REPEAT: u32 = 20;
+    let time = |entrypoint: &str, uniform: &[u8], grid: [u32; 3]| -> f64 {
+        run(gpu, entrypoint, &bufs, uniform, grid);
+        let mut runs: Vec<f64> = Vec::new();
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            dispatch_n(gpu, entrypoint, &bufs, &writes, uniform, grid, REPEAT);
+            runs.push(t.elapsed().as_secs_f64() * 1e3 / f64::from(REPEAT));
+        }
+        runs.sort_by(f64::total_cmp);
+        runs[0]
+    };
+    let vec_block = Block::of("affine_qmv_fast_bfloat16_gs_64_b_4")
+        .i32("in_vec_size", i32::try_from(k).expect("fits"))
+        .i32("out_vec_size", i32::try_from(n).expect("fits"))
+        .done();
+    let vector = time(
+        "affine_qmv_fast_bfloat16_gs_64_b_4",
+        &vec_block,
+        [
+            u32::try_from(m).expect("fits"),
+            over(u32::try_from(n).expect("fits"), 8),
+            1,
+        ],
+    );
+    println!("\n  [{n}, {k}] at m={m}, fastest of five:");
+    println!("    affine_qmv_fast                 {vector:7.3} ms");
+    let mut best = (f64::INFINITY, String::new());
+    for (bm, bn) in [
+        (16usize, 16usize),
+        (16, 32),
+        (16, 64),
+        (32, 16),
+        (32, 32),
+        (32, 64),
+        (64, 16),
+        (64, 32),
+        (64, 64),
+        // `bm_128_bn_32` is stamped only with a `wm_4` tail, which is a
+        // different entrypoint and a different probe shape; asking for the
+        // bare name is how this test found that out.
+    ] {
+        let name = format!("affine_qmm_t_bfloat16_gs_64_b_4_bm_{bm}_bn_{bn}");
+        let block = Block::of(&name)
+            .i32("k", i32::try_from(k).expect("fits"))
+            .i32("n", i32::try_from(n).expect("fits"))
+            .done();
+        let ms = time(
+            &name,
+            &block,
+            [
+                over(u32::try_from(n).expect("fits"), bn as u32),
+                over(u32::try_from(m).expect("fits"), bm as u32),
+                1,
+            ],
+        );
+        println!(
+            "    qmm_t bm={bm:<3} bn={bn:<3}            {ms:7.3} ms   {:.2}x the matvec",
+            ms / vector
+        );
+        if ms < best.0 {
+            best = (ms, format!("bm={bm} bn={bn}"));
+        }
+    }
+    println!(
+        "\n  the fastest tile is {} at {:.3} ms, {:.2}x the matvec",
+        best.1,
+        best.0,
+        best.0 / vector
+    );
+}
+
+/// WHAT THE FUSED GATED-DELTANET CORE COSTS, WHICH NOTHING HAS MEASURED.
+///
+/// `driver-wgpu`'s `whether_a_decode_costs_by_the_fire_or_by_the_launch` ends
+/// by naming this kernel and saying no test in either crate dispatches it in
+/// isolation. The arithmetic that got it there: a decode's per-layer sweep puts
+/// a gated-DeltaNet layer at about 2.9 ms and there are eighteen of them, which
+/// is 52 ms against a decode of roughly 50 -- so the cost is in those layers,
+/// and the thirteen launches of one are twelve projections at the floor plus
+/// this.
+///
+/// It is the only kernel in the mix that touches the recurrent state: a
+/// megabyte a layer read and written, against 187 projections that share a
+/// quarter of a gigabyte of weights between them.
+///
+/// Shaped as the model fires it -- one decode row, 16 value heads of 128 over
+/// 16 key heads of 128, a 6144-channel fused conv at width 4 -- so the number
+/// is the model's and not a microbenchmark's.
+///
+/// # What it says, and the reason sitting in the body
+///
+///     median 0.7736 ms, fastest 0.4565
+///     2.0 MB of recurrent state -> 4.6 GB/s effective
+///     eighteen of them a token is 8.2 ms
+///
+/// Half a percent of this adapter's bandwidth, and 8.2 ms of a decode that
+/// runs about 50. The projections next to it are AT the dispatch floor; this
+/// is not.
+///
+/// The body says why. `qraw` and `kraw` are convolved from `q_off`/`k_off` at
+/// `hk_idx`, and neither index depends on `dv_idx` -- but `dv_idx` is `gid.y`
+/// and runs 0..127, so every one of the 128 value rows of a head convolves the
+/// same query and key channels and L2-normalises them again. 128x redundant,
+/// and the same pathology `affine_qmv_fast` had: a quantity recomputed per row
+/// that does not vary by row.
+///
+/// It is why the SPLIT pair exists -- `gdn_prep` stages q and k once and
+/// `gdn_core_recurrent` reads them -- and a decode fires the fused one.
+///
+/// Four of the 128 share a workgroup, so four of them can be folded through
+/// `var<workgroup>`. That was written -- with the barrier care it needs, since
+/// `row_sum32` is workgroup-wide and the rows that skip the convolution still
+/// have to reach every call of it -- and it is SLOWER, twice measured:
+///
+///     baseline                          0.4565 ms
+///     shared, read in the inner loops   0.8671
+///     shared, hoisted into registers    0.5321
+///
+/// So the redundancy is not costing what it looks like it costs. 128 rows
+/// convolving the same channels read the same addresses, which the cache
+/// serves; what they spend is L1 throughput and arithmetic, not bandwidth, and
+/// replacing that with workgroup memory and an extra barrier costs more than
+/// it saves even when the values are hoisted back into registers before the
+/// inner loops.
+///
+/// Which leaves the 4.6 GB/s unexplained by the obvious reading. The batch
+/// sweep explains it:
+///
+///     rows=1    0.4415 ms    2 MB state     4.8 GB/s   per row 0.4415 ms
+///     rows=4    0.8430       8 MB          10.0        per row 0.2107
+///     rows=16   0.5270      32 MB          63.7        per row 0.0329
+///
+/// Sixteen times the work in about the same time. At the ROW COUNT A DECODE
+/// FIRES -- one -- this kernel is waiting on its fixed cost and not on its
+/// arithmetic: 512 workgroups of 128 threads, four state elements a lane, and
+/// four `row_sum32` calls between them.
+///
+/// So no rewrite of the body helps a single-row decode, which is what the two
+/// shared-memory attempts above found the hard way. The lever is rows -- more
+/// conversations in one fire, or fusing the statements around this one -- and
+/// both are lowering, not WGSL. The 63.7 GB/s at sixteen rows is the same body
+/// on the same adapter, which is the proof that the body is not the problem.
+#[test]
+#[ignore = "a timing, not a check"]
+fn what_the_fused_gated_deltanet_core_costs() {
+    release_only();
+    let Some((gpu, _held)) = adapter() else {
+        return;
+    };
+    for rows in [1usize, 4, 16] {
+        gdn_core_at(gpu, rows);
+    }
+}
+
+/// [`what_the_fused_gated_deltanet_core_costs`] at one batch size.
+///
+/// Swept because a flat cost as the rows grow is the signature of a dispatch
+/// that is waiting on something other than its arithmetic -- 512 workgroups of
+/// 128 threads is not much of a 4090, and this kernel calls `row_sum32` four
+/// times, which is twenty workgroup barriers for four state elements a lane.
+/// A cost that scales says the opposite. The two want different work and
+/// nothing here has told them apart.
+fn gdn_core_at(gpu: &Gpu, rows: usize) {
+    let (dk, dv, hk, hv) = (128usize, 128usize, 16usize, 16usize);
+    let (conv_dim, kc, slots) = (6144usize, 4usize, rows);
+    let (q_off, k_off, v_off) = (0i32, 2048i32, 4096i32);
+    let words = |v: &[f32]| -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()
+    };
+    // The two recurrent planes and the one that receives the rolled window.
+    let conv = storage(gpu, &words(&spread(slots * kc * conv_dim, 3)));
+    let fresh = storage(gpu, &words(&vec![0.0f32; slots * kc * conv_dim]));
+    let rstate = storage(gpu, &words(&spread(slots * hv * dv * dk, 5)));
+    let (mixed, _) = bf16s(gpu, &spread(rows * conv_dim, 7));
+    let out = sentinelled(gpu, (rows * hv * dv).div_ceil(2));
+    let (conv_w, _) = bf16s(gpu, &spread(conv_dim * kc, 11));
+    let (conv_b, _) = bf16s(gpu, &vec![0.0f32; conv_dim]);
+    let a_log = storage(gpu, &words(&spread(hv, 13)));
+    let (dt_bias, _) = bf16s(gpu, &spread(hv, 17));
+    let (a_gate, _) = bf16s(gpu, &spread(rows * hv, 19));
+    let (b_gate, _) = bf16s(gpu, &spread(rows * hv, 23));
+    // `GdnCoreParams`, field for field.
+    let mut block: Vec<u8> = Vec::new();
+    for v in [
+        dk as i32, dv as i32, hk as i32, hv as i32, conv_dim as i32, kc as i32, q_off, k_off,
+        v_off,
+    ] {
+        block.extend_from_slice(&v.to_le_bytes());
+    }
+    block.extend_from_slice(&1e-6f32.to_le_bytes());
+    block.extend_from_slice(&(1.0f32 / (dk as f32).sqrt()).to_le_bytes());
+    let params = storage(gpu, &block);
+
+    let bufs: [&wgpu::Buffer; 12] = [
+        &mixed, &conv, &rstate, &out, &conv_w, &conv_b, &a_log, &dt_bias, &a_gate, &b_gate,
+        &fresh, &params,
+    ];
+    // `gdn_grid` states LANES `[32, Dv, rows * Hv]` over a `(32, 4)` workgroup.
+    let grid = [1u32, (dv / 4) as u32, (rows * hv) as u32];
+    let entrypoint = "gdn_core_bfloat16";
+    run(gpu, entrypoint, &bufs, &[], grid);
+    // What the BODY writes, which is what `dispatch_n` checks against: the
+    // recurrent state in place, the output, and the rolled window. `mixed` and
+    // `conv_state` are read-only however the tree declares them.
+    let writes = [
+        false, false, true, true, false, false, false, false, false, false, true, false,
+    ];
+    const REPEAT: u32 = 50;
+    let mut runs: Vec<f64> = Vec::new();
+    for _ in 0..5 {
+        let t = std::time::Instant::now();
+        dispatch_n(gpu, entrypoint, &bufs, &writes, &[], grid, REPEAT);
+        runs.push(t.elapsed().as_secs_f64() * 1e3 / f64::from(REPEAT));
+    }
+    runs.sort_by(f64::total_cmp);
+    // The state is the traffic that cannot be avoided: read and written once.
+    let state = (slots * hv * dv * dk * 4 * 2) as f64;
+    println!(
+        "  rows={rows:<3} median {:.4} ms  fastest {:.4}  {:5.1} MB state  \
+         {:6.1} GB/s  per row {:.4} ms",
+        runs[runs.len() / 2],
+        runs[0],
+        state / (1u64 << 20) as f64,
+        state / (runs[0] / 1e3) / 1e9,
+        runs[0] / rows as f64,
+    );
 }

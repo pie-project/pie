@@ -759,7 +759,7 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
     uint32_t o_smem_offset_w = o_smem.template get_permuted_offset<UPCAST_STRIDE_FINAL_O>(
         warp_idx_in_wg * 16 + lane_idx % 16,
         warpgroup_idx * NUM_MMA_D_CKV + mma_d * 2 + lane_idx / 16);
-    o_smem.template stmatrix_m8n8x4(o_smem_offset_w, o_frag_f16);
+    o_smem.stmatrix_m8n8x4(o_smem_offset_w, o_frag_f16);
 #else
     uint32_t o_smem_offset_w = o_smem.template get_permuted_offset<UPCAST_STRIDE_FINAL_O>(
         warp_idx_in_wg * 16 + lane_idx / 4, warpgroup_idx * NUM_MMA_D_CKV + mma_d * 2);

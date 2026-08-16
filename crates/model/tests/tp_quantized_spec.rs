@@ -107,7 +107,7 @@ fn spec(f: &Facts) -> model_ir::trace::ForwardPlan {
             || {
                 // The two-step form the fused kernel declines to serve.
                 let summed = dsl::cuda::all_reduce(&partial, f.hidden);
-                dsl::cuda::residual_add_rmsnorm(&summed, &y, &mlp_norm.name, f.hidden);
+                let _ = dsl::cuda::residual_add_rmsnorm(&summed, &y, &mlp_norm.name, f.hidden);
             },
         )
         .expect("the guarded landing produces the normed activation");
@@ -116,7 +116,7 @@ fn spec(f: &Facts) -> model_ir::trace::ForwardPlan {
         // another partial. A full text would land it with a second
         // guard; one is enough to show the shape.
         let gate_up = matmul(&mlp_in, &proj("gate_up", 2 * inter));
-        let act = dsl::cuda::swiglu(&gate_up, inter, true);
+        let act = dsl::cuda::swiglu(&gate_up, inter);
         let _down = matmul(&act, &proj("down", f.hidden));
     })
 }

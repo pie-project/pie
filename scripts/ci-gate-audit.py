@@ -70,6 +70,27 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 
+# The driver-flavor and probe chain: an inner library, and the package that
+# must re-declare its features for them to be reachable from a build command.
+# `pie` is where the chain has to end, because it is the only member with a
+# `[[bin]]`.
+FORWARDS = [("engine", "worker"), ("worker", "pie")]
+
+# Features deliberately not forwarded, and why. Same contract as EXCLUSIONS:
+# the reason lives in the data, because the next reader's question is "was
+# this decided or forgotten?".
+FORWARD_EXCLUSIONS = {
+    ("worker", "pie"): {
+        "nixl": (
+            "`transport`'s NIXL engine is a stub -- `crates/transport/src/"
+            "lib.rs` says so and `Error` has a variant for being asked for "
+            "it in a build that lacks it. Forwarding it would put a "
+            "selectable flag on the CLI that turns on nothing a user can "
+            "reach. Forward it when the engine exists."
+        ),
+    },
+}
+
 # Crates deliberately outside a gate, and what would have to change.
 #
 # The value is the reason. It is printed when the audit fails on a crate
@@ -123,8 +144,19 @@ EXCLUSIONS = {
         # kernel is text NVRTC compiles at run time. The entry to remove is
         # the last warning, not this line.
         "kernels-cuda": "52 warnings, and the rewrite is landing in it",
-        "kernels-metal": "needs a Mac",
-        "kernels-vulkan": "needs slangc on the runner; zero warnings otherwise",
+        # `kernels-metal` and `kernels-vulkan` STOOD HERE, reading "needs a
+        # Mac" and "needs slangc on the runner". Neither claim survives:
+        # this gate names both crates, and neither toolchain is needed to
+        # CHECK one -- `kernels-vulkan` only shells out to `slangc` under
+        # `native`, which is off by default. `kernels-vulkan` is clean under
+        # this gate's exact flags.
+        #
+        # `kernels-metal` is not, and that is a real failure rather than a
+        # missing exclusion: its LIB is clean, but `--all-targets` does not
+        # compile on a non-Mac toolchain (6 errors, E0061/E0308, in the lib
+        # test and `tests/entrypoints.rs`). Re-excluding it here would turn
+        # a red gate into a silent one, which is the trade this whole file
+        # exists to refuse.
         "pie-gpu-tests": "needs a GPU to be worth compiling",
         "pie-server-py": "a pyo3 extension; built by maturin, not by this job",
     },
@@ -150,6 +182,11 @@ STEPS = {
 
 def members():
     """Every crate Cargo considers part of this workspace."""
+    return {name for name in packages()}
+
+
+def packages():
+    """`name -> declared features` for every workspace member."""
     out = subprocess.run(
         ["cargo", "metadata", "--no-deps", "--format-version", "1"],
         cwd=ROOT,
@@ -157,7 +194,62 @@ def members():
         text=True,
         check=True,
     )
-    return {p["name"] for p in json.loads(out.stdout)["packages"]}
+    return {p["name"]: p["features"] for p in json.loads(out.stdout)["packages"]}
+
+
+def forward_problems(pkgs):
+    """Features that stop at a library instead of reaching the binary.
+
+    A feature is only real if the package that produces a BINARY can select
+    it. `engine` and `worker` are libraries, so every flavor and probe they
+    offer has to be re-declared twice on the way out -- by hand, in three
+    manifests, with nothing checking that the copies agree.
+
+    They have not agreed. The root package lost its `driver-metal` forward
+    when the C++ Metal driver was retired and never got it back, leaving
+    five dead `#[cfg]` blocks in `pie init`'s config template (see
+    `scripts/cfg-feature-audit.py`, which catches the OTHER half of that
+    bug: the `cfg` naming a feature nobody declares). `profile-hot-path`
+    and `profile-all` reached `worker` and stopped. `nixl` still does, and
+    is named below so that it stops being an accident.
+
+    Read out of `cargo metadata`, so this sees what Cargo resolved rather
+    than what a manifest appears to say.
+    """
+    problems = []
+    for inner, outer in FORWARDS:
+        forwarded = {
+            edge.split("/", 1)[1]
+            for values in pkgs[outer].values()
+            for edge in values
+            if edge.startswith(f"{inner}/")
+        }
+        allowed = FORWARD_EXCLUSIONS.get((inner, outer), {})
+        for feature in sorted(pkgs[inner]):
+            if feature == "default" or feature in forwarded:
+                continue
+            if feature in allowed:
+                continue
+            problems.append(
+                f"forward: `{inner}/{feature}` is not forwarded by "
+                f"`{outer}`, so no build of `{outer}` can select it. Add "
+                f"the forward, or add it to FORWARD_EXCLUSIONS[({inner!r}, "
+                f"{outer!r})] in this file WITH THE REASON."
+            )
+        for feature in sorted(allowed):
+            if feature not in pkgs[inner]:
+                problems.append(
+                    f"forward: `{inner}/{feature}` is excused from being "
+                    f"forwarded but `{inner}` no longer declares it. Drop "
+                    f"the entry."
+                )
+            elif feature in forwarded:
+                problems.append(
+                    f"forward: `{inner}/{feature}` is excused from being "
+                    f"forwarded and IS forwarded by `{outer}`. The "
+                    f"exclusion is stale -- drop it."
+                )
+    return problems
 
 
 def steps_by_name():
@@ -211,9 +303,10 @@ def listed(body):
 
 
 def main():
-    all_members = members()
+    pkgs = packages()
+    all_members = set(pkgs)
     bodies = steps_by_name()
-    problems = []
+    problems = forward_problems(pkgs)
 
     for gate, step_names in STEPS.items():
         gated = {}

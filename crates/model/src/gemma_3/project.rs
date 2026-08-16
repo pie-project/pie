@@ -171,6 +171,7 @@ pub fn deployment(f: &LlamaLikeFacts, s: &Schedule, norm_eps: f32) -> Deployment
             // Full rotation at the head dim; gemma-3 has no partial
             // rotary factor.
             rotary_dim: 0,
+            q_gate: false,
         })
         .collect();
     Deployment {
@@ -644,6 +645,7 @@ mod tests {
             paged_multi_batch: true,
             qmm_multi_batch: true,
             add_bias: false,
+            fused_qk_rope: false,
         }
     }
 

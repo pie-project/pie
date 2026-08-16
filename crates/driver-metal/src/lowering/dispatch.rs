@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! for launch in &lowered.launches {
-//!     let (routine, arm) = crossed(symbol)?;  // the stem names the body
+//!     let routine = crossed(symbol)?;         // the stem names the body
 //!     let args = bind(lowered, launch, ..)?;  // the driver resolves names
 //!     let facts = facts_of(lowered, launch, geometry);
 //!     routine.body(arm(handles, facts)?, planner)?; // the body states the rest
@@ -120,7 +120,7 @@ pub struct Geometry {
     /// fire's. SDPA's head width is an `Env` the routine composes, so it has
     /// nowhere to ride but here.
     ///
-    /// [`arm::stated`]: crate::lowering::arm
+    /// [`arm::stated`]: crate::lowering::hold
     pub global_head_dim: u32,
     /// The key/value head count the FULL-attention layers use, or zero for
     /// one shape everywhere. See [`Self::global_head_dim`].
@@ -136,6 +136,20 @@ pub struct Geometry {
     ///
     /// [`layout::kv::Shape::full_attn_every`]: crate::layout::kv::Shape::full_attn_every
     pub full_attn_every: u32,
+    /// The value heads and per-head width the LINEAR-attention layers carry,
+    /// or `(0, 0)` for a stack with none.
+    ///
+    /// A THIRD pair beside [`Self::head_dim`] and [`Self::global_head_dim`],
+    /// and not a third spelling of the same thing: a gated-deltanet layer has
+    /// no keys and values in the attention sense at all. qwen3.5's linear
+    /// layers run 32 value heads of 128 next to full layers at 2 heads of
+    /// 256, and the recurrent slab, the gated norm and the scan grid are all
+    /// sized by the former while the KV pool is sized by the latter.
+    ///
+    /// `heads_at` cannot answer this, because it answers about PAGES.
+    pub v_heads: u32,
+    /// See [`Self::v_heads`].
+    pub v_dim: u32,
 }
 
 impl Geometry {
@@ -151,6 +165,25 @@ impl Geometry {
     #[must_use]
     pub const fn is_full_attention(&self, l: u32) -> bool {
         self.full_attn_every > 1 && (l + 1).is_multiple_of(self.full_attn_every)
+    }
+
+    /// This layer's key/value head count and per-head width.
+    ///
+    /// The fire's own pair for every deployment but gemma-4, and for that one
+    /// the full layers' pair on the layers that are full.
+    /// This layer's RECURRENT head count and width.
+    ///
+    /// Falls back to the attention pair when the stack states no recurrent
+    /// one, which is what keeps `device_gdn.rs`'s rig -- a GDN fire whose
+    /// only shape IS the recurrent shape -- reading the same numbers it
+    /// always did.
+    #[must_use]
+    pub const fn recurrent_at(&self) -> (u32, u32) {
+        if self.v_heads > 0 && self.v_dim > 0 {
+            (self.v_heads, self.v_dim)
+        } else {
+            (self.kv_heads, self.head_dim)
+        }
     }
 
     /// This layer's key/value head count and per-head width.
@@ -462,7 +495,7 @@ pub fn facts_of(
     lowered: &Lowered,
     launch: &Launch,
     geometry: Geometry,
-) -> crate::lowering::arm::Facts {
+) -> crate::lowering::hold::Facts {
     // THIS STATEMENT'S affine point, which is the fire's unless the statement
     // is projecting a router gate and the gates arrived at their own.
     //
@@ -476,16 +509,16 @@ pub fn facts_of(
         && lowered.args[launch.args.start as usize..launch.args.end as usize]
             .iter()
             .any(|a| match a {
-                Arg::Weight(name) => {
-                    name.ends_with(crate::model::binding::ROUTER_GATE_AT_ANY_LAYER)
-                }
+                Arg::Weight(name) => crate::model::binding::ROUTER_POINT_AT_ANY_LAYER
+                    .iter()
+                    .any(|g| name.ends_with(g)),
                 _ => false,
             }) {
         (geometry.router_group, geometry.router_bits)
     } else {
         (geometry.group, geometry.bits)
     };
-    crate::lowering::arm::facts(
+    crate::lowering::hold::facts(
         launch,
         geometry,
         lowered.n_requests,
@@ -568,13 +601,13 @@ pub fn plan_launch<'a, S: Resolver>(
     // states the mapping itself, as a stem, so that no row is asked: routing
     // through `sig_in` was circular, and a family whose rows were deleted
     // would have made its own routines unreachable.
-    let Some((routine, arm)) = crate::lowering::routine::crossed(symbol) else {
+    let Some(routine) = crate::lowering::routine::crossed(symbol) else {
         return Err(Undispatchable::Unclaimed {
             symbol: symbol.clone(),
             op: launch.op,
         });
     };
-    plan_routine(lowered, launch, routine, arm, frame, geometry, resolver)
+    plan_routine(lowered, launch, routine, frame, geometry, resolver)
 }
 
 /// One launch of a crossed routine, as the dispatches its body asked for.
@@ -592,7 +625,6 @@ fn plan_routine<'a, S: Resolver>(
     lowered: &'a Lowered,
     launch: &Launch,
     routine: &'static kernels::routine::Routine<kernels_metal::routine::Metal>,
-    arm: crate::lowering::arm::Arm,
     frame: Frame,
     geometry: Geometry,
     resolver: &mut S,
@@ -615,12 +647,10 @@ fn plan_routine<'a, S: Resolver>(
         op: launch.op,
         why,
     };
-    // HOW MANY OF THE WIDTHED OPERANDS ARE RESULTS -- measured, by asking the
-    // arm.
+    // HOW MANY OF THE WIDTHED OPERANDS ARE RESULTS -- read off the row.
     //
-    // It used to be counted off the signature, as the `BufMut` in it, which
-    // is the same fact the table path read off a row's `Out` sources. That
-    // count is wrong for every routine whose writable arguments include STATE:
+    // It used to be counted as the `BufMut` in the signature, which is wrong
+    // for every routine whose writable arguments include STATE:
     // `attn::kv_append_paged` declares `k_pages` and `v_pages` as `BufMut`
     // and both are the KV pool, which the driver holds and no traced value
     // stands for. Counting them made a statement carrying two inputs and no
@@ -628,30 +658,36 @@ fn plan_routine<'a, S: Resolver>(
     // for `input(0)` and was told the statement does not carry one -- every
     // fire, every layer, on every text in the suite.
     //
-    // A type cannot tell the two apart, because they are the same type. The
-    // ARM can, and does: a result is what it asks `output(i)` for and the
-    // pool is what it asks `kv(..)` for. So the arm runs twice -- once over
-    // an undivided statement, purely to count the asks, and once over the
-    // split that count implies. It is two calls per LOWERING, which
-    // `lowering::cached` performs once and replays, and an arm is operand
-    // plumbing with nothing to repeat.
-    let (widthed, all_weights) = crate::lowering::arm::undivided(args);
-    let results = {
-        let mut probe = crate::lowering::arm::Handles::new(
-            &bound.args,
-            &widthed,
-            &widthed,
-            &all_weights,
-            &params,
-            resolver,
-        );
-        arm(&mut probe, facts).map_err(refused)?;
-        probe.asked_results()
-    };
-    let (ins, outs, weights) = crate::lowering::arm::split(args, results);
+    // The repair was to ASK the arm, by running it twice: once over an
+    // undivided statement purely to count the `output(i)` asks, and once over
+    // the split that count implies. That worked because the arm knows the
+    // difference a type could not express -- a result is what it asks
+    // `output(i)` for, the pool is what it asks `kv(..)` for.
+    //
+    // The type expresses it now. `OutSlot<0, BufMut>` is a result and
+    // `Env<BufMut>` is not, which is `Side::Declared` against `Side::OfType`,
+    // and the count is a filter over a `&'static [Side]` the row already
+    // carries. `kv_append_paged` keeps both its `BufMut` and declares
+    // neither.
+    //
+    // What makes the count trustworthy rather than merely plausible is
+    // `routine::tests::every_arm_binds_the_slot_its_signature_states`: it
+    // runs all ninety-one arms and asserts, for each, that the number of
+    // parameters marked `Declared` equals the highest result index the arm
+    // asks for plus one. Those two agree only while each result appears in a
+    // signature exactly once, which is a property nothing else enforces --
+    // so the probe was not deleted until the thing that replaces it was
+    // checked against it.
+    let results = routine
+        .sides
+        .iter()
+        .filter(|side| **side == kernels::routine::Side::Declared)
+        .count();
+    let (ins, outs, weights) = crate::lowering::hold::split(args, results);
     let mut handles =
-        crate::lowering::arm::Handles::new(&bound.args, &ins, &outs, &weights, &params, resolver);
-    let values = arm(&mut handles, facts).map_err(refused)?;
+        crate::lowering::hold::Handles::new(&bound.args, &ins, &outs, &weights, &params, resolver);
+    let values = crate::lowering::bind::bind(routine.args, routine.sources, &mut handles, facts)
+        .map_err(refused)?;
     let staged = handles.staged();
     let planner = crate::lowering::routine::Planner::new(
         routine,
@@ -853,7 +889,7 @@ mod tests {
         let facts = facts_of(&low, launch, geometry);
         assert_eq!(facts.rows, 5, "the rectangle states the rows");
         assert_eq!(facts.width, 64, "the operand states the width");
-        assert_eq!(facts.q_heads, 16, "the fire states the rest");
+        assert_eq!(facts.q_heads(), 16, "the fire states the rest");
     }
 
     #[test]

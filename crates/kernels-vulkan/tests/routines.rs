@@ -92,6 +92,12 @@ const RECIPE: &[(&str, &[(usize, i32)])] = &[
     ("neox_prop_mb", &[(4, 128), (5, 128), (6, 4096), (7, 3)]),
     ("neox_freqs_decode", &[(4, 128), (6, 128), (7, 4096)]),
     ("neox_freqs_mb", &[(4, 128), (6, 128), (7, 4096), (8, 3)]),
+    // The fused norm+rope refuses the same shapes a rotation does and for the
+    // same reasons, so it needs the same kind of recipe: a 128-wide head, a
+    // 4096-wide row -- so 32 heads -- fully rotated, three tokens. `1` would
+    // be refused twice over, as an odd rotary and as a rotary wider than the
+    // head.
+    ("rms_rope", &[(4, 128), (5, 4096), (6, 128), (7, 3)]),
     // `row_pitch` at 5, and it may not be narrower than the row.
     (
         "neox_strided",
@@ -101,7 +107,7 @@ const RECIPE: &[(&str, &[(usize, i32)])] = &[
     // swept ones are below; these are here so the position check applies to
     // them too, because a head width is the argument in this family most
     // likely to move.
-    ("sdpa_paged_decode_sink", &[(17, 64)]),
+    ("sdpa_paged_decode_sink", &[(18, 64)]),
     ("sdpa_paged_mma", &[(18, 64)]),
     ("sdpa_paged_mma_sink", &[(18, 64)]),
     ("sdpa_paged_tiled_sink", &[(18, 64)]),
@@ -166,11 +172,29 @@ const SWEEP: &[Swept] = &[
     ("qmm_t_routed_fp16", &[9, 10], tiles),
     // ONE swept position, which the widened `Swept` makes as ordinary as four:
     // attention picks its module on the head width alone.
-    ("sdpa_paged_decode", &[17], paged_dims),
+    ("sdpa_paged_decode", &[18, 21], paged_split),
     ("sdpa_paged_tiled", &[18], paged_dims),
     ("sdpa_vector_decode", &[11], vector_dims),
     ("sdpa_vector_decode_swa", &[14], swa_dims),
 ];
+
+/// The four head widths, each at one split and at eight.
+///
+/// The split count is a second module selector and not a mere number: above
+/// one, `sdpa_paged_decode` stops dispatching `sdpa_paged_decode_bfloat16_d_*`
+/// and dispatches a `_split_` pass and a `_combine_` fold instead. Sweeping
+/// only the widths would leave nine of this family's modules named by nothing
+/// -- which on this backend is not a compile error but a fault inside
+/// `vkCreateComputePipelines`.
+fn paged_split() -> Vec<Vec<i32>> {
+    let mut out = Vec::new();
+    for d in paged_dims() {
+        for splits in [1, 8] {
+            out.push(vec![d[0], splits]);
+        }
+    }
+    out
+}
 
 /// The four head widths the paged kernels are compiled for.
 ///
@@ -401,8 +425,41 @@ fn fired() -> Vec<(&'static Routine<Vulkan>, Vec<ArgValue>, Seen)> {
 /// the signature is now the only statement of it, so a flag lost on the way
 /// through is a missing barrier, which is a race, which is a plausible number.
 ///
-/// The `Env` arguments are excluded and that is the point of them: they are
-/// the facts a body uses to build its GRID and never hands to the device.
+/// # The BUFFERS, and only they
+///
+/// This filtered the signature to `Provenance::Trace` and compared the whole
+/// argument list, and both halves of that were wrong. Neither could fail:
+/// stating slots on this plane stopped the in-crate tests compiling, and a
+/// test that does not build does not disagree with anything. All three of
+/// the claims below are what running it again said. Provenance is the wrong column: an `Env`
+/// SCALAR is a grid fact and never reaches the device, but an `Env` BUFFER is
+/// the staged parameter block, which reaches it every time -- `split_qkv_bf16`
+/// binds `packed, q, k, v, params` and only the first four are the trace's.
+/// Filtering on `Provenance::Trace` dropped `params` from what the signature
+/// was said to take and then reported the body inventing a fifth buffer.
+///
+/// So the filter is a UNION and not either column alone: everything that
+/// arrives AS a buffer, whoever supplies it, plus everything the trace
+/// supplies, whatever its shape. `Provenance` alone drops every `params`;
+/// buffer-shape alone drops `gate`'s bare `width`, a trace scalar the body
+/// pushes -- so the SCALARS come out of the comparison entirely, on both
+/// sides. Two reasons, and the second is the sufficient one:
+///
+/// - An `Env` scalar reaching the device is ORDINARY, not a fault.
+///   `gdn_core_recurrent_prefill` pushes two, and the paragraph above
+///   claiming `Env` arguments *"never hand to the device"* was describing an
+///   intention rather than the bodies.
+/// - Every synthesised scalar here is `I32(1)`. A subsequence check over
+///   values that cannot be told apart passes for any permutation of them,
+///   so the scalar half was decorative even where it was true. What would
+///   make it real is distinct synthesised values per position, which is a
+///   change to `fired()` and a different test's argument.
+///
+/// The shape is read off the synthesised VALUE and not off `Ty`, because
+/// `Ty::Buf` and `Ty::BufMut` are not the whole of what reaches the device
+/// as a buffer -- `kv_append_paged`'s page tables arrive as `U32s`, and a
+/// `Ty` list written out by hand here would be a second place to keep the
+/// answer.
 ///
 /// What the check does NOT require is that every trace argument is forwarded,
 /// because slangc DELETES a global nothing reads and the deleted ones cannot
@@ -424,13 +481,13 @@ fn a_body_passes_a_subsequence_of_the_arguments_its_signature_takes_in_order() {
             .args
             .iter()
             .zip(&args)
-            .filter(|((_, prov), _)| *prov == Provenance::Trace)
+            .filter(|(_, value)| matches!(value, ArgValue::Buffer { .. }))
             .map(|(_, value)| *value)
             .collect();
 
         for (entrypoint, _, got) in seen.0.borrow().iter() {
             let mut left = want.iter();
-            for value in got {
+            for value in got.iter().filter(|v| matches!(v, ArgValue::Buffer { .. })) {
                 assert!(
                     left.any(|w| w == value),
                     "`{}` fires `{entrypoint}` with {got:?}, which is not its \

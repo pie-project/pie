@@ -1,27 +1,9 @@
 //! The tensor-parallel rendezvous: the one plan every rank leaves with, and
 //! the host all-gather the P2P plane bootstraps through.
 //!
-//! The ranks of a TP group are THREADS OF ONE PROCESS, so both of these are
-//! in-process barriers rather than collectives. This file is separate from
-//! [`super::budget`] because it is not arithmetic about memory at all —
-//! it is a synchronisation primitive that happens to reduce plans, and
-//! the two were one file only because the C++ `plan.hpp` was.
-//!
-//! # Two rendezvous, one key
-//!
-//! [`tp_min_plan`] reduces plans; [`tp_host_allgather`] concatenates bytes.
-//! They are separate registries keyed on the same string, and they must be:
-//! the plan reduction happens ONCE per rank and the all-gather happens once
-//! per bootstrap exchange (`CustomAllReduce` runs at least four, and one more
-//! per `register_buffer`), so a single barrier could not serve both without
-//! the plan's arrival count and the exchange's round count meaning the same
-//! thing.
-//!
-//! **`tp_host_allgather` is the `HostAllgather::gather` half of
-//! `fire::all_reduce::CustomAllReduce::new`.** That constructor reads exactly
-//! two things off a collective — the world size, and one bootstrap-time
-//! all-gather of pointers or IPC handles — and this is the second, for the
-//! deployment shape this driver has: N ranks, N threads, one process.
+//! A TP group's ranks are threads of one process, so both are in-process
+//! barriers. [`tp_min_plan`] and [`tp_host_allgather`] keep separate registries
+//! on the same key: reduction runs once per rank, the all-gather once per round.
 
 use super::budget::CudaMemoryPlan;
 
@@ -40,8 +22,7 @@ struct RendezvousState {
     plan: CudaMemoryPlan,
 }
 
-/// The registry keyed by NCCL unique id, matching the C++'s function-static
-/// `unordered_map`.
+/// The registry keyed by NCCL unique id.
 fn registry() -> &'static Mutex<HashMap<String, Arc<Rendezvous>>> {
     static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Rendezvous>>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
@@ -49,21 +30,16 @@ fn registry() -> &'static Mutex<HashMap<String, Arc<Rendezvous>>> {
 
 /// Reduce one rank's plan to the plan the whole tensor-parallel group can run.
 ///
-/// The ranks of a TP group are **threads of one process**, so this is an
-/// in-process barrier rather than a collective: every rank contributes its
-/// plan, the last to arrive releases the rest, and all of them leave with the
-/// same answer. They must, because the plan sizes buffers whose shapes appear
-/// in collective operations -- two ranks disagreeing about `max_requests`
-/// deadlock at the first all-reduce rather than failing here.
+/// An in-process barrier: every rank contributes its plan, the last to arrive
+/// releases the rest, and all leave with the same answer — they must, or two
+/// ranks disagreeing about a shape deadlock at the first collective.
 ///
-/// Returns `local` unchanged when there is nothing to reconcile: a single rank,
-/// or a group with no `nccl_unique_id_hex` to key on.
+/// Returns `local` unchanged for a single rank or an empty `nccl_unique_id_hex`.
 ///
 /// # Panics
 ///
-/// If the registry lock is poisoned by a rank that panicked mid-rendezvous. A
-/// poisoned barrier cannot be completed -- the ranks still waiting will never
-/// be released -- so there is nothing to recover to.
+/// If the registry lock is poisoned mid-rendezvous: the ranks still waiting
+/// can never be released, so there is nothing to recover to.
 #[must_use]
 pub fn tp_min_plan(
     tp_size: i32,
@@ -102,9 +78,8 @@ pub fn tp_min_plan(
         state.ready = true;
         shared.ready.notify_all();
     } else {
-        // `wait_while` rather than a bare `wait`: a condvar may wake
-        // spuriously, and a rank that returned from a spurious wake would
-        // read a half-reduced plan.
+        // `wait_while`, not bare `wait`: a spurious wake would return a
+        // half-reduced plan.
         state = shared
             .ready
             .wait_while(state, |s| !s.ready)
@@ -118,14 +93,13 @@ pub fn tp_min_plan(
 /// Shared state for one tensor-parallel group's host all-gather.
 struct Exchange {
     inner: Mutex<ExchangeState>,
-    /// Signalled when a round closes. Waiters test [`ExchangeState::round`]
-    /// rather than a flag, so a round that closes and reopens between a
-    /// notify and a wake cannot be missed.
+    /// Signalled when a round closes. Waiters test [`ExchangeState::round`], not
+    /// a flag, so a round that closes and reopens can't be missed.
     departed: Condvar,
 }
 
 struct ExchangeState {
-    /// How many rounds have CLOSED. A rank waits for this to move past the
+    /// How many rounds have closed. A rank waits for this to move past the
     /// value it read on arrival.
     round: u64,
     /// How many ranks have contributed to the round now open.
@@ -134,45 +108,35 @@ struct ExchangeState {
     slots: Vec<Vec<u8>>,
     /// The last round to close, whole.
     ///
-    /// **Publishing rather than reading [`Self::slots`] in place is what makes
-    /// this safe to call in a loop.** The rank that closes a round returns
-    /// without waiting and may re-enter for the next one before a slower rank
-    /// has copied anything out; reading `slots` directly, that rank would see
-    /// the next round's contribution in the previous round's answer. It cannot
-    /// see a stale `published`, because round N+1 cannot close until every
-    /// rank has ENTERED it, and a rank still waiting in round N has not.
+    /// Published as a unit rather than read from [`Self::slots`] in place: the
+    /// rank that closes a round may re-enter before a slower rank copies out, so
+    /// reading `slots` live would show round N+1's bytes as round N's answer.
+    /// Round N+1 can't close until every rank has entered it, so no stale read.
     published: Arc<Vec<Vec<u8>>>,
 }
 
-/// The all-gather registry. Separate from [`registry`] — see the module
-/// header for why one barrier cannot serve both.
+/// The all-gather registry, separate from [`registry`] (see the module header).
 fn exchanges() -> &'static Mutex<HashMap<String, Arc<Exchange>>> {
     static EXCHANGES: OnceLock<Mutex<HashMap<String, Arc<Exchange>>>> = OnceLock::new();
     EXCHANGES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// This rank's half of its group's host all-gather, or `None` when there is
-/// no group to gather across.
+/// This rank's half of its group's host all-gather, or `None` when there is no
+/// group to gather across.
 ///
-/// The returned closure is the `HostAllgather::gather` contract verbatim:
-/// `send` is this rank's contribution, `recv` is `send.len() * tp_size` bytes
-/// and comes back **rank-major**. It may be called any number of times; each
-/// call is one round, and every rank must make the same number of calls with
-/// the same `send.len()` in the same order — which is the same discipline the
-/// collective it bootstraps demands, so it is not a new obligation.
+/// The returned closure is the `HostAllgather::gather` contract: `send` is this
+/// rank's contribution, `recv` is `send.len() * tp_size` bytes rank-major. Each
+/// call is one round; every rank must make the same number of calls with the
+/// same `send.len()` in the same order.
 ///
-/// `None` for a single rank (nothing to gather) and for an empty
-/// `group_key` (nothing to gather ON). The second is not a degenerate case
-/// that can be served by copying `send` into `recv`: a group of two whose
-/// ranks cannot find each other would then bootstrap a plane pointing at its
-/// own memory twice, and every reduction it ran would be silently a no-op.
-/// The caller has to be told, so it is an `Option` rather than a fallback.
+/// `None` for a single rank or an empty `group_key` — an `Option` rather than a
+/// copy-through fallback, so a group whose ranks can't find each other is told
+/// instead of silently bootstrapping a plane that aliases its own memory.
 ///
 /// # Panics
 ///
-/// The returned closure panics if the exchange registry lock is poisoned by a
-/// rank that panicked mid-round, for [`tp_min_plan`]'s reason: the ranks still
-/// waiting will never be released, so there is nothing to recover to.
+/// The returned closure panics if the exchange registry lock is poisoned
+/// mid-round, for [`tp_min_plan`]'s reason.
 #[must_use]
 pub fn tp_host_allgather(
     tp_size: i32,
@@ -213,11 +177,9 @@ fn gather_round(shared: &Exchange, world: usize, me: usize, send: &[u8], recv: &
     let published = {
         let mut state = shared.inner.lock().expect("tp all-gather poisoned");
         let opened = state.round;
-        // A group whose first caller sized the slot list is the only one that
-        // ever sizes it; a later rank with a different `tp_size` on the same
-        // key is a misconfiguration, and growing here rather than indexing
-        // out of bounds keeps it a wrong answer the caller can see instead of
-        // a panic in a barrier.
+        // A later rank with a different `tp_size` on the same key is a
+        // misconfiguration; grow rather than index out of bounds, so it stays a
+        // visible wrong answer instead of a panic in a barrier.
         if state.slots.len() < world {
             state.slots.resize(world, Vec::new());
         }
@@ -230,9 +192,8 @@ fn gather_round(shared: &Exchange, world: usize, me: usize, send: &[u8], recv: &
             state.published = Arc::new(closed);
             shared.departed.notify_all();
         } else {
-            // `wait_while` on the round counter, not on a flag: a condvar may
-            // wake spuriously, and a rank that returned from a spurious wake
-            // would read the PREVIOUS round's answer as this round's.
+            // `wait_while` on the round counter, not a flag: a spurious wake
+            // would return the previous round's answer.
             state = shared
                 .departed
                 .wait_while(state, |s| s.round == opened)
@@ -241,9 +202,8 @@ fn gather_round(shared: &Exchange, world: usize, me: usize, send: &[u8], recv: &
         Arc::clone(&state.published)
     };
 
-    // Rank-major, and sized by what each rank actually sent rather than by
-    // `send.len()`, so a caller that mis-sized `recv` truncates instead of
-    // writing past it.
+    // Rank-major, sized by what each rank sent, so a mis-sized `recv`
+    // truncates instead of overflowing.
     let stride = send.len();
     for (r, slot) in published.iter().enumerate() {
         let at = r * stride;
@@ -287,11 +247,9 @@ mod tests {
     fn shapes_take_the_minimum_and_allocations_the_maximum() {
         let mut a = plan(16, 4096, 8192, 512);
         a.min_into(&plan(16, 8192, 4096, 256));
-        // Shapes: the smaller of each.
         assert_eq!(a.max_workspace_tokens, 4096);
         assert_eq!(a.max_requests, 256);
         assert_eq!(a.capacity.max_custom_mask_bytes, 4096 * 8);
-        // Allocations: the larger of each.
         assert_eq!(a.attn_float_workspace_bytes, 8192 * 16);
         assert_eq!(a.persistent_input_bytes, 512 * 64);
         // Equal page size keeps the larger page bytes.
@@ -301,9 +259,8 @@ mod tests {
 
     #[test]
     fn a_smaller_page_brings_its_own_byte_count() {
-        // The one field pair that must move together: taking min(page_size)
-        // and max(page_bytes) independently would describe a layout no rank
-        // proposed.
+        // min(page_size) and max(page_bytes) taken independently would describe
+        // a layout no rank proposed; this pair must move together.
         let mut a = plan(32, 9000, 4096, 256);
         a.min_into(&plan(16, 4096, 4096, 256));
         assert_eq!(a.kv_page_size, 16);
@@ -402,14 +359,8 @@ mod tests {
         }
     }
 
-    /// Round N's answer must not pick up round N+1's contributions.
-    ///
-    /// This is the property `ExchangeState::published` exists for, and the
-    /// one a barrier that read its slots in place gets wrong: the rank that
-    /// CLOSES a round returns without waiting, so it can re-enter and
-    /// overwrite its own slot before a slower rank has copied anything out.
-    /// Ten rounds with a distinct payload per round is enough to hit it —
-    /// each rank checks every round's answer, so a single leaked byte fails.
+    /// Round N's answer must not pick up round N+1's contributions — what
+    /// `ExchangeState::published` exists for.
     #[test]
     fn consecutive_rounds_do_not_bleed_into_each_other() {
         let key = unique_key("rounds");

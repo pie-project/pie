@@ -73,7 +73,7 @@ pub fn manifest(f: &NemotronHFacts) -> Manifest {
         // forbidden one — the minority answer in this crate, and the one
         // that leaves a 131 072-row projection unbound if a row gets it
         // backwards.
-        .either(!f.tied_embeddings, "lm_head", [vocab, hidden])
+        .tie(f.tied_embeddings, "lm_head", [vocab, hidden])
         // One norm per layer, on all three kinds. The only per-layer
         // tensor that is not a union member.
         .with(TensorSpec::required("backbone.layer.{}.norm", [hidden]))
@@ -217,6 +217,7 @@ pub fn deployment(
             // Full rotation at the head width. Stated as 0 the way every
             // non-partial row states it — see `LayerAttention`.
             rotary_dim: 0,
+            q_gate: false,
         })
         .collect();
     Deployment {

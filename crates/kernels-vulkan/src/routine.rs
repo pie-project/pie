@@ -44,7 +44,7 @@
 use kernels::Ty;
 #[cfg(test)]
 use kernels::routine::Arg;
-use kernels::routine::{Backend, Refusal};
+use kernels::routine::{Backend, Extent, Refusal};
 use kernels::shader::ShaderValue;
 
 /// This backend, as the machinery names it.
@@ -57,6 +57,14 @@ pub struct Vulkan;
 impl Backend for Vulkan {
     type Value = ArgValue;
     type Ctx<'a> = dyn Encode + 'a;
+
+    // A region is `{address, rows, width}`; this backend's bound value is an
+    // address alone. The other two already live per-launch in `Facts`
+    // (`bind/table.rs:592`), so this refusal stays unreachable until a table
+    // asks for a fat `In<N, _>` — which then fails at first fire, not compile time.
+    fn region(_value: &ArgValue, _at: usize) -> Result<Extent, Refusal> {
+        Err(Refusal::Absent { what: "a region's shape: the vulkan binder binds addresses only" })
+    }
 }
 
 /// One value a caller supplies for one argument.
@@ -167,15 +175,10 @@ pub trait Encode {
 
 /// This backend's value, as the shared operand types read it.
 ///
-/// The ten operand types live in [`kernels::shader`] because the vocabulary is
-/// closed and identical in metal, vulkan and wgpu — measured over all 300
-/// rows, `.wiki/kernel-x/refactor-bigplan.md` §7 Stage 1. This file used to
-/// declare its own ten, with Slang spellings; they are gone, and that is the
-/// point. Three crates each holding a private copy of one closed vocabulary is
-/// precisely the arrangement that let seven statements drift unnoticed.
-///
-/// What is NOT shared is the value, which is [`ArgValue`], and this impl is
-/// the whole of what a shared operand type needs to know about it.
+/// The ten operand types live in [`kernels::shader`], not per-backend, because
+/// the vocabulary is closed and identical across metal/vulkan/wgpu. What is
+/// NOT shared is the value, [`ArgValue`]; this impl is the whole of what a
+/// shared operand type needs to know about it.
 impl ShaderValue for ArgValue {
     fn as_buffer(self) -> Option<u32> {
         match self {
@@ -235,17 +238,13 @@ impl ShaderValue for ArgValue {
 
 /// How Slang spells the twelve, as this tree's shaders declare them.
 ///
-/// Every string was read out of `kernels/` before it was written here, with
-/// the count of declarations that use it: `StructuredBuffer<int>` 18 times,
-/// `StructuredBuffer<uint>` 20, `StructuredBuffer<uint8_t>` 8, `StructuredBuffer<float>` 13 and
-/// `RWStructuredBuffer<float>` 10. `PIE_ACT` is
-/// the activation type the tier substitutes, which is why the two opaque
+/// Every string is read out of `kernels/`, not invented; `PIE_ACT` is the
+/// activation type the tier substitutes, which is why the two opaque
 /// buffers name it rather than a concrete element type.
 ///
-/// `USIZE` is empty on purpose. Slang has `uint64_t` under the shader-int64
-/// capability, but nothing in this tree declares one: every live use is an
-/// extent the driver resolves on the host and narrows before it reaches a
-/// push block. A guess here would be worse than the gap.
+/// `USIZE` is empty on purpose: Slang has `uint64_t` under the shader-int64
+/// capability, but nothing in this tree declares one — every live use is an
+/// extent the driver resolves and narrows before it reaches a push block.
 impl kernels::shader::Lang for Vulkan {
     const BUF: &'static str = "StructuredBuffer<PIE_ACT>";
     const BUF_MUT: &'static str = "RWStructuredBuffer<PIE_ACT>";
@@ -360,6 +359,12 @@ fn rectangle(width: i32, rows: i32) -> Result<[u32; 2], Refusal> {
 /// `Env<I32s>` without naming the machinery crate.
 pub use kernels::routine::Env;
 
+/// The slot marks, re-exported for the same reason: a routine signature states
+/// `OutSlot<0, BufMut>` or `Weight<2, F32s>` so the operand slot the arm binds
+/// this pointer from is a fact of the type, not of the hand-written arm alone.
+pub use kernels::keys;
+pub use kernels::routine::{Ask, Block, Else, Held, InSlot, Nth, Null, OutSlot, Over, Param, ParamF32, ParamOr, ParamOrLit, Reckoned, Say, Times, Weight};
+
 /// Re-exported for the same reason.
 pub use kernels::routine::Provenance as Supplier;
 
@@ -368,14 +373,8 @@ mod tests {
     use super::*;
     use kernels::routine::Provenance;
 
-    /// Every argument kind refuses a value of another kind, by position.
-    ///
-    /// The check that matters is the WIDTH one, and it is the reason the
-    /// scalar kinds are separate variants at all: a `Usize` is eight bytes and
-    /// an `I32` is four, so a value that crossed between them either truncates
-    /// or writes over its neighbour depending on where in the push block it
-    /// lands. `driver-vulkan` packs that block from this list and would report
-    /// neither.
+    /// Every argument kind refuses a value of another kind, by position (the
+    /// width check described on [`ArgValue`]).
     #[test]
     fn an_argument_refuses_a_value_of_another_kind() {
         assert_eq!(

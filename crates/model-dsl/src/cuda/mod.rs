@@ -1,43 +1,12 @@
-//! THE CUDA LAUNCHER SURFACE.
+//! CUDA launch statements for model DSL traces.
 //!
-//! The CUDA launchers a lowered declaration may state, one function per
-//! kernel, PARAMETERS = the launcher's semantic operands (tensors,
-//! weights, state, tables). Mechanical parameters — stream, dims,
-//! workspace scratch, plan caches — are the driver's binding, not a
-//! choice, and do not appear. Each records one [`OpKind::Launch`](model_ir::trace::OpKind::Launch) (or
-//! the exact launch pair the hand-written arm makes); the doc comment is
-//! the contract naming the C++ symbol.
-//!
-//! Prepare-phase host work (decode-plan builds, XQA's fire-wide prepare)
-//! is NOT stated here: the trace states the BODY's launches, and a
-//! stated kernel obligates the driver to whatever prepare its contract
-//! needs — the same prepare/body seam the graph work built.
+//! Functions state semantic operands; driver-owned stream, dims, workspace,
+//! and prepare work are bound by the driver contract.
 
-// NOT `use super::*;`, which is what every other file in this crate does.
-// A glob here would collide with the `pub use <file>::*` re-exports below:
-// `rmsnorm`, `swiglu` and `weighted_sum` are spelled BOTH by the neutral
-// vocabulary and by this surface, and two globs binding one name in one
-// module is an ambiguity rather than a shadowing. When `cuda` was an inline
-// module the local `pub fn` won outright; a re-export does not, so the
-// import that used to be free has to be explicit.
-//
-// It is only TYPES. A statement here never calls a neutral op -- it records a
-// launch -- so nothing below is a function, and that is what keeps the list
-// from growing back into a glob.
 use crate::{ConvW, Kv, MatW, NormW, Rs, Trace, Val};
 use model_ir::trace::{DType, Dim, NormVariant, Shape, StateRef, StateStore};
 
-
-/// A launch that produces MORE THAN ONE value.
-///
-/// `TraceBuilder::launch` always returned a `Vec`; [`record`] narrowed it
-/// to the first, which was right for every statement until MLA. Its
-/// prepare splits a latent KV row into four -- `kv_c`, `k_pe`, `q_nope`,
-/// `q_pe` -- and a statement returning one of them would leave the other
-/// three unnamed on the tape, which is exactly the silent dataflow gap
-/// the trace exists to make visible.
-/// [`record_many`], plus the scalar arguments — [`record_with_params`]
-/// for a statement with more than one result.
+/// A launch producing multiple values.
 fn record_many_with_params(
     t: &Trace,
     layer: Option<u32>,
@@ -108,13 +77,8 @@ fn record(
     })
 }
 
-/// [`record`], plus the SCALAR ARGUMENTS the symbol takes that no
-/// operand shape gives ([`model_ir::trace::OpKind::Launch`]'s params).
-///
-/// Signed values ride as their two's complement: `window_left = -1`
-/// is `0xFFFFFFFF`, and the executor casts back. The channel is
-/// untyped on purpose -- what each slot means is the SYMBOL's
-/// contract, exactly as `aux_names`' slots are.
+/// [`record`], plus symbol-defined params.
+/// Signed values use two's complement.
 fn record_with_params(
     t: &Trace,
     layer: Option<u32>,
@@ -149,8 +113,7 @@ fn kv_state(kv: &Kv) -> Option<StateRef> {
     })
 }
 
-/// The GDN ops' state mark, [`kv_state`]-style: the layer's
-/// per-request conv/recurrent slabs.
+/// State mark for GDN ops.
 fn rs_state(rs: &Rs) -> Option<StateRef> {
     Some(StateRef {
         store: StateStore::RecurrentState,
@@ -158,9 +121,7 @@ fn rs_state(rs: &Rs) -> Option<StateRef> {
     })
 }
 
-/// `kernels::rope::rope_standard_table`: build the fire's cos/sin
-/// table, once. A value, not a latch — the fused-QKV kernel consumes
-/// it as an operand.
+/// `kernels::rope::rope_standard_table`.
 pub fn rope_standard_table(t: &Trace, head_dim: u32) -> Val {
     record(
         t,
@@ -174,12 +135,7 @@ pub fn rope_standard_table(t: &Trace, head_dim: u32) -> Val {
     .expect("table launch produces a value")
 }
 
-/// `kernels::attn::qkv_decode_qk_norm_rope_write_kv_bf16`: the fused
-/// decode-QKV epilogue — split + per-head Plain q/k norms + Standard
-/// rope + KV append, one launch. Packed GEMM output in, roped Q out;
-/// K/V go straight to the cache and never exist as values. The
-/// general arm (`split_qkv` + `rmsnorm`×2 + `rope` + `Kv::append`) is
-/// this call's semantics, and the parity harness holds it there.
+/// `kernels::attn::qkv_decode_qk_norm_rope_write_kv_bf16`.
 pub fn qkv_decode_qk_norm_rope_write_kv(
     packed: &Val,
     q_norm: &NormW,
@@ -203,15 +159,149 @@ pub fn qkv_decode_qk_norm_rope_write_kv(
 }
 
 
-// ── The CUDA surface, by subject ───────────────────────────────────────
-//
-// `cuda.rs` was 4,511 lines and 171 statements in one module, ordered by
-// WHEN each generation needed something rather than by what it is. The
-// files below are the subjects; the recording helpers above stay here
-// because every one of them calls these.
-//
-// Flat `pub use`, because a declaration spells `dsl::cuda::rope_partial`
-// and which file a statement lives in is not a declaration's business.
+
+
+/// Defines launch wrappers; `params` and `outs` are positional contracts.
+macro_rules! builder {
+    () => {};
+
+    (
+        $(#[$meta:meta])*
+        pub fn $name:ident($($arg:ident: $ty:ty),* $(,)?) -> Val {
+            symbol: $symbol:literal,
+            on: $on:ident,
+            $(weights: [$($weight:expr),* $(,)?],)?
+            $(layer: $layer:expr,)?
+            $(state: $state:expr,)?
+            // `params` order is the kernel's positional contract.
+            params: [$($param:expr),* $(,)?],
+            inputs: [$($input:ident),* $(,)?],
+            out: [$($dim:expr),* $(,)?] as $dtype:ident,
+            made: $made:literal $(,)?
+        }
+        $($rest:tt)*
+    ) => {
+        $(#[$meta])*
+        #[must_use]
+        pub fn $name($($arg: $ty),*) -> Val {
+            record_with_params(
+                &$on.t,
+                builder!(@layer $on $(, $layer)?),
+                $symbol,
+                vec![$($($weight.to_string()),*)?],
+                builder!(@state $($state)?),
+                vec![$($param),*],
+                vec![$($input.id),*],
+                Some((Shape(vec![$($dim),*]), DType::$dtype)),
+            )
+            .expect($made)
+        }
+        builder! { $($rest)* }
+    };
+
+    (
+        $(#[$meta:meta])*
+        pub fn $name:ident($($arg:ident: $ty:ty),* $(,)?) -> Val {
+            symbol: $symbol:literal,
+            on: $on:ident,
+            $(weights: [$($weight:expr),* $(,)?],)?
+            $(layer: $layer:expr,)?
+            $(state: $state:expr,)?
+            inputs: [$($input:ident),* $(,)?],
+            out: [$($dim:expr),* $(,)?] as $dtype:ident,
+            made: $made:literal $(,)?
+        }
+        $($rest:tt)*
+    ) => {
+        $(#[$meta])*
+        #[must_use]
+        pub fn $name($($arg: $ty),*) -> Val {
+            record(
+                &$on.t,
+                builder!(@layer $on $(, $layer)?),
+                $symbol,
+                vec![$($($weight.to_string()),*)?],
+                builder!(@state $($state)?),
+                vec![$($input.id),*],
+                Some((Shape(vec![$($dim),*]), DType::$dtype)),
+            )
+            .expect($made)
+        }
+        builder! { $($rest)* }
+    };
+
+    (
+        $(#[$meta:meta])*
+        pub fn $name:ident($($arg:ident: $ty:ty),* $(,)?) -> ($($ret:ty),+ $(,)?) {
+            symbol: $symbol:literal,
+            on: $on:ident,
+            $(weights: [$($weight:expr),* $(,)?],)?
+            $(layer: $layer:expr,)?
+            params: [$($param:expr),* $(,)?],
+            inputs: [$($input:ident),* $(,)?],
+            // `outs` order is the returned tuple order.
+            outs: [$([$($dim:expr),* $(,)?] as $dtype:ident),+ $(,)?],
+            made: $made:literal $(,)?
+        }
+        $($rest:tt)*
+    ) => {
+        $(#[$meta])*
+        #[must_use]
+        pub fn $name($($arg: $ty),*) -> ($($ret),+) {
+            let outs = record_many_with_params(
+                &$on.t,
+                builder!(@layer $on $(, $layer)?),
+                $symbol,
+                vec![$($($weight.to_string()),*)?],
+                vec![$($param),*],
+                vec![$($input.id),*],
+                vec![$((Shape(vec![$($dim),*]), DType::$dtype)),+],
+            );
+            let mut it = outs.into_iter();
+            ($(builder!(@peel it, $made, $dtype)),+)
+        }
+        builder! { $($rest)* }
+    };
+
+    (
+        $(#[$meta:meta])*
+        pub fn $name:ident($($arg:ident: $ty:ty),* $(,)?) -> ($($ret:ty),+ $(,)?) {
+            symbol: $symbol:literal,
+            on: $on:ident,
+            $(weights: [$($weight:expr),* $(,)?],)?
+            $(layer: $layer:expr,)?
+            inputs: [$($input:ident),* $(,)?],
+            outs: [$([$($dim:expr),* $(,)?] as $dtype:ident),+ $(,)?],
+            made: $made:literal $(,)?
+        }
+        $($rest:tt)*
+    ) => {
+        $(#[$meta])*
+        #[must_use]
+        pub fn $name($($arg: $ty),*) -> ($($ret),+) {
+            let outs = record_many(
+                &$on.t,
+                builder!(@layer $on $(, $layer)?),
+                $symbol,
+                vec![$($($weight.to_string()),*)?],
+                vec![$($input.id),*],
+                vec![$((Shape(vec![$($dim),*]), DType::$dtype)),+],
+            );
+            let mut it = outs.into_iter();
+            ($(builder!(@peel it, $made, $dtype)),+)
+        }
+        builder! { $($rest)* }
+    };
+
+    (@peel $it:ident, $made:literal, $dtype:ident) => { $it.next().expect($made) };
+
+    (@layer $on:ident) => { $on.layer };
+    (@layer $on:ident, $layer:expr) => { $layer };
+    (@state) => { None };
+    (@state $state:expr) => { $state };
+}
+
+
 mod attn;
 mod base;
 mod deepseek_v4;

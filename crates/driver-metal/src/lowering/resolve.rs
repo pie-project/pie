@@ -106,6 +106,9 @@ pub struct Store<'a> {
     /// which is why [`Resolver::kv`] defaults to `None` rather than being
     /// required.
     kv: Option<&'a dyn Fn(u16, bool) -> Option<Slice>>,
+    /// The per-layer GDN slabs a statement's recurrent state resolves
+    /// through, when this store has a recurrent pool behind it.
+    slabs: Option<&'a dyn Fn(u16, &'static str) -> Option<Slice>>,
     /// The fire's own tables, when this store has a fire behind it.
     fire: Option<&'a dyn Fn(crate::lowering::executor::FireTable) -> Option<Slice>>,
     /// The pool's geometry, when this store has a pool behind it.
@@ -131,6 +134,7 @@ impl<'a> Store<'a> {
             tensors,
             named,
             kv: None,
+            slabs: None,
             fire: None,
             pool: None,
             missed: Vec::new(),
@@ -145,6 +149,23 @@ impl<'a> Store<'a> {
     #[must_use]
     pub fn with_kv(mut self, pages: &'a dyn Fn(u16, bool) -> Option<Slice>) -> Self {
         self.kv = Some(pages);
+        self
+    }
+
+    /// The same store, answering a statement's recurrent state through
+    /// `slabs`.
+    ///
+    /// The recurrent family's [`Self::with_kv`], and a closure for the same
+    /// reason: the pool is Apple-only and this map is not.
+    ///
+    /// Separate from `with_kv` rather than one closure over both because the
+    /// two stores index differently and a caller that fused them would have
+    /// to invent a key. KV asks by `(layer, values)` and is answered by a
+    /// PAGE pool the whole batch shares; a slab is asked by `(layer, name)`
+    /// and is answered by a plane a request holds a seat in.
+    #[must_use]
+    pub fn with_slabs(mut self, slabs: &'a dyn Fn(u16, &'static str) -> Option<Slice>) -> Self {
+        self.slabs = Some(slabs);
         self
     }
 
@@ -262,6 +283,10 @@ impl Resolver for Store<'_> {
 
     fn kv(&mut self, layer: u16, values: bool) -> Option<Slice> {
         self.kv.and_then(|pages| pages(layer, values))
+    }
+
+    fn slab(&mut self, layer: u16, which: &'static str) -> Option<Slice> {
+        self.slabs?(layer, which)
     }
 
     fn fire(&mut self, table: crate::lowering::executor::FireTable) -> Option<Slice> {

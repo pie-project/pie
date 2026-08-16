@@ -7,8 +7,8 @@
 
 use model::shared::llama_like::forward::facts::LlamaLikeCudaFacts;
 use model::shared::llama_like::forward::facts::LlamaLikeFacts;
-use model_ir::kernels::Backend;
 use model_compiler::lower::*;
+use model_ir::kernels::Backend;
 use model_ir::trace::FireClass;
 use model_ir::trace::{ForwardPlan, OpKind, PeelWindow, ValueId};
 use std::ops::Range;
@@ -1485,6 +1485,12 @@ const GDN_FRAGMENT_NOT_IN_METAL: &[&str] = &[
     // moment it left one op semantic, and the reason every Metal text in
     // this workspace states all of its launches.
     "gemm::act_x_w",
+    // D2's accumulating twin (`.wiki/kilimanjaro.md` §5). `act_x_w` took an
+    // `Option<&str>` accumulator and the two behaviours it selected are two
+    // symbols now, so this ledger gains a line for the same reason the table
+    // did -- and gains it HERE because neither twin is in `KERNELS_METAL`,
+    // which is the property this list is about.
+    "gemm::act_x_w_acc",
     "norm::rmsnorm_gated_fp32_in_bf16",
     "norm::rmsnorm_gemma_bf16",
     "ssm::qwen_gdn_post_conv_prep_bf16",
@@ -1662,6 +1668,7 @@ const SEMANTIC_CENSUS: &[&str] = &[
     "attn::split_qkv_bf16 ....................... cuda yes metal -",
     "rope::rope_partial_bf16 .................... cuda yes metal -",
     "rope::rope_bf16 ............................ cuda yes metal -",
+    "gemm::act_x_w_acc .......................... cuda - metal -",
     "gemm::act_x_w .............................. cuda - metal -",
     "moe::moe_grouped_gemm_bf16 ................. cuda yes metal -",
     "moe::topk_softmax_bf16 ..................... cuda yes metal -",

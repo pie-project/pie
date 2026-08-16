@@ -141,9 +141,6 @@ fn path_of(names: &[&str]) -> String {
     if also.is_empty() { path } else { format!("{path} (also carried as {also:?})") }
 }
 
-// ===========================================================================
-// The roots: every carried file the Rust half hands NVRTC as a program source
-// ===========================================================================
 
 /// Every carried file a root declaration under `src/` names, as
 /// `(site, carried name)`.
@@ -175,22 +172,11 @@ fn root_sites() -> Vec<(String, String)> {
     let src = crate_root.join("src");
     let mut files = Vec::new();
     walk(&src, &mut files);
-    // `tests/` too: a fixture that compiles a root is naming a program source
-    // as much as a launch is. `attn/pack_dense_mask.cuh` has no launch at all
-    // -- neither packer has a host program -- and `typecheck_tu` compiling it
-    // for its `StructuredMaskParams` layout is the only thing that reaches it.
     walk(&crate_root.join("tests"), &mut files);
 
     let mut out = Vec::new();
     for file in files {
-        // `src/jit` DECLARES the constructors and `src/source.rs` holds the
-        // carried set itself; neither is a family and neither declares a root.
-        // Their doc comments spell `Root::new("layout/slot_ops.cuh")` to show
-        // what a call looks like, which is exactly the shape scanned for here.
         let under_src = file.strip_prefix(crate_root).expect("the walk started in the crate");
-        // `src/jit` DECLARES the constructors, `src/source.rs` holds the
-        // carried set itself, and THIS file quotes the call forms it greps for.
-        // All three would seed the walk with names that no compile arrives at.
         if under_src.starts_with("src/jit")
             || under_src == Path::new("src/source.rs")
             || under_src == Path::new("tests/every_carried_file_is_reachable.rs")
@@ -205,24 +191,10 @@ fn root_sites() -> Vec<(String, String)> {
         for form in ["Root::new(", "Root::variant(", "source::carried(", "ctx.launch("] {
             for (at, _) in text.match_indices(form) {
                 let line = text[..at].bytes().filter(|&b| b == b'\n').count() + 1;
-                // Prose quotes these forms too, and prose is not balanced.
-                // A site that cannot be read is skipped rather than fatal: the
-                // anti-vacuity assertions below are what catch a scan that has
-                // stopped finding roots, and they do it without this having to
-                // decide which unbalanced text was code.
                 let Some((args, _)) = group(&text[at + form.len() - 1..], '(', ')') else {
                     continue;
                 };
                 let _ = line;
-                // The first literal that looks like a carried file. `variant`
-                // puts the lattice-point name before it and a launch puts the
-                // template-id after it, so position alone does not say which.
-                //
-                // A site with NO such literal is not a failure: `Root::new` is
-                // also passed as a function (`ROOTS.map(Root::new)`), and a
-                // launch may take its file from a caller. What would be a
-                // failure is the scan finding nothing at all, which the
-                // anti-vacuity assertions below are what catch.
                 if let Some(literal) = literals(args).into_iter().find(|s| is_carried_name(s)) {
                     out.push((format!("{show}:{line}"), literal));
                 }
@@ -247,9 +219,6 @@ fn literals(span: &str) -> Vec<String> {
             let mut j = i + 1;
             let mut lit = String::new();
             while j < bytes.len() && bytes[j] != b'"' {
-                // A continuation is `\` then a newline then the next line's
-                // indent, and it joins: that is how a long carried name would
-                // be written if one ever were.
                 if bytes[j] == b'\\' && j + 1 < bytes.len() {
                     if bytes[j + 1] == b'\n' {
                         j += 2;
@@ -327,9 +296,6 @@ fn roots() -> Vec<(String, &'static Header)> {
     out
 }
 
-// ===========================================================================
-// The walk
-// ===========================================================================
 
 /// Every angled `#include <…>` in `source`, in order of appearance.
 ///
@@ -364,17 +330,11 @@ fn reached(roots: &[(String, &'static Header)]) -> BTreeSet<&'static str> {
     }
 
     while let Some(header) = queue.pop() {
-        // The other direction, and the one `reachable` was written for: a
-        // quoted include the set does not carry compiles nowhere, and the
-        // refusal names the root, the header it came through and the spelling.
         let quoted = reachable(header.name, header.text, ALL_HEADERS)
             .unwrap_or_else(|why| panic!("{why}"));
         let angled = angled_includes(header.text);
         for name in quoted.into_iter().chain(angled) {
             let Some(next) = ALL_HEADERS.iter().find(|h| h.name == name) else {
-                // Only an angled spelling reaches here: `reachable` refused the
-                // quoted ones above. It names a header NVRTC brings or the
-                // toolkit owns, which the set is right not to carry.
                 continue;
             };
             if seen.insert(next.name) {
@@ -403,23 +363,12 @@ fn reached(roots: &[(String, &'static Header)]) -> BTreeSet<&'static str> {
 #[test]
 fn every_carried_file_is_reachable_from_a_root() {
     let roots = roots();
-    // Anti-vacuity, and it is the whole fixture that rests on it: if the scan
-    // stopped finding root declarations the walk would start nowhere and
-    // report every carried file as dead, which is loud. This one covers the
-    // other shape, where the scan finds nothing at all and the assertion below
-    // is quantified over an empty set of failures.
     assert!(
         !roots.is_empty(),
         "no root declaration under `src/` names a carried file, so this walk \
          has no root to start from and proves nothing"
     );
 
-    // The seed must be the PROGRAM SOURCES and not the carried set. Reading
-    // every carried file as a root is the failure this number catches: it is
-    // silent, because a seed of everything reaches everything and reports no
-    // dead file at all. `kernels/` holds some 165 files and the roots are a
-    // small fraction of them; a seed that has grown to the whole tree is a
-    // scan that has started matching the table in `source.rs`.
     let distinct: BTreeSet<&'static str> = roots.iter().map(|(_, h)| h.name).collect();
     assert!(
         distinct.len() * 2 < ALL_HEADERS.len(),

@@ -1,24 +1,11 @@
-//! THE RUNTIME BRANCH — `guarded(t).arm(pred, f).otherwise(f)`, the one
-//! construct whose regions are chosen at fire time rather than traced away.
+//! Runtime branch construct for guard regions.
 
 use super::*;
 
-/// An open [`OpKind::Guard`](model_ir::trace::OpKind::Guard) chain: `.arm(pred, f)` regions are tried in
-/// order at fire time, `.otherwise(f)` closes the chain with the
-/// fallback region. The ONE branch a lowered declaration may write over
-/// runtime inputs — the predicate vocabulary is closed ([`GuardPred`](model_ir::trace::GuardPred)),
-/// the regions are flat and consecutive, and a region's OWN values may
-/// not escape (its launches are lowerings of the guard's outputs, which
-/// [`guarded_value`] created up front; the discipline is reviewed, not
-/// enforced).
+/// Open guard chain; arms are tried in order and `.otherwise` closes it.
 #[must_use = "a guard chain must be closed with .otherwise(..)"]
 pub struct GuardCtx {
-    // `pub(crate)` and not private: `rows.rs` builds one directly
-    // (`rows!(..)` opens a guard whose single arm is the row predicate), and
-    // that was a same-module construction until the surface became one file
-    // per kind of statement. Crate-visible rather than public, so the fields
-    // are reachable from the file that needs them and from nowhere a
-    // declaration can write.
+    // Crate-visible: `rows.rs` constructs this for unified regions.
     pub(crate) t: Trace,
     pub(crate) idx: usize,
     pub(crate) arms: Vec<model_ir::trace::GuardArm>,
@@ -48,11 +35,7 @@ impl GuardCtx {
     }
 }
 
-/// Open a side-effect-only guard chain.
-///
-/// Takes the TAPE, not a model context: a guard is a statement about what
-/// gets recorded, and nothing about it is one family's. This used to have an
-/// `&M`-taking twin whose whole body was `guarded(&m.t)`.
+/// Open a side-effect-only guard on the tape.
 pub fn guarded(t: &Trace) -> GuardCtx {
     let idx = {
         let mut b = t.inner.borrow_mut();
@@ -67,10 +50,7 @@ pub fn guarded(t: &Trace) -> GuardCtx {
     }
 }
 
-/// Open a VALUE-PRODUCING guard chain: the returned [`Val`]s are the
-/// guard's outputs — one producer whichever arm runs — and each region's
-/// launches are their lowerings, binding the same output buffer and
-/// recording no SSA outputs of their own.
+/// Value-producing guard; region launches lower the guard output buffers.
 pub fn guarded_value(t: &Trace, layer: Option<u32>, shape: (Shape, DType)) -> (GuardCtx, Val) {
     let (idx, outs) = {
         let mut b = t.inner.borrow_mut();
@@ -92,7 +72,7 @@ pub fn guarded_value(t: &Trace, layer: Option<u32>, shape: (Shape, DType)) -> (G
     )
 }
 
-/// Two-way sugar over [`GuardCtx`] — the 4a form llama_like writes.
+/// Two-way sugar over `GuardCtx`.
 pub fn guard(
     t: &Trace,
     pred: model_ir::trace::GuardPred,

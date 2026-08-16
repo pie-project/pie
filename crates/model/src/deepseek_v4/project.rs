@@ -95,7 +95,7 @@ pub fn manifest(f: &Dsv4Facts, tied_embeddings: bool) -> Manifest {
         .with(TensorSpec::required("norm", [hidden]))
         // TIED vs UNTIED as presence, which is the only way a manifest
         // can tell them apart: every extent agrees.
-        .either(!tied_embeddings, "lm_head", [vocab, hidden])
+        .tie(tied_embeddings, "lm_head", [vocab, hidden])
         // The two norms a layer opens its halves with. Rank-K residual
         // or not, each half still normalizes the stream it reads.
         .with(TensorSpec::required("layer.{}.attn_norm", [hidden]))
@@ -232,6 +232,7 @@ fn plan(f: &Dsv4Facts, rope_theta: f32, norm_eps: f32, advertised: Advertised) -
             // carries straight through are what makes the entries it
             // pools comparable across positions.
             rotary_dim: a.qk_rope_head_dim,
+            q_gate: false,
         })
         .collect();
 
@@ -363,10 +364,7 @@ pub const NO_METAL: &str = "deepseek-v4 has no Metal text in this build: its for
 /// boundaries a fire's positions imply, and that is a per-TOKEN fact
 /// either class can state.
 #[must_use]
-pub fn trace(
-    f: &Dsv4Facts,
-    class: model_ir::trace::FireClass,
-) -> model_ir::trace::ForwardPlan {
+pub fn trace(f: &Dsv4Facts, class: model_ir::trace::FireClass) -> model_ir::trace::ForwardPlan {
     super::forward::dsv4_cuda(f, class)
 }
 

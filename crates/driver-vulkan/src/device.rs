@@ -47,7 +47,6 @@ use ash::vk;
 use kernels_vulkan::Capability;
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char};
-use std::path::PathBuf;
 use std::sync::Mutex;
 
 /// Why there is no device to run on.
@@ -519,6 +518,23 @@ pub struct Device {
     /// twenty-four gigabytes and a scalar block is tens of bytes, so nothing
     /// downstream ever fails -- and this is what makes that countable.
     frees: std::sync::atomic::AtomicU32,
+    /// The last token [`Device::run_all_reusable`] issued.
+    ///
+    /// Only a source of distinct numbers, so that a token a caller holds can
+    /// never name a recording made after it. Never wraps in any run this
+    /// hardware could survive.
+    recordings: std::sync::atomic::AtomicU64,
+    /// The token of the recording [`Scratch::cmd`] holds, or zero.
+    ///
+    /// Zero is "nothing in that command buffer may be submitted again", and
+    /// every act that could make a recorded reference stale writes it: a
+    /// buffer freed, a pipeline destroyed, a fire recorded over the top. See
+    /// [`Device::replay`], which is the only reader.
+    ///
+    /// An atomic rather than a field of [`Scratch`] because [`Device::free`]
+    /// has to invalidate and takes no lock -- one that did would deadlock the
+    /// first time a fire freed anything while recording.
+    valid: std::sync::atomic::AtomicU64,
     /// How many BYTES this device has uploaded through [`Device::write`].
     ///
     /// Bytes rather than calls, because the question this answers is about
@@ -571,6 +587,22 @@ struct Scratch {
     cmd: vk::CommandBuffer,
     /// One fence, reset before each submit.
     fence: vk::Fence,
+    /// The buffer and fence a TRANSFER uses: a fill, a copy, a staged read.
+    ///
+    /// A second pair rather than the fire's, and the reason is
+    /// [`Device::replay`]. A decode step zeroes its arena and reads its
+    /// logits back, and both went through `cmd` -- so the recording a fire
+    /// left behind was overwritten by a `vkCmdFillBuffer` before the next
+    /// step could ask for it. Nothing was ever wrong with that while every
+    /// fire re-recorded; it is what made a fire's recording unable to
+    /// outlive its step, which is the whole of the win here.
+    ///
+    /// Under the same lock, so a transfer and a fire still cannot run at
+    /// once -- which they never could, and which `Device::stage`'s comment
+    /// about the two "keeping off each other" already relied on.
+    transfer: vk::CommandBuffer,
+    /// The fence that pair waits on.
+    transferred: vk::Fence,
     /// How many descriptor pools this device has made, ever.
     ///
     /// Kept for [`Device::pools_made`], which is what lets a test state that
@@ -593,27 +625,36 @@ impl Scratch {
     /// `RESET_COMMAND_BUFFER`, and the caller owns destroying the result with
     /// [`Self::destroy`] before `device` goes.
     unsafe fn new(device: &ash::Device, pool: vk::CommandPool) -> Result<Self, vk::Result> {
-        let cmd = unsafe {
+        let buffers = unsafe {
             device.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
                     .command_pool(pool)
                     .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
+                    .command_buffer_count(2),
             )
-        }?[0];
-        let fence = match unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) } {
-            Ok(f) => f,
-            Err(e) => {
-                unsafe { device.free_command_buffers(pool, &[cmd]) };
-                return Err(e);
+        }?;
+        let (cmd, transfer) = (buffers[0], buffers[1]);
+        let mut fences = Vec::with_capacity(2);
+        for _ in 0..2 {
+            match unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) } {
+                Ok(f) => fences.push(f),
+                Err(e) => {
+                    for f in fences {
+                        unsafe { device.destroy_fence(f, None) };
+                    }
+                    unsafe { device.free_command_buffers(pool, &buffers) };
+                    return Err(e);
+                }
             }
-        };
+        }
         Ok(Self {
             pool: vk::DescriptorPool::null(),
             sets: 0,
             descriptors: 0,
             cmd,
-            fence,
+            fence: fences[0],
+            transfer,
+            transferred: fences[1],
             made: 0,
         })
     }
@@ -688,7 +729,8 @@ impl Scratch {
                 device.destroy_descriptor_pool(self.pool, None);
             }
             device.destroy_fence(self.fence, None);
-            device.free_command_buffers(pool, &[self.cmd]);
+            device.destroy_fence(self.transferred, None);
+            device.free_command_buffers(pool, &[self.cmd, self.transfer]);
         }
     }
 }
@@ -890,13 +932,39 @@ fn advertises_the_matrix_this_tree_uses(
 /// seconds; a value that does not parse, or is zero, is ignored in favour of
 /// the default, because a submit with no deadline at all is the hang this
 /// exists to prevent and a typo should not buy one.
-fn fence_timeout_ns() -> u64 {
+///
+/// # The default is now two defaults, because the paragraph above derived one
+///
+/// Everything that paragraph says about `llvmpipe` was measured and then left
+/// for the reader to act on: the knob existed, and a run on a CPU adapter
+/// still had to be told. `Device` ALREADY decides this -- `Device::software`
+/// is `deviceType == CPU`, and its own doc says it exists because "a wall
+/// clock BUDGET is meaningful on hardware and meaningless on `llvmpipe`, and
+/// a suite run there should say which it is rather than fail a regression
+/// guard that was calibrated elsewhere". A fence deadline is precisely such a
+/// budget, and it was the one guard not reading the field.
+///
+/// So a software adapter gets ten MINUTES. It is still finite, and still a
+/// deadlock guard -- the point is a number that a CPU rasteriser cannot hit
+/// while making progress, not the absence of one. Measured on this branch:
+/// `the_tiled_gemm_answers_the_way_the_vector_kernel_does` takes 243 seconds
+/// on Mesa's lavapipe and 10 seconds is not a near miss.
+///
+/// An explicit `PIE_VULKAN_FENCE_TIMEOUT_SECS` still wins over both, because
+/// someone who states a number knows something this function does not.
+fn fence_timeout_ns(software: bool) -> u64 {
     const DEFAULT_SECS: u64 = 10;
+    const SOFTWARE_SECS: u64 = 600;
+    let default = if software {
+        SOFTWARE_SECS
+    } else {
+        DEFAULT_SECS
+    };
     let secs = std::env::var("PIE_VULKAN_FENCE_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|s| *s > 0)
-        .unwrap_or(DEFAULT_SECS);
+        .unwrap_or(default);
     // Saturating, because `u64::MAX` nanoseconds is how Vulkan spells "wait
     // forever" and nobody should reach it by writing a large number of
     // seconds. Clamped an hour below it so the multiplication cannot land
@@ -1292,6 +1360,8 @@ impl Device {
             staging: Mutex::new(None),
             staged: std::sync::atomic::AtomicU32::new(0),
             frees: std::sync::atomic::AtomicU32::new(0),
+            recordings: std::sync::atomic::AtomicU64::new(0),
+            valid: std::sync::atomic::AtomicU64::new(0),
             uploaded: std::sync::atomic::AtomicU64::new(0),
             timing,
         })
@@ -1388,8 +1458,21 @@ impl Device {
     /// this where it found it.
     #[must_use]
     pub fn live_buffers(&self) -> u32 {
-        self.allocations()
-            .saturating_sub(self.frees.load(std::sync::atomic::Ordering::Relaxed))
+        self.allocations().saturating_sub(self.frees())
+    }
+
+    /// How many buffers this device has freed, ever.
+    ///
+    /// The other half of [`Device::live_buffers`], published for the reason
+    /// [`Device::allocations`] is and for one more: together the two are the
+    /// cheapest complete statement that the SET of buffers this device holds
+    /// has not moved, which is what [`crate::replay`] keys a reusable
+    /// recording on. A handle Vulkan recycled after a free would compare
+    /// equal to the one a command buffer names; a free that nobody counted
+    /// would make that invisible.
+    #[must_use]
+    pub fn frees(&self) -> u32 {
+        self.frees.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// What the device calls itself.
@@ -1426,21 +1509,20 @@ impl Device {
 
     /// The best module for `entrypoint` this device can load, and its tier.
     ///
-    /// Walks the tiers best-first and takes the first one `dir` actually has.
-    /// Both halves are required: a device may support a tier this build did
-    /// not compile, and a build may have a tier this device cannot load. The
-    /// answer is `None` only when even the baseline module is missing, which
-    /// means the directory is not one a `native` build wrote.
+    /// Walks the tiers best-first and takes the first one this BUILD actually
+    /// compiled. Both halves are required: a device may support a tier the
+    /// build did not compile, and a build may have a tier this device cannot
+    /// load. The answer is `None` only when even the baseline module is
+    /// missing, which means `kernels-vulkan` was built without `native`.
+    ///
+    /// It took a DIRECTORY and returned a `PathBuf` until the modules moved
+    /// into the rlib. Same walk, same two halves; what is gone is the caller's
+    /// obligation to know where a build put its files.
     #[must_use]
-    pub fn module_for(
-        &self,
-        dir: &std::path::Path,
-        entrypoint: &str,
-    ) -> Option<(PathBuf, Capability)> {
-        self.tiers.iter().find_map(|&tier| {
-            let path = dir.join(tier.module(entrypoint));
-            path.exists().then_some((path, tier))
-        })
+    pub fn module_for(&self, entrypoint: &str) -> Option<(&'static [u8], Capability)> {
+        self.tiers
+            .iter()
+            .find_map(|&tier| Some((kernels_vulkan::code(entrypoint, tier)?, tier)))
     }
 
     /// `maxPushConstantsSize`.
@@ -1955,9 +2037,9 @@ impl Device {
 
     /// Record one transfer command, submit it, and wait for it.
     ///
-    /// The scratch command buffer and fence are the same pair
-    /// [`Device::stage`] uses, and the lock is what keeps the two off each
-    /// other. Waited on rather than left in flight because every caller here
+    /// The scratch TRANSFER buffer and fence, which are the pair
+    /// [`Device::stage`] uses and are deliberately not the pair a fire
+    /// records into; the lock is what keeps all three off each other. Waited on rather than left in flight because every caller here
     /// reads or frees what it just moved.
     fn submit_once(
         &self,
@@ -1968,7 +2050,7 @@ impl Device {
             .scratch
             .lock()
             .map_err(|_| Failed::Vulkan(format!("{during}: the scratch lock is poisoned")))?;
-        let (cmd, fence) = (scratch.cmd, scratch.fence);
+        let (cmd, fence) = (scratch.transfer, scratch.transferred);
         unsafe {
             self.device
                 .begin_command_buffer(
@@ -1989,7 +2071,7 @@ impl Device {
             self.device
                 .queue_submit(self.queue, &submits, fence)
                 .map_err(|e| Failed::Vulkan(format!("{during}: submit: {e}")))?;
-            let ns = fence_timeout_ns();
+            let ns = fence_timeout_ns(self.software);
             self.device
                 .wait_for_fences(&[fence], true, ns)
                 .map_err(|e| waited_too_long(during, e, ns))?;
@@ -2102,7 +2184,7 @@ impl Device {
             let Ok(scratch) = self.scratch.lock() else {
                 return None;
             };
-            let (cmd, fence) = (scratch.cmd, scratch.fence);
+            let (cmd, fence) = (scratch.transfer, scratch.transferred);
             unsafe {
                 self.device
                     .begin_command_buffer(
@@ -2127,7 +2209,7 @@ impl Device {
                     })
                     .and_then(|()| {
                         self.device
-                            .wait_for_fences(&[fence], true, fence_timeout_ns())
+                            .wait_for_fences(&[fence], true, fence_timeout_ns(self.software))
                     })
             }
         };
@@ -2209,12 +2291,27 @@ impl Device {
     /// device and a handle that carried one would make every buffer as large as
     /// a reference and impossible to store beside the device that owns it.
     pub fn free(&self, buffer: Buffer) {
+        // Before the destroy and not after: a recorded command buffer names
+        // this handle in a descriptor, and Vulkan is free to hand the same
+        // handle back to the next `vkCreateBuffer`. A replay that ran between
+        // the two would dispatch against memory nobody owns.
+        self.forget_recording();
         unsafe {
             self.device.destroy_buffer(buffer.handle, None);
             self.device.free_memory(buffer.memory, None);
         }
         self.frees
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Say that whatever is recorded must not be submitted again.
+    ///
+    /// Called by everything that can make a recorded reference stale --
+    /// freeing a buffer, destroying a pipeline -- rather than only by the
+    /// paths that know about [`Device::replay`]. The safe direction is
+    /// forgetting too often: a forgotten recording costs one re-record.
+    pub fn forget_recording(&self) {
+        self.valid.store(0, std::sync::atomic::Ordering::Release);
     }
 
     /// Run one dispatch to completion and wait for it.
@@ -2276,11 +2373,99 @@ impl Device {
     ///
     /// [`Failed`], with the index of the dispatch that produced it.
     pub fn run_all(&self, run: &[Recorded<'_, '_>]) -> Result<(), (usize, Failed)> {
+        self.record_and_submit(run, false).map(|_| ())
+    }
+
+    /// [`Self::run_all`], leaving the recording where [`Self::replay`] can
+    /// submit it again.
+    ///
+    /// The same command buffer, the same descriptor sets, the same push
+    /// constants and the same grids -- so the only thing this does
+    /// differently is DECLINE to throw them away: the recording is made
+    /// without `ONE_TIME_SUBMIT` and the descriptor pool is not reset when
+    /// the fire returns.
+    ///
+    /// The token names this recording and nothing else. Anything that could
+    /// make a reference in it stale -- a buffer freed, a pipeline destroyed,
+    /// another fire recorded over the top -- sets the device's valid token to
+    /// zero, and [`Self::replay`] then answers `false` instead of submitting.
+    /// That is the whole safety argument, and it is stated as a counter
+    /// rather than as a rule a caller has to keep, because the caller cannot
+    /// see the frees.
+    ///
+    /// Zero is returned, meaning "nothing to replay", when
+    /// `PIE_VULKAN_TIMING` is on: the timestamps are read out of the query
+    /// pool by the recording path, and a replay that reused the recording
+    /// would report the same fire's ticks over and over.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::run_all`].
+    pub fn run_all_reusable(&self, run: &[Recorded<'_, '_>]) -> Result<u64, (usize, Failed)> {
+        self.record_and_submit(run, self.timing.is_none())
+    }
+
+    /// Submit the recording `token` names, if it is still the one held.
+    ///
+    /// `Ok(false)` means the recording is gone and the caller must record
+    /// again -- not an error, and the ordinary answer after anything freed a
+    /// buffer.
+    ///
+    /// # Why this is not a use-after-free waiting to happen
+    ///
+    /// A command buffer names pipelines, descriptor sets and -- through those
+    /// sets -- buffers. Vulkan checks none of it at submit time. What makes
+    /// this sound is that the device itself invalidates: [`Device::free`] and
+    /// [`Device::forget_recording`] clear the token, so a replay can only run
+    /// while every object the recording names is one this device has not
+    /// destroyed since.
+    ///
+    /// Re-submitting is legal because the recording is not `ONE_TIME_SUBMIT`
+    /// and because this waits on the fence before returning, so a command
+    /// buffer is never in flight twice.
+    ///
+    /// # Errors
+    ///
+    /// [`Failed::Vulkan`] if the submit or the wait fails.
+    pub fn replay(&self, token: u64) -> Result<bool, Failed> {
+        if token == 0 {
+            return Ok(false);
+        }
+        let scratch = self
+            .scratch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.valid.load(std::sync::atomic::Ordering::Acquire) != token {
+            return Ok(false);
+        }
+        let _s = crate::phase::span("fire/replay/submit");
+        let fence = scratch.fence;
+        let device = &self.device;
+        unsafe { device.reset_fences(&[fence]) }
+            .map_err(|e| Failed::Vulkan(format!("fence: {e}")))?;
+        let cmd_bufs = [scratch.cmd];
+        let submits = [vk::SubmitInfo::default().command_buffers(&cmd_bufs)];
+        unsafe { device.queue_submit(self.queue, &submits, fence) }
+            .map_err(|e| Failed::Vulkan(format!("submit: {e}")))?;
+        let ns = fence_timeout_ns(self.software);
+        unsafe { device.wait_for_fences(&[fence], true, ns) }
+            .map_err(|e| waited_too_long("replay", e, ns))?;
+        Ok(true)
+    }
+
+    /// [`Self::run_all`], keeping the recording when `reusable`.
+    fn record_and_submit(
+        &self,
+        run: &[Recorded<'_, '_>],
+        reusable: bool,
+    ) -> Result<u64, (usize, Failed)> {
+        let checks = crate::phase::span("fire/run_all/checks");
         for (at, one) in run.iter().enumerate() {
             self.check(one).map_err(|e| (at, e))?;
         }
+        drop(checks);
         if run.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         // A poisoned lock means a fire panicked mid-recording. The objects
         // behind it are handles, not state a panic can leave half written --
@@ -2290,6 +2475,11 @@ impl Device {
             .scratch
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Whatever was recorded is about to be recorded over, and the sets it
+        // named are about to be reset. Said before either happens rather than
+        // after, so a panic in between cannot leave a token naming a
+        // half-recorded buffer.
+        self.forget_recording();
         let descriptors = run.iter().map(|r| r.pipeline.bindings).sum::<u32>();
         // Safe because the previous fire waited on `scratch.fence` before it
         // returned, so no command buffer holding one of these sets is still
@@ -2298,7 +2488,7 @@ impl Device {
             .map_err(|e| (0, Failed::Vulkan(format!("descriptor pool: {e}"))))?;
         // Safe because `pool` came from `scratch` a line ago and the
         // recording is the only user of either until it returns.
-        let fired = unsafe { self.record_all(run, pool, &scratch) };
+        let fired = unsafe { self.record_all(run, pool, &scratch, reusable) };
         if fired.is_err() {
             // A failed fire is the DANGEROUS case, not the harmless one.
             //
@@ -2331,11 +2521,28 @@ impl Device {
         // Safe for the same reason `for_run`'s reset is -- the fence was
         // waited on inside `record_all` -- and on the failing path because of
         // the idle above.
-        let _ = unsafe {
-            self.device
-                .reset_descriptor_pool(pool, vk::DescriptorPoolResetFlags::empty())
-        };
-        fired
+        //
+        // NOT when the recording is to be kept, which is the whole of what
+        // `reusable` buys at this end: a set freed here is a set the replay
+        // would dispatch through. The next fire that records resets the pool
+        // through `for_run` anyway, so nothing is leaked by waiting.
+        if !reusable || fired.is_err() {
+            let _ = unsafe {
+                self.device
+                    .reset_descriptor_pool(pool, vk::DescriptorPoolResetFlags::empty())
+            };
+        }
+        fired?;
+        if !reusable {
+            return Ok(0);
+        }
+        let token = self
+            .recordings
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        self.valid
+            .store(token, std::sync::atomic::Ordering::Release);
+        Ok(token)
     }
 
     /// Everything [`Self::run`] refuses a dispatch for, without recording it.
@@ -2420,8 +2627,10 @@ impl Device {
         run: &[Recorded<'_, '_>],
         pool: vk::DescriptorPool,
         scratch: &Scratch,
+        reusable: bool,
     ) -> Result<(), (usize, Failed)> {
         let device = &self.device;
+        let sets_span = crate::phase::span("fire/run_all/descriptors");
         // Every set allocated and written BEFORE any recording. A descriptor
         // set is read when the command executes, not when it is bound, so a
         // set rewritten between two `cmd_bind_descriptor_sets` in one command
@@ -2496,10 +2705,12 @@ impl Device {
             sets.push(set);
         }
 
+        drop(sets_span);
         // Reset rather than allocated. `begin_command_buffer` on a buffer in
         // the executable state is an implicit reset, but only for a pool made
         // with `RESET_COMMAND_BUFFER`, and saying it here is what ties this
         // code to that flag rather than to a memory of it.
+        let recording = crate::phase::span("fire/run_all/recording");
         let cmd = scratch.cmd;
         unsafe { device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()) }
             .map_err(|e| (0, Failed::Vulkan(format!("command buffer: {e}"))))?;
@@ -2509,8 +2720,18 @@ impl Device {
                 device
                     .begin_command_buffer(
                         cmd,
-                        &vk::CommandBufferBeginInfo::default()
-                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                        // ONE_TIME_SUBMIT is a promise this recording will
+                        // be submitted once, and a driver is entitled to
+                        // patch the buffer while it runs on the strength of
+                        // it. A recording `Device::replay` may submit again
+                        // must not make that promise; a recording that will
+                        // not be replayed still does, because it is the
+                        // flag a compute submission is fastest under.
+                        &vk::CommandBufferBeginInfo::default().flags(if reusable {
+                            vk::CommandBufferUsageFlags::empty()
+                        } else {
+                            vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT
+                        }),
                     )
                     .map_err(|e| Failed::Vulkan(format!("begin: {e}")))?;
                 // The ranges written, and the ranges touched at all, since
@@ -2545,6 +2766,21 @@ impl Device {
                         // into the same stall, so the finer barrier would buy
                         // the finer PLACEMENT and nothing else. The placement
                         // is what `hazards` decides, above.
+                        //
+                        // That was an argument until it was measured, and now
+                        // it is a measurement. Recording one
+                        // `BufferMemoryBarrier` per distinct pending buffer
+                        // instead of this, over `tests/hostprof.rs` on a
+                        // 4-bit qwen3-0.6b, made a decode step SLOWER at both
+                        // contexts -- 1.641 ms against 1.609 short and 1.735
+                        // against 1.655 long -- and the host cost of a step
+                        // rose from 0.093 ms to 0.128 building the vectors.
+                        // The card stalls the same either way and something
+                        // has to write the barriers down, so the finer form
+                        // is the same wait with more bookkeeping in front of
+                        // it. Ordering is 1.06 ms of this step (see the note
+                        // on `hazards`) and NONE of it is reachable by
+                        // describing the same stall more precisely.
                         let barrier = [vk::MemoryBarrier::default()
                             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                             .dst_access_mask(
@@ -2607,6 +2843,8 @@ impl Device {
                 device
                     .end_command_buffer(cmd)
                     .map_err(|e| Failed::Vulkan(format!("end: {e}")))?;
+                drop(recording);
+                let _submit = crate::phase::span("fire/run_all/submit");
 
                 // The fire's own fence, unsignalled again. Reset HERE and
                 // not after the wait, so that a fire which fails between the
@@ -2622,7 +2860,7 @@ impl Device {
                     .queue_submit(self.queue, &submits, fence)
                     .map_err(|e| Failed::Vulkan(format!("submit: {e}")));
                 submitted.and_then(|()| {
-                    let ns = fence_timeout_ns();
+                    let ns = fence_timeout_ns(self.software);
                     device
                         .wait_for_fences(&[fence], true, ns)
                         .map_err(|e| waited_too_long("fire", e, ns))
@@ -2702,6 +2940,604 @@ impl Span {
 /// inside the submit, and 3.8 of those go away when the barriers do. Eight
 /// microseconds each, which is what a compute-to-compute flush costs when the
 /// dispatch it separates is a single row of a small model and takes two.
+///
+/// # That measurement was repeated after the flash decode, and it is still
+/// # the largest number in this driver
+///
+/// Everything else got faster; the ordering did not. Re-run with one line
+/// changed -- `&& std::env::var_os("PIE_VULKAN_NO_BARRIERS").is_none()` added
+/// to the condition below, which produces WRONG ANSWERS and is why it is not
+/// checked in -- against `tests/hostprof.rs` on a 4-bit qwen3-0.6b:
+///
+/// | | barriers | none (incorrect) |
+/// | --- | --- | --- |
+/// | device, 24 tokens | 1.517 ms | **0.460 ms** |
+/// | device, 384 tokens | 1.635 ms | **0.472 ms** |
+/// | wall, 24 tokens | 1.621 ms | 0.551 ms |
+///
+/// **Ordering is 1.06 of the 1.62 milliseconds a decode step costs**, which
+/// is more than every kernel in it put together, and it does not grow with
+/// context -- so it is a floor, not a slope. Divided over the 311 barriers a
+/// step records that is 3.4 us apiece.
+///
+/// Read that number carefully, because the obvious reading is wrong. A
+/// compute-to-compute barrier does not COST three microseconds; it costs
+/// whatever it prevents from overlapping. These dispatches are single rows of
+/// a 0.6b model, so each is mostly launch latency and almost no arithmetic,
+/// and when they may overlap the card hides one behind another. The barrier
+/// does not add work, it stops the hiding. So the unit that costs is neither
+/// the dispatch nor the barrier but the STAGE -- a maximal run with no
+/// barrier inside it -- and a decode layer is eleven of them, twelve once it
+/// splits its keys. Fusing Q, K and V into one weight, the standard advice,
+/// is therefore worth almost nothing: those three already share a stage.
+/// What looks worth 0.14 ms a time is merging a stage into its neighbour's
+/// prologue or epilogue -- an rmsnorm into the projection after it, the
+/// qk-norms into rope, the kv append into rope's write, swiglu into gate/up.
+/// See `a_decode_layer_is_eleven_ordered_stages_and_the_ordering_is_the_cost`
+/// in `tests/device.rs`, which counts them.
+///
+/// # THE FIRST OF THOSE FOUR MERGES WAS BUILT, AND 0.14 MS A STAGE IS WRONG
+///
+/// The rmsnorm was folded into the q/k/v prologue on both backends. It did
+/// what it said: the plan fell from 452 launches to 424 and, once the arena
+/// stopped handing `k_norm` the block `q_norm` had just freed -- a
+/// write-after-read on recycled bytes, which this function has to order and
+/// which had been quietly eating the win -- the count fell from 311 to 283.
+/// One stage a layer, as predicted. The step got 0.09 ms SLOWER: 2.757 ms as
+/// it ships, 2.807 with the arena change alone, 2.846 with both, three runs
+/// each and no overlap in the spreads. The whole thing was reverted; the
+/// numbers and the shader are kept in `quant/qmv.slang`.
+///
+/// The first suspicion was that the 0.14 was the problem -- it is 1.06 ms over
+/// 311, an average taken by removing EVERY barrier at once, and a barrier
+/// costs whatever it prevents from overlapping rather than a fixed amount. So
+/// the price of ONE stage was measured directly, with no kernel involved:
+/// drop one hazard in every N and time the step. Wrong answers, timing only,
+/// and not checked in for the same reason `PIE_VULKAN_NO_BARRIERS` is not.
+///
+/// | barriers dropped | ms/step | delta | us/barrier |
+/// |---|---|---|---|
+/// | 0 (all 311 kept) | 2.810 | -- | -- |
+/// | 28 (one a layer) | 2.711 | 0.099 | 3.5 |
+/// | 52 | 2.595 | 0.215 | 4.1 |
+/// | 104 | 2.519 | 0.291 | 2.8 |
+/// | 156 | 2.186 | 0.624 | 4.0 |
+///
+/// It is linear, and it is 3.7 us a barrier against the 3.4 the average
+/// predicted. THE CURRENCY IS SOUND. One stage a layer really is ~0.10 ms,
+/// and the stage the fusion removed was not a cheap one.
+///
+/// What sank it was the other side of the trade, which nothing had priced:
+/// the fused kernel added ~0.13 ms of arithmetic to buy 0.10 ms of ordering.
+/// A projection's threadgroups are its output rows over eight, so folding a
+/// reduction over K into its prologue makes every one of them redo that
+/// reduction -- 256 times over for q -- and puts the gain multiply and a bf16
+/// round on every element of the inner loop.
+///
+/// The other half of the model came from `kernels-vulkan/tests/qmv_bench.rs`,
+/// and it is worth stating here because it says what is NOT worth trying. A
+/// barrier-separated `affine_qmv_fast` costs 6.14 us at one workgroup and
+/// 6.14 at two hundred and fifty-six, and 6.14 whether K is 64 or 1024:
+/// neither the work nor the parallelism moves it. So the 19 us a dispatch the
+/// in-situ table shows is not the kernel being slow and not the card being
+/// under-occupied -- it is this floor, and a decode's ~452 dispatches at 2.81
+/// ms a step are 6.2 us apiece, which is that floor to two figures. Every
+/// kernel's arithmetic hides inside it. A split-K matvec was therefore not
+/// written; making more workgroups cannot help when workgroup count is not
+/// what is being waited on.
+///
+/// THE ARITHMETIC OF THAT LAST CLOSURE IS A COINCIDENCE, AND BELIEVING IT
+/// COSTS THE NEXT READER A DAY. 6.14 us is what a dispatch costs when a
+/// barrier stands on each side of it -- it is a STAGE, not a dispatch, and
+/// the two are only equal in a bench that separates every fire. A decode's
+/// 564 fires fall into 314 stages, so the per-dispatch reading and the
+/// per-stage reading differ by the number of fires that share a stage with
+/// something else, and nothing in the closure distinguished them.
+///
+/// What distinguishes them is deleting fires and watching nothing happen.
+/// A decode of this model records 112 `cast_qmm_input_strided` fires it never
+/// reads: `llama_like`'s `stage` closure sits OUTSIDE the guard on purpose
+/// (see the memo there), so the half-precision activation the precast GEMMs
+/// want is built whether or not the guard that wants it fires, and at one
+/// token it never does. That is 20% of the fires in a step, all of them dead,
+/// and every one of them sharing a stage with the projection beside it.
+/// Skipping them at record time -- which cannot change a value, since nothing
+/// reads them -- moves the step from 2.777 ms to 2.769, which is inside the
+/// spread of either config.
+///
+/// So a fire that shares a stage with another fire is FREE, and the step is
+/// the sum of its stages plus the ~3.7 us of ordering each stage boundary
+/// costs. The currency is the stage. This is worth saying twice because it
+/// inverts two instincts at once: making a kernel cheaper is worth nothing
+/// unless it is the longest thing in its stage, and splitting one kernel into
+/// several that fit the same stage is FREE rather than expensive. Only a
+/// merge that removes a BOUNDARY is worth anything, and that is the same
+/// conclusion the price curve above reached from the other side.
+///
+/// The eleven stages of a layer, dumped from a warm decode, are: the input
+/// norm; q, k and v together; the two qk-norms together; the two ropes
+/// together; the kv append; the attention; the o projection; the post-norm;
+/// gate and up together; the swiglu; the down projection. The three
+/// projections already share a stage and so do gate and up, so the arena is
+/// not leaving easy pairs on the table -- what is left is the six places
+/// where a value really does flow from one kernel to the next.
+///
+/// # How much is on the table
+///
+/// A decode is a stream of weights: this checkpoint is 335 MB and a step
+/// reads essentially all of it, since the lm head is the 141st
+/// `affine_qmv_fast` and the layers are the other 140. The card is GDDR7 on
+/// a 256-bit bus and its ceiling is about 896 GB/s. So the step has an
+/// arithmetic-free floor of 0.374 ms, and the two configurations sit like
+/// this:
+///
+/// | | ms/step | effective | of peak |
+/// |---|---|---|---|
+/// | as it ships | 2.781 | 120 GB/s | 13% |
+/// | every barrier dropped | 0.739 | 453 GB/s | 51% |
+/// | the bus | 0.374 | 896 GB/s | 100% |
+///
+/// The middle row is not a correct decode -- it races, and the answers are
+/// wrong -- but it is a correct measurement of what this exact sequence of
+/// fires costs when nothing waits. It is the same command buffer, the same
+/// kernels and the same bytes.
+///
+/// Two things follow, and they are the reason this doc is long.
+///
+/// The first is that the kernels are not the problem. Left to overlap they
+/// reach half the bus, which for 4-bit weights with a dequantise in the inner
+/// loop is a respectable number and not one that rewriting a matvec improves
+/// much. Every attempt to make a kernel faster has been refuted -- batched
+/// matvec, split-K, norm fusion -- and this is why.
+///
+/// The second is that ORDERING IS 2.04 ms OF A 2.78 ms STEP, 73% of it, and
+/// 6.5 us for each of the 313 barriers on average. That is larger than the
+/// 3.7 us the marginal price curve above measures, and both numbers are
+/// right: dropping one barrier merges two stages, while dropping all of them
+/// lets the whole run overlap, and the second is worth more per barrier than
+/// the first.
+///
+/// So the ceiling on stage reduction is a 3.8x step, and the gap this work
+/// is trying to close is 1.87x.
+///
+/// # What that room is actually worth, at the price merging actually pays
+///
+/// The line that stood here said eleven stages a layer down to six would be
+/// about 1.7 ms and therefore that the stage count alone has enough room. It
+/// does not, and the error is that it priced five merges a layer at the
+/// WHOLESALE 6.5 us when merging pays the MARGINAL one. The doc says so two
+/// paragraphs up and then spends it anyway: dropping one barrier merges two
+/// stages, dropping all of them lets the whole run overlap, and only the
+/// second is worth 6.5.
+///
+/// The marginal price is measured, not assumed. Suppressing only the
+/// barriers a single named fusion would remove -- every `neox` fire, 28 of
+/// them -- buys 0.099 ms, which is 3.5 us each, and the same figure turns up
+/// two other ways. So five merges a layer is 140 boundaries:
+///
+/// | priced at | 140 boundaries | step lands at |
+/// |---|---|---|
+/// | 3.5 us, the marginal price | 0.49 ms | 2.29 ms |
+/// | 6.5 us, the wholesale price | 0.91 ms | 1.87 ms |
+///
+/// The truth is between: the per-barrier figure rises as more of them go,
+/// because removing enough of them starts to buy overlap and not just a
+/// merge, which is exactly why the two measured numbers differ. But 1.7 ms
+/// is outside that range on the optimistic side, and 1.49 ms -- the 1.87x
+/// target -- is outside it by more. Even deleting EVERY one of the 313
+/// boundaries pairwise, at the marginal price, is 1.10 ms and lands at 1.68.
+///
+/// Which is the honest position and it should not be softened. Pairwise
+/// fusion cannot close this gap. The 3.8x ceiling is real but it is only
+/// reachable WHOLESALE -- by something that lets the whole step overlap
+/// rather than by merging stages two at a time -- and core Vulkan offers a
+/// compute-to-compute dependency and nothing else. Meanwhile the realistic
+/// fusion programme, the three boundaries that survive every constraint, is
+/// 84 boundaries and about 0.30 ms: a 2.78 ms step becomes 2.48. Worth
+/// doing, and not the answer to the question the work is being asked.
+///
+/// That made one comparison load-bearing, and it has now been done. It cost
+/// twenty minutes and it changes what this work is for.
+///
+/// # vLLM, measured on this box, and what it says
+///
+/// vLLM 0.27.1, Qwen3-0.6B in bf16, full CUDA graphs captured, the same
+/// card. Wall clock over 128 forced decode steps, so it includes vLLM's
+/// scheduler, sampler and detokenizer -- the pie column is device time only
+/// and is therefore FLATTERED:
+///
+/// | batch | vLLM ms/step | pie ms/step | pie/vLLM | vLLM tok/s | pie tok/s |
+/// |---|---|---|---|---|---|
+/// | 1 | 2.445 | 2.70 | 1.10x | 409 | 370 |
+/// | 2 | 2.770 | 5.20 | 1.88x | 722 | 385 |
+/// | 4 | 2.797 | 6.06 | 2.17x | 1430 | 660 |
+/// | 8 | 3.024 | 8.39 | 2.77x | 2646 | 954 |
+///
+/// The 1.87x this doc has been chasing was one number standing in for two,
+/// and they point in opposite directions.
+///
+/// **Latency is essentially matched.** 1.10x at batch one, against a
+/// competitor whose figure carries host work that pie's does not. The 0.30
+/// ms fusion programme -- which the paragraph above correctly says cannot
+/// close 1.87x -- closes THIS. 2.78 becomes 2.48 and pie is ahead. The
+/// programme was written off against the wrong target.
+///
+/// **Throughput is where it loses, and the gap widens with the batch.**
+/// vLLM's step grows 1.24x from batch one to eight; pie's grows 3.11x. Fit
+/// both and vLLM is about 0.083 ms a sequence at the margin against pie's
+/// 0.54 -- a factor of six and a half, and the whole of the 2.77x.
+///
+/// # And it reopens the GEMM, in a sharper form
+///
+/// The tile sweep in `qmv_bench` concluded that routing a decode's
+/// multiply-adds through the tensor cores is not available, because pie's
+/// tiled GEMM cannot start in under 55 us at its best tile. vLLM is doing
+/// exactly that routing and paying 0.083 ms a sequence ACROSS THE WHOLE
+/// MODEL. So the conclusion has to be narrowed: it is not that a small-M
+/// GEMM cannot pay on this hardware, it is that THIS ONE cannot. A
+/// cuBLAS-class kernel at M=8 evidently has no 55 us floor.
+///
+/// Two things separate them and only one is fixable. vLLM is reading bf16
+/// and does no dequantisation; pie dequantises 4-bit weights in the inner
+/// loop, and that cost scales with the weights and not with M, which is
+/// precisely why it wants amortising across rows and precisely what the
+/// matvec refuses to do. Against that, pie moves 335 MB a step where vLLM
+/// moves about 1.2 GB, and pie's own no-barrier measurement shows this card
+/// reaching 453 GB/s under pie's kernels against the 490 GB/s vLLM sustains
+/// here. The bytes are on pie's side by 3.6x and the achievable bandwidth is
+/// the same. Nothing about the hardware says this gap has to exist.
+///
+/// # THE FUSED NORM+ROPE IS MEASURED AND IT WINS
+///
+/// `kernels-vulkan/kernels/norm/rms_rope.slang` merges the per-head RMS norm
+/// with the NEOX rotation that always follows it. The case for it was the
+/// barrier between them, priced at 0.099 ms a step by suppressing only the
+/// barrier in front of every `neox` fire, and the worry against it was
+/// occupancy: the fused grid is one workgroup per (head, row) where `neox`'s
+/// is one per rotary pair, so at a 128-wide head only 64 of a 256-thread
+/// group have rotation work.
+///
+/// `kernels-vulkan/tests/norm_bench.rs` settles it. At qwen3-0.6B's shapes
+/// the fused kernel is cheaper at EVERY row count and head count measured,
+/// by one dispatch's worth at decode and by an order of magnitude at
+/// prefill. The occupancy worry is real and too small to see.
+///
+/// Two cautions travel with that table and both are load-bearing:
+///
+/// Every decode figure is an exact multiple of 2.048 us and stayed there
+/// under 32 passes per timed interval, so those rows report a per-dispatch
+/// FLOOR, not a cost. Read them as "one dispatch and one barrier cheaper".
+/// A repeat run moved `16 heads x 1 row` by a whole tick while the fused
+/// column did not move at all.
+///
+/// The prefill delta -- 290.56 us against 20.45 at 512 rows -- is mostly NOT
+/// the fusion. `neox.slang` is `[numthreads(1, 1, 1)]` and its launch is
+/// `[rotary/2, heads, rows]`, so a 512-token prefill dispatches 524288
+/// one-thread workgroups. Widening that grid alone would recover most of it
+/// with no fusion at all. The fusion subsumes the fix and should not be
+/// credited with it.
+///
+/// Correctness is `kernels-vulkan/tests/gpu.rs`:
+/// `rms_rope_answers_what_the_norm_and_the_rotation_answer` runs both paths
+/// on the same input, and `rms_rope_leaves_the_unrotated_tail_normed` covers
+/// the partial-rotary arm gemma-4 needs, checking the tail against the norm's
+/// own output so that "both kernels agreed" cannot pass for the trivial
+/// reason that neither wrote anything. The first was checked against a
+/// deliberately wrong rope base before being believed.
+///
+/// # SPLIT-K WAS THE NAMED CANDIDATE, AND IT IS NOW MEASURED AND OUT
+///
+/// The paragraph above turns a negative result into a target, and the target
+/// it named first was split-K: the tiled GEMM's cost is one workgroup's
+/// serial walk down K, that walk is linear with no floor, and
+/// `affine_qmm_t_splitk_*` is already instantiated, so cutting the walk
+/// across the `z` extent looked like the cheapest thing that could work. It
+/// was priced at 25 to 30 us against the matvec's 10.26 at a batch of eight.
+///
+/// Measured, at exactly that shape and batch: **146 to 149 us**, for the
+/// partial pass alone and before the reduce dispatch. Fourteen times the
+/// matvec, not one and a half.
+///
+/// `qmv_bench` carries the control row that explains it, and the explanation
+/// is a methodology one rather than a kernel one. `affine_qmm_t_splitk` at
+/// ONE partition costs 319 us where the plain `affine_qmm_t` at half the tile
+/// area costs 47: they are not the same kernel body, and the split-K form
+/// takes a scalar `for kk` walk that re-fetches a scale and a bias per
+/// element. The 25-to-30 estimate had taken a constant measured on the plain
+/// kernel and applied it to a sibling on the strength of a shared name.
+///
+/// **That is the third time a number has been carried across a boundary it
+/// does not hold over** -- after `PIE_VULKAN_TIMING`'s per-dispatch absolutes
+/// and the marginal-against-wholesale barrier price -- and all three failed
+/// the same way. A constant belongs to the thing it was measured on. Moving
+/// it to a neighbour is a new measurement, not an inference.
+///
+/// So every existing kernel has now been measured against a decode batch --
+/// the matvec, the batched matvec, the tiled GEMM at seven tile shapes, and
+/// split-K at four partitions -- and the matvec wins all of them. **The
+/// projections are not reachable by routing.** What is left is writing a
+/// decode-shaped quantised GEMM from the tile up, and the honest statement of
+/// what is known about its shape is only "short in M, long in N, and not a
+/// scalar walk over K".
+///
+/// One thing the same sweep did establish, and it sharpens the target: at
+/// N=1024 the matvec costs 7.18 us at one token and 6.15 at FOUR, because
+/// 1024 workgroups do not fill this card and the first three rows of a batch
+/// are free. At N=3072 it is saturated at one token and pays proportionally
+/// from there. The batch penalty is the WIDE projections specifically, and
+/// any replacement has to beat a matvec already running at capacity on them.
+///
+/// # Where the batched step's extra 5.04 ms actually goes
+///
+/// Named it rather than reasoning about it: `PIE_VULKAN_TIMING` per-symbol
+/// totals, differenced against a baseline taken after warm-up, four decode
+/// steps, batch one against batch eight, same 24-token history. Absolutes
+/// are inflated by the timestamps and only the split matters.
+///
+/// | symbol | b1 ms/step | b8 ms/step | delta | fires |
+/// |---|---|---|---|---|
+/// | `affine_qmv_fast` | 1.31 | 4.05 | +2.74 | 141, unchanged |
+/// | `affine_qmv_fast_residual` | 0.81 | 1.44 | +0.63 | 56, unchanged |
+/// | `sdpa_paged_decode_split` | 0.30 | 0 | -0.30 | 28 -> 0 |
+/// | `sdpa_paged_decode_combine` | 0.12 | 0 | -0.12 | 28 -> 0 |
+/// | `sdpa_paged_tiled` | 0 | 1.42 | +1.42 | 0 -> 28 |
+/// | `cast_qmm_input_strided` | 0 | 0.50 | +0.50 | 0 -> 112 |
+/// | `neox_mb` | 0.22 | 0.38 | +0.16 | 56, unchanged |
+/// | `rms_single_row`, `kv_append`, `silu_mul` | | | +0.02 | unchanged |
+///
+/// Three findings, and only the first is the one this doc predicted.
+///
+/// **The projections are 67% of the increase**, 3.37 ms of 5.04, at an
+/// unchanged fire count: `affine_qmv_fast` goes 9.28 us a fire to 28.72.
+/// Sublinear in the batch, as `qmv.slang` says, and still the bulk of it.
+///
+/// **Attention is 1.00 ms of it, and that is structural rather than
+/// arithmetic.** At batch eight the decode's split/combine pair is not
+/// merely slower -- it is GONE. The lane is chosen by `FireClass`, M=1 takes
+/// `Decode` and M>1 takes `Prefill`, so a batch of eight is planned as a
+/// short prefill and takes `sdpa_paged_tiled`, whose tile is 32 query rows.
+/// Eight rows in a 32-row tile, and the eight rows belong to eight DIFFERENT
+/// sequences with eight different key runs, so the tile shares nothing. It
+/// costs 50.63 us a fire against the decode pair's 15.09 -- 3.4x for the
+/// same work. At the long context it is 644.98 us a fire.
+///
+/// A batched decode is not a small prefill and pie has no lane that says so.
+/// That is the cleanest structural statement of the throughput gap in this
+/// doc, and it is a plan-level fact, not a kernel one.
+///
+/// **And the dead casts wake up.** `cast_qmm_input_strided` fires 112 times
+/// a step at batch eight, and it is still DEAD. The proof is in the same table: `affine_qmm_t_*` fires
+/// ZERO times at batch eight, because eight is not a multiple of the 32-row
+/// tile, so nothing ever reads the fp16 activation these casts build. The
+/// memo beside the `stage` closure in `llama_like/forward/mod.rs` measured
+/// this at batch one, found it worth nothing, and said so. At batch eight it
+/// is worth something, and it is the only item on this page that needs no
+/// new kernel and no new lane.
+///
+/// FIXED, and the number is smaller than this table implies -- which is a
+/// warning about this table. The timestamps say 0.50 ms; an A/B of the
+/// shipped build with and without the fix, two runs each, interleaved, says:
+///
+/// | batch | before | after | delta |
+/// |---|---|---|---|
+/// | 1 | 2.726 | 2.697 | -0.029 |
+/// | 2 | 5.171 | 5.105 | -0.066 |
+/// | 4 | 6.053 | 5.889 | -0.164 |
+/// | 8 | 8.338 | 8.231 | -0.107 |
+///
+/// Reproducible and well outside the spread (0.005-0.010 within a build),
+/// and three to five times smaller than the per-symbol totals predicted.
+/// `PIE_VULKAN_TIMING` costs two timestamps a dispatch, so it charges a
+/// short kernel far more than it really costs and it charges 112 of them
+/// most of all -- and on top of that some of these casts still share a stage
+/// with the projection beside them even at batch eight, so removing them
+/// removes no stage. Read the per-symbol table for WHERE the time is and
+/// never for HOW MUCH: this page has now been wrong about that twice.
+///
+/// `dsl::metal::cast_qmm_input_when` carries the fix. The cast has a guard
+/// of its own with the same `TokensMultipleOf` predicate and an empty
+/// `otherwise`, which costs one skipped range in the lowering walk and no
+/// dispatch.
+///
+/// So the two programmes are now correctly ordered, and neither is the one
+/// this doc spent its length on. Latency: finish the three fusions, take the
+/// 0.30 ms, and pie leads at batch one. Throughput, in the order the
+/// measurement puts them: stop firing the dead casts on the M>1 lane when
+/// the GEMM arm cannot run (DONE, 0.11-0.16 ms); give a
+/// batched decode its own lane so it keeps the split/combine attention
+/// instead of a 32-row prefill tile (DONE, ~2.0 ms -- see below); and only
+/// then find out why
+/// `affine_qmm_t` needs 55 us to start when the equivalent CUDA kernel does
+/// not, because that is the 3.37 ms and the hardest of the three.
+///
+/// # The batched-decode lane, built and measured
+///
+/// `multi_batch` was `class != FireClass::Decode`, so eight sequences each
+/// advancing by ONE token were planned on the prefill lane and reached
+/// `sdpa_paged_tiled`: a 32-row query tile holding eight rows belonging to
+/// eight different sequences with eight different key runs, so the tile
+/// shares nothing and pays for a locality it does not have. 50.63 us a fire
+/// against the decode pair's 15.09, and 644.98 us a fire at long context.
+///
+/// `GuardPred::WindowOne` is exactly the missing question -- "is every row a
+/// one-token query window" -- which is what `FireClass::Decode` MEANT but
+/// could not say about a fire it did not classify. The attention is now a
+/// `guarded_value` with the decode pair on the `WindowOne` arm and the tiled
+/// kernel as `otherwise`. A mixed fire answers false and takes the tiled
+/// arm, which serves a one-token row as its degenerate case, so the fallback
+/// is correct and not merely safe.
+///
+/// Making this work needed one unrelated fix: `dsl::metal::sdpa` passed
+/// `Some((Shape, DType))` as its output unconditionally, which records an SSA
+/// output and so is NOT guard-safe -- inside a value region the launch must
+/// bind the GUARD's output buffer, which is what `region_out` returns `None`
+/// for.
+///
+/// Measured, against the build that already had the dead-cast fix, two runs
+/// each and interleaved:
+///
+/// | batch | before | with the lane | delta |
+/// |---|---|---|---|
+/// | 1 | 2.697 | 2.744 | +0.05 (noise; a batch of one was already on this arm) |
+/// | 2 | 5.105 | 3.135 | **-1.97** |
+/// | 4 | 5.889 | 3.873 | **-2.02** |
+/// | 8 | 8.231 | 6.254 | **-1.98** |
+///
+/// Twice what the per-symbol table predicted, which is the direction that
+/// table errs in for LONG fires and the mirror of the dead-cast case. So
+/// against vLLM the ratios go 1.10 / 1.88 / 2.17 / 2.77 to 1.12 / 1.13 /
+/// 1.38 / 2.07, and batch two is now within 13%.
+///
+/// **Do not guard the projections this way.** Their gate is
+/// `TokensMultipleOf`, a question about the TILE, and a batched decode fails
+/// it for a real reason: eight rows do not fill a sixteen-row tile.
+///
+/// Correctness is `hostprof.rs`'s
+/// `batched_decode_answers_what_a_single_decode_answers`: four conversations
+/// with DIFFERENT prompts, greedy-decoded twelve tokens, each matching what
+/// it answers alone and the four disagreeing among themselves. The second
+/// half is what makes the first mean anything -- four identical prompts
+/// would agree even if the lane pooled every row's keys into one run.
+///
+/// # Three ways of asking for the stall more politely, all refused
+///
+/// 6.5 us a barrier is large enough to look like a mistake, so the obvious
+/// three were tried. None of them moves the step, and together they say the
+/// wait is an execution property of the device and not something the shape
+/// of the request reaches.
+///
+/// One: a `BufferMemoryBarrier` per distinct pending buffer instead of the
+/// global one. SLOWER, on both device and host -- the numbers are beside the
+/// barrier itself, below.
+///
+/// Two: drop the memory barrier entirely and record a pure execution
+/// dependency, `cmd_pipeline_barrier` with no barriers of any kind between
+/// the same two stage masks. If any of the 6.5 us were cache maintenance
+/// this would find it. It is 2.756 ms against 2.758 -- the same number. The
+/// whole cost is waiting for the previous dispatch's workgroups to retire,
+/// and NVIDIA's L2 is coherent enough that describing the memory does not
+/// cost anything on top.
+///
+/// Three: a dedicated compute queue. This device offers family 2 with eight
+/// queues at COMPUTE | TRANSFER and no GRAPHICS, against the family 0 with
+/// everything that [`Candidate::read`] picks by taking the first family that
+/// can compute. An async-compute queue plausibly drains differently. It does
+/// not: 2.743 ms against 2.757, inside the spread.
+///
+/// So the barrier is a pipeline drain, its price is fixed, and the only
+/// variable left is how many of them a step contains.
+///
+/// # Which is not where the throughput gap is
+///
+/// `tests/hostprof.rs` sweeps the batch, and the shape of that sweep says
+/// the ordering story does not carry over. Device ms/step at 24 tokens of
+/// history: 2.70 at one, 5.20 at two, 6.06 at four, 8.39 at eight. Two to
+/// four costs 1.17x and one to two costs 1.89x, and a least-squares fit of
+/// the three batched points is 4.03 ms fixed plus 0.54 ms a sequence against
+/// a batch-of-one plan that is 2.70 ms in total.
+///
+/// ENTERING THE BATCHED PATH COSTS 1.33 ms BEFORE THE SECOND SEQUENCE DOES
+/// ANY WORK. The plan really is a different one -- `fire/plan` entries go
+/// 27.12 to 33.84 and spans a step 204 to 251 at a batch of two, and stay
+/// there at four and eight.
+///
+/// It is not ordering. A long-context batch-of-one run has 340 stages against
+/// the short one's 314, for 0.22 ms, so twenty-six boundaries are worth about
+/// 0.09 ms; 1.33 ms cannot be boundaries. It is stage DURATION, which means
+/// the batched plan's kernels are slower rather than more numerous. That is a
+/// larger number than the entire fusion programme above and nobody has looked
+/// at it.
+///
+/// # It is NOT the weights, and the argument that said so was wrong
+///
+/// The suspicion was that a batched step streams the model once a sequence,
+/// which would make batching pointless. Two arguments were offered for it and
+/// both are recorded here because the first looked convincing and the second
+/// is merely weak.
+///
+/// The convincing one: every recording a batched step makes is the same
+/// 564-fire shape as a batch of one, and the batched configs contribute 29
+/// recordings against the 9 a shared run would make. It proves nothing. A
+/// plan's fire COUNT does not depend on how many tokens it carries -- only
+/// the grids do -- so a prefill records 564 fires too, and `hostprof`
+/// prefills each conversation in a step of its own.
+///
+/// The weak one: at 335 MB a step read once is 124 GB/s at a batch of one and
+/// 40 at eight, the card getting worse as work is added, where read once a
+/// sequence it is 124 rising to 319 against a 453 GB/s ceiling. Suggestive,
+/// but ~2.3 ms of the step is ordering that does not scale with the batch, so
+/// the first shape is not impossible either.
+///
+/// SETTLED BY LOOKING. Dumping each fire's grid, `affine_qmv_fast`'s x extent
+/// is the vector count and it tracks the batch exactly: `[1, 384, 1]` at a
+/// batch of one, `[2, ..]`, `[4, ..]`, `[8, ..]`, and `[24, ..]` for the
+/// 24-token prefill. The y extent is the output rows over eight -- 128 for a
+/// 1024-wide projection, 256 for q at 2048, 384 for gate/up at 3072 -- and
+/// there are 141 of them a step at every batch. ONE DISPATCH COVERS EVERY
+/// SEQUENCE. The weights are read once.
+///
+/// So the 1.33 ms is arithmetic, which is what `quant/qmv.slang` says in the
+/// last paragraph of its batched-matvec refutation: the decode matvec is not
+/// weight-fetch-bound, it is bound by the arithmetic and the L2-to-SM issue
+/// rate, "both of which scale with the batch and neither of which a
+/// weight-sharing loop nest removes". A batch of eight does eight times the
+/// fused multiply-adds through a scalar loop over `pc.m`.
+///
+/// Which names the throughput lever precisely, and it is not scheduling and
+/// not weight traffic: it is that these multiply-adds do not go through the
+/// tensor cores. The tiled GEMM that would is behind
+/// `GuardPred::TokensMultipleOf(tile)` in `llama_like`'s `gemm_at`, and no
+/// batch of two, four or eight is a multiple of a 32-row tile, so every
+/// projection falls to the `otherwise` arm.
+///
+/// **And that lever has since been measured and does not move.** The question
+/// left open here was whether padding the batch up to the tile beats
+/// `affine_qmm_t`'s ~102 us floor, and whether a decode-shaped tile has a
+/// lower one. `kernels-vulkan`'s `qmv_bench` now sweeps the tile itself and
+/// answers both. The floor is the TILE's, not the kernel's -- it tracks the
+/// work inside one workgroup, `bm*bn*K`, because at these sizes the card is
+/// latency-bound and extra workgroups are nearly free -- and the smallest
+/// tile is nearly twice as fast as the 102 us that was recorded, 55.23 us at
+/// `16x16` against 102.29 at coopmat `32x32` for the q/o projection.
+///
+/// It still loses. At the best tile the GEMM costs 55.23 us where the matvec
+/// costs 16.37 at sixteen rows, and 61.27 against 26.65 at thirty-two; the
+/// slopes are 0.38 and 0.64 us a row, so they cross near a hundred and fifty
+/// rows. Every batch a decode can present is on the matvec's side of that by
+/// an order of magnitude. Routing the decode's multiply-adds through the
+/// tensor cores means this kernel, and this kernel cannot get started inside
+/// a decode's budget at any tile it has.
+///
+/// So the 1.33 ms is real and none of the four kernels in the tree collects
+/// it: the matvec, the batched matvec, split-K and the tiled GEMM have each
+/// now been measured against a decode batch and each lost. The table and the
+/// full argument are in `qmv_bench.rs` under "the matvec against the tiled
+/// GEMM".
+///
+/// A 6 us compute-to-compute stall on a card this new invites the obvious
+/// suspicion that the card is not actually running, since a decode keeps it
+/// at single-digit occupancy and a clock governor that sees no work is
+/// entitled to leave the clocks down. It is not that. Sampling `nvidia-smi`
+/// through a sustained loop of decode steps reads 2385-2407 MHz against a
+/// 2415 MHz maximum, from the first step onward -- full clock, and only
+/// 50-90 W of a 165 W budget, which is what a latency-bound step should draw.
+/// The idle reading of 180 MHz is real but never survives contact with the
+/// first submit. So the floor is the queue's, not the governor's, and there
+/// is no free win in pinning clocks or padding the workload to keep them up.
+///
+/// So the rule for the three merges still on the list is not "don't", it is a
+/// budget. A merge is worth ~0.10 ms a stage and must add less work than
+/// that. Two of them are free by construction and neither has been built:
+/// the kv append into rope's write, and the qk-norms into rope, both of which
+/// read exactly the elements they already touch. Swiglu into gate/up is the
+/// doubtful one, since one of the two operands has to be recomputed or
+/// re-read. Measure the step, not the count.
+///
+/// What is NOT available is a cheaper description of the same stall. Swapping
+/// the global barrier below for one `BufferMemoryBarrier` per distinct
+/// pending buffer was tried and measured: 1.641 ms a step against 1.609, and
+/// 0.128 ms of host against 0.093 to build the vectors. Slower on both
+/// counts, which is the note beside that barrier.
 ///
 /// Most neighbouring pairs do not touch the same bytes. A layer's Q, K and V
 /// projections all read the same normed rows and write three different
@@ -2873,6 +3709,24 @@ impl Buffer {
         self.size
     }
 
+    /// The Vulkan handle, as a number.
+    ///
+    /// For comparing two buffers, and for nothing else -- there is no way
+    /// back from this to a buffer. It exists because [`crate::replay`] has to
+    /// state that the arena a recorded descriptor names is the arena this
+    /// fire was given, and a `Buffer` is `Copy` plain data with no identity
+    /// of its own: two copies of the same handle are the same memory and two
+    /// different handles are not.
+    ///
+    /// A handle Vulkan RECYCLED after a free would compare equal to a dead
+    /// one, which is why every user of this pairs it with
+    /// [`Device::frees`].
+    #[must_use]
+    pub fn identity(&self) -> u64 {
+        use ash::vk::Handle;
+        self.handle.as_raw()
+    }
+
     /// A buffer of a stated size that names no device allocation.
     ///
     /// Binding produces offsets and lengths AGAINST a buffer and never
@@ -2944,6 +3798,16 @@ impl PartialEq for Bound<'_> {
 impl Eq for Bound<'_> {}
 
 impl<'a> Bound<'a> {
+    /// The three things this range is, taken apart.
+    ///
+    /// A `Buffer` is `Copy` plain data, so this is a range that outlives the
+    /// borrow it came from -- which is what [`crate::replay`] keeps, and the
+    /// only reason the fields are reachable at all.
+    #[must_use]
+    pub fn parts(&self) -> (Buffer, u64, u64) {
+        (*self.buffer, self.offset, self.len)
+    }
+
     /// The whole buffer.
     ///
     /// Offset zero, which every alignment divides, so this cannot be refused
@@ -3108,7 +3972,51 @@ pub struct Pipelines {
     /// answer for all of them. That is not a slow path or a wrong tier -- it
     /// is a pipeline whose SPIR-V does not match the layout the caller sized
     /// from the tier it thinks it selected.
-    built: HashMap<(String, Capability), Pipeline>,
+    ///
+    /// # Why the tier is the OUTER map
+    ///
+    /// It was one map keyed by `(String, Capability)`, and a tuple key cannot
+    /// be looked up without building it: `HashMap<(String, _), _>` borrows as
+    /// `&(String, _)` and nothing else, so both [`Self::get`] and
+    /// [`Self::peek`] began with `entrypoint.to_string()`. A fire asks each of
+    /// them once per RECTANGLE -- 904 heap allocations a decode step, every
+    /// one of them for a key that was already in the map.
+    ///
+    /// Nested, the tier is `Copy` and the inner map is keyed by `String`,
+    /// which `Borrow<str>` lets a `&str` probe directly. No allocation on a
+    /// hit, which is every lookup after the first fire.
+    built: HashMap<Capability, HashMap<String, Pipeline>>,
+    /// The buffer a fire gathers its scalar blocks into, kept for the next
+    /// fire rather than allocated and freed per step.
+    ///
+    /// A DECODE STEP ALLOCATED AND FREED ONE OF THESE EVERY TIME. Measured,
+    /// release, `tests/hostprof.rs` on a 4090: `fire/block` -- one
+    /// `vkCreateBuffer`, one `vkAllocateMemory`, one bind and one mapped
+    /// write, for the 3,624 bytes a qwen3-0.6b decode's 114 blocks come to --
+    /// was **0.18 ms of what was then called a 1.4 ms host step** -- that
+    /// denominator was mostly fence wait and is retracted in this crate's
+    /// module doc, but the 0.18 ms is a phase span and stands -- and the
+    /// matching
+    /// `vkFreeMemory`/`vkDestroyBuffer` at the end of the fire was not
+    /// separately timed and is the same order. The bytes are not what cost
+    /// that; the allocator is, and `serve::fire`'s own comment already
+    /// records that one allocation here is "200 to 450 microseconds".
+    ///
+    /// Held HERE because this is the cache a caller already keeps across
+    /// fires and hands to `serve::fire` -- see [`Pipelines::clear`], which is
+    /// where it is given back. Nothing about it is a pipeline, and the
+    /// alternative was a second `&mut` parameter through the fire path and
+    /// every test that fires one.
+    ///
+    /// # Why reusing it is safe
+    ///
+    /// The same argument that made freeing it safe. `Device::run_all` waits
+    /// on a fence before it returns, so no queue is reading these bytes when
+    /// the fire that wrote them ends -- which is exactly the precondition for
+    /// the next fire to write over them. What a fire binds is a SPAN of it
+    /// per rectangle, so bytes left over from a longer previous fire are past
+    /// every descriptor's range and cannot be read.
+    block: Option<Buffer>,
 }
 
 impl Default for Pipelines {
@@ -3126,7 +4034,7 @@ impl Pipelines {
     /// claim about how long something took.
     #[must_use]
     pub fn built(&self) -> usize {
-        self.built.len()
+        self.built.values().map(HashMap::len).sum()
     }
 
     /// An empty cache.
@@ -3134,6 +4042,52 @@ impl Pipelines {
     pub fn new() -> Self {
         Self {
             built: HashMap::new(),
+            block: None,
+        }
+    }
+
+    /// A buffer holding `bytes`, reusing the one the last fire gave back.
+    ///
+    /// Handed OUT rather than lent, because a fire holds it while it asks
+    /// this same cache for pipelines and a borrow would forbid that. The
+    /// caller returns it with [`Pipelines::keep`]; one that does not has
+    /// leaked a buffer, which is the same contract [`Device::free`] has
+    /// everywhere else in this crate.
+    ///
+    /// Grown and never shrunk. A fire's block run is a few kilobytes and
+    /// varies with the plan, not with the context, so the second decode after
+    /// a prefill fits what the prefill left and no fire after it allocates at
+    /// all.
+    ///
+    /// # Errors
+    ///
+    /// As [`Device::buffer`], and [`Failed::Vulkan`] if the write fails.
+    pub fn block(&mut self, device: &Device, bytes: &[u8]) -> Result<Buffer, Failed> {
+        if let Some(held) = self.block.take() {
+            if held.size() >= bytes.len() as u64 {
+                device.write(&held, bytes)?;
+                return Ok(held);
+            }
+            device.free(held);
+        }
+        device.buffer(bytes)
+    }
+
+    /// Take back what [`Pipelines::block`] handed out.
+    ///
+    /// The larger of the two is kept, so a prefill's block is not thrown away
+    /// by the decode that follows it and then rebuilt by the next prefill.
+    pub fn keep(&mut self, device: &Device, block: Buffer) {
+        match self.block.take() {
+            Some(held) if held.size() >= block.size() => {
+                device.free(block);
+                self.block = Some(held);
+            }
+            Some(held) => {
+                device.free(held);
+                self.block = Some(block);
+            }
+            None => self.block = Some(block),
         }
     }
 
@@ -3179,12 +4133,14 @@ impl Pipelines {
         descriptors: u32,
         tier: Capability,
     ) -> Result<&Pipeline, Failed> {
-        let key = (entrypoint.to_string(), tier);
-        if !self.built.contains_key(&key) {
+        let at = self.built.entry(tier).or_default();
+        if !at.contains_key(entrypoint) {
             let built = Self::build(device, code, push, descriptors)?;
-            self.built.insert(key.clone(), built);
+            at.insert(entrypoint.to_owned(), built);
         }
-        Ok(&self.built[&key])
+        at.get(entrypoint).ok_or(Failed::Vulkan(String::from(
+            "a pipeline inserted one line above is not in the cache",
+        )))
     }
 
     /// A pipeline already built, without the borrow that building takes.
@@ -3196,7 +4152,7 @@ impl Pipelines {
     /// module first and then asks for them.
     #[must_use]
     pub fn peek(&self, entrypoint: &str, tier: Capability) -> Option<&Pipeline> {
-        self.built.get(&(entrypoint.to_string(), tier))
+        self.built.get(&tier)?.get(entrypoint)
     }
 
     /// Build one pipeline.
@@ -3296,14 +4252,24 @@ impl Pipelines {
     /// device is what destroys these, and a cache that borrowed it could not be
     /// held beside it.
     pub fn clear(&mut self, device: &Device) {
+        // A recorded command buffer names these pipelines by handle, so the
+        // recording goes when they do. `Device::free` says the same thing
+        // about buffers; between them, a replay can only ever run while
+        // everything the recording names is still alive.
+        device.forget_recording();
         let d = &device.device;
         unsafe {
             let _ = d.device_wait_idle();
-            for (_, p) in self.built.drain() {
-                d.destroy_pipeline(p.pipeline, None);
-                d.destroy_pipeline_layout(p.layout, None);
-                d.destroy_descriptor_set_layout(p.set_layout, None);
+            for (_, tier) in self.built.drain() {
+                for (_, p) in tier {
+                    d.destroy_pipeline(p.pipeline, None);
+                    d.destroy_pipeline_layout(p.layout, None);
+                    d.destroy_descriptor_set_layout(p.set_layout, None);
+                }
             }
+        }
+        if let Some(block) = self.block.take() {
+            device.free(block);
         }
     }
 }
@@ -3640,7 +4606,25 @@ mod tests {
                     None => std::env::remove_var("PIE_VULKAN_FENCE_TIMEOUT_SECS"),
                 }
             }
-            let got = super::fence_timeout_ns();
+            let got = super::fence_timeout_ns(false);
+            // The SOFTWARE default must obey the same rules: an explicit
+            // value wins on both, and a bad one falls back to that adapter's
+            // own default rather than to the hardware one. A guard that
+            // parsed only for the GPU case would leave `llvmpipe` with ten
+            // seconds again, which is the whole defect.
+            let soft = super::fence_timeout_ns(true);
+            let ten_min = 600 * 1_000_000_000;
+            let explicit = set
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|s| *s > 0);
+            match explicit {
+                Some(_) => assert_eq!(soft, got, "an explicit value ignores the adapter: {why}"),
+                None => assert_eq!(
+                    soft, ten_min,
+                    "a software adapter falls back to ten minutes, not ten \
+                     seconds: {why}"
+                ),
+            }
             assert!(
                 got < u64::MAX,
                 "PIE_VULKAN_FENCE_TIMEOUT_SECS={set:?} produced u64::MAX, which \

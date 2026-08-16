@@ -25,7 +25,7 @@
 //! `#[ignore]`, driver-cuda + profile-fire. Run:
 //!   PIE_COMPILER_LAUNCHER=env RUSTC_WRAPPER=sccache CUDACXX=/usr/local/cuda/bin/nvcc \
 //!   CPM_SOURCE_CACHE=$HOME/.cache/pie-cpm \
-//!   cargo test -p pie-gpu-tests --features driver-cuda,profile-fire \
+//!   cargo test -p pie-gpu-tests --features driver-cuda-13,profile-fire \
 //!     --test cuda_deep_coverify -- --ignored --nocapture
 //!
 //! Config knobs (finalized to bravo's `lowlevel-chat` pilot on

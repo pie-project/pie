@@ -1,31 +1,7 @@
-//! The planner's measurement half: sweep the shape ladder and time it.
+//! Sweep calibration shapes and time synthetic forward steps.
 //!
-//! [`memory_planner::plan`](super::memory_planner::plan) scores its candidate
-//! lattice ANALYTICALLY, and a score is a model of how a shape will perform.
-//! [`profile_cache`](super::profile_cache) is where a MEASUREMENT of the same
-//! question is kept, so a later boot can select by evidence instead. Both
-//! halves existed; nothing measured, which is the gap this closes.
-//!
-//! # What a calibration boot already does
-//!
-//! `PlannerConfig::calibrating` makes the planner build the CEILING of the
-//! feasible region rather than the score's pick — the largest explorable
-//! rectangle — because a bigger arena can run a smaller shape and not the
-//! other way round. With the ceiling built, a downward-only ladder stops
-//! being a restriction and becomes the correct direction.
-//!
-//! So this module never asks whether a shape FITS. That question was answered
-//! when the ceiling was chosen; every point here is inside it by construction.
-//! What is left is: which points to try, how many times, and which one won.
-//!
-//! # The measurement is injected
-//!
-//! [`StepTimer`] is a trait for the same reason
-//! [`ProfileSource`](super::memory_planner::ProfileSource) is: the decision —
-//! the ladder, the repeats, the statistics, the pick — is the part worth
-//! verifying, and it is verifiable without a GPU. The driver supplies a timer
-//! that fires a real synthetic batch; the tests supply one that returns a
-//! function of the shape.
+//! Calibration boots build the feasible ceiling. The ladder only walks
+//! downward because that arena can run smaller shapes, but not larger ones.
 
 use super::profile_cache::ShapeSample;
 use super::profile_key::ProfileShape;
@@ -40,12 +16,7 @@ pub struct Point {
 }
 
 impl Point {
-    /// The synthetic batch's per-request token count.
-    ///
-    /// The shape says how many tokens and how many requests the buffer holds;
-    /// the batch that fills it divides one by the other. Floor, and at least
-    /// one — a shape with more requests than tokens can still be measured, by
-    /// a batch of one-token requests that does not fill it.
+    /// Tokens per request for the synthetic batch, floored at one.
     #[must_use]
     pub const fn tokens_per_request(self) -> i32 {
         let n = self.max_forward_tokens / self.max_forward_requests;
@@ -68,27 +39,15 @@ pub struct Ceiling {
     pub max_forward_requests: i32,
 }
 
-/// The smallest shape worth timing.
-///
-/// Below this the step is dominated by fixed per-fire cost rather than by the
-/// shape, so the samples stop distinguishing candidates and start measuring
-/// the driver. 32 tokens is roughly where that happens on the decode path.
+/// Token floor below which fixed per-fire cost dominates.
 const FLOOR_TOKENS: i32 = 32;
 
-/// And the smallest request count.
+/// Request-count floor.
 const FLOOR_REQUESTS: i32 = 1;
 
-/// The ladder a sweep walks, largest first.
+/// Largest-first powers-of-two ladder over tokens and requests.
 ///
-/// GEOMETRIC and downward-only, halving each axis independently, which is the
-/// same shape the planner's own `token_ladder`/`request_ladder` take when
-/// `calibrating` — powers of two from the ceiling down. Independently rather
-/// than as a diagonal because the two axes answer different questions: tokens
-/// is how much prefill fits, requests is how much decode does, and a device
-/// can prefer one without the other.
-///
-/// The ceiling itself is always first, so a sweep that can afford exactly one
-/// measurement measures the shape the planner would have built anyway.
+/// Axes vary independently: tokens probe prefill capacity; requests probe decode.
 #[must_use]
 pub fn ladder(ceiling: Ceiling) -> Vec<Point> {
     let axis = |top: i32, floor: i32| {
@@ -107,9 +66,7 @@ pub fn ladder(ceiling: Ceiling) -> Vec<Point> {
     let mut out = Vec::with_capacity(tokens.len() * requests.len());
     for &t in &tokens {
         for &r in &requests {
-            // A request count above the token count cannot be filled by a
-            // batch of whole requests, so it is not a shape a sweep can
-            // distinguish — it measures the same batch as `r == t`.
+            // Whole-request batches cannot distinguish r > t from r == t.
             if r <= t {
                 out.push(Point {
                     max_forward_tokens: t,
@@ -123,12 +80,7 @@ pub fn ladder(ceiling: Ceiling) -> Vec<Point> {
 
 /// What the driver supplies: one timed step at one shape.
 pub trait StepTimer {
-    /// Run one forward step at `point` and return its wall time in
-    /// milliseconds, or `None` if this shape could not be run.
-    ///
-    /// A `None` is not a failure of the sweep. A shape the driver declines —
-    /// an arm it has no kernel for at that width — is simply not a candidate,
-    /// and the sweep goes on to the next one.
+    /// Return wall time in milliseconds, or `None` for a declined shape.
     fn step_ms(&mut self, point: Point) -> Option<f64>;
 }
 
@@ -137,29 +89,17 @@ pub trait StepTimer {
 pub struct Calibration {
     /// The winner, ready for [`ProfileCache::store`](super::profile_cache::ProfileCache::store).
     pub shape: ProfileShape,
-    /// Every point, in ladder order, for the audit trail the cache keeps.
+    /// Measured points in ladder order.
     pub samples: Vec<ShapeSample>,
 }
 
-/// How many timed steps make one sample.
-///
-/// Three, and the first is thrown away: the first step at a new shape pays
-/// for whatever the driver builds lazily at that width — an attention plan, a
-/// graph capture, a pool that grows — and timing it measures the build rather
-/// than the step. Two kept repeats is the fewest that yields a spread at all,
-/// and the spread is what tells an operator whether two close candidates were
-/// actually distinguishable.
+/// Timed repeats per point; the first is discarded as warm-up.
 pub const REPEATS: usize = 3;
 
-/// Time every point on the ladder and pick the fastest.
+/// Time each ladder point and pick the fastest measured shape.
 ///
-/// Returns `None` when no point could be measured, which is the honest answer
-/// for a driver that declined the whole ladder — a caller should keep the
-/// analytic pick rather than store an empty measurement.
-///
-/// `template` carries the fields the sweep does not vary: the policy family,
-/// the page size and the budget the ceiling was built inside. Those are
-/// properties of the arena, not of the shape being timed.
+/// Returns `None` if every shape is declined. `template` keeps the policy,
+/// page size, and arena budget that are not varied by calibration.
 pub fn sweep(
     ceiling: Ceiling,
     template: &ProfileShape,
@@ -174,10 +114,7 @@ pub fn sweep(
     }
     let best = samples.iter().enumerate().fold(None, |best, (i, s)| {
         match best {
-            // STRICTLY greater, so ties go to the EARLIER point — and the
-            // ladder is largest-first, so a tie is broken toward the bigger
-            // shape. Two shapes that measure the same are not equally good:
-            // the bigger one serves everything the smaller one does.
+            // Strict comparison keeps ties on the earlier, larger shape.
             Some((_, v)) if s.tokens_per_s <= v => best,
             _ => Some((i, s.tokens_per_s)),
         }
@@ -207,9 +144,7 @@ fn measure(point: Point, timer: &mut dyn StepTimer) -> Option<ShapeSample> {
     }
     let n = kept.len() as f64;
     let mean = kept.iter().sum::<f64>() / n;
-    // POPULATION deviation, not sample: these are every repeat that was run,
-    // not a draw from a larger set, and with two of them Bessel's correction
-    // would report a spread half again as wide as the one observed.
+    // Population deviation: kept repeats are the full measurement set.
     let var = kept.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n;
     Some(ShapeSample {
         max_forward_tokens: point.max_forward_tokens,
@@ -314,8 +249,7 @@ mod tests {
 
     #[test]
     fn the_first_repeat_is_discarded() {
-        // The first step at a shape pays for what the driver builds lazily
-        // there. If it were kept, this 100 ms outlier would move the mean.
+        // The warm-up outlier should not move the mean.
         let mut seen = 0;
         let mut timer = Fake(|_| {
             seen += 1;
@@ -361,16 +295,14 @@ mod tests {
 
     #[test]
     fn the_winner_is_the_fastest_measured_shape_not_the_biggest() {
-        // Throughput peaks in the middle: a real device saturates and then
-        // falls off. If the sweep just took the ceiling there would be no
-        // reason to measure at all.
+        // Throughput can peak below the ceiling.
         let c = Ceiling {
             max_forward_tokens: 512,
             max_forward_requests: 16,
         };
         let mut timer = Fake(|p: Point| {
             let t = f64::from(p.batch_tokens());
-            // Time grows superlinearly past 128 tokens, so tokens/s peaks there.
+            // Tokens/s peaks at 128.
             Some(if t <= 128.0 { t } else { t * t / 128.0 })
         });
         let cal = sweep(c, &template(), &mut timer).expect("a winner");
@@ -392,8 +324,7 @@ mod tests {
 
     #[test]
     fn a_tie_goes_to_the_bigger_shape() {
-        // Two shapes that measure the same are not equally good: the bigger
-        // one serves everything the smaller one does.
+        // Equal throughput keeps the larger shape.
         let c = Ceiling {
             max_forward_tokens: 128,
             max_forward_requests: 1,
@@ -410,7 +341,7 @@ mod tests {
             max_forward_requests: 4,
         };
         let mut timer = Fake(|p: Point| {
-            // The driver has no kernel at the widest shape.
+            // The widest shape is unavailable.
             (p.max_forward_tokens < 256).then(|| f64::from(p.batch_tokens()))
         });
         let cal = sweep(c, &template(), &mut timer).expect("a winner");

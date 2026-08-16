@@ -1,52 +1,23 @@
 //! The launch path's view of device memory: one buffer, at an offset, with a
-//! length both sides are good for.
+//! length both sides are good for — the span a fire binds when it stages a
+//! stage's descriptors, an op's parameters, or a channel ring's words.
 //!
-//! Everything a fire binds — a stage's descriptors, an op's parameters, a
-//! channel ring's words, the status word it reads back — is a sub-range of a
-//! buffer that something else owns. The C++ threads `SlotHandle` through the
-//! whole of `m1_runtime.cpp` for this: a borrowed `void*` buffer, a raw CPU
-//! pointer, a GPU address, an offset and a size, copied field by field. Two
-//! helpers in the file's anonymous namespace build every one of them —
-//! `subhandle`, which re-derives the fields from a base handle, and
-//! `external_handle`, which wraps a channel ring's storage whole. Neither can
-//! refuse anything, and each has something specific wrong with it.
+//! A [`Handle`] can only be a view of a plain buffer. An
+//! [`Elastic`](super::Elastic) (placement-sparse) buffer's sub-range must
+//! never be represented as one: the ordinary capacity test (`bytes <= size`)
+//! would pass against pages with no backing store behind them.
 //!
-//! `subhandle` rebuilds the struct with a designated initializer that names
-//! five of the six fields. The sixth is `elastic` — whether the buffer is a
-//! placement-sparse virtual range — so a sub-range of an elastic buffer would
-//! come out claiming to be an ordinary one, and the ordinary capacity test is
-//! `bytes <= size`, which a sparse range passes with no pages behind it. No
-//! call site hands it an elastic base today; the initializer is one refactor
-//! away from minting one silently. Here there is no flag to mislay: elastic
-//! is [`Elastic`](super::Elastic), a type, and a view of a plain buffer is
-//! all a [`Handle`] can be.
-//!
-//! `subhandle` also checks nothing. A span past the base's end is a handle
-//! onto bytes the base never had, and a base that is the default (invalid)
-//! handle is `static_cast<uint8_t*>(nullptr) + offset` — undefined behaviour
-//! which in practice mints a "handle" whose GPU address *is* the offset,
-//! a number an argument table binds like any other. [`Handle::slice`] refuses
-//! the first with the same wrap-safe bound every [`Region`] uses, and the
-//! second cannot be written down: an invalid `Handle` is not a value of the
-//! type, and "no handle yet" is spelled `Option<Handle>`.
-//!
-//! `external_handle` wraps whatever storage a channel carries, and that
-//! storage has a host-only fallback whose `native_buffer` is null and whose
-//! GPU address is zero. Nothing consults `device_visible()`, so on the wrong
-//! build a ring binds as address zero and the kernel walks the null page.
-//! [`Handle::over`] starts from a real `MTLBuffer` or does not exist, and
-//! refuses one whose bytes the host cannot address.
+//! [`Handle::over`] refuses a buffer whose storage mode gives the host no
+//! address for its bytes. [`Handle::slice`] refuses a span that leaves its
+//! parent view, using the same wrap-safe bound every [`Region`] uses.
 //!
 //! # Ownership
 //!
-//! The C++ view is borrowed — "lifetime owned by RawMetalContext", says the
-//! header — a contract kept by hand at every one of the copies above. A
-//! `Handle` retains its buffer instead: the allocation cannot be freed out
-//! from under a view of it, however the owner that lent it is dropped. What
-//! retaining does not answer for is exclusivity — a pooled buffer whose
-//! [`Transient`](super::Transient) is dropped goes back on the free list even
-//! though a view still addresses its bytes — so a handle belongs beside the
-//! owner it was derived from, and should die with it.
+//! A `Handle` retains its buffer, so the allocation cannot be freed out from
+//! under a view of it. Retaining does not give exclusivity: a pooled buffer
+//! whose [`Transient`](super::Transient) is dropped returns to the free list
+//! even while a `Handle` still addresses its bytes, so a handle must not
+//! outlive the owner it was derived from.
 
 use core::ffi::c_void;
 use core::ptr::NonNull;
@@ -62,9 +33,7 @@ use crate::layout::region::Region;
 /// A span of one shared-storage buffer: an address for the GPU, a pointer for
 /// the host, and the length both are valid for.
 ///
-/// The C++ `SlotHandle`, with the two constructors made refusing and the
-/// borrow made a retain. Cloning is a retain, not a copy of bytes; a clone is
-/// the same span.
+/// Cloning is a retain, not a copy of bytes; a clone is the same span.
 #[derive(Clone)]
 pub struct Handle {
     /// Retained so the span cannot outlive the allocation it names.
@@ -81,8 +50,7 @@ impl Handle {
     /// was *asked for*, not `buffer.length()`: the heap, the pool and the
     /// device all round a request up, the padding is mapped and writable, and
     /// a view that includes it is how one slot quietly reaches its
-    /// neighbour's rounding. This is the port of `external_handle`, which
-    /// trusted its caller on every field.
+    /// neighbour's rounding.
     ///
     /// # Errors
     ///
@@ -120,11 +88,10 @@ impl Handle {
 
     /// The sub-span of `len` bytes starting `offset` bytes into this one.
     ///
-    /// This is the port of `subhandle`, which computed the same three sums
-    /// and checked none of them. The bound is [`Region::check`]'s — written
-    /// as two comparisons so an `offset + len` that wraps is refused rather
-    /// than passed — and both the host pointer and the GPU address move by
-    /// exactly the offset that survived it.
+    /// The bound is [`Region::check`]'s — written as two comparisons so an
+    /// `offset + len` that wraps is refused rather than passed — and both
+    /// the host pointer and the GPU address move by exactly the offset that
+    /// survived it.
     ///
     /// # Errors
     ///
@@ -186,11 +153,8 @@ unsafe impl Region for Handle {
     }
 }
 
-/// Narrow a checked offset to a host index.
-///
-/// Every caller has already compared the value against a `len` that fits the
-/// buffer's own `usize` length, so it fits. Written once so the reason is
-/// written once, as in [`crate::layout::region`].
+/// Narrows a checked offset to a host index; callers have already bounded
+/// it against a `usize`-sized `len`.
 #[allow(clippy::cast_possible_truncation)]
 const fn usize_of(v: u64) -> usize {
     v as usize

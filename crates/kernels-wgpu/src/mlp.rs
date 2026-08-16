@@ -20,7 +20,7 @@ use kernels::KernelSig;
 /// Originally: `mlp` is the first LIVE family to lose its rows — every gated MLP names `silu_mul`, and the three
 /// activations beside it are what gemma and gpt-oss run — so unlike `sample`
 /// and `ptir` the crossing had to be MEASURED rather than argued.
-/// `driver-wgpu`'s `the_routine_path_plans_what_the_table_path_planned`
+/// `driver-wgpu`'s `every_launchs_scalars_land_where_its_module_reads_them`
 /// derives every field of every rectangle twice, by the row and by the arm,
 /// and compares.
 pub static KERNELS: &[KernelSig] = &[];
@@ -36,7 +36,8 @@ pub static ENTRYPOINTS: &[&str] = &[
     "silu_mul_strided_bfloat16",
 ];
 
-use crate::routine::{Bind, Buf, BufMut, Ctx, Env, Fire, Routine};
+use crate::routine::{keys, Ask, Bind, Block, Buf, BufMut, Ctx, Fire, Routine};
+use crate::routine::{InSlot, OutSlot, Param};
 use kernels::routine::Refusal;
 use kernels::shader::elementwise;
 
@@ -51,11 +52,11 @@ use kernels::shader::elementwise;
 /// [`kernels::shader::elementwise`]'s, for a zero width or row count.
 pub fn silu_mul(
     ctx: &Ctx<'_>,
-    gate: Buf,
-    up: Buf,
-    out: BufMut,
-    width: Env<i32>,
-    rows: Env<i32>,
+    gate: InSlot<0, Buf>,
+    up: InSlot<1, Buf>,
+    out: OutSlot<0, BufMut>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -87,12 +88,12 @@ pub fn silu_mul(
 /// [`kernels::shader::elementwise`]'s.
 pub fn geglu_tanh(
     ctx: &Ctx<'_>,
-    gate: Buf,
-    up: Buf,
-    out: BufMut,
-    params: Buf,
-    width: Env<i32>,
-    rows: Env<i32>,
+    gate: InSlot<0, Buf>,
+    up: InSlot<1, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -115,12 +116,12 @@ pub fn geglu_tanh(
 /// [`kernels::shader::elementwise`]'s.
 pub fn geglu_tanh_strided(
     ctx: &Ctx<'_>,
-    gate: Buf,
-    up: Buf,
-    out: BufMut,
-    params: Buf,
-    width: Env<i32>,
-    rows: Env<i32>,
+    gate: InSlot<0, Buf>,
+    up: InSlot<1, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -143,12 +144,12 @@ pub fn geglu_tanh_strided(
 /// [`kernels::shader::elementwise`]'s.
 pub fn gptoss_swiglu(
     ctx: &Ctx<'_>,
-    gate: Buf,
-    up: Buf,
-    out: BufMut,
-    params: Buf,
-    width: Env<i32>,
-    rows: Env<i32>,
+    gate: InSlot<0, Buf>,
+    up: InSlot<1, Buf>,
+    out: OutSlot<0, BufMut>,
+    params: Block<Buf>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {
@@ -181,12 +182,12 @@ pub fn gptoss_swiglu(
 /// [`kernels::shader::elementwise_rows`]'s.
 pub fn silu_mul_strided(
     ctx: &Ctx<'_>,
-    gate: Buf,
-    up: Buf,
-    out: BufMut,
-    row_pitch: i32,
-    width: Env<i32>,
-    rows: Env<i32>,
+    gate: InSlot<0, Buf>,
+    up: InSlot<1, Buf>,
+    out: OutSlot<0, BufMut>,
+    row_pitch: Param<0, i32>,
+    width: Ask<keys::Width, i32>,
+    rows: Ask<keys::Rows, i32>,
 ) -> Result<(), Refusal> {
     ctx.dispatch(
         Fire {

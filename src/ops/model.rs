@@ -91,36 +91,8 @@ fn dirname_to_repo_id(dir: &str) -> Option<String> {
 // Pie-compatibility check
 // -----------------------------------------------------------------------------
 
-/// HuggingFace `model_type` → PIE arch name. Kept in sync with
-/// the model_type strings the C++ drivers (`crates/driver-cuda/csrc/src/loader/`,
-/// `crates/driver-metal/csrc/src/`) recognise. Architectures supported by *any*
-/// of the standalone-linked drivers belong here.
-const HF_TO_PIE_ARCH: &[(&str, &str)] = &[
-    ("llama", "llama3"),
-    ("qwen2", "qwen2"),
-    ("qwen3", "qwen3"),
-    ("qwen3_5", "qwen3_5"),
-    ("qwen3_moe", "qwen3_moe"),
-    ("qwen3_5_moe", "qwen3_5_moe"),
-    ("qwen3_5_moe_text", "qwen3_5_moe"),
-    ("qwen3_vl", "qwen3_vl"),
-    ("qwen3_vl_text", "qwen3_vl"),
-    ("phi3", "phi3"),
-    ("mixtral", "mixtral"),
-    ("gemma2", "gemma2"),
-    ("gemma3_text", "gemma3"),
-    ("gemma4_text", "gemma4"),
-    ("gemma4", "gemma4"),
-    ("mistral3", "mistral3"),
-    ("olmo3", "olmo3"),
-    ("gptoss", "gptoss"),
-    ("gpt_oss", "gptoss"),
-    ("nemotron_h", "nemotron_h"),
-    ("kimi_k3", "kimi_k3"),
-];
-
 /// Read `<repo_dir>/snapshots/<latest>/config.json` and look up its
-/// `model_type` against [`HF_TO_PIE_ARCH`]. Returns
+/// `model_type` against [`model::ingest::arch_for_model_type`]. Returns
 /// `(true, arch_name)` when supported, `(false, "unsupported type:
 /// <model_type>")` when not, or `(false, "no config")` when the
 /// snapshot is missing or unreadable.
@@ -153,12 +125,16 @@ fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
     if model_type.is_empty() {
         return (false, "no config".to_string());
     }
-    for (hf, pie) in HF_TO_PIE_ARCH {
-        if *hf == model_type {
-            return (true, pie.to_string());
-        }
+    // The table used to live here, "kept in sync with the model_type strings
+    // the C++ drivers recognise" by hand -- and it had drifted, naming three
+    // architectures no row in this build advertises. It now sits beside the
+    // rows it is a fact about, in `model::ingest`, where the import passes
+    // that turn a `model_type` into a naming table read the same entries and
+    // a test refuses an entry no generation answers to.
+    match model::ingest::arch_for_model_type(model_type) {
+        Some(pie) => (true, pie.to_string()),
+        None => (false, format!("unsupported type: {model_type}")),
     }
-    (false, format!("unsupported type: {model_type}"))
 }
 
 // -----------------------------------------------------------------------------

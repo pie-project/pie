@@ -9,14 +9,6 @@
 //! wait needs), then parks until the planner restores residency. There is
 //! no park protocol, no decline, no safe-point state — the guest simply
 //! waits out its own eviction.
-//!
-//! The fast path used to be the FLEET-wide `Planner::gate_open()`
-//! ("nobody at all is evicted"), falling through to `Planner::is_resident`
-//! — which takes the planner mutex — whenever it was false. That inverted
-//! the cost exactly where it hurt: an idle fleet paid nothing, and a
-//! contended fleet, where some process is evicted essentially always, paid
-//! a global-lock acquisition on EVERY host call. Reading a per-process
-//! flag is unconditional and costs the same either way.
 
 use anyhow::{Context, Result};
 
@@ -39,8 +31,7 @@ pub(crate) async fn residency_gate(ctx: &mut ProcessCtx) -> Result<()> {
     }
     // Settle our own submitted tail: the parked task must hold no pins, and
     // these finalizations release the fire leases the eviction quiesces on.
-    // `wait_resident` re-posts the process-wide leave before parking (the
-    // lane-resurrection seal wedge, CONTENTION_FOLLOWUP.md §15.2).
+    // `wait_resident` re-posts the process-wide leave before parking.
     drain_pending_fires(ctx).await?;
     planner
         .wait_resident(pid)

@@ -92,7 +92,7 @@ pub trait Reflect {
 pub struct Encoder<'a, 'h, R: Reflect> {
     reflect: &'h R,
     /// The statement's scalar run, for a body that forwards
-    /// [`crate::arm::Handles::params_block`].
+    /// [`crate::hold::Handles::params_block`].
     ///
     /// Held rather than passed per dispatch because it is the STATEMENT's,
     /// and every rectangle a body fires belongs to one statement.
@@ -167,7 +167,10 @@ impl<'a, 'h, R: Reflect> Encoder<'a, 'h, R> {
 /// declared twenty-four is a `Fault::PushRange` and not a shader reading a
 /// stride's high half as its low one.
 fn words(args: &[ArgValue]) -> Vec<u32> {
-    let mut out = Vec::new();
+    // Sized rather than grown: an `ArgValue::Usize` is two words and the rest
+    // are one, so `args.len() + 1` is the answer for every call this tree
+    // makes and an over-estimate for none of them.
+    let mut out = Vec::with_capacity(args.len() + 1);
     for a in args {
         match *a {
             ArgValue::Buffer { .. } => {}
@@ -214,8 +217,8 @@ impl<R: Reflect> Encode for Encoder<'_, '_, R> {
             fire.lanes[2].div_ceil(local.at(2)),
         ];
 
-        let mut buffers = Vec::new();
-        let mut writes = Vec::new();
+        let mut buffers = Vec::with_capacity(args.len());
+        let mut writes = Vec::with_capacity(args.len());
         // Where the caller's scalar block goes in the DENSE list a descriptor
         // set is written from. A module that reads its parameters from a
         // storage buffer binds that buffer at an index its own ABI chooses --
@@ -225,7 +228,7 @@ impl<R: Reflect> Encode for Encoder<'_, '_, R> {
         let mut minted: Option<usize> = None;
         for a in args {
             if let ArgValue::Buffer { handle, writes: w } = *a {
-                if handle == crate::arm::BLOCK {
+                if handle == crate::hold::BLOCK {
                     if minted.is_some() {
                         return Err(Refusal::Device {
                             why: "a routine forwarded its parameter block twice",
@@ -252,7 +255,8 @@ impl<R: Reflect> Encode for Encoder<'_, '_, R> {
             // trace's scalar and `count` is the routine's own -- eight bytes,
             // and four of them would be a struct whose tail reads as zero,
             // which is a gather of no rows reporting success.
-            let mut held = self.block.to_vec();
+            let mut held = Vec::with_capacity(self.block.len() + args.len() + 1);
+            held.extend_from_slice(self.block);
             held.extend(words(args));
             // A statement with nothing to say still gets one word: the shader
             // dereferences the pointer whether or not it reads a field, and a
@@ -260,7 +264,10 @@ impl<R: Reflect> Encode for Encoder<'_, '_, R> {
             if held.is_empty() {
                 held.push(0);
             }
-            let bytes = held.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let mut bytes = Vec::with_capacity(held.len() * 4);
+            for word in &held {
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
             (crate::binding::Params::Block { at, bytes }, Some(at))
         } else {
             let params = params_from(&words(args), declared).map_err(|_| Refusal::Device {
@@ -298,7 +305,7 @@ impl<R: Reflect> Encode for Encoder<'_, '_, R> {
 mod tests {
     use super::*;
     use crate::device::Buffer;
-    use kernels_vulkan::routine::{Buf, BufMut, Env};
+    use kernels_vulkan::routine::{Ask, Buf, BufMut, InSlot, OutSlot};
 
     /// A `Declared` this test can state without a SPIR-V module.
     fn declared(bindings: u32, push: &[u32]) -> Declared {
@@ -352,8 +359,15 @@ mod tests {
         let bounds: Vec<Bound<'_>> = bufs.iter().map(Bound::whole).collect();
 
         let enc = Encoder::new(&one, &bounds, &[], 7);
-        kernels_vulkan::sample::argmax_logits(&enc, Buf(0), BufMut(1), Buf(2), BufMut(3), Env(5))
-            .expect("five rows is a launch");
+        kernels_vulkan::sample::argmax_logits(
+            &enc,
+            InSlot::new(Buf(0)),
+            OutSlot::new(BufMut(1)),
+            InSlot::new(Buf(2)),
+            OutSlot::new(BufMut(3)),
+            Ask::new(5),
+        )
+        .expect("five rows is a launch");
 
         let out = enc.finish();
         assert_eq!(out.len(), 1);
@@ -388,8 +402,15 @@ mod tests {
         let bounds: Vec<Bound<'_>> = bufs.iter().map(Bound::whole).collect();
 
         let enc = Encoder::new(&one, &bounds, &[], 0);
-        kernels_vulkan::sample::argmax_logits(&enc, Buf(0), BufMut(1), Buf(2), BufMut(3), Env(1))
-            .expect("one row is a launch");
+        kernels_vulkan::sample::argmax_logits(
+            &enc,
+            InSlot::new(Buf(0)),
+            OutSlot::new(BufMut(1)),
+            InSlot::new(Buf(2)),
+            OutSlot::new(BufMut(3)),
+            Ask::new(1),
+        )
+        .expect("one row is a launch");
 
         assert_eq!(
             enc.finish()[0].writes,
@@ -413,11 +434,11 @@ mod tests {
         assert_eq!(
             kernels_vulkan::sample::argmax_logits(
                 &enc,
-                Buf(0),
-                BufMut(1),
-                Buf(2),
-                BufMut(3),
-                Env(1)
+                InSlot::new(Buf(0)),
+                OutSlot::new(BufMut(1)),
+                InSlot::new(Buf(2)),
+                OutSlot::new(BufMut(3)),
+                Ask::new(1)
             ),
             Err(Refusal::Undeclared)
         );
@@ -440,11 +461,11 @@ mod tests {
         assert_eq!(
             kernels_vulkan::sample::argmax_logits(
                 &enc,
-                Buf(0),
-                BufMut(1),
-                Buf(2),
-                BufMut(3),
-                Env(1)
+                InSlot::new(Buf(0)),
+                OutSlot::new(BufMut(1)),
+                InSlot::new(Buf(2)),
+                OutSlot::new(BufMut(3)),
+                Ask::new(1)
             ),
             Err(Refusal::Arity { want: 6, got: 4 })
         );

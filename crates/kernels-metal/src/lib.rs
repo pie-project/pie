@@ -200,6 +200,7 @@ pub fn kernel_of(symbol: &str) -> Option<&'static str> {
         RETIRED
             .iter()
             .flat_map(|family| family.iter().map(|(_, name)| *name))
+            .chain(DECLARED_ELSEWHERE.iter().copied())
             .collect()
     });
 
@@ -287,6 +288,26 @@ pub const RETIRED: &[&[(&str, &str)]] = &[
     ssm::ENTRYPOINTS,
 ];
 
+/// Points this backend NAMES but does not build, and the whole of that set.
+///
+/// [`RETIRED`] is the census of what can still be dispatched, and every
+/// name in it rides a `(file, entrypoint)` pair that `device_kernels.rs`
+/// opens against a real device. These are neither: they resolve so that
+/// `model-ir`'s `check_plan` can check a text, and there is no shader
+/// behind them on this backend.
+///
+/// Why a text this backend cannot run reaches a check that asks it: Vulkan
+/// consumes the metal-flavoured plan, so `stated_in(Metal, ..)` is asked
+/// about every symbol a VULKAN launch names. It needs only [`kernel_of`] to
+/// answer, and falls back to a permissive empty signature when no routine is
+/// declared. Putting the point HERE rather than in an `ENTRYPOINTS` row is
+/// what keeps the macOS sweep from trying to compile a file that does not
+/// exist.
+///
+/// Each name is debt, and it is one line each: when Metal grows the kernel,
+/// the name moves to its family's `ENTRYPOINTS` and leaves here.
+pub const DECLARED_ELSEWHERE: &[&str] = &["rms_rope_bfloat16"];
+
 /// The rows that have been retired, by the name their `kernel!` call had.
 ///
 /// [`RETIRED`] answers "what can still be dispatched"; this answers "what
@@ -373,6 +394,30 @@ pub fn retired_rows() -> &'static [&'static str] {
         "residual_add_strided",
         "rms_residual",
         "rms_residual_scaled",
+        // Declared here and NOWHERE ELSE on this backend: there is no
+        // `rms_rope` entry in `norm.rs`'s `ENTRYPOINTS` and no `.metal` body
+        // behind it. That is deliberate and it is the narrowest thing that
+        // works.
+        //
+        // Vulkan consumes the metal-flavoured plan text, so `model-ir`'s
+        // `check_plan` asks `stated_in(Metal, ..)` about every symbol a
+        // VULKAN launch names, and `stated_in` needs only `kernel_of` to
+        // answer -- it falls back to a permissive `Stated { args: &[] }` when
+        // no routine is declared, and `arity_problem` returns immediately on
+        // an empty arg list. `kernel_of` matches a base name against this
+        // census directly, without consulting `ENTRYPOINTS` at all.
+        //
+        // Adding an `ENTRYPOINTS` row instead would oblige a `.metal` file,
+        // because `device_kernels.rs` opens every `(file, entry)` pair on a
+        // real device -- and that file could not be compiled, run or measured
+        // from the machine this fusion was written on. Shipping an
+        // unverifiable shader to satisfy a name lookup is a worse trade than
+        // a name that resolves and dispatches nowhere, especially as the
+        // statement is gated so no Metal text can name it.
+        //
+        // The debt is real and it is one line: when Metal grows the fused
+        // kernel, this comment goes and an `ENTRYPOINTS` row arrives.
+        "rms_rope",
         "rms_single_row",
         "rms_strided_head_row",
         "rms_strided_row",

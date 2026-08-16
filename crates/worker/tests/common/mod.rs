@@ -9,7 +9,7 @@
 //!
 //! Reused by the cuda validation tests (`cuda_forward` = dense forward; the
 //! Lane-C CAS-dedup + Lane-D fold-parity tests compose on these helpers). Every
-//! cuda test is `#[ignore]`d (real GPU + `--features driver-cuda`) and boots
+//! cuda test is `#[ignore]`d (real GPU + `--features driver-cuda-13`) and boots
 //! ONCE per process (global engine state forbids a second boot).
 //!
 //! The model snapshot is overridable via `PIE_CUDA_TEST_SNAPSHOT` (a local HF

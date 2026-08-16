@@ -220,6 +220,7 @@ pub fn kimi_k3_cuda(facts: &KimiK3Facts, class: FireClass) -> ForwardPlan {
                         x,
                         &dsl::ConvW {
                             name: format!("layer.{l}.{name}"),
+                            bias: None,
                             kernel: kd.conv_kernel,
                             layer: l,
                         },
@@ -297,7 +298,7 @@ pub fn kimi_k3_cuda(facts: &KimiK3Facts, class: FireClass) -> ForwardPlan {
                 facts.moe.top_k,
                 facts.moe.moe_intermediate,
             );
-            let act = dsl::cuda::situ(&gate_up, facts.moe.moe_intermediate, true);
+            let act = dsl::cuda::situ(&gate_up, facts.moe.moe_intermediate);
             let route_out = dsl::cuda::mxfp4_moe_down_decode(
                 &act,
                 &experts,
@@ -314,8 +315,8 @@ pub fn kimi_k3_cuda(facts: &KimiK3Facts, class: FireClass) -> ForwardPlan {
 
             let moe_out = if facts.moe.shared_intermediate > 0 {
                 let sgate = matmul(&m, &w.shared_gate);
-                let _sup = matmul(&m, &w.shared_up);
-                let sact = dsl::cuda::situ(&sgate, facts.moe.shared_intermediate, false);
+                let sup = matmul(&m, &w.shared_up);
+                let sact = dsl::cuda::situ_pair(&sgate, &sup, facts.moe.shared_intermediate);
                 let shared = matmul(&sact, &w.shared_down);
                 dsl::cuda::residual_add(&routed, &shared, facts.hidden)
             } else {

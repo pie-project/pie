@@ -67,7 +67,7 @@ pub fn manifest(f: &Glm5Facts, tied_embeddings: bool) -> Manifest {
         .with(TensorSpec::required("norm", [hidden]))
         // TIED vs UNTIED as presence, which is the only way a manifest
         // can tell them apart: every extent agrees.
-        .either(!tied_embeddings, "lm_head", [vocab, hidden])
+        .tie(tied_embeddings, "lm_head", [vocab, hidden])
         .with(TensorSpec::required("layer.{}.input_layernorm", [hidden]))
         .with(TensorSpec::required(
             "layer.{}.post_attention_layernorm",
@@ -229,6 +229,7 @@ fn plan(f: &Glm5Facts, rope_theta: f32, norm_eps: f32, advertised: Advertised) -
             // Only the rope half rotates; the nope half is carried
             // straight through, which is what makes the latent cacheable.
             rotary_dim: a.qk_rope_head_dim,
+            q_gate: false,
         })
         .collect();
 
@@ -344,10 +345,7 @@ pub const NO_METAL: &str = "glm-5 has no Metal text in this build: its forward i
 /// text takes the fused `mla_prepare` unconditionally and states no rope
 /// variant, so the shape is the whole input.
 #[must_use]
-pub fn trace(
-    f: &Glm5Facts,
-    class: model_ir::trace::FireClass,
-) -> model_ir::trace::ForwardPlan {
+pub fn trace(f: &Glm5Facts, class: model_ir::trace::FireClass) -> model_ir::trace::ForwardPlan {
     super::forward::glm5_cuda(f, class)
 }
 

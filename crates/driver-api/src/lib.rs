@@ -10,17 +10,9 @@
 //! A crate both sides speak is a CONTRACT; the substrate only drivers use is
 //! `driver`, which is what that name is now for.
 //!
-//! # The promise, and where it moved from
-//!
 //! [`Driver`] is the contract itself: fourteen verbs one execution device
-//! answers. It was an `enum` in `engine` — `DriverBackend`, fourteen `match`es
-//! over five variants, **seventy arms that all forwarded** — because a C++
-//! shell behind a `*mut PieDriver` cannot implement a trait. The arms are
-//! gone and so is the reason they existed; see [`driver`] for what the shape
-//! was costing besides lines.
-//!
-//! Three things had to move here for the trait to be statable, and each was
-//! already contract rather than engine:
+//! answers. Three things had to move here for the trait to be statable, and
+//! each was already contract rather than engine:
 //!
 //! - [`completion`] — a driver MINTS a completion (its `launch` returns one),
 //!   so the broker that mints them is vocabulary, not scheduler internals.
@@ -29,20 +21,15 @@
 //!   driver answers. The `ChannelEndpoint` an application holds stayed in
 //!   `engine`: no verb here takes one.
 //!
-//! # The rest of the vocabulary
+//! The rest of the vocabulary:
 //!
 //! - [`local`]: the five records a driver answers with, and the constants
-//!   both sides name. It was twenty-eight `#[repr(C)]` descriptors; the
-//!   header there says what happened to the other twenty-three.
+//!   both sides name.
 //! - [`capabilities`]: what a driver answers at create and load time.
 //! - [`transfer`]: the KV transfer vocabulary shared with cross-node transport.
 //! - [`plan`]: owned verb plans shared by local and remote backends.
 //! - [`submission`]: the sealed frame a `launch` takes.
 //! - [`remote`]: the versioned worker-to-executor protocol.
-//!
-//! The C header this crate used to generate, the `unsafe extern "C"` block
-//! that declared thirteen `pie_cuda_*` symbols, and the cbindgen binary that
-//! wrote the header are all gone with the C++ drivers they served.
 
 pub mod capabilities;
 pub mod channel;

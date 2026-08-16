@@ -1,41 +1,13 @@
 //! Whether the machine running this has a Metal 4 device, stated out loud.
 //!
-//! Every device test in this crate opens the same way:
+//! A skipped device test and one that measured real hardware both print an
+//! `ok`, so `device_attention`, `device_gdn` and `device_kernels` give no
+//! sign of whether they ran on real hardware. This test is not `#[ignore]`d
+//! — its job is to run everywhere and say which case applies.
 //!
-//! ```ignore
-//! let Ok(context) = Context::new() else {
-//!     eprintln!("SKIP: no Metal 4 device");
-//!     return;
-//! };
-//! ```
-//!
-//! That is the right shape -- a test that cannot run should not fail -- and
-//! it has one bad property: a test that skipped and a test that measured a
-//! thousand numbers print the same `ok`. The `driver-metal` job's own
-//! comments already name this failure for a different case:
-//!
-//!   "The name says what the green tick means, because a job that tested
-//!    nothing and a job that tested the portable half look identical."
-//!
-//! The device tests violate exactly that. `device_attention`, `device_gdn`
-//! and `device_kernels` between them assert several thousand numbers off real
-//! hardware, and until this file existed CI ran none of them and said nothing
-//! about why. Adding `--include-ignored` to the job makes them run wherever a
-//! device exists; this test is what makes the OTHER case legible, so a build
-//! that measured nothing says so instead of looking like a build that
-//! measured everything.
-//!
-//! It is not `#[ignore]`d, because its whole job is to run everywhere.
-//!
-//! # The switch
-//!
-//! `PIE_METAL_REQUIRE_DEVICE=1` turns the absence into a failure. Nothing
-//! sets it yet, and the reason is that nobody knows the answer: GitHub's
-//! `macos-latest` now maps to macOS 26, which is the OS Metal 4 needs, but
-//! whether a hosted runner's virtualised Apple GPU actually vends a Metal 4
-//! device has never been checked by anything in this tree. The honest thing
-//! is to make the runner say, once, in a log -- and then set the variable and
-//! keep it true.
+//! `PIE_METAL_REQUIRE_DEVICE=1` turns an absent device into a failure.
+//! Nothing sets it yet: whether a hosted `macos-latest` runner actually
+//! vends a Metal 4 device has not been confirmed.
 
 #![cfg(feature = "metal-4")]
 
