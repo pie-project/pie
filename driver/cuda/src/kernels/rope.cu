@@ -854,9 +854,8 @@ std::uint16_t bf16_rne_bits(float f) {
     return static_cast<std::uint16_t>((b + 0x7fffu + ((b >> 16) & 1u)) >> 16);
 }
 
-// Which host trig builds the table. THIS CHOICE IS EMPIRICAL, NOT PRINCIPLED,
-// and the honest version of the reasoning is uncomfortable enough to be worth
-// writing down.
+// Which host trig builds the table. The reasoning took three wrong turns before
+// it settled, so it is written out rather than summarised.
 //
 // The reference's trig is Intel MKL VML, not SLEEF and not glibc. Measured:
 // `vmsCos`/`vmsSin` with torch's exact mode word
@@ -866,53 +865,67 @@ std::uint16_t bf16_rne_bits(float f) {
 // `Vectorized<float>::cos()` is never reached on an x86 torch build -- which is
 // what the reference runs.
 //
-// We cannot call MKL from here, so the question is only which available
-// implementation lands on the reference's side of a bf16 midpoint most often.
-// The direction is settled: correct rounding is NOT the goal. MKL VML HA is
-// itself ~0.60 ulp and not correctly rounded, so being similarly-imperfect
-// agrees with it more often than being perfect does. That is correlation of
-// error, not correctness -- glibc is not right here, it is wrong in a way that
-// sometimes resembles MKL. A glibc version bump could move it, and nothing
-// would notice except the parity test, which is why that test pins measured
-// reference bits rather than a formula.
+// We cannot call MKL from here, so the question is which available
+// implementation lands closest to it. In PRINCIPLE error-correlation could beat
+// accuracy: MKL VML HA is itself ~0.60 ulp and not correctly rounded, so an
+// implementation wrong in a similar way could agree with it more often than a
+// perfect one would. Measured, it does not.
 //
-// BUT THE DEFAULT IS THE CORRECTLY-ROUNDED BUILD ANYWAY, because the win is
-// one entry and the cost is determinism.
+// Fraction of angles whose fp32 value differs from the reference:
 //
-// Measured over positions 0..262143 (16,777,216 angles) against the reference:
+//   double -> round to fp32 (correctly rounded) : 5.205%
+//   plain cosf/sinf                             : 5.297%
 //
-//   double -> round to fp32 (correctly rounded) : 19 mismatches
-//   plain cosf/sinf                             : 18 mismatches
+// So `exact` is the CLOSER of the two, not merely the more deterministic. At
+// bf16 they are near-indistinguishable -- over positions 0..262143 (16,777,216
+// angles) `exact` misses 19 entries and `libm` 18, differing only at
+// pos=70308 cos[5] -- but that one entry is noise, and it runs opposite to the
+// fp32 figures above. `cosf`/`sinf` are almost correctly rounded here anyway:
+// they differ from the double-rounded value on 1.18% of those angles, always by
+// exactly 1 fp32 ulp, and bf16 absorbs all but one. The two backends are very
+// nearly the same function.
 //
-// The single entry is pos=70308 cos[5]. `cosf`/`sinf` are ALMOST correctly
-// rounded here: they differ from the double-rounded value on 1.18% of those
-// angles, always by exactly 1 fp32 ulp, and bf16 absorbs all but ONE. The two
-// backends are very nearly the same function.
+// `exact` is therefore the default on two independent legs:
 //
-// `exact` wins on determinism. Correct rounding has exactly one answer, so the
-// table it produces depends on nothing -- not the C library, its version, the
-// compiler, or the CPU. `libm` is by definition whatever the linked libm does,
-// which would make Pie's table a property of the machine it was built on. For
-// a parity campaign that is a real liability, and it is not worth trading for
-// one entry in 16.7 million.
+//   1. DETERMINISM. Correct rounding has exactly one answer, so the table
+//      depends on nothing -- not the C library, its version, the compiler, or
+//      the CPU. `libm` is by definition whatever the linked libm does, which
+//      would make Pie's table a property of the machine it was built on. True
+//      in principle; NOT demonstrated by the two glibcs tested below, which
+//      agree exactly. The liability is structural, not observed.
+//   2. PROXIMITY. 5.205% versus 5.297%, above. Measured, not argued.
 //
-// TWO CLAIMS ABOUT THIS THAT ARE NOT TRUE, recorded so they are not re-derived:
+// A REFUTED CLAIM AND ITS RESOLUTION, recorded because the underlying artifact
+// row is easy to misread the same way twice.
 //
-//   * "plain cosf/sinf scores 0 in the campaign window and 1 overall." Not
-//     reproduced. On the deployment base it is 18, and 13852 -- the one
-//     in-window entry -- is among the 18 it misses.
-//   * "the error correlation moves with the glibc version, 2.35 vs 2.41."
-//     It does not. Both were measured directly, in ubuntu:22.04 (glibc 2.35)
-//     and debian:13 (glibc 2.41), and the per-entry output is BYTE-IDENTICAL:
-//     18/19 either way, and the same 1.1794% fp32 divergence. Whatever produced
-//     0/1 elsewhere, it was not the glibc version.
+//   The claim was that plain `cosf`/`sinf` scores 0 mismatches in the campaign
+//   window and 1 overall against the reference, making it a free improvement.
+//   It does not: on the deployment base it misses 18, including pos=13852, the
+//   single in-window entry.
+//
+//   The 0/1 was a real number measuring something else. The artifact row reads
+//   "PIE vs libm cosf/sinf -- fp32 differs 197877/16777216 (1.179%), bf16
+//   differs 1". That is PIE'S CONSTRUCTION AGAINST GLIBC -- the distance
+//   between our own two candidate backends -- not glibc against the reference.
+//   Read as a reference comparison it invents a free win that does not exist.
+//   The figures reproduce exactly, which is precisely why the misreading
+//   survived: the numbers were never wrong, only their subject. The
+//   libm-vs-reference figure lives in a different row of the same artifact and
+//   is the 5.297% above.
+//
+//   A second explanation offered for the same figure -- that the correlation
+//   tracks the glibc version, 2.35 versus 2.41 -- is independently false. Both
+//   were run rather than reasoned about, in ubuntu:22.04 (glibc 2.35) and
+//   debian:13 (glibc 2.41), same source and same fixture: the per-entry output
+//   is BYTE-IDENTICAL. 18/19 either way, same 1.1794% divergence. glibc's
+//   `cosf`/`sinf` are bit-identical between those versions for this input set.
 //
 // The deployment target is glibc 2.35 regardless:
 // `backend/docker/eval-worker-base.Dockerfile` pins
 // PIE_CUDA_RUNTIME_IMAGE=nvidia/cuda:12.9.1-cudnn-runtime-ubuntu22.04, so the
 // decoder runs on Ubuntu 22.04.
 //
-// `PIE_ROPE_VLLM_TABLE_TRIG=libm` selects the error-correlated build, so the
+// `PIE_ROPE_VLLM_TABLE_TRIG=libm` selects the `cosf`/`sinf` build, so the
 // comparison stays reproducible and the choice revisitable rather than
 // entombed. Do not chase the remaining 19: the reference's exact bits require
 // vendoring closed-source, x86-only oneMKL into a CUDA driver's host-side table

@@ -44,23 +44,27 @@ you measured with --reference-isa; the test prints it on every run.
 AND NOTE WHY THIS CANNOT BE "FIXED" IN THE HOST ARITHMETIC
 ==========================================================
 
-Correct rounding is not the goal in principle: MKL VML HA is itself ~0.60 ulp
-and not correctly rounded, so an implementation that is similarly imperfect
-lands on the same side of a bf16 midpoint slightly more often than a perfect
-one does. Measured over 0..262143 against the real MKL reference:
+In principle correct rounding need not be the goal -- MKL VML HA is itself
+~0.60 ulp and not correctly rounded, so a similarly imperfect implementation
+could land on the reference's side of a bf16 midpoint more often than a perfect
+one. Measured against the real MKL reference, it does not:
 
-    double -> round to fp32  (correctly rounded) : 19 mismatches
-    plain cosf/sinf                              : 18 mismatches
+    fraction of angles whose fp32 value differs from the reference
+    double -> round to fp32  (correctly rounded) : 5.205%
+    plain cosf/sinf                              : 5.297%
 
-One entry, in 16,777,216. The driver nevertheless DEFAULTS to the correctly
-rounded build, because it is deterministic across C libraries and one entry is
-not worth trading that for; PIE_ROPE_VLLM_TABLE_TRIG=libm selects the other.
+The driver therefore DEFAULTS to the correctly rounded build, which is both the
+closer of the two and deterministic across C libraries;
+PIE_ROPE_VLLM_TABLE_TRIG=libm selects the other.
 
-Two claims about this are NOT true and should not be re-derived: that cosf/sinf
-scores 0 in the campaign window (it is 18, and misses 13852, the one in-window
-entry), and that the difference tracks the glibc version. The latter was tested
-directly in ubuntu:22.04 (glibc 2.35) and debian:13 (glibc 2.41): per-entry
-output is BYTE-IDENTICAL, 18/19 either way.
+A claim that cosf/sinf scores 0 mismatches in the campaign window and 1 overall
+is NOT true and should not be re-derived. It came from misreading an artifact
+row, "PIE vs libm cosf/sinf -- bf16 differs 1", which measures the distance
+between our own two backends rather than glibc against the reference. Against
+the reference cosf/sinf misses 18 entries, including 13852, the one in-window
+entry. A follow-up explanation that the difference tracks the glibc version is
+also false: tested directly in ubuntu:22.04 (glibc 2.35) and debian:13 (glibc
+2.41), the per-entry output is BYTE-IDENTICAL.
 
 None of this changes the fixture. The base construction below is the
 correctly-rounded one and the overrides are measured against IT, so the fixture
