@@ -26,8 +26,8 @@ use pie_loader::plan::{
     compile as compile_load_plan,
 };
 use pie_loader::types::{
-    BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantGranularity, QuantScheme,
-    RepackLayout, ScaleForm, TensorId, Visibility,
+    BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantGranularity, RepackLayout,
+    ScaleForm, TensorId, Visibility,
 };
 use pie_loader::verify::ContractView;
 
@@ -514,13 +514,13 @@ fn qwen3_5_refuses_fp8_gdn_without_scales() {
             .expect_err(&format!("tp={tp_size}: an unpaired FP8 GDN weight must be refused"));
         let msg = err.to_string();
         assert!(
-            msg.contains("weight_scale_inv") && msg.contains("cannot be dequantized"),
+            msg.contains("weight_scale_inv") && msg.contains("cannot be paired"),
             "tp={tp_size}: unexpected error: {msg}"
         );
     }
 }
 
-// ── qwen3_5: FP8 GDN load-time dequantization ───────────────────────
+// ── qwen3_5: native FP8 GDN — raw weights beside banded block scales ─
 
 /// The E4M3 byte for a small positive value that E4M3 represents exactly.
 fn fp8_e4m3(value: f64) -> u8 {
@@ -626,36 +626,48 @@ fn qwen3_5_fp8_gdn_checkpoint() -> CheckpointMetadata {
     metadata
 }
 
-/// The bf16 bytes the dequant must produce for the local tensor whose
-/// element (r, c) reads global element (rows[r], cols[c]) of a full
-/// `[_, full_cols]` FP8 weight with `[_, full_cols / 4]`-shaped scales.
-fn gdn_expected(rows: &[i64], cols: &[i64], full_cols: i64) -> Vec<u8> {
-    let block = 4i64;
-    let scale_cols = full_cols / block;
-    let mut out = Vec::with_capacity(rows.len() * cols.len() * 2);
+/// The FP8 payload bytes the load must lay down for the local tensor whose
+/// element (r, c) reads global element (rows[r], cols[c]) of the full
+/// `[_, full_cols]` weight — native FP8: the bytes move, nothing decodes.
+fn gdn_fp8_expected(rows: &[i64], cols: &[i64], full_cols: i64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rows.len() * cols.len());
     for &gr in rows {
         for &gc in cols {
-            let value = gdn_value(usize::try_from(gr * full_cols + gc).unwrap());
-            let scale =
-                gdn_scale(usize::try_from((gr / block) * scale_cols + gc / block).unwrap());
-            out.extend_from_slice(&bf16_bits(value * scale).to_le_bytes());
+            out.push(fp8_e4m3(f64::from(gdn_value(
+                usize::try_from(gr * full_cols + gc).unwrap(),
+            ))));
         }
     }
     out
 }
 
-/// The load plan dequantizes FP8 GDN weights to the mathematically expected
-/// bf16 values — `weight = fp8 * block_scale` — at tp=1 and on both ranks of
-/// tp=2, executed end to end by the host executor over real checkpoint
-/// bytes. The tp=2 ranks also prove the `[K|K|V]` bands and the row/column
-/// shards slice the *scales* consistently with the weights.
+/// The BF16 factor bytes for the local scale tensor, by the same mapping.
+fn gdn_scale_expected(rows: &[i64], cols: &[i64], full_cols: i64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rows.len() * cols.len() * 2);
+    for &gr in rows {
+        for &gc in cols {
+            let bits = bf16_bits(gdn_scale(usize::try_from(gr * full_cols + gc).unwrap()));
+            out.extend_from_slice(&bits.to_le_bytes());
+        }
+    }
+    out
+}
+
+/// The GDN projections serve natively: the load publishes the E4M3 payload
+/// raw and its `weight_scale_inv` factors beside it, paired through a plan
+/// attachment, at tp=1 and on both ranks of tp=2 — and the host executor
+/// materializes byte-exact `[K|K|V]` bands of the *weight* and of the
+/// *scales*, sliced by the same offsets divided by the row block. That byte
+/// equality is the mathematical content of the tp split: each rank's scale
+/// rows are exactly the blocks its weight rows fall in.
 #[test]
-fn qwen3_5_fp8_gdn_dequantizes_to_expected_bf16() {
+fn qwen3_5_fp8_gdn_ships_raw_with_banded_scales() {
     let mut facts = facts("qwen3_5", 2);
     facts.head_dim = 4;
     let checkpoint = qwen3_5_fp8_gdn_checkpoint();
     let la = "model.layers.0.linear_attn.";
     let all8: Vec<i64> = (0..8).collect();
+    let all2: Vec<i64> = (0..2).collect();
 
     for (tp_rank, tp_size) in [(0, 1), (0, 2), (1, 2)] {
         let target = target(tp_rank, tp_size);
@@ -670,8 +682,8 @@ fn qwen3_5_fp8_gdn_dequantizes_to_expected_bf16() {
                 .unwrap_or_else(|| panic!("{leaf}: no published weight"));
             assert_eq!(
                 entry.encoding,
-                Encoding::Raw(DType::BF16),
-                "{leaf}: the GDN path binds bf16"
+                Encoding::Raw(DType::F8E4M3),
+                "{leaf}: the GDN path serves the shipped FP8, not a dequant"
             );
             let scales = contract
                 .tensors
@@ -680,13 +692,10 @@ fn qwen3_5_fp8_gdn_dequantizes_to_expected_bf16() {
                 .unwrap_or_else(|| panic!("{leaf}: no declared scale factors"));
             assert_eq!(
                 scales.visibility,
-                Visibility::Internal,
-                "{leaf}: factors are load-time only, not a bind name"
+                Visibility::Public,
+                "{leaf}: the driver reads the factors through the attachment, \
+                 so they must be finalized"
             );
-            // At the checkpoint's own dtype: a cast to F32 in the plan hands
-            // the CUDA executor an operand it cannot type — a staged gather
-            // is untyped bytes to it — so the widening belongs to the Scale
-            // kernel, not the contract.
             assert_eq!(
                 scales.encoding,
                 Encoding::Raw(DType::BF16),
@@ -702,26 +711,35 @@ fn qwen3_5_fp8_gdn_dequantizes_to_expected_bf16() {
             let listed: Vec<String> = violations.iter().map(ToString::to_string).collect();
             panic!("tp{tp_size} rank {tp_rank}: {}", listed.join("\n  "));
         }
-        let scaled: Vec<_> = plan
-            .instrs
-            .iter()
-            .filter_map(|instr| match instr {
-                StorageInstr::TileMap {
-                    kind: TileMapKind::Scale,
-                    transform,
-                    ..
-                } => Some(transform),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            scaled.len(),
-            3,
-            "tp{tp_size} rank {tp_rank}: one per-block Scale per FP8 projection"
+        // Native FP8 means nothing dequantizes at load: no Scale tile maps.
+        assert!(
+            !plan.instrs.iter().any(|instr| matches!(
+                instr,
+                StorageInstr::TileMap { kind: TileMapKind::Scale, .. }
+            )),
+            "tp{tp_size} rank {tp_rank}: the load plan should move bytes, not decode them"
         );
-        for transform in scaled {
-            assert_eq!(transform.scale_blocks, vec![4, 4]);
-            assert_eq!(transform.from, Some(QuantScheme::Fp8E4M3));
+        // Each GDN projection is paired, resolved by name through the plan's
+        // tensor table the way the driver's resolve_quant_attachments does.
+        let name_of: std::collections::HashMap<_, _> = plan
+            .tensors
+            .iter()
+            .map(|decl| (decl.id, decl.name.as_str()))
+            .collect();
+        for leaf in ["in_proj_qkv", "in_proj_z", "out_proj"] {
+            let weight = format!("{la}{leaf}.weight");
+            let attachment = plan
+                .attachments
+                .iter()
+                .find(|a| name_of.get(&a.tensor).copied() == Some(weight.as_str()))
+                .unwrap_or_else(|| {
+                    panic!("tp{tp_size} rank {tp_rank}: '{weight}' has no scale attachment")
+                });
+            assert_eq!(
+                name_of.get(&attachment.scale_tensor).copied(),
+                Some(format!("{weight}_scale_inv").as_str()),
+                "tp{tp_size} rank {tp_rank}: '{weight}' paired with the wrong scales"
+            );
         }
         // Every Cast must be one the CUDA engine can actually run: a *dense*
         // file source (its cast path refuses non-compact sources), or an
@@ -775,17 +793,15 @@ fn qwen3_5_fp8_gdn_dequantizes_to_expected_bf16() {
         .expect("host execution failed");
         // This rank's global rows/cols per projection: at tp=2 the qkv rows
         // are the rank's half of each of the [K=8 | K=8 | V=16] bands, z
-        // splits rows, out_proj splits columns.
+        // splits rows, out_proj splits columns — and the scale tensors band
+        // by the same arithmetic divided by the 4-wide block.
         let half = |base: i64, len: i64| -> Vec<i64> {
             let start = base + i64::from(tp_rank) * len / 2;
             (start..start + len / 2).collect()
         };
+        let full = |len: i64| -> Vec<i64> { (0..len).collect() };
         let (qkv_rows, z_rows, out_cols) = if tp_size == 1 {
-            (
-                (0..32).collect::<Vec<i64>>(),
-                (0..16).collect::<Vec<i64>>(),
-                (0..16).collect::<Vec<i64>>(),
-            )
+            (full(32), full(16), full(16))
         } else {
             (
                 [half(0, 8), half(8, 8), half(16, 16)].concat(),
@@ -793,6 +809,31 @@ fn qwen3_5_fp8_gdn_dequantizes_to_expected_bf16() {
                 half(0, 16),
             )
         };
+        let (qkv_srows, z_srows, out_scols) = if tp_size == 1 {
+            (full(8), full(4), full(4))
+        } else {
+            (
+                [half(0, 2), half(2, 2), half(4, 4)].concat(),
+                half(0, 4),
+                half(0, 4),
+            )
+        };
+        for (leaf, srows, scols, scale_cols) in [
+            ("in_proj_qkv", &qkv_srows, &all2, 2),
+            ("in_proj_z", &z_srows, &all2, 2),
+            ("out_proj", &all2, &out_scols, 4),
+        ] {
+            let name = format!("{la}{leaf}.weight_scale_inv");
+            let bytes = storage
+                .tensors
+                .get(&name)
+                .unwrap_or_else(|| panic!("{name}: not materialized"));
+            assert_eq!(
+                bytes,
+                &gdn_scale_expected(srows, scols, scale_cols),
+                "tp{tp_size} rank {tp_rank}: {name} banded wrong"
+            );
+        }
         for (leaf, rows, cols, full_cols) in [
             ("in_proj_qkv", &qkv_rows, &all8, 8),
             ("in_proj_z", &z_rows, &all8, 8),
@@ -805,10 +846,152 @@ fn qwen3_5_fp8_gdn_dequantizes_to_expected_bf16() {
                 .unwrap_or_else(|| panic!("{name}: not materialized"));
             assert_eq!(
                 bytes,
-                &gdn_expected(rows, cols, full_cols),
-                "tp{tp_size} rank {tp_rank}: {name} dequantized wrong"
+                &gdn_fp8_expected(rows, cols, full_cols),
+                "tp{tp_size} rank {tp_rank}: {name} banded wrong"
             );
         }
+    }
+}
+
+/// The GDN fixture with the full-attention layer *also* FP8: every dense
+/// projection ships E4M3 beside a BF16 `weight_scale_inv` in 4x4 blocks,
+/// which is what Qwen3.6-27B-FP8 actually looks like layer for layer.
+fn qwen3_5_fp8_full_checkpoint() -> CheckpointMetadata {
+    let hidden = 8i64;
+    let (k_dim, v_dim) = (8i64, 16i64);
+    let conv_dim = 2 * k_dim + v_dim;
+    let block = 4i64;
+    let fp8 = Encoding::Raw(DType::F8E4M3);
+    let mut ck = Checkpoint::new();
+    ck.push("model.embed_tokens.weight", &[16, hidden], bf16());
+    let la = "model.layers.0.linear_attn.";
+    ck.push(
+        &format!("{la}in_proj_qkv.weight"),
+        &[conv_dim, hidden],
+        fp8.clone(),
+    );
+    ck.push(
+        &format!("{la}in_proj_qkv.weight_scale_inv"),
+        &[conv_dim / block, hidden / block],
+        bf16(),
+    );
+    ck.push(&format!("{la}in_proj_z.weight"), &[v_dim, hidden], fp8.clone());
+    ck.push(
+        &format!("{la}in_proj_z.weight_scale_inv"),
+        &[v_dim / block, hidden / block],
+        bf16(),
+    );
+    ck.push(&format!("{la}in_proj_b.weight"), &[2, hidden], bf16());
+    ck.push(&format!("{la}in_proj_a.weight"), &[2, hidden], bf16());
+    ck.push(&format!("{la}conv1d.weight"), &[conv_dim, 1, 4], bf16());
+    ck.push(&format!("{la}conv1d.bias"), &[conv_dim], bf16());
+    ck.push(&format!("{la}out_proj.weight"), &[hidden, v_dim], fp8.clone());
+    ck.push(
+        &format!("{la}out_proj.weight_scale_inv"),
+        &[hidden / block, v_dim / block],
+        bf16(),
+    );
+    ck.push(&format!("{la}A_log"), &[2], bf16());
+    ck.push(&format!("{la}dt_bias"), &[2], bf16());
+    ck.push(&format!("{la}norm.weight"), &[v_dim], f32enc());
+    // Eight full-attention layers, FP8 with block scales throughout. Eight,
+    // because tp >= 2 runs `coalesce_direct_row_shards`, which rewrites any
+    // 16-or-more equally-shaped row shards into a bank plus views — 8 layers
+    // of q/k/v/o make a 32-member `[8, 8]` bucket, gate/up a 16-member
+    // `[16, 8]` one, and their scale tensors two more — and that rewrite is
+    // where Qwen3.6-27B-FP8 lost 230 of its 263 pairings on the pod.
+    // `down_proj` shards on axis 1, so it stays out of every bucket: both
+    // the rewritten and the untouched paths are asserted below.
+    let (heads, head_dim, inter) = (2i64, 4i64, 16i64);
+    for layer in 1..9 {
+        let p = format!("model.layers.{layer}.");
+        ck.push(&format!("{p}input_layernorm.weight"), &[hidden], bf16());
+        for (leaf, rows, cols) in [
+            ("self_attn.q_proj", heads * head_dim, hidden),
+            ("self_attn.k_proj", heads * head_dim, hidden),
+            ("self_attn.v_proj", heads * head_dim, hidden),
+            ("self_attn.o_proj", hidden, heads * head_dim),
+            ("mlp.gate_proj", inter, hidden),
+            ("mlp.up_proj", inter, hidden),
+            ("mlp.down_proj", hidden, inter),
+        ] {
+            ck.push(&format!("{p}{leaf}.weight"), &[rows, cols], fp8.clone());
+            ck.push(
+                &format!("{p}{leaf}.weight_scale_inv"),
+                &[rows / block, cols / block],
+                bf16(),
+            );
+        }
+        ck.push(&format!("{p}self_attn.q_norm.weight"), &[head_dim], bf16());
+        ck.push(&format!("{p}self_attn.k_norm.weight"), &[head_dim], bf16());
+        ck.push(
+            &format!("{p}post_attention_layernorm.weight"),
+            &[hidden],
+            bf16(),
+        );
+    }
+    ck.push("model.norm.weight", &[hidden], bf16());
+    ck.finish("qwen3_5_fp8_full")
+}
+
+/// Every F8E4M3 tensor the contract publishes reaches `gemm_act_x_w` through
+/// a QuantMeta port, and that port is null unless the plan carries a scale
+/// attachment for it — so each one must be paired, at tp=1 and on both ranks
+/// of tp=2. This is the structural half of the pod failure
+/// `gemm_act_x_w[FP8_E4M3]: quant scale data is null`.
+#[test]
+fn qwen3_5_fp8_quant_weights_carry_scale_attachments() {
+    let mut facts = facts("qwen3_5", 9);
+    facts.head_dim = 4;
+    let checkpoint = qwen3_5_fp8_full_checkpoint();
+    for (tp_rank, tp_size) in [(0, 1), (0, 2), (1, 2)] {
+        let target = target(tp_rank, tp_size);
+        let contract = author(&facts, &checkpoint, &target, &Policy::default())
+            .expect("authoring failed")
+            .expect("no author for qwen3_5");
+        let plan = compile_load_plan(&checkpoint, &contract, target)
+            .expect("compiling failed");
+        // Resolved by name through the plan's own tensor table — the same
+        // arithmetic the driver's `resolve_quant_attachments` runs — because
+        // the row-shard coalesce may rewrite the contract before the plan is
+        // built, and contract indices do not survive that.
+        let name_of: std::collections::HashMap<_, _> = plan
+            .tensors
+            .iter()
+            .map(|decl| (decl.id, decl.name.as_str()))
+            .collect();
+        let mut fp8_weights = 0;
+        for tensor in &contract.tensors {
+            if tensor.encoding != Encoding::Raw(DType::F8E4M3) {
+                continue;
+            }
+            fp8_weights += 1;
+            let attachment = plan
+                .attachments
+                .iter()
+                .find(|attachment| {
+                    name_of.get(&attachment.tensor).copied() == Some(tensor.name.as_str())
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "tp{tp_size} rank {tp_rank}: '{}' is published F8E4M3 \
+                         with no scale attachment — its QuantMeta port binds \
+                         null and the GEMM throws",
+                        tensor.name
+                    )
+                });
+            assert_eq!(
+                name_of.get(&attachment.scale_tensor).copied(),
+                Some(format!("{}_scale_inv", tensor.name).as_str()),
+                "tp{tp_size} rank {tp_rank}: '{}' is paired with the wrong scales",
+                tensor.name
+            );
+        }
+        assert_eq!(
+            fp8_weights, 59,
+            "tp{tp_size} rank {tp_rank}: eight full-attention layers of seven \
+             projections plus the three GDN projections all serve FP8"
+        );
     }
 }
 

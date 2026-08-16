@@ -191,12 +191,22 @@ fn emit_row_shard_bank(
 
     for (slot, &old_index) in indices.iter().enumerate() {
         let original = &contract.tensors[old_index];
-        new_tensors.push(TensorContract::new(
+        let mut rebuilt = TensorContract::new(
             original.name.clone(),
             Expr::out(bank_name.clone()).slice(0, slot as i64 * local_rows, local_rows),
             vec![local_rows, cols],
             original.encoding.clone(),
-        ));
+        );
+        // "Declares exactly the same tensors" is this module's whole license,
+        // and a declaration is more than a name and a shape. Rebuilding a
+        // member without its `scales` silently unpaired every coalesced
+        // block-scale tensor from its FP8 weight — 230 of Qwen3.6-27B-FP8's
+        // 263 quant attachments gone at tp 2, and every affected GEMM threw
+        // "quant scale data is null" — and dropping `visibility` promoted
+        // internal factors into the bind table.
+        rebuilt.scales = original.scales.clone();
+        rebuilt.visibility = original.visibility;
+        new_tensors.push(rebuilt);
     }
     Ok(())
 }
@@ -246,4 +256,93 @@ fn checked_mul_i64(lhs: i64, rhs: u64, context: &str) -> Result<u64, Error> {
         u64::try_from(lhs).map_err(|_| Error::Contract(format!("{context}: negative value")))?;
     lhs.checked_mul(rhs)
         .or_overflow(format!("{context}: byte overflow"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::checkpoint::{CheckpointFile, RawTensor};
+    use crate::contract::Scales;
+    use crate::types::{
+        CheckpointFormat, DType, FileId, QuantGranularity, ScaleForm, TensorId, Visibility,
+    };
+
+    /// A coalesced member is still the declaration it was: its `scales`
+    /// pairing and its `visibility` ride along into the bank view. Losing the
+    /// first silently unpaired 230 of Qwen3.6-27B-FP8's 263 block-scale
+    /// attachments at tp 2 ("quant scale data is null" in every affected
+    /// GEMM); losing the second promoted internal factors into the bind table.
+    #[test]
+    fn a_coalesced_member_keeps_its_scales_and_visibility() {
+        let mut tensors = Vec::new();
+        let mut contract_tensors = Vec::new();
+        let mut offset = 0u64;
+        // 16 members: `coalesce_direct_row_shards`'s MIN_GROUP_TENSORS.
+        for index in 0..16 {
+            let name = format!("layer.{index}.weight_scale_inv");
+            let span = 8 * 4 * 2;
+            tensors.push(RawTensor {
+                id: TensorId(index as u32),
+                name: name.clone(),
+                file_id: FileId(0),
+                file_offset: offset,
+                span_bytes: span,
+                shape: vec![8, 4],
+                encoding: Encoding::Raw(DType::BF16),
+            });
+            offset += span;
+            let mut entry = TensorContract::new(
+                name.clone(),
+                Expr::src(&name).shard(0),
+                vec![4, 4],
+                Encoding::Raw(DType::BF16),
+            );
+            entry.scales = Some(Scales {
+                of: format!("layer.{index}.weight"),
+                granularity: QuantGranularity::PerGroup,
+                group_size: 128,
+                channel_axis: 0,
+                form: ScaleForm::F32Factors,
+            });
+            entry.visibility = Visibility::Internal;
+            contract_tensors.push(entry);
+        }
+        let metadata = CheckpointMetadata {
+            files: vec![CheckpointFile {
+                id: FileId(0),
+                path: "model.safetensors".to_string(),
+                size_bytes: offset,
+                format: CheckpointFormat::Safetensors,
+            }],
+            tensors,
+        };
+        let contract = ModelContract {
+            alignment: 1,
+            tensors: contract_tensors,
+            groups: Vec::new(),
+        };
+        let target = StorageTarget {
+            tp_rank: 0,
+            tp_size: 2,
+            ..StorageTarget::default()
+        };
+
+        let rewritten = coalesce_direct_row_shards(&contract, &metadata, &target).unwrap();
+        assert!(
+            rewritten
+                .tensors
+                .iter()
+                .any(|tensor| tensor.name.starts_with("__pie.row_shard_bank.")),
+            "the fixture must actually trigger the coalesce"
+        );
+        for original in &contract.tensors {
+            let member = rewritten
+                .tensors
+                .iter()
+                .find(|tensor| tensor.name == original.name)
+                .expect("every member is still declared");
+            assert_eq!(member.scales, original.scales, "{}", original.name);
+            assert_eq!(member.visibility, original.visibility, "{}", original.name);
+        }
+    }
 }
