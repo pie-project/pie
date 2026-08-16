@@ -854,6 +854,62 @@ std::uint16_t bf16_rne_bits(float f) {
     return static_cast<std::uint16_t>((b + 0x7fffu + ((b >> 16) & 1u)) >> 16);
 }
 
+// Which host trig builds the table. THIS CHOICE IS EMPIRICAL, NOT PRINCIPLED,
+// and the honest version of the reasoning is uncomfortable enough to be worth
+// writing down.
+//
+// The reference's trig is Intel MKL VML, not SLEEF and not glibc. Measured:
+// `vmsCos`/`vmsSin` with torch's exact mode word
+// `VML_HA|VML_FTZDAZ_OFF|VML_ERRMODE_IGNORE` (0x140102) reproduce torch
+// bit-for-bit, 0 diffs over 960,032 angles. `ATen/cpu/vml.h` specialises
+// vcos/vsin onto MKL whenever `AT_MKL_ENABLED() && !__APPLE__`, so
+// `Vectorized<float>::cos()` is never reached on an x86 torch build -- which is
+// what the reference runs.
+//
+// We cannot call MKL from here, so the question is only which available
+// implementation lands on the reference's side of a bf16 midpoint most often.
+// The direction is settled: correct rounding is NOT the goal. MKL VML HA is
+// itself ~0.60 ulp and not correctly rounded, so being similarly-imperfect
+// agrees with it more often than being perfect does. That is correlation of
+// error, not correctness -- glibc is not right here, it is wrong in a way that
+// sometimes resembles MKL. A glibc version bump could move it, and nothing
+// would notice except the parity test, which is why that test pins measured
+// reference bits rather than a formula.
+//
+// THE SIZE OF THE WIN IS SMALL AND ENVIRONMENT-DEPENDENT. Measured here on
+// glibc 2.35 (Ubuntu 22.04, x86_64), over positions 0..262143:
+//
+//   double -> round to fp32 (correctly rounded) vs reference : 19 mismatches
+//   plain cosf/sinf                             vs reference : 18 mismatches
+//
+// One entry, pos=70308 cos[5]. The reason is that this glibc's `cosf`/`sinf`
+// are ALMOST correctly rounded: they differ from the double-rounded value on
+// 1.18% of the 16,777,216 angles in that range, always by exactly 1 fp32 ulp,
+// and bf16 absorbs all but ONE of those. The two backends are very nearly the
+// same function.
+//
+// A campaign measurement reported 0/1 for this backend rather than 18/19. That
+// is arithmetically incompatible with what is measured here -- if the two
+// backends differ on a single bf16 entry, they cannot differ by 18 in their
+// mismatch counts -- so one of the two environments is not glibc 2.35 scalar
+// `cosf`. Until that is resolved, do not quote 0/1: the defensible claim is
+// that `libm` is never worse and is better by one entry here.
+//
+// `PIE_ROPE_VLLM_TABLE_TRIG=exact` selects the correctly-rounded build, so the
+// comparison stays reproducible and the choice revisitable rather than
+// entombed. Do not "improve" the default toward correct rounding; that is the
+// direction measured to be worse, however slightly.
+enum class TableTrig { Libm, Exact };
+
+TableTrig vllm_table_trig() {
+    static const TableTrig mode = [] {
+        const char* v = std::getenv("PIE_ROPE_VLLM_TABLE_TRIG");
+        if (v != nullptr && std::strcmp(v, "exact") == 0) return TableTrig::Exact;
+        return TableTrig::Libm;
+    }();
+    return mode;
+}
+
 int vllm_table_capacity() {
     static const int cap = [] {
         if (const char* v = std::getenv("PIE_ROPE_VLLM_TABLE_MAX_POS")) {
@@ -906,6 +962,7 @@ const VllmCosSinTable* vllm_table_for(float theta, int rotary_dim) {
         inv[j] = 1.f / p;
     }
 
+    const bool exact = vllm_table_trig() == TableTrig::Exact;
     std::vector<std::uint16_t> host(
         static_cast<std::size_t>(cap) * static_cast<std::size_t>(rotary_dim));
     for (int p = 0; p < cap; ++p) {
@@ -913,10 +970,17 @@ const VllmCosSinTable* vllm_table_for(float theta, int rotary_dim) {
             host.data() + static_cast<std::size_t>(p) * rotary_dim;
         for (int j = 0; j < angles; ++j) {
             const float ang = static_cast<float>(p) * inv[j];  // fp32 product
-            row[j] = bf16_rne_bits(
-                static_cast<float>(std::cos(static_cast<double>(ang))));
-            row[angles + j] = bf16_rne_bits(
-                static_cast<float>(std::sin(static_cast<double>(ang))));
+            // `std::cos(float)` is the float overload, i.e. `cosf`. The double
+            // form is the correctly-rounded one and is the WORSE match; see
+            // `vllm_table_trig`.
+            const float c = exact
+                ? static_cast<float>(std::cos(static_cast<double>(ang)))
+                : std::cos(ang);
+            const float s = exact
+                ? static_cast<float>(std::sin(static_cast<double>(ang)))
+                : std::sin(ang);
+            row[j] = bf16_rne_bits(c);
+            row[angles + j] = bf16_rne_bits(s);
         }
     }
 

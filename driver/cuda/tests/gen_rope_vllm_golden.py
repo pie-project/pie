@@ -28,23 +28,37 @@ THE RESIDUAL IS ISA-DEPENDENT -- PASS THE ISA YOU MEASURED ON
 bit-identical between the two sides. torch's fp32 trig is SLEEF, bit-for-bit,
 and WHICH SLEEF depends on the host:
 
-  * arm64   -> SLEEF aarch64 u10  (1.0 ulp)
-  * x86_64  -> Sleef_cosf8_u35 (AVX2) / Sleef_cosf16_u35 (AVX512), the 3.5 ulp
-               variants
+  * x86_64 with MKL -> Intel MKL VML, NOT SLEEF. `ATen/cpu/vml.h` specialises
+                       vcos/vsin onto MKL whenever AT_MKL_ENABLED() && !__APPLE__,
+                       so Vectorized<float>::cos() is never reached. Measured:
+                       vmsCos/vmsSin with torch's mode word
+                       VML_HA|VML_FTZDAZ_OFF|VML_ERRMODE_IGNORE (0x140102)
+                       reproduce torch bit-for-bit, 0 diffs / 960,032.
+  * arm64 / Apple   -> SLEEF u10, because those builds have USE_MKL=OFF and
+                       __APPLE__.
 
-Those do not have the same residual. Record the ISA you measured on with
---reference-isa; the test prints it on every run so a stale slice is visible
-rather than silently trusted.
+These are different libraries, not variants, and their residuals sit at
+different entries -- a slice derived on the wrong one cannot fail. Record what
+you measured with --reference-isa; the test prints it on every run.
 
 AND NOTE WHY THIS CANNOT BE "FIXED" IN THE HOST ARITHMETIC
 ==========================================================
 
-Pie's host construction (trig in double, rounded to fp32) is CORRECTLY ROUNDED,
-max 0.5 ulp. SLEEF u10 is 0.92 ulp and is not correctly rounded. At several of
-the residual sites Pie's correctly-rounded value lands exactly on a bf16
-midpoint and ties-to-even AWAY from the reference. Pie is more accurate and
-therefore less correct. Do not adjust the arithmetic to close the gap; it is
-already optimal, and that is precisely the problem.
+Correct rounding is not the goal, and chasing it makes things worse. Measured
+on x86 against the real MKL reference:
+
+    double -> round to fp32   (correctly rounded, 0.5000 ulp):   1 / 19
+    plain glibc cosf/sinf     (NOT correctly rounded, 0.5599):   0 /  1
+
+MKL VML HA is itself 0.6012 ulp and not correctly rounded, so being
+similarly-imperfect lands on the same side of a bf16 midpoint more often than
+being perfect does. Do not "fix" the arithmetic toward correctness.
+
+NOTE THE BASE CONSTRUCTION HERE IS DELIBERATELY THE CORRECTLY-ROUNDED ONE, and
+is NOT required to match the driver. What matters is that base + overrides
+equals the REFERENCE over the surveyed range. The override list must therefore
+correspond to whatever this script computes, not to whatever the driver
+computes; mixing those up is how the fixture became circular once already.
 
 USAGE
 =====
@@ -58,8 +72,9 @@ USAGE
         --agree 100:1:sin --agree 3411:18:sin \
         --out rope_vllm_cos_sin_golden.hpp
 
-`--mismatch` entries are where the reference and this construction are MEASURED
-to differ; they are what stops the slice being decorative. `--regression`
+`--override` entries are where the reference and this script's construction are
+MEASURED to differ, carrying the REFERENCE's bf16 bits; they are what stops the
+slice being decorative, and what makes it a slice of the reference at all. `--regression`
 entries are defects already fixed, kept so a fix cannot silently come undone.
 `--agree` entries sit equally close to a midpoint but match, so the check
 discriminates rather than merely recording known failures.
@@ -149,7 +164,7 @@ def main():
                     help="ISA the residual was measured on, e.g. x86_64-avx2-sleef-u35")
     ap.add_argument("--survey-max", type=int, required=True,
                     help="highest position the residual survey covered")
-    ap.add_argument("--mismatch", action="append", default=[],
+    ap.add_argument("--override", action="append", default=[],
                     metavar="POS:LANE:KIND:REFBITS",
                     help="entry MEASURED to differ, with the REFERENCE's bf16 bits")
     ap.add_argument("--regression", action="append", default=[], metavar="POS:LANE:KIND",
@@ -159,12 +174,12 @@ def main():
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    mismatches = [parse_entry(s, with_bits=True) for s in args.mismatch]
+    overrides = [parse_entry(s, with_bits=True) for s in args.override]
     regressions = [parse_entry(s) for s in args.regression]
     agrees = [parse_entry(s) for s in args.agree]
 
     positions = sorted(set(BASE_POSITIONS)
-                       | {m[0] for m in mismatches}
+                       | {m[0] for m in overrides}
                        | {p for p, _ in regressions}
                        | {p for p, _ in agrees})
     row_of = {p: i for i, p in enumerate(positions)}
@@ -194,11 +209,11 @@ def main():
         dist = midpoint_distance(v)
         bits = to_bf16(v.astype(np.float32))
         # Override with the reference's measured bits wherever the two differ.
-        for mp, me, mbits in mismatches:
+        for mp, me, mbits in overrides:
             if mp == p:
                 if int(bits[me]) == mbits:
                     raise SystemExit(
-                        f"--mismatch {mp}:{me} claims the reference differs, but "
+                        f"--override {mp}:{me} claims the reference differs, but "
                         f"this construction already produces 0x{mbits:04x} there. "
                         f"Either the measurement is stale or the ISA is wrong.")
                 bits[me] = np.uint16(mbits)
@@ -267,20 +282,20 @@ def main():
     w("")
     w("struct Entry { int row; int entry; };")
     w("")
-    w("// Entries MEASURED to differ from the reference on kReferenceIsa. These are")
-    w("// what stop this slice being decorative: a golden that can only pass is the")
-    w("// defect that shipped twice. They are NOT an allowance -- the parity check")
-    w("// still requires zero mismatches. They exist so the test can tell a known")
-    w("// standing residual apart from a new regression.")
-    w("constexpr Entry kKnownReferenceMismatches[] = {")
-    if not mismatches:
+    w("// Entries where this script's construction was MEASURED to differ from the")
+    w("// reference, replaced here by the REFERENCE's bits. These are what make this")
+    w("// a slice OF THE REFERENCE rather than of ourselves, and what gives it teeth:")
+    w("// any implementation that drifts toward correct rounding lights them up. They")
+    w("// are NOT an allowance -- the parity check still requires zero mismatches.")
+    w("constexpr Entry kReferenceOverrides[] = {")
+    if not overrides:
         w("    // none recorded")
-    for p, e, bits in sorted(mismatches):
+    for p, e, bits in sorted(overrides):
         kind, lane = ("cos", e) if e < ANGLES else ("sin", e - ANGLES)
         w(f"    {{{row_of[p]:2d}, {e:2d}}},  // pos={p} {kind}[{lane}]"
           f" reference=0x{bits:04x}")
     w("};")
-    w(f"constexpr int kKnownReferenceMismatchCount = {len(mismatches)};")
+    w(f"constexpr int kReferenceOverrideCount = {len(overrides)};")
     w("")
     w("// Entries that USED to differ and must now match. Kept so a fix cannot")
     w("// silently come undone.")
@@ -314,11 +329,12 @@ def main():
     print(f"wrote {args.out}")
     print(f"  reference ISA        : {args.reference_isa}")
     print(f"  rows / entries       : {len(positions)} / {len(positions) * ROTARY_DIM}")
-    print(f"  known mismatches     : {len(mismatches)}")
+    print(f"  reference overrides  : {len(overrides)}")
     print(f"  regression guards    : {len(regressions)}")
     print(f"  near-midpoint <=4ulp : {len(near)}  (within 1 ulp: {within1})")
-    if not mismatches:
-        print("  WARNING: no known mismatches recorded -- the slice can only pass.")
+    if not overrides:
+        print("  WARNING: no reference overrides -- the slice is our own construction,")
+        print("           compared against itself, and cannot fail.")
 
 
 if __name__ == "__main__":

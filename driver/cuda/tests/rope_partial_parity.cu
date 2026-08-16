@@ -211,16 +211,21 @@ bool listed(const pie_rope_golden::Entry* list, int count, int row, int entry) {
 }
 
 struct TableDiff {
-    int total = 0;       // every mismatch; the bar is that this is zero
-    int expected = 0;    // the standing residual recorded in the fixture
-    int unexpected = 0;  // NEW -- a regression, or a stale/wrong-ISA fixture
+    int total = 0;         // every mismatch; the bar is that this is zero
+    int at_override = 0;   // at an entry carrying measured reference bits
+    int elsewhere = 0;     // somewhere the two constructions were thought to agree
     int guards_broken = 0;
 };
 
-// Classifies mismatches but does NOT excuse any of them. `expected` is a
-// diagnostic label, not an allowance: the parity check requires `total == 0`.
-// The split exists so that a run which is red for the known SLEEF residual
-// reads differently from one that is red because something broke.
+// Classifies mismatches but does NOT excuse any of them. The parity check
+// requires `total == 0`; the split is a diagnostic.
+//
+// `at_override` means the driver disagreed at an entry where the reference is
+// KNOWN to differ from a correctly-rounded construction -- most likely the
+// driver has drifted toward correct rounding, which is the direction measured
+// to be worse. `elsewhere` means it disagreed where the two constructions were
+// believed identical, which is either a real regression or a fixture derived
+// against the wrong reference build.
 TableDiff diff_table(const std::vector<std::uint16_t>& got, bool report) {
     namespace g = pie_rope_golden;
     TableDiff d;
@@ -233,15 +238,15 @@ TableDiff diff_table(const std::vector<std::uint16_t>& got, bool report) {
                 listed(g::kRegressionGuards, g::kRegressionGuardCount, n, e);
             if (have == want) continue;
             ++d.total;
-            const bool known = listed(g::kKnownReferenceMismatches,
-                                      g::kKnownReferenceMismatchCount, n, e);
-            if (known) ++d.expected; else ++d.unexpected;
+            const bool known = listed(g::kReferenceOverrides,
+                                      g::kReferenceOverrideCount, n, e);
+            if (known) ++d.at_override; else ++d.elsewhere;
             if (guard) ++d.guards_broken;
             if (!report || printed >= 12) continue;
             ++printed;
             std::printf("      %-10s pos=%-6d %s[%2d]  got=0x%04x want=0x%04x  "
                         "delta=%+d bf16 ulp%s\n",
-                        known ? "[residual]" : "[NEW]",
+                        known ? "[at-override]" : "[elsewhere]",
                         g::kCosSinCache[n].pos,
                         e < g::kAngles ? "cos" : "sin",
                         e < g::kAngles ? e : e - g::kAngles, have, want,
@@ -382,21 +387,24 @@ void run_golden_slice_is_not_blind() {
     constexpr int kFloor = 8;
 
     const bool has_boundary_entries = g::kEntriesWithinOneUlp >= kFloor;
-    // A survey that found nothing legitimately yields no known mismatch; a
-    // survey that found something and is not represented here means the slice
-    // is stale, most likely derived on the wrong ISA.
-    const bool can_fail = g::kKnownReferenceMismatchCount >= 1;
-    const bool ok = has_boundary_entries && can_fail;
+    // Without at least one overridden entry, every bit in this fixture came
+    // from our own construction and the parity check compares us against
+    // ourselves. That is not a weak test, it is a circular one, and it is what
+    // the fixture silently was until the divergent entries were measured.
+    const bool is_reference_derived = g::kReferenceOverrideCount >= 1;
+    const bool ok = has_boundary_entries && is_reference_derived;
     if (!ok) ++g_failures;
 
     std::printf("[%s] %-28s rows=%d entries=%d  boundary_adjacent<=1ulp=%d "
-                "(>=%d)  known_mismatches=%d (>=1)  guards=%d\n",
+                "(>=%d)  reference_overrides=%d (>=1)  guards=%d\n",
                 ok ? "ok" : "FAIL", "golden slice has teeth", g::kRows,
                 g::kRows * g::kRotaryDim, g::kEntriesWithinOneUlp, kFloor,
-                g::kKnownReferenceMismatchCount, g::kRegressionGuardCount);
-    // Printed every run: the residual is ISA-dependent (torch's fp32 trig is
-    // SLEEF, and arm64 u10 and x86_64 u35 do not share one), so a slice derived
-    // on the wrong host is a slice that cannot fail. Loud beats subtle.
+                g::kReferenceOverrideCount, g::kRegressionGuardCount);
+    // Printed every run. The reference's trig is a different LIBRARY on
+    // different hosts -- Intel MKL VML on an x86 torch build, SLEEF only where
+    // USE_MKL=OFF or __APPLE__ -- and their divergences sit at different
+    // entries. A slice derived against the wrong one cannot fail. Loud beats
+    // subtle.
     std::printf("      reference ISA: %s  (residual surveyed to position %d)\n",
                 g::kReferenceIsa, g::kResidualSurveyMax);
 }
@@ -419,18 +427,19 @@ void run_vllm_golden_table() {
     for (int n = 0; n < g::kRows; ++n)
         max_pos = std::max(max_pos, g::kCosSinCache[n].pos);
 
-    // Zero is the bar. `expected` is a label on the standing residual, not an
-    // allowance -- widening this to `d.unexpected == 0` would bless a token
-    // flip, since one bf16 ulp in cos can move a logit across a decision
-    // boundary. Whether closing the last entries justifies vendoring SLEEF is
-    // a cost decision to be taken deliberately, not by relaxing an assertion.
+    // Zero is the bar. The classification above is a label, not an allowance:
+    // widening this to `d.elsewhere == 0` would bless a token flip, since one
+    // bf16 ulp in cos can move a logit across a decision boundary. Closing the
+    // last entries bit-exactly would mean vendoring Intel oneMKL -- x86-only
+    // and closed-source -- into a CUDA driver's host-side table builder, which
+    // is a cost decision to be taken deliberately, not by relaxing a test.
     const bool ok = d.total == 0 && oob == 0u && capacity > max_pos;
     if (!ok) ++g_failures;
-    std::printf("[%s] %-28s entries=%d  mismatches=%d (required: 0; residual=%d"
-                " new=%d guards_broken=%d)  capacity=%d (max_pos=%d)  "
-                "device_trig_fallback_blocks=%u (required: 0)\n",
+    std::printf("[%s] %-28s entries=%d  mismatches=%d (required: 0; "
+                "at_override=%d elsewhere=%d guards_broken=%d)  capacity=%d "
+                "(max_pos=%d)  device_trig_fallback_blocks=%u (required: 0)\n",
                 ok ? "ok" : "FAIL", "vllm-table matches cache",
-                g::kRows * g::kRotaryDim, d.total, d.expected, d.unexpected,
+                g::kRows * g::kRotaryDim, d.total, d.at_override, d.elsewhere,
                 d.guards_broken, capacity, max_pos, oob);
     if (d.guards_broken > 0)
         std::printf("      REGRESSION: an entry the host-side table build "
