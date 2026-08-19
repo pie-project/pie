@@ -126,8 +126,8 @@ pub unsafe fn variable_length(job: VarLen, stream: *mut c_void) -> Merged {
 
 #[cfg(test)]
 mod tests {
-    use super::{Merged, VarLen};
     use crate::Refusal;
+    use super::{Merged, VarLen};
 
     /// A declined fold is not a launched one.
     ///

@@ -6299,7 +6299,7 @@ fn results_of(symbol: &str) -> usize {
     routine
         .args
         .iter()
-        .filter(|(ty, _)| matches!(ty, kernels::Ty::BufMut | kernels::Ty::F32sMut))
+        .filter(|(ty, _)| ty.binds() == kernels::Binds::Writes)
         .count()
 }
 

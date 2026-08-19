@@ -12,8 +12,7 @@ use std::ffi::c_void;
 
 use crate::jit::abi::bf16;
 use crate::{norm, vision};
-use kernels::keys::{self, Fact};
-use kernels::routine::{Bank, In, Out};
+use kernels::routine::{Const, In, InOut, Out};
 
 use super::{Refused, Result, Scratch, Stream, call, read_raw_span};
 
@@ -203,7 +202,7 @@ fn rms(
     stream: Stream<'_>,
 ) -> Result<()> {
     call("norm::rmsnorm_strided_bf16", stream, |ctx| {
-        norm::rmsnorm_strided_bf16(
+        norm::rmsnorm_strided_bf16_at(
             ctx,
             // The stride is now the difference between the two regions' widths;
             // this caller passes `hidden` for both.
@@ -211,9 +210,9 @@ fn rms(
             // `Bank`, not `Weight`: the callee reads its weight as the
             // positional bank (`args[n_in + n_out]`), and the two wrappers look
             // alike enough that a swap would not be caught by the compiler.
-            Bank { ptr: weight.cast() },
+            Const { v: weight.cast() },
             Out { ptr: y.cast(), rows, width: hidden },
-            keys::RmsEps::env(eps),
+            eps,
         )
     })
 }
@@ -320,12 +319,12 @@ fn run(
         // `rmsnorm_no_scale` over `v`: the head width (64) is passed as an
         // operand, not recovered from the grid.
         call("norm::rmsnorm_no_scale_bf16", stream, |ctx| {
-            norm::rmsnorm_no_scale::<bf16>(
+            norm::rmsnorm_no_scale_at(
                 ctx,
                 In { ptr: v.cast_const().cast(), rows: head_rows, width: head_dim },
                 Out { ptr: v.cast(), rows: head_rows, width: head_dim },
-                keys::PerHeadDim::env(0),
-                keys::RmsEps::env(eps),
+                0,
+                eps,
             )
         })?;
         // Axial 2-D rope over `q` then `k`.
@@ -439,12 +438,12 @@ fn run(
     let pn = scratch.bf16(pooled_elems)?;
     // The pooled rows normalised.
     call("norm::rmsnorm_no_scale_bf16", stream, |ctx| {
-        norm::rmsnorm_no_scale::<bf16>(
+        norm::rmsnorm_no_scale_at(
             ctx,
             In { ptr: pooled.cast_const().cast(), rows: out_len, width: hd },
             Out { ptr: pn.cast(), rows: out_len, width: hd },
-            keys::PerHeadDim::env(0),
-            keys::RmsEps::env(eps),
+            0,
+            eps,
         )
     })?;
     // The third and last cuBLAS call.
@@ -537,7 +536,10 @@ fn residual_add(
     call("norm::residual_add_bf16", stream, |ctx| {
         norm::residual_add::<bf16>(
             ctx,
-            Out { ptr: y.cast(), rows, width },
+            // ONE ADDRESS IN BOTH RUNS: `residual_add` writes into the same
+            // buffer it reads, which the signature says with `InOut` where the
+            // row used to say it with an `in_place` pair.
+            InOut { ptr: y.cast(), rows, width },
             In { ptr: x.cast(), rows, width },
         )
     })

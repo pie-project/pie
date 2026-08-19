@@ -88,6 +88,32 @@ pub(super) fn semantic(kind: &OpKind, peel_tail: bool) -> Semantic {
     }
 }
 
+/// The scalars a SEMANTIC op carries for the kernel [`semantic`] names, in
+/// that routine's declaration order.
+///
+/// Almost always empty, and the emptiness is the point: a semantic op is one
+/// whose kernel is fixed executor behaviour, and most carry no numbers at all
+/// — `OpKind::Embed` is a weight name, `OpKind::RmsnormGated` is a weight
+/// name. A routine reached only that way must ASK for what it needs, because
+/// there is nothing here to hand it.
+///
+/// The exception is an op that already holds the number on its own variant.
+/// `OpKind::Rope`'s `partial` IS `rope::rope_partial_bf16`'s `rotary_dim` —
+/// the resolved channel count, not HF's factor — and HEAD took it as
+/// `Param<0, i32>` from a statement. `dsl::cuda::rope_partial` still states
+/// it that way; gemma-4 reaches the same routine through the SEMANTIC path,
+/// where the number was being dropped on the floor between an op that has it
+/// and a routine that declares it.
+pub(super) fn semantic_params(kind: &OpKind) -> Vec<u32> {
+    match kind {
+        OpKind::Rope {
+            partial: Some(rotary_dim),
+            ..
+        } => vec![*rotary_dim],
+        _ => Vec::new(),
+    }
+}
+
 /// The kind's name, for a refusal a human reads.
 pub(super) fn kind_name(kind: &OpKind) -> &'static str {
     use OpKind::*;

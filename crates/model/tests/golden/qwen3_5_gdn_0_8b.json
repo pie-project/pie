@@ -229,6 +229,7 @@
       "kind": {
         "CausalConv1d": {
           "weight": "layer.0.conv",
+          "bias": null,
           "layer": 0,
           "kernel": 4
         }

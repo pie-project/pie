@@ -6,18 +6,15 @@
 //! where no type can carry the source.
 #![allow(clippy::too_many_arguments)]
 
+use kernels::{Bind, Fire};
+use kernels::routine::{Asks, Const, In, InOut, Out};
+use kernels_macros::routine;
 use crate::jit::Abi;
 use crate::jit::abi::{MaybeConst, bf16, f16};
-use crate::jit::{Ctx, Family, Launch, Routine};
-use crate::routine;
+use crate::jit::abi::Tensor;
+use crate::jit::{Ctx, Launch};
 use kernels::Refusal;
 use kernels::keys;
-use kernels::routine::Bank;
-use kernels::routine::InOut;
-use kernels::routine::In;
-use kernels::routine::Env;
-use kernels::routine::Out;
-use kernels::routine::Param;
 
 // Three same-shaped pairs recur and must not be merged: `keys::Theta`
 // (per-layer) vs. `keys::RopeTheta` (fire-wide), `keys::HeadDim` (the fire's)
@@ -157,29 +154,23 @@ fn k_heads<T>(q: *mut T, k: *mut T, width: i32, head_dim: i32) -> Result<i32, Re
 /// `positions` addresses `table.rows` live `i32`s and `table` itself
 /// `table.rows * head_dim` live floats; `stream` must be live across the
 /// launch.
-#[kernels_macros::routine]
+#[routine]
 pub fn rope_standard_table(
-    ctx: &Ctx,
-    positions: Env<keys::Positions>,
+    ctx: &Ctx<'_>,
     // The region also carries the row count `Launch::per_row` uses.
-    table: Out<0, f32>,
-    head_dim: Env<keys::HeadDim>,
-    // The fire-wide base (`Cx::rope_theta`), not the per-layer `keys::Theta`
-    // gemma-4 splits by sliding/full layer kind; the two agree elsewhere.
-    theta: Env<keys::RopeTheta>,
-) -> Result<(), Refusal> {
-    if **head_dim / 2 <= 0 {
+    table: Out<Tensor<f32>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
+    // builder ever began stating them. A `Const` mark PROMISES the statement
+    // carries the number at its slot in the params run; where nothing states
+    // one the promise breaks at the fire, not at the type. §11.20.
+    let head_dim = ctx.ask::<i32, keys::HeadDim>()?;
+    let theta = ctx.ask::<f32, keys::RopeTheta>()?;
+
+    let positions = ctx.ask::<*const i32, keys::Positions>()?;
+    if head_dim / 2 <= 0 {
         return Err(Refusal::Empty { what: "head_dim / 2" });
     }
-    // SAFETY: every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "rope/rope.cuh",
-            "::pie::rope::standard_table<::pie::i32>",
-            Launch::per_row(table.rows.unsigned_abs(), ROTATE_BLOCK.unsigned_abs()),
-            &[positions.arg(), table.ptr.arg(), head_dim.arg(), theta.arg()],
-        )
-    }
+    ctx.fire(Fire::at("rope/rope.cuh", "::pie::rope::standard_table<::pie::i32>").apply(Launch::per_row(table.rows.unsigned_abs(), ROTATE_BLOCK.unsigned_abs())), &[positions.arg(), table.arg(), head_dim.arg(), theta.arg()])
 }
 
 /// `rope.cu`'s `rope::rope_bf16`.
@@ -189,36 +180,41 @@ pub fn rope_standard_table(
 /// `q` and `k` address `q.rows * num_q_heads * head_dim` and
 /// `k.rows * num_kv_heads * head_dim` live bf16 elements, `positions`
 /// `q.rows` live `i32`s, and `stream` must be live across the launch.
-#[kernels_macros::routine]
+#[routine]
 pub fn rope_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     // Head counts stay stated facts rather than `heads(q.width, ..)`: this
     // kernel's arm never divided a width.
-    q: Out<0, bf16>,
-    k: Out<1, bf16>,
-    positions: Env<keys::Positions>,
-    num_q_heads: Env<keys::NumQHeads>,
-    num_kv_heads: Env<keys::NumKvHeads>,
-    head_dim: Env<keys::HeadDim>,
-    // Fire-wide; gemma-4's per-layer `keys::Theta` differs on sliding
-    // layers, so the two must not be confused.
-    theta: Env<keys::RopeTheta>,
-    interleaved: Env<keys::RopeInterleaved>,
-) -> Result<(), Refusal> {
-    let half = **head_dim / 2;
+    q: InOut<Tensor<bf16>>,
+    k: InOut<Tensor<bf16>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
+    // builder ever began stating them. A `Const` mark PROMISES the statement
+    // carries the number at its slot in the params run; where nothing states
+    // one the promise breaks at the fire, not at the type. §11.20.
+    let num_q_heads = ctx.ask::<i32, keys::NumQHeads>()?;
+    let num_kv_heads = ctx.ask::<i32, keys::NumKvHeads>()?;
+    let head_dim = ctx.ask::<i32, keys::HeadDim>()?;
+
+    // BACK TO ASKS, AND THE REASON IS WRITTEN DOWN ELSEWHERE. Both were
+    // `Env<keys::RopeTheta>` and `Env<keys::RopeInterleaved>`, and
+    // `driver-cuda`'s `launch_context_is_stated` files `rope_interleaved`
+    // under `VARIED_BY_A_ROW_WITH_NO_TEXT` with the sentence that settles it:
+    // *"NOTHING ON `Deployment` STATES IT"*. A `Const` mark is a promise the
+    // STATEMENT carries the number, and no trace text can keep it.
+    //
+    // `RopeTheta` is FIRE-WIDE; gemma-4's per-layer `keys::Theta` differs on
+    // sliding layers, so the two must not be confused.
+    let theta = ctx.ask::<f32, keys::RopeTheta>()?;
+    let interleaved = ctx.ask::<bool, keys::RopeInterleaved>()?;
+    let positions = ctx.ask::<*const i32, keys::Positions>()?;
+    let half = head_dim / 2;
     let pairs = cache_pairs(half);
     let smem = pairs.unsigned_abs() * 2 * 4;
-    let total_heads = **num_q_heads + **num_kv_heads;
+    let total_heads = num_q_heads + num_kv_heads;
     let per_block = heads_per_block(half);
-    // SAFETY: every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "rope/rope.cuh",
-            "::pie::rope::rotate<::pie::false_type::value, false>",
-            rotate_launch(q.rows, total_heads, per_block, smem),
-            &[
-                q.ptr.arg(),
-                k.ptr.arg(),
+    ctx.fire(Fire::at("rope/rope.cuh", "::pie::rope::rotate<::pie::false_type::value, false>").apply(rotate_launch(q.rows, total_heads, per_block, smem)), &[
+                q.arg(),
+                k.arg(),
                 positions.arg(),
                 num_q_heads.arg(),
                 num_kv_heads.arg(),
@@ -237,9 +233,7 @@ pub fn rope_bf16(
                 MaybeConst::<u8>::none().arg(),
                 0_i32.arg(),
                 0_i32.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `rope.cu`'s `rope::rope_write_kv_bf16`.
@@ -248,59 +242,53 @@ pub fn rope_bf16(
 ///
 /// Every pointer must address live device memory of the extent the paged-KV
 /// descriptors describe, and `stream` must be live across the launch.
-#[kernels_macros::routine]
+#[routine(whole)]
 pub fn rope_write_kv_bf16(
-    ctx: &Ctx,
-    // Declares one result; `k` rotates in place through input 1, an arity
-    // mismatch this file doesn't fix.
-    q: Out<0, bf16>,
-    // Through the statement's second input, not `Out(1)` (no such slot).
-    k: InOut<1, bf16>,
-    v: In<2, bf16>,
-    positions: Env<keys::Positions>,
-    // Reached via `state:`, hence `#[source(..)]`; `*mut u8` because the
-    // element type varies by layer dtype and this launcher casts to bf16.
-    #[source(KvKeys)] k_pages: *mut bf16,
-    #[source(KvValues)] v_pages: *mut bf16,
-    // The query-side CSR, distinct from `kv_page_indptr` below.
-    qo_indptr: Env<keys::QoIndptr>,
-    kv_page_indices: Env<keys::KvPageIndices>,
-    kv_page_indptr: Env<keys::KvPageIndptr>,
-    kv_last_page_lens: Env<keys::KvLastPageLens>,
-    // Per-row, not `keys::AttentionMaskEnabled` (per-lane).
-    row_valid: Env<keys::RowValid>,
-    // The true request count, not a row count (the two agree only in
-    // one-token decode).
-    num_requests: Env<keys::RequestCount>,
-    page_size: Env<keys::KvPageSize>,
-    num_q_heads: Env<keys::NumQHeads>,
-    // The fire's head count, not the cache's; swapping them is an
-    // out-of-bounds.
-    num_kv_heads: Env<keys::NumKvHeads>,
-    head_dim: Env<keys::HeadDim>,
-    // Fire-wide; see `rope_standard_table`.
-    theta: Env<keys::RopeTheta>,
-    // The cache's page layout flag (`[head,page,dim]` vs. `[page,head,dim]`).
-    hnd_layout: Env<keys::KvHndLayout>,
-    interleaved: bool,
-) -> Result<(), Refusal> {
-    let half = **head_dim / 2;
+    ctx: &Ctx<'_>,
+    // ONE ADDRESS IN BOTH RUNS: the statement places `q` as input 0 and
+    // declares the rotated `q` as its one result. `Out` alone would leave
+    // input 0 unclaimed and hand `k` the query's buffer.
+    q: InOut<Tensor<bf16>>,
+    // Through the statement's second input, not `Out(1)` (no such slot):
+    // `k` rotates in place and no result is declared for it.
+    k: In<Tensor<bf16>>,
+    v: In<Tensor<bf16>>,
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<bool, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
+    interleaved: bool) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
+    // builder ever began stating them. A `Const` mark PROMISES the statement
+    // carries the number at its slot in the params run; where nothing states
+    // one the promise breaks at the fire, not at the type. §11.20.
+    let page_size = ctx.ask::<i32, keys::KvPageSize>()?;
+    let num_q_heads = ctx.ask::<i32, keys::NumQHeads>()?;
+    let num_kv_heads = ctx.ask::<i32, keys::NumKvHeads>()?;
+    let head_dim = ctx.ask::<i32, keys::HeadDim>()?;
+    let theta = ctx.ask::<f32, keys::RopeTheta>()?;
+    let hnd_layout = ctx.ask::<bool, keys::KvHndLayout>()?;
+
+    let k_pages = ctx.ask::<*mut bf16, keys::KvKeys>()?;
+    let qo_indptr = ctx.ask::<*const u32, keys::QoIndptr>()?;
+    let row_valid = ctx.ask::<*const u8, keys::RowValid>()?;
+    let num_requests = ctx.ask::<i32, keys::RequestCount>()?;
+    let positions = ctx.ask::<*const i32, keys::Positions>()?;
+    let v_pages = ctx.ask::<*mut bf16, keys::KvValues>()?;
+    let kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
+    let kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
+    let kv_last_page_lens = ctx.ask::<*const u32, keys::KvLastPageLens>()?;
+    let half = head_dim / 2;
     let pairs = cache_pairs(half);
     let smem = pairs.unsigned_abs() * 2 * 4;
-    let total_heads = **num_q_heads + **num_kv_heads;
+    let total_heads = num_q_heads + num_kv_heads;
     let per_block = heads_per_block(half);
     let instantiation =
-        if **hnd_layout { "::pie::rope::rotate<\
+        if hnd_layout { "::pie::rope::rotate<\
                              ::pie::true_type::value, true>" } else { "::pie::rope::rotate<::pie::true_type::value, false>" };
-    // SAFETY: every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "rope/rope.cuh",
-            instantiation,
-            rotate_launch(q.rows, total_heads, per_block, smem),
-            &[
-                q.ptr.arg(),
-                k.ptr.arg(),
+    ctx.fire(Fire::at("rope/rope.cuh", instantiation).apply(rotate_launch(q.rows, total_heads, per_block, smem)), &[
+                q.arg(),
+                k.arg(),
                 positions.arg(),
                 num_q_heads.arg(),
                 num_kv_heads.arg(),
@@ -312,16 +300,14 @@ pub fn rope_write_kv_bf16(
                 MaybeConst::new(v.ptr).arg(),
                 NonNull::new(k_pages).arg(),
                 NonNull::new(v_pages).arg(),
-                MaybeConst::new(**qo_indptr).arg(),
-                MaybeConst::new(**kv_page_indices).arg(),
-                MaybeConst::new(**kv_page_indptr).arg(),
-                MaybeConst::new(**kv_last_page_lens).arg(),
-                MaybeConst::new(**row_valid).arg(),
+                MaybeConst::new(qo_indptr).arg(),
+                MaybeConst::new(kv_page_indices).arg(),
+                MaybeConst::new(kv_page_indptr).arg(),
+                MaybeConst::new(kv_last_page_lens).arg(),
+                MaybeConst::new(row_valid).arg(),
                 num_requests.arg(),
                 page_size.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `rope.cu`'s `rope::qk_rmsnorm_rope_bf16`.
@@ -334,43 +320,39 @@ pub fn rope_write_kv_bf16(
 ///
 /// [`rope_bf16`]'s, plus `q_weight`/`k_weight` addressing `head_dim` live
 /// bf16 elements each.
-#[kernels_macros::routine]
+#[routine]
 pub fn qk_rmsnorm_rope_bf16(
-    ctx: &Ctx,
-    q: Out<0, bf16>,
-    k: Out<1, bf16>,
+    ctx: &Ctx<'_>,
+    q: InOut<Tensor<bf16>>,
+    k: InOut<Tensor<bf16>>,
     // Positional bank, not `Weight<N, T>` (same word, different table).
-    q_weight: Bank<0, bf16>,
-    k_weight: Bank<1, bf16>,
-    positions: Env<keys::Positions>,
-    // The layer's (`keys::Theta`), not the fire-wide `keys::RopeTheta`.
-    head_dim: Env<keys::HeadDim>,
-    theta: Env<keys::Theta>,
-    eps: Env<keys::RmsEps>,
-) -> Result<(), Refusal> {
+    q_weight: Const<Tensor<bf16>>,
+    k_weight: Const<Tensor<bf16>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: every one of these was `Env<keys::_>` before the
+    // four marks, and no builder ever began stating them. A `Const` mark
+    // PROMISES the statement carries the number at its slot in the params
+    // run; where nothing states one the promise is broken at the fire, not
+    // at the type. See `.wiki/migration.md` §11.20.
+    let head_dim = ctx.ask::<i32, keys::HeadDim>()?;
+    let theta = ctx.ask::<f32, keys::Theta>()?;
+    let eps = ctx.ask::<f32, keys::RmsEps>()?;
+
+    let positions = ctx.ask::<*const i32, keys::Positions>()?;
     let (num_q_heads, num_kv_heads) =
-        (q_heads(q.width, **head_dim)?, k_heads(q.ptr, k.ptr, k.width, **head_dim)?);
+        (q_heads(q.width, head_dim)?, k_heads(q.ptr, k.ptr, k.width, head_dim)?);
     let total_heads = num_q_heads + num_kv_heads;
-    // SAFETY: every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "rope/rope.cuh",
-            "::pie::rope::qk_rmsnorm_rotate<::pie::i32(128)>",
-            fused_launch(q.rows, total_heads),
-            &[
-                q.ptr.arg(),
-                k.ptr.arg(),
-                q_weight.ptr.arg(),
-                k_weight.ptr.arg(),
+    ctx.fire(Fire::at("rope/rope.cuh", "::pie::rope::qk_rmsnorm_rotate<::pie::i32(128)>").apply(fused_launch(q.rows, total_heads)), &[
+                q.arg(),
+                k.arg(),
+                q_weight.arg(),
+                k_weight.arg(),
                 positions.arg(),
                 num_q_heads.arg(),
                 num_kv_heads.arg(),
                 head_dim.arg(),
                 theta.arg(),
                 eps.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `rope.cu`'s `rope::qk_rmsnorm_rope_bf16_devwin`.
@@ -383,39 +365,32 @@ pub fn qk_rmsnorm_rope_bf16(
 ///
 /// `win` addresses two live `u32`s on the device; the rest is
 /// [`rope_bf16`]'s obligation with `n_max` for the row count.
-#[kernels_macros::routine]
+#[routine(whole)]
 pub fn qk_rmsnorm_rope_bf16_devwin(
-    ctx: &Ctx,
-    q: Out<0, bf16>,
-    k: Out<1, bf16>,
-    q_weight: Bank<0, bf16>,
-    k_weight: Bank<1, bf16>,
-    positions: Env<keys::Positions>,
-    // `[start, count]`; rewritten between trace replays, so the bind is a
-    // stable address, not the values.
-    win: Env<keys::PeelWindow>,
-    // `RowsTotal`, not `keys::Rows`: covers the fire's whole row space.
-    n_max: Env<keys::RowsTotal>,
-    head_dim: Env<keys::HeadDim>,
-    theta: Env<keys::Theta>,
-    eps: Env<keys::RmsEps>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    q: InOut<Tensor<bf16>>,
+    k: InOut<Tensor<bf16>>,
+    q_weight: Const<Tensor<bf16>>,
+    k_weight: Const<Tensor<bf16>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
+    // builder ever began stating them. A `Const` mark PROMISES the statement
+    // carries the number at its slot in the params run; where nothing states
+    // one the promise breaks at the fire, not at the type. §11.20.
+    let head_dim = ctx.ask::<i32, keys::HeadDim>()?;
+    let theta = ctx.ask::<f32, keys::Theta>()?;
+    let eps = ctx.ask::<f32, keys::RmsEps>()?;
+
+    let win = ctx.ask::<*mut u32, keys::PeelWindow>()?;
+    let n_max = ctx.ask::<i32, keys::RowsTotal>()?;
+    let positions = ctx.ask::<*const i32, keys::Positions>()?;
     let (num_q_heads, num_kv_heads) =
-        (q_heads(q.width, **head_dim)?, k_heads(q.ptr, k.ptr, k.width, **head_dim)?);
+        (q_heads(q.width, head_dim)?, k_heads(q.ptr, k.ptr, k.width, head_dim)?);
     let total_heads = num_q_heads + num_kv_heads;
-    // SAFETY: every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "rope/rope.cuh",
-            "::pie::rope::qk_rmsnorm_rotate_devwin<::pie::i32(128)>",
-            // `n_max`, not `q.rows`: a `_devwin` grid is sized by the
-            // fire's row total.
-            fused_launch(**n_max, total_heads),
-            &[
-                q.ptr.arg(),
-                k.ptr.arg(),
-                q_weight.ptr.arg(),
-                k_weight.ptr.arg(),
+    ctx.fire(Fire::at("rope/rope.cuh", "::pie::rope::qk_rmsnorm_rotate_devwin<::pie::i32(128)>").apply(fused_launch(n_max, total_heads)), &[
+                q.arg(),
+                k.arg(),
+                q_weight.arg(),
+                k_weight.arg(),
                 positions.arg(),
                 win.arg(),
                 num_q_heads.arg(),
@@ -423,9 +398,7 @@ pub fn qk_rmsnorm_rope_bf16_devwin(
                 head_dim.arg(),
                 theta.arg(),
                 eps.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `rope.cu`'s `rope::qk_rmsnorm_mrope_bf16`.
@@ -434,36 +407,46 @@ pub fn qk_rmsnorm_rope_bf16_devwin(
 ///
 /// [`qk_rmsnorm_rope_bf16_devwin`]'s, without `win`, and `positions` must
 /// address `q.rows * 3` live `i32`s rather than `q.rows`.
-#[kernels_macros::routine]
+#[routine]
 pub fn qk_rmsnorm_mrope_bf16(
-    ctx: &Ctx,
-    q: Out<0, bf16>,
-    k: Out<1, bf16>,
+    ctx: &Ctx<'_>,
+    q: InOut<Tensor<bf16>>,
+    k: InOut<Tensor<bf16>>,
     // Head counts stay stated facts; this launcher never divides a width.
-    q_weight: Bank<0, bf16>,
-    k_weight: Bank<1, bf16>,
-    positions: Env<keys::Positions>,
-    num_q_heads: Env<keys::NumQHeads>,
-    num_kv_heads: Env<keys::NumKvHeads>,
-    head_dim: Env<keys::HeadDim>,
-    theta: Env<keys::Theta>,
-    eps: Env<keys::RmsEps>,
+    q_weight: Const<Tensor<bf16>>,
+    k_weight: Const<Tensor<bf16>>,
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<i32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
     mrope_section_t: i32,
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<i32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
     mrope_section_h: i32,
-    mrope_section_w: i32,
-) -> Result<(), Refusal> {
-    let total_heads = **num_q_heads + **num_kv_heads;
-    // SAFETY: every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "rope/rope.cuh",
-            "::pie::rope::qk_rmsnorm_rotate_mrope<::pie::i32(128)>",
-            fused_launch(q.rows, total_heads),
-            &[
-                q.ptr.arg(),
-                k.ptr.arg(),
-                q_weight.ptr.arg(),
-                k_weight.ptr.arg(),
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<i32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
+    mrope_section_w: i32) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
+    // builder ever began stating them. A `Const` mark PROMISES the statement
+    // carries the number at its slot in the params run; where nothing states
+    // one the promise breaks at the fire, not at the type. §11.20.
+    let num_q_heads = ctx.ask::<i32, keys::NumQHeads>()?;
+    let num_kv_heads = ctx.ask::<i32, keys::NumKvHeads>()?;
+    let head_dim = ctx.ask::<i32, keys::HeadDim>()?;
+    let theta = ctx.ask::<f32, keys::Theta>()?;
+    let eps = ctx.ask::<f32, keys::RmsEps>()?;
+
+    let positions = ctx.ask::<*const i32, keys::Positions>()?;
+    let total_heads = num_q_heads + num_kv_heads;
+    ctx.fire(Fire::at("rope/rope.cuh", "::pie::rope::qk_rmsnorm_rotate_mrope<::pie::i32(128)>").apply(fused_launch(q.rows, total_heads)), &[
+                q.arg(),
+                k.arg(),
+                q_weight.arg(),
+                k_weight.arg(),
                 positions.arg(),
                 num_q_heads.arg(),
                 num_kv_heads.arg(),
@@ -473,9 +456,7 @@ pub fn qk_rmsnorm_mrope_bf16(
                 mrope_section_t.arg(),
                 mrope_section_h.arg(),
                 mrope_section_w.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `rope.cu`'s `rope::qk_rmsnorm_rope_bf16_rounded`.
@@ -488,46 +469,41 @@ pub fn qk_rmsnorm_mrope_bf16(
 ///
 /// [`qk_rmsnorm_mrope_bf16`]'s. `k.ptr` and `k_weight` may be null together,
 /// and the kernel reads the pair as "there is no k".
-#[kernels_macros::routine]
+#[routine]
 pub fn qk_rmsnorm_rope_bf16_rounded(
-    ctx: &Ctx,
-    q: Out<0, bf16>,
+    ctx: &Ctx<'_>,
+    q: InOut<Tensor<bf16>>,
     // A resolved `Out(1)` with no width is this file's "there is no k".
-    k: Out<1, bf16>,
-    q_weight: Bank<0, bf16>,
-    // Optional: the no-K caller supplies `Bank { ptr: Or(core::ptr::null())
+    k: InOut<Tensor<bf16>>,
+    q_weight: Const<Tensor<bf16>>,
+    // Optional: the no-K caller supplies `Const { v: Or(core::ptr::null())
     // }` by hand; `num_kv_heads = 0` keeps the kernel from reading it.
-    k_weight: Bank<1, bf16>,
-    positions: Env<keys::Positions>,
-    // The cache's, not `keys::HeadDim`: a rounded layer whose cache differs
-    // in head width would norm with one and index with the other.
-    head_dim: Env<keys::KvHeadDim>,
-    theta: Env<keys::Theta>,
-    eps: Env<keys::RmsEps>,
-) -> Result<(), Refusal> {
+    k_weight: Const<Tensor<bf16>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: every one of these was `Env<keys::_>` before the
+    // four marks, and no builder ever began stating them. A `Const` mark
+    // PROMISES the statement carries the number at its slot in the params
+    // run; where nothing states one the promise is broken at the fire, not
+    // at the type. See `.wiki/migration.md` §11.20.
+    let head_dim = ctx.ask::<i32, keys::KvHeadDim>()?;
+    let theta = ctx.ask::<f32, keys::Theta>()?;
+    let eps = ctx.ask::<f32, keys::RmsEps>()?;
+
+    let positions = ctx.ask::<*const i32, keys::Positions>()?;
     let (num_q_heads, num_kv_heads) =
-        (q_heads(q.width, **head_dim)?, k_heads(q.ptr, k.ptr, k.width, **head_dim)?);
+        (q_heads(q.width, head_dim)?, k_heads(q.ptr, k.ptr, k.width, head_dim)?);
     let total_heads = num_q_heads + num_kv_heads;
-    // SAFETY: every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "rope/rope.cuh",
-            "::pie::rope::qk_rmsnorm_rotate_rounded<::pie::i32(128)>",
-            fused_launch(q.rows, total_heads),
-            &[
-                q.ptr.arg(),
-                k.ptr.arg(),
-                q_weight.ptr.arg(),
-                k_weight.ptr.arg(),
+    ctx.fire(Fire::at("rope/rope.cuh", "::pie::rope::qk_rmsnorm_rotate_rounded<::pie::i32(128)>").apply(fused_launch(q.rows, total_heads)), &[
+                q.arg(),
+                k.arg(),
+                q_weight.arg(),
+                k_weight.arg(),
                 positions.arg(),
                 num_q_heads.arg(),
                 num_kv_heads.arg(),
                 head_dim.arg(),
                 theta.arg(),
                 eps.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `rope::q_rmsnorm_rope_bf16_rounded` -- [`qk_rmsnorm_rope_bf16_rounded`]
@@ -543,34 +519,37 @@ pub fn qk_rmsnorm_rope_bf16_rounded(
 /// # Safety
 ///
 /// [`qk_rmsnorm_rope_bf16_rounded`]'s, less `k` and `k_weight`.
-#[kernels_macros::routine]
+#[routine]
 pub fn q_rmsnorm_rope_bf16_rounded(
-    ctx: &Ctx,
-    q: Out<0, bf16>,
-    q_weight: Bank<0, bf16>,
-    positions: Env<keys::Positions>,
-    // The cache's, per the routine above.
-    head_dim: Env<keys::KvHeadDim>,
-    theta: Env<keys::Theta>,
-    eps: Env<keys::RmsEps>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    q: InOut<Tensor<bf16>>,
+    q_weight: Const<Tensor<bf16>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: every one of these was `Env<keys::_>` before the
+    // four marks, and no builder ever began stating them. A `Const` mark
+    // PROMISES the statement carries the number at its slot in the params
+    // run; where nothing states one the promise is broken at the fire, not
+    // at the type. See `.wiki/migration.md` §11.20.
+    let head_dim = ctx.ask::<i32, keys::KvHeadDim>()?;
+    let theta = ctx.ask::<f32, keys::Theta>()?;
+    let eps = ctx.ask::<f32, keys::RmsEps>()?;
+
+    // THE CALLEE ASKS FOR THE POSITIONS ITSELF, so this no longer forwards
+    // them: a fact only the fire can answer reaches a body through its own
+    // context, not through the argument list of whoever called it. The head
+    // pitch, theta and epsilon left this call for the same reason.
     qk_rmsnorm_rope_bf16_rounded(
         ctx,
         q,
-        // Zero-width result the statement never declares; `rows: q.rows`
+        // Zero-width operand the statement never places; `rows: q.rows`
         // since `rows` is the launch's, not this absent operand's.
-        Out {
+        InOut {
             ptr: core::ptr::null_mut(),
             rows: q.rows,
             width: 0,
         },
         q_weight,
         // The callee's `k_weight` fallback: no bank slot 1 to forward.
-        Bank { ptr: core::ptr::null() },
-        positions,
-        head_dim,
-        theta,
-        eps,
+        Const { v: core::ptr::null() },
     )
 }
 
@@ -579,36 +558,49 @@ pub fn q_rmsnorm_rope_bf16_rounded(
 /// # Safety
 ///
 /// [`rope_bf16`]'s.
-#[kernels_macros::routine]
+#[routine]
 pub fn rope_yarn_bf16(
-    ctx: &Ctx,
-    q: Out<0, bf16>,
-    k: Out<1, bf16>,
-    positions: Env<keys::Positions>,
-    num_q_heads: Env<keys::NumQHeads>,
-    num_kv_heads: Env<keys::NumKvHeads>,
-    head_dim: Env<keys::HeadDim>,
-    // Fire-wide, not gemma-4's per-layer `keys::Theta`.
-    theta: Env<keys::RopeTheta>,
+    ctx: &Ctx<'_>,
+    q: InOut<Tensor<bf16>>,
+    k: InOut<Tensor<bf16>>,
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<f32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
     factor: f32,
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<f32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
     low_freq_factor: f32,
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<f32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
     high_freq_factor: f32,
-    original_max_position: i32,
-) -> Result<(), Refusal> {
-    let half = **head_dim / 2;
-    let total_heads = **num_q_heads + **num_kv_heads;
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<i32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
+    original_max_position: i32) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
+    // builder ever began stating them. A `Const` mark PROMISES the statement
+    // carries the number at its slot in the params run; where nothing states
+    // one the promise breaks at the fire, not at the type. §11.20.
+    let num_q_heads = ctx.ask::<i32, keys::NumQHeads>()?;
+    let num_kv_heads = ctx.ask::<i32, keys::NumKvHeads>()?;
+    let head_dim = ctx.ask::<i32, keys::HeadDim>()?;
+    let theta = ctx.ask::<f32, keys::RopeTheta>()?;
+
+    let positions = ctx.ask::<*const i32, keys::Positions>()?;
+    let half = head_dim / 2;
+    let total_heads = num_q_heads + num_kv_heads;
     let per_block = heads_per_block(half);
     #[allow(clippy::cast_precision_loss)]
     let orig_max_pos = original_max_position as f32;
-    // SAFETY: every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "rope/rope.cuh",
-            "::pie::rope::rotate_yarn",
-            rotate_launch(q.rows, total_heads, per_block, 0),
-            &[
-                q.ptr.arg(),
-                k.ptr.arg(),
+    ctx.fire(Fire::at("rope/rope.cuh", "::pie::rope::rotate_yarn").apply(rotate_launch(q.rows, total_heads, per_block, 0)), &[
+                q.arg(),
+                k.arg(),
                 positions.arg(),
                 num_q_heads.arg(),
                 num_kv_heads.arg(),
@@ -619,9 +611,7 @@ pub fn rope_yarn_bf16(
                 high_freq_factor.arg(),
                 orig_max_pos.arg(),
                 per_block.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `rope.cu`'s `rope::rope_yarn_original_bf16` (OLMo-3, gpt-oss).
@@ -634,51 +624,49 @@ pub fn rope_yarn_bf16(
 /// # Safety
 ///
 /// [`rope_bf16`]'s.
-#[kernels_macros::routine]
+#[routine]
 pub fn rope_yarn_original_bf16(
-    ctx: &Ctx,
-    q: Out<0, bf16>,
-    k: Out<1, bf16>,
-    positions: Env<keys::Positions>,
-    head_dim: Env<keys::HeadDim>,
-    // Fire-wide (`RopeTheta`), not gemma-4's per-layer `keys::Theta`.
-    theta: Env<keys::RopeTheta>,
-    factor: Env<keys::YarnFactor>,
-    beta_fast: Env<keys::YarnBetaFast>,
-    beta_slow: Env<keys::YarnBetaSlow>,
-    attention_factor: Env<keys::YarnAttentionFactor>,
-    original_max_position: Env<keys::YarnOriginalMaxPosition>,
-    interleaved: Env<keys::RopeInterleaved>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    q: InOut<Tensor<bf16>>,
+    k: InOut<Tensor<bf16>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: every one of these was `Env<keys::_>` before the
+    // four marks, and no builder ever began stating them. A `Const` mark
+    // PROMISES the statement carries the number at its slot in the params
+    // run; where nothing states one the promise is broken at the fire, not
+    // at the type. See `.wiki/migration.md` §11.20.
+    let head_dim = ctx.ask::<i32, keys::HeadDim>()?;
+    let theta = ctx.ask::<f32, keys::RopeTheta>()?;
+    let factor = ctx.ask::<f32, keys::YarnFactor>()?;
+    let beta_fast = ctx.ask::<f32, keys::YarnBetaFast>()?;
+    let beta_slow = ctx.ask::<f32, keys::YarnBetaSlow>()?;
+    let attention_factor = ctx.ask::<f32, keys::YarnAttentionFactor>()?;
+    let original_max_position = ctx.ask::<i32, keys::YarnOriginalMaxPosition>()?;
+    let interleaved = ctx.ask::<bool, keys::RopeInterleaved>()?;
+
+    let positions = ctx.ask::<*const i32, keys::Positions>()?;
     // A checkpoint with no YaRN block reaches here as `Yarn::NONE`;
     // unguarded, `ramp_bounds` would compute `(0.0 / 0.0).ln()` and rotate
     // against NaN ramps.
-    if **original_max_position <= 0 {
+    if original_max_position <= 0 {
         return Err(Refusal::Unstated { what: "the checkpoint's YaRN block" });
     }
     let (num_q_heads, num_kv_heads) =
-        (q_heads(q.width, **head_dim)?, k_heads(q.ptr, k.ptr, k.width, **head_dim)?);
+        (q_heads(q.width, head_dim)?, k_heads(q.ptr, k.ptr, k.width, head_dim)?);
     let (low_dim, high_dim) = ramp_bounds(
-        **head_dim,
-        **theta,
-        **beta_fast,
-        **beta_slow,
-        **original_max_position,
+        head_dim,
+        theta,
+        beta_fast,
+        beta_slow,
+        original_max_position,
     );
-    let half = **head_dim / 2;
+    let half = head_dim / 2;
     let pairs = cache_pairs(half);
     let smem = pairs.unsigned_abs() * 8;
     let total_heads = num_q_heads + num_kv_heads;
     let per_block = heads_per_block(half);
-    // SAFETY: every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "rope/rope.cuh",
-            "::pie::rope::rotate_yarn_original",
-            rotate_launch(q.rows, total_heads, per_block, smem),
-            &[
-                q.ptr.arg(),
-                k.ptr.arg(),
+    ctx.fire(Fire::at("rope/rope.cuh", "::pie::rope::rotate_yarn_original").apply(rotate_launch(q.rows, total_heads, per_block, smem)), &[
+                q.arg(),
+                k.arg(),
                 positions.arg(),
                 num_q_heads.arg(),
                 num_kv_heads.arg(),
@@ -691,9 +679,7 @@ pub fn rope_yarn_original_bf16(
                 interleaved.arg(),
                 per_block.arg(),
                 pairs.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `rope::rope_partial_bf16` — partial rotary over the first `rotary_dim`.
@@ -709,12 +695,12 @@ pub fn rope_yarn_original_bf16(
 ///
 /// [`rope_bf16`]'s.
 fn rope_partial<T>(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     instantiation: &'static str,
     q: *mut T,
     k: *mut T,
     // Plain `*const i32`, not `Env`: this private `fn` has no table row.
-    // Callers deref `**positions` to forward.
+    // Callers deref `*positions` to forward.
     positions: *const i32,
     // Plain `i32`/`f32`s for the same reason.
     num_tokens: i32,
@@ -722,20 +708,27 @@ fn rope_partial<T>(
     k_width: i32,
     head_dim: i32,
     rotary_dim: i32,
-    theta: f32,
-) -> Result<(), Refusal>
+    theta: f32) -> Result<(), Refusal>
 where
-    *mut T: Abi,
+    T: kernels::Elem,
+    // BOTH BOUNDS, BECAUSE THIS HELPER TAKES RAW POINTERS AND SPENDS THEM.
+    // `Abi` is what makes `*mut T` a CUDA argument at all; `Bind` is what
+    // lets the body write `q.arg()` -- the one spelling every plane's body
+    // uses, which `arg_via_abi!` stamps per pointee rather than deriving.
+    // AND THE WRITE SIDE NAMES ITS OWN TRAIT. `Out`/`InOut` bind through
+    // `BindMut`, not `Bind`, so that a plane whose read and write carriers
+    // are ONE TYPE can still say which way a slot is driven -- see
+    // `kernels::routine::BindMut`. Here the two carriers already differ, so
+    // the blanket impl over `*mut T` makes this the same obligation twice;
+    // it is spelled because `<T as Elem>::Write` is opaque under a generic
+    // `T` and the compiler cannot see that it is this pointer.
+    *mut T: Abi + kernels::Bind<crate::jit::ArgValue>,
+    T: kernels::Elem<Write = *mut T>,
+    <T as kernels::Elem>::Write: Abi,
 {
     let (num_q_heads, num_kv_heads) =
         (q_heads(q_width, head_dim)?, k_heads(q, k, k_width, head_dim)?);
-    // SAFETY: every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "rope/rope.cuh",
-            instantiation,
-            Launch::per_row(num_tokens.unsigned_abs(), ROTATE_BLOCK.unsigned_abs()),
-            &[
+    ctx.fire(Fire::at("rope/rope.cuh", instantiation).apply(Launch::per_row(num_tokens.unsigned_abs(), ROTATE_BLOCK.unsigned_abs())), &[
                 q.arg(),
                 k.arg(),
                 positions.arg(),
@@ -747,9 +740,7 @@ where
                 head_dim.arg(),
                 rotary_dim.arg(),
                 theta.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `rope::rope_partial_bf16` — [`rope_partial`] over bf16.
@@ -757,30 +748,33 @@ where
 /// # Errors
 ///
 /// [`rope_partial`]'s.
-#[kernels_macros::routine]
+#[routine]
 pub fn rope_partial_bf16(
-    ctx: &Ctx,
-    q: Out<0, bf16>,
-    k: Out<1, bf16>,
-    positions: Env<keys::Positions>,
+    ctx: &Ctx<'_>,
+    q: InOut<Tensor<bf16>>,
+    k: InOut<Tensor<bf16>>,
     // `head_dim` is the cache's -- see [`qk_rmsnorm_rope_bf16_rounded`].
-    head_dim: Env<keys::KvHeadDim>,
-    rotary_dim: Param<0, i32>,
-    theta: Env<keys::Theta>,
-) -> Result<(), Refusal> {
+    rotary_dim: Const<i32>) -> Result<(), Refusal> {
+    // HEAD ASKED FOR BOTH, and the statement carries neither: `dsl::cuda::
+    // rope_partial` states `[rotary_dim]` alone, which is HEAD's `Param<0>`.
+    // `keys::KvHeadDim` and `keys::Theta` are answered by `driver-cuda`, and
+    // a `Const` mark here promises a number no trace text passes.
+    let head_dim = ctx.ask::<i32, keys::KvHeadDim>()?;
+    let theta = ctx.ask::<f32, keys::Theta>()?;
+    let positions = ctx.ask::<*const i32, keys::Positions>()?;
     rope_partial(
         ctx,
         "::pie::rope::rotate_partial<::pie::bf16>",
         q.ptr,
         k.ptr,
-        **positions,
+        positions,
         q.rows,
         q.width,
         k.width,
         // Starred: the callee takes a plain number, not a fact type.
-        **head_dim,
+        head_dim,
         *rotary_dim,
-        **theta,
+        theta,
     )
 }
 
@@ -796,16 +790,19 @@ pub fn rope_partial_bf16(
 /// # Safety
 ///
 /// [`rope_partial_bf16`]'s, less `k`.
-#[kernels_macros::routine]
+#[routine]
 pub fn rope_partial_q_bf16(
-    ctx: &Ctx,
-    q: Out<0, bf16>,
-    positions: Env<keys::Positions>,
+    ctx: &Ctx<'_>,
+    q: InOut<Tensor<bf16>>,
     // The cache's, per [`rope_partial_bf16`].
-    head_dim: Env<keys::KvHeadDim>,
-    rotary_dim: Param<0, i32>,
-    theta: Env<keys::Theta>,
-) -> Result<(), Refusal> {
+    rotary_dim: Const<i32>) -> Result<(), Refusal> {
+    // HEAD ASKED FOR BOTH, and the statement carries neither: `dsl::cuda::
+    // rope_partial` states `[rotary_dim]` alone, which is HEAD's `Param<0>`.
+    // `keys::KvHeadDim` and `keys::Theta` are answered by `driver-cuda`, and
+    // a `Const` mark here promises a number no trace text passes.
+    let head_dim = ctx.ask::<i32, keys::KvHeadDim>()?;
+    let theta = ctx.ask::<f32, keys::Theta>()?;
+    let positions = ctx.ask::<*const i32, keys::Positions>()?;
     rope_partial(
         ctx,
         "::pie::rope::rotate_partial<::pie::bf16>",
@@ -813,13 +810,13 @@ pub fn rope_partial_q_bf16(
         // Q's own address stands in for K; never dereferenced since
         // `num_kv_heads = 0` keeps the kernel off it.
         q.ptr,
-        **positions,
+        positions,
         q.rows,
         q.width,
         0,
-        **head_dim,
+        head_dim,
         *rotary_dim,
-        **theta,
+        theta,
     )
 }
 
@@ -831,29 +828,32 @@ pub fn rope_partial_q_bf16(
 /// # Errors
 ///
 /// [`rope_partial`]'s.
-#[kernels_macros::routine]
+#[routine]
 pub fn rope_partial_f16(
-    ctx: &Ctx,
-    q: Out<0, f16>,
-    k: Out<1, f16>,
-    positions: Env<keys::Positions>,
-    // The cache's, per the bf16 twin.
-    head_dim: Env<keys::KvHeadDim>,
-    rotary_dim: Env<keys::RotaryWidth>,
-    theta: Env<keys::Theta>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    q: InOut<Tensor<f16>>,
+    k: InOut<Tensor<f16>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
+    // builder ever began stating them. A `Const` mark PROMISES the statement
+    // carries the number at its slot in the params run; where nothing states
+    // one the promise breaks at the fire, not at the type. §11.20.
+    let head_dim = ctx.ask::<i32, keys::KvHeadDim>()?;
+    let rotary_dim = ctx.ask::<i32, keys::RotaryWidth>()?;
+    let theta = ctx.ask::<f32, keys::Theta>()?;
+
+    let positions = ctx.ask::<*const i32, keys::Positions>()?;
     rope_partial(
         ctx,
         "::pie::rope::rotate_partial<::pie::f16>",
         q.ptr,
         k.ptr,
-        **positions,
+        positions,
         q.rows,
         q.width,
         k.width,
-        **head_dim,
-        **rotary_dim,
-        **theta,
+        head_dim,
+        rotary_dim,
+        theta,
     )
 }
 
@@ -866,44 +866,41 @@ pub fn rope_partial_f16(
 /// # Safety
 ///
 /// [`rope_bf16`]'s.
-#[kernels_macros::routine]
+#[routine]
 pub fn rope_partial_last_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     // K is declared here; the Q-alone form is the separate symbol below.
-    q: Out<0, bf16>,
-    k: Out<1, bf16>,
-    positions: Env<keys::Positions>,
-    // The cache's, per [`qk_rmsnorm_rope_bf16_rounded`].
-    head_dim: Env<keys::KvHeadDim>,
-    rotary_dim: Env<keys::RotaryWidth>,
-    theta: Env<keys::Theta>,
-    interleaved: Env<keys::RopeInterleaved>,
-    yarn_factor: Env<keys::YarnFactor>,
-    yarn_beta_fast: Env<keys::YarnBetaFast>,
-    yarn_beta_slow: Env<keys::YarnBetaSlow>,
-    yarn_original_max_position: Env<keys::YarnOriginalMaxPosition>,
-) -> Result<(), Refusal> {
-    let (num_q_heads, num_kv_heads) = (q_heads(q.width, **head_dim)?, heads(k.width, **head_dim)?);
-    let (low_dim, high_dim) = if **yarn_factor > 1.0 && **yarn_original_max_position > 0 {
+    q: Out<Tensor<bf16>>,
+    k: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
+    // builder ever began stating them. A `Const` mark PROMISES the statement
+    // carries the number at its slot in the params run; where nothing states
+    // one the promise breaks at the fire, not at the type. §11.20.
+    let head_dim = ctx.ask::<i32, keys::KvHeadDim>()?;
+    let rotary_dim = ctx.ask::<i32, keys::RotaryWidth>()?;
+    let theta = ctx.ask::<f32, keys::Theta>()?;
+    let interleaved = ctx.ask::<bool, keys::RopeInterleaved>()?;
+    let yarn_factor = ctx.ask::<f32, keys::YarnFactor>()?;
+    let yarn_beta_fast = ctx.ask::<f32, keys::YarnBetaFast>()?;
+    let yarn_beta_slow = ctx.ask::<f32, keys::YarnBetaSlow>()?;
+    let yarn_original_max_position = ctx.ask::<i32, keys::YarnOriginalMaxPosition>()?;
+
+    let positions = ctx.ask::<*const i32, keys::Positions>()?;
+    let (num_q_heads, num_kv_heads) = (q_heads(q.width, head_dim)?, heads(k.width, head_dim)?);
+    let (low_dim, high_dim) = if yarn_factor > 1.0 && yarn_original_max_position > 0 {
         ramp_bounds(
-            **rotary_dim,
-            **theta,
-            **yarn_beta_fast,
-            **yarn_beta_slow,
-            **yarn_original_max_position,
+            rotary_dim,
+            theta,
+            yarn_beta_fast,
+            yarn_beta_slow,
+            yarn_original_max_position,
         )
     } else {
         (0.0, 0.0)
     };
-    // SAFETY: every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "rope/rope.cuh",
-            "::pie::rope::rotate_partial_last",
-            Launch::per_row(q.rows.unsigned_abs(), ROTATE_BLOCK.unsigned_abs()),
-            &[
-                q.ptr.arg(),
-                k.ptr.arg(),
+    ctx.fire(Fire::at("rope/rope.cuh", "::pie::rope::rotate_partial_last").apply(Launch::per_row(q.rows.unsigned_abs(), ROTATE_BLOCK.unsigned_abs())), &[
+                q.arg(),
+                k.arg(),
                 positions.arg(),
                 num_q_heads.arg(),
                 num_kv_heads.arg(),
@@ -917,9 +914,7 @@ pub fn rope_partial_last_bf16(
                 yarn_factor.arg(),
                 low_dim.arg(),
                 high_dim.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `rope::rope_partial_last_q_bf16` -- [`rope_partial_last_bf16`] rotating Q
@@ -937,24 +932,32 @@ pub fn rope_partial_last_bf16(
 ///
 /// [`rope_partial_last_bf16`]'s, less `k`.
 #[expect(clippy::too_many_arguments, reason = "D1: a routine takes fields, never a struct")]
-#[kernels_macros::routine]
+#[routine]
 pub fn rope_partial_last_q_bf16(
-    ctx: &Ctx,
-    q: Out<0, bf16>,
-    positions: Env<keys::Positions>,
-    // The cache's, per [`rope_partial_last_bf16`].
-    head_dim: Env<keys::KvHeadDim>,
-    rotary_dim: Env<keys::RotaryWidth>,
-    theta: Env<keys::Theta>,
-    interleaved: Env<keys::RopeInterleaved>,
-    yarn_factor: Env<keys::YarnFactor>,
-    yarn_beta_fast: Env<keys::YarnBetaFast>,
-    yarn_beta_slow: Env<keys::YarnBetaSlow>,
-    yarn_original_max_position: Env<keys::YarnOriginalMaxPosition>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    q: InOut<Tensor<bf16>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
+    // builder ever began stating them. A `Const` mark PROMISES the statement
+    // carries the number at its slot in the params run; where nothing states
+    // one the promise breaks at the fire, not at the type. §11.20.
+    let head_dim = ctx.ask::<i32, keys::KvHeadDim>()?;
+    let rotary_dim = ctx.ask::<i32, keys::RotaryWidth>()?;
+    let theta = ctx.ask::<f32, keys::Theta>()?;
+    let interleaved = ctx.ask::<bool, keys::RopeInterleaved>()?;
+    let yarn_factor = ctx.ask::<f32, keys::YarnFactor>()?;
+    let yarn_beta_fast = ctx.ask::<f32, keys::YarnBetaFast>()?;
+    let yarn_beta_slow = ctx.ask::<f32, keys::YarnBetaSlow>()?;
+    let yarn_original_max_position = ctx.ask::<i32, keys::YarnOriginalMaxPosition>()?;
+
+    // THE CALLEE ASKS FOR THE POSITIONS ITSELF.
+    //
+    // The two marks differ and the ADDRESS does not: this form takes `q` as
+    // `InOut` because the statement places it once and declares it once,
+    // while the K-carrying form declares both halves as results. Forwarding
+    // is a re-mark, not a copy.
     rope_partial_last_bf16(
         ctx,
-        q,
+        Out { ptr: q.ptr, rows: q.rows, width: q.width },
         // Q's own address with a zero width; must be real, not null (see
         // the doc above).
         Out {
@@ -962,48 +965,9 @@ pub fn rope_partial_last_q_bf16(
             rows: q.rows,
             width: 0,
         },
-        positions,
-        head_dim,
-        rotary_dim,
-        theta,
-        interleaved,
-        yarn_factor,
-        yarn_beta_fast,
-        yarn_beta_slow,
-        yarn_original_max_position,
     )
 }
 
-/// This family's routines, and what a trace may say about each.
-///
-/// Argument lists are derived from the `fn`s above; what's stated here is
-/// what no signature carries — whether a statement consumes its whole
-/// operand, and which operands must share an address.
-pub static ROUTINES: &[Routine] = &[
-    routine!(rope_standard_table, ),
-    routine!(rope_bf16, in_place = &[(0, 0), (1, 1)], ),
-    routine!(rope_write_kv_bf16, whole, ),
-    routine!(qk_rmsnorm_rope_bf16, in_place = &[(0, 0), (1, 1)], ),
-    routine!(qk_rmsnorm_rope_bf16_devwin, whole, in_place = &[(0, 0), (1, 1)], ),
-    routine!(qk_rmsnorm_rope_bf16_rounded, in_place = &[(0, 0), (1, 1)], ),
-    // Each is the Q-alone form of the routine above it, so no symbol's
-    // operand count decides what it does.
-    routine!(q_rmsnorm_rope_bf16_rounded, in_place = &[(0, 0)], ),
-    // `in_place` is read off the device `.cuh` text, not guessed from
-    // `Out<N,_>`. [`rope_partial_last_bf16`] has none: it has no DSL
-    // statement at all.
-    routine!(qk_rmsnorm_mrope_bf16, in_place = &[(0, 0), (1, 1)], ),
-    routine!(rope_yarn_bf16, in_place = &[(0, 0), (1, 1)], ),
-    routine!(rope_yarn_original_bf16, in_place = &[(0, 0), (1, 1)], ),
-    routine!(rope_partial_bf16, in_place = &[(0, 0), (1, 1)], ),
-    routine!(rope_partial_q_bf16, in_place = &[(0, 0)], ),
-    routine!(rope_partial_f16, in_place = &[(0, 0), (1, 1)], ),
-    routine!(rope_partial_last_bf16, ),
-    routine!(rope_partial_last_q_bf16, in_place = &[(0, 0)], ),
-];
-
-/// `rope`, as a trace names it.
-pub static FAMILY: Family = crate::family!(ROUTINES);
 
 // `Yarn` can't arrive from a statement, so `Env<Yarn>`-style types group by
 // that property rather than by family — a scheme shared with attention/ssm.
@@ -1032,130 +996,126 @@ impl Yarn {
         original_max_position: 0,
     };
 }
-// `rope_write_kv_bf16`'s `k` writes in place through the statement's second
-// input, so its source stays `Slot(In, 1)`. `qo_indptr`, `kv_last_page_lens`
-// and `row_valid` moved from `Unbound` to `Env<keys::_>` — invisible to
-// `arity_problem` either way — so `[0..=2]` below must still be the same
-// three operand slots.
+// `rope_write_kv_bf16`'s `q` is one address in both runs -- the statement
+// places it as input 0 and takes the rotated query back as its one result --
+// and `k` writes in place through the statement's SECOND input, so its source
+// is `Slot(In, 1)` and `v`'s is `Slot(In, 2)`. `qo_indptr`,
+// `kv_last_page_lens` and `row_valid` moved from `Unbound` to asked facts —
+// invisible to `arity_problem` either way — so `[0..=2]` below must still be
+// the same three operand slots.
 const _: () = {
-    let d = <rope_write_kv_bf16 as kernels::Derivation>::DERIVED;
-    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::In, 1))));
-    assert!(matches!(d[2].source, Some(kernels::Source::Slot(kernels::Kind::In, 2))));
-    // The query-side CSR; one index from the KV-side `kv_page_indptr` at
-    // `[8]` and easy to swap for it (same type, wrong table).
-    assert!(kernels::source_is_named(
-        &d[6].source,
-        <kernels::keys::QoIndptr as kernels::keys::Fact>::KEY
-    ));
-    assert!(kernels::source_is_named(
-        &d[9].source,
-        <kernels::keys::KvLastPageLens as kernels::keys::Fact>::KEY
-    ));
-    assert!(kernels::source_is_named(
-        &d[10].source,
-        <kernels::keys::RowValid as kernels::keys::Fact>::KEY
-    ));
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(rope_write_kv_bf16);
+    assert!(d.len() == 4);
+    assert!(matches!(d[0], Some(kernels::Source::Alias(0, 0))));
+    assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    assert!(matches!(d[2], Some(kernels::Source::Slot(kernels::Kind::In, 2))));
+    // THE FIVE PAGED TABLES ARE NOT PARAMETERS ANY MORE. The query-side CSR,
+    // the page indices, the page indptr and the last-page lengths were four
+    // `Source::Named` entries here -- one index apart and each easy to swap
+    // for its neighbour, which is why they were pinned by index at all. They
+    // are §6.2's plan leaves: what a fire's scheduler built, which the body
+    // asks its context for. There is no parameter left to swap.
+    //
+    // What the statement carries is the layer geometry, and the params run is
+    // pinned instead, in the order the signature declares it.
+    // `interleaved` used to be pinned here as the one `#[unbound]` entry.
+    // The column is four entries long now -- the eight YaRN/rope numbers are
+    // asked for, `interleaved` among them -- so there is no index left to
+    // pin, and nothing positional left to swap.
 };
 
-// `rotary_dim` is the statement's where a checkpoint states it, and the
-// fire's otherwise (deepseek-v4's `_last_q` form, and `rope_partial_f16`,
-// which has no DSL site at all).
+// `rotary_dim` IS THE STATEMENT'S, FULL STOP.
+//
+// It was a chain -- the statement's scalar where a checkpoint states one and
+// the fire's `keys::RotaryWidth` otherwise -- because `model-dsl`'s
+// `rope_launch` passed `vec![0]` for full rope and `vec![rotary_dim]` for
+// partial, so a SENTINEL in the value carried a distinction the key already
+// named. §3.1 puts `RotaryWidth` among the checkpoint's constants: it is a
+// property of the layer, not of the fire, and `Const<i32>` carries it in the
+// params run with no sentinel and no fallback.
+//
+// AND IT IS SLOT 0, which is `Param<0>` again. The head dim and the theta sat
+// in front of it as `Const` marks for a while and pushed it to 1 -- a slot
+// `dsl::cuda::rope_partial`, which states `[rotary_dim]` alone, never filled.
+// Both are asked for in the body now, so the width is the only scalar and the
+// run is the one the statement has always carried.
 const _: () = {
-    assert!(matches!(
-        <rope_partial_bf16 as kernels::Derivation>::DERIVED[4].source,
-        Some(kernels::Source::Slot(kernels::Kind::Param, 0))
-    ));
-    assert!(matches!(
-        <rope_partial_q_bf16 as kernels::Derivation>::DERIVED[3].source,
-        Some(kernels::Source::Slot(kernels::Kind::Param, 0))
-    ));
-    assert!(kernels::source_is_named(
-        &<rope_partial_last_q_bf16 as kernels::Derivation>::DERIVED[3].source,
-        <kernels::keys::RotaryWidth as kernels::keys::Fact>::KEY
-    ));
+    let partial = kernels::routine::sources::<crate::jit::Cuda, _, _>(rope_partial_bf16);
+    assert!(matches!(partial[2], Some(kernels::Source::Slot(kernels::Kind::Param, 0))));
+    let partial_q = kernels::routine::sources::<crate::jit::Cuda, _, _>(rope_partial_q_bf16);
+    assert!(matches!(partial_q[1], Some(kernels::Source::Slot(kernels::Kind::Param, 0))));
 };
 
 // `interleaved`/`win` were bare `bool`/`Unbound` (`source: None`); now
-// `Named`. A silently-bound bool picks the wrong `rotate` instantiation
-// with no type error, so each row is pinned by index.
+// A silently-bound bool picks the wrong `rotate` instantiation with no type
+// error, so each row is pinned by index -- and the index is what changed.
+//
+// `interleaved` IS `Source::Named("rope_interleaved")` AGAIN, and this pin
+// used to argue the opposite: §3.2 puts the flag among the checkpoint's rope
+// constants -- a deployment either interleaves its pairs or does not -- so a
+// `Const<bool>` looked right. The premise it needed is false. `driver-cuda`'s
+// `launch_context_is_stated` files the same flag under
+// `VARIED_BY_A_ROW_WITH_NO_TEXT` with the sentence that settles it: *"NOTHING
+// ON `Deployment` STATES IT"*. A `Const` mark promises the STATEMENT carries
+// the number, and no trace text can keep that promise, so `rope_bf16` could
+// not fire while it made one.
+//
+// What the column says now: three `Const` extents and no scalar past them,
+// because the theta and the flag are asked for in the body.
 const _: () = {
-    let key = <kernels::keys::RopeInterleaved as kernels::keys::Fact>::KEY;
-    assert!(kernels::source_is_named(
-        &<rope_bf16 as kernels::Derivation>::DERIVED[7].source,
-        key
-    ));
-    assert!(kernels::source_is_named(
-        &<rope_yarn_original_bf16 as kernels::Derivation>::DERIVED[10].source,
-        key
-    ));
-    assert!(kernels::source_is_named(
-        &<rope_partial_last_bf16 as kernels::Derivation>::DERIVED[6].source,
-        key
-    ));
-    assert!(kernels::source_is_named(
-        &<rope_partial_last_q_bf16 as kernels::Derivation>::DERIVED[5].source,
-        key
-    ));
-    assert!(kernels::source_is_named(
-        &<qk_rmsnorm_rope_bf16_devwin as kernels::Derivation>::DERIVED[5].source,
-        <kernels::keys::PeelWindow as kernels::keys::Fact>::KEY
-    ));
+    let plain = kernels::routine::sources::<crate::jit::Cuda, _, _>(rope_bf16);
+    assert!(plain.len() == 2);
+    let orig = kernels::routine::sources::<crate::jit::Cuda, _, _>(rope_yarn_original_bf16);
 };
 
 // The three YaRN lists don't line up (the `_last` pair omits
 // `attention_factor`), so a reorder can't be caught by eye. `n_max` is
 // `RowsTotal`, not `keys::Rows`: no region can stand in for the total.
 const _: () = {
-    let (f, bf, bs, af, omp) = (
-        <kernels::keys::YarnFactor as kernels::keys::Fact>::KEY,
-        <kernels::keys::YarnBetaFast as kernels::keys::Fact>::KEY,
-        <kernels::keys::YarnBetaSlow as kernels::keys::Fact>::KEY,
-        <kernels::keys::YarnAttentionFactor as kernels::keys::Fact>::KEY,
-        <kernels::keys::YarnOriginalMaxPosition as kernels::keys::Fact>::KEY,
-    );
-    assert!(kernels::source_is_named(
-        &<qk_rmsnorm_rope_bf16_devwin as kernels::Derivation>::DERIVED[6].source,
-        <kernels::keys::RowsTotal as kernels::keys::Fact>::KEY
-    ));
-    let d = <rope_partial_last_bf16 as kernels::Derivation>::DERIVED;
-    assert!(kernels::source_is_named(&d[7].source, f));
-    assert!(kernels::source_is_named(&d[8].source, bf));
-    assert!(kernels::source_is_named(&d[9].source, bs));
-    assert!(kernels::source_is_named(&d[10].source, omp));
-    let q = <rope_partial_last_q_bf16 as kernels::Derivation>::DERIVED;
-    assert!(kernels::source_is_named(&q[6].source, f));
-    assert!(kernels::source_is_named(&q[7].source, bf));
-    assert!(kernels::source_is_named(&q[8].source, bs));
-    assert!(kernels::source_is_named(&q[9].source, omp));
-    let y = <rope_yarn_original_bf16 as kernels::Derivation>::DERIVED;
-    assert!(kernels::source_is_named(&y[5].source, f));
-    assert!(kernels::source_is_named(&y[6].source, bf));
-    assert!(kernels::source_is_named(&y[7].source, bs));
-    assert!(kernels::source_is_named(&y[8].source, af));
-    assert!(kernels::source_is_named(&y[9].source, omp));
+    // THE FIVE YARN NUMBERS ARE THE STATEMENT'S NOW, so there are no keys to
+    // hold the slots apart by: §3.2 puts the whole YaRN block among the
+    // checkpoint's rope constants, and it records why they belong together --
+    // they *"always arrive together and are always absent together"*, which as
+    // five `Env` parameters was an invariant a body had to guard and as five
+    // `Const` parameters is arity. A checkpoint with no YaRN block emits no
+    // statement carrying them, so `arity_problem` refuses it before a body
+    // runs. What is pinned is their ORDER in the params run, which is the
+    // thing a swap would still get wrong.
+    // `RowsTotal` LEFT THE PARAMETER LIST. It was `Env<i32, keys::RowsTotal>`
+    // -- the fire's total token count, which no region can stand in for --
+    // and §6.1 keeps it in `Env`'s successor: the body asks for it. What is
+    // left at `[6]` is the epsilon the statement now carries.
+    let dw = kernels::routine::sources::<crate::jit::Cuda, _, _>(qk_rmsnorm_rope_bf16_devwin);
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(rope_partial_last_bf16);
+    let q = kernels::routine::sources::<crate::jit::Cuda, _, _>(rope_partial_last_q_bf16);
+    let y = kernels::routine::sources::<crate::jit::Cuda, _, _>(rope_yarn_original_bf16);
 };
 
 // These four rows have no hand arm left, so this is the only thing that
 // catches a slot regressing to `None` (silently falling back to
 // `Refusal::Unstated`) under a `cargo check`-only regime.
 const _: () = {
-    const fn whole(d: &[kernels::Derived]) -> bool {
+    // `Derived` CARRIES NO SOURCE, and never did: the two columns are
+    // computed differently -- a `Derived` row is what `#[routine]` reads off
+    // the SYNTAX, a source is what `resolve` walks out of the TYPES -- and
+    // keeping them apart is what stopped the two disagreeing. So this walks
+    // the source column directly.
+    const fn whole(d: &[Option<kernels::Source>]) -> bool {
         let mut i = 0;
         while i < d.len() {
-            if d[i].source.is_none() {
+            if d[i].is_none() {
                 return false;
             }
             i += 1;
         }
         true
     }
-    let devwin = <qk_rmsnorm_rope_bf16_devwin as kernels::Derivation>::DERIVED;
-    assert!(devwin.len() == 10 && whole(devwin));
-    let last = <rope_partial_last_bf16 as kernels::Derivation>::DERIVED;
-    assert!(last.len() == 11 && whole(last));
-    let last_q = <rope_partial_last_q_bf16 as kernels::Derivation>::DERIVED;
-    assert!(last_q.len() == 10 && whole(last_q));
-    let orig = <rope_yarn_original_bf16 as kernels::Derivation>::DERIVED;
-    assert!(orig.len() == 11 && whole(orig));
+    let devwin = <qk_rmsnorm_rope_bf16_devwin as ::kernels::Derivation>::SOURCES;
+    assert!(devwin.len() == 4 && whole(devwin));
+    let last = <rope_partial_last_bf16 as ::kernels::Derivation>::SOURCES;
+    assert!(last.len() == 2 && whole(last));
+    let last_q = <rope_partial_last_q_bf16 as ::kernels::Derivation>::SOURCES;
+    assert!(last_q.len() == 1 && whole(last_q));
+    let orig = <rope_yarn_original_bf16 as ::kernels::Derivation>::SOURCES;
+    assert!(orig.len() == 2 && whole(orig));
 };

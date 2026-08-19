@@ -1003,7 +1003,7 @@ fn full_attn_body_cuda(
                 Some(out_shape),
                 |c| {
                     c.arm(dsl::Region::Fire(GuardPred::TokensLE(1)), || {
-                        cuda::attention_flashinfer_prefill(&q, &w.kv, window_left, facts.head_dim);
+                        cuda::attention_flashinfer_prefill(&q, &w.kv, window_left, facts.head_dim, 0.0, 0.0);
                     });
                 },
                 || {
@@ -1015,7 +1015,7 @@ fn full_attn_body_cuda(
         FireClass::Prefill => {
             // No dequant statement beside it: qwen3_5's full-attention
             // path gates on a native-bf16 cache.
-            cuda::attention_flashinfer_prefill(&q, &w.kv, window_left, facts.head_dim)
+            cuda::attention_flashinfer_prefill(&q, &w.kv, window_left, facts.head_dim, 0.0, 0.0)
         }
     };
     let attn = attn.expect("a plain attention statement produces its value");

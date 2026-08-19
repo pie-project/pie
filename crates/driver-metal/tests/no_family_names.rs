@@ -80,7 +80,6 @@ fn budget() -> BTreeMap<&'static str, usize> {
         // kernel would move the mention rather than remove it, since the
         // activation really is one deployment's.
         ("lowering/routine.rs", 1),
-        ("lowering/arm.rs", 1),
     ]
     .into_iter()
     .collect()

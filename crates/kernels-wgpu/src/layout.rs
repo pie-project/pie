@@ -7,8 +7,8 @@
 // struct to satisfy a count would undo the derivation -- the table row IS the
 // signature -- and `kernels-cuda-new` carries the same allow for the same
 // reason, at a ceiling of 24.
-#![allow(clippy::too_many_arguments)]
 
+use kernels_macros::routine;
 use kernels::KernelSig;
 
 /// EMPTY: this family's rows have been RETIRED.
@@ -62,8 +62,7 @@ pub static ENTRYPOINTS: &[&str] = &[
 // statements of one fact is what this refactor is against, so the row goes
 // when the family does, and not one commit later.
 
-use crate::routine::{keys, Ask, Bind, Block, Buf, BufMut, Ctx, Fire, I32s, InPacked, Param, ParamF32, Routine, U32s};
-use crate::routine::{InSlot, OutSlot, Weight};
+use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, InPacked, Out, Tensor, bf16, keys};
 use kernels::routine::Refusal;
 use kernels::shader::{elementwise, elementwise_rows};
 
@@ -86,32 +85,28 @@ use kernels::shader::{elementwise, elementwise_rows};
 /// [`Refusal::Empty`] when the block is empty. Stated rather than dispatched
 /// as a zero grid: `dispatch_workgroups(0, 1, 1)` is legal WebGPU that runs
 /// nothing and reports success.
+#[routine]
 pub fn ple_combine(
-    ctx: &Ctx,
-    proj: InSlot<0, Buf>,
-    token: InSlot<1, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    if *width <= 0 {
+    ctx: &Ctx<'_>,
+    proj: In<Tensor<bf16>>,
+    token: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let width = proj.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    if width <= 0 {
         return Err(Refusal::Empty { what: "width" });
     }
-    if *rows <= 0 {
+    if rows <= 0 {
         return Err(Refusal::Empty { what: "rows" });
     }
     // `LaunchRule::Elementwise`, whole: one lane per element of the
     // rectangle, on one axis. The division into workgroups is the driver's --
     // `@workgroup_size` is in the WGSL and this crate does not reflect it.
     let lanes = width.unsigned_abs() * rows.unsigned_abs();
-    ctx.dispatch(
-        Fire {
-            module: "layout/ple_combine.wgsl",
-            entrypoint: "ple_combine_bfloat16",
-            lanes: [lanes, 1, 1],
-        },
-        &[proj.v(), token.v(), out.v(), params.v()],
+    ctx.fire(
+        Fire::at("layout/ple_combine.wgsl", "ple_combine_bfloat16").apply([lanes, 1, 1]),
+        &[proj.arg(), token.arg(), out.arg(), params],
     )
 }
 
@@ -204,26 +199,22 @@ static EMBED_GATHER_SCALED_MB: [&str; 6] = [
 ///
 /// [`Refusal::Empty`] for an empty rectangle, [`Refusal::Narrow`] for an
 /// affine point the shader tree does not carry.
+#[routine]
 pub fn embed_gather_4bit(
-    ctx: &Ctx,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    id: Ask<keys::TokenIds, I32s>,
-    out: OutSlot<0, BufMut>,
-    hidden: Param<0, i32>,
-    group: Ask<keys::QuantGroup, i32>,
-    bits: Ask<keys::QuantBits, i32>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    group: Const<i32>,
+    bits: Const<i32>) -> Result<(), Refusal> {
+    let id = ctx.ask::<Tensor<i32>, keys::TokenIds>()?;
+    let hidden = out.width;
     let rows = 1;
-    let lanes = elementwise(*hidden, rows)?;
-    ctx.dispatch(
-        Fire {
-            module: "layout/embed_gather.wgsl",
-            entrypoint: EMBED_GATHER[affine_point(*group, *bits)?],
-            lanes,
-        },
-        &[w.v(), scales.v(), biases.v(), id.v(), out.v(), hidden.v()],
+    let lanes = elementwise(hidden, rows)?;
+    ctx.fire(
+        Fire::at("layout/embed_gather.wgsl", EMBED_GATHER[affine_point(*group, *bits)?]).apply(lanes),
+        &[w.arg(), scales.arg(), biases.arg(), id.arg(), out.arg(), hidden.arg()],
     )
 }
 
@@ -232,26 +223,22 @@ pub fn embed_gather_4bit(
 /// # Errors
 ///
 /// As [`embed_gather_4bit`].
+#[routine]
 pub fn embed_gather_mb_4bit(
-    ctx: &Ctx,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    id: Ask<keys::TokenIds, I32s>,
-    out: OutSlot<0, BufMut>,
-    hidden: Param<0, i32>,
-    rows: Ask<keys::Rows, i32>,
-    group: Ask<keys::QuantGroup, i32>,
-    bits: Ask<keys::QuantBits, i32>,
-) -> Result<(), Refusal> {
-    let lanes = elementwise_rows(*hidden, *rows)?;
-    ctx.dispatch(
-        Fire {
-            module: "layout/embed_gather.wgsl",
-            entrypoint: EMBED_GATHER_MB[affine_point(*group, *bits)?],
-            lanes,
-        },
-        &[w.v(), scales.v(), biases.v(), id.v(), out.v(), hidden.v()],
+    ctx: &Ctx<'_>,
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    group: Const<i32>,
+    bits: Const<i32>) -> Result<(), Refusal> {
+    let id = ctx.ask::<Tensor<i32>, keys::TokenIds>()?;
+    let hidden = out.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    let lanes = elementwise_rows(hidden, rows)?;
+    ctx.fire(
+        Fire::at("layout/embed_gather.wgsl", EMBED_GATHER_MB[affine_point(*group, *bits)?]).apply(lanes),
+        &[w.arg(), scales.arg(), biases.arg(), id.arg(), out.arg(), hidden.arg()],
     )
 }
 
@@ -261,33 +248,29 @@ pub fn embed_gather_mb_4bit(
 /// # Errors
 ///
 /// As [`embed_gather_4bit`].
+#[routine]
 pub fn embed_gather_scaled_4bit(
-    ctx: &Ctx,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    id: Ask<keys::TokenIds, I32s>,
-    out: OutSlot<0, BufMut>,
-    hidden: Param<0, i32>,
-    embed_scale: ParamF32<1>,
-    group: Ask<keys::QuantGroup, i32>,
-    bits: Ask<keys::QuantBits, i32>,
-) -> Result<(), Refusal> {
-    let lanes = elementwise(*hidden, 1)?;
-    ctx.dispatch(
-        Fire {
-            module: "layout/embed_gather.wgsl",
-            entrypoint: EMBED_GATHER_SCALED[affine_point(*group, *bits)?],
-            lanes,
-        },
+    ctx: &Ctx<'_>,
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    embed_scale: Const<f32>,
+    group: Const<i32>,
+    bits: Const<i32>) -> Result<(), Refusal> {
+    let id = ctx.ask::<Tensor<i32>, keys::TokenIds>()?;
+    let hidden = out.width;
+    let lanes = elementwise(hidden, 1)?;
+    ctx.fire(
+        Fire::at("layout/embed_gather.wgsl", EMBED_GATHER_SCALED[affine_point(*group, *bits)?]).apply(lanes),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            id.v(),
-            out.v(),
-            hidden.v(),
-            embed_scale.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            id.arg(),
+            out.arg(),
+            hidden.arg(),
+            embed_scale.arg(),
         ],
     )
 }
@@ -297,34 +280,30 @@ pub fn embed_gather_scaled_4bit(
 /// # Errors
 ///
 /// As [`embed_gather_4bit`].
+#[routine]
 pub fn embed_gather_scaled_mb_4bit(
-    ctx: &Ctx,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    id: Ask<keys::TokenIds, I32s>,
-    out: OutSlot<0, BufMut>,
-    hidden: Param<0, i32>,
-    embed_scale: ParamF32<1>,
-    rows: Ask<keys::Rows, i32>,
-    group: Ask<keys::QuantGroup, i32>,
-    bits: Ask<keys::QuantBits, i32>,
-) -> Result<(), Refusal> {
-    let lanes = elementwise_rows(*hidden, *rows)?;
-    ctx.dispatch(
-        Fire {
-            module: "layout/embed_gather.wgsl",
-            entrypoint: EMBED_GATHER_SCALED_MB[affine_point(*group, *bits)?],
-            lanes,
-        },
+    ctx: &Ctx<'_>,
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    embed_scale: Const<f32>,
+    group: Const<i32>,
+    bits: Const<i32>) -> Result<(), Refusal> {
+    let id = ctx.ask::<Tensor<i32>, keys::TokenIds>()?;
+    let hidden = out.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    let lanes = elementwise_rows(hidden, rows)?;
+    ctx.fire(
+        Fire::at("layout/embed_gather.wgsl", EMBED_GATHER_SCALED_MB[affine_point(*group, *bits)?]).apply(lanes),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            id.v(),
-            out.v(),
-            hidden.v(),
-            embed_scale.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            id.arg(),
+            out.arg(),
+            hidden.arg(),
+            embed_scale.arg(),
         ],
     )
 }
@@ -341,101 +320,156 @@ pub fn embed_gather_scaled_mb_4bit(
 /// # Errors
 ///
 /// [`Refusal::Empty`] for an empty rectangle.
+#[routine]
 pub fn row_gather(
-    ctx: &Ctx,
-    input: InSlot<0, Buf>,
-    out: OutSlot<0, BufMut>,
-    rows: Ask<keys::SamplingIndices, U32s>,
-    params: Block<Buf>,
-    count: Ask<keys::RequestCount, InPacked>,
-    width: Ask<keys::Width, i32>,
-    row_count: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    let lanes = elementwise_rows(*width, *row_count)?;
-    ctx.dispatch(
-        Fire {
-            module: "layout/row_gather.wgsl",
-            entrypoint: "row_gather_bfloat16",
-            lanes,
-        },
-        &[input.v(), out.v(), rows.v(), params.v(), count.v()],
+    ctx: &Ctx<'_>,
+    input: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let rows = ctx.ask::<Tensor<u32>, keys::SamplingIndices>()?;
+    let params = ctx.params()?;
+    let count = ctx.ask::<InPacked, keys::RequestCount>()?;
+    let width = input.width;
+    let row_count = ctx.ask::<i32, keys::Rows>()?;
+    let lanes = elementwise_rows(width, row_count)?;
+    ctx.fire(
+        Fire::at("layout/row_gather.wgsl", "row_gather_bfloat16").apply(lanes),
+        &[input.arg(), out.arg(), rows.arg(), params, count.arg()],
     )
 }
 
-/// This family's routines.
-pub static ROUTINES: &[Routine] = &[
-    crate::routine!(ple_combine),
-    crate::routine!(embed_gather_4bit),
-    crate::routine!(embed_gather_mb_4bit),
-    crate::routine!(embed_gather_scaled_4bit),
-    crate::routine!(embed_gather_scaled_mb_4bit),
-    crate::routine!(row_gather),
-];
 
 #[cfg(test)]
 mod ported {
     use super::*;
     use crate::routine::ArgValue;
-    use core::cell::RefCell;
+    use core::cell::{Cell, RefCell};
     use kernels::Ty;
-    use kernels::routine::Provenance;
 
     /// One dispatch, as the recorder kept it.
     type Kept = (String, String, [u32; 3], Vec<ArgValue>);
 
-    /// An `Encode` that records instead of dispatching.
-    #[derive(Default)]
+    /// An `Encode` that records instead of dispatching, and answers a body's
+    /// asks the same way `tests/routines.rs`'s `Seen` does: generically, by
+    /// [`kernels::Ty`] alone, with two exceptions.
+    ///
+    /// `rows` is held in a `Cell` rather than answered by a fixed default,
+    /// because `an_empty_block_is_refused_rather_than_launched_as_nothing`
+    /// needs a ZERO there while every other test in this module needs a real
+    /// row count -- and `rows` is asked for from inside the body now, not a
+    /// positional argument a caller can vary directly. `ctx.params()` answers
+    /// a fixed handle rather than a fresh one, so
+    /// `the_body_asks_for_the_elementwise_grid`'s exact dispatched list stays
+    /// legible as four small, distinct numbers.
     struct Recorder {
         seen: RefCell<Vec<Kept>>,
+        /// What `ctx.ask::<i32, keys::Rows>()` answers.
+        rows: Cell<i32>,
+        /// A source of buffer handles for any OTHER asked fact, clear of the
+        /// small handles this file's tests hand its routines directly.
+        asked: Cell<u32>,
+    }
+
+    impl Default for Recorder {
+        fn default() -> Self {
+            Self {
+                seen: RefCell::default(),
+                rows: Cell::new(7),
+                asked: Cell::new(0),
+            }
+        }
+    }
+
+    impl Recorder {
+        /// A fresh handle, clear of every test's own small numbers.
+        fn asked_buffer(&self) -> u32 {
+            let at = 900 + self.asked.get();
+            self.asked.set(self.asked.get() + 1);
+            at
+        }
     }
 
     impl crate::routine::Encode for Recorder {
-        fn dispatch(&self, fire: Fire<'_>, args: &[ArgValue]) -> Result<(), Refusal> {
+        fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
             self.seen.borrow_mut().push((
-                fire.module.to_owned(),
+                fire.file.to_owned(),
                 fire.entrypoint.to_owned(),
                 fire.lanes,
                 args.to_vec(),
             ));
             Ok(())
         }
+
+        fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
+            // The statement's own scalars, read by index where the params run
+            // is the shader's struct -- see `Asks::param`.
+            if let kernels::Source::Slot(kernels::Kind::Param, n) = source {
+                let _ = n;
+                return Ok(ArgValue::I32(4096));
+            }
+            use kernels::{Source as Src, Ty as T};
+            if source == Src::Named("rows") {
+                return Ok(ArgValue::I32(self.rows.get()));
+            }
+            // FIXED, not the counter below: kept small and constant so the
+            // one test that checks a whole dispatched list can still read it
+            // at a glance.
+            if source == Src::Slot(kernels::Kind::Params, 0) {
+                return Ok(ArgValue::Buffer(3));
+            }
+            Ok(match ty {
+                T::Buf
+                | T::BufMut
+                | T::Bf16s
+                | T::Bf16sMut
+                | T::F16s
+                | T::F16sMut
+                | T::I32s
+                | T::I32sMut
+                | T::U32s
+                | T::U32sMut
+                | T::U8s
+                | T::U8sMut
+                | T::F32s
+                | T::F32sMut => ArgValue::Buffer(self.asked_buffer()),
+                T::I32 => ArgValue::I32(8),
+                T::U32 => ArgValue::U32(8),
+                T::F32 => ArgValue::F32(1.0),
+                T::Usize => ArgValue::Usize(4096),
+                T::InPacked => ArgValue::U32(8),
+                _ => {
+                    return Err(Refusal::Unstated {
+                        what: "a fact this recorder does not answer",
+                    });
+                }
+            })
+        }
     }
 
     /// The row this routine replaces is derived from its signature.
     ///
-    /// Six arguments where the `kernel!` row states four operands, and the
-    /// difference is the whole point: `width` and `rows` were never operands.
-    /// `LaunchRule::Elementwise` told the driver to read them off the
-    /// rectangle, so they were a fact about the launch that the row pointed at
-    /// and did not carry. The signature carries them, and their `Env`
-    /// provenance says who supplies them.
-    ///
-    /// THREE now, not two. The per-layer embedding table joined them: it is
-    /// the FIRE's and no statement places it as an operand, and marking it
-    /// `Env` is what stops `model-ir::kernels::arity_problem` counting it
-    /// against the operands a statement placed. Only the first THREE arguments
-    /// are the row's operands after that -- the count below is what says so,
-    /// and it moved because the meaning did.
+    /// THREE operands, not the six a `kernel!` row stated. The row this
+    /// replaced was positional over everything a launch read, `Env` included,
+    /// so it carried `width` and `rows` beside the four buffers. Neither
+    /// scalar is a parameter of any kind any more: `width` comes off
+    /// `proj.width`, the mark's own rectangle, and `rows` is asked for from
+    /// inside the body (`ctx.ask::<i32, keys::Rows>()` -- see
+    /// `Recorder::resolve`, which is what a test answers that ask with now
+    /// that `Env` provenance cannot). What is left on the signature, and so
+    /// in `row.args`, is exactly the three buffers the shader binds: two
+    /// reads and a write, which is `Ty::Bf16sMut` and not a third `Bf16s` --
+    /// [`kernels::shader::Element::TY_MUT`] is what a mark's write/read split
+    /// still says once a buffer's own type no longer implies which.
     #[test]
     fn the_routines_row_is_its_signature_and_names_the_two_that_were_not_operands() {
-        let row = ROUTINES
+        let row = crate::ROUTINES
             .iter()
             .find(|r| r.name == "ple_combine")
             .expect("the family declares it");
 
-        assert_eq!(row.args.len(), 6, "four operands and two environment facts");
         assert_eq!(
-            row.args.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
-            [Ty::Buf, Ty::Buf, Ty::BufMut, Ty::Buf, Ty::I32, Ty::I32],
-            "and the first four are the row's operands, in the row's order"
-        );
-        assert_eq!(
-            row.args
-                .iter()
-                .filter(|(_, p)| *p == Provenance::Env)
-                .count(),
-            3,
-            "the three the statement does not supply"
+            row.args.iter().copied().collect::<Vec<_>>(),
+            [Ty::Bf16s, Ty::Bf16s, Ty::Bf16sMut],
+            "the row's operands, in the row's order: two reads then a write"
         );
     }
 
@@ -446,27 +480,54 @@ mod ported {
     /// driver-side half of this check, which compares against `geometry::groups`
     /// itself rather than against a transcription of it, is
     /// `the_first_ported_routine_asks_for_the_grid_its_row_asked_for`.
+    ///
+    /// # No file, any more
+    ///
+    /// This used to compare `fire.module` against a literal `.wgsl` path.
+    /// `Fire` carries no `module` field today -- the shared type's field is
+    /// `file`, and it is EMPTY for every wgpu fire, because this backend (like
+    /// vulkan) reaches a point through the module registry
+    /// [`crate::source::entrypoint_source`] builds from the entrypoint STRING
+    /// alone, never by a path a body states. Checking `file` against a
+    /// literal would now be checking that it is always the empty string,
+    /// which says nothing about `ple_combine` in particular; asking the
+    /// registry the same question a driver would is the check that replaces
+    /// it.
     #[test]
     fn the_body_asks_for_the_elementwise_grid() {
         let to = Recorder::default();
         ple_combine(
             &to,
-            InSlot { ptr: Buf(0) },
-            InSlot { ptr: Buf(1) },
-            OutSlot { ptr: BufMut(2) },
-            Block::new(Buf(3)),
-            Ask::new(64),
-            Ask::new(7),
+            In { ptr: Tensor::<bf16>::new(0), rows: 0, width: 64 },
+            In { ptr: Tensor::<bf16>::new(1), rows: 0, width: 64 },
+            Out { ptr: Tensor::<bf16>::new(2), rows: 0, width: 64 },
         )
-            .expect("it dispatches");
+        .expect("it dispatches");
 
         let seen = to.seen.borrow();
-        let (module, entrypoint, lanes, args) = seen.first().expect("one dispatch");
-        assert_eq!(module, "layout/ple_combine.wgsl");
+        let (file, entrypoint, lanes, args) = seen.first().expect("one dispatch");
+        assert_eq!(
+            file, "layout/ple_combine.wgsl",
+            "the body states the file its point lives in"
+        );
         assert_eq!(
             entrypoint, "ple_combine_bfloat16",
             "the axis point, pasted by the body"
         );
+        // THE PAIR HAS TO AGREE, which is the whole reason the file is stated.
+        // `entrypoint_source` used to recover the file by re-parsing all 38
+        // embedded sources and taking the first entrypoint that matched; a
+        // body that names both makes the scan a lookup, and makes a mismatch
+        // between the two a test failure rather than a silently different
+        // module.
+        assert!(
+            crate::source::source(file)
+                .expect("the file the body named is in the tree")
+                .contains(entrypoint),
+            "`{entrypoint}` is declared by `{file}`"
+        );
+        crate::source::entrypoint_source(entrypoint, crate::Capability::Baseline)
+            .unwrap_or_else(|e| panic!("`{entrypoint}` names no module the tree carries: {e}"));
         assert_eq!(*lanes, [64 * 7, 1, 1], "width * rows on one axis");
         assert_eq!(
             args,
@@ -476,8 +537,10 @@ mod ported {
                 ArgValue::Buffer(2),
                 ArgValue::Buffer(3)
             ],
-            "the four operands, and NOT the two environment facts -- those \
-             sized the grid and the kernel never reads them"
+            "the three operands and the params slot -- and NOT `width` or \
+             `rows`, which are no longer arguments at all: `width` comes off \
+             `proj`'s own rectangle and `rows` is asked for from inside the \
+             body (`Recorder::resolve` answers it, here as 7)"
         );
     }
 
@@ -554,20 +617,43 @@ mod ported {
     }
 
     /// This family declares six routines and each is named by its `fn`.
+    ///
+    /// FILTERED BY NAMESPACE, and compared UNORDERED, neither of which this
+    /// test needed before every other family crossed. `ROUTINES` is a
+    /// crate-wide `linkme` distributed slice -- one list every family's
+    /// `#[routine]` pushes into, from every object file the linker sees --
+    /// and this test predates the other nine families joining it: at the
+    /// time it was written this family's six were the only entries there, in
+    /// the order the one file declared them, so reading `ROUTINES` whole and
+    /// comparing it to a literal Vec answered both "are these the six" and
+    /// "in this order" at once. Neither survives a hundred routines from ten
+    /// families sharing the slice: the check now narrows to the routines
+    /// whose `namespace` (`module_path!()`'s own segment, see
+    /// [`kernels::routine::namespace`]) is `"layout"` -- and sorts before
+    /// comparing, because a distributed slice's order across TRANSLATION
+    /// UNITS is the linker's to choose, not this crate's, and it is in fact
+    /// no longer declaration order (`row_gather` links first despite being
+    /// declared last). The claim was always "the family declares these six",
+    /// never "in this order", so sorting both sides loses nothing the test
+    /// meant to check.
     #[test]
     fn the_family_declares_the_six_it_has_ported() {
-        let names: Vec<&str> = ROUTINES.iter().map(|r| r.name).collect();
-        assert_eq!(
-            names,
-            [
-                "ple_combine",
-                "embed_gather_4bit",
-                "embed_gather_mb_4bit",
-                "embed_gather_scaled_4bit",
-                "embed_gather_scaled_mb_4bit",
-                "row_gather",
-            ]
-        );
+        let mut names: Vec<&str> = crate::ROUTINES
+            .iter()
+            .filter(|r| r.namespace == "layout")
+            .map(|r| r.name)
+            .collect();
+        names.sort_unstable();
+        let mut want = [
+            "ple_combine",
+            "embed_gather_4bit",
+            "embed_gather_mb_4bit",
+            "embed_gather_scaled_4bit",
+            "embed_gather_scaled_mb_4bit",
+            "row_gather",
+        ];
+        want.sort_unstable();
+        assert_eq!(names, want);
     }
 
     /// Every body in this family asks for the grid its row's rule names.
@@ -588,57 +674,61 @@ mod ported {
         const R: i32 = 7;
 
         let to = Recorder::default();
-        let (b, m) = (Buf(0), BufMut(1));
+        to.rows.set(R);
+        let (b, m) = (Tensor::<bf16>::new(0), Tensor::<bf16>::new(1));
         ple_combine(
             &to,
-            InSlot { ptr: b },
-            InSlot { ptr: b },
-            OutSlot { ptr: m },
-            Block::new(b),
-            Ask::new(W),
-            Ask::new(R),
+            In { ptr: b, rows: 0, width: W },
+            In { ptr: b, rows: 0, width: W },
+            Out { ptr: m, rows: 0, width: W },
         )
         .expect("dispatches");
         embed_gather_4bit(
             &to,
-            Weight { ptr: b },
-            Weight { ptr: b },
-            Weight { ptr: b },
-            Ask::new(I32s(2)),
-            OutSlot { ptr: m }, Param::new(W), Ask::new(64), Ask::new(4)).expect("dispatches");
+            Const::new(Tensor::<u32>::new(0)),
+            Const::new(b),
+            Const::new(b),
+            Out { ptr: m, rows: 0, width: W },
+            Const::new(64),
+            Const::new(4),
+        )
+        .expect("dispatches");
         embed_gather_mb_4bit(
             &to,
-            Weight { ptr: b },
-            Weight { ptr: b },
-            Weight { ptr: b },
-            Ask::new(I32s(2)),
-            OutSlot { ptr: m }, Param::new(W), Ask::new(R), Ask::new(64), Ask::new(4))
-            .expect("dispatches");
+            Const::new(Tensor::<u32>::new(0)),
+            Const::new(b),
+            Const::new(b),
+            Out { ptr: m, rows: 0, width: W },
+            Const::new(64),
+            Const::new(4),
+        )
+        .expect("dispatches");
         embed_gather_scaled_4bit(
             &to,
-            Weight { ptr: b },
-            Weight { ptr: b },
-            Weight { ptr: b },
-            Ask::new(I32s(2)),
-            OutSlot { ptr: m }, Param::new(W), ParamF32::new(1.0), Ask::new(64), Ask::new(4))
-            .expect("dispatches");
+            Const::new(Tensor::<u32>::new(0)),
+            Const::new(b),
+            Const::new(b),
+            Out { ptr: m, rows: 0, width: W },
+            Const::new(1.0),
+            Const::new(64),
+            Const::new(4),
+        )
+        .expect("dispatches");
         embed_gather_scaled_mb_4bit(
             &to,
-            Weight { ptr: b },
-            Weight { ptr: b },
-            Weight { ptr: b },
-            Ask::new(I32s(2)),
-            OutSlot { ptr: m }, Param::new(W), ParamF32::new(1.0), Ask::new(R), Ask::new(64), Ask::new(4))
-            .expect("dispatches");
+            Const::new(Tensor::<u32>::new(0)),
+            Const::new(b),
+            Const::new(b),
+            Out { ptr: m, rows: 0, width: W },
+            Const::new(1.0),
+            Const::new(64),
+            Const::new(4),
+        )
+        .expect("dispatches");
         row_gather(
             &to,
-            InSlot { ptr: b },
-            OutSlot { ptr: m },
-            Ask::new(U32s(3)),
-            Block::new(b),
-            Ask::new(InPacked(1)),
-            Ask::new(W),
-            Ask::new(R),
+            In { ptr: b, rows: 0, width: W },
+            Out { ptr: m, rows: 0, width: W },
         )
         .expect("dispatches");
 
@@ -692,25 +782,44 @@ mod ported {
     }
 
     /// An empty rectangle is refused, not dispatched as a zero grid.
+    ///
+    /// Two refusals, and each needs its own construction now rather than one
+    /// loop over a shared pair of positional arguments. `width` used to be a
+    /// positional `Env` scalar a caller could vary directly; it comes off
+    /// `proj.width`, the mark's own rectangle, so an empty width is an empty
+    /// `In`. `rows` used to sit right beside it; it is asked for from inside
+    /// the body now, so an empty rows is answered by `Recorder::rows`
+    /// instead of passed.
     #[test]
     fn an_empty_block_is_refused_rather_than_launched_as_nothing() {
         let to = Recorder::default();
-        for (w, r, what) in [(0, 7, "width"), (64, 0, "rows")] {
-            assert_eq!(
-                ple_combine(
-                    &to,
-                    InSlot { ptr: Buf(0) },
-                    InSlot { ptr: Buf(1) },
-                    OutSlot { ptr: BufMut(2) },
-                    Block::new(Buf(3)),
-                    Ask::new(w),
-                    Ask::new(r),
-                ),
-                Err(Refusal::Empty { what }),
-                "`dispatch_workgroups(0, 1, 1)` is legal WebGPU that runs \
-                 nothing and reports success"
-            );
-        }
+        assert_eq!(
+            ple_combine(
+                &to,
+                In { ptr: Tensor::<bf16>::new(0), rows: 0, width: 0 },
+                In { ptr: Tensor::<bf16>::new(1), rows: 0, width: 0 },
+                Out { ptr: Tensor::<bf16>::new(2), rows: 0, width: 0 },
+            ),
+            Err(Refusal::Empty { what: "width" }),
+            "`dispatch_workgroups(0, 1, 1)` is legal WebGPU that runs \
+             nothing and reports success"
+        );
+
+        // `width` is real here (64) so only `rows`, which `Recorder` now
+        // answers as zero, can be the empty one.
+        to.rows.set(0);
+        assert_eq!(
+            ple_combine(
+                &to,
+                In { ptr: Tensor::<bf16>::new(0), rows: 0, width: 64 },
+                In { ptr: Tensor::<bf16>::new(1), rows: 0, width: 64 },
+                Out { ptr: Tensor::<bf16>::new(2), rows: 0, width: 64 },
+            ),
+            Err(Refusal::Empty { what: "rows" }),
+            "the same refusal, for the fact that is asked for rather than \
+             read off a mark"
+        );
+
         assert!(to.seen.borrow().is_empty(), "and nothing was dispatched");
     }
 }

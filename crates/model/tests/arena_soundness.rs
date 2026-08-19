@@ -29,7 +29,6 @@
 //! intended sharing passes while an accidental one still fails.
 
 use model_compiler::lower::{Buffers, Row, value_bytes};
-use model_ir::kernels::Backend;
 use model_ir::trace::{FireClass, ForwardPlan, OpKind, ValueId};
 
 /// A decode-shaped fire: every row samples, so the epilogue's row space
@@ -84,7 +83,7 @@ fn aliases(plan: &ForwardPlan) -> Alias {
                 }
             }
             OpKind::Launch { kernel, .. } => {
-                for &(o, i) in model_ir::kernels::in_place_pairs(plan, kernel) {
+                for (o, i) in model_ir::kernels::in_place_pairs(plan, kernel) {
                     if let (Some(&src), Some(&out)) =
                         (op.inputs.get(i as usize), op.outputs.get(o as usize))
                     {

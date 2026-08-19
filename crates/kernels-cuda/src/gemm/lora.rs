@@ -31,23 +31,23 @@
 //! [`Staged`] is the seam, and it is a borrow rather than a copy because the
 //! two `Vec`s are the fire's and outlive every launch made from them.
 
+use kernels_macros::routine;
 use core::ffi::c_void;
 
 use crate::jit::Ctx;
 use crate::jit::abi::bf16;
 use kernels::Refusal;
-use kernels::routine::Unbound;
-// `act_x_wt_bf16`'s weight position wears `Weight<0, _>` so that `#[routine]`
-// derives `Source::Named(<keys::NamedWeight as keys::Fact>::KEY)` for it rather
-// than `In(1)`. LoRA is the one caller for whom that derived claim is false —
+// `act_x_wt_bf16`'s weight position wears `Const<Tensor<c_void>>` so that
+// `#[routine]` derives `Source::Named(<keys::NamedWeight as keys::Fact>::KEY)`
+// for it rather than `In(1)`. LoRA is the one caller for whom that derived claim is false —
 // these are adapter matrices off a `LoraLane` — and it costs nothing, because
 // this file never fires through the binder: it is a host program calling a Rust
 // function, and the column it would have used is one it never reads. The three
 // calls below likewise build an `In` and an `Out` by hand for extents that live
 // inside the regions; the SHAPE they carry is true, and every number passed is
 // the lane view's own.
-use kernels::{In, Out, Weight};
-// `#[kernels_macros::routine]` on the correction below is fully qualified,
+use kernels::routine::{Const, In, InOut, Out};
+// `#[routine]` on the correction below is fully qualified,
 // because the family spells it that way in all four files that hold a launcher.
 
 // ── the sink's vocabulary ────────────────────────────────────────────────
@@ -245,9 +245,9 @@ pub fn bf16_row(base: *const c_void, row: u32, width: i32) -> *const c_void {
 /// scratch's, and every pointer [`Staged`] carries must be one the staging
 /// laid down for THIS fire — a slab from a previous fire is a set of
 /// addresses that have since been reused.
-#[kernels_macros::routine]
+#[routine(untraced)]
 pub fn lora_qkv_correction(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     staged: Staged<'_>,
     layer: i32,
     qkv_in: *const c_void,
@@ -256,8 +256,7 @@ pub fn lora_qkv_correction(
     hk: i32,
     q_out: *mut c_void,
     v_out: *mut c_void,
-    xa_scratch: *mut c_void,
-) -> Result<(), Refusal> {
+    xa_scratch: *mut c_void) -> Result<(), Refusal> {
     let layer_u = usize::try_from(layer).unwrap_or(0);
 
     for lane in staged.lanes {
@@ -294,19 +293,19 @@ pub fn lora_qkv_correction(
         // `xa_scratch` -- so the shape a `In`/`Out` carries here is the
         // shape the buffer actually has. Nothing is being invented to fill
         // a field.
-        super::act_x_wt_bf16(
+        super::act_x_wt_bf16_beta(
             ctx,
             In { ptr: x, rows: t, width: h },
-            Weight { ptr: a_l },
+            Const { v: a_l },
             Out { ptr: xa_scratch, rows: t, width: r },
             0.0,
         )?;
         let d_out = i32::try_from(v.d_out).unwrap_or(0);
         if v.sites_bits & LORA_SITE_Q != 0 {
-            super::act_x_wt_bf16(
+            super::act_x_wt_bf16_beta(
                 ctx,
                 In { ptr: xa_scratch.cast_const(), rows: t, width: r },
-                Weight { ptr: b_l },
+                Const { v: b_l },
                 Out {
                     ptr: bf16_row(q_out.cast_const(), v.token_start, hq).cast_mut(),
                     rows: t,
@@ -316,10 +315,10 @@ pub fn lora_qkv_correction(
             )?;
         }
         if v.sites_bits & LORA_SITE_V != 0 {
-            super::act_x_wt_bf16(
+            super::act_x_wt_bf16_beta(
                 ctx,
                 In { ptr: xa_scratch.cast_const(), rows: t, width: r },
-                Weight { ptr: b_l },
+                Const { v: b_l },
                 Out {
                     ptr: bf16_row(v_out.cast_const(), v.token_start, hk).cast_mut(),
                     rows: t,
@@ -359,28 +358,22 @@ pub fn lora_qkv_correction(
             // only `g.m` is host, which is the split cuBLAS asks for.
             super::grouped_act_x_wt_bf16(
                 ctx,
-                Unbound { ptr: x_ptrs },
-                Unbound { ptr: a_ptrs },
-                Unbound { ptr: xa_ptrs.cast::<*mut c_void>().cast_mut() },
-                Unbound { ptr: g.m.as_ptr() },
+                x_ptrs,
+                a_ptrs,
+                xa_ptrs.cast::<*mut c_void>().cast_mut(),
+                g.m.as_ptr(),
                 i32::try_from(n).unwrap_or(0),
-                g.rank,
-                g.d_in,
                 0.0,
             )?;
             if g.nq > 0 {
                 let base = x_ptrs.add(3 * n);
                 super::grouped_act_x_wt_bf16(
                     ctx,
-                    Unbound { ptr: base },
-                    Unbound { ptr: base.add(g.nq as usize) },
-                    Unbound {
-                        ptr: base.add(2 * g.nq as usize).cast::<*mut c_void>().cast_mut(),
-                    },
-                    Unbound { ptr: g.mq.as_ptr() },
+                    base,
+                    base.add(g.nq as usize),
+                    base.add(2 * g.nq as usize).cast::<*mut c_void>().cast_mut(),
+                    g.mq.as_ptr(),
                     g.nq,
-                    g.d_out,
-                    g.rank,
                     1.0,
                 )?;
             }
@@ -388,15 +381,11 @@ pub fn lora_qkv_correction(
                 let base = x_ptrs.add(3 * n + 3 * g.nq as usize);
                 super::grouped_act_x_wt_bf16(
                     ctx,
-                    Unbound { ptr: base },
-                    Unbound { ptr: base.add(g.nv as usize) },
-                    Unbound {
-                        ptr: base.add(2 * g.nv as usize).cast::<*mut c_void>().cast_mut(),
-                    },
-                    Unbound { ptr: g.mv.as_ptr() },
+                    base,
+                    base.add(g.nv as usize),
+                    base.add(2 * g.nv as usize).cast::<*mut c_void>().cast_mut(),
+                    g.mv.as_ptr(),
                     g.nv,
-                    g.d_out,
-                    g.rank,
                     1.0,
                 )?;
             }
@@ -418,10 +407,10 @@ pub fn lora_qkv_correction(
                 // FROM THE SAME POINTER, which is why this is a conversion
                 // and not an invention. `scale_rows` deleted its `rows` and
                 // `width` parameters when its `OutSlot<0, _>` became
-                // `Out<0, _>`; the two scalars that used to follow this
+                // `InOut<Tensor<_>>`; the two scalars that used to follow this
                 // argument were `t` and `d_out`, and they are the two the
                 // region carries now.
-                Out {
+                InOut {
                     ptr: bf16_row(q_out.cast_const(), v.token_start, hq)
                         .cast_mut()
                         .cast::<crate::jit::abi::bf16>(),
@@ -444,7 +433,7 @@ pub fn lora_qkv_correction(
             crate::quant::scale_rows::<bf16>(
                 ctx,
                 // As the Q site above, and the same pair of numbers.
-                Out {
+                InOut {
                     ptr: bf16_row(v_out.cast_const(), v.token_start, hk)
                         .cast_mut()
                         .cast::<crate::jit::abi::bf16>(),

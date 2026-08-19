@@ -2,7 +2,7 @@
 //! kept as a driver op since the six pointer arrays must outlive normal trace
 //! liveness across both grouped GEMMs, kept alive via [`MoePtrArena`].
 
-use kernels::routine::{Env};
+
 use std::ffi::c_void;
 
 use crate::fire::sideband_arena::DeviceMemory;
@@ -292,23 +292,23 @@ pub unsafe fn build<M: DeviceMemory>(
     let fired = kernels_cuda::moe::build_moe_ptrs_aligned_bf16(
         &ctx,
         kernels::routine::In { ptr: expert_ids.cast::<i32>(), rows: 0, width: 0 },
-        kernels::routine::Bank { ptr: banks.gate_up.cast::<bf16>() },
-        kernels::routine::Bank { ptr: banks.down.cast::<bf16>() },
+        kernels::routine::Const { v: banks.gate_up.cast::<bf16>() },
+        kernels::routine::Const { v: banks.down.cast::<bf16>() },
         kernels::routine::In { ptr: aligned_in.cast::<bf16>(), rows: 0, width: 0 },
         kernels::routine::Out { ptr: stage.gate_up.cast::<bf16>(), rows: 0, width: 0 },
         kernels::routine::Out { ptr: stage.act.cast::<bf16>(), rows: 0, width: bounds.moe_intermediate },
         kernels::routine::Out { ptr: stage.out.cast::<bf16>(), rows: 0, width: bounds.hidden },
-        Env(arrays.a_gu.cast::<*const bf16>()),
-        Env(arrays.b_gu.cast::<*const bf16>()),
-        Env(arrays.c_gu.cast::<*mut bf16>()),
-        Env(arrays.a_dn.cast::<*const bf16>()),
-        Env(arrays.b_dn.cast::<*const bf16>()),
-        Env(arrays.c_dn.cast::<*mut bf16>()),
+        arrays.a_gu.cast::<*const bf16>(),
+        arrays.b_gu.cast::<*const bf16>(),
+        arrays.c_gu.cast::<*mut bf16>(),
+        arrays.a_dn.cast::<*const bf16>(),
+        arrays.b_dn.cast::<*const bf16>(),
+        arrays.c_dn.cast::<*mut bf16>(),
         bounds.max_blocks,
         bounds.block_size,
         bounds.routed_blocks,
-        kernels::routine::Unbound { ptr: banks.shared_gate_up.cast::<bf16>() },
-        kernels::routine::Unbound { ptr: banks.shared_down.cast::<bf16>() },
+        banks.shared_gate_up.cast::<bf16>(),
+        banks.shared_down.cast::<bf16>(),
     );
     match fired {
         Ok(()) => Built::Ready(arrays),

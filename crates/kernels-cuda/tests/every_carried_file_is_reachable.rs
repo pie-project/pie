@@ -187,8 +187,17 @@ fn root_sites() -> Vec<(String, String)> {
         let text = std::fs::read_to_string(&file).expect("a readable source file");
         let show = under_src.to_string_lossy().into_owned();
         // A launch names its file too, and after the inlining that is where
-        // most of them are: `ctx.launch("mlp/swiglu.cuh", "::pie..", ..)`.
-        for form in ["Root::new(", "Root::variant(", "source::carried(", "ctx.launch("] {
+        // most of them are. `ctx.launch("mlp/swiglu.cuh", "::pie..", ..)` was
+        // the spelling; `Fire::at("mlp/swiglu.cuh", "::pie..")` is the one a
+        // body uses now, and a scanner that knows only the first found
+        // fifteen roots where the crate has a hundred and thirty.
+        for form in [
+            "Root::new(",
+            "Root::variant(",
+            "source::carried(",
+            "ctx.launch(",
+            "Fire::at(",
+        ] {
             for (at, _) in text.match_indices(form) {
                 let line = text[..at].bytes().filter(|&b| b == b'\n').count() + 1;
                 let Some((args, _)) = group(&text[at + form.len() - 1..], '(', ')') else {

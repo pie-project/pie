@@ -4171,6 +4171,7 @@
       "kind": {
         "CausalConv1d": {
           "weight": "layer.0.conv",
+          "bias": null,
           "layer": 0,
           "kernel": 4
         }
@@ -4392,6 +4393,7 @@
       "kind": {
         "CausalConv1d": {
           "weight": "layer.1.conv",
+          "bias": null,
           "layer": 1,
           "kernel": 4
         }
@@ -4613,6 +4615,7 @@
       "kind": {
         "CausalConv1d": {
           "weight": "layer.2.conv",
+          "bias": null,
           "layer": 2,
           "kernel": 4
         }
@@ -5073,6 +5076,7 @@
       "kind": {
         "CausalConv1d": {
           "weight": "layer.4.conv",
+          "bias": null,
           "layer": 4,
           "kernel": 4
         }
@@ -5294,6 +5298,7 @@
       "kind": {
         "CausalConv1d": {
           "weight": "layer.5.conv",
+          "bias": null,
           "layer": 5,
           "kernel": 4
         }
@@ -5515,6 +5520,7 @@
       "kind": {
         "CausalConv1d": {
           "weight": "layer.6.conv",
+          "bias": null,
           "layer": 6,
           "kernel": 4
         }
@@ -5975,6 +5981,7 @@
       "kind": {
         "CausalConv1d": {
           "weight": "layer.8.conv",
+          "bias": null,
           "layer": 8,
           "kernel": 4
         }
@@ -6196,6 +6203,7 @@
       "kind": {
         "CausalConv1d": {
           "weight": "layer.9.conv",
+          "bias": null,
           "layer": 9,
           "kernel": 4
         }
@@ -6417,6 +6425,7 @@
       "kind": {
         "CausalConv1d": {
           "weight": "layer.10.conv",
+          "bias": null,
           "layer": 10,
           "kernel": 4
         }
@@ -6877,6 +6886,7 @@
       "kind": {
         "CausalConv1d": {
           "weight": "layer.12.conv",
+          "bias": null,
           "layer": 12,
           "kernel": 4
         }
@@ -7098,6 +7108,7 @@
       "kind": {
         "CausalConv1d": {
           "weight": "layer.13.conv",
+          "bias": null,
           "layer": 13,
           "kernel": 4
         }
@@ -7319,6 +7330,7 @@
       "kind": {
         "CausalConv1d": {
           "weight": "layer.14.conv",
+          "bias": null,
           "layer": 14,
           "kernel": 4
         }
@@ -7779,6 +7791,7 @@
       "kind": {
         "CausalConv1d": {
           "weight": "layer.16.conv",
+          "bias": null,
           "layer": 16,
           "kernel": 4
         }
@@ -8000,6 +8013,7 @@
       "kind": {
         "CausalConv1d": {
           "weight": "layer.17.conv",
+          "bias": null,
           "layer": 17,
           "kernel": 4
         }
@@ -8221,6 +8235,7 @@
       "kind": {
         "CausalConv1d": {
           "weight": "layer.18.conv",
+          "bias": null,
           "layer": 18,
           "kernel": 4
         }
@@ -8681,6 +8696,7 @@
       "kind": {
         "CausalConv1d": {
           "weight": "layer.20.conv",
+          "bias": null,
           "layer": 20,
           "kernel": 4
         }
@@ -8902,6 +8918,7 @@
       "kind": {
         "CausalConv1d": {
           "weight": "layer.21.conv",
+          "bias": null,
           "layer": 21,
           "kernel": 4
         }
@@ -9123,6 +9140,7 @@
       "kind": {
         "CausalConv1d": {
           "weight": "layer.22.conv",
+          "bias": null,
           "layer": 22,
           "kernel": 4
         }

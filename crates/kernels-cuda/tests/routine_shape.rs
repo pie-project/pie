@@ -7,11 +7,10 @@
 //! that is half the point of the split.
 
 use kernels::Ty;
-use kernels::routine::{Env, Provenance, Refusal};
+use kernels::{Asks, Bind, Const, Fire, InOut, Out, Refusal};
+use kernels::keys;
 use kernels_cuda::jit::{ArgValue, Ctx, Launch, Root, Routine};
-use kernels_cuda::routine;
-use kernels_cuda::jit::abi::bf16;
-
+use kernels_cuda::jit::abi::{Tensor, bf16};
 
 /// `rope.cu:82` — `constexpr int BLOCK = 256;`
 const ROTATE_BLOCK: u32 = 256;
@@ -23,95 +22,105 @@ const ROTATE_BLOCK: u32 = 256;
 /// check a device pointer either way, so the obligation is stated once at
 /// `call()`, where the pointers come from, instead of restated by all 200 of
 /// these.
-#[kernels_macros::routine]
+///
+/// `positions` used to be a parameter, `Env<*const i32>`; asking is what an
+/// `Env` with no key beside it became, because there was no key beside it --
+/// `keys::Positions` was always the fact, just not yet spelled. `table`
+/// carries its own row count now, so `num_tokens` is gone with it: a region
+/// mark's `.rows` is the count a bare pointer needed a second parameter to
+/// say. This is `rope::rope_standard_table`'s own real signature, copied
+/// rather than paralleled, so this file stays what it claims to be.
+///
+/// # Safety
+///
+/// `positions` addresses `table.rows` live `i32`s and `table` itself
+/// `table.rows * head_dim` live floats; `stream` must be live across the
+/// launch.
 fn rope_standard_table(
-    ctx: &Ctx,
-    positions: Env<*const i32>,
-    table: *mut f32,
-    num_tokens: i32,
-    head_dim: i32,
-    theta: f32,
+    ctx: &Ctx<'_>,
+    table: Out<Tensor<f32>>,
+    head_dim: Const<i32>,
+    theta: Const<f32>,
 ) -> Result<(), Refusal> {
-    if num_tokens <= 0 {
-        return Err(Refusal::Empty { what: "num_tokens" });
-    }
-    if head_dim / 2 <= 0 {
+    let positions = ctx.ask::<*const i32, keys::Positions>()?;
+    if *head_dim / 2 <= 0 {
         return Err(Refusal::Empty { what: "head_dim / 2" });
     }
-    // SAFETY: `call()`'s contract -- every pointer bound into this list
-    // addresses live device memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "rope/rope.cuh",
-            "::pie::rope::standard_table<::pie::i32>",
-            Launch::per_row(num_tokens.unsigned_abs(), ROTATE_BLOCK),
-            &[
-                ArgValue::Ptr((*positions).cast_mut().cast()),
-                ArgValue::Ptr(table.cast()),
-                ArgValue::I32(head_dim),
-                ArgValue::F32(theta),
-            ],
-        )
-    }
+    ctx.fire(
+        Fire::at("rope/rope.cuh", "::pie::rope::standard_table<::pie::i32>")
+            .apply(Launch::per_row(table.rows.unsigned_abs(), ROTATE_BLOCK)),
+        &[positions.arg(), table.arg(), head_dim.arg(), theta.arg()],
+    )
 }
 
 /// A second routine, at a different arity and with a stated fact.
-#[kernels_macros::routine]
+///
+/// `in_place = &[(0, 0), (1, 1)]` was the row's own statement of this; it is
+/// `q` and `k` wearing `InOut` now, one address in an operand slot and a
+/// result slot each, and [`kernels::routine::aliased`] reads the same pairs
+/// back off `SOURCES` rather than off a second, hand-kept list.
 fn rope_bf16_stub(
-    ctx: &Ctx,
-    q: *mut bf16,
-    k: *mut bf16,
-    positions: Env<*const i32>,
-    num_tokens: i32,
+    ctx: &Ctx<'_>,
+    q: InOut<Tensor<bf16>>,
+    k: InOut<Tensor<bf16>>,
+    num_tokens: Const<i32>,
 ) -> Result<(), Refusal> {
-    let _ = (q, k, positions);
-    if num_tokens <= 0 {
+    let positions = ctx.ask::<*const i32, keys::Positions>()?;
+    if *num_tokens <= 0 {
         return Err(Refusal::Empty { what: "num_tokens" });
     }
-    // SAFETY: as above.
-    unsafe {
-        ctx.launch(
-            "rope/rope.cuh",
-            "::pie::rope::rotate<false, false>",
-            Launch::per_row(num_tokens.unsigned_abs(), ROTATE_BLOCK),
-            &[],
-        )
-    }
+    ctx.fire(
+        Fire::at("rope/rope.cuh", "::pie::rope::rotate<false, false>")
+            .apply(Launch::per_row(num_tokens.unsigned_abs(), ROTATE_BLOCK)),
+        &[q.arg(), k.arg(), positions.arg(), num_tokens.arg()],
+    )
 }
 
-static ROUTINES: &[Routine] =
-    &[routine!(rope_standard_table), routine!(rope_bf16_stub, in_place = &[(0, 0), (1, 1)])];
+/// Both routines' rows, built by hand rather than read off a distributed
+/// slice.
+///
+/// `#[routine]` auto-registers into `crate::ROUTINES` — the crate that
+/// compiled it, which for a kernel in `kernels-cuda/src` is the plane's own
+/// `CUDA_ROUTINES`. An integration test is a SEPARATE crate with no such
+/// slice of its own to register into, and no reason to invent one: two
+/// routines a reader can see whole are the point of this file, and
+/// `kernels::routine!` still builds a row from a plain `fn` without it.
+static ROUTINES: &[Routine] = &[
+    kernels::routine!(kernels_cuda::jit::Cuda, rope_standard_table),
+    kernels::routine!(kernels_cuda::jit::Cuda, rope_bf16_stub),
+];
 
 fn find(name: &str) -> &'static Routine {
     ROUTINES.iter().find(|r| r.name == name).expect("a routine this test declares")
 }
 
-/// The row is the signature — including which arguments the environment
-/// supplies, which is stated on the argument and nowhere else.
+/// The row is the signature: the arguments a launch binds positionally, in
+/// order.
+///
+/// `positions` is not among them for either routine — `keys::Positions` is a
+/// fact only the fire answers, asked inside the body — so `Provenance`,
+/// which used to mark an argument `Env` beside its `Ty`, has nothing left to
+/// distinguish: every surviving argument is the statement's own, whether it
+/// reads, writes, or is a `Const` the checkpoint fixed. `args` is a plain
+/// `Ty` list now for exactly that reason.
 #[test]
 fn the_row_derives_from_the_signature() {
-    assert_eq!(
-        find("rope_standard_table").args,
-        &[
-            (Ty::I32s, Provenance::Env),
-            (Ty::F32sMut, Provenance::Trace),
-            (Ty::I32, Provenance::Trace),
-            (Ty::I32, Provenance::Trace),
-            (Ty::F32, Provenance::Trace),
-        ]
-    );
-    assert_eq!(find("rope_bf16_stub").args.len(), 4);
+    assert_eq!(find("rope_standard_table").args, &[Ty::F32sMut, Ty::I32, Ty::F32]);
+    assert_eq!(find("rope_bf16_stub").args.len(), 3);
 }
 
 /// The C++ spelling comes across too, per position, from the same impl the
 /// marshalling tag does.
+///
+/// `rope_standard_table`'s row is three long, not five: `positions` carried
+/// no spelling of its own to check, and does not need one, since asking it
+/// is a call and not an entry in this list.
 #[test]
 fn the_spelling_comes_with_it() {
     let spelling = find("rope_standard_table").spelling;
-    assert_eq!(spelling[0], "const ::std::int32_t*");
-    assert_eq!(spelling[1], "float*");
-    assert_eq!(spelling[2], "int");
-    assert_eq!(spelling[4], "float");
+    assert_eq!(spelling[0], "float*");
+    assert_eq!(spelling[1], "int");
+    assert_eq!(spelling[2], "float");
     assert_eq!(
         find("rope_bf16_stub").spelling[0],
         "::pie::bf16*",
@@ -122,50 +131,70 @@ fn the_spelling_comes_with_it() {
 /// A stated fact is stated; an unstated one is false rather than absent.
 #[test]
 fn the_stated_facts_are_the_ones_stated() {
-    assert_eq!(find("rope_bf16_stub").in_place, &[(0, 0), (1, 1)]);
+    assert_eq!(find("rope_bf16_stub").in_place(), &[(0, 0), (1, 1)]);
     assert!(!find("rope_bf16_stub").whole);
-    assert!(find("rope_standard_table").in_place.is_empty());
+    assert!(find("rope_standard_table").in_place().is_empty());
+}
+
+/// Answers every fact with a null pointer.
+///
+/// Enough to clear `ctx.ask::<_, keys::Positions>()`'s `Refusal::Unstated`
+/// without ever dereferencing what it hands back -- nothing below reaches a
+/// device, so nothing needs the address to be real, only present.
+struct AnyFact;
+
+impl kernels::Answers<kernels_cuda::jit::Cuda> for AnyFact {
+    fn resolve(&self, _ty: Ty, _source: kernels::Source) -> Result<ArgValue, Refusal> {
+        Ok(ArgValue::Ptr(std::ptr::null_mut()))
+    }
 }
 
 /// A body's own refusal survives the erasure, and reaches no device on the
 /// way — this test runs on a machine with no GPU.
+///
+/// `head_dim / 2 <= 0` is the one refusal left in this body: `num_tokens`'s
+/// used to be a second, but the row count merged into `table.rows` once
+/// `table` became a region mark, and a zero grid is [`Ctx::fire`]'s own
+/// refusal now, common to every routine rather than typed by hand in each.
+/// Reaching this check at all needs `positions` answered first, which is
+/// what [`AnyFact`] is for.
 #[test]
 fn a_refusal_needs_no_device() {
-    // SAFETY: the stream is never used -- every case here refuses first.
-    let ctx = unsafe { Ctx::on(std::ptr::null_mut()) };
+    let env = AnyFact;
+    // SAFETY: the stream is never used -- the refusal below fires first.
+    let ctx = unsafe { Ctx::on(std::ptr::null_mut()) }.with_env(&env);
     let args = [
-        ArgValue::Ptr(std::ptr::null_mut()),
-        ArgValue::Ptr(std::ptr::null_mut()),
+        ArgValue::Region { ptr: std::ptr::null_mut(), rows: 4, width: 8 },
         ArgValue::I32(0),
-        ArgValue::I32(128),
         ArgValue::F32(1e4),
     ];
     assert_eq!(
         (find("rope_standard_table").body)(&ctx, &args),
-        Err(Refusal::Empty { what: "num_tokens" })
+        Err(Refusal::Empty { what: "head_dim / 2" })
     );
 }
 
 /// The erased path checks the list against the signature, because the values
 /// arrive dynamically and the signature is the only statement of the shape.
+///
+/// Arity and kind are both checked before the body runs, so neither case
+/// here needs an environment that can answer `positions`.
 #[test]
 fn a_list_that_does_not_fit_is_refused() {
-    // SAFETY: as above.
+    // SAFETY: as above -- every case here refuses before a device is named.
     let ctx = unsafe { Ctx::on(std::ptr::null_mut()) };
     assert_eq!(
         (find("rope_standard_table").body)(&ctx, &[ArgValue::I32(1)]),
-        Err(Refusal::Arity { want: 5, got: 1 })
+        Err(Refusal::Arity { want: 3, got: 1 })
     );
     let swapped = [
-        ArgValue::Ptr(std::ptr::null_mut()),
-        ArgValue::Ptr(std::ptr::null_mut()),
+        ArgValue::Region { ptr: std::ptr::null_mut(), rows: 4, width: 8 },
         ArgValue::F32(1.0),
-        ArgValue::I32(128),
         ArgValue::F32(1e4),
     ];
     assert_eq!(
         (find("rope_standard_table").body)(&ctx, &swapped),
-        Err(Refusal::Kind { at: 2, want: Ty::I32 })
+        Err(Refusal::Kind { at: 1, want: Ty::I32 })
     );
 }
 

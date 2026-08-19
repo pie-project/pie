@@ -203,10 +203,10 @@
       "shape": [
         "Tokens",
         {
-          "Const": 16
+          "Const": 1
         },
         {
-          "Const": 64
+          "Const": 128
         }
       ],
       "dtype": "BF16"
@@ -545,10 +545,10 @@
       "shape": [
         "Tokens",
         {
-          "Const": 16
+          "Const": 1
         },
         {
-          "Const": 64
+          "Const": 128
         }
       ],
       "dtype": "BF16"
@@ -920,10 +920,10 @@
       "shape": [
         "Tokens",
         {
-          "Const": 16
+          "Const": 1
         },
         {
-          "Const": 64
+          "Const": 128
         }
       ],
       "dtype": "BF16"
@@ -1295,10 +1295,10 @@
       "shape": [
         "Tokens",
         {
-          "Const": 16
+          "Const": 1
         },
         {
-          "Const": 64
+          "Const": 128
         }
       ],
       "dtype": "BF16"
@@ -1670,10 +1670,10 @@
       "shape": [
         "Tokens",
         {
-          "Const": 16
+          "Const": 1
         },
         {
-          "Const": 64
+          "Const": 128
         }
       ],
       "dtype": "BF16"
@@ -2045,10 +2045,10 @@
       "shape": [
         "Tokens",
         {
-          "Const": 16
+          "Const": 1
         },
         {
-          "Const": 64
+          "Const": 128
         }
       ],
       "dtype": "BF16"
@@ -2331,10 +2331,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::hc_rmsnorm_to_f32",
-          "weights": [
-            "layer.0.attn_norm"
-          ]
+          "kernel": "norm::hc_rmsnorm_to_f32"
         }
       },
       "inputs": [
@@ -2412,10 +2409,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::per_head_rmsnorm_bf16",
-          "weights": [
-            ""
-          ]
+          "kernel": "norm::per_head_rmsnorm_bf16"
         }
       },
       "inputs": [
@@ -2461,7 +2455,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::rope_partial_last_bf16"
+          "kernel": "rope::rope_partial_last_q_bf16"
         }
       },
       "inputs": [
@@ -2475,7 +2469,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::rope_partial_last_bf16"
+          "kernel": "rope::rope_partial_last_q_bf16"
         }
       },
       "inputs": [
@@ -2519,7 +2513,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 0
@@ -2560,7 +2554,8 @@
         }
       },
       "inputs": [
-        2
+        2,
+        3
       ],
       "outputs": [
         20
@@ -2570,7 +2565,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::rope_partial_last_bf16"
+          "kernel": "rope::rope_partial_last_q_bf16"
         }
       },
       "inputs": [
@@ -2593,7 +2588,8 @@
       },
       "inputs": [
         21,
-        2
+        2,
+        3
       ],
       "outputs": [],
       "layer": 0
@@ -2716,10 +2712,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::hc_rmsnorm_to_f32",
-          "weights": [
-            "layer.0.mlp_norm"
-          ]
+          "kernel": "norm::hc_rmsnorm_to_f32"
         }
       },
       "inputs": [
@@ -2784,7 +2777,8 @@
         }
       },
       "inputs": [
-        34
+        34,
+        35
       ],
       "outputs": [
         36
@@ -2826,10 +2820,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::hc_rmsnorm_to_f32",
-          "weights": [
-            "layer.1.attn_norm"
-          ]
+          "kernel": "norm::hc_rmsnorm_to_f32"
         }
       },
       "inputs": [
@@ -2907,10 +2898,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::per_head_rmsnorm_bf16",
-          "weights": [
-            ""
-          ]
+          "kernel": "norm::per_head_rmsnorm_bf16"
         }
       },
       "inputs": [
@@ -2956,7 +2944,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::rope_partial_last_bf16"
+          "kernel": "rope::rope_partial_last_q_bf16"
         }
       },
       "inputs": [
@@ -2970,7 +2958,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::rope_partial_last_bf16"
+          "kernel": "rope::rope_partial_last_q_bf16"
         }
       },
       "inputs": [
@@ -3014,7 +3002,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 1
@@ -3055,7 +3043,8 @@
         }
       },
       "inputs": [
-        2
+        2,
+        3
       ],
       "outputs": [
         54
@@ -3065,7 +3054,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::rope_partial_last_bf16"
+          "kernel": "rope::rope_partial_last_q_bf16"
         }
       },
       "inputs": [
@@ -3088,7 +3077,8 @@
       },
       "inputs": [
         55,
-        2
+        2,
+        3
       ],
       "outputs": [],
       "layer": 1
@@ -3211,10 +3201,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::hc_rmsnorm_to_f32",
-          "weights": [
-            "layer.1.mlp_norm"
-          ]
+          "kernel": "norm::hc_rmsnorm_to_f32"
         }
       },
       "inputs": [
@@ -3360,10 +3347,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::hc_rmsnorm_to_f32",
-          "weights": [
-            "layer.2.attn_norm"
-          ]
+          "kernel": "norm::hc_rmsnorm_to_f32"
         }
       },
       "inputs": [
@@ -3441,10 +3425,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::per_head_rmsnorm_bf16",
-          "weights": [
-            ""
-          ]
+          "kernel": "norm::per_head_rmsnorm_bf16"
         }
       },
       "inputs": [
@@ -3490,7 +3471,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::rope_partial_last_bf16"
+          "kernel": "rope::rope_partial_last_q_bf16"
         }
       },
       "inputs": [
@@ -3504,7 +3485,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::rope_partial_last_bf16"
+          "kernel": "rope::rope_partial_last_q_bf16"
         }
       },
       "inputs": [
@@ -3548,7 +3529,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 2
@@ -3589,7 +3570,8 @@
         }
       },
       "inputs": [
-        2
+        2,
+        3
       ],
       "outputs": [
         91
@@ -3599,7 +3581,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::rope_partial_last_bf16"
+          "kernel": "rope::rope_partial_last_q_bf16"
         }
       },
       "inputs": [
@@ -3622,7 +3604,8 @@
       },
       "inputs": [
         92,
-        2
+        2,
+        3
       ],
       "outputs": [],
       "layer": 2
@@ -3745,10 +3728,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::hc_rmsnorm_to_f32",
-          "weights": [
-            "layer.2.mlp_norm"
-          ]
+          "kernel": "norm::hc_rmsnorm_to_f32"
         }
       },
       "inputs": [
@@ -3894,10 +3874,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::hc_rmsnorm_to_f32",
-          "weights": [
-            "layer.3.attn_norm"
-          ]
+          "kernel": "norm::hc_rmsnorm_to_f32"
         }
       },
       "inputs": [
@@ -3975,10 +3952,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::per_head_rmsnorm_bf16",
-          "weights": [
-            ""
-          ]
+          "kernel": "norm::per_head_rmsnorm_bf16"
         }
       },
       "inputs": [
@@ -4024,7 +3998,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::rope_partial_last_bf16"
+          "kernel": "rope::rope_partial_last_q_bf16"
         }
       },
       "inputs": [
@@ -4038,7 +4012,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::rope_partial_last_bf16"
+          "kernel": "rope::rope_partial_last_q_bf16"
         }
       },
       "inputs": [
@@ -4082,7 +4056,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 3
@@ -4123,7 +4097,8 @@
         }
       },
       "inputs": [
-        2
+        2,
+        3
       ],
       "outputs": [
         128
@@ -4133,7 +4108,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::rope_partial_last_bf16"
+          "kernel": "rope::rope_partial_last_q_bf16"
         }
       },
       "inputs": [
@@ -4156,7 +4131,8 @@
       },
       "inputs": [
         129,
-        2
+        2,
+        3
       ],
       "outputs": [],
       "layer": 3
@@ -4279,10 +4255,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::hc_rmsnorm_to_f32",
-          "weights": [
-            "layer.3.mlp_norm"
-          ]
+          "kernel": "norm::hc_rmsnorm_to_f32"
         }
       },
       "inputs": [
@@ -4428,10 +4401,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::hc_rmsnorm_to_f32",
-          "weights": [
-            "layer.4.attn_norm"
-          ]
+          "kernel": "norm::hc_rmsnorm_to_f32"
         }
       },
       "inputs": [
@@ -4509,10 +4479,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::per_head_rmsnorm_bf16",
-          "weights": [
-            ""
-          ]
+          "kernel": "norm::per_head_rmsnorm_bf16"
         }
       },
       "inputs": [
@@ -4558,7 +4525,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::rope_partial_last_bf16"
+          "kernel": "rope::rope_partial_last_q_bf16"
         }
       },
       "inputs": [
@@ -4572,7 +4539,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::rope_partial_last_bf16"
+          "kernel": "rope::rope_partial_last_q_bf16"
         }
       },
       "inputs": [
@@ -4616,7 +4583,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 4
@@ -4657,7 +4624,8 @@
         }
       },
       "inputs": [
-        2
+        2,
+        3
       ],
       "outputs": [
         165
@@ -4667,7 +4635,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::rope_partial_last_bf16"
+          "kernel": "rope::rope_partial_last_q_bf16"
         }
       },
       "inputs": [
@@ -4690,7 +4658,8 @@
       },
       "inputs": [
         166,
-        2
+        2,
+        3
       ],
       "outputs": [],
       "layer": 4
@@ -4813,10 +4782,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::hc_rmsnorm_to_f32",
-          "weights": [
-            "layer.4.mlp_norm"
-          ]
+          "kernel": "norm::hc_rmsnorm_to_f32"
         }
       },
       "inputs": [
@@ -4962,10 +4928,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::hc_rmsnorm_to_f32",
-          "weights": [
-            "layer.5.attn_norm"
-          ]
+          "kernel": "norm::hc_rmsnorm_to_f32"
         }
       },
       "inputs": [
@@ -5043,10 +5006,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::per_head_rmsnorm_bf16",
-          "weights": [
-            ""
-          ]
+          "kernel": "norm::per_head_rmsnorm_bf16"
         }
       },
       "inputs": [
@@ -5092,7 +5052,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::rope_partial_last_bf16"
+          "kernel": "rope::rope_partial_last_q_bf16"
         }
       },
       "inputs": [
@@ -5106,7 +5066,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::rope_partial_last_bf16"
+          "kernel": "rope::rope_partial_last_q_bf16"
         }
       },
       "inputs": [
@@ -5150,7 +5110,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 5
@@ -5191,7 +5151,8 @@
         }
       },
       "inputs": [
-        2
+        2,
+        3
       ],
       "outputs": [
         202
@@ -5201,7 +5162,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::rope_partial_last_bf16"
+          "kernel": "rope::rope_partial_last_q_bf16"
         }
       },
       "inputs": [
@@ -5224,7 +5185,8 @@
       },
       "inputs": [
         203,
-        2
+        2,
+        3
       ],
       "outputs": [],
       "layer": 5
@@ -5347,10 +5309,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::hc_rmsnorm_to_f32",
-          "weights": [
-            "layer.5.mlp_norm"
-          ]
+          "kernel": "norm::hc_rmsnorm_to_f32"
         }
       },
       "inputs": [

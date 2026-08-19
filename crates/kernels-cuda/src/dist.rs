@@ -25,10 +25,12 @@
 //! peer memory and takes a PLANE, which no statement carries and no `Source`
 //! names.
 
+use kernels_macros::routine;
 use crate::jit::Ctx;
 use crate::jit::abi::bf16;
+use crate::jit::abi::Tensor;
 use kernels::Refusal;
-use kernels::routine::{In, Out};
+use kernels::routine::{In, InOut, Out};
 
 /// What every body here says, in one place so three refusals cannot drift.
 fn no_nccl(what: &'static str) -> Refusal {
@@ -48,8 +50,14 @@ fn no_nccl(what: &'static str) -> Refusal {
 ///
 /// # Errors
 /// Always. See the module header.
-#[kernels_macros::routine]
-pub fn all_reduce_bf16(ctx: &Ctx, buf: Out<0, bf16>) -> Result<(), Refusal> {
+// NOT `untraced`: every parameter here IS a mark, so the column derives —
+// and the column is where the ALIAS lives now. The row stated
+// `in_place = &[(0, 0)]` beside it before the marks could, and a
+// `untraced` row has an empty source column by design, so declaring it
+// that way dropped the pair silently. An in-place all-reduce whose result the
+// allocator gives a fresh buffer sums into bytes nobody wrote.
+#[routine(whole)]
+pub fn all_reduce_bf16(ctx: &Ctx<'_>, buf: InOut<Tensor<bf16>>) -> Result<(), Refusal> {
     let r = buf.all("out_width(0)")?;
     all_reduce_in_place(ctx, r.ptr.cast(), i64::from(r.elements()))
 }
@@ -62,10 +70,9 @@ pub fn all_reduce_bf16(ctx: &Ctx, buf: Out<0, bf16>) -> Result<(), Refusal> {
 /// # Errors
 /// Always. See the module header.
 pub fn all_reduce_in_place(
-    _ctx: &Ctx,
+    _ctx: &Ctx<'_>,
     _buf: *mut core::ffi::c_void,
-    _elems: i64,
-) -> Result<(), Refusal> {
+    _elems: i64) -> Result<(), Refusal> {
     Err(no_nccl("all_reduce"))
 }
 
@@ -74,12 +81,11 @@ pub fn all_reduce_in_place(
 ///
 /// # Errors
 /// Always. See the module header.
-#[kernels_macros::routine]
+#[routine(whole)]
 pub fn all_reduce_bf16_out(
-    ctx: &Ctx,
-    src: In<0, bf16>,
-    dst: Out<0, bf16>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    src: In<Tensor<bf16>>,
+    dst: Out<Tensor<bf16>>) -> Result<(), Refusal> {
     let d = dst.all("out_width(0)")?;
     all_reduce_out_of_place(ctx, src.ptr.cast(), d.ptr.cast(), i64::from(d.elements()))
 }
@@ -93,11 +99,10 @@ pub fn all_reduce_bf16_out(
 /// # Errors
 /// Always. See the module header.
 pub fn all_reduce_out_of_place(
-    _ctx: &Ctx,
+    _ctx: &Ctx<'_>,
     _src: *const core::ffi::c_void,
     _dst: *mut core::ffi::c_void,
-    _elems: i64,
-) -> Result<(), Refusal> {
+    _elems: i64) -> Result<(), Refusal> {
     Err(no_nccl("all_reduce_out"))
 }
 
@@ -105,8 +110,8 @@ pub fn all_reduce_out_of_place(
 ///
 /// # Errors
 /// Always. See the module header.
-#[kernels_macros::routine]
-pub fn all_gather_bf16(ctx: &Ctx, src: In<0, bf16>, dst: Out<0, bf16>) -> Result<(), Refusal> {
+#[routine(whole)]
+pub fn all_gather_bf16(ctx: &Ctx<'_>, src: In<Tensor<bf16>>, dst: Out<Tensor<bf16>>) -> Result<(), Refusal> {
     // The INPUT's width, not the output's: the count is per rank, and the
     // destination is `world_size` times as wide. Reading the output here would
     // have every rank write past its own band.
@@ -119,26 +124,10 @@ pub fn all_gather_bf16(ctx: &Ctx, src: In<0, bf16>, dst: Out<0, bf16>) -> Result
 /// # Errors
 /// Always. See the module header.
 pub fn all_gather(
-    _ctx: &Ctx,
+    _ctx: &Ctx<'_>,
     _src: *const core::ffi::c_void,
     _dst: *mut core::ffi::c_void,
-    _elems_per_rank: i64,
-) -> Result<(), Refusal> {
+    _elems_per_rank: i64) -> Result<(), Refusal> {
     Err(no_nccl("all_gather"))
 }
 
-/// The three symbols, declared so a TP model text resolves rather than being
-/// refused for the wrong reason.
-///
-/// `routine!` and not `driver_bound!`: NCCL resolves its own communicator
-/// inside the collective, so every argument these take IS one a statement
-/// supplies, and a `driver_bound!` row's empty column is what kept three
-/// hand-written arms alive in `driver-cuda` for arithmetic a launcher owns.
-pub static ROUTINES: &[crate::jit::Routine] = &[
-    crate::routine!(all_reduce_bf16, whole, in_place = &[(0, 0)]),
-    crate::routine!(all_reduce_bf16_out, whole),
-    crate::routine!(all_gather_bf16, whole),
-];
-
-/// `dist`, as a trace names it.
-pub static FAMILY: crate::jit::Family = crate::family!(ROUTINES);

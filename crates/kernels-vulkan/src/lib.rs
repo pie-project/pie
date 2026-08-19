@@ -42,7 +42,7 @@
 //!
 //! So the row is read in TWO passes, and the rule is mechanical:
 //!
-//! * every operand whose [`kernels::Ty`] is a BUFFER kind (`Buf`, `BufMut`,
+//! * every operand whose [`kernels::Ty`] is a BUFFER kind (`Buf`, `Buf`,
 //!   `I32s`, `U32s`, `U8s`, `F32s`, and the rest of the pointer family) takes
 //!   the next `layout(std430, binding = N)` slot, in row order, from 0;
 //! * every operand whose kind is a SCALAR (`I32`, `U32`, `F32`, `Usize`,
@@ -189,63 +189,23 @@ pub mod rope;
 pub mod sample;
 pub mod ssm;
 
-/// The family tables, concatenated. THERE ARE NO ROWS.
+/// This crate's backend, under the one name `#[routine]` knows it by.
 ///
-/// This was `&CONCAT`: a `FAMILIES` list, a `total()`/`N` const fold, an
-/// `EMPTY` filler row, a field-by-field `copy_sig` because `KernelSig` is not
-/// `Copy` in a const context, and a const-evaluated loop that laid ten family
-/// tables end to end so the whole hundred stayed a `&'static` the compiler
-/// could read at load with no allocation. About a hundred and forty lines, and
-/// the last family crossing made all of it a machine for concatenating
-/// nothing.
-///
-/// The NAME stays, and stays deliberately, for exactly the reason
-/// `kernels-metal` gives at its own copy of this line:
-/// `kernels/tests/shader_backends_agree.rs` reads all three backends through
-/// it, and an empty table and an absent one are the same shape to that gate
-/// but not the same fact. This backend FINISHED. `refactor-bigplan.md` §7
-/// Stage 5 deletes `KernelSig` itself, once `kernels-wgpu` -- the last with
-/// rows -- can write this line too.
-///
-/// Nothing in this crate reads it, and nothing in `driver-vulkan` names
-/// `KernelSig` at all.
-pub static KERNELS: &[kernels::KernelSig] = &[];
+/// The attribute is shared by all four planes and cannot name any of them, so
+/// each aliases its own here and the macro writes `crate::Plane`.
+pub type Plane = crate::routine::Vulkan;
 
-// The rest of what stood here, and where it went:
-//
-// `pub static KERNELS: &[KernelSig] = &CONCAT` was backed by the
-// `FAMILIES` list, the `total()`/`N` const fold, the `EMPTY` row, `copy_sig`,
-// and the const-evaluated `CONCAT` loop that laid ten family tables end to
-// end -- a hundred and forty lines whose only job was to make one `&'static
-// [KernelSig]` the compiler could read at load with no allocation.
-//
-// All ten families are `&[]`. Every one has crossed to a routine, so the fold
-// concatenated nothing into a zero-length array and `KERNELS` was an empty
-// slice that thirty-odd readers across three crates went on consulting -- each
-// of them, on the day its family crossed, quietly checking nothing.
-//
-// What names this crate's kernels now is `retired_rows()`, which is the whole
-// hundred, and `routines()`, which is what serves them. `entrypoints()` below
-// is unchanged in meaning and simpler in fact: it was the table's names plus
-// the retired ones, and it is the retired ones.
-//
-// `kernels-wgpu` is the last crate holding rows. When it finishes, the
-// `kernel!` macro and `KernelSig`'s sixteen fields go with it -- Stage 5 --
-// and nothing in this crate will have to move for that to happen.
-
-/// Every entrypoint the table names, sorted.
+/// Every routine this crate declares.
 ///
-/// The set `scripts/vulkan-kernel-audit.py` compares against the shader tree,
-/// and — one for one — the set of `.spv` module names a `native` build writes.
-pub fn entrypoints() -> Vec<String> {
-    let mut out: Vec<String> = RETIRED
-        .iter()
-        .flat_map(|family| family.iter().map(|n| (*n).to_owned()))
-        .collect();
-    out.sort();
-    out
-}
-
+/// A DISTRIBUTED SLICE, so nothing enumerates: `#[routine]` puts each row in a
+/// `linkme_ROUTINES` link section beside its own `fn`, and the linker hands
+/// back the bounds. There is no membership list to add a routine to, which is
+/// the last hand-written thing about one -- and the last that could be
+/// forgotten, leaving a routine compiled, correct and unreachable.
+///
+/// The order is LINK ORDER and no reader may depend on it. Nothing does:
+/// lookups match on the full symbol, which `no_symbol_is_declared_twice`
+/// keeps unique.
 /// The entrypoints of the families whose `kernel!` rows have been RETIRED.
 ///
 /// The crossing moves who NAMES an entrypoint, not whether it exists: the
@@ -273,6 +233,61 @@ const RETIRED: &[&[&str]] = &[
     attn::ENTRYPOINTS,
     quant::ENTRYPOINTS,
 ];
+
+// THE SLICE'S NAME IS A LINK-SECTION NAME, AND IT IS GLOBAL.
+//
+// `linkme` keys a distributed slice on the STATIC's identifier, not on the
+// crate that declares it, so four crates each declaring `ROUTINES` are four
+// declarations of one slice -- and `linkme` 0.3.37 refuses that outright
+// ("duplicate #[distributed_slice] with name \"ROUTINES\"") the moment two of
+// them are linked into one binary, which `kernels`' cross-backend agreement
+// test is. Before that version it was worse than a refusal: the sections
+// merged, and a sweep over one plane's rows walked another's.
+//
+// So the declaration wears the plane's name and the ALIAS wears the one
+// `#[routine]` emits. `crate::ROUTINES` still resolves, at no cost to a
+// reader, and the link section is this crate's alone.
+#[::linkme::distributed_slice]
+pub static VULKAN_ROUTINES: [::kernels::routine::Routine<Plane>];
+
+/// The slice under the name `#[routine]` registers into.
+pub use VULKAN_ROUTINES as ROUTINES;
+
+/// The family tables, concatenated. THERE ARE NO ROWS.
+///
+/// This was `&CONCAT`: a `FAMILIES` list, a `total()`/`N` const fold, an
+/// `EMPTY` filler row, a field-by-field `copy_sig` because `KernelSig` is not
+/// `Copy` in a const context, and a const-evaluated loop that laid ten family
+/// tables end to end so the whole hundred stayed a `&'static` the compiler
+/// could read at load with no allocation. About a hundred and forty lines, and
+/// the last family crossing made all of it a machine for concatenating
+/// nothing.
+///
+/// The NAME stays, and stays deliberately, for exactly the reason
+/// `kernels-metal` gives at its own copy of this line:
+/// `kernels/tests/shader_backends_agree.rs` reads all three backends through
+/// it, and an empty table and an absent one are the same shape to that gate
+/// but not the same fact. This backend FINISHED. `refactor-bigplan.md` §7
+/// Stage 5 deletes `KernelSig` itself, once `kernels-wgpu` -- the last with
+/// rows -- can write this line too.
+///
+/// Nothing in this crate reads it, and nothing in `driver-vulkan` names
+/// `KernelSig` at all.
+pub static KERNELS: &[kernels::KernelSig] = &[];
+
+/// Every entrypoint the table names, sorted.
+///
+/// The set `scripts/vulkan-kernel-audit.py` compares against the shader tree,
+/// and — one for one — the set of `.spv` module names a `native` build writes.
+pub fn entrypoints() -> Vec<String> {
+    let mut out: Vec<String> = RETIRED
+        .iter()
+        .flat_map(|family| family.iter().map(|n| (*n).to_owned()))
+        .collect();
+    out.sort();
+    out
+}
+
 
 /// The rows that have been retired, by the name their `kernel!` call had.
 ///
@@ -416,26 +431,9 @@ pub fn retired() -> Vec<&'static str> {
 /// wrong buffer to the wrong slot and computes a plausible number.
 #[must_use]
 pub fn declared() -> Vec<kernels::routine::Declared> {
-    CROSSED
-        .iter()
-        .flat_map(|family| family.iter().map(kernels::routine::Routine::declared))
-        .collect()
+    ROUTINES.iter().map(kernels::routine::Routine::declared).collect()
 }
 
-/// The families that have crossed. One line per family, and the list is what
-/// [`KERNELS`] is being emptied into.
-const CROSSED: &[&[routine::Routine]] = &[
-    attn::ROUTINES,
-    layout::ROUTINES,
-    mlp::ROUTINES,
-    moe::ROUTINES,
-    norm::ROUTINES,
-    ptir::ROUTINES,
-    quant::ROUTINES,
-    rope::ROUTINES,
-    sample::ROUTINES,
-    ssm::ROUTINES,
-];
 
 /// Every crossed routine, with its body still attached.
 ///
@@ -445,7 +443,7 @@ const CROSSED: &[&[routine::Routine]] = &[
 /// different questions and neither is derivable from the other.
 #[must_use]
 pub fn routines() -> Vec<&'static routine::Routine> {
-    CROSSED.iter().copied().flatten().collect()
+    ROUTINES.iter().collect()
 }
 
 // THE LAYOUT HALF STOOD HERE -- `Binding`, `bindings`, `buffer_count`,
@@ -478,3 +476,13 @@ pub fn routines() -> Vec<&'static routine::Routine> {
 // guarded is now the device's own `maxPushConstantsSize`, which
 // `Pipelines::get` takes and `driver-vulkan`'s
 // `the_tier_this_device_selects_is_one_it_can_actually_load` states outright.
+
+/// What a generic routine's element type must be on this plane.
+///
+/// `#[routine]` puts this on every type parameter that states no bound of its
+/// own, so a generic signature reads the same on all four planes and the
+/// plane's own requirement is said HERE, once. A shader plane binds a handle
+/// and asks nothing more of an element than that it be one.
+pub trait RoutineElem: kernels::Elem {}
+
+impl<T: kernels::Elem> RoutineElem for T {}

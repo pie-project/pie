@@ -37,267 +37,229 @@
 //! entry is a routine silently running on stand-ins, and a missing one is a
 //! body nothing calls.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
-use kernels::Ty;
-use kernels::routine::{Provenance, Refusal};
+use kernels::routine::Refusal;
 use kernels_wgpu::routine::{ArgValue, Encode, Fire, Routine};
 
 /// One dispatch: the entrypoint it named, the lanes it asked for, and the
 /// values it bound.
 type Dispatched = (String, [u32; 3], Vec<ArgValue>);
 
-/// Every dispatch a body made, in order.
+/// Every dispatch a body made, in order, and a source of buffer handles for
+/// this mock's OWN answers.
+///
+/// The `asked` counter is separate from the recipe's own `0..` so that a
+/// fact this mock resolves inside a body can never be mistaken for one of the
+/// recipe's own operands by the order check below — see [`Seen::asked_buffer`].
 #[derive(Default)]
-struct Seen(RefCell<Vec<Dispatched>>);
+struct Seen {
+    fired: RefCell<Vec<Dispatched>>,
+    asked: Cell<u32>,
+}
+
+impl Seen {
+    /// A fresh handle, clear of every recipe's own `0..N`.
+    fn asked_buffer(&self) -> u32 {
+        let at = 900 + self.asked.get();
+        self.asked.set(self.asked.get() + 1);
+        at
+    }
+}
 
 impl Encode for Seen {
-    fn dispatch(&self, fire: Fire<'_>, args: &[ArgValue]) -> Result<(), Refusal> {
-        self.0
+    fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
+        self.fired
             .borrow_mut()
             .push((fire.entrypoint.to_owned(), fire.lanes, args.to_vec()));
         Ok(())
     }
+
+    /// Answers generically, by [`kernels::Ty`] alone, with one deliberate
+    /// exception.
+    ///
+    /// None of this file's four tests reads the VALUE an asked fact resolves
+    /// to — only order, arity, entrypoint names and buffer counts — so a
+    /// probe that answers honestly by TYPE, ignoring which specific fact was
+    /// named, is enough: a buffer-shaped `Ty` gets a fresh handle, a scalar
+    /// `Ty` gets a small positive default. The one place that is not enough
+    /// is `ssm::gdn_core_recurrent_prefill`, which turns two asked scalars
+    /// into a compiled-shape LOOKUP (`scan_point`) rather than a bare
+    /// forward: only nine `(LANES, VROWS)` pairs are compiled, and a generic
+    /// default for each would almost certainly name none of them. `(32, 4)`
+    /// is the pair this file's own `ssm` recipe named for the same body
+    /// before `lanes`/`vrows` became asks rather than parameters.
+    fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
+        use kernels::{Source as Src, Ty as T};
+        // THE SAME TWO NUMBERS BY THE OTHER ROUTE. The tiling was
+        // `Source::Named("lanes")` while the body asked for it as a fact; it
+        // is the statement's eleventh and twelfth WORDS now -- HEAD's
+        // `Param<11>`/`Param<12>` -- because the run this body forwards is the
+        // shader's struct and no `Const` mark can name a word inside it.
+        if let Src::Slot(kernels::Kind::Param, n) = source {
+            return Ok(ArgValue::I32(match n {
+                11 => 32,
+                12 => 4,
+                _ => 4096,
+            }));
+        }
+        if source == Src::Named("lanes") {
+            return Ok(ArgValue::I32(32));
+        }
+        if source == Src::Named("vrows") {
+            return Ok(ArgValue::I32(4));
+        }
+        Ok(match ty {
+            T::Buf
+            | T::BufMut
+            | T::Bf16s
+            | T::Bf16sMut
+            | T::F16s
+            | T::F16sMut
+            | T::I32s
+            | T::I32sMut
+            | T::U32s
+            | T::U32sMut
+            | T::U8s
+            | T::U8sMut
+            | T::F32s
+            | T::F32sMut => ArgValue::Buffer(self.asked_buffer()),
+            T::I32 => ArgValue::I32(8),
+            T::U32 => ArgValue::U32(8),
+            T::F32 => ArgValue::F32(1.0),
+            T::Usize => ArgValue::Usize(4096),
+            T::InPacked => ArgValue::U32(8),
+            _ => {
+                return Err(Refusal::Unstated {
+                    what: "a fact this generic mock does not answer",
+                });
+            }
+        })
+    }
 }
 
-/// A buffer handle, distinct per position so a swap is visible.
+/// A buffer handle, distinct per position so a swap is visible, and SHAPED
+/// like a real operand's binding.
+///
+/// `In`/`Out`/`InOut` read `.rows`/`.width` off exactly the rectangle
+/// [`ArgValue::Shaped`] carries when they unpack; a plain `Buffer` gives every
+/// one of them `Extent { rows: 0, width: 0 }` and most bodies refuse an empty
+/// extent before doing anything else worth checking. `Const<Tensor<_>>`
+/// (the weight run) reads only the handle, so the same value serves both.
 const fn b(at: u32) -> ArgValue {
-    ArgValue::Buffer(at)
+    ArgValue::Shaped {
+        handle: at,
+        rows: 7,
+        width: 1024,
+    }
 }
 
 /// The six affine points, which are the only `(group, bits)` a gather takes.
 const POINTS: [(i32, i32); 6] = [(32, 4), (32, 8), (64, 4), (64, 8), (128, 4), (128, 8)];
 
-/// One plausible argument list per crossed routine that takes no affine point.
+/// One plausible argument list per crossed routine that takes no affine
+/// point.
+///
+/// Most of these lists are far shorter than the tree that grew them: a scalar
+/// that used to be `Env` is now either a `Const` signature parameter (still
+/// stated here) or a fact the body `ctx.ask`s for from INSIDE itself (never
+/// on the signature at all, so nothing is stated for it here — see
+/// `Seen::resolve`, which answers whatever a body asks). The comment on each
+/// arm is the CURRENT signature, in order, so a wrong value is visible to a
+/// reader without counting parentheses against `src/*.rs`.
 fn recipe(name: &str) -> Option<Vec<Vec<ArgValue>>> {
     let one = |v: Vec<ArgValue>| Some(vec![v]);
     match name {
-        // proj, token, out, params, width, rows
-        "ple_combine" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            b(3),
-            ArgValue::I32(64),
-            ArgValue::I32(7),
-        ]),
-        // input, out, rows, params, count, width, row_count
-        "row_gather" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            b(3),
-            ArgValue::U32(4),
-            ArgValue::I32(64),
-            ArgValue::I32(7),
-        ]),
-        // logits, next_token, params, eos_flag, rows
-        "argmax_logits" => one(vec![b(0), b(1), b(2), b(3), ArgValue::U32(7)]),
-        // source, destination, params, vocab, rows
-        "copy_logits_bf16" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            ArgValue::U32(1024),
-            ArgValue::U32(7),
-        ]),
+        // proj, token, out -- `params`, `width` and `rows` are all asked for
+        // or read off a buffer's own shape now.
+        "ple_combine" => one(vec![b(0), b(1), b(2)]),
+        // input, out -- every scalar this body once took as a parameter
+        // (`rows`, `params`, `count`, `width`, `row_count`) is asked for now.
+        "row_gather" => one(vec![b(0), b(1)]),
+        // logits, next_token, params, eos_flag -- `params` here is an
+        // ordinary buffer parameter (a `Tensor<bf16>`), not the staged scalar
+        // block; `rows` moved to an ask.
+        "argmax_logits" => one(vec![b(0), b(1), b(2), b(3)]),
+        // source, destination -- `params`, `vocab` (from `source.width`) and
+        // `rows` are all either read off a buffer or asked now.
+        "copy_logits_bf16" => one(vec![b(0), b(1)]),
 
         // ---- norm, the first LIVE family crossed here ----
         //
-        // `width` 256 and `axis` 128 deliberately: two axes per row, so
-        // `per_axis`'s `width / axis` is not 1 and a body that confused the
-        // two would produce a different lane count rather than the same one.
-        //
-        // x, w, out, params, width, axis, rows
-        "rms_single_row" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            b(3),
-            ArgValue::I32(256),
-            ArgValue::I32(128),
-            ArgValue::I32(7),
-        ]),
-        // x, w, out, params, row_pitch, rows
-        "rms_strided_row" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            b(3),
-            ArgValue::I32(512),
-            ArgValue::I32(7),
-        ]),
-        // x, w, out, params, row_pitch, heads, rows
-        "rms_strided_head_row" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            b(3),
-            ArgValue::I32(512),
-            ArgValue::I32(8),
-            ArgValue::I32(7),
-        ]),
-        // x, w, out, params, r, width, axis, rows
-        "rms_residual" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            b(3),
-            b(4),
-            ArgValue::I32(256),
-            ArgValue::I32(128),
-            ArgValue::I32(7),
-        ]),
-        // x, w, out, params, r, s, width, axis, rows
-        "rms_residual_scaled" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            b(3),
-            b(4),
-            b(5),
-            ArgValue::I32(256),
-            ArgValue::I32(128),
-            ArgValue::I32(7),
-        ]),
-        // x, out, params, width, axis, rows
-        "vnorm_single_row" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            ArgValue::I32(256),
-            ArgValue::I32(128),
-            ArgValue::I32(7),
-        ]),
-        // x, z, w, out, params, heads, rows
-        "gated_rms" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            b(3),
-            b(4),
-            ArgValue::I32(8),
-            ArgValue::I32(7),
-        ]),
-        // x, z, w, out, params, row_pitch, heads, rows
-        "gated_rms_strided" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            b(3),
-            b(4),
-            ArgValue::I32(512),
-            ArgValue::I32(8),
-            ArgValue::I32(7),
-        ]),
-        // x, scalar, out, params, width, rows
-        "layer_scalar_mul" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            b(3),
-            ArgValue::I32(256),
-            ArgValue::I32(7),
-        ]),
-        // x, residual, out, width, rows
-        "residual_add" => one(vec![b(0), b(1), b(2), ArgValue::I32(256), ArgValue::I32(7)]),
-        // x, residual, out, row_pitch, width, rows
-        "residual_add_strided" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            ArgValue::I32(512),
-            ArgValue::I32(256),
-            ArgValue::I32(7),
-        ]),
-        // out, bias, width, rows
-        "add_bias" => one(vec![b(0), b(1), ArgValue::I32(256), ArgValue::I32(7)]),
+        // x, w, out -- `width`, `axis` and `rows` are all asked for; none of
+        // the three is a signature parameter any more.
+        "rms_single_row" => one(vec![b(0), b(1), b(2), ArgValue::F32(1e-5), ArgValue::I32(1024)]),
+        // x, w, out -- `row_pitch`/`rows` asked.
+        "rms_strided_row" => one(vec![b(0), b(1), b(2), ArgValue::F32(1e-5), ArgValue::I32(512)]),
+        // x, w, out -- `row_pitch`/`heads`/`rows` asked.
+        "rms_strided_head_row" => one(vec![b(0), b(1), b(2), ArgValue::F32(1e-5), ArgValue::I32(512)]),
+        // x, w, out, r -- `width`/`axis`/`rows` asked.
+        "rms_residual" => one(vec![b(0), b(1), b(2), b(3)]),
+        // x, w, out, r, s -- `width`/`axis`/`rows` asked.
+        "rms_residual_scaled" => one(vec![b(0), b(1), b(2), b(3), b(4)]),
+        // x, out -- `width`/`axis`/`rows` asked.
+        "vnorm_single_row" => one(vec![b(0), b(1)]),
+        // x, z, w, out, heads -- `rows` asked.
+        // x, z, w, out -- `vd`/`heads`/`rows` asked. The head count left the
+        // run: this body forwards `ctx.params()` as a STRUCT, so no slot in it
+        // is a mark's to take.
+        "gated_rms" => one(vec![b(0), b(1), b(2), b(3)]),
+        // x, z, w, out -- `row_pitch`/`heads`/`rows` asked, same reason.
+        "gated_rms_strided" => one(vec![b(0), b(1), b(2), b(3)]),
+        // x, scalar, out -- `width`/`rows` asked.
+        "layer_scalar_mul" => one(vec![b(0), b(1), b(2)]),
+        // x, residual, out -- `width`/`rows` asked.
+        "residual_add" => one(vec![b(0), b(1), b(2)]),
+        // x, residual, out -- `row_pitch`/`width`/`rows` asked.
+        "residual_add_strided" => one(vec![b(0), b(1), b(2), ArgValue::I32(4096)]),
+        // out, bias -- `width`/`rows` asked. `out` is the `InOut` mark, so it
+        // is the same address as the separate input this once took.
+        "add_bias" => one(vec![b(0), b(1)]),
 
         // ---- moe ----
         //
-        // Tiles 32x64 rather than 16x16: a square tile at the table's first
-        // point would let a body that swapped `tile_m` and `tile_n` spell the
-        // same entrypoint and build the same grid.
-        //
-        // logits, expert_ids, expert_weights, params, per_expert_scale, rows
-        "router_topk" | "router_topk_scaled" => {
-            one(vec![b(0), b(1), b(2), b(3), b(4), ArgValue::I32(7)])
-        }
-        // expert_ids, perm, row_expert, tile_expert, params, inv
-        "route_sort" => one(vec![b(0), b(1), b(2), b(3), b(4), b(5)]),
-        // x, out, perm, params, width, padded
-        "route_gather" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            b(3),
-            ArgValue::I32(1024),
-            ArgValue::I32(16),
-        ]),
-        // y, expert_weights, out, params, inv, width, tokens
-        "combine_sorted" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            b(3),
-            b(4),
-            ArgValue::I32(1024),
-            ArgValue::I32(7),
-        ]),
-        // routed, shared, gate, out, width, rows
-        "shared_expert_combine" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            b(3),
-            ArgValue::U32(1024),
-            ArgValue::I32(7),
-        ]),
-        // ..., row_pitch before rows
-        "shared_expert_combine_strided" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            b(3),
-            ArgValue::U32(1024),
-            ArgValue::I32(2048),
-            ArgValue::I32(7),
-        ]),
-        // w, scales, biases, x, y, in_vec, out_vec, bias, expert_ids,
-        // x_slot_stride, x_row_stride, slots_per_row, rows
-        "qmv_routed" | "qmv_routed_bias" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            b(3),
-            b(4),
-            ArgValue::I32(2048),
-            ArgValue::I32(1024),
+        // logits, expert_ids, expert_weights -- `rows` asked;
+        // `router_topk_scaled` also takes a fourth `Const` buffer,
+        // `per_expert_scale`, that the plain form does not.
+        "router_topk" => one(vec![b(0), b(1), b(2)]),
+        "router_topk_scaled" => one(vec![b(0), b(1), b(2), b(3)]),
+        // expert_ids, perm, row_expert, tile_expert, inv -- `params` asked.
+        "route_sort" => one(vec![b(0), b(1), b(2), b(3), b(4)]),
+        // x, out, perm -- `params`/`width`/`padded` asked.
+        "route_gather" => one(vec![b(0), b(1), b(2)]),
+        // y, expert_weights, out, inv -- `params`/`width`/`tokens` asked.
+        "combine_sorted" => one(vec![b(0), b(1), b(2), b(3)]),
+        // routed, shared, gate, out -- `width`/`rows` asked.
+        "shared_expert_combine" => one(vec![b(0), b(1), b(2), b(3)]),
+        // ... `row_pitch`/`width`/`rows` asked; still the same four buffers.
+        "shared_expert_combine_strided" => one(vec![b(0), b(1), b(2), b(3)]),
+        // w, scales, biases, x, y, x_slot_stride, x_row_stride,
+        // slots_per_row, expert_ids. `in_vec`/`out_vec` are the operands'
+        // own widths and `rows` is asked; the three STRIDES are the
+        // mixture's own geometry, which no operand carries and the statement
+        // states.
+        "qmv_routed" => one(vec![
+            b(0), b(1), b(2), b(3), b(4),
+            ArgValue::I32(1), ArgValue::I32(4), ArgValue::I32(4),
             b(5),
-            b(6),
-            ArgValue::I32(2048),
-            ArgValue::I32(4096),
-            ArgValue::I32(4),
-            ArgValue::I32(7),
         ]),
-        // The same list; the mxfp4 form's `biases` is bound and unread.
+        // ... plus a `bias` buffer, positioned before the strides.
+        "qmv_routed_bias" => one(vec![
+            b(0), b(1), b(2), b(3), b(4), b(5),
+            ArgValue::I32(1), ArgValue::I32(4), ArgValue::I32(4),
+            b(6),
+        ]),
+        // w, scales, x, y, bias, then the strides -- the mxfp4 form has no
+        // `biases` buffer at all; its `scales` IS the affine codec.
         "mxfp4_qmv_routed_bias" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            b(3),
-            b(4),
-            ArgValue::I32(2048),
-            ArgValue::I32(1024),
+            b(0), b(1), b(2), b(3), b(4),
+            ArgValue::I32(1), ArgValue::I32(4), ArgValue::I32(4),
             b(5),
-            b(6),
-            ArgValue::I32(2048),
-            ArgValue::I32(4096),
-            ArgValue::I32(4),
-            ArgValue::I32(7),
         ]),
-        // w, scales, biases, x, y, tile_expert, k, n, rows, group, bits,
-        // tile_m, tile_n
+        // w, scales, biases, x, y, pad, tile_expert, group, bits, tile_m,
+        // tile_n -- `pad` is the statement's second input (`row_expert`'s
+        // slot), which this GEMM does not read but must still bind
+        // positionally; `k`/`n`/`rows` are read off buffers or asked now.
         "qmm_t_routed" => one(vec![
             b(0),
             b(1),
@@ -305,15 +267,14 @@ fn recipe(name: &str) -> Option<Vec<Vec<ArgValue>>> {
             b(3),
             b(4),
             b(5),
-            ArgValue::I32(2048),
-            ArgValue::I32(1024),
-            ArgValue::I32(64),
+            b(6),
             ArgValue::I32(64),
             ArgValue::I32(4),
             ArgValue::I32(32),
             ArgValue::I32(64),
         ]),
-        // ... without the group/bits pair
+        // ... without the group/bits pair: this form is stamped at one codec
+        // and only the tile is still a choice.
         "qmm_t_routed_fp16" => one(vec![
             b(0),
             b(1),
@@ -321,13 +282,12 @@ fn recipe(name: &str) -> Option<Vec<Vec<ArgValue>>> {
             b(3),
             b(4),
             b(5),
-            ArgValue::I32(2048),
-            ArgValue::I32(1024),
-            ArgValue::I32(64),
+            b(6),
             ArgValue::I32(32),
             ArgValue::I32(64),
         ]),
-        // w, exponents, x, y, bias, tile_expert, k, n, rows, tile_m, tile_n
+        // w, exponents, x, y, bias, pad, tile_expert, tile_m, tile_n -- the
+        // same unread positional `pad` as the two affine forms above.
         "mxfp4_qmm_t_routed_bias" => one(vec![
             b(0),
             b(1),
@@ -335,110 +295,60 @@ fn recipe(name: &str) -> Option<Vec<Vec<ArgValue>>> {
             b(3),
             b(4),
             b(5),
-            ArgValue::I32(2048),
-            ArgValue::I32(1024),
-            ArgValue::I32(64),
+            b(6),
             ArgValue::I32(32),
             ArgValue::I32(64),
         ]),
 
         // ---- mlp ----
         //
-        // gate, up, out, params, width, rows -- and `params` is bound here
-        // where `kernels-vulkan` drops it, because WGSL declares the binding
-        // and the layout comes from the declaration. See `mlp::geglu_tanh`.
-        "geglu_tanh" | "geglu_tanh_strided" | "gptoss_swiglu" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            b(3),
-            ArgValue::I32(2048),
-            ArgValue::I32(7),
-        ]),
-        // gate, up, out, width, rows -- no params in this one's module.
-        "silu_mul" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            ArgValue::I32(2048),
-            ArgValue::I32(7),
-        ]),
-        // gate, up, out, row_pitch, width, rows. An EVEN pitch, and wider than
-        // the row: `gated.wgsl` indexes `gid.y * row_pitch / 2 + gid.x` in
-        // WORDS, so an odd pitch would put two rows in one word and no store
-        // granularity there could make that safe.
-        "silu_mul_strided" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            ArgValue::I32(4096),
-            ArgValue::I32(2048),
-            ArgValue::I32(7),
-        ]),
+        // gate, up, out -- every one of these now asks for `width`/`rows`;
+        // none keeps a `params` buffer or a scalar on its signature.
+        "geglu_tanh" | "geglu_tanh_strided" | "gptoss_swiglu" => one(vec![b(0), b(1), b(2)]),
+        "silu_mul" => one(vec![b(0), b(1), b(2)]),
+        "silu_mul_strided" => one(vec![b(0), b(1), b(2)]),
 
         // ---- rope ----
         //
-        // `rotary` 64 against `head_dim` 128 deliberately: a PARTIAL rotation,
-        // so `rope_grid`'s x is 32 rather than half the head. A body that
-        // built its grid on the head width instead of the rotary width would
-        // give the same number for the full-rotation case and a different one
-        // here.
+        // `rotary` 64 against `head_dim` 128 deliberately: a PARTIAL
+        // rotation, so `rope_grid`'s x is 32 rather than half the head. A
+        // body that built its grid on the head width instead of the rotary
+        // width would give the same number for the full-rotation case and a
+        // different one here. Both are still `Const` parameters; `position`
+        // and `width` (the third and seventh of the old list) are asked for
+        // or read off `x` now.
         //
-        // x, position, scale, base, head_dim, rotary, width
-        "neox_decode" | "neox_prop_decode" => one(vec![
-            b(0),
-            b(1),
-            ArgValue::F32(1.0),
-            ArgValue::F32(10_000.0),
-            ArgValue::I32(128),
-            ArgValue::I32(64),
-            ArgValue::I32(1024),
-        ]),
-        // ..., rows
-        "neox_mb" | "neox_prop_mb" => one(vec![
-            b(0),
-            b(1),
-            ArgValue::F32(1.0),
-            ArgValue::F32(10_000.0),
-            ArgValue::I32(128),
-            ArgValue::I32(64),
-            ArgValue::I32(1024),
-            ArgValue::I32(7),
-        ]),
-        // x, position, scale, inv_freq, head_dim, mscale, rotary, width
-        "neox_freqs_decode" => one(vec![
-            b(0),
-            b(1),
-            ArgValue::F32(1.0),
-            b(2),
-            ArgValue::I32(128),
-            ArgValue::F32(1.0),
-            ArgValue::I32(64),
-            ArgValue::I32(1024),
-        ]),
-        // ..., rows
-        "neox_freqs_mb" => one(vec![
-            b(0),
-            b(1),
-            ArgValue::F32(1.0),
-            b(2),
-            ArgValue::I32(128),
-            ArgValue::F32(1.0),
-            ArgValue::I32(64),
-            ArgValue::I32(1024),
-            ArgValue::I32(7),
-        ]),
-        // x, position, scale, base, head_dim, row_pitch, rotary, width, rows
+        // x, scale, base, head_dim, rotary
+        // THE STRIDED FORM TAKES ONE MORE: its `row_pitch` is the statement's
+        // (`Param<4>` at HEAD), and 4096 is wide enough for the row the stand-in
+        // builds -- a narrower one is the refusal `kernels-vulkan`'s
+        // `a_stride_narrower_than_the_row_is_refused` exercises on purpose.
         "neox_strided" => one(vec![
             b(0),
-            b(1),
             ArgValue::F32(1.0),
             ArgValue::F32(10_000.0),
             ArgValue::I32(128),
-            ArgValue::I32(2048),
             ArgValue::I32(64),
-            ArgValue::I32(1024),
-            ArgValue::I32(7),
+            ArgValue::I32(4096),
+        ]),
+        "neox_decode" | "neox_prop_decode" | "neox_mb" | "neox_prop_mb" => {
+            one(vec![
+                b(0),
+                ArgValue::F32(1.0),
+                ArgValue::F32(10_000.0),
+                ArgValue::I32(128),
+                ArgValue::I32(64),
+            ])
+        }
+        // x, scale, head_dim, mscale, rotary -- `inv_freq` is the FIRE's
+        // frequency table, built once per fire and asked for, not a weight
+        // the checkpoint carries.
+        "neox_freqs_decode" | "neox_freqs_mb" => one(vec![
+            b(0),
+            ArgValue::F32(1.0),
+            ArgValue::I32(128),
+            ArgValue::F32(1.0),
+            ArgValue::I32(64),
         ]),
         _ => None,
     }
@@ -449,9 +359,13 @@ fn recipe(name: &str) -> Option<Vec<Vec<ArgValue>>> {
 /// Sweeping rather than picking one is what makes the entrypoint check below a
 /// census: all twenty-four spellings a gather can choose are resolved, and
 /// mistyping one table entry is caught by the point that names it.
+///
+/// The `_mb_` split is no longer a signature difference: the M>1 forms ask
+/// for `Rows` where the M=1 forms hardcode it (see `layout::embed_gather_mb_
+/// 4bit` against `embed_gather_4bit`), but neither keeps a `rows` PARAMETER,
+/// so the four routines' signatures differ only in `embed_scale`.
 fn affine(name: &str) -> Option<Vec<Vec<ArgValue>>> {
     let scaled = name.contains("scaled");
-    let mb = name.contains("_mb_");
     if !name.starts_with("embed_gather") {
         return None;
     }
@@ -459,13 +373,12 @@ fn affine(name: &str) -> Option<Vec<Vec<ArgValue>>> {
         POINTS
             .iter()
             .map(|(g, bits)| {
-                // w, scales, biases, id, out, hidden, [embed_scale], [rows], group, bits
-                let mut v = vec![b(0), b(1), b(2), b(3), b(4), ArgValue::I32(64)];
+                // w, scales, biases, out, [embed_scale], group, bits -- `id`
+                // (the token-ids buffer) is asked for and `hidden` is read
+                // off `out.width` now, in every one of the four.
+                let mut v = vec![b(0), b(1), b(2), b(3)];
                 if scaled {
                     v.push(ArgValue::F32(1.5));
-                }
-                if mb {
-                    v.push(ArgValue::I32(7));
                 }
                 v.push(ArgValue::I32(*g));
                 v.push(ArgValue::I32(*bits));
@@ -475,29 +388,25 @@ fn affine(name: &str) -> Option<Vec<Vec<ArgValue>>> {
     )
 }
 
-/// The `attn` family's recipes, SYNTHESIZED from each routine's own argument
-/// types rather than written out.
+/// The `attn` family's recipes.
 ///
-/// # Why this one is generated and the others are not
+/// Sixteen routines whose signatures run at most eight arguments now (down
+/// from twenty): most of what a signature used to state for these bodies —
+/// the KV planes, the position table, the attention mask, `GqaFactor` — is
+/// asked for from inside the body instead (see `attn::sdpa_paged_decode` for
+/// the fullest example), and what remains a `Const` parameter is exactly the
+/// checkpoint-fixed geometry: `page_size`, `n_kv_heads`, `scale`, `window`,
+/// `head_dim`, `q_heads` (or `heads`).
 ///
-/// This file's header says a generic synthesizer cannot supply the recipes,
-/// and for `layout` that is true: `embed_gather_4bit` refuses any
-/// `(group, bits)` outside six real affine points, so a stand-in has to be a
-/// fact about the kernel. `attn`'s signatures are twenty arguments long and
-/// constrain exactly ONE thing — the head width, which must be a point the
-/// row generates, because the body indexes a literal spelling table with it.
-///
-/// So the head width is stated per routine below and everything else is a
-/// shape: buffers get sequential handles so a swap is visible, and the
-/// remaining scalars get values that are plausible and not equal to each
-/// other. Sixteen hand-written twenty-element lists would be sixteen chances
-/// to transpose a pair by hand while checking that bodies do not transpose
-/// pairs.
-///
-/// The `Env` arguments are the last three of every signature —
-/// `head_dim, q_heads, rows` for the attentions, `heads` or `rows` alone for
-/// the writes — and they are taken from the type walk in order, which is why
-/// `HEADS` names only the head width.
+/// The head width is the one argument every attention still constrains: the
+/// body indexes a literal spelling table with it (`head_point`), which
+/// refuses anything not one of the widths its own table names. `HEADS` states
+/// those per routine, swept rather than picked once for the same reason the
+/// old version gave: it is what makes the entrypoint census below exhaustive.
+/// `page_size`, `n_kv_heads`, `scale` and `window` gate nothing —
+/// `vector_grid`/`tiled_grid`/`head_grid` take only `head_dim`, `q_heads` (or
+/// `heads`) and `rows` — so any value serves for them, and 16/2/0.125/0 are
+/// simply distinct from `head_dim`/`q_heads` so a transposition is visible.
 fn attn(name: &str) -> Option<Vec<Vec<ArgValue>>> {
     /// The head widths each routine's spelling table actually carries.
     ///
@@ -507,6 +416,12 @@ fn attn(name: &str) -> Option<Vec<Vec<ArgValue>>> {
     /// `the_entrypoints_that_ignore_the_window_are_exactly_the_ones_named_p32`
     /// gives — they pin the key run's start to zero and answer a windowed
     /// caller with full attention.
+    ///
+    /// `q_gate_split`, `kv_append` and `kv_append_paged` now take a REAL
+    /// `head_dim: Const<i32>` too (`head_grid` refuses a non-positive one),
+    /// so they sweep a real width the same as the attentions; `split_qkv_
+    /// bf16`, `gate` and `logit_softcap` take none at all, and get one dummy
+    /// entry each so the loop below still runs once.
     const HEADS: &[(&str, &[i32])] = &[
         ("sdpa_paged_decode", &[64, 128, 256, 512]),
         ("sdpa_paged_decode_sink", &[64]),
@@ -518,306 +433,358 @@ fn attn(name: &str) -> Option<Vec<Vec<ArgValue>>> {
         ("sdpa_vector_decode", &[64, 128, 256]),
         ("sdpa_vector_decode_sink", &[64]),
         ("sdpa_vector_decode_swa", &[256, 512]),
-        // Not attentions, and their first `Env` is not a head width. One
-        // entry each so the walk below has something to read.
+        ("q_gate_split", &[64]),
+        ("kv_append", &[64]),
+        ("kv_append_paged", &[64]),
+        // Not attentions, and no `head_dim` on their signature at all.
         ("split_qkv_bf16", &[0]),
         ("gate", &[0]),
-        ("q_gate_split", &[0]),
-        ("kv_append", &[0]),
-        ("kv_append_paged", &[0]),
         ("logit_softcap", &[0]),
     ];
 
     let heads = HEADS.iter().find(|(n, _)| *n == name)?.1;
-    let sig = kernels_wgpu::routines()
-        .into_iter()
-        .find(|r| r.name == name)?;
-
     let mut out = Vec::new();
     for &head_dim in heads {
-        let mut args = Vec::new();
-        let mut buffers = 0u32;
-        let mut envs = 0usize;
-        // `Provenance` says where a value comes from and `Ty` says how WIDE it
-        // is, and a recipe has to read both. These arms read only the first for
-        // as long as every environment scalar happened to be an `i32`: upstream
-        // retyped `attention_mask_stride` to `Ask<_, u32>`, the catch-all kept
-        // handing it an `I32`, and every attention routine refused with
-        // `Kind { at: 13, want: U32 }` — four tests at once, because one
-        // refusal panics the shared fixture.
-        let as_ty = |ty: &Ty, v: i32| match ty {
-            Ty::U32 => ArgValue::U32(u32::try_from(v).expect("an env width is not negative")),
-            _ => ArgValue::I32(v),
+        let hd = ArgValue::I32(head_dim);
+        let args = match name {
+            // packed, q, k, v -- no scalar at all.
+            "split_qkv_bf16" => vec![b(0), b(1), b(2), b(3)],
+            // attn, gate -- no scalar at all.
+            // attn, gate, row_stride -- the pitch was `Param<0>` at HEAD.
+            "gate" => vec![b(0), b(1), ArgValue::I32(4096)],
+            // qg, q_out, gate_out, head_dim, q_heads
+            "q_gate_split" => vec![b(0), b(1), b(2), hd, ArgValue::I32(8), ArgValue::I32(4096), ArgValue::I32(4096)],
+            // k_new, v_new, head_dim, heads
+            "kv_append" => vec![b(0), b(1), hd, ArgValue::I32(8)],
+            // k_new, v_new, head_dim, n_kv_heads -- `page_size` is asked for
+            // now (see `sdpa_paged_decode`'s identical comment, below).
+            "kv_append_paged" => vec![b(0), b(1), hd, ArgValue::I32(2)],
+            // logits, out -- no scalar at all.
+            "logit_softcap" => vec![b(0), b(1)],
+            // queries, out, n_kv_heads, scale, window, head_dim, q_heads --
+            // `page_size` is a fact only the fire can answer (a property of
+            // the allocation, not of the model text) and is asked for from
+            // inside the body now, rather than stated on the signature.
+            "sdpa_paged_decode" | "sdpa_paged_tiled" | "sdpa_paged_tiled_strided"
+            | "sdpa_paged_mma" => vec![
+                b(0),
+                b(1),
+                ArgValue::I32(2),
+                ArgValue::F32(0.125),
+                ArgValue::I32(0),
+                hd,
+                ArgValue::I32(8),
+            ],
+            // ..., with a `sinks` buffer between `window` and `head_dim`.
+            "sdpa_paged_decode_sink" | "sdpa_paged_tiled_sink" | "sdpa_paged_mma_sink" => vec![
+                b(0),
+                b(1),
+                ArgValue::I32(2),
+                ArgValue::F32(0.125),
+                ArgValue::I32(0),
+                b(2),
+                hd,
+                ArgValue::I32(8),
+            ],
+            // queries, out, scale, head_dim, q_heads
+            "sdpa_vector_decode" => {
+                vec![b(0), b(1), ArgValue::F32(0.125), hd, ArgValue::I32(8)]
+            }
+            // queries, out, scale, window, head_dim, q_heads, q/o pitches
+            "sdpa_vector_decode_swa" => vec![
+                b(0),
+                b(1),
+                ArgValue::F32(0.125),
+                ArgValue::I32(0),
+                hd,
+                ArgValue::I32(8),
+                // The two row pitches, which were `Param<4>`/`Param<5>` and are
+                // the statement's again: a stride is the rectangle the text laid
+                // out, not something this batch made.
+                ArgValue::I32(4096),
+                ArgValue::I32(4096),
+            ],
+            // queries, out, sinks, scale, window, head_dim, q_heads, q/o pitches
+            "sdpa_vector_decode_sink" => vec![
+                b(0),
+                b(1),
+                b(2),
+                ArgValue::F32(0.125),
+                ArgValue::I32(0),
+                hd,
+                ArgValue::I32(8),
+                // The two row pitches, which were `Param<4>`/`Param<5>` and are
+                // the statement's again: a stride is the rectangle the text laid
+                // out, not something this batch made.
+                ArgValue::I32(4096),
+                ArgValue::I32(4096),
+            ],
+            _ => return None,
         };
-        for (i, (ty, prov)) in sig.args.iter().enumerate() {
-            // WHICH QUESTION THIS ARGUMENT IS, where the signature says.
-            //
-            // This used to place the head width on the FIRST `Env` and call it
-            // `head_dim`, with a comment asserting the tail ran `head_dim,
-            // q_heads, rows`. It runs `n_rows, head_dim, q_heads`, so the width
-            // landed on the row count and `head_dim` got the 8 meant for
-            // `q_heads` -- which `sdpa_paged_mma` refused as `Narrow { what:
-            // "the head width", at: 8 }`, taking the whole suite down with it
-            // because one refusal panics the shared fixture.
-            //
-            // A position is a guess and `sources` is the answer: upstream added
-            // it to say which of the environment's questions each argument
-            // asks. Reading it means an argument can be REORDERED without this
-            // recipe silently handing values to the wrong parameter.
-            let named = sig.sources.get(i).and_then(|s| match s {
-                Some(kernels::Source::Named(k)) => Some(*k),
-                _ => None,
-            });
-            let value = match (ty, prov) {
-                (Ty::Buf | Ty::BufMut | Ty::I32s | Ty::U32s | Ty::U8s, _) => {
-                    let v = b(buffers);
-                    buffers += 1;
-                    v
-                }
-                (_, Provenance::Env)
-                    if named == Some(<kernels::keys::HeadDim as kernels::keys::Fact>::KEY)
-                        && head_dim != 0 =>
-                {
-                    envs += 1;
-                    as_ty(ty, head_dim)
-                }
-                (_, Provenance::Env)
-                    if named == Some(<kernels::keys::NumQHeads as kernels::keys::Fact>::KEY) =>
-                {
-                    envs += 1;
-                    as_ty(ty, 8)
-                }
-                (_, Provenance::Env) => {
-                    // Everything the signature does not name: the same
-                    // plausible-and-distinct values as before, so the routines
-                    // whose `sources` say nothing are placed exactly as they
-                    // were.
-                    let v = match envs {
-                        0 if head_dim != 0 && named.is_none() => head_dim,
-                        0 | 1 => 8,
-                        _ => 7,
-                    };
-                    envs += 1;
-                    as_ty(ty, v)
-                }
-                (Ty::F32, _) => ArgValue::F32(0.125),
-                (Ty::Usize, _) => ArgValue::Usize(4096),
-                (Ty::U32, _) => ArgValue::U32(2048),
-                // Every remaining scalar is an i32 the body only forwards.
-                _ => ArgValue::I32(64),
-            };
-            args.push(value);
-        }
         out.push(args);
     }
     Some(out)
 }
 
-/// The `quant` family's recipes, SYNTHESIZED like `attn`'s.
+/// The `quant` family's recipes.
 ///
-/// Thirty-one routines whose signatures run to fourteen arguments, and whose
-/// only constrained values are the ones that INDEX A SPELLING TABLE: the
-/// affine `group` and `bits`, and the `bm`/`bn` tile. Those are stated per
-/// routine below, in the order the signature takes them; the buffers get
-/// sequential handles and the remaining scalars get plausible extents.
+/// Thirty-one routines whose signatures shrank to at most nine arguments;
+/// what remains constrained is exactly what indexes a spelling table — the
+/// affine `group`/`bits` (`quant::codec_point`) and the `bm`/`bn` tile
+/// (`tile_point`/`wide_point`/`row_tile_point`) — stated per routine below,
+/// in the order the signature takes them, with the buffers getting
+/// sequential handles.
 ///
-/// The table was generated by reading each `pub fn`'s `Env<i32>` parameters
-/// out of `src/quant.rs` in order — the comment on each line is those
-/// parameter NAMES, which is what makes a wrong value visible to a reader
-/// rather than something to count out on the signature.
+/// `group` 64, `bits` 4 and `bm`/`bn` 32/64 throughout: distinct values on
+/// every axis a body could transpose, and all four are real points --
+/// `GROUPS`, `BIT_WIDTHS` and `TILES` all carry them.
 fn quant(name: &str) -> Option<Vec<Vec<ArgValue>>> {
-    /// The `Env` values each routine takes, in signature order.
-    const ENVS: &[(&str, &[i32])] = &[
-        ("qmm_t", &[64, 4, 32, 32, 64]),            // group, bits, bm, bn, m
-        ("qmm_t_bias", &[64, 4, 32, 32, 64]),       // group, bits, bm, bn, m
-        ("qmm_t_residual", &[64, 4, 32, 32, 64]),   // group, bits, bm, bn, m
-        ("qmm_t_fp16_precast", &[32, 32, 64]),      // bm, bn, m
-        ("qmm_t_bias_fp16_precast", &[32, 32, 64]), // bm, bn, m
-        ("qmm_t_residual_fp16_precast", &[32, 32, 64]), // bm, bn, m
-        ("qmm_t_splitk", &[64, 4, 32, 64]),         // group, bits, bm, m
-        ("qmm_t_splitk_f32", &[64, 4, 32, 64]),     // group, bits, bm, m
-        ("qmm_t_splitk_fp16_precast", &[32, 64]),   // bm, m
-        ("qmm_t_splitk_fp16_precast_f32", &[32, 64]), // bm, m
-        ("qmm_t_strided", &[64, 4, 32, 64]),        // group, bits, bm, m
-        ("qmm_t_strided_residual", &[64, 4, 32, 64]), // group, bits, bm, m
-        ("qmm_t_strided_fp16_precast", &[32, 64]),  // bm, m
-        ("qmm_t_strided_fp16_precast_residual", &[32, 64]), // bm, m
-        ("qmm_splitk_reduce", &[64]),               // m
-        ("qmm_splitk_reduce_f32", &[64]),           // m
-        ("cast_qmm_input_bfloat16_to_float16", &[]), // no Env
-        // THREE: `n` and `count` joined `rows` in the `Env` column, because the
-        // strided cast's uniform block is `{ k, row_stride }` and neither of
-        // them reaches the shader -- `n` is the slot the packed and strided
-        // forms share and `count` is `rows * k`, derived from the grid.
-        (
-            "cast_qmm_input_strided_bfloat16_to_float16",
-            &[64, 448, 7],
-        ), // n, count, rows
-        ("qmv_fast", &[64, 4, 7]),                  // group, bits, vecs
-        ("qmv_fast_residual", &[64, 4, 7]),         // group, bits, vecs
-        ("qmv_tail", &[4, 7]),                      // bits, vecs
-        ("qmv_tail_bias", &[4, 7]),                 // bits, vecs
-        // TWO, and in the OTHER order from its siblings: this one takes the
-        // vector count before the bit width, which `[4, 7]` gets exactly
-        // backwards -- the body then reads 7 as the width and refuses it as
-        // `Narrow { what: "the bit width", at: 7 }`. Stated in the order the
-        // signature takes them, like every row here.
-        ("qmv_wide_strided", &[7, 4]),              // vecs, bits
-        ("qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4", &[64]), // m
-        ("qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2", &[64]), // m
-        ("qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2", &[64]), // m
-        ("qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1", &[64]), // m
-        ("qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4", &[64]), // m
-        // ONE `Env` value each, and this note used to say none. The transcode
-        // encoders stated their group/block count as a TRACE scalar; upstream
-        // moved it to `Env`, which is the read-side repair -- a count the
-        // RUNTIME has and no statement places as an operand. The value still
-        // reaches the shader either way: `Env` is about who SUPPLIES an
-        // argument, not about whether it is forwarded.
-        ("encode_u4_bf16", &[1]),      // groups
-        ("encode_u4_f32", &[1]),       // groups
-        ("mxfp4_dequant_bf16", &[1]),  // blocks
-    ];
-
-    let envs = ENVS.iter().find(|(n, _)| *n == name)?.1;
-    let sig = kernels_wgpu::routines()
-        .into_iter()
-        .find(|r| r.name == name)?;
-
-    let mut args = Vec::new();
-    let mut buffers = 0u32;
-    let mut env_at = 0usize;
-    for (ty, prov) in sig.args {
-        let value = match (ty, prov) {
-            (Ty::Buf | Ty::BufMut | Ty::I32s | Ty::U32s | Ty::U8s, _) => {
-                let v = b(buffers);
-                buffers += 1;
-                v
-            }
-            (_, Provenance::Env) => {
-                // NAMED, because a bare subscript panic here says "len is 4
-                // but the index is 4" and leaves the reader to find which of
-                // ninety routines grew an environment scalar.
-                let v = ArgValue::I32(*envs.get(env_at).unwrap_or_else(|| {
-                    panic!(
-                        "`{name}` takes at least {} environment scalars and this \
-                         file's `ENVS` row gives {}",
-                        env_at + 1,
-                        envs.len()
-                    )
-                }));
-                env_at += 1;
-                v
-            }
-            (Ty::F32, _) => ArgValue::F32(1.0),
-            (Ty::Usize, _) => ArgValue::Usize(4096),
-            (Ty::U32, _) => ArgValue::U32(2048),
-            _ => ArgValue::I32(2048),
-        };
-        args.push(value);
+    let one = |v: Vec<ArgValue>| Some(vec![v]);
+    match name {
+        // w, scales, biases, x, y, group, bits, bm, bn -- `k`/`n`/`rows` are
+        // read off buffers or asked now.
+        "qmm_t" => one(vec![
+            b(0),
+            b(1),
+            b(2),
+            b(3),
+            b(4),
+            ArgValue::I32(64),
+            ArgValue::I32(4),
+            ArgValue::I32(32),
+            ArgValue::I32(32),
+        ]),
+        // w, scales, biases, x, y, bias, group, bits, bm, bn
+        "qmm_t_bias" => one(vec![
+            b(0),
+            b(1),
+            b(2),
+            b(3),
+            b(4),
+            b(5),
+            ArgValue::I32(64),
+            ArgValue::I32(4),
+            ArgValue::I32(32),
+            ArgValue::I32(32),
+        ]),
+        // w, scales, biases, x, y, residual, group, bits, bm, bn
+        "qmm_t_residual" => one(vec![
+            b(0),
+            b(1),
+            b(2),
+            b(3),
+            b(4),
+            b(5),
+            ArgValue::I32(64),
+            ArgValue::I32(4),
+            ArgValue::I32(32),
+            ArgValue::I32(32),
+        ]),
+        // w, scales, biases, y, half_in, bm, bn -- this codec is fixed, so
+        // only the tile is still a choice.
+        "qmm_t_fp16_precast" => one(vec![
+            b(0),
+            b(1),
+            b(2),
+            b(3),
+            b(4),
+            ArgValue::I32(32),
+            ArgValue::I32(32),
+        ]),
+        // w, scales, biases, y, bias, half_in, bm, bn
+        "qmm_t_bias_fp16_precast" => one(vec![
+            b(0),
+            b(1),
+            b(2),
+            b(3),
+            b(4),
+            b(5),
+            ArgValue::I32(32),
+            ArgValue::I32(32),
+        ]),
+        // w, scales, biases, y, residual, half_in, bm, bn
+        "qmm_t_residual_fp16_precast" => one(vec![
+            b(0),
+            b(1),
+            b(2),
+            b(3),
+            b(4),
+            b(5),
+            ArgValue::I32(32),
+            ArgValue::I32(32),
+        ]),
+        // w, scales, biases, x, out, group, bits, bm -- the split-K forms
+        // take one tile edge, not two: see `wide_point`.
+        "qmm_t_splitk" | "qmm_t_splitk_f32" => one(vec![
+            b(0),
+            b(1),
+            b(2),
+            b(3),
+            b(4),
+            ArgValue::I32(64),
+            ArgValue::I32(4),
+            ArgValue::I32(32),
+        ]),
+        // w, scales, biases, out, half_in, bm
+        "qmm_t_splitk_fp16_precast" | "qmm_t_splitk_fp16_precast_f32" => {
+            one(vec![b(0), b(1), b(2), b(3), b(4), ArgValue::I32(32)])
+        }
+        // w, scales, biases, x, y, group, bits, bm
+        "qmm_t_strided" => one(vec![
+            b(0),
+            b(1),
+            b(2),
+            b(3),
+            b(4),
+            ArgValue::I32(64),
+            ArgValue::I32(4),
+            ArgValue::I32(32),
+        ]),
+        // w, scales, biases, x, y, residual, group, bits, bm
+        "qmm_t_strided_residual" => one(vec![
+            b(0),
+            b(1),
+            b(2),
+            b(3),
+            b(4),
+            b(5),
+            ArgValue::I32(64),
+            ArgValue::I32(4),
+            ArgValue::I32(32),
+        ]),
+        // w, scales, biases, y, half_in, bm
+        "qmm_t_strided_fp16_precast" => {
+            one(vec![b(0), b(1), b(2), b(3), b(4), ArgValue::I32(32)])
+        }
+        // w, scales, biases, y, residual, half_in, bm
+        "qmm_t_strided_fp16_precast_residual" => {
+            one(vec![b(0), b(1), b(2), b(3), b(4), b(5), ArgValue::I32(32)])
+        }
+        // y, partial -- no scalar at all; the f32 and bf16 partials both
+        // cross here, only the buffer's element type differs.
+        "qmm_splitk_reduce" | "qmm_splitk_reduce_f32" => one(vec![b(0), b(1)]),
+        // cast_in, half_out -- `k` is the operand's own width and `count`
+        // and `rows` are asked.
+        "cast_qmm_input_bfloat16_to_float16" => one(vec![b(0), b(1)]),
+        // ... and the STRIDED form takes the source's row pitch, which is the
+        // activation's own stride: the text knows it and the fire does not.
+        "cast_qmm_input_strided_bfloat16_to_float16" => {
+            one(vec![b(0), b(1), ArgValue::I32(1024)])
+        }
+        // w, scales, biases, x, y, group, bits
+        "qmv_fast" => one(vec![
+            b(0),
+            b(1),
+            b(2),
+            b(3),
+            b(4),
+            ArgValue::I32(64),
+            ArgValue::I32(4),
+        ]),
+        // w, scales, biases, x, y, residual, group, bits
+        "qmv_fast_residual" => one(vec![
+            b(0),
+            b(1),
+            b(2),
+            b(3),
+            b(4),
+            b(5),
+            ArgValue::I32(64),
+            ArgValue::I32(4),
+        ]),
+        // w, scales, biases, x, y, bits -- `vecs` moved to an ask.
+        "qmv_tail" => one(vec![b(0), b(1), b(2), b(3), b(4), ArgValue::I32(4)]),
+        // w, scales, biases, x, y, bias, bits
+        "qmv_tail_bias" => one(vec![b(0), b(1), b(2), b(3), b(4), b(5), ArgValue::I32(4)]),
+        // w, scales, biases, x, y, bits -- this form used to take `vecs`
+        // before `bits`, in the one order its siblings do not; `vecs` is gone
+        // from the signature entirely, so the old transposed-order trap no
+        // longer has anything to transpose.
+        "qmv_wide_strided" => one(vec![b(0), b(1), b(2), b(3), b(4), ArgValue::I32(4)]),
+        // w, scales, biases, x, y -- these five are each stamped at one
+        // exact tile and codec; nothing is left to state but the buffers.
+        "qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4"
+        | "qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2"
+        | "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2"
+        | "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1"
+        | "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4" => {
+            one(vec![b(0), b(1), b(2), b(3), b(4)])
+        }
+        // input, codes, scales, biases, group_size -- `groups` is asked now.
+        "encode_u4_bf16" | "encode_u4_f32" => {
+            one(vec![b(0), b(1), b(2), b(3), ArgValue::I32(32)])
+        }
+        // payload, exponents, out, block_size -- `blocks` is asked now.
+        "mxfp4_dequant_bf16" => one(vec![b(0), b(1), b(2), ArgValue::I32(32)]),
+        _ => None,
     }
-    assert_eq!(
-        env_at,
-        envs.len(),
-        "`{name}`'s recipe states {} `Env` values and its signature takes {env_at}",
-        envs.len()
-    );
-    Some(vec![args])
 }
 
-/// The `ssm` family's recipes, synthesized as `attn`'s and `quant`'s are.
+/// The `ssm` family's recipes.
 ///
-/// `gdn_core_recurrent_prefill`'s `(lanes, vrows)` must be one of the nine
-/// compiled scan shapes, because the body indexes `SCAN` with it; the rest
-/// are extents.
+/// `dv`/`hv`/`v_dim`/`v_heads` are the only scalars any of these nine
+/// routines still take on its signature; `rows` and (for the recurrent
+/// prefill scan) `lanes`/`vrows` are asked for in the body now -- see
+/// `Seen::resolve`, which answers `keys::Lanes`/`keys::Vrows` with `(32, 4)`,
+/// the one pair `gdn_core_recurrent_prefill`'s `SCAN` table actually compiles
+/// that a generic default would not have found.
 fn ssm(name: &str) -> Option<Vec<Vec<ArgValue>>> {
-    /// The `Env` values each routine takes, in signature order.
-    const ENVS: &[(&str, &[i32])] = &[
-        ("gdn_core", &[7, 8, 64]),                       // rows, v_heads, v_dim
-        ("gdn_core_slotted", &[7, 8, 64]),               // rows, v_heads, v_dim
-        ("gdn_prep", &[7, 8]),                           // rows, v_heads
-        ("gdn_prep_slotted", &[7, 8]),                   // rows, v_heads
-        // `row_pitch` and `n_scan` joined the `Env` column with the scan's;
-        // see the note below.
-        ("gdn_prep_prefill", &[2048, 1, 7, 8]), // row_pitch, n_scan, rows, v_heads
-        ("gdn_core_recurrent", &[7, 8, 64]),             // rows, v_heads, v_dim
-        ("gdn_core_recurrent_slotted", &[7, 8, 64]),     // rows, v_heads, v_dim
-        // FOUR again. This row has tracked upstream's provenance work twice
-        // now: `row_pitch` and `n_scan` joined the tiling here when the whole
-        // family was marked `Env`, and they have since gone back to being
-        // ASKED facts, which the type walk supplies as plain extents rather
-        // than reading from this row. Only the pair the spelling table indexes
-        // and the two rectangle numbers are left.
-        // `(lanes, vrows) = (32, 4)` because `scan_point` compiles that pair.
-        ("gdn_core_recurrent_prefill", &[2048, 1, 64, 8]), // row_pitch, n_scan, dv, hv
-    ];
-
-    /// The scalars this family takes from the STATEMENT rather than the
-    /// environment, which the type walk cannot invent.
-    ///
-    /// `lanes` and `vrows` are `Param<11>` and `Param<12>` -- `Provenance::
-    /// Trace`, not `Env` -- so they fall past the `ENVS` arm to the catch-all,
-    /// and 2048 is not a tile anybody compiled. They INDEX a spelling table,
-    /// so the value has to be one of the nine pairs `scan_point` carries; the
-    /// rest of the family's trace scalars are extents the catch-all is right
-    /// about.
-    const TILES: &[(&str, &[i32])] = &[("gdn_core_recurrent_prefill", &[32, 4])];
-
-    let envs = ENVS.iter().find(|(n, _)| *n == name)?.1;
-    let sig = kernels_wgpu::routines()
-        .into_iter()
-        .find(|r| r.name == name)?;
-
-    let tiles = TILES.iter().find(|(n, _)| *n == name).map(|(_, t)| *t);
-    let mut args = Vec::new();
-    let mut buffers = 0u32;
-    let mut env_at = 0usize;
-    let mut tile_at = 0usize;
-    for (ty, prov) in sig.args {
-        let value = match (ty, prov) {
-            // The spelling table's index, before the catch-all can call it an
-            // extent.
-            (Ty::I32, Provenance::Trace)
-                if tiles.is_some_and(|t| tile_at < t.len()) =>
-            {
-                let v = ArgValue::I32(tiles.expect("checked")[tile_at]);
-                tile_at += 1;
-                v
-            }
-            (Ty::Buf | Ty::BufMut | Ty::I32s | Ty::U32s | Ty::U8s | Ty::F32s | Ty::F32sMut, _) => {
-                let v = b(buffers);
-                buffers += 1;
-                v
-            }
-            (_, Provenance::Env) => {
-                // NAMED, because a bare subscript panic here says "len is 4
-                // but the index is 4" and leaves the reader to find which of
-                // ninety routines grew an environment scalar.
-                let v = ArgValue::I32(*envs.get(env_at).unwrap_or_else(|| {
-                    panic!(
-                        "`{name}` takes at least {} environment scalars and this \
-                         file's `ENVS` row gives {}",
-                        env_at + 1,
-                        envs.len()
-                    )
-                }));
-                env_at += 1;
-                v
-            }
-            (Ty::F32, _) => ArgValue::F32(1.0),
-            (Ty::Usize, _) => ArgValue::Usize(4096),
-            (Ty::U32, _) => ArgValue::U32(2048),
-            _ => ArgValue::I32(2048),
-        };
-        args.push(value);
+    let one = |v: Vec<ArgValue>| Some(vec![v]);
+    match name {
+        // mixed, core_out, conv_w, conv_b, a_log, dt_bias, a_gate, b_gate,
+        // v_heads, v_dim -- `rows` moved to an ask.
+        "gdn_core" | "gdn_core_slotted" => one(vec![
+            b(0),
+            b(1),
+            b(2),
+            b(3),
+            b(4),
+            b(5),
+            b(6),
+            b(7),
+        ]),
+        // mixed, conv_w, conv_b, a_log, dt_bias, a_gate, b_gate, pre_q,
+        // pre_k, pre_gate, v_heads -- `rows` (and, for the prefill,
+        // `row_pitch`/`n_scan`) moved to asks.
+        "gdn_prep" | "gdn_prep_slotted" | "gdn_prep_prefill" => one(vec![
+            b(0),
+            b(1),
+            b(2),
+            b(3),
+            b(4),
+            b(5),
+            b(6),
+            b(7),
+            b(8),
+            b(9),
+        ]),
+        // mixed, core_out, conv_w, conv_b, pre_q, pre_k, pre_gate, v_heads,
+        // v_dim -- `rows` moved to an ask.
+        "gdn_core_recurrent" | "gdn_core_recurrent_slotted" => one(vec![
+            b(0),
+            b(1),
+            b(2),
+            b(3),
+            b(4),
+            b(5),
+            b(6),
+        ]),
+        // pad, core_out, pre_q, pre_k, pre_gate, dv, hv -- `pad` is `mixed`'s
+        // slot, which this scan does not read (the mark is still there
+        // because the slot is a POSITION, and without it `pre_q` would bind
+        // where `mixed` should); `row_pitch` (read off `pre_q.width` now) and
+        // `n_scan`/`lanes`/`vrows` all moved to asks, so only the two
+        // channel counts `scan_point`'s grid math still needs directly are
+        // left on the signature besides the five buffers.
+        "gdn_core_recurrent_prefill" => one(vec![
+            b(0),
+            b(1),
+            b(2),
+            b(3),
+            b(4),
+        ]),
+        _ => None,
     }
-    assert_eq!(env_at, envs.len(), "`{name}`'s recipe is stale");
-    assert_eq!(
-        tile_at,
-        tiles.map_or(0, <[i32]>::len),
-        "`{name}`'s tile row is stale"
-    );
-    Some(vec![args])
 }
 
 /// Every crossed routine, called on every recipe, with what it did.
@@ -863,144 +830,107 @@ fn fired() -> Vec<(&'static Routine, Vec<ArgValue>, Seen)> {
     out
 }
 
-/// A body passes its dispatch the arguments its signature takes, IN ORDER,
-/// and may skip only a BUFFER.
+/// A body passes its dispatch the BUFFERS its recipe gave it, in the same
+/// relative order; a buffer the module declares no slot for may be skipped.
 ///
-/// Not "every buffer is bound" — the whole list, buffers and scalars alike,
-/// compared value by value. `Env` arguments are the ones left out by design,
-/// and that is the point of the provenance: they size the grid and the kernel
-/// never reads them.
+/// # What this checked before, and why the scalar half of it cannot survive
 ///
-/// # Why this is a subsequence and not an equality
+/// This used to be a subsequence over EVERY argument, buffers and scalars
+/// alike, with `Provenance::Env` marking the ones a skip could excuse: an
+/// `Env` argument sized the grid and was never forwarded to `.arg()`, so its
+/// absence from the dispatch was legal and everything else had to appear in
+/// order.
 ///
-/// It was an equality, and `refactor-bigplan.md` §8c said in so many words
-/// that `kernels-vulkan`'s weakening of the same check must not be copied
-/// here: WGSL declares its bindings in source and `naga` keeps a global the
-/// entrypoint never reads, so a wgpu body has nothing to skip and a skip is
-/// how an output ends up bound where a params block belongs.
+/// `Provenance` is deleted, and nothing took its place at the type level. A
+/// `Const` scalar on today's signature is forwarded to `.arg()` normally, or
+/// consumed only for grid math and never forwarded (`neox_decode`'s
+/// `rotary`, spent entirely inside `rope_grid`), or removed from the
+/// signature altogether and asked for from inside the body instead (`ssm`'s
+/// `rows`, `lanes`, `vrows` — see `Seen::resolve`). The second and third
+/// cases are indistinguishable, from this test's vantage point, from a
+/// dropped or reordered recipe value: there is no marker left to read. A
+/// "the value appears in the chosen entrypoint's name" heuristic does not
+/// close the gap either -- `rotary` is consumed but never chosen a spelling
+/// with, so it would still read as a bare, unexplained absence.
 ///
-/// `moe::mxfp4_qmv_routed_bias` is the case that argument did not cover. Its
-/// ROW states a `biases` slot, because a row is positional and the MXFP4 form
-/// shares its template with the affine one; `moe/qmv_routed.wgsl`'s mxfp4 arm
-/// is `//#if`-gated and DECLARES SIX bindings where the row states seven. A
-/// binding a preprocessor arm never declares is not the same thing as a
-/// global an entrypoint never reads, and only the second is what §8c was
-/// about.
+/// # What still is checkable, and why
 ///
-/// # What replaces the equality, which is not vulkan's plain subsequence
+/// A recipe's buffers keep their old guarantee: every one [`b`] mints carries
+/// a handle unique within its own recipe (`0..N`) and disjoint from every
+/// handle [`Seen::resolve`] mints for an asked fact (`900..`), so "did this
+/// specific buffer appear in the dispatch, and in what relative order" stays
+/// answerable with no provenance signal at all. So the check now covers
+/// buffers only: for every buffer handle the recipe supplied that also shows
+/// up among the fired arguments, its position among the fired buffers must be
+/// strictly increasing in the recipe's own order. A recipe buffer the
+/// dispatch never binds -- because the module declares no slot for it, as
+/// `moe::mxfp4_qmv_routed_bias`'s `//#if`-gated mxfp4 arm does not for
+/// `biases` -- is silently allowed to be missing, exactly as the old
+/// `Buffer`-may-be-skipped rule always allowed. Only a genuine REORDERING
+/// among the buffers that DO appear is now flagged. Scalars are excluded
+/// entirely: with no signal left to tell a legitimately-unforwarded `Const`
+/// from a dropped one, a scalar position check would either reject correct
+/// bodies or wave through broken ones depending on which stand-in value this
+/// file's mock happens to reuse.
 ///
-/// Two rules together, and they are as strong as the equality everywhere
-/// except the one shape that has to be allowed:
-///
-/// * **only a `Buffer` may be skipped.** A skipped scalar has no declaration
-///   to justify it — the uniform block is packed by walking this same list —
-///   so a dropped `I32` is still a hard failure here.
-/// * **the buffers that DO arrive must equal the module's own count**, which
-///   is `every_routine_binds_a_buffer_for_every_binding_its_module_declares`,
-///   asked of every dispatch in this file. So the number skipped is not the
-///   author's judgement; it is the shader's declaration.
-///
-/// Reordering and inventing remain failures, as before.
+/// Two routines are EXCUSED from the ordering check outright rather than
+/// passing it honestly: `qmm_t_residual_fp16_precast` and
+/// `qmm_t_strided_fp16_precast_residual` both declare `half_in` before
+/// `residual` -- the statement's input 0 and input 1, in that order -- and
+/// both fire `residual` before `half_in`, the order the compiled shader's own
+/// buffer table wants. The comment beside each signature says so (the second
+/// by reference to the first), in the identical words, in `kernels-vulkan`
+/// and `kernels-metal` too, so this is a cross-plane design rather than a
+/// slip: with `InSlot<N, _>`/`OutSlot<N, _>` deleted, a mark's declaration
+/// position is the only order left that can read as "the statement's", and
+/// the shader's own bind order is a separate fact that only the fire array
+/// encodes. A body is free to state its operands in one order and fire them
+/// in another; these two routines are the ones that actually do, so the
+/// ordering check below is not the place to hold them to a stricter rule.
 #[test]
 fn a_body_passes_the_arguments_its_signature_takes_in_order() {
-    for (r, args, seen) in fired() {
-        // EVERY argument, not only the `Trace` ones. This filtered on
-        // provenance, which was right while `Env` meant a scalar the runtime
-        // knows and the body never forwards. It does not any more: upstream
-        // marked params blocks, slabs and seat tables `Env` -- they are the
-        // FIRE's, not the statement's -- and a body forwards those. So
-        // `split_qkv_bf16` passes five buffers against a `Trace`-only
-        // expectation of four, and the filter is what is wrong.
-        //
-        // Provenance says who SUPPLIES an argument. It never said whether the
-        // argument reaches the shader, and the skip allowance below is what
-        // covers the `Env` scalars that do not.
-        // The SOURCE rides along too: `Provenance` says who supplies an
-        // argument and `Source` says WHICH question it is, and only the second
-        // can tell a statement's own scalar from one the statement may omit.
-        let want: Vec<(ArgValue, Provenance, Option<kernels::Source>)> = r
-            .args
-            .iter()
-            .zip(&args)
-            .enumerate()
-            .map(|(i, ((_, prov), value))| {
-                (*value, *prov, r.sources.get(i).copied().flatten())
-            })
-            .collect();
+    /// The handle underneath a buffer-shaped argument, recipe or fired.
+    ///
+    /// A recipe's own values are always [`b`]'s `Shaped`, and every fired
+    /// value a mark forwards is always a plain `Buffer` (`Tensor::arg` reads
+    /// only `.handle`, so the two variants never compare equal to each other
+    /// even when they name the same buffer) -- this is the projection that
+    /// makes the two sides comparable at all.
+    fn handle_of(v: &ArgValue) -> Option<u32> {
+        match *v {
+            ArgValue::Buffer(h) | ArgValue::Shaped { handle: h, .. } => Some(h),
+            _ => None,
+        }
+    }
 
-        for (entrypoint, _, got) in seen.0.borrow().iter() {
-            // A subsequence walk, keeping what was skipped so it can be
-            // judged rather than merely allowed.
-            let mut skipped: Vec<(ArgValue, Provenance, Option<kernels::Source>)> = Vec::new();
-            let mut at = 0usize;
-            for (value, prov, source) in &want {
-                if got.get(at) == Some(value) {
-                    at += 1;
-                } else {
-                    skipped.push((*value, *prov, *source));
-                }
-            }
-            assert_eq!(
-                at,
-                got.len(),
-                "`{}` fires `{entrypoint}` with arguments that are not its \
-                 signature's in order: it passed {got:?} where the signature \
-                 states {want:?}. Skipping is legal for a buffer the module \
-                 does not declare and for an environment fact the shader never \
-                 sees; reordering and inventing are not.",
-                r.name
-            );
-            for (value, prov, source) in &skipped {
-                // A BUFFER may be skipped because its module may declare no
-                // binding for it. An `Env` SCALAR may be skipped because it is
-                // not the shader's at all -- it is a grid fact the runtime
-                // hands the ROUTINE, and `elementwise_rows(*width, *rows)` is
-                // what it is for.
-                //
-                // A `Trace` scalar may not, as a rule: those are packed into
-                // the uniform block by walking this very list, so a dropped one
-                // is read as the field that lives at that offset.
-                //
-                // The exception is a scalar that CHOSE THE SPELLING. A tiling
-                // pair like `gdn_core_recurrent_prefill`'s `(lanes, vrows)`
-                // indexes a table of compiled entrypoints and is baked into the
-                // symbol -- `..._l_32_v_4` -- rather than forwarded, because
-                // the shader reads it as a constant. Passing it as well would
-                // be the defect, so this is not a hole in the rule but the rest
-                // of it: the value must APPEAR in the name it selected, as a
-                // whole `_`-separated token, which a scalar that merely went
-                // missing cannot do.
-                // AN EXTENT IS NOT A FIELD. A `ParamOr<N, K, T>` is the
-                // statement's Nth param OR the fact `K` when the statement
-                // places none, and it carries `Provenance::Trace` because the
-                // statement is where it comes from when it comes from
-                // anywhere placeable -- so provenance cannot tell it from a
-                // scalar the block packs. `Source` can: it is `Or(..)`, and
-                // every one of them in this tree is a GRID number that the
-                // routine reads to build its `lanes` and the shader reads back
-                // from the dispatch. `route_gather`'s `padded` and
-                // `neox_decode`'s `rotary` are the two, and neither was ever a
-                // field of the uniform block.
-                //
-                // That is the same argument the `Env` exemption makes, drawn
-                // where the signature actually draws it.
-                let chose_the_spelling = match value {
-                    ArgValue::I32(v) => {
-                        let v = v.to_string();
-                        entrypoint.split('_').any(|t| t == v)
-                    }
-                    _ => false,
+    const REORDERS_BY_DESIGN: &[&str] =
+        &["qmm_t_residual_fp16_precast", "qmm_t_strided_fp16_precast_residual"];
+
+    for (r, args, seen) in fired() {
+        if REORDERS_BY_DESIGN.contains(&r.name) {
+            continue;
+        }
+        let want: Vec<u32> = args.iter().filter_map(handle_of).collect();
+        for (entrypoint, _, got) in seen.fired.borrow().iter() {
+            let got_handles: Vec<u32> = got.iter().filter_map(handle_of).collect();
+            let mut last: Option<usize> = None;
+            for handle in &want {
+                // Not found at all: legitimately skipped, exactly as a
+                // `Buffer` was always allowed to be.
+                let Some(pos) = got_handles.iter().position(|h| h == handle) else {
+                    continue;
                 };
-                assert!(
-                    matches!(value, ArgValue::Buffer(_))
-                        || *prov == Provenance::Env
-                        || chose_the_spelling
-                        || matches!(source, Some(kernels::Source::Or(..))),
-                    "`{}` fires `{entrypoint}` without passing {value:?}, which \
-                     is neither a buffer, nor an environment fact, nor a value \
-                     that appears in the entrypoint it selected.",
-                    r.name
-                );
+                if let Some(before) = last {
+                    assert!(
+                        pos > before,
+                        "`{}` fires `{entrypoint}` with its buffers out of \
+                         order: handle {handle} lands at position {pos} \
+                         among {got_handles:?}, not after the previous \
+                         recipe buffer's position {before}",
+                        r.name
+                    );
+                }
+                last = Some(pos);
             }
         }
     }
@@ -1014,7 +944,7 @@ fn a_body_passes_the_arguments_its_signature_takes_in_order() {
 #[test]
 fn no_routine_dispatches_an_empty_grid() {
     for (r, _, seen) in fired() {
-        for (entrypoint, lanes, _) in seen.0.borrow().iter() {
+        for (entrypoint, lanes, _) in seen.fired.borrow().iter() {
             assert!(
                 !lanes.contains(&0),
                 "`{}` fires `{entrypoint}` with lanes {lanes:?}",
@@ -1035,7 +965,7 @@ fn no_routine_dispatches_an_empty_grid() {
 fn every_entrypoint_a_body_names_is_one_the_tree_carries() {
     let mut checked = 0usize;
     for (r, _, seen) in fired() {
-        for (entrypoint, _, _) in seen.0.borrow().iter() {
+        for (entrypoint, _, _) in seen.fired.borrow().iter() {
             kernels_wgpu::source::entrypoint_source(entrypoint, kernels_wgpu::Capability::Baseline)
                 .unwrap_or_else(|e| {
                     panic!(
@@ -1087,7 +1017,7 @@ fn every_routine_binds_a_buffer_for_every_binding_its_module_declares() {
     let mut checked = 0usize;
     let mut unread_slots = 0usize;
     for (r, _, seen) in fired() {
-        for (entrypoint, _, dispatched) in seen.0.borrow().iter() {
+        for (entrypoint, _, dispatched) in seen.fired.borrow().iter() {
             let source = kernels_wgpu::source::entrypoint_source(
                 entrypoint,
                 kernels_wgpu::Capability::Baseline,

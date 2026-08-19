@@ -98,10 +98,15 @@ builder! {
 
 
     /// `kernels::ssm::zamba_rmsnorm_gated_bf16`.
-    pub fn zamba_rmsnorm_gated(x: &Val, gate: &Val, weight: &str, hidden: u32) -> Val {
+    ///
+    /// `n_groups` is the routine's one `Const`: a grouped RMS norm reduces
+    /// within a group, so the count is the geometry and not a fact of the
+    /// fire. Stating it is what `check_plan`'s params rule counts.
+    pub fn zamba_rmsnorm_gated(x: &Val, gate: &Val, weight: &str, hidden: u32, n_groups: u32) -> Val {
         symbol: "ssm::zamba_rmsnorm_gated_bf16",
         on: x,
         weights: [weight],
+        params: [n_groups],
         inputs: [x, gate],
         out: [Dim::Tokens, Dim::Const(hidden)] as BF16,
         made: "the norm produces its value",
@@ -205,12 +210,17 @@ builder! {
         width: u32,
         heads: u32,
         head_dim: u32,
+        eps: f32,
     ) -> Val {
         symbol: "ssm::kda_o_norm_gated_bf16",
         on: x,
         weights: [weight],
-        // params[0] = heads, params[1] = head_dim; grid and state stride use this order.
-        params: [heads, head_dim],
+        // params[0] = heads, params[1] = head_dim, params[2] = eps read as
+        // its bits; grid and state stride use this order. The epsilon was
+        // `Env<keys::RmsEps>` and is the ROW's number, so the statement
+        // carries it -- an unstated one is a zero, and a zero epsilon makes
+        // every all-zero row divide by nothing.
+        params: [heads, head_dim, eps.to_bits()],
         inputs: [x, gate],
         out: [Dim::Tokens, Dim::Const(width)] as BF16,
         made: "the norm produces its value",

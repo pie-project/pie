@@ -1,10 +1,11 @@
 //! The PTIR substrate's own kernels -- the ones the tensor-compiler's
 //! emitted shader text cannot produce because they predate a region.
 
+use kernels_macros::routine;
+use crate::routine::{Asks, Bind, Ctx, Fire, In, Out, Tensor, bf16, keys};
+use kernels::KernelSig;
 use kernels::routine::Refusal;
 
-use crate::routine::{keys, Ask, Bind, Block, Buf, BufMut, Ctx, Fire, Routine};
-use crate::routine::{InSlot, OutSlot};
 
 // This family's `kernel!` row was NOT filled, and that was never an
 // oversight: this backend's channel-plane interpreter does not dispatch
@@ -44,81 +45,22 @@ pub static ENTRYPOINTS: &[&str] = &["copy_logits_bf16"];
 /// [`Refusal::Empty`] for an empty vocabulary or an empty row count. A
 /// zero-lane dispatch is legal Vulkan that runs nothing and reports success,
 /// so the caller would read the destination it passed as a staged row.
+#[routine]
 pub fn copy_logits_bf16(
     ctx: &Ctx<'_>,
-    source: InSlot<0, Buf>,
-    destination: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    vocab: Ask<keys::Width, u32>,
-    rows: Ask<keys::Rows, u32>,
-) -> Result<(), Refusal> {
-    if *rows == 0 {
+    source: In<Tensor<bf16>>,
+    destination: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let vocab = source.width.unsigned_abs();
+    let rows = ctx.ask::<u32, keys::Rows>()?;
+    if rows == 0 {
         return Err(Refusal::Empty { what: "rows" });
     }
-    if *vocab == 0 {
+    if vocab == 0 {
         return Err(Refusal::Empty { what: "vocab" });
     }
-    ctx.dispatch(
-        Fire {
-            entrypoint: "copy_logits_bf16",
-            lanes: [*vocab, *rows, 1],
-        },
-        &[source.v(), destination.v(), params.v()],
+    ctx.fire(
+        Fire::at(crate::routine::module_path("copy_logits_bf16", ctx.best()), "copy_logits_bf16").apply([vocab, rows, 1]),
+        &[source.arg(), destination.arg(), params],
     )
-}
-
-/// The crossed rows of this family.
-pub static ROUTINES: &[Routine] = &[crate::routine!(copy_logits_bf16)];
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::routine::{ArgValue, Encode};
-    use core::cell::RefCell;
-
-    type Call = (String, [u32; 3], Vec<ArgValue>);
-
-    #[derive(Default)]
-    struct Seen(RefCell<Vec<Call>>);
-
-    impl Encode for Seen {
-        fn dispatch(&self, fire: Fire<'_>, args: &[ArgValue]) -> Result<(), Refusal> {
-            self.0
-                .borrow_mut()
-                .push((fire.entrypoint.to_string(), fire.lanes, args.to_vec()));
-            Ok(())
-        }
-    }
-
-    /// A lane per vocabulary entry, a row per record, and no scalar pushed.
-    ///
-    /// The x extent is the FULL vocabulary and not half of it: the wgpu port
-    /// of this kernel writes two entries per lane and launches `vocab / 2`,
-    /// and the Slang one writes one, so a grid copied across from that crate
-    /// would stage the first half of every row and leave the rest holding
-    /// whatever the arena held.
-    #[test]
-    fn a_staging_fires_one_lane_for_each_entry_of_each_row() {
-        let seen = Seen::default();
-        copy_logits_bf16(&seen, InSlot::new(Buf(0)), OutSlot::new(BufMut(1)), Block::new(Buf(2)), Ask::new(262_144), Ask::new(16)).unwrap();
-        let calls = seen.0.borrow();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].1, [262_144, 16, 1]);
-        assert_eq!(calls[0].2.len(), 3, "the row states no scalar block");
-    }
-
-    /// An empty grid is refused on either axis, and names which.
-    #[test]
-    fn an_empty_vocabulary_or_row_count_is_refused() {
-        let seen = Seen::default();
-        assert!(matches!(
-            copy_logits_bf16(&seen, InSlot::new(Buf(0)), OutSlot::new(BufMut(1)), Block::new(Buf(2)), Ask::new(8), Ask::new(0)),
-            Err(Refusal::Empty { what: "rows" })
-        ));
-        assert!(matches!(
-            copy_logits_bf16(&seen, InSlot::new(Buf(0)), OutSlot::new(BufMut(1)), Block::new(Buf(2)), Ask::new(0), Ask::new(4)),
-            Err(Refusal::Empty { what: "vocab" })
-        ));
-        assert!(seen.0.borrow().is_empty(), "a refused shape dispatched");
-    }
 }

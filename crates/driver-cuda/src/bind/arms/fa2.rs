@@ -31,8 +31,7 @@
 use core::ffi::c_void;
 
 use kernels::Refusal;
-use kernels::keys::{self, Fact};
-use kernels::routine::{Env, In, Out};
+use kernels::routine::{Const, In, Out};
 use kernels_cuda::jit::Ctx;
 use kernels_cuda::jit::abi::bf16;
 use kernels_cuda::attn::kv_paged;
@@ -139,30 +138,37 @@ unsafe fn upload(
 ///
 /// `let _ =`: a layer whose dtype `KvDType` does not name skips the prelude and
 /// the attention below still runs.
-fn dequant_prelude(cx: &Cx<'_>, stream: *mut c_void, pages: i32) -> Result<(), Refusal> {
+fn dequant_prelude(cx: &Cx<'_>, stream: *mut c_void, _pages: i32) -> Result<(), Refusal> {
     let layer = cx.kv_layer()?;
-    let plan = cx.plan()?;
+    let _plan = cx.plan()?;
     // SAFETY: `stream` is the fire's own, live across the launch.
-    let ctx = unsafe { Ctx::on(stream) };
-    let _ = kv_paged::dequant_kv_cache_layer_to_bf16_active(
-        &ctx,
-        keys::KvKeys::env(layer.k_pages.cast()),
-        keys::KvValues::env(layer.v_pages.cast()),
-        keys::KvKeyScales::env(layer.k_scales),
-        keys::KvValueScales::env(layer.v_scales),
-        keys::KvBf16Keys::env(layer.k_bf16_pages),
-        keys::KvBf16Values::env(layer.v_bf16_pages),
-        keys::KvPageSize::env(layer.page_size),
-        keys::KvNumHeads::env(layer.num_kv_heads),
-        keys::KvHeadDim::env(layer.head_dim),
-        keys::KvBlockSize::env(layer.block_size),
-        keys::KvSchemeByte::env(layer.scheme as i32),
-        keys::KvStorageDtype::env(layer.storage_dtype as i32),
-        keys::KvNativeBf16::env(layer.is_native_bf16),
-        keys::KvPageIndices::env(plan.kv_page_indices),
-        keys::KvPagesInBatch::env(pages),
-    );
+    // AND IT LENDS THIS FIRE'S ANSWERS: the bodies ask for the plan
+    // leaves and the KV pool rather than taking them as parameters.
+    let answers = crate::bind::table::Answering::over_facts(cx);
+    let ctx = unsafe { Ctx::on(stream) }.with_env(&answers);
+    // THE SEVEN LAYER NUMBERS ARE ASKED FOR INSIDE THE CALLEE NOW: they came
+    // off `cx.kv_layer()` here and reach the body off the same borrow through
+    // `keys::Kv_`, so there is one source rather than two that could disagree.
+    let _ = kv_paged::dequant_kv_cache_layer_to_bf16_active(&ctx);
     Ok(())
+}
+
+/// `attn::dequant_kv_cache_layer_to_bf16_active`, as its own arm.
+///
+/// A HAND ARM AGAIN, and not a regression: the routine takes NOTHING from the
+/// statement now — its seven layer numbers are asked for and its pointers come
+/// off `Cx` — so there is no operand column to derive, and `derived_arm`
+/// refuses an empty one with "nothing states an operand column". A row bound
+/// from a column it does not have is the same mistake as a column bound from
+/// a row that does not exist.
+///
+/// The body is `dequant_prelude`'s, whose page count this launch does not use.
+///
+/// # Errors
+///
+/// Whatever the layer query or the launch refuses.
+pub fn dequant_kv_cache_layer_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
+    dequant_prelude(cx, stream, 0)
 }
 
 /// `attn::dispatch_attention_flashinfer_decode`
@@ -203,85 +209,38 @@ fn fa2_decode(cx: &Cx<'_>, stream: *mut c_void, form: Form) -> Result<(), Refusa
     let cache = unsafe { &*plan_ptr(cx, a, "decode")?.cast::<ffa2::DecodePlanCache>() };
     // The same resolution the column would do, through the same function: two
     // copies of the offset arithmetic is how the two paths come to disagree.
-    let l = super::super::table::fa2_decode_leaves(cx)?;
+    let _l = super::super::table::fa2_decode_leaves(cx)?;
 
     dequant_prelude(cx, stream, cache.num_pages_in_batch)?;
     // SAFETY: the fire's stream, and the workspace the planner carved against.
     unsafe { upload(cache.int_upload.as_slice(), a.workspace, cache.int_base_bytes, stream) }?;
 
     // SAFETY: `stream` is the fire's own, live across the launch.
-    let ctx = unsafe { Ctx::on(stream) };
-    let k_pages = keys::KvKeys::env(layer.k_bf16_pages.cast::<u8>());
-    let v_pages = keys::KvValues::env(layer.v_bf16_pages.cast::<u8>());
-    let kv_page_indices = keys::KvPageIndices::env(plan_of.kv_page_indices);
-    let kv_page_indptr = keys::KvPageIndptr::env(plan_of.kv_page_indptr);
-    let kv_last_page_lens = keys::KvLastPageLens::env(plan_of.kv_last_page_lens);
-    let window_left = keys::WindowLeft::env(cx.window_left()?);
+    // AND IT LENDS THIS FIRE'S ANSWERS: the bodies ask for the plan
+    // leaves and the KV pool rather than taking them as parameters.
+    let answers = crate::bind::table::Answering::over_facts(cx);
+    let ctx = unsafe { Ctx::on(stream) }.with_env(&answers);
+    let _k_pages = layer.k_bf16_pages.cast::<u8>();
+    let _v_pages = layer.v_bf16_pages.cast::<u8>();
+    let _kv_page_indices = plan_of.kv_page_indices;
+    let _kv_page_indptr = plan_of.kv_page_indptr;
+    let _kv_last_page_lens = plan_of.kv_last_page_lens;
+    // THE THREE NUMBERS ARE ASKED FOR INSIDE THE CALLEE NOW. `ctx` carries
+    // `Answering::over_facts(cx)`, so `keys::WindowLeft`, `AttnLogitsSoftCap`
+    // and `SmScale` reach the body off the same `Cx` this arm read them from
+    // -- one source rather than two that could disagree.
     match form {
         Form::Plain => dispatch_attention_flashinfer_decode(
             &ctx,
             q,
             Out { ptr: o, rows: 0, width: 0 },
-            k_pages,
-            v_pages,
-            kv_page_indices,
-            kv_page_indptr,
-            kv_last_page_lens,
-            // `Env`, not `Out { .. }`: this spelling has no second buffer.
-            keys::AttnLseOut::env(lse),
-            keys::Fa2DecodeRequestIndices::env(l.request_indices),
-            keys::Fa2DecodeKvTileIndices::env(l.kv_tile_indices),
-            keys::Fa2DecodeOIndptr::env(l.o_indptr),
-            keys::Fa2DecodeKvChunkSize::env(l.kv_chunk_size),
-            keys::Fa2DecodeBlockValidMask::env(l.block_valid_mask),
-            keys::Fa2DecodeTmpV::env(l.tmp_v),
-            keys::Fa2DecodeTmpS::env(l.tmp_s),
-            keys::Fa2DecodePaddedBatch::env(l.padded_batch),
-            keys::Fa2DecodeSplitKv::env(l.split_kv),
-            keys::Fa2DecodeRequests::env(l.requests),
-            keys::Fa2DecodeNumQHeads::env(l.num_q_heads),
-            keys::Fa2DecodeNumKvHeads::env(l.num_kv_heads),
-            keys::Fa2DecodeHeadDim::env(l.head_dim),
-            keys::Fa2DecodePageSize::env(l.page_size),
-            keys::Fa2DecodeHndLayout::env(l.hnd_layout),
-            keys::Fa2DecodeFullAttention::env(l.full_attention),
-            window_left,
-            keys::AttnLogitsSoftCap::env(a.logits_soft_cap),
-            keys::SmScale::env(a.sm_scale),
-            // `broadcast_q`: a decode step reads one query row per request.
-            Env(false),
-        ),
+    ),
         Form::Lse => dispatch_attention_flashinfer_decode_lse(
             &ctx,
             q,
             Out { ptr: o, rows: 0, width: 0 },
-            k_pages,
-            v_pages,
-            kv_page_indices,
-            kv_page_indptr,
-            kv_last_page_lens,
             Out { ptr: lse, rows: 0, width: 0 },
-            keys::Fa2DecodeRequestIndices::env(l.request_indices),
-            keys::Fa2DecodeKvTileIndices::env(l.kv_tile_indices),
-            keys::Fa2DecodeOIndptr::env(l.o_indptr),
-            keys::Fa2DecodeKvChunkSize::env(l.kv_chunk_size),
-            keys::Fa2DecodeBlockValidMask::env(l.block_valid_mask),
-            keys::Fa2DecodeTmpV::env(l.tmp_v),
-            keys::Fa2DecodeTmpS::env(l.tmp_s),
-            keys::Fa2DecodePaddedBatch::env(l.padded_batch),
-            keys::Fa2DecodeSplitKv::env(l.split_kv),
-            keys::Fa2DecodeRequests::env(l.requests),
-            keys::Fa2DecodeNumQHeads::env(l.num_q_heads),
-            keys::Fa2DecodeNumKvHeads::env(l.num_kv_heads),
-            keys::Fa2DecodeHeadDim::env(l.head_dim),
-            keys::Fa2DecodePageSize::env(l.page_size),
-            keys::Fa2DecodeHndLayout::env(l.hnd_layout),
-            keys::Fa2DecodeFullAttention::env(l.full_attention),
-            window_left,
-            keys::AttnLogitsSoftCap::env(a.logits_soft_cap),
-            keys::SmScale::env(a.sm_scale),
-            Env(false),
-        ),
+    ),
     }
 }
 
@@ -292,8 +251,8 @@ fn fa2_decode(cx: &Cx<'_>, stream: *mut c_void, form: Form) -> Result<(), Refusa
 fn fa2_decode_capture_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     no_join_extras(cx)?;
     let a = cx.attn_ctx()?;
-    let layer = cx.kv_layer()?;
-    let plan_of = cx.plan()?;
+    let _layer = cx.kv_layer()?;
+    let _plan_of = cx.plan()?;
     let q = In {
         ptr: cx.arg_in(0)?.cast::<bf16>().cast_const(),
         rows: cx.rows().count,
@@ -302,51 +261,31 @@ fn fa2_decode_capture_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusa
     let o = o_or(cx, a)?;
     // `lse_slab` and not a probe: this dispatch has one DSL spelling, so there
     // is no `arg_out(1)` to find.
-    let lse = lse_slab(a)?;
+    let _lse = lse_slab(a)?;
     published(a.score_out.cast_const(), "the score sink this launcher writes")?;
     published(a.score_indptr_d, "the score index this launcher writes into")?;
     // SAFETY: as `fa2_decode_arm`'s.
     let cache = unsafe { &*plan_ptr(cx, a, "decode")?.cast::<ffa2::DecodePlanCache>() };
-    let l = super::super::table::fa2_decode_leaves(cx)?;
+    let _l = super::super::table::fa2_decode_leaves(cx)?;
 
     dequant_prelude(cx, stream, cache.num_pages_in_batch)?;
     // SAFETY: as above.
     unsafe { upload(cache.int_upload.as_slice(), a.workspace, cache.int_base_bytes, stream) }?;
 
     // SAFETY: `stream` is the fire's own, live across the launch.
-    let ctx = unsafe { Ctx::on(stream) };
+    // AND IT LENDS THIS FIRE'S ANSWERS: the bodies ask for the plan
+    // leaves and the KV pool rather than taking them as parameters.
+    let answers = crate::bind::table::Answering::over_facts(cx);
+    let ctx = unsafe { Ctx::on(stream) }.with_env(&answers);
     dispatch_attention_flashinfer_decode_capture(
         &ctx,
         q,
         Out { ptr: o, rows: 0, width: 0 },
-        keys::KvKeys::env(layer.k_bf16_pages.cast::<u8>()),
-        keys::KvValues::env(layer.v_bf16_pages.cast::<u8>()),
-        keys::KvPageIndices::env(plan_of.kv_page_indices),
-        keys::KvPageIndptr::env(plan_of.kv_page_indptr),
-        keys::KvLastPageLens::env(plan_of.kv_last_page_lens),
-        keys::AttnLseOut::env(lse),
-        keys::Fa2DecodeRequestIndices::env(l.request_indices),
-        keys::Fa2DecodeKvTileIndices::env(l.kv_tile_indices),
-        keys::Fa2DecodeOIndptr::env(l.o_indptr),
-        keys::Fa2DecodeKvChunkSize::env(l.kv_chunk_size),
-        keys::Fa2DecodeBlockValidMask::env(l.block_valid_mask),
-        keys::Fa2DecodeTmpV::env(l.tmp_v),
-        keys::Fa2DecodeTmpS::env(l.tmp_s),
-        keys::Fa2DecodePaddedBatch::env(l.padded_batch),
-        keys::Fa2DecodeSplitKv::env(l.split_kv),
-        keys::Fa2DecodeRequests::env(l.requests),
-        keys::Fa2DecodeNumQHeads::env(l.num_q_heads),
-        keys::Fa2DecodeNumKvHeads::env(l.num_kv_heads),
-        keys::Fa2DecodeHeadDim::env(l.head_dim),
-        keys::Fa2DecodePageSize::env(l.page_size),
-        keys::Fa2DecodeHndLayout::env(l.hnd_layout),
-        keys::Fa2DecodeFullAttention::env(l.full_attention),
-        Env(a.score_out),
-        Env(a.score_indptr_d),
-        keys::WindowLeft::env(cx.window_left()?),
-        keys::AttnLogitsSoftCap::env(a.logits_soft_cap),
-        keys::SmScale::env(a.sm_scale),
-        Env(false),
+        a.score_out,
+        a.score_indptr_d,
+        Const { v: cx.window_left()? },
+        Const { v: a.logits_soft_cap },
+        Const { v: a.sm_scale },
     )
 }
 
@@ -356,8 +295,8 @@ fn fa2_decode_capture_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusa
 fn fa2_prefill_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     no_join_extras(cx)?;
     let a = cx.attn_ctx()?;
-    let layer = cx.kv_layer()?;
-    let plan_of = cx.plan()?;
+    let _layer = cx.kv_layer()?;
+    let _plan_of = cx.plan()?;
     let q = In {
         ptr: cx.arg_in(0)?.cast::<bf16>().cast_const(),
         rows: cx.rows().count,
@@ -366,50 +305,19 @@ fn fa2_prefill_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     let o = o_or(cx, a)?;
     // SAFETY: `bind::PrefillPlan::as_ptr` is the only producer.
     let cache = unsafe { &*plan_ptr(cx, a, "prefill")?.cast::<ffa2::PrefillPlanCache>() };
-    let l = super::super::table::fa2_prefill_leaves(cx)?;
+    let _l = super::super::table::fa2_prefill_leaves(cx)?;
 
     // SAFETY: the fire's stream, and the workspace this plan was raised against.
     unsafe { upload(cache.int_upload.as_slice(), a.prefill_workspace, cache.int_base_bytes, stream) }?;
 
     // SAFETY: `stream` is the fire's own, live across the launch.
-    let ctx = unsafe { Ctx::on(stream) };
-    dispatch_attention_flashinfer_prefill_bf16(
-        &ctx,
-        q,
-        Out { ptr: o, rows: 0, width: 0 },
-        keys::KvKeys::env(layer.k_bf16_pages.cast::<u8>()),
-        keys::KvValues::env(layer.v_bf16_pages.cast::<u8>()),
-        keys::QoIndptr::env(plan_of.qo_indptr),
-        keys::KvPageIndices::env(plan_of.kv_page_indices),
-        keys::KvPageIndptr::env(plan_of.kv_page_indptr),
-        keys::KvLastPageLens::env(plan_of.kv_last_page_lens),
-        // `Env` and not `Out { .. }`: no text of this symbol declares a second result.
-        keys::AttnLseOut::env(a.lse_out_d),
-        keys::Fa2PrefillRequestIndices::env(l.request_indices),
-        keys::Fa2PrefillQoTileIndices::env(l.qo_tile_indices),
-        keys::Fa2PrefillKvTileIndices::env(l.kv_tile_indices),
-        keys::Fa2PrefillMergeIndptr::env(l.merge_indptr),
-        keys::Fa2PrefillOIndptr::env(l.o_indptr),
-        keys::Fa2PrefillKvChunkSize::env(l.kv_chunk_size),
-        keys::Fa2PrefillBlockValidMask::env(l.block_valid_mask),
-        keys::Fa2PrefillTmpV::env(l.tmp_v),
-        keys::Fa2PrefillTmpS::env(l.tmp_s),
-        keys::Fa2PrefillPaddedBatch::env(l.padded_batch),
-        keys::Fa2PrefillSplitKv::env(l.split_kv),
-        keys::Fa2PrefillTotalRows::env(l.total_rows),
-        keys::Fa2PrefillCtaTileQ::env(l.cta_tile_q),
-        keys::Fa2PrefillRequests::env(l.requests),
-        keys::Fa2PrefillNumQHeads::env(l.num_q_heads),
-        keys::Fa2PrefillNumKvHeads::env(l.num_kv_heads),
-        keys::Fa2PrefillHeadDim::env(l.head_dim),
-        keys::Fa2PrefillPageSize::env(l.page_size),
-        keys::Fa2PrefillWindowLeft::env(l.window_left),
-        keys::Fa2PrefillHndLayout::env(l.hnd_layout),
-        keys::Fa2PrefillFullAttention::env(l.full_attention),
-        keys::Fa2PrefillCausalMask::env(l.causal_mask),
-        keys::AttnLogitsSoftCap::env(a.logits_soft_cap),
-        keys::SmScale::env(a.sm_scale),
-    )
+    // AND IT LENDS THIS FIRE'S ANSWERS: the bodies ask for the plan
+    // leaves and the KV pool rather than taking them as parameters.
+    let answers = crate::bind::table::Answering::over_facts(cx);
+    let ctx = unsafe { Ctx::on(stream) }.with_env(&answers);
+    // The cap and the scale are asked for inside the callee; see the decode
+    // arm above.
+    dispatch_attention_flashinfer_prefill_bf16(&ctx, q, Out { ptr: o, rows: 0, width: 0 })
 }
 
 /// `attn::dispatch_attention_flashinfer_prefill_capture_bf16`
@@ -420,8 +328,8 @@ fn fa2_prefill_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
 fn fa2_prefill_capture_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     no_join_extras(cx)?;
     let a = cx.attn_ctx()?;
-    let layer = cx.kv_layer()?;
-    let plan_of = cx.plan()?;
+    let _layer = cx.kv_layer()?;
+    let _plan_of = cx.plan()?;
     let q = In {
         ptr: cx.arg_in(0)?.cast::<bf16>().cast_const(),
         rows: cx.rows().count,
@@ -432,52 +340,25 @@ fn fa2_prefill_capture_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refus
     published(a.score_indptr_d, "the score index this launcher writes into")?;
     // SAFETY: as `fa2_prefill_arm`'s.
     let cache = unsafe { &*plan_ptr(cx, a, "prefill")?.cast::<ffa2::PrefillPlanCache>() };
-    let l = super::super::table::fa2_prefill_leaves(cx)?;
+    let _l = super::super::table::fa2_prefill_leaves(cx)?;
 
     // SAFETY: as above.
     unsafe { upload(cache.int_upload.as_slice(), a.prefill_workspace, cache.int_base_bytes, stream) }?;
 
     // SAFETY: `stream` is the fire's own, live across the launch.
-    let ctx = unsafe { Ctx::on(stream) };
+    // AND IT LENDS THIS FIRE'S ANSWERS: the bodies ask for the plan
+    // leaves and the KV pool rather than taking them as parameters.
+    let answers = crate::bind::table::Answering::over_facts(cx);
+    let ctx = unsafe { Ctx::on(stream) }.with_env(&answers);
     dispatch_attention_flashinfer_prefill_capture_bf16(
         &ctx,
         q,
         Out { ptr: o, rows: 0, width: 0 },
-        keys::KvKeys::env(layer.k_bf16_pages.cast::<u8>()),
-        keys::KvValues::env(layer.v_bf16_pages.cast::<u8>()),
-        keys::QoIndptr::env(plan_of.qo_indptr),
-        keys::KvPageIndices::env(plan_of.kv_page_indices),
-        keys::KvPageIndptr::env(plan_of.kv_page_indptr),
-        keys::KvLastPageLens::env(plan_of.kv_last_page_lens),
-        // `Env` and not `Out { .. }`: no text of this symbol declares a second result.
-        keys::AttnLseOut::env(a.lse_out_d),
-        keys::Fa2PrefillRequestIndices::env(l.request_indices),
-        keys::Fa2PrefillQoTileIndices::env(l.qo_tile_indices),
-        keys::Fa2PrefillKvTileIndices::env(l.kv_tile_indices),
-        keys::Fa2PrefillMergeIndptr::env(l.merge_indptr),
-        keys::Fa2PrefillOIndptr::env(l.o_indptr),
-        keys::Fa2PrefillKvChunkSize::env(l.kv_chunk_size),
-        keys::Fa2PrefillBlockValidMask::env(l.block_valid_mask),
-        keys::Fa2PrefillTmpV::env(l.tmp_v),
-        keys::Fa2PrefillTmpS::env(l.tmp_s),
-        keys::Fa2PrefillPaddedBatch::env(l.padded_batch),
-        keys::Fa2PrefillSplitKv::env(l.split_kv),
-        keys::Fa2PrefillTotalRows::env(l.total_rows),
-        keys::Fa2PrefillCtaTileQ::env(l.cta_tile_q),
-        keys::Fa2PrefillRequests::env(l.requests),
-        keys::Fa2PrefillNumQHeads::env(l.num_q_heads),
-        keys::Fa2PrefillNumKvHeads::env(l.num_kv_heads),
-        keys::Fa2PrefillHeadDim::env(l.head_dim),
-        keys::Fa2PrefillPageSize::env(l.page_size),
-        keys::Fa2PrefillWindowLeft::env(l.window_left),
-        keys::Fa2PrefillHndLayout::env(l.hnd_layout),
-        keys::Fa2PrefillFullAttention::env(l.full_attention),
-        keys::Fa2PrefillCausalMask::env(l.causal_mask),
-        Env(a.score_out),
-        Env(a.score_indptr_d),
-        Env(a.score_window),
-        keys::AttnLogitsSoftCap::env(a.logits_soft_cap),
-        keys::SmScale::env(a.sm_scale),
+        a.score_out,
+        a.score_indptr_d,
+        a.score_window,
+        Const { v: a.logits_soft_cap },
+        Const { v: a.sm_scale },
     )
 }
 
@@ -489,8 +370,8 @@ fn fa2_prefill_capture_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refus
 fn fa2_prefill_custom_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusal> {
     no_join_extras(cx)?;
     let a = cx.attn_ctx()?;
-    let layer = cx.kv_layer()?;
-    let plan_of = cx.plan()?;
+    let _layer = cx.kv_layer()?;
+    let _plan_of = cx.plan()?;
     let q = In {
         ptr: cx.arg_in(0)?.cast::<bf16>().cast_const(),
         rows: cx.rows().count,
@@ -501,7 +382,7 @@ fn fa2_prefill_custom_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusa
     published(a.mask_indptr_d, "the custom mask's index")?;
     // SAFETY: as `fa2_prefill_arm`'s.
     let cache = unsafe { &*plan_ptr(cx, a, "prefill")?.cast::<ffa2::PrefillPlanCache>() };
-    let l = super::super::table::fa2_prefill_leaves(cx)?;
+    let _l = super::super::table::fa2_prefill_leaves(cx)?;
 
     // The page count comes off the plan's widened KV indptr, not the device copy.
     let pages = if cache.num_requests > 0 {
@@ -514,45 +395,18 @@ fn fa2_prefill_custom_arm(cx: &Cx<'_>, stream: *mut c_void) -> Result<(), Refusa
     unsafe { upload(cache.int_upload.as_slice(), a.prefill_workspace, cache.int_base_bytes, stream) }?;
 
     // SAFETY: `stream` is the fire's own, live across the launch.
-    let ctx = unsafe { Ctx::on(stream) };
+    // AND IT LENDS THIS FIRE'S ANSWERS: the bodies ask for the plan
+    // leaves and the KV pool rather than taking them as parameters.
+    let answers = crate::bind::table::Answering::over_facts(cx);
+    let ctx = unsafe { Ctx::on(stream) }.with_env(&answers);
     dispatch_attention_flashinfer_prefill_custom(
         &ctx,
         q,
         Out { ptr: o, rows: 0, width: 0 },
-        keys::KvKeys::env(layer.k_bf16_pages.cast::<u8>()),
-        keys::KvValues::env(layer.v_bf16_pages.cast::<u8>()),
-        keys::QoIndptr::env(plan_of.qo_indptr),
-        keys::KvPageIndices::env(plan_of.kv_page_indices),
-        keys::KvPageIndptr::env(plan_of.kv_page_indptr),
-        keys::KvLastPageLens::env(plan_of.kv_last_page_lens),
-        // `Env` and not `Out { .. }`: no text of this symbol declares a second result.
-        keys::AttnLseOut::env(a.lse_out_d),
-        keys::Fa2PrefillRequestIndices::env(l.request_indices),
-        keys::Fa2PrefillQoTileIndices::env(l.qo_tile_indices),
-        keys::Fa2PrefillKvTileIndices::env(l.kv_tile_indices),
-        keys::Fa2PrefillMergeIndptr::env(l.merge_indptr),
-        keys::Fa2PrefillOIndptr::env(l.o_indptr),
-        keys::Fa2PrefillKvChunkSize::env(l.kv_chunk_size),
-        keys::Fa2PrefillBlockValidMask::env(l.block_valid_mask),
-        keys::Fa2PrefillTmpV::env(l.tmp_v),
-        keys::Fa2PrefillTmpS::env(l.tmp_s),
-        keys::Fa2PrefillPaddedBatch::env(l.padded_batch),
-        keys::Fa2PrefillSplitKv::env(l.split_kv),
-        keys::Fa2PrefillTotalRows::env(l.total_rows),
-        keys::Fa2PrefillCtaTileQ::env(l.cta_tile_q),
-        keys::Fa2PrefillRequests::env(l.requests),
-        keys::Fa2PrefillNumQHeads::env(l.num_q_heads),
-        keys::Fa2PrefillNumKvHeads::env(l.num_kv_heads),
-        keys::Fa2PrefillHeadDim::env(l.head_dim),
-        keys::Fa2PrefillPageSize::env(l.page_size),
-        keys::Fa2PrefillWindowLeft::env(l.window_left),
-        keys::Fa2PrefillHndLayout::env(l.hnd_layout),
-        keys::Fa2PrefillFullAttention::env(l.full_attention),
-        keys::Fa2PrefillCausalMask::env(l.causal_mask),
-        Env(a.mask_d),
-        Env(a.mask_indptr_d),
-        keys::AttnLogitsSoftCap::env(a.logits_soft_cap),
-        keys::SmScale::env(a.sm_scale),
+        a.mask_d,
+        a.mask_indptr_d,
+        Const { v: a.logits_soft_cap },
+        Const { v: a.sm_scale },
     )
 }
 
@@ -670,48 +524,37 @@ fn fa2_prefill_planless(cx: &Cx<'_>, stream: *mut c_void, form: Form) -> Result<
     unsafe { upload(cache.int_upload.as_slice(), a.workspace, cache.int_base_bytes, stream) }?;
 
     // SAFETY: `stream` is the fire's own, live across the launch.
-    let ctx = unsafe { Ctx::on(stream) };
-    let k_pages = keys::KvKeys::env(layer.k_bf16_pages.cast::<u8>());
-    let v_pages = keys::KvValues::env(layer.v_bf16_pages.cast::<u8>());
-    let kv_page_indices = keys::KvPageIndices::env(plan_of.kv_page_indices);
-    let kv_page_indptr = keys::KvPageIndptr::env(plan_of.kv_page_indptr);
-    let kv_last_page_lens = keys::KvLastPageLens::env(plan_of.kv_last_page_lens);
-    let prefill_plan = Env(fa2d::prefill_plan_of(cache, ffa2::fa_device()));
+    // AND IT LENDS THIS FIRE'S ANSWERS: the bodies ask for the plan
+    // leaves and the KV pool rather than taking them as parameters.
+    let answers = crate::bind::table::Answering::over_facts(cx);
+    let ctx = unsafe { Ctx::on(stream) }.with_env(&answers);
+    let _k_pages = layer.k_bf16_pages.cast::<u8>();
+    let _v_pages = layer.v_bf16_pages.cast::<u8>();
+    let _kv_page_indices = plan_of.kv_page_indices;
+    let _kv_page_indptr = plan_of.kv_page_indptr;
+    let _kv_last_page_lens = plan_of.kv_last_page_lens;
+    // THE PLAN IS THE ARM'S OWN AGGREGATE, which is why it is `#[unbound]` at
+    // the signature: nothing publishes it before the fire, so no column can
+    // answer for it. The workspaces beside it used to be threaded through too
+    // and are asked for in the body now.
+    let prefill_plan = fa2d::prefill_plan_of(cache, ffa2::fa_device());
     match form {
         Form::Plain => attention_flashinfer_prefill(
             &ctx,
             q,
             Out { ptr: o, rows: 0, width: 0 },
-            k_pages,
-            v_pages,
-            keys::QoIndptr::env(plan_of.qo_indptr),
-            kv_page_indices,
-            kv_page_indptr,
-            kv_last_page_lens,
-            // The fire's slab as a source, not the losing half of a fallback.
-            keys::AttnLseOut::env(lse),
-            keys::AttnWorkspaceInt::env(a.workspace.int_buffer),
-            keys::AttnWorkspaceFloat::env(a.workspace.float_buffer),
             prefill_plan,
-            keys::AttnLogitsSoftCap::env(a.logits_soft_cap),
-            keys::SmScale::env(a.sm_scale),
+            Const { v: a.logits_soft_cap },
+            Const { v: a.sm_scale },
         ),
         Form::Lse => attention_flashinfer_prefill_lse(
             &ctx,
             q,
             Out { ptr: o, rows: 0, width: 0 },
-            k_pages,
-            v_pages,
-            keys::QoIndptr::env(plan_of.qo_indptr),
-            kv_page_indices,
-            kv_page_indptr,
-            kv_last_page_lens,
             Out { ptr: lse, rows: 0, width: 0 },
-            keys::AttnWorkspaceInt::env(a.workspace.int_buffer),
-            keys::AttnWorkspaceFloat::env(a.workspace.float_buffer),
             prefill_plan,
-            keys::AttnLogitsSoftCap::env(a.logits_soft_cap),
-            keys::SmScale::env(a.sm_scale),
+            Const { v: a.logits_soft_cap },
+            Const { v: a.sm_scale },
         ),
     }
 }

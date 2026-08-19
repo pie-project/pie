@@ -2057,8 +2057,9 @@
 //! The missing half was which operands are WRITTEN. SPIR-V does not say
 //! usefully: `slangc` decorates a buffer `NonWritable` only where the shader said
 //! `readonly`, and these shaders mostly do not. The kernel table does say --
-//! `kernels::Ty::BufMut` is "the launcher may write through this" -- and that
-//! field had never been read by anything. `dispatch::Dispatch` now carries a
+//! a writable operand type, [`kernels::Binds::Writes`], is "the launcher may
+//! write through this" -- and that field had never been read by anything.
+//! `dispatch::Dispatch` now carries a
 //! `writes` mask beside its `buffers`, built where a slot's index is still the
 //! index of the operand that produced it, and `device::hazards` puts a barrier
 //! in only for a real read-after-write, write-after-write or write-after-read

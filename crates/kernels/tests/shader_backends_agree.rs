@@ -57,7 +57,23 @@ use kernels::KernelSig;
 /// Raise it when a kernel is added to all the planes that want it. Lowering
 /// it is what `retired_rows` is for -- and for a kernel that never shipped,
 /// which is not a retirement, lower it and leave nothing behind.
-const CENSUS: usize = 100;
+///
+/// # It was 100, and 100 was measured over a merged list
+///
+/// The three planes each declared their routine slice as
+/// `#[distributed_slice] static ROUTINES`, and `linkme` keys a slice on the
+/// STATIC's identifier rather than on the crate — so the three sections were
+/// ONE section, and `kernels_vulkan::declared()` returned vulkan's rows plus
+/// wgpu's plus metal's. Every plane answered the same list, so the union was
+/// that list and the three could not be compared at all: this gate was reading
+/// one table three times and finding it equal to itself.
+///
+/// The slices carry per-plane names now and the union is honest. It is 101
+/// because vulkan has one family the others have not crossed — `rms_rope`, the
+/// fused norm+rope `norm.rs` has declared since before this migration — which
+/// is exactly the "a backend has GAINED a family" case the entrypoint census
+/// below states in `EXCLUSIVE`.
+const CENSUS: usize = 101;
 
 /// How many of [`CENSUS`] are crossed by more than one backend, and so are
 /// actually compared below.
@@ -81,7 +97,29 @@ const COMPARED: usize = 199;
 /// stays a QUESTION. A count that quietly allowed any shortfall would let a
 /// port lose a kernel and a port never write one look identical, which is
 /// the whole reason this file exists.
-const UNCROSSED: &[(&str, &str, &str)] = &[];
+const UNCROSSED: &[(&str, &str, &str)] = &[
+    // THE FUSED NORM+ROPE, WHICH ONLY VULKAN HAS. `kernels-vulkan/src/norm.rs`
+    // has declared `rms_rope` since before the `Env` -> `Const` migration; it
+    // normalises and rotates in one dispatch, which is a fusion the other two
+    // planes have never written a module for.
+    //
+    // It became VISIBLE with that migration and not because of it. The three
+    // planes each spelled their routine slice `#[distributed_slice] static
+    // ROUTINES`, and `linkme` keys a slice on the STATIC's identifier rather
+    // than on the crate — so the three sections were one section, every
+    // plane's `declared()` answered the same merged list, and no shortfall
+    // could show. The slices carry per-plane names now.
+    (
+        "wgpu",
+        "rms_rope",
+        "the fused norm+rope is vulkan's alone; wgpu has no module for it",
+    ),
+    (
+        "metal",
+        "rms_rope",
+        "the fused norm+rope is vulkan's alone; metal has no module for it",
+    ),
+];
 
 /// One backend's table, under the name this file reports it by.
 struct Table {
@@ -163,7 +201,11 @@ fn kernel_facts(sig: &KernelSig) -> String {
         "axes={:?} whole={} in_place={:?} depth_prefix_plan={}",
         sig.axes.iter().map(|a| a.points).collect::<Vec<_>>(),
         sig.whole,
-        sig.in_place,
+        // ALIASING, OFF THE SOURCE COLUMN. `KernelSig` never had an
+        // `in_place()` of its own -- `Declared` does -- and the pairs come off
+        // the same `Source::Alias` the marks derive, so there is one statement
+        // of them and this reads it.
+        kernels::routine::aliased(sig.sources),
         sig.depth_prefix_plan,
     )
 }
@@ -600,6 +642,21 @@ fn retiring_a_row_does_not_shrink_a_backends_census() {
         // oddly in a list called EXCLUSIVE, but the question the list
         // answers is the right one either way: what to leave out of a
         // comparison of what the backends SHARE.
+        //
+        // THE FUSED NORM+ROPE, WHICH IS VULKAN'S ALONE. Six entrypoints of
+        // one family `kernels-vulkan/src/norm.rs` has declared since before
+        // the `Env` -> `Const` migration and neither other plane has a
+        // module for -- `UNCROSSED` records the kernel, and these are the
+        // entrypoints that kernel spells. It became visible with the
+        // migration and not because of it: the three planes shared one
+        // `linkme` section until their slices were given per-plane names,
+        // so no shortfall between them could show.
+        ("vulkan", "rms_rope_bfloat16"),
+        ("vulkan", "rms_rope_decode_bfloat16"),
+        ("vulkan", "rms_rope_freqs_bfloat16"),
+        ("vulkan", "rms_rope_freqs_decode_bfloat16"),
+        ("vulkan", "rms_rope_prop_bfloat16"),
+        ("vulkan", "rms_rope_prop_decode_bfloat16"),
     ];
 
     let shared = |what: &str, census: &[String]| -> Vec<String> {
@@ -767,18 +824,6 @@ const DIVERGED: &[(&str, &str)] = &[
     // The day another backend splits its decode, its signature grows these
     // two and this entry is deleted -- which the test enforces, since an
     // entry whose backends have stopped disagreeing fails as stale.
-    (
-        "sdpa_paged_decode",
-        "vulkan splits the key range across workgroups and folds the partials \
-         in a second pass, so its signature carries the partials buffer and \
-         the split count; the other backends fire one pass and have neither",
-    ),
-    (
-        "sdpa_paged_decode_sink",
-        "the same two-pass split as `sdpa_paged_decode`, and the sink is added \
-         once in the fold rather than once per split, which is why the split \
-         module is shared between the sink and sinkless forms",
-    ),
     // THREE transcode kernels, and this one is wgpu's own shape rather than a
     // slot metal reserves.
     //
@@ -828,91 +873,6 @@ const DIVERGED: &[(&str, &str)] = &[
     // Written down as seventeen entries rather than one, because a rule with
     // an exception list is a rule and a waiver is not: if one of these ever
     // stops diverging, that entry goes stale and this gate says so.
-    (
-        "cast_qmm_input_bfloat16_to_float16",
-        "metal reserves a positional `pad` slot its flat argument table needs \
-         and wgpu numbers each preprocessed variant densely instead",
-    ),
-    (
-        "cast_qmm_input_strided_bfloat16_to_float16",
-        "metal reserves a positional `pad` slot its flat argument table needs \
-         and wgpu numbers each preprocessed variant densely instead",
-    ),
-    (
-        "qmm_splitk_reduce",
-        "metal reserves a positional `pad` slot its flat argument table needs \
-         and wgpu numbers each preprocessed variant densely instead",
-    ),
-    (
-        "qmm_splitk_reduce_f32",
-        "metal reserves a positional `pad` slot its flat argument table needs \
-         and wgpu numbers each preprocessed variant densely instead",
-    ),
-    (
-        "qmm_t_bias_fp16_precast",
-        "metal reserves a positional `pad` slot its flat argument table needs \
-         and wgpu numbers each preprocessed variant densely instead",
-    ),
-    (
-        "qmm_t_fp16_precast",
-        "metal reserves a positional `pad` slot its flat argument table needs \
-         and wgpu numbers each preprocessed variant densely instead",
-    ),
-    (
-        "qmm_t_residual_fp16_precast",
-        "metal reserves a positional `pad` slot its flat argument table needs \
-         and wgpu numbers each preprocessed variant densely instead",
-    ),
-    (
-        "qmm_t_splitk",
-        "metal reserves a positional `pad` slot its flat argument table needs \
-         and wgpu numbers each preprocessed variant densely instead",
-    ),
-    (
-        "qmm_t_splitk_f32",
-        "metal reserves a positional `pad` slot its flat argument table needs \
-         and wgpu numbers each preprocessed variant densely instead",
-    ),
-    (
-        "qmm_t_splitk_fp16_precast",
-        "metal reserves a positional `pad` slot its flat argument table needs \
-         and wgpu numbers each preprocessed variant densely instead",
-    ),
-    (
-        "qmm_t_splitk_fp16_precast_f32",
-        "metal reserves a positional `pad` slot its flat argument table needs \
-         and wgpu numbers each preprocessed variant densely instead",
-    ),
-    (
-        "qmm_t_strided",
-        "metal reserves a positional `pad` slot its flat argument table needs \
-         and wgpu numbers each preprocessed variant densely instead",
-    ),
-    (
-        "qmm_t_strided_fp16_precast",
-        "metal reserves a positional `pad` slot its flat argument table needs \
-         and wgpu numbers each preprocessed variant densely instead",
-    ),
-    (
-        "qmm_t_strided_fp16_precast_residual",
-        "metal reserves a positional `pad` slot its flat argument table needs \
-         and wgpu numbers each preprocessed variant densely instead",
-    ),
-    (
-        "qmv_tail",
-        "metal reserves a positional `pad` slot its flat argument table needs \
-         and wgpu numbers each preprocessed variant densely instead",
-    ),
-    (
-        "qmv_tail_bias",
-        "metal reserves a positional `pad` slot its flat argument table needs \
-         and wgpu numbers each preprocessed variant densely instead",
-    ),
-    (
-        "qmv_wide_strided",
-        "metal reserves a positional `pad` slot its flat argument table needs \
-         and wgpu numbers each preprocessed variant densely instead",
-    ),
     // Vulkan's descriptor set holds buffers and its push block holds scalars,
     // and they are two namespaces: `sdpa_sliding.slang` gives `sinks` binding
     // 4, right behind `out_`, because a buffer cannot sit past a push
@@ -932,18 +892,14 @@ const DIVERGED: &[(&str, &str)] = &[
     // there they are grid-only. Metal's scan also binds a leading `pad`
     // buffer the Slang module has no binding for at all. Both are in the
     // shaders, and neither is expressible as one signature.
-    (
-        "gdn_core_recurrent_prefill",
-        "vulkan pushes row_pitch and n_scan that metal reads from its params \
-         block, and metal binds a leading pad buffer the slang module does \
-         not declare",
-    ),
-    (
-        "gdn_prep_prefill",
-        "vulkan pushes row_pitch and n_scan that metal reads from its params \
-         block, so the same two numbers are bound on one backend and \
-         grid-only on the other",
-    ),
+    // `gdn_prep_prefill` STOOD HERE AND IS SETTLED. Its divergence was one
+    // parameter: vulkan's signature carried a bare `Env<i32>` for `rows` --
+    // a wrapper claiming NO source at all, so the routine's column resolved
+    // nothing and the row could never be bound -- where metal asked for the
+    // fire's token count. The `Env` -> `ask` move left the wrapper with
+    // nothing to be, and the parameter turned out to be `keys::Rows`, which
+    // is what its own sibling `gdn_prep_slotted` had been asking for beside
+    // it all along. Two backends, one signature.
     // The norm family's four strided/gated forms. Metal sizes the
     // THREADGROUP on the axis -- `grid::rms` has always been `axis / 4`
     // threads, capped at 1024 -- while every Slang module here is compiled at
@@ -955,30 +911,38 @@ const DIVERGED: &[(&str, &str)] = &[
     // finding: there the axis divides the row into `width / axis` reductions,
     // so both backends need both numbers, vulkan was launching one workgroup
     // per row, and it took metal's signature rather than an excuse.
-    (
-        "gated_rms",
-        "metal's threadgroup is the value-head width and vulkan's is a fixed \
-         256 that loops, so the head dim is a grid fact on one backend and \
-         a shader constant on the other",
-    ),
-    (
-        "gated_rms_strided",
-        "metal's threadgroup is the value-head width and vulkan's is a fixed \
-         256 that loops, so the head dim is a grid fact on one backend and \
-         a shader constant on the other",
-    ),
-    (
-        "rms_strided_row",
-        "metal sizes the threadgroup on the axis and vulkan compiles a fixed \
-         256-wide workgroup that walks it, and a pitched row holds exactly \
-         one norm so neither backend needs the axis for the grid's EXTENT",
-    ),
-    (
-        "rms_strided_head_row",
-        "metal sizes the threadgroup on the axis and vulkan compiles a fixed \
-         256-wide workgroup that walks it, and the head is its own grid axis \
-         on both, so the axis is only a group width and only metal's varies",
-    ),
+    // ── FIVE ENTRIES THE `Env` -> `Const`/`ask` MIGRATION SETTLED ────────────
+//
+// `gdn_prep_prefill`, `rms_strided_row`, `rms_strided_head_row`,
+// `sdpa_paged_decode` and `sdpa_paged_decode_sink` stood in this list and no
+// longer do. Not one of them was a device difference; every one was a
+// PARAMETER LIST difference, and each is a finding `.wiki/migration.md`
+// predicted by name:
+//
+//   * the two `rms_strided_*` forms differed over `axis` -- §9.1's *"one key
+//     under two parameter names"*, `keys::Width` twice, at fifteen sites. With
+//     the rectangle off the mark it is `x.width` on both planes, which is a
+//     grid fact and not a parameter, so the signatures are one signature.
+//   * `gdn_prep_prefill` differed over a bare `Env<i32>` that claimed no
+//     source at all, so vulkan's row could never be bound. It is the fire's
+//     token count, which its own sibling was already asking for beside it.
+//   * the two `sdpa_paged_decode` forms differed over which of twenty facts
+//     each plane spelled as a parameter -- §5.6's case exactly. Twelve of them
+//     are the page tables, the KV pool, the staged mask and the partials
+//     buffer, and they leave the signature entirely; six are the checkpoint's
+//     and stay as `Const`. What is left agrees.
+//
+// The list is shorter because the signatures are shorter, and that is the
+// point of the change rather than a side effect of it.
+
+// `rms_strided_head_row` STOOD HERE AND IS SETTLED. Its divergence was
+    // `axis`: metal declared it and vulkan did not, because metal sizes the
+    // threadgroup on it and vulkan compiles a fixed 256-wide workgroup that
+    // walks it. Both spelled the number `keys::Width` -- §9.1's finding, one
+    // key under two parameter names at fifteen sites -- and with the rectangle
+    // off the mark it is `x.width` on both planes, which is a grid fact and
+    // not a parameter. The two signatures were the same signature all along;
+    // only the parameter list said otherwise.
     // The moe family's six, in two groups of three, and both groups are a
     // shape this list already carries.
     //
@@ -991,18 +955,6 @@ const DIVERGED: &[(&str, &str)] = &[
     // than five: it declares nothing at 2 either, because the codec has no
     // zero point to bind where affine puts `biases`.
     (
-        "qmm_t_routed",
-        "metal binds a pad at slots 7..=11 because its entrypoint declares \
-         tile_expert at buffer 12, which is the routed matvec's numbering \
-         kept so one argument table serves both pipelines",
-    ),
-    (
-        "qmm_t_routed_fp16",
-        "metal binds a pad at slots 7..=11 because its entrypoint declares \
-         tile_expert at buffer 12, which is the routed matvec's numbering \
-         kept so one argument table serves both pipelines",
-    ),
-    (
         "mxfp4_qmm_t_routed_bias",
         "metal binds a pad at slot 2 and at 8..=11: tile_expert is at buffer \
          12 and MXFP4 has no zero point to bind where the affine codec puts \
@@ -1014,24 +966,6 @@ const DIVERGED: &[(&str, &str)] = &[
     // Slang module here is compiled at a flat 1024 and strides. So the expert
     // count is a grid fact on one backend and a shader constant on the other,
     // which is the `norm` family's divergence in a second family.
-    (
-        "router_topk",
-        "metal's threadgroup is the expert count rounded to a simdgroup and \
-         vulkan's is a flat 1024 that strides, so the count is a grid fact \
-         on one backend and a shader constant on the other",
-    ),
-    (
-        "router_topk_scaled",
-        "metal's threadgroup is the expert count rounded to a simdgroup and \
-         vulkan's is a flat 1024 that strides, so the count is a grid fact \
-         on one backend and a shader constant on the other",
-    ),
-    (
-        "route_sort",
-        "metal's ONE threadgroup is as wide as the expert count and vulkan's \
-         is a flat 1024 that strides, so the count is a grid fact on one \
-         backend and a shader constant on the other",
-    ),
     // =================================================================
     // THE PARAMS BLOCK, SETTLED. Twenty-five entries stood here and are
     // gone. The way they went is worth the paragraphs they cost.
@@ -1208,8 +1142,8 @@ fn two_backends_that_crossed_the_same_kernel_agree_on_its_signature() {
                 ));
             }
             assert_eq!(
-                (other.whole, other.depth_prefix_plan, other.in_place),
-                (first.whole, first.depth_prefix_plan, first.in_place),
+                (other.whole, other.depth_prefix_plan, other.in_place()),
+                (first.whole, first.depth_prefix_plan, first.in_place()),
                 "`{name}` is stated differently in {what} and {first_what}. \
                  These three are facts about how a TRACE may use the kernel -- \
                  whether it consumes its whole operand, whether it joins the \
@@ -1232,11 +1166,13 @@ fn two_backends_that_crossed_the_same_kernel_agree_on_its_signature() {
             // same sentence covers it -- a trace does not know which backend
             // will run it, so it cannot place an operand at one index here
             // and another there.
-            assert_eq!(
-                other.sides, first.sides,
-                "`{name}` binds different operand slots in {what} and \
-                 {first_what}. A slot is the statement's, not the device's."
-            );
+            // `sides` STOOD HERE AND IS DELETED, but the claim it made is
+            // not: a slot is a fact about the STATEMENT, so a trace that does
+            // not know which backend will run it cannot place an operand at
+            // one index here and another there. `Source` carries the slot now
+            // -- `Slot(Kind::In, n)`, `Slot(Kind::Out, n)`, `Alias(i, o)` --
+            // and it is compared just below, which is where the assertion
+            // moved rather than where it went.
             // WHICH OF THE ENVIRONMENT'S QUESTIONS, which `args` cannot see
             // either, and for the same reason: `Ask<keys::TokenIds, I32s>`
             // and `Env<I32s>` are the same `Ty` and the same `Provenance`.
@@ -1339,3 +1275,4 @@ fn two_backends_that_crossed_the_same_kernel_agree_on_its_signature() {
 // unit-tested in `kernels-metal`, and `model-ir`'s load-time check, which
 // refuses any text naming a symbol no backend resolves. Both are on the
 // side that has the rows.
+

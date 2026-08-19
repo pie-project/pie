@@ -136,7 +136,7 @@ impl<M: Modules> Encode for Encoder<'_, M> {
 
         let source = self
             .modules
-            .source(fire.entrypoint, self.tier)
+            .at(fire.file, fire.entrypoint, self.tier)
             .ok_or(Refusal::Undeclared)?;
 
         let mut pipelines = self.pipelines.borrow_mut();

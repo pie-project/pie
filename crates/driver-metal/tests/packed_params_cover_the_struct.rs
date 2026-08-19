@@ -45,6 +45,21 @@ impl Resolver for Sentinels {
             bytes: 1 << 30,
         })
     }
+    /// THE POOL'S NUMBERS, WHICH THE DEFAULT REFUSES. `kv_append_paged` reaches
+    /// for its page size and both cache strides, and a resolver that answers
+    /// none of them refuses every routed launch -- so this file planned nothing
+    /// and its own denominator said so. A pool of 16-token pages over 8 heads
+    /// of 128 is plausible and nothing here reads the values, only that they
+    /// are there.
+    fn pool(&mut self, which: driver_metal::lowering::executor::FireTable) -> Option<u32> {
+        use driver_metal::lowering::executor::FireTable;
+        Some(match which {
+            FireTable::KvPageSize => 16,
+            FireTable::KvHeadStride => 128,
+            FireTable::KvSeqStride => 8 * 128,
+            _ => return None,
+        })
+    }
 }
 
 /// gpt-oss-20b's shape: 32 experts, top-4 — the routed arm of the shared

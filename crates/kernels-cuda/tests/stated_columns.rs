@@ -109,7 +109,7 @@
 //! `not_yet_crossed.rs`, which is the STATED half; these three columns are
 //! hand-typed on the DERIVED half and stay hand-typed however many families
 //! cross. Emptying that file MOVED the transcriptions, it did not remove
-//! them: a `driver_bound!(all_reduce_bf16, whole)` types `whole` by hand
+//! them: a `untraced!(all_reduce_bf16, whole)` types `whole` by hand
 //! exactly as `kernel!(all_reduce_p2p "comm::all_reduce_bf16", whole = true)`
 //! did.
 //!
@@ -120,7 +120,7 @@
 //! port; twelve need a driver resource or name no `__global__` at all; one is
 //! deliberately excluded and one is a single symbol with two arms."* **The
 //! file is deleted.** Every one of those classifications was true and none of
-//! them was a reason to state a row: `kernels::driver_bound!` derives a
+//! them was a reason to state a row: `kernels::untraced!` derives a
 //! declaration from the `fn` that runs it whether or not a STATEMENT can bind
 //! it, which is a different question from the one each of those twenty-one
 //! sentences was answering. The prediction is kept because being wrong about
@@ -143,7 +143,7 @@
 //! Four of the 28 arrived by DECLARATION rather than by anyone writing a
 //! kernel: `attn::split_qkv_bf16`, `layout::split_q_gate_bf16`,
 //! `mlp::sigmoid_gate_inplace_bf16` and `ssm::qwen_gdn_post_conv_prep_bf16`
-//! are `driver_bound!` lines over `kernels_cuda::driver_internal`'s
+//! are `untraced!` lines over `kernels_cuda::driver_internal`'s
 //! `fn`s, and live model texts had been lowering to all four while nothing
 //! declared them. They are the sharpest case of what "arrived after" does not
 //! mean: every one of the four is older than `9e3936fb9^` as CODE, and new
@@ -393,8 +393,13 @@ const AT_9E3936FB9: &[Stated] = &[
 /// cosmetic change: `model-compiler`'s `check_plan` coverage rule refuses a
 /// model text at LOAD for naming a symbol nothing declares, so a row that
 /// disappears without anyone deciding it should is a deployment that stops
-/// loading. Two have left, both deliberately, and a third would fail the test
+/// loading. Every entry below is deliberate, and one more would fail the test
 /// below rather than pass unnoticed.
+///
+/// THREE SHAPES ARE IN HERE and the struct cannot tell them apart, which is
+/// why each `why` says which it is: a DELETION (the symbol is gone), a RENAME
+/// (it is still there under another name) and a DEMOTION (the `fn` is still
+/// there and still fires, and what it stopped being is a `Routine`).
 struct Departed {
     symbol: &'static str,
     /// The decision, in one sentence, with the address that holds it.
@@ -470,6 +475,30 @@ const DEPARTED: &[Departed] = &[
               half -- three passes of matmul over a staged lane set -- is \
               `gemm::lora`; the staging stays in `driver-cuda`, which is where \
               the per-fire arena it draws from lives",
+    },
+    // THE LOADER'S TWO, WHICH LEFT AS A PAIR AND NOT AS A DELETION. Both
+    // still exist, still fire, and still have their symbol carried in a
+    // plan; what they stopped being is a ROUTINE. Nothing that loads a model
+    // notices, because `check_plan`'s coverage rule reads the symbols a
+    // `dsl::cuda` builder RECORDS, and no builder ever recorded either.
+    Departed {
+        symbol: "quant::quantize_bf16_to_mxfp4_e2m1_per_block",
+        why: "LEFT `ROUTINES`, not the tree. A `Routine` is what a TRACE \
+              states and no trace states a load-time weight transform: \
+              `model-loader`'s tile plan runs this once over a CHECKPOINT \
+              MATRIX, so its `In`/`Out` wrappers promised a statement that \
+              did not exist and every caller passed `rows: 0, width: 0` \
+              through them. It is a plain `unsafe fn` in `kernels_cuda::\
+              quant` now (\"the six that take raw pointers\"), reached by \
+              path from `executor/cuda.rs`, and the row it had in \
+              `driver-cuda/src/bind/arms/quant.rs` went with it",
+    },
+    Departed {
+        symbol: "quant::quantize_bf16_to_fp8_e4m3_per_channel",
+        why: "LEFT `ROUTINES` with the MXFP4 quantiser above, for its reason \
+              and in the same commit; the plan names both as strings in \
+              `plan/passes/tile.rs`, which is the LOADER's vocabulary and \
+              not this crate's registry",
     },
 ];
 
@@ -568,6 +597,66 @@ const DIVERGED: &[Diverged] = &[Diverged {
 /// column type — two rows do not pay for a trait, and the `why` strings
 /// are what a reader comes here for.
 const DIVERGED_IN_PLACE: &[DivergedInPlace] = &[
+    // ── THE FIVE THE `Env` -> `Const` MIGRATION SETTLED ──
+    //
+    // Two directions and one reason each, and none of them is a slip. See
+    // `.wiki/migration.md` §11.5 and §11.6.
+    DivergedInPlace {
+        symbol: "quant::scale_rows_bf16",
+        was: &[],
+        is: &[(0, 0)],
+        why: "The row declared no alias and the launcher's own comment \
+              always did: *`dsl::cuda::scale_rows` hands back the same \
+              buffer it took as input 0*. The kernel fires ONE pointer for \
+              the data -- `&[buf.ptr, l_bf16, buf.stride]` -- so a fresh \
+              result buffer would be scaled from bytes nobody wrote. \
+              `InOut<Tensor<T>>` says it at the parameter, and saying it \
+              there is also what puts `l_bf16` back at input 1 where its \
+              `In<1, T>` used to spell it.",
+    },
+    DivergedInPlace {
+        symbol: "rope::rope_write_kv_bf16",
+        was: &[],
+        is: &[(0, 0)],
+        why: "As `scale_rows`: the row declared none and the numbering \
+              required one. `q` was `Out<0>` while `k` and `v` were \
+              `In<1>`/`In<2>`, so the statement's input 0 -- `q` itself -- \
+              was claimed by no parameter. Under positional derivation that \
+              gap closes the wrong way and `k` binds the query's buffer. \
+              `InOut` is the mark that claims both slots at one address, \
+              which is what the statement does: it places `q` and declares \
+              the rotated `q` as its one result.",
+    },
+    DivergedInPlace {
+        symbol: "mlp::geglu_tanh_bf16",
+        was: &[(0, 0)],
+        is: &[],
+        why: "A MAY-ALIAS, and the four marks have no word for one. The \
+              pair was an allocator INSTRUCTION -- give result 0 operand \
+              0's offset -- and the kernel does not require it: it takes \
+              the gate and the destination as two pointers, and \
+              `tower::gemma4_vision` calls this launcher directly with \
+              three distinct buffers. `InOut` claims ONE ADDRESS, which \
+              would be false at that caller, so the hint is dropped rather \
+              than mis-stated. The cost is an arena that reuses one buffer \
+              less; the alternative is a claim that is not true.",
+    },
+    DivergedInPlace {
+        symbol: "mlp::gpt_oss_glu_bf16",
+        was: &[(0, 0)],
+        is: &[],
+        why: "As `geglu_tanh_bf16`, and for the same caller.",
+    },
+    DivergedInPlace {
+        symbol: "norm::rmsnorm_no_scale_bf16",
+        was: &[(0, 0)],
+        is: &[],
+        why: "As `geglu_tanh_bf16`. `tower::gemma4_vision` normalises the \
+              pooled rows out of place -- `pooled` in, `pn` out, two \
+              scratch allocations -- so the kernel's two pointers are two \
+              buffers there and the alias was the statement's convenience \
+              rather than the launcher's requirement.",
+    },
     DivergedInPlace {
         symbol: "moe::add_moe_route_bias_bf16",
         was: &[],
@@ -610,27 +699,17 @@ const DIVERGED_IN_PLACE: &[DivergedInPlace] = &[
     },
     // AND THIS ONE NAMES A RESULT THE STATEMENT NEVER DECLARES, which is a
     // shape neither pin above has.
-    DivergedInPlace {
-        symbol: "norm::residual_add_rmsnorm_bf16",
-        was: &[],
-        is: &[(1, 0)],
-        why: "The launcher writes TWICE and the statement declares one \
-              result. `norm_out` is `Out<0, *mut T>`; `hidden` is \
-              `In<0, *mut T>` and its own comment has always said so -- \
-              *the statement lists it as an INPUT with no matching output, \
-              which is why the arm reaches for `cx.arg_in(0)` and casts \
-              away the const*. A pair is `(output, input)`, so the second \
-              write's output index is one past the only index there is, \
-              and `(1, 0)` is the vocabulary's way of saying a write \
-              landed in an operand's buffer rather than in a result. \
-              `arity_problem` reads it exactly so -- a pair whose output \
-              the statement never declares subtracts from `writes` -- \
-              which is what stopped this row failing §6.2 the moment the \
-              metal plane started checking it. The read side moves too: \
-              the floor drops from 3 to 2 against `reads = 2`, which is \
-              where it belonged, since `hidden` is a pointer the statement \
-              places and the signature counts as a write.",
-    },
+    // `norm::residual_add_rmsnorm_bf16` STOOD HERE and the divergence is
+    // over: the row is back to the `[]` the pinned table records.
+    //
+    // Its `(1, 0)` named an output index one past the only one there is --
+    // the old vocabulary's way of saying `hidden` is a pointer the statement
+    // PLACES and the launcher WRITES THROUGH, with no result declared for it.
+    // The four marks say that at the parameter instead: `hidden` is
+    // `In<Tensor<T>>` and the body spells the mutation where the kernel is
+    // called. `InOut` would be the wrong word — it claims a RESULT slot too,
+    // which would push `norm_out` to `Out(1)`, a slot no statement fills.
+    // `.wiki/migration.md` §11.6.
     // AND THESE TWO WERE ALREADY DIVERGENT WHEN THE MECHANISM WAS BUILT,
     // which is the argument for building it rather than editing two pins.
     // `4c3843dd3` repaired them with a full case at the `routine!` line and
@@ -756,10 +835,22 @@ fn every_stated_column_still_says_what_it_said() {
         // Exempted exactly as `whole` is above, and for a stronger reason:
         // the two rows in `DIVERGED_IN_PLACE` had the pin holding the value
         // that corrupts. See that constant.
-        if !diverged_in_place.contains_key(pinned.symbol) && row.in_place != pinned.in_place {
+        // DERIVED NOW, AND THAT IS WHAT THIS PIN IS WORTH. The forty-one
+        // values below were written by hand on the rows; they come off the
+        // `InOut` marks in the signatures since, and this comparison is what
+        // says the two agree. `KernelSig` carries no `in_place` method of its
+        // own -- `kernels::routine::aliased` is the one definition
+        // `Routine::in_place` and `Declared::in_place` both read `sources`
+        // through, and `sigs()`'s rows are a third shape that reads it the
+        // same way.
+        if !diverged_in_place.contains_key(pinned.symbol)
+            && kernels::routine::aliased(row.sources) != pinned.in_place
+        {
             wrong.push(format!(
                 "{}: `in_place` was {:?} at 9e3936fb9^, is {:?} now",
-                pinned.symbol, pinned.in_place, row.in_place
+                pinned.symbol,
+                pinned.in_place,
+                kernels::routine::aliased(row.sources)
             ));
         }
     }
@@ -848,11 +939,13 @@ fn every_recorded_alias_divergence_is_still_a_divergence() {
             .get(d.symbol)
             .unwrap_or_else(|| panic!("{}: diverges from `sigs()` and is not in it", d.symbol));
         assert_eq!(
-            row.in_place, d.is,
+            kernels::routine::aliased(row.sources), d.is,
             "{}: `DIVERGED_IN_PLACE` says this row states `in_place = {:?}` on purpose, and it \
              states {:?}. If the alias was reverted, delete the entry -- but read the `why` \
              first, because these two were reverted once already by never being stated.",
-            d.symbol, d.is, row.in_place
+            d.symbol,
+            d.is,
+            kernels::routine::aliased(row.sources)
         );
     }
 }
@@ -935,17 +1028,18 @@ fn no_mark_names_a_fact_a_key_already_carries() {
     // the test fail, which is the point: the exemption and the repair are
     // the same edit.
     const EXCUSED: &[(&str, &str)] = &[
-        (
-            "KvKeys",
-            "the key is `*mut u8` and right; the parameter is `*mut bf16` \
-             and this launcher is one instantiation of a family with an fp8 \
-             sibling. The route is a cast at the parameter, in thirty \
-             launchers, which is the shape of change that gets half made.",
-        ),
-        (
-            "KvValues",
-            "`KvKeys`'s reason, in the same signature two lines down.",
-        ),
+        // `"KvKeys"` AND `"KvValues"` STOOD HERE, AND THE NOTATION GREW TO
+        // REACH THEM. The excuse read *"the key is `*mut u8` and right; the
+        // parameter is `*mut bf16` ... the route is a cast at the parameter,
+        // in thirty launchers, which is the shape of change that gets half
+        // made"*. That was a statement about a mark that carried a POINTER
+        // and therefore an element it could disagree with the key about.
+        //
+        // `Tensor<E>` is the carrier now and a body ASKS: `ctx.ask::<Tensor
+        // <bf16>, keys::KvKeys>()` names the element at the call, so the two
+        // spellings meet in one expression and there is nothing left for the
+        // key to disagree with. The thirty casts are gone with them.
+        // `.wiki/migration.md` §11.1.
         // `"Attn"` STOOD HERE AND ITS EXCUSE WAS FALSIFIED BY BEING FIXED.
         // It read *"`operand()` has no `Source::Attn` arm; the variant
         // reaches the binder only through the blocked allowlist ... the mark
@@ -1085,55 +1179,82 @@ fn the_marks_that_remain_are_the_ones_that_cannot_convert() {
     // (file, variant, class). The class is the load-bearing column: a mark
     // with no class is backlog, and a mark with one is a floor.
     const RESIDUE: &[(&str, &str, &str)] = &[
-        (
-            "ssm.rs",
-            "WeightNamed2",
-            "THE KEY DOES NOT FIT, in `KvKeys`' class. `keys::NamedWeight2` is \
-             a non-nullable `*const u8`; the parameter is `MaybeConst<T>` and \
-             the C++ is `const T* __restrict__ bias // [C] nullable`. qwen3.5 \
-             builds this conv `bias=False`, so the null is a deployment and \
-             not a lookup that failed.",
-        ),
-        (
-            "gemm/mod.rs",
-            "OutWidth",
-            "NO REGION TO ASK. E1 needs a body holding a region; the operand \
-             is `Unbound<*const *const c_void>`, which says the address did \
-             not come from the statement. A device pointer inside a HOST \
-             array has no rectangle.",
-        ),
-        (
-            "gemm/mod.rs",
-            "InWidth",
-            "`OutWidth`'s reason, one line down, for the input side.",
-        ),
-        (
-            "quant.rs",
-            "OutElements",
-            "NO RECTANGLE EITHER, and for an unrelated reason: a byte run \
-             longer than `i32::MAX` does not fit `Extent`. Its own site says \
-             widening `Extent` to `i64` would retire this one and do nothing \
-             for the two above -- which is why they are separate classes and \
-             not one.",
-        ),
-        (
-            "rope.rs",
-            "KvKeys",
-            "THE KEY DOES NOT FIT. `*mut u8` against a `*mut bf16` \
-             parameter, and the key is the correct one -- a KV page is bytes \
-             whose element type is the layer's dtype, so a fact true of one \
-             instantiation is not a fact.",
-        ),
-        ("rope.rs", "KvValues", "`KvKeys`'s reason, two lines down."),
-        (
-            "attn/mod.rs",
-            "Weight",
-            "THE STATEMENT DOES NOT PLACE IT. `mla_prepare` has no weight \
-             parameter in the DSL at all, so this names a bank that does not \
-             exist -- the mark is a DEFECT, not a notation gap, and it is the \
-             one entry here that should someday leave by being fixed rather \
-             than by the notation growing.",
-        ),
+        // `("ssm.rs", "WeightNamed2")` STOOD HERE, AND THE NOTATION GREW TO
+        // REACH IT. The residue read *"the key does not fit ... `keys::
+        // NamedWeight2` is a non-nullable `*const u8`; the parameter is
+        // `MaybeConst<T>`"* -- a mismatch between what the KEY declared and
+        // what the parameter could hold.
+        //
+        // `Const<Tensor<MaybeConst<T>>>` holds both: the mark says the
+        // statement places it, `Tensor` says which element, and `MaybeConst`
+        // says it may be absent. The chain it derives IS `weight2`'s, and
+        // nullability is read off the carrier rather than off the key -- so
+        // qwen3.5's `bias=False` is a deployment the column states, which is
+        // what this entry said it wanted.
+        // `("gemm/mod.rs", "OutWidth")` AND ITS INPUT-SIDE TWIN STOOD HERE,
+        // AND THE NOTATION GREW TO REACH THEM -- by a different route than
+        // the one they were blocked on.
+        //
+        // The residue read *"NO REGION TO ASK. E1 needs a body holding a
+        // region; the operand is `Unbound<*const *const c_void>` ... a device
+        // pointer inside a HOST array has no rectangle"*. Every clause is
+        // still true: `grouped_act_x_wt_bf16` still takes four bare pointer
+        // arrays and still holds no region.
+        //
+        // What changed is that a body no longer has to DERIVE a fact from a
+        // rectangle to reach it. `ctx.ask::<i32, keys::OutWidth0>()` asks the
+        // fire directly, which is what `#[source(OutWidth(0))]` was asking
+        // for through the column, and neither reading needs an operand to
+        // hang on. The blocked route stayed blocked; a second one opened.
+        // `.wiki/migration.md` §4.4.
+        // `("quant.rs", "OutElements")` STOOD HERE AND ITS SITE ANSWERED IT.
+        // The residue read *"NO RECTANGLE EITHER ... a byte run longer than
+        // `i32::MAX` does not fit `Extent`"*, and the repair it named was
+        // widening `Extent` to `i64`.
+        //
+        // `cast_fp32_to` took a different one. `keys::OutElements0` is *"rows
+        // times the result's row width"* -- the two numbers the operand
+        // already carries -- so the mark was asking a driver for a product of
+        // its own extents. `Out<Tensor<T>>` carries both, and the body reads
+        // `Region::elements` off the value the caller placed, which is also
+        // what makes the routine reachable from a hand-written caller: an ask
+        // needs a fire behind it and `Ctx::on(stream)` has none.
+        //
+        // `Extent` is still `i32`, and that limit is still there. It is no
+        // longer in this row's way.
+        // `("rope.rs", "KvKeys")` AND ITS TWIN STOOD HERE, AND THE NOTATION
+        // GREW TO REACH THEM -- the same growth that retired the pair in
+        // `EXCUSED` above, for the same reason.
+        //
+        // The residue read *"the key does not fit: `*mut u8` against a
+        // `*mut bf16` parameter, and the key is the correct one -- a KV page
+        // is bytes whose element type is the layer's dtype, so a fact true of
+        // one instantiation is not a fact"*. That is a mismatch between a
+        // key's declared value type and a PARAMETER's, and it only exists
+        // while the fact has to arrive as a parameter.
+        //
+        // It does not: `let k_pages = ctx.ask::<*mut bf16, keys::KvKeys>()?`
+        // names the reading at the call. The key still declares the bytes and
+        // this instantiation still reads them as bf16; the two now meet in
+        // one expression, where a reader can see both.
+        // `.wiki/migration.md` §11.1.
+        // `("attn/mod.rs", "Weight")` WAS THE LAST ENTRY, AND THE LIST IS
+        // EMPTY BECAUSE THE NOTATION IT MEASURED IS GONE.
+        //
+        // Every entry here named a `#[source(..)]` attribute — the escape
+        // the five marks needed when a parameter's source could not be read
+        // off its type. The four marks derive it from the type in every case
+        // (`kernels/src/routine.rs`'s `resolve`), so the attribute has no
+        // remaining use and no remaining site: the scan below finds only
+        // prose mentions, which it strips.
+        //
+        // The defect this last entry named is NOT retired by that. The DSL
+        // still places no weight for `mla_prepare`, and the parameter is
+        // still there — it is `kv_a_norm_weight: Const<Tensor<bf16>>` now,
+        // deriving `Or(Named("weight"), Slot(Weight, 0))` where it used to
+        // say `#[source(Weight(0))]`. What changed is only that a scan for
+        // attributes cannot see it. `model-ir`'s `arity_problem` can, and
+        // that is the gate that should carry it.
         // `("attn/xqa.rs", "Attn")` STOOD HERE AND CONVERTED, WHICH IS THE
         // ONLY WAY AN ENTRY IS SUPPOSED TO LEAVE THIS LIST. Its class was
         // *"blocked by design, pending the four-part binder template -- the

@@ -476,7 +476,7 @@ const AWAITING_THE_VERIFY_STASH_POOL: &[&str] =
 /// of it were false: statements name four of the six, and this crate calls
 /// none of the six by path.
 ///
-/// All four are DECLARED now — a `driver_bound!` line each in `attn`,
+/// All four are DECLARED now — a `untraced!` line each in `attn`,
 /// `layout`, `mlp` and `ssm`, deriving the row from the same `fn`, with the
 /// bodies left in `driver_internal` because that is where the driver-shaped
 /// `void*` parameter lists belong. So `sigs()` reaches them and this list has
@@ -537,7 +537,7 @@ fn bridged_symbols() -> BTreeSet<&'static str> {
     // and the population it excluded has half moved. `driver_internal`
     // declares no `FAMILY` of its own and never will — its header says why —
     // but four of its six `fn`s are named from `attn`, `layout`, `mlp` and
-    // `ssm` by a `driver_bound!` line each, so their symbols ARE in `sigs()`
+    // `ssm` by a `untraced!` line each, so their symbols ARE in `sigs()`
     // and belong there: a live model text lowers to every one. The other two
     // forward to `norm` routines that were already declared, so nothing in
     // that module is a row waiting to be filtered back out. The set below IS
@@ -1707,10 +1707,10 @@ fn a_named_operand_names_its_alias_owner() {
                     model_ir::trace::OpKind::Launch { kernel, .. } => {
                         model_ir::kernels::in_place_pairs(&plan, kernel)
                     }
-                    other => model_ir::kernels::semantic_in_place(other),
+                    other => model_ir::kernels::semantic_in_place(other).to_vec(),
                 };
                 let args = &l.args[lu.args.start as usize..lu.args.end as usize];
-                for &(o, in_i) in pairs {
+                for &(o, in_i) in &pairs {
                     let (Some(a_in), Some(a_out)) = (
                         args.get(in_i as usize),
                         args.get(op.inputs.len() + o as usize),

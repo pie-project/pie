@@ -4,10 +4,11 @@
 //! name: it bakes gpt-oss's asymmetric clamp, its `alpha` and its `(up + 1)`
 //! term, and its own first line says so.
 
+use kernels_macros::routine;
+use crate::routine::{Asks, Bind, Ctx, Fire, In, Out, Tensor, bf16, elementwise, elementwise_rows, keys};
+use kernels::KernelSig;
 use kernels::routine::Refusal;
 
-use crate::routine::{elementwise, keys, Ask, Bind, Block, Buf, BufMut, Ctx, Fire, Routine};
-use crate::routine::{InSlot, OutSlot, Param};
 
 /// gemma's gated activation: `gelu_tanh(gate) * up`, the tanh approximation
 /// and not the erf one.
@@ -26,21 +27,18 @@ use crate::routine::{InSlot, OutSlot, Param};
 /// # Errors
 ///
 /// See [`crate::routine::elementwise`].
+#[routine]
 pub fn geglu_tanh(
     ctx: &Ctx<'_>,
-    gate: InSlot<0, Buf>,
-    up: InSlot<1, Buf>,
-    out: OutSlot<0, BufMut>,
-    _params: Block<Buf>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "geglu_tanh_bfloat16",
-            lanes: elementwise(*width, *rows)?,
-        },
-        &[gate.v(), up.v(), out.v()],
+    gate: In<Tensor<bf16>>,
+    up: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let _params = ctx.params()?;
+    let width = gate.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(crate::routine::module_path("geglu_tanh_bfloat16", ctx.best()), "geglu_tanh_bfloat16").apply(elementwise(width, rows)?),
+        &[gate.arg(), up.arg(), out.arg()],
     )
 }
 
@@ -60,21 +58,18 @@ pub fn geglu_tanh(
 /// # Errors
 ///
 /// See [`crate::routine::elementwise`].
+#[routine]
 pub fn geglu_tanh_strided(
     ctx: &Ctx<'_>,
-    gate: InSlot<0, Buf>,
-    up: InSlot<1, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "geglu_tanh_strided_bfloat16",
-            lanes: elementwise(*width, *rows)?,
-        },
-        &[gate.v(), up.v(), out.v(), params.v()],
+    gate: In<Tensor<bf16>>,
+    up: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let width = gate.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(crate::routine::module_path("geglu_tanh_strided_bfloat16", ctx.best()), "geglu_tanh_strided_bfloat16").apply(elementwise(width, rows)?),
+        &[gate.arg(), up.arg(), out.arg(), params],
     )
 }
 
@@ -91,21 +86,18 @@ pub fn geglu_tanh_strided(
 /// # Errors
 ///
 /// See [`crate::routine::elementwise`].
+#[routine]
 pub fn gptoss_swiglu(
     ctx: &Ctx<'_>,
-    gate: InSlot<0, Buf>,
-    up: InSlot<1, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "gptoss_swiglu_bfloat16",
-            lanes: elementwise(*width, *rows)?,
-        },
-        &[gate.v(), up.v(), out.v(), params.v()],
+    gate: In<Tensor<bf16>>,
+    up: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let width = gate.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(crate::routine::module_path("gptoss_swiglu_bfloat16", ctx.best()), "gptoss_swiglu_bfloat16").apply(elementwise(width, rows)?),
+        &[gate.arg(), up.arg(), out.arg(), params],
     )
 }
 
@@ -123,20 +115,17 @@ pub fn gptoss_swiglu(
 /// # Errors
 ///
 /// See [`crate::routine::elementwise`].
+#[routine]
 pub fn silu_mul(
     ctx: &Ctx<'_>,
-    gate: InSlot<0, Buf>,
-    up: InSlot<1, Buf>,
-    out: OutSlot<0, BufMut>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "silu_mul_bfloat16",
-            lanes: elementwise(*width, *rows)?,
-        },
-        &[gate.v(), up.v(), out.v()],
+    gate: In<Tensor<bf16>>,
+    up: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let width = gate.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(crate::routine::module_path("silu_mul_bfloat16", ctx.best()), "silu_mul_bfloat16").apply(elementwise(width, rows)?),
+        &[gate.arg(), up.arg(), out.arg()],
     )
 }
 
@@ -157,32 +146,25 @@ pub fn silu_mul(
 /// # Errors
 ///
 /// See [`crate::routine::elementwise_rows`].
+#[routine]
 pub fn silu_mul_strided(
     ctx: &Ctx<'_>,
-    gate: InSlot<0, Buf>,
-    up: InSlot<1, Buf>,
-    out: OutSlot<0, BufMut>,
-    row_pitch: Param<0, i32>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "silu_mul_strided_bfloat16",
-            lanes: crate::routine::elementwise_rows(*width, *rows)?,
-        },
-        &[gate.v(), up.v(), out.v(), row_pitch.v()],
+    gate: In<Tensor<bf16>>,
+    up: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<1>` named.
+    // This body forwards `ctx.params()` as a STRUCT, so the run is the
+    // shader's layout and no `Const` mark can name a word inside it; the
+    // migration made this `keys::RowPitch`, which no driver answers.
+    let row_pitch = ctx.param(1)?;
+    let width = gate.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(crate::routine::module_path("silu_mul_strided_bfloat16", ctx.best()), "silu_mul_strided_bfloat16").apply(elementwise_rows(width, rows)?),
+        &[gate.arg(), up.arg(), out.arg(), row_pitch.arg()],
     )
 }
 
-/// This family's routines.
-pub static ROUTINES: &[Routine] = &[
-    crate::routine!(geglu_tanh),
-    crate::routine!(geglu_tanh_strided),
-    crate::routine!(gptoss_swiglu),
-    crate::routine!(silu_mul),
-    crate::routine!(silu_mul_strided),
-];
 
 /// The entrypoints this family's crossed routines spell, now that their rows
 /// are gone. See [`crate::RETIRED`].
@@ -197,19 +179,75 @@ pub static ENTRYPOINTS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routine::{ArgValue, Encode};
-    use core::cell::RefCell;
+    use crate::routine::{ArgValue, Encode, Tensor};
+    use core::cell::{Cell, RefCell};
 
     type Call = (String, [u32; 3], Vec<ArgValue>);
 
-    /// An `Encode` that remembers. See `sample.rs` for why a body is worth
-    /// checking without a device.
-    #[derive(Default)]
-    struct Seen(RefCell<Vec<Call>>);
+    /// An `Encode` that remembers, and answers the facts this family's bodies
+    /// ask for.
+    ///
+    /// `width` came off the mark -- every routine here reads `gate.width`
+    /// directly, so a test states it at construction and this probe never
+    /// sees it. `rows` did not: it is `ctx.ask::<i32, keys::Rows>()` in every
+    /// one of these five bodies, unconditionally and before the rectangle is
+    /// even checked, so `resolve` has to answer it for ANY call to run past
+    /// its first line. The default is a representative nonzero count so a
+    /// call that does not care about the exact number still runs whole; a
+    /// test asserting a specific dispatch, or driving the empty-rows
+    /// refusal, sets it first. `row_pitch` answers `silu_mul_strided`'s own
+    /// ask the same way. `ctx.params()`, which three of these five call for a
+    /// block none of them read the CONTENTS of, is answered generically by
+    /// `Ty` alone rather than by a field of its own.
+    struct Seen {
+        calls: RefCell<Vec<Call>>,
+        rows: Cell<i32>,
+        row_pitch: Cell<i32>,
+    }
+
+    impl Default for Seen {
+        fn default() -> Self {
+            Self {
+                calls: RefCell::default(),
+                rows: Cell::new(3),
+                row_pitch: Cell::new(4096),
+            }
+        }
+    }
 
     impl Encode for Seen {
-        fn dispatch(&self, fire: Fire<'_>, args: &[ArgValue]) -> Result<(), Refusal> {
-            self.0
+        // Answers the two NAMED facts this file's bodies ask by name, and
+        // `ctx.params()` -- `Ty::Buf` at `Source::Slot(Params, 0)` -- by type
+        // alone, since no test here inspects what the params block holds.
+        // Anything else is refused: a probe that invented an answer to a
+        // fact it does not know would let a body pass under test while the
+        // same fact went unanswered on a real driver.
+        fn resolve(
+            &self,
+            ty: kernels::Ty,
+            source: kernels::Source,
+        ) -> Result<ArgValue, Refusal> {
+            // The statement's own scalars, read by index where the params run
+            // is the shader's struct -- see `Asks::param`.
+            if let kernels::Source::Slot(kernels::Kind::Param, n) = source {
+                let _ = n;
+                return Ok(ArgValue::I32(4096));
+            }
+            use kernels::Source as Src;
+            if source == Src::Named("rows") {
+                return Ok(ArgValue::I32(self.rows.get()));
+            }
+            if source == Src::Named("row_pitch") {
+                return Ok(ArgValue::I32(self.row_pitch.get()));
+            }
+            if matches!(ty, kernels::Ty::Buf) {
+                return Ok(ArgValue::Buffer { handle: 900, writes: false, rows: 0, width: 0 });
+            }
+            Err(Refusal::Unstated { what: "a fact this probe does not answer" })
+        }
+
+        fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
+            self.calls
                 .borrow_mut()
                 .push((fire.entrypoint.to_owned(), fire.lanes, args.to_vec()));
             Ok(())
@@ -233,16 +271,38 @@ mod tests {
     #[test]
     fn every_activation_launches_one_lane_per_element_on_x_alone() {
         let seen = Seen::default();
-        geglu_tanh(&seen, InSlot::new(Buf(0)), InSlot::new(Buf(1)), OutSlot::new(BufMut(2)), Block::new(Buf(3)), Ask::new(64), Ask::new(3))
-            .expect("64 wide by 3 rows is a launch");
-        geglu_tanh_strided(&seen, InSlot::new(Buf(0)), InSlot::new(Buf(1)), OutSlot::new(BufMut(2)), Block::new(Buf(3)), Ask::new(64), Ask::new(3))
-            .expect("a pitch does not make it two-dimensional");
-        gptoss_swiglu(&seen, InSlot::new(Buf(0)), InSlot::new(Buf(1)), OutSlot::new(BufMut(2)), Block::new(Buf(3)), Ask::new(64), Ask::new(3))
-            .expect("64 wide by 3 rows is a launch");
-        silu_mul(&seen, InSlot::new(Buf(0)), InSlot::new(Buf(1)), OutSlot::new(BufMut(2)), Ask::new(64), Ask::new(3))
-            .expect("64 wide by 3 rows is a launch");
+        // `seen.rows` defaults to 3, which is what every assertion below
+        // treats "3 rows" as meaning; `width: 64` rides each mark directly.
+        geglu_tanh(
+            &seen,
+            In { ptr: Tensor::<bf16>::new(0), rows: 3, width: 64 },
+            In { ptr: Tensor::<bf16>::new(1), rows: 3, width: 64 },
+            Out { ptr: Tensor::<bf16>::new(2), rows: 3, width: 64 },
+        )
+        .expect("64 wide by 3 rows is a launch");
+        geglu_tanh_strided(
+            &seen,
+            In { ptr: Tensor::<bf16>::new(0), rows: 3, width: 64 },
+            In { ptr: Tensor::<bf16>::new(1), rows: 3, width: 64 },
+            Out { ptr: Tensor::<bf16>::new(2), rows: 3, width: 64 },
+        )
+        .expect("a pitch does not make it two-dimensional");
+        gptoss_swiglu(
+            &seen,
+            In { ptr: Tensor::<bf16>::new(0), rows: 3, width: 64 },
+            In { ptr: Tensor::<bf16>::new(1), rows: 3, width: 64 },
+            Out { ptr: Tensor::<bf16>::new(2), rows: 3, width: 64 },
+        )
+        .expect("64 wide by 3 rows is a launch");
+        silu_mul(
+            &seen,
+            In { ptr: Tensor::<bf16>::new(0), rows: 3, width: 64 },
+            In { ptr: Tensor::<bf16>::new(1), rows: 3, width: 64 },
+            Out { ptr: Tensor::<bf16>::new(2), rows: 3, width: 64 },
+        )
+        .expect("64 wide by 3 rows is a launch");
 
-        let calls = seen.0.borrow();
+        let calls = seen.calls.borrow();
         let fired: Vec<(&str, [u32; 3])> = calls
             .iter()
             .map(|(e, lanes, _)| (e.as_str(), *lanes))
@@ -272,16 +332,31 @@ mod tests {
     #[test]
     fn an_empty_rectangle_is_refused() {
         let seen = Seen::default();
+        seen.rows.set(0);
         assert!(
             matches!(
-                silu_mul(&seen, InSlot::new(Buf(0)), InSlot::new(Buf(1)), OutSlot::new(BufMut(2)), Ask::new(64), Ask::new(0)),
+                silu_mul(
+                    &seen,
+                    In { ptr: Tensor::<bf16>::new(0), rows: 0, width: 64 },
+                    In { ptr: Tensor::<bf16>::new(1), rows: 0, width: 64 },
+                    Out { ptr: Tensor::<bf16>::new(2), rows: 0, width: 64 },
+                ),
                 Err(Refusal::Empty { what: "rows" })
             ),
             "no rows routed to this expert is not a launch of nothing"
         );
+        // `rows` is asked unconditionally, before the rectangle is checked,
+        // so it still has to resolve to something here even though the
+        // width failure below fires first; its value plays no other part.
+        seen.rows.set(3);
         assert!(
             matches!(
-                silu_mul(&seen, InSlot::new(Buf(0)), InSlot::new(Buf(1)), OutSlot::new(BufMut(2)), Ask::new(0), Ask::new(3)),
+                silu_mul(
+                    &seen,
+                    In { ptr: Tensor::<bf16>::new(0), rows: 3, width: 0 },
+                    In { ptr: Tensor::<bf16>::new(1), rows: 3, width: 0 },
+                    Out { ptr: Tensor::<bf16>::new(2), rows: 3, width: 0 },
+                ),
                 Err(Refusal::Empty { what: "width" })
             ),
             "a zero-wide row is refused too, and the refusal NAMES which \
@@ -289,7 +364,7 @@ mod tests {
              caller that wants to fall back needs to know which"
         );
         assert!(
-            seen.0.borrow().is_empty(),
+            seen.calls.borrow().is_empty(),
             "a refusal reaches the driver as nothing at all"
         );
     }
@@ -303,7 +378,13 @@ mod tests {
     #[test]
     fn a_rectangle_too_large_to_count_is_refused() {
         let seen = Seen::default();
-        let e = silu_mul(&seen, InSlot::new(Buf(0)), InSlot::new(Buf(1)), OutSlot::new(BufMut(2)), Ask::new(1 << 20), Ask::new(1 << 13));
+        seen.rows.set(1 << 13);
+        let e = silu_mul(
+            &seen,
+            In { ptr: Tensor::<bf16>::new(0), rows: 1 << 13, width: 1 << 20 },
+            In { ptr: Tensor::<bf16>::new(1), rows: 1 << 13, width: 1 << 20 },
+            Out { ptr: Tensor::<bf16>::new(2), rows: 1 << 13, width: 1 << 20 },
+        );
         assert!(
             matches!(
                 e,

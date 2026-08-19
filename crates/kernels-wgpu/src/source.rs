@@ -110,6 +110,38 @@ pub fn declared() -> Vec<(&'static str, Variant)> {
     out
 }
 
+/// The WGSL one entrypoint compiles from, when the caller knows the file.
+///
+/// # WHY THE FILE IS WORTH STATING
+///
+/// [`entrypoint_source`] recovers it by calling [`declared`], which re-parses
+/// every one of the embedded sources and takes the first variant whose
+/// entrypoint matches. That is a scan over the whole tree to answer a question
+/// about one file, and `.find` would silently take the first of two files that
+/// declared the same name. A routine body knows which file its point lives in
+/// — it is the first argument of `Fire::at` — so passing it turns the scan
+/// into a lookup and the ambiguity into a stated fact.
+///
+/// # Errors
+///
+/// [`Missing::NoVariant`] when that file declares no such variant at this tier,
+/// and [`Missing::Unexpandable`] when it does and the source is wrong.
+pub fn at(file: &str, entrypoint: &str, tier: Capability) -> Result<String, Missing> {
+    let text = source(file).ok_or_else(|| Missing::NoVariant {
+        entrypoint: entrypoint.to_owned(),
+        tier,
+    })?;
+    let variant = crate::preproc::instantiations(text)
+        .unwrap_or_else(|why| panic!("`{file}` was parsed at build time: {why}"))
+        .into_iter()
+        .find(|v| v.entrypoint == entrypoint && v.tier == tier)
+        .ok_or_else(|| Missing::NoVariant {
+            entrypoint: entrypoint.to_owned(),
+            tier,
+        })?;
+    expand_variant(file, text, &variant, tier)
+}
+
 /// The WGSL one entrypoint compiles from, at one tier.
 ///
 /// # Errors
@@ -145,6 +177,33 @@ pub fn entrypoint_source(entrypoint: &str, tier: Capability) -> Result<String, M
         &defines,
         &|path| source(path).map(ToOwned::to_owned),
     )
+    .map_err(|why| Missing::Unexpandable {
+        file: file.to_owned(),
+        why,
+    })
+}
+
+/// One variant's WGSL, with the tier's defines under its own.
+///
+/// Shared by [`at`] and [`entrypoint_source`] so the two cannot expand the
+/// same variant differently — the only thing that ever differed between them
+/// is how the file was found.
+fn expand_variant(
+    file: &str,
+    text: &'static str,
+    variant: &Variant,
+    tier: Capability,
+) -> Result<String, Missing> {
+    let mut defines: BTreeMap<String, String> = tier
+        .defines()
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
+    defines.extend(variant.defines.clone());
+
+    crate::preproc::expand(text, &defines, &|path| {
+        source(path).map(ToOwned::to_owned)
+    })
     .map_err(|why| Missing::Unexpandable {
         file: file.to_owned(),
         why,

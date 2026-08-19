@@ -1645,7 +1645,7 @@ fn llama_like_cuda_text(
                     // launchers -- a kernel choice from a param. This
                     // family rotates the full head, and says which
                     // kernel that is.
-                    dsl::cuda::rope(&q, &k)
+                    dsl::cuda::rope(&q, &k, f.q_heads, f.kv_heads, f.head_dim)
                 };
                 // The KV-write mechanism is a per-fire runtime input
                 // (explicit descriptors when the fire steers a graph
@@ -1819,7 +1819,7 @@ fn llama_like_cuda_text(
                                     // plain-decode requests, ragged qo.
                                     if c.force_prefill_path {
                                         cuda::dequant_only(&w.kv);
-                                        cuda::attention_flashinfer_prefill(q, &w.kv, window_left, plan_head_dim);
+                                        cuda::attention_flashinfer_prefill(q, &w.kv, window_left, plan_head_dim, 0.0, 0.0);
                                     } else {
                                         dsl::guarded(m.trace())
                                             .arm(GuardPred::WindowOne, || {
@@ -1842,7 +1842,7 @@ fn llama_like_cuda_text(
                                                             &w.kv,
                                                             window_left,
                                                         plan_head_dim,
-);
+ 0.0, 0.0);
                                                     })
                                                     .otherwise(|| {
                                                         cuda::attention_flashinfer_decode(
@@ -1860,7 +1860,7 @@ fn llama_like_cuda_text(
                                                     &w.kv,
                                                     window_left,
                                                 plan_head_dim,
-);
+ 0.0, 0.0);
                                             });
                                     }
                                 });
@@ -1870,7 +1870,7 @@ fn llama_like_cuda_text(
                                         &w.kv,
                                         window_left,
                                     plan_head_dim,
-);
+ 0.0, 0.0);
                                 });
                             });
                         };
@@ -1878,7 +1878,7 @@ fn llama_like_cuda_text(
                             // The split's row offsets are logical-width
                             // and the padded staging is not, so this
                             // deployment keeps the fire-level word.
-                            cuda::attention_flashinfer_prefill_custom(q, &w.kv, window_left, plan_head_dim);
+                            cuda::attention_flashinfer_prefill_custom(q, &w.kv, window_left, plan_head_dim, 0.0, 0.0);
                         } else if c.xqa_decode {
                             // XQA's prepare is fire-wide (R-shaped), so a
                             // window-one fire cannot peel; a ragged one
@@ -1892,7 +1892,7 @@ fn llama_like_cuda_text(
                                         &w.kv,
                                         window_left,
                                     plan_head_dim,
-);
+ 0.0, 0.0);
                                 },
                                 || peeled(q),
                             );
@@ -1914,7 +1914,7 @@ fn llama_like_cuda_text(
                             // the prefill dispatch — there is nothing
                             // left for a guard to choose between.
                             cuda::dequant_only(&w.kv);
-                            cuda::attention_flashinfer_prefill(q, &w.kv, window_left, plan_head_dim);
+                            cuda::attention_flashinfer_prefill(q, &w.kv, window_left, plan_head_dim, 0.0, 0.0);
                         } else {
                             dsl::guarded(m.trace())
                                 .arm(GuardPred::WindowOne, || {
@@ -1925,7 +1925,7 @@ fn llama_like_cuda_text(
                                                 &w.kv,
                                                 window_left,
                                             plan_head_dim,
-);
+ 0.0, 0.0);
                                         })
                                         .otherwise(|| {
                                             cuda::attention_flashinfer_decode(
@@ -1948,7 +1948,7 @@ fn llama_like_cuda_text(
                                                 &w.kv,
                                                 window_left,
                                             plan_head_dim,
-);
+ 0.0, 0.0);
                                         })
                                         .otherwise(|| {
                                             cuda::attention_flashinfer_prefill(
@@ -1956,7 +1956,7 @@ fn llama_like_cuda_text(
                                                 &w.kv,
                                                 window_left,
                                             plan_head_dim,
-);
+ 0.0, 0.0);
                                         });
                                 });
                         }

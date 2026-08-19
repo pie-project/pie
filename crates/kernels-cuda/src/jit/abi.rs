@@ -237,6 +237,36 @@ impl<T> Clone for MaybeConst<T> {
 }
 impl<T> Copy for MaybeConst<T> {}
 
+// A NULLABLE POINTER IS AN ELEMENT WITH ONE CARRIER — ITSELF.
+//
+// `MaybeConst<T>` is a `const T*` that may be absent, and the absence is the
+// whole of what distinguishes it: there is no writing form, because the two
+// launchers that take one (`ssm`'s conv bias, `gemm`'s LoRA bias) only read
+// through it. So `Read` and `Write` are both `Self`, exactly as a shader
+// plane's handle answers, and the `Ty` still splits because the table must say
+// which way the launch drives it even where the value cannot.
+impl<T: 'static> kernels::Elem for MaybeConst<T> {
+    type Read = Self;
+    type Write = Self;
+
+    // A NULLABLE POINTER DOES NOT WINDOW. Every caller that advances an
+    // operand bounds `start` against a rectangle first, and an absent bias has
+    // no rectangle to bound against — answering with the value unchanged is
+    // the honest reading of "advance a thing that may not be there".
+    unsafe fn advance_read(read: Self::Read, _elems: usize) -> Self::Read {
+        read
+    }
+
+    unsafe fn advance_write(write: Self::Write, _elems: usize) -> Self::Write {
+        write
+    }
+
+    const CPP_CONST: &'static str = "const void*";
+    const CPP_MUT: &'static str = "void*";
+    const TY_CONST: Ty = Ty::Buf;
+    const TY_MUT: Ty = Ty::BufMut;
+}
+
 impl<T> MaybeConst<T> {
     /// A possibly-null `const T*` from a raw pointer.
     #[must_use]
@@ -276,6 +306,29 @@ scalar_abi!(f32, "float", F32, F32);
 scalar_abi!(bool, "bool", Bool, Bool);
 scalar_abi!(i64, "long long", I64, I64);
 scalar_abi!(usize, "std::size_t", Usize, Usize);
+
+/// `Const<usize>`'s bound value, on every plane: `ConstRun for usize` (in
+/// `kernels::routine`) fixes `Held = u64` so a checkpoint `usize` crosses the
+/// ABI at one width regardless of the host's pointer size. This is the CUDA
+/// reading of that width — the same `Ty::Usize`/`std::size_t` pair `usize`
+/// itself wears, with the cast at the boundary because `ArgValue::Usize`
+/// carries the Rust-native `usize` and not a `u64`. Not `scalar_abi!`: that
+/// macro assumes the Rust type IS the `ArgValue` payload, which is true of
+/// `usize` and not of this conversion.
+impl Abi for u64 {
+    const CPP: &'static str = "std::size_t";
+    const TY: Ty = Ty::Usize;
+    fn arg(&self) -> crate::jit::ArgValue {
+        crate::jit::ArgValue::Usize(*self as usize)
+    }
+    fn unpack(value: &crate::jit::ArgValue, at: usize) -> Result<Self, kernels::Refusal> {
+        match value {
+            crate::jit::ArgValue::Usize(v) => Ok(*v as u64),
+            _ => Err(wrong_kind(at, Ty::Usize)),
+        }
+    }
+}
+crate::arg_via_abi!(u64);
 
 /// `__nv_fp8_interpretation_t`, as the kernels take it.
 ///
@@ -431,9 +484,78 @@ macro_rules! elem_agrees {
     };
 }
 
+/// A DEVICE ARRAY OF `E`, as CUDA binds one.
+///
+/// The same written form as [`kernels::shader::Tensor`] and different innards,
+/// which is what [`kernels::Elem`] requires: a shader plane's tensor holds a
+/// binding index and this one holds nothing at all, because on CUDA the
+/// carrier IS the pointer the element already names.
+///
+/// It exists so that one word says *"a plane of `E`"* on every plane. Once
+/// [`kernels::Const`] stopped implying buffer-ness — `Const<Tensor<bf16>>` is a
+/// weight and `Const<i32>` a scalar the statement carries — the carrier had to
+/// say which, and `Tensor<E>` is that saying.
+#[derive(Debug)]
+pub struct Tensor<E>(core::marker::PhantomData<E>);
+
+impl<E> Clone for Tensor<E> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<E> Copy for Tensor<E> {}
+
+// A TENSOR OF `E` BINDS EXACTLY AS `E` DOES. `#[repr]` does not come into it:
+// the type is uninhabited at run time and forwards both carriers, so
+// `In<Tensor<bf16>>` hands a body the same `*const bf16` that `In<bf16>` did.
+impl<E: kernels::Elem> kernels::Elem for Tensor<E> {
+    type Read = E::Read;
+    type Write = E::Write;
+
+    unsafe fn advance_read(read: Self::Read, elems: usize) -> Self::Read {
+        // SAFETY: the trait's obligation, forwarded to the element.
+        unsafe { E::advance_read(read, elems) }
+    }
+
+    unsafe fn advance_write(write: Self::Write, elems: usize) -> Self::Write {
+        // SAFETY: as above.
+        unsafe { E::advance_write(write, elems) }
+    }
+
+    const CPP_CONST: &'static str = E::CPP_CONST;
+    const CPP_MUT: &'static str = E::CPP_MUT;
+    const TY_CONST: Ty = E::TY_CONST;
+    const TY_MUT: Ty = E::TY_MUT;
+}
+
+// A TENSOR IS THE WEIGHT RUN'S CARRIER, on this plane as on the other three.
+// `Const<Tensor<bf16>>` claims the next weight and inherits the named-bank
+// chain `Weight` had; `Const<i32>` claims the next slot of the params run.
+impl<E: kernels::Elem> kernels::ConstRun for Tensor<E> {
+    const RUN: kernels::routine::Claim = kernels::routine::Claim::Weight;
+    const TY: Ty = E::TY_CONST;
+    type Held = E::Read;
+}
+
 // THE LOCAL POINTEES. These four are this crate's own types, so the orphan
 // rule allows the impl here -- beside the C++ spellings they already carry.
 impl kernels::Elem for bf16 {
+    // A POINTEE'S CARRIERS ARE ITS TWO POINTERS, as `prim_elem!` states for
+    // the primitives in `kernels/src/routine.rs`. This is the same pair, for
+    // the pointee this crate owns.
+    type Read = *const bf16;
+    type Write = *mut bf16;
+
+    unsafe fn advance_read(read: Self::Read, elems: usize) -> Self::Read {
+        // SAFETY: the trait's obligation, forwarded to the caller.
+        unsafe { read.add(elems) }
+    }
+
+    unsafe fn advance_write(write: Self::Write, elems: usize) -> Self::Write {
+        // SAFETY: as above.
+        unsafe { write.add(elems) }
+    }
+
     const CPP_CONST: &'static str = "const ::pie::bf16*";
     const CPP_MUT: &'static str = "::pie::bf16*";
     const TY_CONST: Ty = Ty::Bf16s;
@@ -441,6 +563,22 @@ impl kernels::Elem for bf16 {
 }
 
 impl kernels::Elem for f16 {
+    // A POINTEE'S CARRIERS ARE ITS TWO POINTERS, as `prim_elem!` states for
+    // the primitives in `kernels/src/routine.rs`. This is the same pair, for
+    // the pointee this crate owns.
+    type Read = *const f16;
+    type Write = *mut f16;
+
+    unsafe fn advance_read(read: Self::Read, elems: usize) -> Self::Read {
+        // SAFETY: the trait's obligation, forwarded to the caller.
+        unsafe { read.add(elems) }
+    }
+
+    unsafe fn advance_write(write: Self::Write, elems: usize) -> Self::Write {
+        // SAFETY: as above.
+        unsafe { write.add(elems) }
+    }
+
     const CPP_CONST: &'static str = "const ::pie::f16*";
     const CPP_MUT: &'static str = "::pie::f16*";
     const TY_CONST: Ty = Ty::F16s;
@@ -922,3 +1060,57 @@ pub fn typecheck_tu(root: &str, layouts: &[Layout]) -> String {
 // parameter. An asymmetry stated in two files and asserted equal is an
 // asymmetry that stays deliberate.
 elem_agrees!(bf16, f16, i32, i64, i8, u32, u8, u16, f32, c_void);
+
+// THE SHARED CONVERSION, over everything this file gives an ABI.
+//
+// `Abi::arg` and the shader planes' `Bind::v` were the same job under two
+// names, which is one of the five things that told a CUDA body apart from a
+// metal one at a glance. `Bind` is `kernels::routine`'s now, and `arg_via_abi!`
+// stamps it beside the `Arg` impl for every crossing type -- a blanket cannot
+// carry it here for the orphan reason `jit/arg.rs`'s header states.
+
+/// A pointee this backend can both instantiate and bind.
+///
+/// ONE BOUND WHERE THERE WERE THREE. A generic routine used to carry
+/// `T: Inst + kernels::Elem, <T as Elem>::Read: Abi, <T as Elem>::Write: Abi`
+/// -- three lines naming two CUDA-only traits, on a signature whose shader
+/// twin carried none. The facts are all implied by "this is a pointee CUDA
+/// knows", so they are said once, here, and a routine writes `T: Pointee`.
+///
+/// # The bounds are on the associated types, not in a `where`
+///
+/// `trait Pointee: Elem where Self::Read: Abi` compiles and does NOT reach a
+/// caller: a trait definition's `where` clause is checked at the impl and not
+/// elaborated to the use site, so `T: Pointee` left `T::Read: Abi` unproven
+/// and one hundred and twenty-eight bodies failed on a bound their signature
+/// had just stated. `Elem<Read: Abi, Write: Abi>` is a SUPERTRAIT bound and
+/// is elaborated, which is the whole difference.
+/// # `Bind` rides along for the same reason
+///
+/// A body writes `x.arg()`, which is [`kernels::routine::Bind`], and a generic
+/// one has only `T: Pointee` to prove it from. `Abi` alone used to be enough
+/// because a blanket `impl<T: Abi + Copy> Bind<ArgValue> for T` supplied the
+/// rest -- an impl the orphan rule refuses, so the conversion is stamped per
+/// type by `arg_via_abi!` now and no longer follows from `Abi`. Naming it here
+/// is what keeps a generic routine's signature at one bound.
+pub trait Pointee:
+    Inst
+    + kernels::routine::Elem<
+        Read: Abi + kernels::routine::Bind<crate::jit::ArgValue>,
+        Write: Abi
+            + kernels::routine::Bind<crate::jit::ArgValue>
+            + kernels::routine::BindMut<crate::jit::ArgValue>,
+    >
+{
+}
+
+impl<T> Pointee for T where
+    T: Inst
+        + kernels::routine::Elem<
+            Read: Abi + kernels::routine::Bind<crate::jit::ArgValue>,
+            Write: Abi
+            + kernels::routine::Bind<crate::jit::ArgValue>
+            + kernels::routine::BindMut<crate::jit::ArgValue>,
+        >
+{
+}

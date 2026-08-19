@@ -24,10 +24,24 @@
 //! [`crate::geometry::groups`] has always done it.
 //!
 //! **Choosing the capability tier.** One entrypoint compiles to up to three
-//! `.spv` modules and the driver walks `Capability::PREFERENCE` for the best
-//! this adapter advertises. A body that could name a tier could name one the
-//! device lacks, which faults inside `vkCreateComputePipelines` with the
-//! validation layer entirely silent.
+//! `.spv` modules, and the BODY picks which one it fires: it asks
+//! [`Encode::best`] for the ceiling this adapter advertises and hands the
+//! answer to `kernels_vulkan::module::path`, which steps down to the tier the
+//! build actually compiled. What arrives here is the artifact's own name, and
+//! this loads exactly that.
+//!
+//! It used to be the other way round — a body named a bare entrypoint and this
+//! driver walked `Capability::PREFERENCE` behind it — and the crate header
+//! records what that cost: the walk could not reach a tiered artifact at all,
+//! so 146 cooperative-matrix modules and 20 fp16 ones were dead on every
+//! device from the first commit, and nothing failed. A body that names its
+//! module cannot have that bug, because a variant nothing names is a file
+//! nothing reads.
+//!
+//! The safety the walk was protecting is kept by where the ceiling comes from:
+//! a body can only compose a tier [`Encode::best`] gave it, so it still cannot
+//! name one the device lacks — which would fault inside
+//! `vkCreateComputePipelines` with the validation layer entirely silent.
 //!
 //! **The split of arguments into descriptors and scalars.** A routine hands
 //! over its argument list in signature order and this reads the split off the
@@ -50,10 +64,12 @@ use core::cell::RefCell;
 use std::rc::Rc;
 
 use kernels::routine::Refusal;
+use kernels_vulkan::Capability;
 use kernels_vulkan::routine::{ArgValue, Encode, Fire};
 
 use crate::binding::params_from;
 use crate::device::Bound;
+use crate::hold::Facts;
 use crate::dispatch::Dispatch;
 use crate::geometry::Module;
 use crate::spirv::Declared;
@@ -67,9 +83,16 @@ use crate::spirv::Declared;
 pub trait Reflect {
     /// The workgroup size and tile, and what the module binds.
     ///
-    /// `None` when this adapter has no module for the entrypoint at the tier
-    /// it settled on, which is a refusal and not a panic: a routine may name
-    /// an instantiation this build did not produce.
+    /// `file` is the ARTIFACT the body named and `entrypoint` the point inside
+    /// it. Two arguments and not one, because they stopped being the same
+    /// question: the artifact is what gets loaded, and the entrypoint is what
+    /// `geometry::Module::named` reads a tile out of.
+    ///
+    /// `None` when this build has no module under that name, which is a
+    /// refusal and not a panic: a routine may name an instantiation this build
+    /// did not produce. There is no walk down to a lesser tier here — the body
+    /// already resolved that when it composed `file`, and a driver that walked
+    /// again could only disagree with it.
     ///
     /// # Why the declaration is shared rather than borrowed
     ///
@@ -81,7 +104,14 @@ pub trait Reflect {
     /// either. An [`Rc`] is the smallest thing that lets the cache stay lazy:
     /// one refcount bump per dispatch, against the few-thousand-word SPIR-V
     /// walk it exists to avoid.
-    fn of(&self, entrypoint: &str) -> Option<(Module, Rc<Declared>)>;
+    fn of(&self, file: &str, entrypoint: &str) -> Option<(Module, Rc<Declared>)>;
+
+    /// The highest tier this adapter advertises, for a body to compose with.
+    ///
+    /// The device's ceiling and not a choice: [`kernels_vulkan::module::path`]
+    /// steps down from it to what the build compiled. It is here because the
+    /// body needs it and the encoder is what the body holds.
+    fn best(&self) -> Capability;
 }
 
 /// One fire's worth of driver, handed to a routine body.
@@ -111,10 +141,25 @@ pub struct Encoder<'a, 'h, R: Reflect> {
     /// The traced op these dispatches are attributed to, so a refusal points
     /// at a statement rather than at a routine.
     op: u32,
-    /// `Encode::dispatch` takes `&self`, because the machinery hands a body
+    /// `Encode::fire` takes `&self`, because the machinery hands a body
     /// `&B::Ctx`. Accumulation is mutation; interior mutability is the whole
     /// of the difference and it is confined here.
     out: RefCell<Vec<Dispatch<'a>>>,
+    /// WHAT THIS FIRE ANSWERS, for a body that asks.
+    ///
+    /// `Env` left the parameter list, so a fact only the fire can answer —
+    /// a page table, the KV pool, this batch's row count — is no longer bound
+    /// into `values` before the body runs. The body asks for it instead, and
+    /// this is what answers: the same [`crate::hold::Handles`] the binder used
+    /// and the same [`Facts`], through the same [`kernels::bind::one`].
+    ///
+    /// `RefCell` because answering MINTS: a staged fact takes a handle, which
+    /// is a mutation of the handle vector, and the body holds only a `&self`.
+    /// The binder's own borrow has ended by the time a body runs, so the two
+    /// never overlap.
+    ///
+    /// `None` on an encoder built for a probe, which has no fire behind it.
+    answers: Option<(&'h RefCell<crate::hold::Handles<'a, 'h>>, Facts)>,
 }
 
 impl<'a, 'h, R: Reflect> Encoder<'a, 'h, R> {
@@ -126,7 +171,23 @@ impl<'a, 'h, R: Reflect> Encoder<'a, 'h, R> {
             block,
             op,
             out: RefCell::new(Vec::new()),
+            answers: None,
         }
+    }
+
+    /// The same view, able to ANSWER a body that asks.
+    ///
+    /// Separate from [`Self::new`] because a probe encoder has no fire behind
+    /// it and must not pretend to: a body that asks on one gets
+    /// [`Refusal::Unstated`], which is the honest answer.
+    #[must_use]
+    pub fn answering(
+        mut self,
+        handles: &'h RefCell<crate::hold::Handles<'a, 'h>>,
+        facts: Facts,
+    ) -> Self {
+        self.answers = Some((handles, facts));
+        self
     }
 
     /// What the bodies asked for, in the order they asked.
@@ -190,8 +251,22 @@ fn words(args: &[ArgValue]) -> Vec<u32> {
 }
 
 impl<R: Reflect> Encode for Encoder<'_, '_, R> {
-    fn dispatch(&self, fire: Fire<'_>, args: &[ArgValue]) -> Result<(), Refusal> {
-        // A body with nothing to do should have refused already; a zero here
+    fn best(&self) -> Capability {
+        self.reflect.best()
+    }
+
+    fn resolve(
+        &self,
+        ty: kernels::Ty,
+        source: kernels::Source,
+    ) -> Result<ArgValue, Refusal> {
+        let (handles, facts) = self.answers.ok_or(Refusal::Unstated {
+            what: "a fact, on an encoder with no fire behind it",
+        })?;
+        crate::bind::one(ty, source, &mut handles.borrow_mut(), facts)
+    }
+
+    fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {        // A body with nothing to do should have refused already; a zero here
         // would become `vkCmdDispatch(0, 1, 1)`, which is legal Vulkan that
         // runs nothing and reports success over a buffer that kept its zeros.
         // This backend has paid for that once: a shared expert's gate came
@@ -205,7 +280,7 @@ impl<R: Reflect> Encode for Encoder<'_, '_, R> {
 
         let (module, declared) = self
             .reflect
-            .of(fire.entrypoint)
+            .of(fire.file, fire.entrypoint)
             .ok_or(Refusal::Undeclared)?;
         let declared = &*declared;
 
@@ -227,7 +302,14 @@ impl<R: Reflect> Encode for Encoder<'_, '_, R> {
         // its argument list and never guessed at "one past the operands".
         let mut minted: Option<usize> = None;
         for a in args {
-            if let ArgValue::Buffer { handle, writes: w } = *a {
+            // EVERY FIELD NAMED, and that is the point. This split used to read
+            // `if let ArgValue::Buffer { handle, writes: w }` beside a separate
+            // `Shaped` variant that carried the rectangle — and an `if let`
+            // does not have to be exhaustive, so every shaped operand was
+            // skipped here silently: never pushed, never bound, never in a
+            // descriptor set. One variant makes the same mistake a compile
+            // error, which is how this line was found.
+            if let ArgValue::Buffer { handle, writes: w, .. } = *a {
                 if handle == crate::hold::BLOCK {
                     if minted.is_some() {
                         return Err(Refusal::Device {
@@ -289,6 +371,7 @@ impl<R: Reflect> Encode for Encoder<'_, '_, R> {
         }
 
         self.out.borrow_mut().push(Dispatch {
+            file: fire.file.to_owned().into(),
             symbol: fire.entrypoint.to_owned().into(),
             buffers,
             writes,
@@ -305,7 +388,7 @@ impl<R: Reflect> Encode for Encoder<'_, '_, R> {
 mod tests {
     use super::*;
     use crate::device::Buffer;
-    use kernels_vulkan::routine::{Ask, Buf, BufMut, InSlot, OutSlot};
+    use kernels_vulkan::routine::{Buf, BufMut, Env, In, Out};
 
     /// A `Declared` this test can state without a SPIR-V module.
     fn declared(bindings: u32, push: &[u32]) -> Declared {
@@ -361,11 +444,11 @@ mod tests {
         let enc = Encoder::new(&one, &bounds, &[], 7);
         kernels_vulkan::sample::argmax_logits(
             &enc,
-            InSlot::new(Buf(0)),
-            OutSlot::new(BufMut(1)),
-            InSlot::new(Buf(2)),
-            OutSlot::new(BufMut(3)),
-            Ask::new(5),
+            In::new(Buf(0)),
+            Out::new(BufMut(1)),
+            In::new(Buf(2)),
+            Out::new(BufMut(3)),
+            Env::new(5),
         )
         .expect("five rows is a launch");
 
@@ -404,11 +487,11 @@ mod tests {
         let enc = Encoder::new(&one, &bounds, &[], 0);
         kernels_vulkan::sample::argmax_logits(
             &enc,
-            InSlot::new(Buf(0)),
-            OutSlot::new(BufMut(1)),
-            InSlot::new(Buf(2)),
-            OutSlot::new(BufMut(3)),
-            Ask::new(1),
+            In::new(Buf(0)),
+            Out::new(BufMut(1)),
+            In::new(Buf(2)),
+            Out::new(BufMut(3)),
+            Env::new(1),
         )
         .expect("one row is a launch");
 
@@ -434,11 +517,11 @@ mod tests {
         assert_eq!(
             kernels_vulkan::sample::argmax_logits(
                 &enc,
-                InSlot::new(Buf(0)),
-                OutSlot::new(BufMut(1)),
-                InSlot::new(Buf(2)),
-                OutSlot::new(BufMut(3)),
-                Ask::new(1)
+                In::new(Buf(0)),
+                Out::new(BufMut(1)),
+                In::new(Buf(2)),
+                Out::new(BufMut(3)),
+                Env::new(1)
             ),
             Err(Refusal::Undeclared)
         );
@@ -461,11 +544,11 @@ mod tests {
         assert_eq!(
             kernels_vulkan::sample::argmax_logits(
                 &enc,
-                InSlot::new(Buf(0)),
-                OutSlot::new(BufMut(1)),
-                InSlot::new(Buf(2)),
-                OutSlot::new(BufMut(3)),
-                Ask::new(1)
+                In::new(Buf(0)),
+                Out::new(BufMut(1)),
+                In::new(Buf(2)),
+                Out::new(BufMut(3)),
+                Env::new(1)
             ),
             Err(Refusal::Arity { want: 6, got: 4 })
         );
@@ -530,3 +613,4 @@ mod tests {
         );
     }
 }
+

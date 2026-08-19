@@ -200,7 +200,7 @@ const UNSTATED_ROWS: &[&str] = &[
     // maps onto TWO because the peel's tail serves absolute row offsets in a
     // full-N buffer — the lowering states the pick rather than making the
     // driver derive it from a window pointer. Four of the seven are declared
-    // by `driver_bound!` lines against host programs in
+    // by `untraced!` lines against host programs in
     // `kernels_cuda::driver_internal`, the other three by ordinary
     // `routine!`s; both spellings land in `declared` and neither can land in
     // `stated`. `bind/arms/` arms six of the seven for real, and the seventh,
@@ -224,6 +224,13 @@ const UNSTATED_ROWS: &[&str] = &[
     // symbol has an arm — `gemm::act_x_w` is `arm: None` with a reason that
     // `Route::refusal` turns into a load-time `Unfireable`. That is a gap in
     // the fire path, not a fact about this list.
+    // TWO MORE OF THE `lower::semantic` KIND, and the list had missed them.
+    // `OpKind::Matmul` maps onto `gemm::act_x_w` or `gemm::act_x_w_acc` by its
+    // `beta_one` flag (`lower/semantics.rs:58`), and an op kind carrying no
+    // kernel string is invisible to the scan below — the same reason the seven
+    // named further down are here.
+    "gemm::act_x_w",
+    "gemm::act_x_w_acc",
     "gemm::gemv_bf16",
     // §54's FOUR DELETED WRAPPERS, BACK AS ROWS AND NOT AS DEMAND (4).
     // `copy_if_valid_slot`, `concat_rows`, `deinterleave_rows` and
@@ -261,12 +268,6 @@ const UNSTATED_ROWS: &[&str] = &[
     // See the block above `attn::split_qkv_bf16`.
     "layout::split_q_gate_bf16",
     "mlp::sigmoid_gate_inplace_bf16",
-    // THE QUANTISED GEMM'S FOUR STAGING LAUNCHES, all legs. `gemm/quant.rs`
-    // fires them by path from the int8 and fp8 arms: quantise the activation,
-    // run the low-precision GEMM, dequantise the accumulator. A text states
-    // the matmul and the weight REPRESENTATION it carries; the staging is what
-    // reading that representation costs, chosen inside the body from the
-    // dtypes rather than by anything a trace could say.
     "moe::scalar_weighted_add_bf16",
     // `OpKind::AddBias`, and one of the seven. See the block above
     // `attn::split_qkv_bf16`.
@@ -278,24 +279,7 @@ const UNSTATED_ROWS: &[&str] = &[
     "norm::rmsnorm_gated_fp32_in_bf16",
     // An f16 twin. See the block above `attn::logit_softcap_f16`.
     "norm::tanh_f16",
-    // The LOADER's two quantizers, fired from `model-loader`'s
-    // `executor/cuda.rs` against an arena-addressed transform plan rather than
-    // recorded by any forward text: a weight transform runs once at load and
-    // never appears in a fire's op list. (`executor/arena.rs` is the transform
-    // DRIVER; `plan/passes/tile.rs` names both symbols as plan strings.)
     "norm::unstrided_bf16",
-    // THE QUANTISED GEMM'S FOUR STAGING LAUNCHES, all legs. `gemm/quant.rs`
-    // fires them by path from inside the int8 and fp8 arms of `gemm::act_x_w`
-    // and the scaled-weight bodies: quantise the activation, run the low
-    // precision GEMM, dequantise the accumulator. A text states the matmul
-    // and the weight REPRESENTATION it carries -- which is what
-    // `a_weight_representation_states_its_kernel` below is about -- and the
-    // staging is what reading that representation costs, chosen inside the
-    // body from the dtypes rather than by anything a trace could say. See
-    // the leg block above `attn::qkv_decode_fused_dispatch`, and the arm gap
-    // recorded at `gemm::gemv_bf16`.
-    "quant::dequant_int32_w8a8_to_bf16",
-    "quant::dequant_int8_to_bf16_per_channel",
     // An f16 twin, and the rope family's only one. See the block above
     // `attn::logit_softcap_f16`. `rope::rope_partial_bf16_position_delta` stood
     // beside it until the symbol left `sigs()` in the kernel-x sweep — a
@@ -303,15 +287,7 @@ const UNSTATED_ROWS: &[&str] = &[
     // It is unreachable from BOTH ends (its arm is `unbound`, no builder
     // records it), so a draft/verify deployment that wants it needs a
     // statement, a row and an arm together.
-    "quant::quantize_bf16_to_fp8_e4m3_per_channel",
-    // Two more of the quantised GEMM's staging four, in sort order rather
-    // than beside their pair. See the block above
-    // `quant::dequant_int32_w8a8_to_bf16`.
-    "quant::quantize_bf16_to_fp8_e4m3_per_token_group",
-    "quant::quantize_bf16_to_int8_per_channel",
-    // The second loader quantizer. See the block above
-    // `quant::quantize_bf16_to_fp8_e4m3_per_channel`.
-    "quant::quantize_bf16_to_mxfp4_e2m1_per_block",
+    "rope::rope_partial_f16",
     // D2's THREE-TENSOR FORM, LEFT WITHOUT A TEXT (1). §5 D2 split every
     // symbol whose operand COUNT decided what it did, and
     // `rope::rope_partial_last_bf16` is the one split whose TWO-tensor half no
@@ -319,7 +295,7 @@ const UNSTATED_ROWS: &[&str] = &[
     // channels, and its statement names `rope::rope_partial_last_q_bf16`. NOT
     // dead — the Q-alone routine calls this one with `num_kv_heads = 0`, so it
     // runs on every deepseek-v4 fire; what it lacks is a STATEMENT.
-    "rope::rope_partial_f16",
+    "rope::rope_partial_last_bf16",
     // THE THREE PLAIN ARGMAXES (3), missing not a caller but a JOB. Sampling
     // is not a model text's to state: the greedy readout is a tensor program,
     // `tensor-ir`'s `Op::ReduceArgmax` lowered by `tensor-compiler` into the
@@ -327,7 +303,6 @@ const UNSTATED_ROWS: &[&str] = &[
     // `sample` routine a text DOES state is the contrast:
     // `sample::lm_head_gemv_argmax_int8` folds the int8 LM head into the
     // readout, and a weight is the kind of thing a model text owns.
-    "rope::rope_partial_last_bf16",
     "sample::argmax_bf16",
     "sample::argmax_compact_scatter_bf16",
     "sample::argmax_f32",

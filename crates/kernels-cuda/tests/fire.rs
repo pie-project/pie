@@ -209,12 +209,12 @@ fn the_dynamic_path_and_the_routine_agree() {
     // it compared before.
     let fired = kernels_cuda::norm::scalar_mul::<bf16>(
         &ctx,
-        kernels_cuda::Out {
+        kernels_cuda::InOut {
             ptr: buffer.ptr as *mut kernels_cuda::jit::abi::bf16,
             rows: 1,
             width: i32::try_from(buffer.n).expect("the test's 1024 fits an i32"),
         },
-        kernels::routine::ParamF32(2.0),
+        kernels::routine::Const::new(2.0),
     );
     assert_eq!(fired, Ok(()), "the routine fires");
     buffer.assert_doubled("the routine");

@@ -228,6 +228,7 @@ pub fn gpt_oss_cuda(facts: &GptOssFacts, cuda: &GptOssCudaFacts, class: FireClas
                 facts.top_k,
                 facts.intermediate,
                 facts.swiglu_limit,
+                crate::gpt_oss::project::GATE_ALPHA,
             );
             let routed = dsl::cuda::bf16_to_fp16(&routed);
             let out = dsl::cuda::mxfp4_moe_down_decode(

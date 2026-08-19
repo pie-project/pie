@@ -9,13 +9,19 @@ use kernels_cuda::jit::{Ctx, Launch};
 #[allow(clippy::not_unsafe_ptr_arg_deref)] // the stream is borrowed, never read
 pub fn fire(
     file: &'static str,
-    instantiation: &str,
+    instantiation: &'static str,
     launch: Launch,
     values: &[ArgValue],
     stream: *mut std::ffi::c_void,
 ) {
     // SAFETY: `values` are live allocations; `stream` stays valid across the launch.
-    let fired = unsafe { Ctx::on(stream).launch(file, instantiation, launch, values) };
+    // `Ctx::launch` BECAME `Ctx::fire`, taking the four facts as one `Fire`.
+    let fired = unsafe {
+        Ctx::on(stream).fire(
+            kernels::Fire::at(file, instantiation).apply(launch),
+            values,
+        )
+    };
     if let Err(why) = fired {
         panic!("{instantiation}: {why}");
     }

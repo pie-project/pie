@@ -65,7 +65,13 @@ pub static ARMS: &[Bound] = &[
     Bound::derived("attn::qkv_decode_qk_norm_rope_write_kv_bf16"),
     // `keys::KvPagesInBatch` is the per-batch bound, deliberately not `xqa`'s
     // per-request maximum.
-    Bound::derived("attn::dequant_kv_cache_layer_to_bf16_active"),
+    // NOT `derived`: the routine takes nothing from the statement, so there
+    // is no column. See the arm.
+    Bound {
+        symbol: "attn::dequant_kv_cache_layer_to_bf16_active",
+        arm: Some(super::fa2::dequant_kv_cache_layer_arm),
+        unbound: None,
+    },
     Bound {
         symbol: "attn::dsa_index_q_rope_bf16",
         arm: None,

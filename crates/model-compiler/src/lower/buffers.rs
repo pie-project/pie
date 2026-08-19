@@ -126,12 +126,15 @@ impl Buffers {
             }
             // In-place outputs reuse the input offset named by the kernel or semantic pair.
             {
+                // OWNED for the launch arm and borrowed for the semantic one:
+                // a launch's pairs are DERIVED from the row's `Source::Alias`
+                // marks now, so there is no `&'static` list to hand back.
                 let pairs = match &op.kind {
                     OpKind::Launch { kernel, .. } => model_ir::kernels::in_place_pairs(plan, kernel),
-                    other => model_ir::kernels::semantic_in_place(other),
+                    other => model_ir::kernels::semantic_in_place(other).to_vec(),
                 };
                 let mut aliased = false;
-                for &(o, i) in pairs {
+                for &(o, i) in &pairs {
                     // A pair outside arity is allowed; rows state the widest form.
                     if let (Some(&src), Some(&out)) =
                         (op.inputs.get(i as usize), op.outputs.get(o as usize))
@@ -268,8 +271,8 @@ pub(crate) fn alias_owners(plan: &ForwardPlan) -> Vec<ValueId> {
                 _ => Vec::new(),
             },
             OpKind::Launch { kernel, .. } => model_ir::kernels::in_place_pairs(plan, kernel)
-                .iter()
-                .filter_map(|&(o, i)| {
+                .into_iter()
+                .filter_map(|(o, i)| {
                     Some((*op.inputs.get(i as usize)?, *op.outputs.get(o as usize)?))
                 })
                 .collect(),

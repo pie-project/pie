@@ -19,9 +19,9 @@
 use core::ffi::c_void;
 use std::fmt;
 
-use crate::driver_bound;
-use crate::jit::{ArgValue, Ctx, Family, Launch, Routine};
+use crate::jit::{ArgValue, Ctx, Launch};
 use kernels::Refusal;
+use kernels::{Bind, Fire};
 
 // ── the root ─────────────────────────────────────────────────────────────
 
@@ -1365,11 +1365,10 @@ impl Plane {
 /// for the duration of the launch — is [`Ctx::with_comm`]'s `# Safety`.
 #[must_use]
 pub fn all_reduce_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     input: *const c_void,
     output: *mut c_void,
-    count: usize,
-) -> AllReduce {
+    count: usize) -> AllReduce {
     match plain_all_reduce_bf16(ctx, input, output, count) {
         AllReduce::Launched => AllReduce::Launched,
         AllReduce::Declined(why) => fall_back_out_of_place(ctx, input, output, count, why),
@@ -1401,12 +1400,11 @@ pub fn all_reduce_bf16(
 /// peer memory.
 #[must_use]
 pub fn fall_back_out_of_place(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     input: *const c_void,
     output: *mut c_void,
     count: usize,
-    why: Decline,
-) -> AllReduce {
+    why: Decline) -> AllReduce {
     let elems = i64::try_from(count).unwrap_or(i64::MAX);
     match crate::dist::all_reduce_out_of_place(ctx, input, output, elems) {
         // If NCCL ever lands, this is the whole of the fallback: same
@@ -1451,11 +1449,10 @@ pub fn fall_back_out_of_place(
 /// [`all_reduce_bf16`]'s.
 #[must_use]
 fn plain_all_reduce_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     input: *const c_void,
     output: *mut c_void,
-    count: usize,
-) -> AllReduce {
+    count: usize) -> AllReduce {
     // `custom_all_reduce.cu:466`. `input` and not `output`, which is
     // upstream's asymmetry and is kept: a null `output` would be reported as
     // `NullInput`, and a refusal that names the wrong pointer is worse than
@@ -1504,21 +1501,14 @@ fn plain_all_reduce_bf16(
     // SAFETY: the caller's contract. Every pointer bound here addresses live
     // device memory of the extent the kernel reads it as, and `signals`
     // outlives the call because the launch copies the aggregate out.
-    let fired = unsafe {
-        ctx.launch(
-            "comm/all_reduce.cuh",
-            instantiation,
-            Launch::grid([geometry.grid, 1, 1], [geometry.block, 1, 1]),
-            &[
+    let fired = ctx.fire(Fire::at("comm/all_reduce.cuh", instantiation).apply(Launch::grid([geometry.grid, 1, 1], [geometry.block, 1, 1])), &[
                 ArgValue::Ptr(plane.peers.rank_data),
                 signals_arg,
                 ArgValue::Ptr(plane.peers.self_signal),
                 ArgValue::Ptr(output),
                 ArgValue::I32(plane.rank),
                 ArgValue::I32(size),
-            ],
-        )
-    };
+            ]);
     match fired {
         Ok(()) => AllReduce::Launched,
         Err(why) => AllReduce::Declined(Decline::Launch(why)),
@@ -1547,15 +1537,14 @@ fn plain_all_reduce_bf16(
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn all_reduce_residual_rmsnorm_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     input: *const c_void,
     residual_inout: *mut c_void,
     rms_gamma: *const c_void,
     norm_out: *mut c_void,
     tokens: i32,
     hidden: i32,
-    eps: f32,
-) -> AllReduce {
+    eps: f32) -> AllReduce {
     // As in `all_reduce_bf16`: no plane is no instance.
     let Ok(plane) = ctx.comm() else {
         return AllReduce::Declined(Decline::NoInstance);
@@ -1626,23 +1615,16 @@ pub fn all_reduce_residual_rmsnorm_bf16(
     // of this frame and the launch copies every aggregate out before it
     // returns.
     let fired = if point.leaf.oneshot() {
-        unsafe { ctx.launch("comm/all_reduce.cuh", instantiation, launch, &[params.arg()]) }
+        ctx.fire(Fire::at("comm/all_reduce.cuh", instantiation).apply(launch), &[params.arg()])
     } else {
         let (begin, per_rank) = twoshot_split(tokens, point.nranks);
         let bytes = core::mem::size_of::<i32>()
             * usize::try_from(point.nranks).unwrap_or(0).min(begin.len());
-        unsafe {
-            ctx.launch(
-                "comm/all_reduce.cuh",
-                instantiation,
-                launch,
-                &[
+        ctx.fire(Fire::at("comm/all_reduce.cuh", instantiation).apply(launch), &[
                     params.arg(),
                     ArgValue::Bytes { ptr: begin.as_ptr().cast::<u8>(), len: bytes },
                     ArgValue::Bytes { ptr: per_rank.as_ptr().cast::<u8>(), len: bytes },
-                ],
-            )
-        }
+                ])
     };
     match fired {
         Ok(()) => AllReduce::Launched,
@@ -1650,28 +1632,52 @@ pub fn all_reduce_residual_rmsnorm_bf16(
     }
 }
 
-/// The P2P collectives' two symbols, declared so a sharded model text
-/// resolves.
-///
-/// `driver_bound!`, not `routine!`: a collective takes a COMMUNICATOR, a
-/// property of the deployment's process group that no trace statement can
-/// carry.
-///
-/// Both `whole`: every rank must enter the same collective the same number
-/// of times, so a row window that split one rank's launch and not another's
-/// would deadlock rather than compute a wrong answer. The fused landing also
-/// states `in_place = &[(0, 1)]`: the residual is updated in place and the
-/// normed activation is the other result.
-pub static ROUTINES: &[Routine] = &[
-    driver_bound!(all_reduce_bf16, whole),
-    driver_bound!(all_reduce_residual_rmsnorm_bf16, whole, in_place = &[(0, 1)]),
-];
+// ── The two names this family declares ───────────────────────────────────
+//
+// Neither is a `#[routine]` and neither can be: both return `AllReduce`
+// rather than `Result<(), Refusal>` -- the decline is the point -- and both
+// take bare pointers the driver has in hand rather than marks a statement
+// fills. `untraced!` is the row for exactly that: a symbol declared so a
+// model text may name it and fired by a typed call rather than by string.
+//
+// They were two lines in a `ROUTINES` list. Rows register by existing now, so
+// the declaration is a `#[distributed_slice]` static; losing it made
+// `check_plan` answer *"launches `comm::all_reduce_bf16`, which no cuda
+// kernel declares"* against every tensor-parallel text.
 
-/// `comm`, as a trace names it.
-pub static FAMILY: Family = crate::family!(ROUTINES);
+/// `comm::all_reduce_bf16`'s row. See [`all_reduce_bf16`].
+#[::linkme::distributed_slice(crate::ROUTINES)]
+static ALL_REDUCE_BF16_ROUTINE: ::kernels::routine::Routine<crate::Plane> =
+    ::kernels::untraced!(
+        crate::Plane,
+        "all_reduce_bf16",
+        all_reduce_bf16,
+        namespace = "comm",
+        whole
+    );
+
+/// `comm::all_reduce_residual_rmsnorm_bf16`'s row.
+///
+/// THE ONE ROW THAT STATES ITS COLUMN. `residual_inout` is updated in place
+/// and the statement declares a result on top of it, which the row used to
+/// carry beside it as `in_place = &[(0, 1)]`: result 0 IS operand 1. A
+/// `untraced!` row has no signature to derive that from -- its parameters
+/// are pointers, not marks -- so it says so, and `Routine::stating` is the
+/// only door for it.
+#[::linkme::distributed_slice(crate::ROUTINES)]
+static ALL_REDUCE_RESIDUAL_RMSNORM_BF16_ROUTINE: ::kernels::routine::Routine<crate::Plane> =
+    ::kernels::untraced!(
+        crate::Plane,
+        "all_reduce_residual_rmsnorm_bf16",
+        all_reduce_residual_rmsnorm_bf16,
+        namespace = "comm",
+        whole
+    )
+    .stating(&[Some(::kernels::Source::Alias(1, 0))]);
 
 #[cfg(test)]
 mod tests {
+    use crate::jit::Ctx;
     use super::{
         AOT_POINTS_AFTER_PRUNING, AllReduce, CAN_LAUNCH, CLUSTER_SIZE, Decline, FusionParams,
         FusionPattern, FusionPlane, INSTANTIATED, Instantiation, Leaf, NRANKS, PLAIN_NRANKS,
@@ -1679,7 +1685,6 @@ mod tests {
         all_reduce_residual_rmsnorm_bf16, fusion_geometry, plain_geometry,
         plain_name_expression, resolve, twoshot_split,
     };
-    use crate::jit::Ctx;
 
     /// A plane sized to admit the one point pie reaches, with no live device
     /// memory behind any of it.

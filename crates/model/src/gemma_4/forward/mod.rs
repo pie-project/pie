@@ -268,7 +268,18 @@ pub fn gemma4_cuda(facts: &Gemma4Facts, cuda: &Gemma4CudaFacts, class: FireClass
                     dsl::cuda::attention_naive_paged(&attn_in, &kv, window_left)
                 }
                 FireClass::Prefill => {
-                    dsl::cuda::attention_flashinfer_prefill_planless(&attn_in, &kv, window_left)
+                    // GEMMA-4 STATES ITS SCALE AND IT IS 1.0, not `1/sqrt(d)`:
+                    // the per-head `q_norm`/`k_norm` above have already
+                    // divided by what the derivation would divide by again,
+                    // and a second division is finite, varied and wrong.
+                    dsl::cuda::attention_flashinfer_prefill_planless(
+                        &attn_in,
+                        &kv,
+                        window_left,
+                        facts.head_dim_of(l),
+                        0.0,
+                        1.0,
+                    )
                 }
             }
             .expect("the class states its attention");

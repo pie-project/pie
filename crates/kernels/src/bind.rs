@@ -166,7 +166,7 @@ pub trait Holds {
 
 /// Bind one launch's arguments from the row the signature derived.
 ///
-/// `args` is the routine's `(Ty, Provenance)` column and `sources` is its
+/// `args` is the routine's [`Ty`] column and `sources` is its
 /// `Source` column; they are the same length and the same order as the
 /// dispatch the kernel expects.
 ///
@@ -177,12 +177,12 @@ pub trait Holds {
 /// produce: [`Refusal::Absent`] for a slot or scalar the trace does not
 /// carry.
 pub fn bind<V: ShaderValue, H: Holds + ?Sized>(
-    args: &[(Ty, crate::Provenance)],
+    args: &[Ty],
     sources: &[Option<Source>],
     h: &mut H,
 ) -> Result<Vec<V>, Refusal> {
     let mut out = Vec::with_capacity(args.len());
-    for (at, (ty, _)) in args.iter().enumerate() {
+    for (at, ty) in args.iter().enumerate() {
         let source = sources.get(at).copied().flatten().ok_or(Refusal::Unstated {
             what: "an argument whose signature does not say where it comes from",
         })?;
@@ -201,15 +201,30 @@ pub fn one<V: ShaderValue, H: Holds + ?Sized>(
         // A SLOT. The CARRIER picks the accessor, not the kind: an
         // `OutSlot<0, Buf>` is a read, and `output_read` is what keeps an
         // encoder's hazard tracking honest.
-        Source::Slot(Kind::In, n) => handle(ty, h.input(n.into())?),
+        // A SLOT, AND THE RECTANGLE THAT CAME WITH IT. The CARRIER picks the
+        // accessor, not the kind: an `Out<Tensor<u32>>` is a read, and
+        // `output_read` is what keeps an encoder's hazard tracking honest.
+        //
+        // THE SHAPE RIDES ALONG because the mark is where a body reads it now.
+        // `Holds::in_width` and `out_width` are the same accessors a
+        // `Kind::InWidth` slot already went through -- the only change is that
+        // the answer reaches the operand instead of a parameter beside it.
+        Source::Slot(Kind::In, n) => {
+            let at = h.input(n.into())?;
+            shaped(ty, at, rows(h), h.in_width(n.into()).unwrap_or(0))
+        }
         Source::Slot(Kind::Out, n) => {
             let at = if matches!(ty, Ty::Buf | Ty::I32s | Ty::U32s | Ty::F32s) {
                 h.output_read(n.into())?
             } else {
                 h.output(n.into())?
             };
-            handle(ty, at)
+            shaped(ty, at, rows(h), h.out_width(n.into()).unwrap_or(0))
         }
+        // A WEIGHT HAS NO LAUNCH RECTANGLE. Its extents are the checkpoint
+        // tensor's, which the fire's row count says nothing about, and a
+        // reader taking `rows` off a weight would get this batch's token
+        // count for a bank that has none.
         Source::Slot(Kind::Weight, n) => handle(ty, h.weight(n.into())?),
         Source::Slot(Kind::Params, _) => Ok(V::buffer(h.params_block())),
         // THE CARRIER SAYS WHICH READING. `Param<2, f32>` and `ParamF32<2>`
@@ -228,6 +243,13 @@ pub fn one<V: ShaderValue, H: Holds + ?Sized>(
         Source::Slot(Kind::OutWidth, n) => number(ty, h.out_width(n.into())?),
         Source::Slot(Kind::OutElements, n) => number(ty, h.out_elements(n.into())?),
         Source::Slot(kind, _) => Err(unstated(kind)),
+        // ONE ADDRESS IN TWO SLOTS, resolved as the INPUT: that is the address
+        // the statement placed, and the result wears the same one by
+        // construction. NOT a chain — there is no second thing to try.
+        Source::Alias(n, _) => {
+            let at = h.input(n.into())?;
+            shaped(ty, at, rows(h), h.in_width(n.into()).unwrap_or(0))
+        }
         // A FACT the driver answers, by name.
         Source::Named(key) => named(ty, key, h),
         // A CHAIN, and only for scalars: `param` mints nothing, while `input`
@@ -241,8 +263,26 @@ pub fn one<V: ShaderValue, H: Holds + ?Sized>(
                 None => one(ty, *fallback, h),
             }
         }
+        // THE WEIGHT CHAIN: the named bank first and the positional one after,
+        // which is what `Const<Tensor<E>>` derives for every weight a routine
+        // takes (`Or(Named("weight"), Slot(Kind::Weight, 0))`).
+        //
+        // It is safe where the scalar chain above needed a note: `named`
+        // resolves a fact and mints NOTHING when it fails, so a discarded
+        // attempt shifts no handle. `weight(n)` is the one that numbers, and
+        // it is only reached once, on the fallback.
+        //
+        // Without this arm every shader-plane weight refused. The five marks
+        // spelled the two halves apart -- `Weight<N, _>` took the named bank
+        // and `Bank<N, _>` the positional one -- so no chain reached here at
+        // all, and the four marks resolve one mark to both.
+        Source::Or(&Source::Named(key), fallback) => match named(ty, key, h) {
+            Ok(v) => Ok(v),
+            Err(_) => one(ty, *fallback, h),
+        },
         Source::Or(..) => Err(Refusal::Unstated {
-            what: "a chain whose first half is not one of the statement's scalars",
+            what: "a chain whose first half is neither one of the statement's \
+                   scalars nor a fact the driver answers by name",
         }),
         // ARITHMETIC ON WHAT IS KNOWN. Both halves are themselves sources,
         // because a divisor may be a chain.
@@ -275,6 +315,34 @@ fn count<V: ShaderValue, H: Holds + ?Sized>(source: Source, h: &mut H) -> Result
         .ok_or(Refusal::Unstated {
             what: "a side of an arithmetic source that is not a number",
         })
+}
+
+/// This fire's row count, or zero where the driver does not answer for one.
+///
+/// Zero is already this crate's word for *"the statement gave no extent"*, so
+/// a plane that answers no `rows` lands on the value every reader checks
+/// rather than refusing an operand that is otherwise perfectly bound.
+fn rows<H: Holds + ?Sized>(h: &mut H) -> i32 {
+    match h.fact(<crate::keys::Rows as crate::keys::Fact>::KEY) {
+        Some(Ok(Answer::Number(n))) => n,
+        _ => 0,
+    }
+}
+
+/// A bound buffer CARRYING ITS RECTANGLE, where the value has room for one.
+///
+/// [`ShaderValue::buffer_at`] defaults to dropping the shape, so a plane that
+/// has nowhere to put it is unchanged and its marks answer zero -- which is
+/// what they answered before this existed.
+fn shaped<V: ShaderValue>(ty: Ty, at: u32, rows: i32, width: i32) -> Result<V, Refusal> {
+    let whole: V = handle(ty, at)?;
+    Ok(match whole.as_buffer() {
+        // The direction is already decided by `handle`; re-deciding it here
+        // from the `Ty` is one place too many for one fact.
+        Some(_) if ty.binds() == crate::Binds::Writes => V::buffer_mut_at(at, rows, width),
+        Some(_) => V::buffer_at(at, rows, width),
+        None => whole,
+    })
 }
 
 /// A bound buffer, at whatever carrier the signature spells.

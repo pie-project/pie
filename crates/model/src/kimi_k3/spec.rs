@@ -34,6 +34,18 @@ pub struct KimiK3KdaFacts {
     pub conv_kernel: u32,
     /// `cfg.kda_gate_lower_bound`, the decay's floor.
     pub gate_lower_bound_milli: u32,
+    /// The output norm's epsilon, in millionths.
+    ///
+    /// A ROW'S NUMBER AND NOT THE FIRE'S. `kda_o_norm_gated` takes it as a
+    /// `Const<f32>`, which means the STATEMENT carries it -- two fires of one
+    /// deployment see the same epsilon, so it is not something `ctx.ask` can
+    /// be asked for. It was `Env<keys::RmsEps>` and the driver still answers
+    /// that key, which proves only that it USED to be asked.
+    ///
+    /// Millionths because a `VARIANTS` entry is evaluated at compile time and
+    /// these rows are `const`: `1e-5` is `10`, and [`Self::norm_eps`] is the
+    /// float the statement states.
+    pub norm_eps_micro: u32,
 }
 
 impl KimiK3KdaFacts {
@@ -44,6 +56,12 @@ impl KimiK3KdaFacts {
     #[must_use]
     pub const fn width(&self) -> u32 {
         self.value_heads * self.value_head_dim
+    }
+
+    /// The output norm's epsilon, as the statement states it.
+    #[must_use]
+    pub fn norm_eps(&self) -> f32 {
+        self.norm_eps_micro as f32 / 1.0e6
     }
 }
 
@@ -132,6 +150,7 @@ impl KimiK3Facts {
                 value_head_dim: 128,
                 conv_kernel: 4,
                 gate_lower_bound_milli: 0,
+                norm_eps_micro: 10,
             },
             moe: KimiK3MoeFacts {
                 num_experts: 64,

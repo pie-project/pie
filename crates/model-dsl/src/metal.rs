@@ -219,7 +219,18 @@ pub fn embed_gather(
         &format!("{stem}{point}"),
         quant_table(weight, repr),
         None,
-        vec![hidden],
+        // THE CODEC POINT, AS NUMBERS. `hidden` stood here alone and the
+        // group and the bit width were `Ask<keys::QuantGroup>` and
+        // `Ask<keys::QuantBits>` -- facts the driver recovered from the
+        // SYMBOL. They are the checkpoint's constants, so the statement
+        // carries them (`.wiki/migration.md` §3.2), and the routine reads
+        // `hidden` off the result's own width rather than off this run.
+        //
+        // The pair is derived from the same `repr` and `point` the symbol
+        // above is composed from, so the string and the numbers cannot
+        // disagree: `point_of` is `affine_point`'s inverse over the two
+        // fields that build it.
+        point_of(repr, point),
         vec![],
         Some((Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)),
     )
@@ -338,6 +349,49 @@ pub fn affine_gemm_point(repr: WeightRepr, bits: u32, tile: (u32, u32)) -> Strin
     format!("{}_bm_{bm}_bn_{bn}", affine_point(repr, bits))
 }
 
+/// The tile an affine GEMM point spells, as `[bm, bn]`.
+///
+/// [`point_of`]'s companion, and read back for its reason: a `qmm` routine
+/// takes the tile as two `Const<i32>`s after its codec pair, and the caller
+/// composed the spelling out of the same numbers.
+#[must_use]
+pub fn tile_of(point: &str) -> Vec<u32> {
+    let num = |k: &str| {
+        point
+            .rsplit_once(k)
+            .and_then(|(_, v)| v.split('_').next())
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0)
+    };
+    vec![num("_bm_"), num("_bn_")]
+}
+
+/// The params run an affine point's own numbers make: `[group, bits]`.
+///
+/// The pair every `qmm`/`qmv`/`embed_gather` routine reads as `Const<i32>`,
+/// in the order their marks claim the run. It is derived from the same two
+/// things [`affine_point`] composes its string out of -- the `repr`'s group
+/// and the bit width -- so the entrypoint a statement names and the numbers
+/// it carries are one decision written twice, not two.
+///
+/// The bit width is recovered from the SPELLING because that is where the
+/// caller put it: `affine_point` is the only thing that writes `_b_{bits}`,
+/// and every caller passes its output straight through. A point that does
+/// not carry one yields zero, which the routine refuses.
+#[must_use]
+pub fn point_of(repr: WeightRepr, point: &str) -> Vec<u32> {
+    let group = match repr {
+        WeightRepr::Scaled { group, .. } => group,
+        _ => 0,
+    };
+    let bits = point
+        .rsplit_once("_b_")
+        .and_then(|(_, b)| b.split('_').next())
+        .and_then(|b| b.parse::<u32>().ok())
+        .unwrap_or(0);
+    vec![group, bits]
+}
+
 #[must_use]
 pub fn affine_point(repr: WeightRepr, bits: u32) -> String {
     let group = match repr {
@@ -414,10 +468,12 @@ pub fn qmv(x: &Val, w: &MatW, point: &str) -> Val {
         &format!("affine_qmv_fast{point}"),
         quant_weights(w),
         None,
-        // The GEMV's two extents: the row it reads and the row it writes.
-        // A projection told its output is zero wide computes nothing and
-        // reports success, which is why these are stated and not derived.
-        vec![in_width(x), w.width],
+        // THE CODEC POINT, AS NUMBERS. The two extents stood here — the row
+        // the GEMV reads and the row it writes — and the routine reads both
+        // off its own marks now (`x.width`, `y.width`), while the group and
+        // the bit width it used to `Ask` for are the checkpoint's constants
+        // the statement carries.
+        point_of(w.repr, point),
         vec![x.id],
         region_out(
             &x.t,
@@ -437,7 +493,7 @@ pub fn qmv_residual(x: &Val, w: &MatW, residual: &Val, point: &str) -> Val {
         &format!("affine_qmv_fast_residual{point}"),
         quant_weights(w),
         None,
-        vec![in_width(x), w.width],
+        point_of(w.repr, point),
         vec![x.id, residual.id],
         region_out(
             &x.t,
@@ -456,10 +512,9 @@ pub fn qmm(x: &Val, w: &MatW, point: &str) -> Val {
         &format!("affine_qmm_t{point}"),
         quant_weights(w),
         None,
-        // The GEMV's two extents: the row it reads and the row it writes.
-        // A projection told its output is zero wide computes nothing and
-        // reports success, which is why these are stated and not derived.
-        vec![in_width(x), w.width],
+        // As `qmv`'s, plus the TILE: a `qmm` is stamped over
+        // `(group × bits × bm × bn)` and takes all four as `Const<i32>`.
+        [point_of(w.repr, point), tile_of(point)].concat(),
         vec![x.id],
         region_out(
             &x.t,
@@ -477,7 +532,7 @@ pub fn qmm_residual(x: &Val, w: &MatW, residual: &Val, point: &str) -> Val {
         &format!("affine_qmm_t_residual{point}"),
         quant_weights(w),
         None,
-        vec![in_width(x), w.width],
+        [point_of(w.repr, point), tile_of(point)].concat(),
         vec![x.id, residual.id],
         region_out(
             &x.t,
@@ -516,10 +571,11 @@ pub fn cast_qmm_input(x: &Val) -> Val {
         "cast_qmm_input_strided_bfloat16_to_float16",
         Vec::new(),
         None,
-        // `k`, the unread `n` slot the shared table keeps between them, and
-        // the row pitch — which is `k` for a packed activation, and every
-        // activation this is asked of is packed.
-        vec![k, k, k],
+        // THE ROW PITCH, ALONE. `k` and the unread `n` slot stood before it
+        // — the first is `cast_in.width`, which the operand carries, and the
+        // second was never read. The pitch is `k` for a packed activation,
+        // and every activation this is asked of is packed.
+        vec![k],
         vec![x.id],
         region_out(&x.t, (Shape(vec![Dim::Tokens, Dim::Const(k)]), DType::F16)),
     );
@@ -583,7 +639,9 @@ pub fn qmm_fp16(x: &Val, w: &MatW, point: &str) -> Val {
         &format!("affine_qmm_t_fp16_precast{point}"),
         quant_weights(w),
         None,
-        vec![in_width(x), w.width],
+        // The precast pair takes the TILE alone: its operands are already
+        // half-precision, so no codec point is read at the launch.
+        tile_of(point),
         vec![x.id],
         region_out(
             &x.t,
@@ -601,7 +659,7 @@ pub fn qmm_residual_fp16(x: &Val, w: &MatW, residual: &Val, point: &str) -> Val 
         &format!("affine_qmm_t_residual_fp16_precast{point}"),
         quant_weights(w),
         None,
-        vec![in_width(x), w.width],
+        tile_of(point),
         vec![x.id, residual.id],
         region_out(
             &x.t,
@@ -1062,7 +1120,26 @@ pub fn sdpa(
         // learned logit, and the row's `Weight(0)`.
         sinks.map(|w| vec![w.to_string()]).unwrap_or_default(),
         kv_state(kv),
-        vec![gqa_factor, kv_heads, scale.to_bits(), 0, window as u32],
+        // THE RUN THE ROUTINES DECLARE, in the order their `Const` marks
+        // claim it: `[n_kv_heads, scale, window, head_dim, q_heads]`.
+        //
+        // It was `[gqa_factor, kv_heads, scale, 0, window]` -- a run with a
+        // HOLE at index 3, and a `gqa_factor` the bodies now derive from the
+        // two head counts rather than being told a third time. The extents
+        // moved in the other direction: `head_dim` and `q_heads` were facts
+        // the driver recovered from the SYMBOL (`_d_128`) and they are the
+        // checkpoint's, so the statement carries them.
+        //
+        // `q_heads` is `q_width / head_dim` and not a separate number: the
+        // query's row is heads laid end to end, which is the same division
+        // the symbol's `_d_` suffix already implies.
+        vec![
+            kv_heads,
+            scale.to_bits(),
+            window as u32,
+            head_dim,
+            if head_dim > 0 { q_width / head_dim } else { 0 },
+        ],
         vec![q.id],
         // `region_out` and not `Some(..)`: a batched DECODE guards this
         // statement (`GuardPred::WindowOne`) and an arm's launches bind the
@@ -1136,7 +1213,19 @@ pub fn embed_gather_scaled(
         &format!("{stem}{point}"),
         quant_table(weight, repr),
         None,
-        vec![width, scale.to_bits()],
+        // THE RUN THE ROUTINE DECLARES, in the order its three `Const` marks
+        // claim it: `[embed_scale, group, bits]`. It was `[width, scale]` --
+        // a `width` at the slot the scale is read from and a scale at the
+        // slot the group is, so the gather scaled by a group size and picked
+        // its point from a bit count that was really a float's bits.
+        //
+        // `width` is not a param at all: the body reads `out.width`, which
+        // the statement already gives as the rectangle below.
+        {
+            let mut p = vec![scale.to_bits()];
+            p.extend(point_of(repr, point));
+            p
+        },
         vec![],
         Some((Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16)),
     )
@@ -1379,7 +1468,9 @@ pub fn lm_head(x: &Val, weight: &str, vocab: u32, repr: WeightRepr, point: &str)
         &format!("affine_qmv_fast{point}"),
         quant_table(weight, repr),
         None,
-        vec![in_width(x), vocab],
+        // The codec point, as `qmv` states it: the two extents this run held
+        // are the operands' own rectangles now.
+        point_of(repr, point),
         vec![x.id],
         // BF16, because that is what the kernel WRITES. `affine_qmv_fast`
         // is instantiated at bfloat and its output is `device T*`; the
@@ -1722,13 +1813,11 @@ pub fn routed_qmv(
         sym,
         weights,
         None,
-        vec![
-            in_vec,
-            w.width,
-            in_vec,
-            in_vec * experts_per_token,
-            experts_per_token,
-        ],
+        // THE SORTED STACK'S THREE STRIDES. `in_vec` and `w.width` stood
+        // first and left: they are the operands' own widths, which the marks
+        // carry. What is left is the geometry the MIXTURE has and no operand
+        // does -- a row is `k` slots wide and a slot is one.
+        vec![in_vec, in_vec * experts_per_token, experts_per_token],
         vec![x.id, row_expert.id],
         // `k` results per token, end to end. The row axis of the MATVEC
         // is `w.width` alone and the row states so (`grid_param`); this
@@ -1852,11 +1941,22 @@ pub fn routed_qmm(
         &sym,
         weights,
         None,
-        // `k` and `n`: the contraction and the output width. The arm reads
-        // exactly these two off `param(0)` and `param(1)` and takes its row
-        // count from the statement's own row axis, which is why neither the
-        // stack height nor the tile is written here.
-        vec![in_vec, w.width],
+        // THE TILE, AND THE CODEC PAIR WHERE THE SYMBOL HAS ONE. `k` and `n`
+        // stood here -- the contraction and the output width -- and both are
+        // the operands' own rectangles now, which the marks carry.
+        //
+        // The tile is not: `_bm_32_bn_64` is a decision the compiler made
+        // about this deployment's shapes, and the routine reads it as two
+        // `Const<i32>`s. The affine form reads the group and the bit width
+        // before them; the MXFP4 one has no codec point to read, which is
+        // the same split `sym` above is chosen by.
+        if matches!(w.repr, WeightRepr::Mxfp4Marlin) || staged {
+            vec![bm, bn]
+        } else {
+            let mut run = point_of(w.repr, &affine_point(w.repr, bits));
+            run.extend([bm, bn]);
+            run
+        },
         // `row_expert` rides the second slot the arm calls `pad` -- the
         // GEMM does not read it, and binding a real buffer there rather
         // than nothing keeps the operand list the same length as the
@@ -2296,7 +2396,11 @@ pub fn q_gate_split(qg: &Val, q_heads: u32, head_dim: u32) -> (Val, Val) {
             "q_gate_split_bfloat16",
             vec![],
             None,
-            vec![head_dim, 2 * width, width],
+            // `[head_dim, qg_row_stride, out_row_stride, q_heads]`, which is
+            // the run the routine's four `Const` marks claim, in order. The
+            // two strides were `Param<1>`/`Param<2>` at HEAD and spent a spell
+            // as asks no driver answered; the head count closes the run.
+            vec![head_dim, 2 * width, width, q_heads],
             vec![qg.id],
             vec![(shape.clone(), DType::BF16), (shape, DType::BF16)],
         )

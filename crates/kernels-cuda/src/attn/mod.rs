@@ -4,33 +4,38 @@
 //!
 //! Parameters are typed by what a binder can answer for. `In<N, _>`/`Out<N, _>`
 //! promise a region's `rows` and `width`, so a launcher holding one divides for
-//! itself rather than taking the quotient as a parameter; `Unbound<T>` is the
+//! itself rather than taking the quotient as a parameter; `Env<T>` is the
 //! opposite — `T` plus a name for the absence of a source, promising no extent
 //! and consuming neither positional counter. The `#[source(..)]` marks record
 //! which driver-side query each parameter is read from, and the block below the
 //! imports says where they come from and what an unmarked parameter means.
 
-#![allow(clippy::too_many_arguments)]
-
-use core::ffi::c_void;
-
-use crate::jit::abi::{Inst, bf16, f16};
-use crate::jit::{Abi, Ctx, Family, Launch, Routine};
-use crate::rope::Yarn;
-use crate::{driver_bound, routine};
+use crate::jit::Ctx;
+use kernels::Fire;
+use crate::jit::Launch;
 use kernels::Refusal;
 use kernels::keys;
-use kernels::routine::{Bank, Env, In, Out, Param, Unbound};
+use kernels::Bind;
+use kernels_macros::routine;
+use core::ffi::c_void;
 
-use attention_flashinfer::attn_score_fold_heads;
-use crate::driver_internal::split_qkv_bf16;
-use dsv4_compress::{dsv4_compress_gather_paged_bf16, dsv4_store_comp_entries_bf16};
+use crate::jit::abi::Tensor;
+use crate::jit::Abi as _;
+use kernels::routine::{Asks, Const, In, Out};
+// NOT UNUSED AT THE TOP LEVEL ONLY. Eight nested modules in this file reach
+// the element through `use super::bf16`, so the name has to be in scope here
+// for them to re-export it; the outer module itself never spells it.
+#[allow(unused_imports)]
+use crate::jit::abi::bf16;
+use crate::jit::Abi;
+use crate::rope::Yarn;
+use kernels::routine::InOut;
+use crate::jit::abi::f16;
 use kv_paged::{
-    dequant_kv_cache_layer_to_bf16_active, write_kv_explicit_bf16, write_kv_explicit_bf16_devwin,
-    write_kv_to_pages, write_kv_to_pages_bf16, write_kv_to_pages_quantised,
+    dequant_kv_cache_layer_to_bf16_active, write_kv_explicit_bf16, write_kv_explicit_bf16_devwin, write_kv_to_pages_bf16, write_kv_to_pages_quantised,
 };
 use qkv_fused::{
-    qkv_decode_fused_dispatch, qkv_decode_qk_norm_rope_write_kv_bf16,
+    qkv_decode_qk_norm_rope_write_kv_bf16,
     qkv_packed_qk_norm_rope_vnorm_write_kv_bf16,
 };
 
@@ -81,7 +86,7 @@ use qkv_fused::{
 // `_devwin` launchers exist for, which is why `write_kv_explicit_bf16_devwin`
 // and `split_qkv_bf16_devwin` keep their `n_max` unmarked and unwrapped.
 //
-// `Unbound<T>` is a REFUSAL and not a mark: it is `T` plus a name for the
+// `Env<T>` is a REFUSAL and not a mark: it is `T` plus a name for the
 // absence of a source, promises no extent, and consumes neither positional
 // counter. `In<N, _>`/`Out<N, _>` do promise extents — a region carries
 // `rows` and `width`, so a launcher holding one divides for itself rather
@@ -97,7 +102,7 @@ use qkv_fused::{
 //
 // ── WHICH ROWS CARRY A COLUMN ──────────────────────────────────────────
 //
-// `routine!` rows do. `driver_bound!` rows do not: their bodies answer
+// `routine!` rows do. `untraced!` rows do not: their bodies answer
 // `Refusal::Absent { what: "a statement-bound body" }` for every argument
 // list, so a column could never be honoured by the thing it feeds. Those six
 // launchers still carry their marks, because the mark is where the reading is
@@ -300,11 +305,14 @@ pub mod params {
 
 /// `attn/attention_flashinfer.cuh` — the per-head → per-request score fold.
 pub mod attention_flashinfer {
+    use crate::routine::Fire;
     use crate::jit::{Ctx, Launch};
-    use crate::jit::Abi;
-    use kernels::keys;
-    use kernels::routine::{Env, Unbound};
+    use crate::jit::abi::Tensor;
     use kernels::Refusal;
+    use kernels::routine::{Asks, Const, In, Out};
+    use kernels_macros::routine;
+    
+    use kernels::{Bind};
 
     /// `attn::attn_score_fold_heads_dev` — the per-head rows of one request
     /// averaged into the one row a policy reads.
@@ -325,19 +333,17 @@ pub mod attention_flashinfer {
     /// [`Refusal::Empty`] for an empty fire — a legal no-op that must not
     /// reach a launch, since a zero `grid.x` is itself a refusal — and
     /// whatever the compile, the load or the launch refuses.
-    #[allow(clippy::too_many_arguments)]
-    #[kernels_macros::routine]
+        #[routine(whole, untraced)]
     pub fn attn_score_fold_heads(
-        ctx: &Ctx,
+        ctx: &Ctx<'_>,
         scores: *const f32,
-        score_indptr: Unbound<*const i32>,
-        kv_page_indptr: Env<keys::KvPageIndptr>,
-        kv_last_page_lens: Unbound<*const u32>,
-        page_size: Env<keys::KvPageSize>,
-        num_requests: Env<keys::RequestCount>,
-        num_q_heads: Env<keys::NumQHeads>,
-        folded: *mut f32,
-    ) -> Result<(), Refusal> {
+        score_indptr: *const i32,
+        kv_page_indptr: *const u32,
+        kv_last_page_lens: *const u32,
+        page_size: i32,
+        num_requests: i32,
+        num_q_heads: i32,
+        folded: *mut f32) -> Result<(), Refusal> {
         /// The fold's block width: `attention_flashinfer.cu:829`'s `256`.
         ///
         /// Load-bearing and not tuning: the kernel folds warp partials through
@@ -372,22 +378,15 @@ pub mod attention_flashinfer {
         //
         // SAFETY: `call()`'s contract -- every pointer bound here addresses
         // live device memory of the extent the kernel reads it as.
-        unsafe {
-            ctx.launch(
-                "attn/attention_flashinfer.cuh",
-                "::pie::attn::attn_score_fold_heads",
-                Launch::grid([num_requests.unsigned_abs(), FOLD_GRID_Y, 1], [FOLD_BLOCK, 1, 1]),
-                &[
+        ctx.fire(Fire::at("attn/attention_flashinfer.cuh", "::pie::attn::attn_score_fold_heads").apply(Launch::grid([num_requests.unsigned_abs(), FOLD_GRID_Y, 1], [FOLD_BLOCK, 1, 1])), &[
                     scores.arg(),
-                    score_indptr.ptr.arg(),
+                    score_indptr.arg(),
                     kv_page_indptr.arg(),
-                    kv_last_page_lens.ptr.arg(),
+                    kv_last_page_lens.arg(),
                     page_size.arg(),
                     num_q_heads.arg(),
                     folded.arg(),
-                ],
-            )
-        }
+                ])
     }
 }
 
@@ -401,10 +400,13 @@ pub mod attention_flashinfer {
 /// than separate calls. The driver issues them at the point on its own stream
 /// where those dispatches used to.
 pub mod attention_score_post {
-    use kernels::routine::Env;
-    use crate::jit::{Ctx, Launch};
-    use crate::jit::Abi;
-    use kernels::Refusal;
+    use super::bf16;
+    use super::{Ctx, Launch, Refusal};
+    use crate::jit::abi::Tensor;
+    use kernels::keys;
+    use kernels::routine::{Asks, Const, In, Out};
+    use kernels::{Bind, Fire};
+    use kernels_macros::routine;
 
     /// `attn/attention_score_post.cuh` — the root all three compile out of.
     ///
@@ -463,38 +465,30 @@ pub mod attention_score_post {
     /// [`Refusal::Empty`] for an empty fire on either grid axis, and whatever
     /// the compile, the load or the launch refuses.
     pub fn attn_score_normalize(
-        ctx: &Ctx,
+        ctx: &Ctx<'_>,
         scores: *mut f32,
         score_indptr: *const i32,
         kv_page_indptr: *const u32,
         kv_last_page_lens: *const u32,
         page_size: i32,
         num_requests: i32,
-        num_q_heads: i32,
-    ) -> Result<(), Refusal> {
+        num_q_heads: i32) -> Result<(), Refusal> {
         // The C++ had no such guard, because the dispatch above it could not
         // be reached with an empty fire. It is required here: a zero grid axis
         // reaching a launch is a refusal, which would turn a legal no-op into
         // one.
         // SAFETY: `call()`'s contract -- every pointer bound here addresses
         // live device memory of the extent the kernel reads it as.
-        unsafe {
-            ctx.launch(
-                "attn/attention_score_post.cuh",
-                "::pie::attn::attn_score_normalize",
-                Launch::grid(
+        ctx.fire(Fire::at("attn/attention_score_post.cuh", "::pie::attn::attn_score_normalize").apply(Launch::grid(
                     [num_requests.unsigned_abs(), num_q_heads.unsigned_abs(), 1],
                     [NORMALIZE_BLOCK, 1, 1],
-                ),
-                &[
+                )), &[
                     scores.arg(),
                     score_indptr.arg(),
                     kv_page_indptr.arg(),
                     kv_last_page_lens.arg(),
                     page_size.arg(),
-                ],
-            )
-        }
+                ])
     }
 
     /// `attn::attn_prefill_score_normalize` — the same, over SnapKV's
@@ -523,31 +517,24 @@ pub mod attention_score_post {
     /// As [`attn_score_normalize`], with `window` a third empty axis.
     #[allow(clippy::too_many_arguments)]
     pub fn attn_prefill_score_normalize(
-        ctx: &Ctx,
+        ctx: &Ctx<'_>,
         scores: *mut f32,
         score_indptr: *const i32,
-        qo_indptr: Env<*const u32>,
+        qo_indptr: *const u32,
         kv_page_indptr: *const u32,
         kv_last_page_lens: *const u32,
         page_size: i32,
         num_requests: i32,
         num_q_heads: i32,
-        window: i32,
-    ) -> Result<(), Refusal> {
-        // SAFETY: as [`attn_score_normalize`]'s.
-        unsafe {
-            ctx.launch(
-                "attn/attention_score_post.cuh",
-                "::pie::attn::attn_prefill_score_normalize",
-                Launch::grid(
+        window: i32) -> Result<(), Refusal> {
+        ctx.fire(Fire::at("attn/attention_score_post.cuh", "::pie::attn::attn_prefill_score_normalize").apply(Launch::grid(
                     [
                         num_requests.unsigned_abs(),
                         num_q_heads.unsigned_abs(),
                         window.unsigned_abs(),
                     ],
                     [NORMALIZE_BLOCK, 1, 1],
-                ),
-                &[
+                )), &[
                     scores.arg(),
                     score_indptr.arg(),
                     qo_indptr.arg(),
@@ -555,9 +542,7 @@ pub mod attention_score_post {
                     kv_last_page_lens.arg(),
                     page_size.arg(),
                     window.arg(),
-                ],
-            )
-        }
+                ])
     }
 
     /// `attn::attn_prefill_score_fold` — heads AND window rows collapsed into
@@ -587,29 +572,23 @@ pub mod attention_score_post {
     /// load or the launch refuses.
     #[allow(clippy::too_many_arguments)]
     pub fn attn_prefill_score_fold(
-        ctx: &Ctx,
+        ctx: &Ctx<'_>,
         scores: *const f32,
         folded: *mut f32,
         score_indptr: *const i32,
-        qo_indptr: Env<*const u32>,
+        qo_indptr: *const u32,
         kv_page_indptr: *const u32,
         kv_last_page_lens: *const u32,
         page_size: i32,
         num_requests: i32,
         num_q_heads: i32,
-        window: i32,
-    ) -> Result<(), Refusal> {
+        window: i32) -> Result<(), Refusal> {
         // SAFETY: as [`attn_score_normalize`]'s, and `folded` is written
         // rather than read.
-        unsafe {
-            ctx.launch(
-                "attn/attention_score_post.cuh",
-                "::pie::attn::attn_prefill_score_fold",
-                Launch::grid(
+        ctx.fire(Fire::at("attn/attention_score_post.cuh", "::pie::attn::attn_prefill_score_fold").apply(Launch::grid(
                     [num_requests.unsigned_abs(), PREFILL_FOLD_GRID_Y, 1],
                     [NORMALIZE_BLOCK, 1, 1],
-                ),
-                &[
+                )), &[
                     scores.arg(),
                     folded.arg(),
                     score_indptr.arg(),
@@ -619,16 +598,13 @@ pub mod attention_score_post {
                     page_size.arg(),
                     num_q_heads.arg(),
                     window.arg(),
-                ],
-            )
-        }
+                ])
     }
 
 }
 
 /// `attn/dsa_indexer.cuh` — glm5's sparse-attention index network, three
 pub mod dsa_indexer {
-    
 
     /// `attn/dsa_indexer.cuh` — the root these routines compile a symbol out
     /// of.
@@ -648,7 +624,6 @@ pub mod dsa_indexer {
 
 /// `attn/page_compact.cuh` — dropping the pages a keep-mask rejects and
 pub mod page_compact {
-    
 
     /// `attn/page_compact.cuh` — the root both halves compile out of.
         /// The template-ids NVRTC is handed, spelled as it is handed them.
@@ -669,65 +644,53 @@ pub mod page_compact {
 /// eleven ARE answered: `keep` is `arg_in(0)`, the three CSR inputs and
 /// `num_requests` come off `plan()`"*. Only two of the six are marks a
 /// `Source` can carry; the other four are the reason the row is declined.
-#[kernels_macros::routine]
+#[routine(whole, untraced)]
 pub fn compact_page_csr(
-    ctx: &Ctx,
-    // WHICH IS A DESCRIPTION OF CONFUSION AND NOT A FINDING. Chased to the
-    // end, nothing was stopping them, and here is the whole check:
-    page_indices_in: Env<keys::KvPageIndices>,
-    page_indptr_in: Env<keys::KvPageIndptr>,
-    last_page_lens_in: Unbound<*const u32>,
-    keep: In<0, u8>,
-    scratch_counts: Unbound<*mut u32>,
+    ctx: &Ctx<'_>,
+    last_page_lens_in: *const u32,
+    keep: In<Tensor<u8>>,
+    scratch_counts: *mut u32,
+    page_indices_out: *mut u32,
+    page_indptr_out: *mut u32,
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<u32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
     keep_stride: u32,
-    num_requests: Env<keys::RequestCount>,
-    page_indices_out: Unbound<*mut u32>,
-    page_indptr_out: Unbound<*mut u32>,
-    last_page_lens_out: Unbound<*mut u32>,
-) -> Result<(), Refusal> {
-    if scratch_counts.ptr.is_null() {
+    last_page_lens_out: *mut u32) -> Result<(), Refusal> {
+    let page_indices_in = ctx.ask::<*const u32, keys::KvPageIndices>()?;
+    let page_indptr_in = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
+    let num_requests = ctx.ask::<i32, keys::RequestCount>()?;
+    if scratch_counts.is_null() {
         return Err(Refusal::Absent { what: "the compaction scratch buffer" });
     }
     let launch = Launch::per_row(num_requests.unsigned_abs(), page_compact::K_BLOCK);
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as. The two launches are
     // ordered by the stream, and the second reads what the first wrote.
-    unsafe {
-        ctx.launch(
-            "attn/page_compact.cuh",
-            "::pie::attn::count_kept<::pie::i32(256)>",
-            launch,
-            &[
+    ctx.fire(Fire::at("attn/page_compact.cuh", "::pie::attn::count_kept<::pie::i32(256)>").apply(launch), &[
                 page_indptr_in.arg(),
-                keep.ptr.arg(),
+                keep.arg(),
                 keep_stride.arg(),
                 num_requests.arg(),
-                scratch_counts.ptr.arg(),
-            ],
-        )?;
-        ctx.launch(
-            "attn/page_compact.cuh",
-            "::pie::attn::scan_and_scatter<::pie::i32(256)>",
-            launch,
-            &[
+                scratch_counts.arg(),
+            ])?;
+        ctx.fire(Fire::at("attn/page_compact.cuh", "::pie::attn::scan_and_scatter<::pie::i32(256)>").apply(launch), &[
                 page_indices_in.arg(),
                 page_indptr_in.arg(),
-                last_page_lens_in.ptr.arg(),
-                keep.ptr.arg(),
-                scratch_counts.ptr.cast_const().arg(),
+                last_page_lens_in.arg(),
+                keep.arg(),
+                scratch_counts.cast_const().arg(),
                 keep_stride.arg(),
                 num_requests.arg(),
-                page_indptr_out.ptr.arg(),
-                last_page_lens_out.ptr.arg(),
-                page_indices_out.ptr.arg(),
-            ],
-        )
-    }
+                page_indptr_out.arg(),
+                last_page_lens_out.arg(),
+                page_indices_out.arg(),
+            ])
 }
 
 /// `attn/attention_naive.cuh` — the MTP pair and the reference attention.
 pub mod attention_naive {
-    
 
     /// `attn/attention_naive.cuh` — the root these routines compile a symbol
     /// out of.
@@ -749,22 +712,26 @@ pub mod attention_naive {
 /// the statement hands the pending slab over as an INPUT [...] `out` is
 /// `arg_out(0)`, `qo_indptr` and `num_requests` come off `plan()`,
 /// `total_tokens` is `rows()` and `hidden_size` is `out_width(0)`"*.
-#[kernels_macros::routine]
+#[routine(bf16, whole)]
 pub fn mtp_shift_hidden<T>(
-    ctx: &Ctx,
-    target_hidden: In<0, T>,
-    pending_hidden: In<1, T>,
-    qo_indptr: Env<keys::QoIndptr>,
-    slot_ids: Unbound<*const i32>,
-    out: Out<0, T>,
-    num_requests: Env<keys::RequestCount>,
-) -> Result<(), Refusal>
+    ctx: &Ctx<'_>,
+    target_hidden: In<Tensor<T>>,
+    pending_hidden: In<Tensor<T>>,
+    slot_ids: *const i32,
+    out: Out<Tensor<T>>) -> Result<(), Refusal>
 where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
+    // THE PENDING SLAB IS TESTED FOR ABSENCE, so its carrier has to be a
+    // pointer rather than merely an `Elem`'s associated type: an MTP fire with
+    // no pending state hands this routine a null and expects a refusal.
+    <T as kernels::Elem>::Read: Abi + kernels::Bind<crate::jit::ArgValue>,
+    <T as kernels::Elem>::Write: Abi + kernels::Bind<crate::jit::ArgValue> + kernels::BindMut<crate::jit::ArgValue>,
 {
-    if pending_hidden.ptr.is_null() {
+    let qo_indptr = ctx.ask::<*const u32, keys::QoIndptr>()?;
+    let num_requests = ctx.ask::<i32, keys::RequestCount>()?;
+    // A NULL THROUGH THE CARRIER'S OWN BINDING. `Elem::Read` is an associated
+    // type and not a pointer as far as this signature can see, so the absence
+    // is asked in the one vocabulary every carrier answers: what it BINDS as.
+    if matches!(pending_hidden.ptr.arg(), crate::jit::ArgValue::Ptr(p) if p.is_null()) {
         return Err(Refusal::Absent { what: "the MTP pending-hidden state" });
     }
     // THE WIDTH AND NOT THE PITCH, though `attention_naive.cuh:314-317`
@@ -775,45 +742,45 @@ where
     let hidden_size = dst.width;
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "attn/attention_naive.cuh",
-            &format!("::pie::attn::mtp_shift_hidden<{}>", T::CPP),
-            Launch::per_row(dst.rows.unsigned_abs(), attention_naive::BLOCK),
-            &[
-                target_hidden.ptr.arg(),
-                pending_hidden.ptr.arg(),
+    ctx.fire(Fire::at("attn/attention_naive.cuh", crate::jit::symbol(&format!("::pie::attn::mtp_shift_hidden<{}>", T::CPP))).apply(Launch::per_row(dst.rows.unsigned_abs(), attention_naive::BLOCK)), &[
+                target_hidden.arg(),
+                pending_hidden.arg(),
                 qo_indptr.arg(),
-                slot_ids.ptr.arg(),
-                out.ptr.arg(),
+                slot_ids.arg(),
+                out.arg(),
                 num_requests.arg(),
                 hidden_size.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `attn::mtp_update_pending_hidden_bf16` — one block per REQUEST.
 ///
 /// [`mtp_shift_hidden`]'s obligation.
-#[kernels_macros::routine]
+#[routine(bf16, whole)]
 pub fn mtp_update_pending_hidden<T>(
-    ctx: &Ctx,
-    target_hidden: In<0, T>,
-    pending_hidden: Unbound<*mut T>,
+    ctx: &Ctx<'_>,
+    target_hidden: In<Tensor<T>>,
+    pending_hidden: *mut T,
     // As its twin's, and it is a NAME now: `keys::QoIndptr` = "plan.qo_indptr",
-    // which `operand()` answers off `cx.plan()`. Reason (a) had this row for
-    // two stages and lost it.
-    qo_indptr: Env<keys::QoIndptr>,
-    slot_ids: Unbound<*const i32>,
-    num_requests: Env<keys::RequestCount>,
-) -> Result<(), Refusal>
+    slot_ids: *const i32) -> Result<(), Refusal>
 where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
+    // THE BARE POINTERS ARE SPENT INTO THE ARGUMENT LIST, so they must be
+    // bindable. `arg_via_abi!` stamps `Bind` per pointee rather than deriving
+    // it, which is why a generic body has to ask for both.
+    *const T: Abi + kernels::Bind<crate::jit::ArgValue>,
+    // AND THE WRITE SIDE NAMES ITS OWN TRAIT. `Out`/`InOut` bind through
+    // `BindMut`, not `Bind`, so that a plane whose read and write carriers
+    // are ONE TYPE can still say which way a slot is driven -- see
+    // `kernels::routine::BindMut`. Here the two carriers already differ, so
+    // the blanket impl over `*mut T` makes this the same obligation twice;
+    // it is spelled because `<T as Elem>::Write` is opaque under a generic
+    // `T` and the compiler cannot see that it is this pointer.
+    *mut T: Abi + kernels::Bind<crate::jit::ArgValue>,
+    T: kernels::Elem<Write = *mut T>,
 {
-    if pending_hidden.ptr.is_null() {
+    let qo_indptr = ctx.ask::<*const u32, keys::QoIndptr>()?;
+    let num_requests = ctx.ask::<i32, keys::RequestCount>()?;
+    if pending_hidden.is_null() {
         return Err(Refusal::Absent { what: "the MTP pending-hidden state" });
     }
     // As its twin's, off the input this form reads instead of the output it
@@ -822,21 +789,14 @@ where
     let hidden_size = src.width;
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "attn/attention_naive.cuh",
-            &format!("::pie::attn::mtp_update_pending_hidden<{}>", T::CPP),
-            Launch::per_row(num_requests.unsigned_abs(), attention_naive::BLOCK),
-            &[
-                target_hidden.ptr.arg(),
-                pending_hidden.ptr.arg(),
+    ctx.fire(Fire::at("attn/attention_naive.cuh", crate::jit::symbol(&format!("::pie::attn::mtp_update_pending_hidden<{}>", T::CPP))).apply(Launch::per_row(num_requests.unsigned_abs(), attention_naive::BLOCK)), &[
+                target_hidden.arg(),
+                pending_hidden.arg(),
                 qo_indptr.arg(),
-                slot_ids.ptr.arg(),
+                slot_ids.arg(),
                 num_requests.arg(),
                 hidden_size.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `attn::mla_prepare_bf16` — the whole MLA prologue in one kernel.
@@ -845,39 +805,35 @@ where
 /// device address live across the launch, `layer`'s two page pointers
 /// included.
 #[allow(clippy::similar_names)]
-#[kernels_macros::routine]
+#[routine(whole, untraced)]
 pub fn mla_prepare_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     layer: MlaLayer,
-    kv_a: In<0, bf16>,
-    #[source(Weight(0))] kv_a_norm_weight: *const bf16,
-    q_b: In<1, bf16>,
-    kv_c: Out<0, bf16>,
-    k_pe: Out<1, bf16>,
-    q_nope: Out<2, bf16>,
-    q_pe: Out<3, bf16>,
-    positions: Env<keys::Positions>,
-    // `keys::QoIndptr`. `row_valid` below keeps its own reason, which never
-    // depended on this one: it arrives `Unbound` because the MLA rows are
-    // blocked by `MlaLayer` whole, not because the fact wants a word.
-    qo_indptr: Env<keys::QoIndptr>,
-    kv_page_indices: Env<keys::KvPageIndices>,
-    kv_page_indptr: Env<keys::KvPageIndptr>,
-    kv_last_page_lens: Unbound<*const u32>,
-    row_valid: Unbound<*const u8>,
-    num_requests: Env<keys::RequestCount>,
+    kv_a: In<Tensor<bf16>>,
+    kv_a_norm_weight: Const<Tensor<bf16>>,
+    q_b: In<Tensor<bf16>>,
+    kv_c: Out<Tensor<bf16>>,
+    k_pe: Out<Tensor<bf16>>,
+    q_nope: Out<Tensor<bf16>>,
+    q_pe: Out<Tensor<bf16>>,
+    kv_last_page_lens: *const u32,
+    row_valid: *const u8,
     heads: i32,
     qk_nope_head_dim: i32,
-    eps: Env<keys::RmsEps>,
+    eps: Const<f32>,
     // `Source::Named(<keys::RopeTheta as keys::Fact>::KEY)`, NOT `Source::Named(<keys::Theta as keys::Fact>::KEY)`, and the distinction is the
     // whole reason this parameter has a comment.
-    theta: Env<keys::RopeTheta>,
+    theta: Const<f32>,
     interleaved: bool,
     kv_a_row_stride: i32,
     // `cx.yarn()`, the YaRN scaling block, which `operand()` refuses as part
     // of the documented boundary: reason (b).
-    yarn: Unbound<Option<Yarn>>,
-) -> Result<(), Refusal> {
+    yarn: Option<Yarn>) -> Result<(), Refusal> {
+    let qo_indptr = ctx.ask::<*const u32, keys::QoIndptr>()?;
+    let positions = ctx.ask::<*const i32, keys::Positions>()?;
+    let kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
+    let kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
+    let num_requests = ctx.ask::<i32, keys::RequestCount>()?;
     /// `mla_paged.cu:65` — the grid's second axis, less its KV lane.
     #[must_use]
     pub fn mla_q_blocks(heads: i32, heads_per_block: i32) -> i32 {
@@ -909,45 +865,40 @@ pub fn mla_prepare_bf16(
     let per_block = mla_heads_per_block(rope);
     let blocks = mla_q_blocks(heads, per_block);
 
-    let (low_dim, high_dim) = match yarn.ptr {
+    let (low_dim, high_dim) = match yarn {
         Some(y) => crate::rope::ramp_bounds(
             rope,
-            **theta,
+            *theta,
             y.beta_fast,
             y.beta_slow,
             y.original_max_position,
         ),
         None => (0.0, 0.0),
     };
-    let yarn_factor = yarn.ptr.map_or(-1.0_f32, |y| y.factor);
-    let yarn_mscale = yarn.ptr.map_or(1.0_f32, |y| y.attention_factor);
+    let yarn_factor = yarn.map_or(-1.0_f32, |y| y.factor);
+    let yarn_mscale = yarn.map_or(1.0_f32, |y| y.attention_factor);
 
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "attn/mla_paged.cuh",
-            "::pie::attn::mla_prepare<::pie::i32(256)>",
-            Launch::grid(
+    ctx.fire(Fire::at("attn/mla_paged.cuh", "::pie::attn::mla_prepare<::pie::i32(256)>").apply(Launch::grid(
                 [kv_c.rows.unsigned_abs(), blocks.saturating_add(1).max(1).unsigned_abs(), 1],
                 [MLA_PREPARE_BLOCK.unsigned_abs(), 1, 1],
-            ),
-            &[
-                kv_a.ptr.arg(),
+            )), &[
+                kv_a.arg(),
                 kv_a_norm_weight.arg(),
-                q_b.ptr.arg(),
-                kv_c.ptr.arg(),
-                k_pe.ptr.arg(),
-                q_nope.ptr.arg(),
-                q_pe.ptr.arg(),
+                q_b.arg(),
+                kv_c.arg(),
+                k_pe.arg(),
+                q_nope.arg(),
+                q_pe.arg(),
                 layer.ckv_pages.cast::<bf16>().arg(),
                 layer.kpe_pages.cast::<bf16>().arg(),
                 positions.arg(),
                 qo_indptr.arg(),
                 kv_page_indices.arg(),
                 kv_page_indptr.arg(),
-                kv_last_page_lens.ptr.arg(),
-                row_valid.ptr.arg(),
+                kv_last_page_lens.arg(),
+                row_valid.arg(),
                 num_requests.arg(),
                 layer.page_size.arg(),
                 heads.arg(),
@@ -963,54 +914,44 @@ pub fn mla_prepare_bf16(
                 low_dim.arg(),
                 high_dim.arg(),
                 yarn_mscale.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `attn::write_mla_to_pages` — appends one step's compressed latent and rope
 ///
 /// [`mla_prepare_bf16`]'s obligation.
-#[kernels_macros::routine]
+#[routine(whole, untraced)]
 pub fn write_mla_to_pages(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     layer: MlaLayer,
-    ckv_curr: In<0, bf16>,
-    kpe_curr: In<1, bf16>,
-    qo_indptr: Env<keys::QoIndptr>,
-    kv_page_indices: Env<keys::KvPageIndices>,
-    kv_page_indptr: Env<keys::KvPageIndptr>,
-    kv_last_page_lens: Unbound<*const u32>,
-    row_valid: Unbound<*const u8>,
-    num_requests: Env<keys::RequestCount>,
-) -> Result<(), Refusal> {
+    ckv_curr: In<Tensor<bf16>>,
+    kpe_curr: In<Tensor<bf16>>,
+    kv_last_page_lens: *const u32,
+    row_valid: *const u8) -> Result<(), Refusal> {
+    let qo_indptr = ctx.ask::<*const u32, keys::QoIndptr>()?;
+    let kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
+    let kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
+    let num_requests = ctx.ask::<i32, keys::RequestCount>()?;
     /// `mla_paged.cu:105` — `write_mla`'s block, one per token row.
     pub const MLA_WRITE_BLOCK: u32 = 256;
 
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "attn/mla_paged.cuh",
-            "::pie::attn::write_mla",
-            Launch::per_row(ckv_curr.rows.unsigned_abs(), MLA_WRITE_BLOCK),
-            &[
-                ckv_curr.ptr.arg(),
-                kpe_curr.ptr.arg(),
+    ctx.fire(Fire::at("attn/mla_paged.cuh", "::pie::attn::write_mla").apply(Launch::per_row(ckv_curr.rows.unsigned_abs(), MLA_WRITE_BLOCK)), &[
+                ckv_curr.arg(),
+                kpe_curr.arg(),
                 layer.ckv_pages.cast::<bf16>().arg(),
                 layer.kpe_pages.cast::<bf16>().arg(),
                 qo_indptr.arg(),
                 kv_page_indices.arg(),
                 kv_page_indptr.arg(),
-                kv_last_page_lens.ptr.arg(),
-                row_valid.ptr.arg(),
+                kv_last_page_lens.arg(),
+                row_valid.arg(),
                 num_requests.arg(),
                 layer.page_size.arg(),
                 layer.kv_lora_rank.arg(),
                 layer.qk_rope_head_dim.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `dsv4_compress.cu:139` and `:161` — the boundary-meta block.
@@ -1026,85 +967,71 @@ const DSV4_META_BLOCK: u32 = 128;
 /// `row_valid` and `requests` come off `plan()`, and `n` is `rows()`"*. Every
 /// one of those is a mark below except `row_valid`, which is a `plan()` array
 /// no variant names.
-#[kernels_macros::routine]
+#[routine]
 pub fn dsv4_boundary_meta_decode(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     // # NOT `Env<keys::Positions>`, AND THIS IS THE ONE `positions` IN THE
     // # TREE A NAME SWEEP WOULD GET WRONG WITHOUT REFUSING
-    positions: In<0, i32>,
-    out_pos: Out<0, i32>,
-    out_req: Out<1, i32>,
-    out_rope: Out<2, i32>,
-    ratio: i32,
-    // `plan.row_valid` = `keys::RowValid`. The row's own sentence
-    // (`arms/attn.rs`) called this *"a `plan()` array no variant names"*;
-    // `keys.rs` §1 names it now, so the sentence is wrong and the type is
-    // right.
-    row_valid: Env<keys::RowValid>,
-) -> Result<(), Refusal> {
+    positions: In<Tensor<i32>>,
+    out_pos: Out<Tensor<i32>>,
+    out_req: Out<Tensor<i32>>,
+    out_rope: Out<Tensor<i32>>,
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<i32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
+    ratio: i32) -> Result<(), Refusal> {
+    let row_valid = ctx.ask::<*const u8, keys::RowValid>()?;
     if ratio <= 0 {
         return Err(Refusal::Narrow { what: "ratio", at: i64::from(ratio) });
     }
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "attn/dsv4_compress.cuh",
-            "::pie::attn::dsv4_boundary_meta_decode<::pie::i32>",
-            Launch::flat(out_pos.rows.unsigned_abs(), DSV4_META_BLOCK),
-            &[
-                positions.ptr.arg(),
-                out_pos.ptr.arg(),
-                out_req.ptr.arg(),
-                out_rope.ptr.arg(),
+    ctx.fire(Fire::at("attn/dsv4_compress.cuh", "::pie::attn::dsv4_boundary_meta_decode<::pie::i32>").apply(Launch::flat(out_pos.rows.unsigned_abs(), DSV4_META_BLOCK)), &[
+                positions.arg(),
+                out_pos.arg(),
+                out_req.arg(),
+                out_rope.arg(),
                 out_pos.rows.arg(),
                 ratio.arg(),
                 row_valid.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `attn::dsv4_boundary_meta_paged` — the prefill form of
 ///
 /// [`dsv4_boundary_meta_decode`]'s obligation.
-#[kernels_macros::routine]
+#[routine(whole)]
 pub fn dsv4_boundary_meta_paged(
-    ctx: &Ctx,
-    positions: In<0, i32>,
-    qo_indptr: Env<keys::QoIndptr>,
-    out_pos: Out<0, i32>,
-    out_req: Out<1, i32>,
-    out_rope: Out<2, i32>,
-    num_requests: Env<keys::RequestCount>,
-    // Its twin's: a number nothing in the driver holds. Reason (a).
-    ratio: i32,
-    // `plan.row_valid`, as on the decode twin above, and keyed with it.
-    row_valid: Env<keys::RowValid>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    positions: In<Tensor<i32>>,
+    out_pos: Out<Tensor<i32>>,
+    out_req: Out<Tensor<i32>>,
+    out_rope: Out<Tensor<i32>>,
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<i32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
+    ratio: i32) -> Result<(), Refusal> {
+    let row_valid = ctx.ask::<*const u8, keys::RowValid>()?;
+    let qo_indptr = ctx.ask::<*const u32, keys::QoIndptr>()?;
+    let num_requests = ctx.ask::<i32, keys::RequestCount>()?;
     if ratio <= 0 {
         return Err(Refusal::Narrow { what: "ratio", at: i64::from(ratio) });
     }
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "attn/dsv4_compress.cuh",
-            "::pie::attn::dsv4_boundary_meta_paged<::pie::i32>",
-            Launch::flat(out_pos.rows.unsigned_abs(), DSV4_META_BLOCK),
-            &[
-                positions.ptr.arg(),
+    ctx.fire(Fire::at("attn/dsv4_compress.cuh", "::pie::attn::dsv4_boundary_meta_paged<::pie::i32>").apply(Launch::flat(out_pos.rows.unsigned_abs(), DSV4_META_BLOCK)), &[
+                positions.arg(),
                 qo_indptr.arg(),
-                out_pos.ptr.arg(),
-                out_req.ptr.arg(),
-                out_rope.ptr.arg(),
+                out_pos.arg(),
+                out_req.arg(),
+                out_rope.arg(),
                 out_pos.rows.arg(),
                 num_requests.arg(),
                 ratio.arg(),
                 row_valid.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `attn::attention_compressed_paged_bf16` — attention against the COMPRESSED
@@ -1124,15 +1051,15 @@ pub fn dsv4_boundary_meta_paged(
 /// head_dim` (`:678-679`), so it is the fire's head dim and not the KV view's,
 /// which is exactly `Source::Named(<keys::HeadDim as keys::Fact>::KEY)`. Both are marked on that evidence
 /// rather than on the row's word.
-#[kernels_macros::routine]
+#[routine(whole)]
 pub fn attention_compressed_paged_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     // `In(0)`: the statement's `inputs: [q]`
     // (`model-dsl/src/cuda/deepseek_v4.rs:301`) has one entry.
-    q: In<0, bf16>,
-    comp_kv_pages: Env<*const bf16>,
+    q: In<Tensor<bf16>>,
+    comp_kv_pages: *const bf16,
     // `Out(0)`, the first of the statement's two `outs`.
-    o: Out<0, bf16>,
+    o: Out<Tensor<bf16>>,
     // The log-sum-exp side channel, written only when a later merge wants it.
     //
     // D2 APPLIED AND DECLINED (`.wiki/kilimanjaro3.md` §3.8). The absence is
@@ -1142,7 +1069,7 @@ pub fn attention_compressed_paged_bf16(
     // `if (lse_out != nullptr && tid == 0)`. `lse_out.ptr` is threaded into
     // the argument list below beside `o.ptr` with no test between them, the
     // instantiation `::pie::attn::compressed_attn_paged` is not templated on
-    // it, and `Launch::grid` reads `o.rows`, not this pointer. A split would
+    // it, and `Launch:Env<:grid` reads `o.rows`, keys::Unstated>, not this pointer. A split would
     // produce two bodies that differ in nothing, which is one function under
     // two names -- the rule asks for two FUNCTIONS.
     //
@@ -1157,7 +1084,7 @@ pub fn attention_compressed_paged_bf16(
     //   `opt_writes`, giving a band of `[1, 2]`. This symbol has ONE text --
     //   `dsl::cuda::attention_compressed_paged`
     //   (`model-dsl/src/cuda/deepseek_v4.rs:298`) -- whose `outs:` list is
-    //   unconditional and two long, and `deepseek_v4/forward/mod.rs:155` is
+    //   unconditional and two long, and `deepseek_v4/forward/mod.rs:Env<155` is, keys::Unstated>
     //   its only caller. `declared` is 2, always. The band is `[2, 2]` now
     //   and 2 is in it.
     // * `accepts_an_unstated_result` (`:227`) is consulted by
@@ -1176,26 +1103,25 @@ pub fn attention_compressed_paged_bf16(
     // callers this file does not own, and it is what makes the D2 verdict
     // above right. It says nothing about which arities a Rust signature must
     // admit, and the two were being conflated by one spelling.
-    lse_out: Out<1, f32>,
-    // `Env<keys::Positions>` and not `Env<*const i32>`: the same
-    // `Source::Named(<keys::Positions as keys::Fact>::KEY)`, reached from the TYPE instead of from the name.
-    positions: Env<keys::Positions>,
-    kv_page_indices: Env<keys::KvPageIndices>,
-    kv_page_indptr: Env<keys::KvPageIndptr>,
-    // *"a per-token request map that nothing in `driver-cuda` builds"*.
-    req_of_token: Env<keys::RequestOfToken>,
-    num_q_heads: Env<keys::NumQHeads>,
-    head_dim: Env<keys::HeadDim>,
-    // The `dsv4` three's ratio, as on the boundary pair: a number no context
-    // holds. Reason (a).
-    ratio: i32,
-    page_size: Env<keys::KvPageSize>,
-    // `cx.sm_scale()` = `keys::SmScale`, answered by `operand()`. The doc
-    // above cites this parameter as a producer *"with no query and no
-    // variant"*; the variant exists and the query is `Fire::sm_scale`, so the
-    // citation is retired here and at `dispatch_attention_mla_bf16`.
-    sm_scale: Env<keys::SmScale>,
-) -> Result<(), Refusal> {
+    lse_out: Out<Tensor<f32>>,
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<i32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
+    ratio: i32) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
+    // builder ever began stating them. A `Const` mark PROMISES the statement
+    // carries the number at its slot in the params run; where nothing states
+    // one the promise breaks at the fire, not at the type. §11.20.
+    let num_q_heads = ctx.ask::<i32, keys::NumQHeads>()?;
+    let head_dim = ctx.ask::<i32, keys::HeadDim>()?;
+    let page_size = ctx.ask::<i32, keys::KvPageSize>()?;
+    let sm_scale = ctx.ask::<f32, keys::SmScale>()?;
+
+    let positions = ctx.ask::<*const i32, keys::Positions>()?;
+    let kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
+    let kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
+    let req_of_token = ctx.ask::<*const i32, keys::RequestOfToken>()?;
     /// `dsv4_compress.cu:37` — `constexpr int ATTN_BLOCK = 128;`.
     const DSV4_ATTN_BLOCK: u32 = 128;
 
@@ -1206,20 +1132,15 @@ pub fn attention_compressed_paged_bf16(
         .saturating_mul(u32::try_from(core::mem::size_of::<f32>()).unwrap_or(4));
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "attn/dsv4_compress.cuh",
-            "::pie::attn::compressed_attn_paged",
-            Launch::grid(
+    ctx.fire(Fire::at("attn/dsv4_compress.cuh", "::pie::attn::compressed_attn_paged").apply(Launch::grid(
                 [o.rows.unsigned_abs(), num_q_heads.unsigned_abs(), 1],
                 [DSV4_ATTN_BLOCK, 1, 1],
             )
-            .smem(smem),
-            &[
-                q.ptr.arg(),
+            .smem(smem)), &[
+                q.arg(),
                 comp_kv_pages.arg(),
-                o.ptr.arg(),
-                lse_out.ptr.arg(),
+                o.arg(),
+                lse_out.arg(),
                 positions.arg(),
                 kv_page_indices.arg(),
                 kv_page_indptr.arg(),
@@ -1229,9 +1150,7 @@ pub fn attention_compressed_paged_bf16(
                 ratio.arg(),
                 page_size.arg(),
                 sm_scale.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `attn::dsa_index_knorm_rope_bf16` — LayerNorm then interleaved RoPE on the
@@ -1244,29 +1163,41 @@ pub fn attention_compressed_paged_bf16(
 /// reads a LayerNorm weight AND a bias -- two operands with nothing to come
 /// from, on top of the `rope_dim` its sibling also lacks. `head_dim` alone is
 /// statable, as `out_width(0)`"*.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn dsa_index_knorm_rope<T>(
-    ctx: &Ctx,
-    idx_k: Out<0, T>,
-    k_norm_weight: Unbound<*const T>,
+    ctx: &Ctx<'_>,
+    idx_k: InOut<Tensor<T>>,
+    k_norm_weight: *const T,
     // A LayerNorm bias, absent on a text that norms without one.
-    k_norm_bias: Unbound<*const T>,
-    // The fire's position array, as on every rope in the tree.
-    //
-    // `fact_of` maps `positions` to `Source::Named(<keys::Positions as keys::Fact>::KEY)` and `operand()`
-    // answers it, so this one resolves without a `#[source]`.
-    positions: Env<keys::Positions>,
-    // *"`rope_dim` appears in no statement, no shape and no context at all"*
-    // (`arms/attn.rs:542`, the sibling's row). Reason (a).
-    rope_dim: i32,
-    theta: Env<keys::Theta>,
-    eps: Env<keys::RmsEps>,
-) -> Result<(), Refusal>
+    k_norm_bias: *const T,
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<i32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
+    rope_dim: i32) -> Result<(), Refusal>
 where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
+    // THE BARE POINTERS ARE SPENT INTO THE ARGUMENT LIST, so they must be
+    // bindable. `arg_via_abi!` stamps `Bind` per pointee rather than deriving
+    // it, which is why a generic body has to ask for both.
+    *const T: Abi + kernels::Bind<crate::jit::ArgValue>,
+    // AND THE WRITE SIDE NAMES ITS OWN TRAIT. `Out`/`InOut` bind through
+    // `BindMut`, not `Bind`, so that a plane whose read and write carriers
+    // are ONE TYPE can still say which way a slot is driven -- see
+    // `kernels::routine::BindMut`. Here the two carriers already differ, so
+    // the blanket impl over `*mut T` makes this the same obligation twice;
+    // it is spelled because `<T as Elem>::Write` is opaque under a generic
+    // `T` and the compiler cannot see that it is this pointer.
+    *mut T: Abi + kernels::Bind<crate::jit::ArgValue>,
+    T: kernels::Elem<Write = *mut T>,
 {
+    // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
+    // builder ever began stating them. A `Const` mark PROMISES the statement
+    // carries the number at its slot in the params run; where nothing states
+    // one the promise breaks at the fire, not at the type. §11.20.
+    let theta = ctx.ask::<f32, keys::Theta>()?;
+    let eps = ctx.ask::<f32, keys::RmsEps>()?;
+
+    let positions = ctx.ask::<*const i32, keys::Positions>()?;
     // A HEAD DIM AND NOT A PITCH: `dsa_indexer.cuh:111` strides `idx_k` by
     // it and `:115` loops to it, so this operand's row IS one head and the
     // width the row calls `out_width(0)` is `head_dim` itself.
@@ -1274,23 +1205,16 @@ where
     let head_dim = dst.width;
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "attn/dsa_indexer.cuh",
-            &format!("::pie::attn::index_knorm_rope<{}>", T::CPP),
-            Launch::per_row(dst.rows.unsigned_abs(), dsa_indexer::K_BLOCK),
-            &[
-                idx_k.ptr.arg(),
-                k_norm_weight.ptr.arg(),
-                k_norm_bias.ptr.arg(),
+    ctx.fire(Fire::at("attn/dsa_indexer.cuh", crate::jit::symbol(&format!("::pie::attn::index_knorm_rope<{}>", T::CPP))).apply(Launch::per_row(dst.rows.unsigned_abs(), dsa_indexer::K_BLOCK)), &[
+                idx_k.arg(),
+                k_norm_weight.arg(),
+                k_norm_bias.arg(),
                 positions.arg(),
                 head_dim.arg(),
                 rope_dim.arg(),
                 theta.arg(),
                 eps.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `attn::dsa_index_q_rope_bf16` — interleaved RoPE on the indexer's QUERY
@@ -1299,40 +1223,42 @@ where
 ///
 /// **Read the `in_place` note in `ROUTINES` before crossing this one.** The
 /// kernel reads AND writes `idx_q` and the registration does not say so.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn dsa_index_q_rope<T>(
-    ctx: &Ctx,
-    idx_q: Out<0, T>,
-    positions: Env<keys::Positions>,
+    ctx: &Ctx<'_>,
+    idx_q: InOut<Tensor<T>>,
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<i32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
     n_heads: i32,
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<i32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
     head_dim: i32,
-    // *"`rope_dim` appears in no statement, no shape and no context at all"*.
-    // Reason (a).
-    rope_dim: i32,
-    // As its sibling's, and on the same indirect evidence.
-    theta: Env<keys::Theta>,
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *mut T: Abi,
-{
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<i32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
+    rope_dim: i32) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
+    // builder ever began stating them. A `Const` mark PROMISES the statement
+    // carries the number at its slot in the params run; where nothing states
+    // one the promise breaks at the fire, not at the type. §11.20.
+    let theta = ctx.ask::<f32, keys::Theta>()?;
+
+    let positions = ctx.ask::<*const i32, keys::Positions>()?;
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "attn/dsa_indexer.cuh",
-            &format!("::pie::attn::index_q_rope<{}>", T::CPP),
-            Launch::per_row(idx_q.rows.unsigned_abs(), dsa_indexer::q_rope_block(n_heads)),
-            &[
-                idx_q.ptr.arg(),
+    ctx.fire(Fire::at("attn/dsa_indexer.cuh", crate::jit::symbol(&format!("::pie::attn::index_q_rope<{}>", T::CPP))).apply(Launch::per_row(idx_q.rows.unsigned_abs(), dsa_indexer::q_rope_block(n_heads))), &[
+                idx_q.arg(),
                 positions.arg(),
                 n_heads.arg(),
                 head_dim.arg(),
                 rope_dim.arg(),
                 theta.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `attn::dsa_index_topk_mask` — score every causal (query, key) pair and
@@ -1343,40 +1269,32 @@ where
 /// the final three parameters name `Kind::Param(0..=2)` directly, matching the
 /// old arm's `cx.param` reads while leaving the input/output counters at the
 /// three score buffers and one mask.
-#[kernels_macros::routine]
+#[routine(whole)]
 pub fn dsa_index_topk_mask(
-    ctx: &Ctx,
-    idx_q: In<0, bf16>,
-    idx_k: In<1, bf16>,
-    idx_w: In<2, bf16>,
-    mask: Out<0, u8>,
-    n_heads: Param<0, i32>,
-    head_dim: Param<1, i32>,
-    topk: Param<2, i32>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    idx_q: In<Tensor<bf16>>,
+    idx_k: In<Tensor<bf16>>,
+    idx_w: In<Tensor<bf16>>,
+    mask: Out<Tensor<u8>>,
+    n_heads: Const<i32>,
+    head_dim: Const<i32>,
+    topk: Const<i32>) -> Result<(), Refusal> {
     let smem = mask
         .rows
         .unsigned_abs()
         .saturating_mul(u32::try_from(core::mem::size_of::<f32>()).unwrap_or(4));
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "attn/dsa_indexer.cuh",
-            "::pie::attn::index_topk_mask<::pie::bf16>",
-            Launch::per_row(mask.rows.unsigned_abs(), dsa_indexer::K_BLOCK).smem(smem),
-            &[
-                idx_q.ptr.arg(),
-                idx_k.ptr.arg(),
-                idx_w.ptr.arg(),
-                mask.ptr.arg(),
+    ctx.fire(Fire::at("attn/dsa_indexer.cuh", "::pie::attn::index_topk_mask<::pie::bf16>").apply(Launch::per_row(mask.rows.unsigned_abs(), dsa_indexer::K_BLOCK).smem(smem)), &[
+                idx_q.arg(),
+                idx_k.arg(),
+                idx_w.arg(),
+                mask.arg(),
                 mask.rows.arg(),
                 n_heads.arg(),
                 head_dim.arg(),
                 topk.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `flashinfer::MLAParams` — measured, mirrored, and pinned with
@@ -1573,8 +1491,11 @@ pub mod mla_params {
 pub mod mla_naive {
     use super::bf16;
     use super::{Ctx, Launch, Refusal};
-    
-    use crate::jit::Abi;
+    use crate::jit::abi::Tensor;
+    use kernels::keys;
+    use kernels::routine::{Asks, Const, In, Out};
+    use kernels::{Bind, Fire};
+    use kernels_macros::routine;
 
     /// `attn/attention_mla_naive.cuh` — the root the fallback pair compiles
     /// out of.
@@ -1992,7 +1913,7 @@ pub mod mla_naive {
     /// cannot serve is not an error: it is [`MlaNaive::Declined`], because
     /// three of the four were a `throw` and one a bare `return` and neither is
     /// a device failure.
-    pub fn fire(ctx: &Ctx, ptrs: NaivePtrs, shape: NaiveShape) -> Result<MlaNaive, Refusal> {
+    pub fn fire(ctx: &Ctx<'_>, ptrs: NaivePtrs, shape: NaiveShape) -> Result<MlaNaive, Refusal> {
         let have_indptr = !ptrs.qo_indptr.is_null()
             && !ptrs.kv_page_indptr.is_null()
             && !ptrs.kv_last_page_lens.is_null();
@@ -2006,8 +1927,7 @@ pub mod mla_naive {
                 // compares them rather than forwarding them.
                 //
                 // SAFETY: the caller's obligation on every pointer, above.
-                unsafe {
-                    ctx.launch("attn/attention_mla_naive.cuh", "::pie::attn::mla_naive::mma_detail::mla_mma_paged_kernel", launch, &[
+                ctx.fire(Fire::at("attn/attention_mla_naive.cuh", "::pie::attn::mla_naive::mma_detail::mla_mma_paged_kernel").apply(launch), &[
                         ptrs.q_nope.arg(),
                         ptrs.q_pe.arg(),
                         ptrs.ckv_pages.arg(),
@@ -2025,7 +1945,6 @@ pub mod mla_naive {
                         shape.sm_scale.arg(),
                         shape.causal.arg(),
                     ])?;
-                }
                 Ok(MlaNaive::LaunchedMma)
             }
             NaivePlan::Scalar { launch, head_group } => {
@@ -2035,8 +1954,7 @@ pub mod mla_naive {
                 // y axis was divided by.
                 //
                 // SAFETY: the caller's obligation on every pointer, above.
-                unsafe {
-                    ctx.launch("attn/attention_mla_naive.cuh", "::pie::attn::mla_naive::mla_naive_paged_kernel", launch, &[
+                ctx.fire(Fire::at("attn/attention_mla_naive.cuh", "::pie::attn::mla_naive::mla_naive_paged_kernel").apply(launch), &[
                         ptrs.q_nope.arg(),
                         ptrs.q_pe.arg(),
                         ptrs.ckv_pages.arg(),
@@ -2057,7 +1975,6 @@ pub mod mla_naive {
                         shape.causal.arg(),
                         head_group.arg(),
                     ])?;
-                }
                 Ok(MlaNaive::LaunchedScalar)
             }
         }
@@ -2107,12 +2024,17 @@ pub mod mla_naive {
 
 /// The FlashInfer FA2 MLA host program — **compilable, and not yet fireable.**
 pub mod mla_fa2 {
+    use crate::jit::{Launch, Root};
     use super::bf16;
     use super::mla_params::{MlaParams, UintFastdiv};
     use super::{Ctx, Refusal};
-    use crate::jit::{Launch, Root};
     use crate::attn::plan::MlaPlanInfo;
     use crate::jit::Abi;
+    use crate::jit::abi::Tensor;
+    use kernels::keys;
+    use kernels::routine::{Asks, Const, In, Out};
+    use kernels::{Bind, Fire};
+    use kernels_macros::routine;
 
     /// `attn/attention_mla_fa2.cuh` — the root this arm's symbols come out of.
     ///
@@ -2412,26 +2334,18 @@ pub mod mla_fa2 {
     /// [`Refusal::Absent`] for an `arm` past [`ARMS`]; otherwise whatever the
     /// compile, the load or the launch refuses.
     pub fn fire(
-        ctx: &Ctx,
+        ctx: &Ctx<'_>,
         arm: usize,
         causal: bool,
         params: &MlaParams,
-        launch: Launch,
-    ) -> Result<(), Refusal> {
+        launch: Launch) -> Result<(), Refusal> {
         let Some(row) = inst::MLA.get(arm) else {
             return Err(Refusal::Absent { what: "a `DISPATCH_SMEM_CONFIG` arm for this device" });
         };
         // SAFETY: every pointer in `params` is a device address the caller
         // keeps live across the launch -- the obligation every `<<<>>>` made,
         // and `pack`'s own.
-        unsafe {
-            ctx.launch(
-                "attn/attention_mla_fa2.cuh",
-                row[usize::from(causal)],
-                launch,
-                &[params.arg()],
-            )
-        }
+        ctx.fire(Fire::at("attn/attention_mla_fa2.cuh", row[usize::from(causal)]).apply(launch), &[params.arg()])
     }
 }
 
@@ -2569,33 +2483,32 @@ pub enum MlaDispatch {
 /// `num_heads`; nothing here can check it.
 ///
 /// Marked but NOT given a column, and it could not carry a useful one: a
-/// `driver_bound!` row, an `unsafe fn`, returning `MlaDispatch` rather than
+/// `untraced!` row, an `unsafe fn`, returning `MlaDispatch` rather than
 /// `()`.
-#[kernels_macros::routine]
+#[routine(untraced)]
 pub unsafe fn dispatch_attention_mla_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     plan: &MlaPlan,
-    q_nope: In<0, bf16>,
-    q_pe: In<1, bf16>,
+    q_nope: In<Tensor<bf16>>,
+    q_pe: In<Tensor<bf16>>,
     // `Cx::mla_layer`, the same structural refusal `mla_prepare_bf16` blocks
     // on. Reason (a).
     layer: MlaLayer,
-    o: Out<0, bf16>,
-    kv_page_indices: Env<keys::KvPageIndices>,
-    lse: Unbound<*mut f32>,
-    qo_indptr: Env<keys::QoIndptr>,
-    kv_page_indptr: Env<keys::KvPageIndptr>,
-    kv_last_page_lens: Unbound<*const u32>,
-    index_mask: Unbound<*const u8>,
+    o: Out<Tensor<bf16>>,
+    lse: *mut f32,
+    kv_last_page_lens: *const u32,
+    index_mask: *const u8,
     index_mask_stride: i32,
-    num_requests: Env<keys::RequestCount>,
     num_heads: i32,
     // `AttnCtx::sm_scale` = `keys::SmScale`, which `operand()` answers off
     // `f.sm_scale()`. It was *"a producer with no query and no variant"*
     // when this comment was written and it is neither now.
-    sm_scale: Env<keys::SmScale>,
-    causal: bool,
-) -> Result<MlaDispatch, Refusal> {
+    sm_scale: Const<f32>,
+    causal: bool) -> Result<MlaDispatch, Refusal> {
+    let kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
+    let qo_indptr = ctx.ask::<*const u32, keys::QoIndptr>()?;
+    let kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
+    let num_requests = ctx.ask::<i32, keys::RequestCount>()?;
     let Some(major) = ctx.compute_capability_major() else {
         return Err(Refusal::Device {
             why: "the device would not say its compute capability, which is the whole \
@@ -2613,21 +2526,21 @@ pub unsafe fn dispatch_attention_mla_bf16(
             q_pe: q_pe.ptr,
             ckv_pages: layer.ckv_pages.cast::<bf16>().cast_const(),
             kpe_pages: layer.kpe_pages.cast::<bf16>().cast_const(),
-            qo_indptr: **qo_indptr,
-            kv_page_indices: **kv_page_indices,
-            kv_page_indptr: **kv_page_indptr,
-            kv_last_page_lens: kv_last_page_lens.ptr,
+            qo_indptr: qo_indptr,
+            kv_page_indices: kv_page_indices,
+            kv_page_indptr: kv_page_indptr,
+            kv_last_page_lens: kv_last_page_lens,
             o: o.ptr,
-            index_mask: index_mask.ptr,
+            index_mask: index_mask,
         };
         let shape = mla_naive::NaiveShape {
             kv_lora_rank: layer.kv_lora_rank,
             qk_rope_head_dim: layer.qk_rope_head_dim,
             page_size: layer.page_size,
             total_tokens: o.rows,
-            num_requests: **num_requests,
+            num_requests: num_requests,
             num_heads,
-            sm_scale: **sm_scale,
+            sm_scale: *sm_scale,
             causal,
             index_mask_stride,
         };
@@ -2644,7 +2557,7 @@ pub unsafe fn dispatch_attention_mla_bf16(
         num_heads: num_heads.unsigned_abs(),
         kv_lora_rank: layer.kv_lora_rank.unsigned_abs(),
         qk_rope_head_dim: layer.qk_rope_head_dim.unsigned_abs(),
-        sm_scale: **sm_scale,
+        sm_scale: *sm_scale,
     };
     let buffers = mla_fa2::Buffers {
         int_buffer: plan.int_arena.cast::<u8>(),
@@ -2654,14 +2567,14 @@ pub unsafe fn dispatch_attention_mla_bf16(
         ckv_pages: layer.ckv_pages.cast::<bf16>(),
         kpe_pages: layer.kpe_pages.cast::<bf16>(),
         out: o.ptr,
-        kv_page_indices: (**kv_page_indices).cast::<i32>().cast_mut(),
-        lse: lse.ptr,
+        kv_page_indices: (kv_page_indices).cast::<i32>().cast_mut(),
+        lse: lse,
     };
     // SAFETY: the caller's obligation, forwarded -- every pointer here is a
     // device address live across the launch, and `plan` is the plan its two
     // arenas were uploaded from. Nothing is dereferenced on this side; the
     // offsets `pack` adds are the ones the upload used.
-    let params = unsafe { mla_fa2::pack(&plan.info, shape, buffers, !lse.ptr.is_null()) };
+    let params = unsafe { mla_fa2::pack(&plan.info, shape, buffers, !lse.is_null()) };
     // `attention_mla.cu:406-414` — the mask is a template parameter upstream
     // and an index here, which is why one call replaces the C++'s two.
     mla_fa2::fire(ctx, arm, causal, &params, mla_fa2::grid(&plan.info, mla_fa2::ARMS[arm]))?;
@@ -2670,12 +2583,14 @@ pub unsafe fn dispatch_attention_mla_bf16(
 
 /// The units `attn` compiles in fn-world.
 pub mod qkv_fused {
-    use kernels::keys;
     use super::bf16;
     use super::{Ctx, Launch, Refusal};
-    use kernels::routine::{Bank, Env, In, Out};
-    
-    use crate::jit::Abi;
+    use core::ffi::c_void;
+    use crate::jit::abi::Tensor;
+    use kernels::keys;
+    use kernels::routine::{Asks, Const, In, Out};
+    use kernels::{Bind, Fire};
+    use kernels_macros::routine;
 
     /// `attn::qkv_packed_qk_norm_rope_vnorm_write_kv_bf16` — the fused
     ///
@@ -2693,45 +2608,39 @@ pub mod qkv_fused {
     /// layer.head_dim`, which is arithmetic and belongs to the launcher that
     /// divides (F6). Both are below, and the pin at the end of this file
     /// asserts the seventeen entries the column now derives.
-    #[kernels_macros::routine]
+    #[routine]
     pub fn qkv_packed_qk_norm_rope_vnorm_write_kv_bf16(
-        ctx: &Ctx,
+        ctx: &Ctx<'_>,
         // `In(0)` -- the statement's one input, which is the whole of what
         // position was guessing correctly.
-        packed: In<0, bf16>,
-        q_out: Out<0, bf16>,
-        k_pages: Env<keys::KvKeys>,
-        v_pages: Env<keys::KvValues>,
+        packed: In<Tensor<bf16>>,
+        q_out: Out<Tensor<bf16>>,
         // `cx.weight(0)` and `cx.weight(1)` (`arms/attn.rs:413-414` -- the
         // citation said `:227-228` and the arm has moved twice since), the
         // POSITIONAL banks, so `Weight(n)` and not `WeightNamed`. Neither
         // mark consumes the `In` counter, which is what leaves the positional
         // pointers above them where the arm puts them.
-        q_weight: Bank<0, bf16>,
-        k_weight: Bank<1, bf16>,
-        positions: Env<keys::Positions>,
-        kv_page_indices: Env<keys::KvPageIndices>,
-        kv_page_indptr: Env<keys::KvPageIndptr>,
-        kv_last_page_lens: Env<keys::KvLastPageLens>,
-        // `plan.row_valid`, and it is `keys::RowValid` rather than a bare
-        // `Env<*const u8>` as of Kilimanjaro III Stage 3: the fact was read
-        // by hand at `arms/attn.rs` for as long as this signature existed and
-        // had no NAME, which is the whole of §1.5's *"reads an aggregate
-        // field with no key"*. `operand()` answers it off `cx.plan()`.
-        row_valid: Env<keys::RowValid>,
-        // `num_q_heads` STOOD HERE AND WAS THE ARM'S ARITHMETIC — F6.
-        // `qkv_packed_post_arm` read `cx.out_width(0)? / layer.head_dim`,
-        // which is `q_out`'s width over a fact this signature already takes,
-        // so the quotient is computed below and the parameter is gone. It was
-        // the LAST thing that arm did that this body could not, and the row
-        // reads `Bound::derived` now.
-        num_kv_heads: Env<keys::KvNumHeads>,
-        head_dim: Env<keys::KvHeadDim>,
-        page_size: Env<keys::KvPageSize>,
-        hnd_layout: Env<keys::KvHndLayout>,
-        theta: Env<keys::Theta>,
-        eps: Env<keys::RmsEps>,
-    ) -> Result<(), Refusal> {
+        q_weight: Const<Tensor<bf16>>,
+        k_weight: Const<Tensor<bf16>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: every one of these was `Env<keys::_>` before the
+    // four marks, and no builder ever began stating them. A `Const` mark
+    // PROMISES the statement carries the number at its slot in the params
+    // run; where nothing states one the promise is broken at the fire, not
+    // at the type. See `.wiki/migration.md` §11.20.
+    let num_kv_heads = ctx.ask::<i32, keys::KvNumHeads>()?;
+    let head_dim = ctx.ask::<i32, keys::KvHeadDim>()?;
+    let page_size = ctx.ask::<i32, keys::KvPageSize>()?;
+    let hnd_layout = ctx.ask::<bool, keys::KvHndLayout>()?;
+    let theta = ctx.ask::<f32, keys::Theta>()?;
+    let eps = ctx.ask::<f32, keys::RmsEps>()?;
+
+    let k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
+    let v_pages = ctx.ask::<*mut u8, keys::KvValues>()?;
+    let positions = ctx.ask::<*const i32, keys::Positions>()?;
+    let kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
+    let kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
+    let kv_last_page_lens = ctx.ask::<*const u32, keys::KvLastPageLens>()?;
+    let row_valid = ctx.ask::<*const u8, keys::RowValid>()?;
         /// `attn/qkv_fused.cuh` — the root these routines compile a symbol out of.
         /// The template-ids NVRTC is handed, spelled as it is handed them.
         ///
@@ -2755,25 +2664,20 @@ pub mod qkv_fused {
         // "out_width(0)" }` on the same `width <= 0`
         // (`kernels/src/routine.rs:1146`). Same kind, same shapes refused,
         // and the new word names the operand a reader would go and look at.
-        if **head_dim <= 0 {
+        if head_dim <= 0 {
             return Err(Refusal::Empty { what: "head_dim" });
         }
-        let num_q_heads = q_out.all("out_width(0)")?.width / **head_dim;
+        let num_q_heads = q_out.all("out_width(0)")?.width / head_dim;
         let heads = num_q_heads.unsigned_abs() + num_kv_heads.unsigned_abs();
         // SAFETY: `call()`'s contract -- every pointer bound here addresses
         // live device memory of the extent the kernel reads it as.
-        unsafe {
-            ctx.launch(
-                "attn/qkv_fused.cuh",
-                "::pie::attn::qkv_packed_qk_norm_rope_vnorm_write_kv<::pie::i32(256)>",
-                Launch::grid([packed.rows.unsigned_abs(), heads, 1], [PACKED_BLOCK, 1, 1]),
-                &[
-                    packed.ptr.arg(),
-                    q_out.ptr.arg(),
+        ctx.fire(Fire::at("attn/qkv_fused.cuh", "::pie::attn::qkv_packed_qk_norm_rope_vnorm_write_kv<::pie::i32(256)>").apply(Launch::grid([packed.rows.unsigned_abs(), heads, 1], [PACKED_BLOCK, 1, 1])), &[
+                    packed.arg(),
+                    q_out.arg(),
                     k_pages.arg(),
                     v_pages.arg(),
-                    q_weight.ptr.arg(),
-                    k_weight.ptr.arg(),
+                    q_weight.arg(),
+                    k_weight.arg(),
                     positions.arg(),
                     kv_page_indices.arg(),
                     kv_page_indptr.arg(),
@@ -2786,9 +2690,7 @@ pub mod qkv_fused {
                     hnd_layout.arg(),
                     theta.arg(),
                     eps.arg(),
-                ],
-            )
-        }
+                ])
     }
 
     /// The six warp instantiations, by `(head_dim, rope_table)`.
@@ -2814,7 +2716,7 @@ pub mod qkv_fused {
     /// be null.
     #[allow(clippy::fn_params_excessive_bools)]
     pub fn qkv_decode_fused_dispatch(
-        ctx: &Ctx,
+        ctx: &Ctx<'_>,
         packed: *const bf16,
         q_out: *mut bf16,
         k_pages: *mut bf16,
@@ -2837,8 +2739,7 @@ pub mod qkv_fused {
         page_size: i32,
         hnd_layout: bool,
         theta: f32,
-        eps: f32,
-    ) -> Result<(), Refusal> {
+        eps: f32) -> Result<(), Refusal> {
         /// `qkv_fused.cu:51` — `constexpr int WARP_BLOCK = 256;`, and it is NOT
         pub const WARP_BLOCK: u32 = 256;
 
@@ -2865,12 +2766,7 @@ pub mod qkv_fused {
             // SAFETY: `call()`'s contract -- every pointer bound here
             // addresses live device memory of the extent the kernel reads it
             // as.
-            return unsafe {
-                ctx.launch(
-                    "attn/qkv_fused.cuh",
-                    instantiation,
-                    Launch::grid([units.div_ceil(WARPS_PER_BLOCK), 1, 1], [WARP_BLOCK, 1, 1]),
-                    &[
+            return ctx.fire(Fire::at("attn/qkv_fused.cuh", instantiation).apply(Launch::grid([units.div_ceil(WARPS_PER_BLOCK), 1, 1], [WARP_BLOCK, 1, 1])), &[
                         packed.arg(),
                         q_out.arg(),
                         k_pages.arg(),
@@ -2893,18 +2789,9 @@ pub mod qkv_fused {
                         hnd_layout.arg(),
                         theta.arg(),
                         eps.arg(),
-                    ],
-                )
-            };
+                    ]);
         }
-
-        // SAFETY: as above.
-        unsafe {
-            ctx.launch(
-                "attn/qkv_fused.cuh",
-                block_instantiation(use_rope_table),
-                Launch::grid([num_requests.unsigned_abs(), heads, 1], [DECODE_BLOCK, 1, 1]),
-                &[
+        ctx.fire(Fire::at("attn/qkv_fused.cuh", block_instantiation(use_rope_table)).apply(Launch::grid([num_requests.unsigned_abs(), heads, 1], [DECODE_BLOCK, 1, 1])), &[
                     packed.arg(),
                     q_out.arg(),
                     k_pages.arg(),
@@ -2927,10 +2814,26 @@ pub mod qkv_fused {
                     hnd_layout.arg(),
                     theta.arg(),
                     eps.arg(),
-                ],
-            )
-        }
+                ])
     }
+
+    // AND THE SHARED BODY IS DECLARED, WITHOUT A COLUMN.
+    //
+    // `driver-cuda/src/bind/table.rs` names it in `NO_COLUMN_ON_PURPOSE` and
+    // `model/tests/kernels_table.rs` in `UNSTATED_ROWS`: a compiled body has
+    // an operand contract whether or not a text wants one, and this one has
+    // no statement -- the fused decode path calls it by path, with a null
+    // window. Its parameters are pointers rather than marks, so there is no
+    // column to derive and `untraced!` is the row that says so.
+    #[::linkme::distributed_slice(crate::ROUTINES)]
+    #[allow(non_upper_case_globals)]
+    static QKV_DECODE_FUSED_DISPATCH_ROUTINE: ::kernels::routine::Routine<crate::Plane> =
+        ::kernels::untraced!(
+            crate::Plane,
+            "qkv_decode_fused_dispatch",
+            qkv_decode_fused_dispatch,
+            namespace = "attn"
+        );
 
     /// `attn/qkv_fused.cu:160` — `qkv_decode_qk_norm_rope_write_kv_bf16`.
     ///
@@ -2947,88 +2850,78 @@ pub mod qkv_fused {
     /// `rope_table` to `In(3)`.
     ///
     /// **THAT ARM STAYS AND ITS PACKED TWIN'S DOES NOT**, over one parameter:
-    /// `q_out` is `Out<0, _>`: the region form states no result, so
+    /// `q_out` is `Out<0, *mut _>`: the region form states no result, so
     /// `TraceBuilder::push` stamps the enclosing region's buffer onto
     /// `Op::dest` and the lowerer pushes it into the operand run.
     #[allow(clippy::fn_params_excessive_bools)]
-    #[kernels_macros::routine]
+    #[routine]
     pub fn qkv_decode_qk_norm_rope_write_kv_bf16(
-        ctx: &Ctx,
+        ctx: &Ctx<'_>,
         // `In(0)` -- the statement's packed projection.
-        packed: In<0, bf16>,
-        q_out: Out<0, bf16>,
-        // `layer.k_pages` / `layer.v_pages`. `KvKeys` / `KvValues`, named and
-        // answered as of Stage 2: reason (b) no longer applies to these two.
-        k_pages: Env<keys::KvKeys>,
-        v_pages: Env<keys::KvValues>,
+        packed: In<Tensor<bf16>>,
+        q_out: Out<Tensor<bf16>>,
         // `cx.weight(0)` / `cx.weight(1)`, the POSITIONAL banks.
-        q_weight: Bank<0, bf16>,
-        k_weight: Bank<1, bf16>,
-        positions: Env<keys::Positions>,
-        rope_table: In<1, f32>,
-        kv_page_indices: Env<keys::KvPageIndices>,
-        kv_page_indptr: Env<keys::KvPageIndptr>,
-        kv_last_page_lens: Env<keys::KvLastPageLens>,
-        // The `_or_null` pair: a fire that appends no KV carries a null and the
-        // kernel branches on it, so the refusing spelling would decline it.
-        w_page: Env<keys::KvWritePageOrNull>,
-        w_off: Env<keys::KvWriteOffsetOrNull>,
-        // `w_page`/`w_off` STAY BARE ON THIS ROW ALONE. `keys::KvWritePage`
-        // and `keys::KvWriteOffset` bind them on `write_kv_explicit_bf16`,
-        // where the arm reads `cx.w_page_d()?` and the key's null-check is the
-        // same refusal. Here the arm reads `unwrap_or(null)` and the kernel
-        // branches on the null itself, so the key would refuse a valid fire.
-        row_valid: Env<keys::RowValid>,
-        // `num_q_heads` STOOD HERE. `qkv_decode_fused_arm` computed
-        // `(cx.in_width(0)? - 2 * num_kv_heads * head_dim) / head_dim` and
-        // divided by a `head_dim` it never checked -- a panic rather than a
-        // refusal on a layer view stating none. F6 puts the arithmetic in the
-        // launcher that has all three numbers, and the guard with it.
-        num_kv_heads: Env<keys::KvNumHeads>,
-        head_dim: Env<keys::KvHeadDim>,
-        page_size: Env<keys::KvPageSize>,
-        hnd_layout: Env<keys::KvHndLayout>,
-        theta: Env<keys::Theta>,
-        eps: Env<keys::RmsEps>,
-    ) -> Result<(), Refusal> {
+        q_weight: Const<Tensor<bf16>>,
+        k_weight: Const<Tensor<bf16>>,
+        rope_table: In<Tensor<f32>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
+    // builder ever began stating them. A `Const` mark PROMISES the statement
+    // carries the number at its slot in the params run; where nothing states
+    // one the promise breaks at the fire, not at the type. §11.20.
+    let num_kv_heads = ctx.ask::<i32, keys::KvNumHeads>()?;
+    let head_dim = ctx.ask::<i32, keys::KvHeadDim>()?;
+    let page_size = ctx.ask::<i32, keys::KvPageSize>()?;
+    let hnd_layout = ctx.ask::<bool, keys::KvHndLayout>()?;
+    let theta = ctx.ask::<f32, keys::Theta>()?;
+    let eps = ctx.ask::<f32, keys::RmsEps>()?;
+
+    let k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
+    let v_pages = ctx.ask::<*mut u8, keys::KvValues>()?;
+    let positions = ctx.ask::<*const i32, keys::Positions>()?;
+    let kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
+    let kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
+    let kv_last_page_lens = ctx.ask::<*const u32, keys::KvLastPageLens>()?;
+    let w_page = ctx.ask::<*const u32, keys::KvWritePageOrNull>()?;
+    let w_off = ctx.ask::<*const u32, keys::KvWriteOffsetOrNull>()?;
+    let row_valid = ctx.ask::<*const u8, keys::RowValid>()?;
         // The packed twin's guard, for the packed twin's reason, over the
         // subtraction this form does first: the packed row's width is q's
         // heads and both KV halves, so the query heads are what is left after
         // the two KV runs are taken off it. `cx.in_width(0)?` became
         // `packed.all("in_width(0)")?` -- `Refusal::Absent` either way, and
         // the word now names the slot rather than "an input's width".
-        if **head_dim <= 0 {
+        if head_dim <= 0 {
             return Err(Refusal::Empty { what: "head_dim" });
         }
         let packed_width = packed.all("in_width(0)")?.width;
-        let num_q_heads = (packed_width - 2 * **num_kv_heads * **head_dim) / **head_dim;
+        let num_q_heads = (packed_width - 2 * num_kv_heads * head_dim) / head_dim;
         qkv_decode_fused_dispatch(
             ctx,
             packed.ptr,
             q_out.ptr,
             k_pages.cast::<bf16>(),
             v_pages.cast::<bf16>(),
-            q_weight.ptr,
-            k_weight.ptr,
-            **positions,
+            q_weight.v,
+            k_weight.v,
+            positions,
             rope_table.ptr,
-            **kv_page_indices,
-            **kv_page_indptr,
-            **kv_last_page_lens,
-            **w_page,
-            **w_off,
-            **row_valid,
+            kv_page_indices,
+            kv_page_indptr,
+            kv_last_page_lens,
+            w_page,
+            w_off,
+            row_valid,
             core::ptr::null(),
             // The misnamed parameter's value, from the region rather than
             // from a `#[source(Rows)]` scalar. Same number, same slot.
             packed.rows,
             num_q_heads,
-            **num_kv_heads,
-            **head_dim,
-            **page_size,
-            **hnd_layout,
-            **theta,
-            **eps,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            hnd_layout,
+            theta,
+            eps,
         )
     }
 }
@@ -3036,11 +2929,12 @@ pub mod qkv_fused {
 /// `attn/dsv4_compress.cuh` — deepseek_v4's SECOND KV cache, and the eleven
 pub mod dsv4_compress {
     use super::bf16;
-    use kernels::keys;
-    use kernels::routine::{Env, In, Out};
     use super::{Ctx, Launch, Refusal};
-    
-    use crate::jit::Abi;
+    use crate::jit::abi::Tensor;
+    use kernels::keys;
+    use kernels::routine::{Asks, In, Out};
+    use kernels::{Bind, Fire};
+    use kernels_macros::routine;
 
     /// `attn/dsv4_compress.cuh` — the root these routines compile a symbol
     /// out of.
@@ -3066,49 +2960,51 @@ pub mod dsv4_compress {
     /// `state_score`, `ape`, `boundary_req`, `ratio` and `coff` have no
     /// operand to come from"*. Six of thirteen, so the marks below are the
     /// other seven and the reasons are the six.
-    #[kernels_macros::routine]
+    #[routine]
     pub fn dsv4_compress_gather_paged_bf16(
-        ctx: &Ctx,
-        state_kv: Env<*const bf16>,
-        state_score: Env<*const bf16>,
+        ctx: &Ctx<'_>,
+        state_kv: *const bf16,
+        state_score: *const bf16,
         // The absolute-position table, a load-time constant.
-        ape: Env<*const f32>,
-        boundary_pos: In<0, i32>,
-        boundary_req: In<1, i32>,
-        kv_page_indices: Env<keys::KvPageIndices>,
-        kv_page_indptr: Env<keys::KvPageIndptr>,
+        ape: *const f32,
+        boundary_pos: In<Tensor<i32>>,
+        boundary_req: In<Tensor<i32>>,
         // `Out(0)`, the statement's single `out`, declared
         // `[Dim::Tokens, Dim::Const(head_dim)] as BF16`.
-        out: Out<0, bf16>,
+        out: Out<Tensor<bf16>>,
+        // NOTHING SUPPLIES THESE FOUR AND THE SIGNATURE SAYS SO. The row
+        // declines the whole symbol over exactly this: *"`state_kv`,
+        // `state_score`, `ape`, `boundary_req`, `ratio` and `coff` have no
+        // operand to come from"*. They were bare `i32`s that no mark claimed;
+        // `#[unbound]` is that sentence said out loud, at the parameter.
+        #[unbound]
         num_entries: i32,
+        #[unbound]
         ratio: i32,
+        #[unbound]
         coff: i32,
+        #[unbound]
         page_size: i32,
     ) -> Result<(), Refusal> {
+        let kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
+        let kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
         let head_dim = out.all("out_width(0)")?.width;
         // SAFETY: `call()`'s contract -- every pointer bound here addresses
         // live device memory of the extent the kernel reads it as.
-        unsafe {
-            ctx.launch(
-                "attn/dsv4_compress.cuh",
-                "::pie::attn::dsv4_compress_gather_paged<::pie::bf16>",
-                route_rows(num_entries, head_dim),
-                &[
+        ctx.fire(Fire::at("attn/dsv4_compress.cuh", "::pie::attn::dsv4_compress_gather_paged<::pie::bf16>").apply(route_rows(num_entries, head_dim)), &[
                     state_kv.arg(),
                     state_score.arg(),
                     ape.arg(),
-                    boundary_pos.ptr.arg(),
-                    boundary_req.ptr.arg(),
+                    boundary_pos.arg(),
+                    boundary_req.arg(),
                     kv_page_indices.arg(),
                     kv_page_indptr.arg(),
-                    out.ptr.arg(),
+                    out.arg(),
                     head_dim.arg(),
                     ratio.arg(),
                     coff.arg(),
                     page_size.arg(),
-                ],
-            )
-        }
+                ])
     }
 
     /// Commit those entries to the compressed cache.
@@ -3119,61 +3015,57 @@ pub mod dsv4_compress {
     /// `boundary_pos`, and the kernel also reads `boundary_req` [...] and
     /// needs `head_dim` and `page_size` besides"*. So `In(0)` and `In(1)` are
     /// the two it names and everything else refuses.
-    #[kernels_macros::routine]
+    #[routine(whole)]
     pub fn dsv4_store_comp_entries_bf16(
-        ctx: &Ctx,
-        entries: In<0, bf16>,
-        comp_kv_pages: Env<*mut bf16>,
+        ctx: &Ctx<'_>,
+        entries: In<Tensor<bf16>>,
+        comp_kv_pages: *mut bf16,
         // `In(1)`, stated, and the statement does name it.
-        boundary_pos: In<1, i32>,
-        boundary_req: In<2, i32>,
-        kv_page_indices: Env<keys::KvPageIndices>,
-        kv_page_indptr: Env<keys::KvPageIndptr>,
+        boundary_pos: In<Tensor<i32>>,
+        boundary_req: In<Tensor<i32>>,
+        // NOTHING SUPPLIES THESE TWO, per the row above: the statement names
+        // `entries` and `boundary_pos` and nothing else.
+        #[unbound]
         num_entries: i32,
+        #[unbound]
         page_size: i32,
     ) -> Result<(), Refusal> {
+        let kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
+        let kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
         // The gather's guard, for the gather's reason -- `route_rows`'s
         // `.max(1)` hides a zero width from the empty-grid check. A view is
         // where that guard lives now, and it refuses in the same word.
         let head_dim = entries.all("in_width(0)")?.width;
         // SAFETY: `call()`'s contract -- every pointer bound here addresses
         // live device memory of the extent the kernel reads it as.
-        unsafe {
-            ctx.launch(
-                "attn/dsv4_compress.cuh",
-                "::pie::attn::dsv4_store_comp_entries<::pie::bf16>",
-                route_rows(num_entries, head_dim),
-                &[
-                    entries.ptr.arg(),
+        ctx.fire(Fire::at("attn/dsv4_compress.cuh", "::pie::attn::dsv4_store_comp_entries<::pie::bf16>").apply(route_rows(num_entries, head_dim)), &[
+                    entries.arg(),
                     comp_kv_pages.arg(),
-                    boundary_pos.ptr.arg(),
-                    boundary_req.ptr.arg(),
+                    boundary_pos.arg(),
+                    boundary_req.arg(),
                     kv_page_indices.arg(),
                     kv_page_indptr.arg(),
                     head_dim.arg(),
                     page_size.arg(),
-                ],
-            )
-        }
+                ])
     }
 }
 
 /// `attn/kv_paged.cuh` — the paged KV cache's appenders, its quantised
 pub mod kv_paged {
-    use kernels::keys;
+    use crate::attn::{KvDType, KvScheme, kv_dtype, kv_scheme};
 
-    use kernels::routine::{Env, In, Unbound};
-    use super::bf16;
     use crate::jit::abi::MaybeConst;
     use crate::jit::fp8_kind;
 
-    use super::{Ctx, Launch, scheme_byte};
-    
+    use super::{Ctx, Launch, Refusal, scheme_byte};
+    use super::bf16;
     use core::ffi::c_void;
-
-    use crate::jit::Abi;
-    use crate::attn::{KvDType, KvScheme, kv_dtype, kv_scheme};
-    use kernels::Refusal;
+    use crate::jit::abi::Tensor;
+    use kernels::keys;
+    use kernels::routine::{Asks, Const, In, Out};
+    use kernels::{Bind, Fire};
+    use kernels_macros::routine;
 
     /// `attn/kv_paged.cuh` — the root these routines compile a symbol out of.
         /// The template-ids NVRTC is handed, spelled as it is handed them.
@@ -3238,78 +3130,64 @@ pub mod kv_paged {
     /// The column is read off `write_kv_explicit_arm` (`arms/attn.rs:324-348`)
     /// and is nine tenths refusal: two `In`s, `Rows`, `KvPageSize`, and
     /// thirteen facts the fire holds and the table has no word for.
-    #[kernels_macros::routine]
+    #[routine]
     pub fn write_kv_explicit_bf16(
-        ctx: &Ctx,
-        k_curr: In<0, bf16>,
-        v_curr: In<1, bf16>,
-        k_pages: Env<keys::KvKeys>,
-        v_pages: Env<keys::KvValues>,
-        w_page: Env<keys::KvWritePage>,
-        w_off: Env<keys::KvWriteOffset>,
-        // `plan.row_valid` = `keys::RowValid` (`keys.rs` §1). This was
-        // reason (a) -- a fact with no word -- until Kilimanjaro III Stage 3
-        // minted one; `operand()` answers it off `cx.plan()`, so the arm
-        // stops reading it by hand.
-        row_valid: Env<keys::RowValid>,
-        // `layer.k_env_min` / `layer.k_env_max` -- the per-page bf16 envelope
-        // pair, two more `KvLayer` fields. Reason (b), `KvLayerField`, AND
-        // THE FIRST REFUSAL ON THIS ROW now that `row_valid` above it is
-        // answered: this is the pair `write_kv_to_pages_bf16_arm`'s doc names.
-        k_env_min: Env<keys::KvEnvMin>,
-        k_env_max: Env<keys::KvEnvMax>,
-        page_size: Env<keys::KvPageSize>,
-        num_kv_heads: Env<keys::KvNumHeads>,
-        head_dim: Env<keys::KvHeadDim>,
-        hnd: Env<keys::KvHndLayout>,
-        // `layer.has_envelopes` = `keys::KvHasEnvelopes`, `bool` because
-        // `operand()` mints an `ArgValue::Bool` for it (`table.rs:928`) and
-        // an `i32` key would refuse the day an arm is written.
-        has_envelopes: Env<keys::KvHasEnvelopes>,
-        is_native_bf16: Env<keys::KvNativeBf16>,
-    ) -> Result<(), Refusal> {
-        assert!(**is_native_bf16, "attn::write_kv_explicit_bf16 requires native bf16 KV cache");
+        ctx: &Ctx<'_>,
+        k_curr: In<Tensor<bf16>>,
+        v_curr: In<Tensor<bf16>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
+    // builder ever began stating them. A `Const` mark PROMISES the statement
+    // carries the number at its slot in the params run; where nothing states
+    // one the promise breaks at the fire, not at the type. §11.20.
+    let page_size = ctx.ask::<i32, keys::KvPageSize>()?;
+    let num_kv_heads = ctx.ask::<i32, keys::KvNumHeads>()?;
+    let head_dim = ctx.ask::<i32, keys::KvHeadDim>()?;
+    let hnd = ctx.ask::<bool, keys::KvHndLayout>()?;
+    let has_envelopes = ctx.ask::<bool, keys::KvHasEnvelopes>()?;
+    let is_native_bf16 = ctx.ask::<bool, keys::KvNativeBf16>()?;
+
+    let k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
+    let v_pages = ctx.ask::<*mut u8, keys::KvValues>()?;
+    let w_page = ctx.ask::<*const u32, keys::KvWritePage>()?;
+    let w_off = ctx.ask::<*const u32, keys::KvWriteOffset>()?;
+    let row_valid = ctx.ask::<*const u8, keys::RowValid>()?;
+    let k_env_min = ctx.ask::<*const u16, keys::KvEnvMin>()?;
+    let k_env_max = ctx.ask::<*const u16, keys::KvEnvMax>()?;
+        assert!(is_native_bf16, "attn::write_kv_explicit_bf16 requires native bf16 KV cache");
 
         let instantiation =
-            if **hnd { "::pie::attn::write_kv_explicit<\
+            if hnd { "::pie::attn::write_kv_explicit<\
                                 ::pie::true_type::value>" } else { "::pie::attn::write_kv_explicit<::pie::false_type::value>" };
         // SAFETY: `call()`'s contract -- every pointer bound here addresses
         // live device memory of the extent the kernel reads it as.
-        unsafe {
-            ctx.launch(
-                "attn/kv_paged.cuh",
-                instantiation,
-                Launch::per_row(k_curr.rows.unsigned_abs(), BLOCK),
-                &[
-                    k_curr.ptr.arg(),
-                    v_curr.ptr.arg(),
+        ctx.fire(Fire::at("attn/kv_paged.cuh", instantiation).apply(Launch::per_row(k_curr.rows.unsigned_abs(), BLOCK)), &[
+                    k_curr.arg(),
+                    v_curr.arg(),
                     k_pages.arg(),
                     v_pages.arg(),
                     w_page.arg(),
                     w_off.arg(),
-                    MaybeConst::new(**row_valid).arg(),
+                    MaybeConst::new(row_valid).arg(),
                     k_curr.rows.arg(),
                     page_size.arg(),
                     num_kv_heads.arg(),
                     head_dim.arg(),
-                ],
-            )?;
-        }
+                ])?;
 
-        if **has_envelopes && !**hnd {
+        if has_envelopes && !hnd {
             let _ = crate::layout::envelope_merge_written(
                 ctx,
-                Unbound { ptr: k_curr.ptr },
-                Unbound { ptr: **w_page },
-                Unbound { ptr: **w_off },
-                Unbound { ptr: MaybeConst::new(**row_valid) },
-                Unbound { ptr: (**k_env_min).cast::<bf16>().cast_mut() },
-                Unbound { ptr: (**k_env_max).cast::<bf16>().cast_mut() },
+                k_curr.ptr,
+                w_page,
+                w_off,
+                MaybeConst::new(row_valid),
+                (k_env_min).cast::<bf16>().cast_mut(),
+                (k_env_max).cast::<bf16>().cast_mut(),
                 k_curr.rows,
                 // `crate::layout` is not this family and its parameters are flat
                 // `i32`s, so the two facts are opened at the call.
-                **num_kv_heads,
-                **head_dim,
+                num_kv_heads,
+                head_dim,
             );
         }
         Ok(())
@@ -3327,63 +3205,60 @@ pub mod kv_paged {
     /// `split_qkv_bf16_devwin` arm (`arms/attn.rs:146`) is the evidence for
     /// that, since it is the other `_devwin` in the family and does exactly
     /// this.
-    #[kernels_macros::routine]
+    #[routine(whole)]
     pub fn write_kv_explicit_bf16_devwin(
-        ctx: &Ctx,
-        k_curr: In<0, bf16>,
-        v_curr: In<1, bf16>,
-        k_pages: Env<keys::KvKeys>,
-        v_pages: Env<keys::KvValues>,
-        w_page: Env<keys::KvWritePage>,
-        w_off: Env<keys::KvWriteOffset>,
-        win_d: Env<keys::PeelWindow>,
-        row_valid: Env<keys::RowValid>,
-        n_max: Env<keys::RowsTotal>,
-        page_size: Env<keys::KvPageSize>,
-        num_kv_heads: Env<keys::KvNumHeads>,
-        head_dim: Env<keys::KvHeadDim>,
-        hnd: Env<keys::KvHndLayout>,
-        has_envelopes: Env<keys::KvHasEnvelopes>,
-        is_native_bf16: Env<keys::KvNativeBf16>,
-    ) -> Result<(), Refusal> {
+        ctx: &Ctx<'_>,
+        k_curr: In<Tensor<bf16>>,
+        v_curr: In<Tensor<bf16>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
+    // builder ever began stating them. A `Const` mark PROMISES the statement
+    // carries the number at its slot in the params run; where nothing states
+    // one the promise breaks at the fire, not at the type. §11.20.
+    let page_size = ctx.ask::<i32, keys::KvPageSize>()?;
+    let num_kv_heads = ctx.ask::<i32, keys::KvNumHeads>()?;
+    let head_dim = ctx.ask::<i32, keys::KvHeadDim>()?;
+    let hnd = ctx.ask::<bool, keys::KvHndLayout>()?;
+    let has_envelopes = ctx.ask::<bool, keys::KvHasEnvelopes>()?;
+    let is_native_bf16 = ctx.ask::<bool, keys::KvNativeBf16>()?;
+
+    let k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
+    let v_pages = ctx.ask::<*mut u8, keys::KvValues>()?;
+    let w_page = ctx.ask::<*const u32, keys::KvWritePage>()?;
+    let w_off = ctx.ask::<*const u32, keys::KvWriteOffset>()?;
+    let win_d = ctx.ask::<*mut u32, keys::PeelWindow>()?;
+    let row_valid = ctx.ask::<*const u8, keys::RowValid>()?;
+    let n_max = ctx.ask::<i32, keys::RowsTotal>()?;
         assert!(
-            **is_native_bf16,
+            is_native_bf16,
             "attn::write_kv_explicit_bf16_devwin requires native bf16 KV cache"
         );
         assert!(
-            !**has_envelopes,
+            !has_envelopes,
             "attn::write_kv_explicit_bf16_devwin: envelope maintenance not yet \
              windowed — use the host-window form"
         );
 
-        let instantiation = if **hnd {
+        let instantiation = if hnd {
             "::pie::attn::write_kv_explicit_devwin<::pie::true_type::value>"
         } else {
             "::pie::attn::write_kv_explicit_devwin<::pie::false_type::value>"
         };
         // SAFETY: `call()`'s contract -- every pointer bound here addresses
         // live device memory of the extent the kernel reads it as.
-        unsafe {
-            ctx.launch(
-                "attn/kv_paged.cuh",
-                instantiation,
-                Launch::per_row((**n_max).unsigned_abs(), BLOCK),
-                &[
-                    k_curr.ptr.arg(),
-                    v_curr.ptr.arg(),
+        ctx.fire(Fire::at("attn/kv_paged.cuh", instantiation).apply(Launch::per_row((n_max).unsigned_abs(), BLOCK)), &[
+                    k_curr.arg(),
+                    v_curr.arg(),
                     k_pages.arg(),
                     v_pages.arg(),
                     w_page.arg(),
                     w_off.arg(),
-                    MaybeConst::new(**row_valid).arg(),
+                    MaybeConst::new(row_valid).arg(),
                     win_d.arg(),
                     n_max.arg(),
                     page_size.arg(),
                     num_kv_heads.arg(),
                     head_dim.arg(),
-                ],
-            )
-        }
+                ])
     }
 
     /// `attn::write_kv_to_pages_bf16` — the native-bf16 append,
@@ -3411,76 +3286,72 @@ pub mod kv_paged {
     ///
     /// The column is read off `write_kv_to_pages_bf16_arm`
     /// (`arms/attn.rs:246-273`).
-    #[kernels_macros::routine]
+    #[routine]
     pub fn write_kv_to_pages_bf16(
-        ctx: &Ctx,
-        k_curr: In<0, bf16>,
-        v_curr: In<1, bf16>,
-        k_pages: Env<keys::KvKeys>,
-        v_pages: Env<keys::KvValues>,
-        qo_indptr: Env<keys::QoIndptr>,
-        kv_page_indices: Env<keys::KvPageIndices>,
-        kv_page_indptr: Env<keys::KvPageIndptr>,
-        kv_last_page_lens: Env<keys::KvLastPageLens>,
-        row_valid: Env<keys::RowValid>,
-        // Two `KvLayer` fields: reason (b), and the FIRST refusal on this row
-        // now that the CSR above it is four keys deep.
-        k_env_min: Env<keys::KvEnvMin>,
-        k_env_max: Env<keys::KvEnvMax>,
-        num_requests: Env<keys::RequestCount>,
-        first_token: Env<keys::FirstToken>,
-        page_size: Env<keys::KvPageSize>,
-        num_kv_heads: Env<keys::KvNumHeads>,
-        head_dim: Env<keys::KvHeadDim>,
-        hnd: Env<keys::KvHndLayout>,
-        has_envelopes: Env<keys::KvHasEnvelopes>,
-    ) -> Result<(), Refusal> {
-        let launch_tokens = k_curr.rows - **first_token;
+        ctx: &Ctx<'_>,
+        k_curr: In<Tensor<bf16>>,
+        v_curr: In<Tensor<bf16>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: the KV geometry was `Env<keys::Kv_>` before the
+    // four marks and no builder ever began stating it. `Boot::route`
+    // resolves `attn::write_kv_to_pages` to this routine from the boot's KV
+    // dtype, and the STATED name is an `untraced!` declaration with no
+    // params at all -- so nothing could have stated these even in
+    // principle without the text naming a writer it is not allowed to pick.
+    let page_size = ctx.ask::<i32, keys::KvPageSize>()?;
+    let num_kv_heads = ctx.ask::<i32, keys::KvNumHeads>()?;
+    let head_dim = ctx.ask::<i32, keys::KvHeadDim>()?;
+    let hnd = ctx.ask::<bool, keys::KvHndLayout>()?;
+    let has_envelopes = ctx.ask::<bool, keys::KvHasEnvelopes>()?;
+    let k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
+    let v_pages = ctx.ask::<*mut u8, keys::KvValues>()?;
+    let qo_indptr = ctx.ask::<*const u32, keys::QoIndptr>()?;
+    let kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
+    let kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
+    let kv_last_page_lens = ctx.ask::<*const u32, keys::KvLastPageLens>()?;
+    let row_valid = ctx.ask::<*const u8, keys::RowValid>()?;
+    let k_env_min = ctx.ask::<*const u16, keys::KvEnvMin>()?;
+    let k_env_max = ctx.ask::<*const u16, keys::KvEnvMax>()?;
+    let num_requests = ctx.ask::<i32, keys::RequestCount>()?;
+    let first_token = ctx.ask::<i32, keys::FirstToken>()?;
+        let launch_tokens = k_curr.rows - first_token;
 
-        let instantiation = if **hnd { "::pie::attn::write_kv<\
+        let instantiation = if hnd { "::pie::attn::write_kv<\
                                                 ::pie::true_type::value>" } else { "::pie::attn::write_kv<::pie::false_type::value>" };
         // SAFETY: `call()`'s contract -- every pointer bound here addresses
         // live device memory of the extent the kernel reads it as.
-        unsafe {
-            ctx.launch(
-                "attn/kv_paged.cuh",
-                instantiation,
-                Launch::per_row(launch_tokens.unsigned_abs(), BLOCK),
-                &[
-                    k_curr.ptr.arg(),
-                    v_curr.ptr.arg(),
+        ctx.fire(Fire::at("attn/kv_paged.cuh", instantiation).apply(Launch::per_row(launch_tokens.unsigned_abs(), BLOCK)), &[
+                    k_curr.arg(),
+                    v_curr.arg(),
                     k_pages.arg(),
                     v_pages.arg(),
                     qo_indptr.arg(),
                     kv_page_indices.arg(),
                     kv_page_indptr.arg(),
                     kv_last_page_lens.arg(),
-                    MaybeConst::new(**row_valid).arg(),
+                    MaybeConst::new(row_valid).arg(),
                     MaybeConst::<u32>::none().arg(),
                     num_requests.arg(),
                     page_size.arg(),
                     num_kv_heads.arg(),
                     head_dim.arg(),
                     first_token.arg(),
-                ],
-            )?;
-        }
+                ])?;
 
-        if **has_envelopes && !**hnd && k_curr.rows > 0 {
+        if has_envelopes && !hnd && k_curr.rows > 0 {
             let _ = crate::layout::envelope_update_appended(
                 ctx,
-                Unbound { ptr: k_pages.cast::<bf16>().cast_const() },
-                Unbound { ptr: **qo_indptr },
-                Unbound { ptr: **kv_page_indices },
-                Unbound { ptr: **kv_page_indptr },
-                Unbound { ptr: **kv_last_page_lens },
-                Unbound { ptr: (**k_env_min).cast::<bf16>().cast_mut() },
-                Unbound { ptr: (**k_env_max).cast::<bf16>().cast_mut() },
-                **num_requests,
-                max_touched_pages(k_curr.rows, **num_requests, **page_size),
-                **page_size,
-                **num_kv_heads,
-                **head_dim,
+                k_pages.cast::<bf16>().cast_const(),
+                qo_indptr,
+                kv_page_indices,
+                kv_page_indptr,
+                kv_last_page_lens,
+                (k_env_min).cast::<bf16>().cast_mut(),
+                (k_env_max).cast::<bf16>().cast_mut(),
+                num_requests,
+                max_touched_pages(k_curr.rows, num_requests, page_size),
+                page_size,
+                num_kv_heads,
+                head_dim,
             );
         }
         Ok(())
@@ -3524,43 +3395,40 @@ pub mod kv_paged {
     /// in the driver arm only because this signature did not take the fact.
     /// It does now. `is_native_bf16` on [`write_kv_explicit_bf16`] is the
     /// same shape: taken, asserted on, never passed to a kernel.
-    #[kernels_macros::routine]
+    #[routine]
     pub fn write_kv_to_pages_quantised(
-        ctx: &Ctx,
-        k_curr: In<0, bf16>,
-        v_curr: In<1, bf16>,
-        first_token: Env<keys::FirstToken>,
-        // `KvKeys` / `KvValues`, reason (b), witnessed at
-        // `arms/attn.rs:556-557`.
-        k_pages: Env<keys::KvKeys>,
-        v_pages: Env<keys::KvValues>,
-        // Same TYPE as a workspace buffer, a different fact, and that is why
-        // the sweep that named `attn/fa2/`'s stopped here until these two got
-        // their own keys.
-        k_scales: Env<keys::KvKeyScales>,
-        v_scales: Env<keys::KvValueScales>,
-        // Four `plan()` CSRs, ALL FOUR spelled from their keys now
-        // (`arms/attn.rs`'s bindings): `qo_indptr` was the odd one out under
-        // reason (a) and `keys::QoIndptr` ended that.
-        qo_indptr: Env<keys::QoIndptr>,
-        kv_page_indices: Env<keys::KvPageIndices>,
-        kv_page_indptr: Env<keys::KvPageIndptr>,
-        kv_last_page_lens: Env<keys::KvLastPageLens>,
-        num_requests: Env<keys::RequestCount>,
-        page_size: Env<keys::KvPageSize>,
-        num_kv_heads: Env<keys::KvNumHeads>,
-        head_dim: Env<keys::KvHeadDim>,
-        block_size: Env<keys::KvBlockSize>,
-        scheme: Env<keys::KvSchemeByte>,
-        storage_dtype: Env<keys::KvStorageDtype>,
-    ) -> Result<(), Refusal> {
-        if **first_token != 0 {
+        ctx: &Ctx<'_>,
+        k_curr: In<Tensor<bf16>>,
+        v_curr: In<Tensor<bf16>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: the KV geometry was `Env<keys::Kv_>` before the
+    // four marks and no builder ever began stating it. `Boot::route`
+    // resolves `attn::write_kv_to_pages` to this routine from the boot's KV
+    // dtype, and the STATED name is an `untraced!` declaration with no
+    // params at all -- so nothing could have stated these even in
+    // principle without the text naming a writer it is not allowed to pick.
+    let page_size = ctx.ask::<i32, keys::KvPageSize>()?;
+    let num_kv_heads = ctx.ask::<i32, keys::KvNumHeads>()?;
+    let head_dim = ctx.ask::<i32, keys::KvHeadDim>()?;
+    let block_size = ctx.ask::<i32, keys::KvBlockSize>()?;
+    let scheme = ctx.ask::<i32, keys::KvSchemeByte>()?;
+    let storage_dtype = ctx.ask::<i32, keys::KvStorageDtype>()?;
+    let first_token = ctx.ask::<i32, keys::FirstToken>()?;
+    let k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
+    let v_pages = ctx.ask::<*mut u8, keys::KvValues>()?;
+    let k_scales = ctx.ask::<*mut core::ffi::c_void, keys::KvKeyScales>()?;
+    let v_scales = ctx.ask::<*mut core::ffi::c_void, keys::KvValueScales>()?;
+    let qo_indptr = ctx.ask::<*const u32, keys::QoIndptr>()?;
+    let kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
+    let kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
+    let kv_last_page_lens = ctx.ask::<*const u32, keys::KvLastPageLens>()?;
+    let num_requests = ctx.ask::<i32, keys::RequestCount>()?;
+        if first_token != 0 {
             return Err(Refusal::Absent {
                 what: "a quantised appender that skips the first tokens",
             });
         }
-        let scheme = kv_scheme(scheme_byte(**scheme));
-        let storage_dtype = kv_dtype(scheme_byte(**storage_dtype));
+        let scheme = kv_scheme(scheme_byte(scheme));
+        let storage_dtype = kv_dtype(scheme_byte(storage_dtype));
         let h_kv = num_kv_heads;
         let d = head_dim;
         let tokens = k_curr.rows.unsigned_abs();
@@ -3570,14 +3438,9 @@ pub mod kv_paged {
             // SAFETY, in all three arms: `call()`'s contract -- every pointer
             // bound here addresses live device memory of the extent the
             // kernel reads it as.
-            Some(KvScheme::Fp8PerTensor) => unsafe {
-                ctx.launch(
-                    "attn/kv_paged.cuh",
-                    "::pie::attn::write_kv_fp8_per_tensor",
-                    Launch::per_row(tokens, BLOCK),
-                    &[
-                        k_curr.ptr.arg(),
-                        v_curr.ptr.arg(),
+            Some(KvScheme::Fp8PerTensor) => ctx.fire(Fire::at("attn/kv_paged.cuh", "::pie::attn::write_kv_fp8_per_tensor").apply(Launch::per_row(tokens, BLOCK)), &[
+                        k_curr.arg(),
+                        v_curr.arg(),
                         k_pages.arg(),
                         v_pages.arg(),
                         qo_indptr.arg(),
@@ -3589,9 +3452,7 @@ pub mod kv_paged {
                         h_kv.arg(),
                         d.arg(),
                         fp8_kind_of(storage_dtype).arg(),
-                    ],
-                )
-            },
+                    ]),
 
             Some(KvScheme::Int8PerTokenHead | KvScheme::Fp8PerTokenHead) => {
                 let instantiation = if scheme == kv_scheme::of(KvScheme::Fp8PerTokenHead) {
@@ -3602,14 +3463,9 @@ pub mod kv_paged {
                 // One `float` per warp, twice: the per-token-per-head scale
                 // is a max over the head, reduced warp-wise for k and for v.
                 let smem = 2 * (BLOCK / 32) * (core::mem::size_of::<f32>() as u32);
-                unsafe {
-                    ctx.launch(
-                        "attn/kv_paged.cuh",
-                        instantiation,
-                        Launch::grid([tokens, heads, 1], [BLOCK, 1, 1]).smem(smem),
-                        &[
-                            k_curr.ptr.arg(),
-                            v_curr.ptr.arg(),
+                ctx.fire(Fire::at("attn/kv_paged.cuh", instantiation).apply(Launch::grid([tokens, heads, 1], [BLOCK, 1, 1]).smem(smem)), &[
+                            k_curr.arg(),
+                            v_curr.arg(),
                             k_pages.arg(),
                             v_pages.arg(),
                             k_scales.cast::<f32>().arg(),
@@ -3622,22 +3478,15 @@ pub mod kv_paged {
                             page_size.arg(),
                             h_kv.arg(),
                             d.arg(),
-                        ],
-                    )
-                }
+                        ])
             }
 
             Some(KvScheme::Fp4Block) => {
-                let block_size = fp4_block_size(**block_size);
+                let block_size = fp4_block_size(block_size);
                 let blocks = d.div_euclid(block_size) + i32::from(d.rem_euclid(block_size) != 0);
-                unsafe {
-                    ctx.launch(
-                        "attn/kv_paged.cuh",
-                        "::pie::attn::write_kv_fp4_block",
-                        Launch::grid([tokens, heads, blocks.unsigned_abs()], [32, 1, 1]),
-                        &[
-                            k_curr.ptr.arg(),
-                            v_curr.ptr.arg(),
+                ctx.fire(Fire::at("attn/kv_paged.cuh", "::pie::attn::write_kv_fp4_block").apply(Launch::grid([tokens, heads, blocks.unsigned_abs()], [32, 1, 1])), &[
+                            k_curr.arg(),
+                            v_curr.arg(),
                             k_pages.arg(),
                             v_pages.arg(),
                             k_scales.cast::<f32>().arg(),
@@ -3651,9 +3500,7 @@ pub mod kv_paged {
                             h_kv.arg(),
                             d.arg(),
                             block_size.arg(),
-                        ],
-                    )
-                }
+                        ])
             }
 
             Some(KvScheme::Native) => {
@@ -3679,7 +3526,7 @@ pub mod kv_paged {
     /// has it in hand (`driver-cuda/src/bind/arms/attn.rs`,
     /// `write_kv_to_pages_quantised_arm`).
     ///
-    /// The stated symbol keeps its `driver_bound!` row: `kernels_cuda::sigs()`
+    /// The stated symbol keeps its `untraced!` row: `kernels_cuda::sigs()`
     /// is what `check_plan` measures a model text against, and every live text
     /// states this name through `model-dsl/src/cuda/base.rs:696`.
     #[must_use]
@@ -3696,6 +3543,28 @@ pub mod kv_paged {
         let _ = (write_kv_to_pages_bf16, write_kv_to_pages_quantised);
     }
 
+    // AND THE NAME ITSELF IS DECLARED, because a model text states it.
+    //
+    // `check_plan` measures a text against `kernels_cuda::sigs()`, and every
+    // live text names this symbol through `model-dsl/src/cuda/base.rs`. The
+    // MAP above answers which of the two real launchers serves a deployment,
+    // and the driver asks once at model load -- so there is a symbol with no
+    // `fn` behind it, which is exactly what a `untraced` row is for.
+    //
+    // It used to be a hand-written `untraced!(write_kv_to_pages)` line in
+    // a `ROUTINES` list. The list is a distributed slice now and rows register
+    // by existing, so the declaration comes back as one: a row that answers
+    // `Refusal::Absent` if anything ever tries to fire it by string.
+    #[::linkme::distributed_slice(crate::ROUTINES)]
+    #[allow(non_upper_case_globals)]
+    static WRITE_KV_TO_PAGES_ROUTINE: ::kernels::routine::Routine<crate::Plane> =
+        ::kernels::untraced!(
+            crate::Plane,
+            "write_kv_to_pages",
+            write_kv_to_pages_bf16,
+            namespace = "attn"
+        );
+
     /// The fp8-per-tensor arm, called by name from
     ///
     /// What the caller must guarantee, as `call()` states it:
@@ -3703,7 +3572,7 @@ pub mod kv_paged {
     /// and the layer's bf16 mirror planes must be sized for them.
     #[allow(clippy::too_many_arguments)]
     pub fn dequant_fp8_per_tensor_pages_active(
-        ctx: &Ctx,
+        ctx: &Ctx<'_>,
         k_pages: *mut u8,
         v_pages: *mut u8,
         k_bf16_pages: *mut c_void,
@@ -3715,8 +3584,7 @@ pub mod kv_paged {
         storage_dtype: kv_dtype,
         is_native_bf16: bool,
         kv_page_indices: *const u32,
-        num_pages_in_batch: i32,
-    ) -> Result<(), Refusal> {
+        num_pages_in_batch: i32) -> Result<(), Refusal> {
         if is_native_bf16 {
             return Err(Refusal::Absent { what: "quantised pages on a bf16 layer" });
         }
@@ -3728,12 +3596,7 @@ pub mod kv_paged {
             active_geometry(page_size, num_kv_heads, head_dim, num_pages_in_batch);
         // SAFETY: `call()`'s contract -- every pointer bound here addresses
         // live device memory of the extent the kernel reads it as.
-        unsafe {
-            ctx.launch(
-                "attn/kv_paged.cuh",
-                "::pie::attn::dequant_fp8_pages_active",
-                launch,
-                &[
+        ctx.fire(Fire::at("attn/kv_paged.cuh", "::pie::attn::dequant_fp8_pages_active").apply(launch), &[
                     k_pages.cast::<u8>().cast_const().arg(),
                     v_pages.cast::<u8>().cast_const().arg(),
                     k_bf16_pages.cast::<bf16>().arg(),
@@ -3742,9 +3605,7 @@ pub mod kv_paged {
                     logical_n.arg(),
                     page_elems.arg(),
                     fp8_kind_of(storage_dtype).arg(),
-                ],
-            )
-        }
+                ])
     }
 
     /// The element count an active-page pass covers, and the grid that
@@ -3771,127 +3632,104 @@ pub mod kv_paged {
     /// written that answer around the old `Err` -- `arms/fa2.rs`'s
     /// `dequant_prelude` with `let _ =`, `dequant_kv_active_arm` with an
     /// `is_native_bf16` branch -- so no caller ever wanted the decline.
-    #[kernels_macros::routine]
+    #[routine]
     #[allow(clippy::too_many_arguments)]
     pub fn dequant_kv_cache_layer_to_bf16_active(
-        ctx: &Ctx,
-        k_pages: Env<keys::KvKeys>,
-        v_pages: Env<keys::KvValues>,
-        k_scales: Env<keys::KvKeyScales>,
-        v_scales: Env<keys::KvValueScales>,
-        // The mirrors this pass WRITES. Bound as they stand, null included:
-        // `keys::KvNativeBf16` on the same row announces the layer that has
-        // none, so a refusal here would contradict a fact the row carries.
-        k_bf16_pages: Env<keys::KvBf16Keys>,
-        v_bf16_pages: Env<keys::KvBf16Values>,
-        page_size: Env<keys::KvPageSize>,
-        num_kv_heads: Env<keys::KvNumHeads>,
-        head_dim: Env<keys::KvHeadDim>,
-        block_size: Env<keys::KvBlockSize>,
-        scheme: Env<keys::KvSchemeByte>,
-        storage_dtype: Env<keys::KvStorageDtype>,
-        is_native_bf16: Env<keys::KvNativeBf16>,
-        kv_page_indices: Env<keys::KvPageIndices>,
-        // The fire-wide page BOUND, which is what this pass covers. Not
-        // `xqa`'s `max_pages_per_seq`, a per-request maximum the same table
-        // happens to be able to approximate.
-        num_pages_in_batch: Env<keys::KvPagesInBatch>,
-    ) -> Result<(), Refusal> {
-        if **is_native_bf16 {
+        ctx: &Ctx<'_>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
+    // builder ever began stating them. A `Const` mark PROMISES the statement
+    // carries the number at its slot in the params run; where nothing states
+    // one the promise breaks at the fire, not at the type. §11.20.
+    let page_size = ctx.ask::<i32, keys::KvPageSize>()?;
+    let num_kv_heads = ctx.ask::<i32, keys::KvNumHeads>()?;
+    let head_dim = ctx.ask::<i32, keys::KvHeadDim>()?;
+    let block_size = ctx.ask::<i32, keys::KvBlockSize>()?;
+    let scheme = ctx.ask::<i32, keys::KvSchemeByte>()?;
+    let storage_dtype = ctx.ask::<i32, keys::KvStorageDtype>()?;
+    let is_native_bf16 = ctx.ask::<bool, keys::KvNativeBf16>()?;
+
+    let k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
+    let v_pages = ctx.ask::<*mut u8, keys::KvValues>()?;
+    let k_scales = ctx.ask::<*mut core::ffi::c_void, keys::KvKeyScales>()?;
+    let v_scales = ctx.ask::<*mut core::ffi::c_void, keys::KvValueScales>()?;
+    let k_bf16_pages = ctx.ask::<*mut core::ffi::c_void, keys::KvBf16Keys>()?;
+    let v_bf16_pages = ctx.ask::<*mut core::ffi::c_void, keys::KvBf16Values>()?;
+    let kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
+    let num_pages_in_batch = ctx.ask::<i32, keys::KvPagesInBatch>()?;
+        if is_native_bf16 {
             return Ok(());
         }
-        let scheme = kv_scheme(scheme_byte(**scheme));
-        let storage_dtype = kv_dtype(scheme_byte(**storage_dtype));
+        let scheme = kv_scheme(scheme_byte(scheme));
+        let storage_dtype = kv_dtype(scheme_byte(storage_dtype));
         let (logical_n, _page_elems, launch) = active_geometry(
-            **page_size,
-            **num_kv_heads,
-            **head_dim,
-            **num_pages_in_batch,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            num_pages_in_batch,
         );
 
         match scheme.scheme() {
             Some(KvScheme::Fp8PerTensor) => dequant_fp8_per_tensor_pages_active(
                 ctx,
-                **k_pages,
-                **v_pages,
-                **k_bf16_pages,
-                **v_bf16_pages,
-                **page_size,
-                **num_kv_heads,
-                **head_dim,
+                k_pages,
+                v_pages,
+                k_bf16_pages,
+                v_bf16_pages,
+                page_size,
+                num_kv_heads,
+                head_dim,
                 scheme,
                 storage_dtype,
-                **is_native_bf16,
-                **kv_page_indices,
-                **num_pages_in_batch,
+                is_native_bf16,
+                kv_page_indices,
+                num_pages_in_batch,
             ),
 
             // SAFETY, in all three arms: `call()`'s contract -- every pointer
             // bound here addresses live device memory of the extent the
             // kernel reads it as.
-            Some(KvScheme::Fp8PerTokenHead) => unsafe {
-                ctx.launch(
-                    "attn/kv_paged.cuh",
-                    "::pie::attn::dequant_fp8_per_token_head_pages_active<::pie::bf16>",
-                    launch,
-                    &[
-                        (**k_pages).cast::<u8>().cast_const().arg(),
-                        (**v_pages).cast::<u8>().cast_const().arg(),
-                        (**k_scales).cast::<f32>().cast_const().arg(),
-                        (**v_scales).cast::<f32>().cast_const().arg(),
-                        (**k_bf16_pages).cast::<bf16>().arg(),
-                        (**v_bf16_pages).cast::<bf16>().arg(),
-                        (**kv_page_indices).arg(),
+            Some(KvScheme::Fp8PerTokenHead) => ctx.fire(Fire::at("attn/kv_paged.cuh", "::pie::attn::dequant_fp8_per_token_head_pages_active<::pie::bf16>").apply(launch), &[
+                        (k_pages).cast::<u8>().cast_const().arg(),
+                        (v_pages).cast::<u8>().cast_const().arg(),
+                        (k_scales).cast::<f32>().cast_const().arg(),
+                        (v_scales).cast::<f32>().cast_const().arg(),
+                        (k_bf16_pages).cast::<bf16>().arg(),
+                        (v_bf16_pages).cast::<bf16>().arg(),
+                        (kv_page_indices).arg(),
                         logical_n.arg(),
                         page_size.arg(),
                         num_kv_heads.arg(),
                         head_dim.arg(),
-                    ],
-                )
-            },
+                    ]),
 
-            Some(KvScheme::Int8PerTokenHead) => unsafe {
-                ctx.launch(
-                    "attn/kv_paged.cuh",
-                    "::pie::attn::dequant_int8_per_token_head_pages_active<::pie::bf16>",
-                    launch,
-                    &[
-                        (**k_pages).cast::<i8>().cast_const().arg(),
-                        (**v_pages).cast::<i8>().cast_const().arg(),
-                        (**k_scales).cast::<f32>().cast_const().arg(),
-                        (**v_scales).cast::<f32>().cast_const().arg(),
-                        (**k_bf16_pages).cast::<bf16>().arg(),
-                        (**v_bf16_pages).cast::<bf16>().arg(),
-                        (**kv_page_indices).arg(),
+            Some(KvScheme::Int8PerTokenHead) => ctx.fire(Fire::at("attn/kv_paged.cuh", "::pie::attn::dequant_int8_per_token_head_pages_active<::pie::bf16>").apply(launch), &[
+                        (k_pages).cast::<i8>().cast_const().arg(),
+                        (v_pages).cast::<i8>().cast_const().arg(),
+                        (k_scales).cast::<f32>().cast_const().arg(),
+                        (v_scales).cast::<f32>().cast_const().arg(),
+                        (k_bf16_pages).cast::<bf16>().arg(),
+                        (v_bf16_pages).cast::<bf16>().arg(),
+                        (kv_page_indices).arg(),
                         logical_n.arg(),
                         page_size.arg(),
                         num_kv_heads.arg(),
                         head_dim.arg(),
-                    ],
-                )
-            },
+                    ]),
 
-            Some(KvScheme::Fp4Block) => unsafe {
-                ctx.launch(
-                    "attn/kv_paged.cuh",
-                    "::pie::attn::dequant_fp4_pages_active<::pie::bf16>",
-                    launch,
-                    &[
-                        (**k_pages).cast::<u8>().cast_const().arg(),
-                        (**v_pages).cast::<u8>().cast_const().arg(),
-                        (**k_scales).cast::<f32>().cast_const().arg(),
-                        (**v_scales).cast::<f32>().cast_const().arg(),
-                        (**k_bf16_pages).cast::<bf16>().arg(),
-                        (**v_bf16_pages).cast::<bf16>().arg(),
-                        (**kv_page_indices).arg(),
+            Some(KvScheme::Fp4Block) => ctx.fire(Fire::at("attn/kv_paged.cuh", "::pie::attn::dequant_fp4_pages_active<::pie::bf16>").apply(launch), &[
+                        (k_pages).cast::<u8>().cast_const().arg(),
+                        (v_pages).cast::<u8>().cast_const().arg(),
+                        (k_scales).cast::<f32>().cast_const().arg(),
+                        (v_scales).cast::<f32>().cast_const().arg(),
+                        (k_bf16_pages).cast::<bf16>().arg(),
+                        (v_bf16_pages).cast::<bf16>().arg(),
+                        (kv_page_indices).arg(),
                         logical_n.arg(),
                         page_size.arg(),
                         num_kv_heads.arg(),
                         head_dim.arg(),
-                        fp4_block_size(**block_size).arg(),
-                    ],
-                )
-            },
+                        fp4_block_size(block_size).arg(),
+                    ]),
 
             Some(KvScheme::Native) => {
                 Err(Refusal::Absent { what: "a quantised dequant for Native storage" })
@@ -3956,11 +3794,10 @@ const fn per_head(rows: u32, heads: u32) -> Launch {
 /// `Routine::args` in hand (`bind/table.rs:1062`), converting the `I32` to a
 /// `Usize` and refusing rather than wrapping where that would lose
 /// information.
-#[kernels_macros::routine]
+#[routine]
 pub fn lse_log2_to_ln(
-    ctx: &Ctx,
-    lse: Out<0, f32>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    lse: InOut<Tensor<f32>>) -> Result<(), Refusal> {
     // `Region::elements()` IS this product, and it is safe there for the
     // reason it was guarded here: a view cannot have a zero width, so the
     // multiply cannot collapse an unstated pitch into a stated zero.
@@ -3971,14 +3808,7 @@ pub fn lse_log2_to_ln(
     let n = elems as usize;
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "attn/attn_sink.cuh",
-            "::pie::attn::lse_log2_to_ln<::pie::attn::f32>",
-            elementwise(elems),
-            &[lse.ptr.arg(), n.arg()],
-        )
-    }
+    ctx.fire(Fire::at("attn/attn_sink.cuh", "::pie::attn::lse_log2_to_ln<::pie::attn::f32>").apply(elementwise(elems)), &[lse.arg(), n.arg()])
 }
 
 /// `attn::attention_sink_rescale_bf16` — gpt-oss's per-head sink correction,
@@ -4002,42 +3832,35 @@ pub fn lse_log2_to_ln(
 /// condition that guard was added for. Were the column ever to gain a second
 /// `In(_)`, the shift would stop and this binding would silently change; the
 /// `lse` parameter below says so at the parameter.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn attention_sink_rescale<T>(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     // `Out(0)`.
-    o: Out<0, T>,
-    lse: In<1, f32>,
-    sinks: Bank<0, T>,
-    num_q_heads: Env<keys::NumQHeads>,
-    head_dim: Env<keys::HeadDim>,
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
-{
+    o: InOut<Tensor<T>>,
+    lse: In<Tensor<f32>>,
+    sinks: Const<Tensor<T>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: every one of these was `Env<keys::_>` before the
+    // four marks, and no builder ever began stating them. A `Const` mark
+    // PROMISES the statement carries the number at its slot in the params
+    // run; where nothing states one the promise is broken at the fire, not
+    // at the type. See `.wiki/migration.md` §11.20.
+    let num_q_heads = ctx.ask::<i32, keys::NumQHeads>()?;
+    let head_dim = ctx.ask::<i32, keys::HeadDim>()?;
+
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "attn/attn_sink.cuh",
-            &format!("::pie::attn::attn_sink_rescale<{}>", T::CPP),
-            per_head_elementwise(
+    ctx.fire(Fire::at("attn/attn_sink.cuh", crate::jit::symbol(&format!("::pie::attn::attn_sink_rescale<{}>", T::CPP))).apply(per_head_elementwise(
                 o.rows.unsigned_abs(),
                 num_q_heads.unsigned_abs(),
                 head_dim.unsigned_abs(),
-            ),
-            &[
-                o.ptr.arg(),
-                lse.ptr.arg(),
-                sinks.ptr.arg(),
+            )), &[
+                o.arg(),
+                lse.arg(),
+                sinks.arg(),
                 o.rows.arg(),
                 num_q_heads.arg(),
                 head_dim.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `attn::split_qkv_bf16_devwin` — the packed activation cut into Q, K and V,
@@ -4047,16 +3870,15 @@ where
 /// buffer pointers must be BASE pointers — the kernel windows them itself
 /// from `win`, so a pre-windowed pointer is windowed twice. The binder
 /// guarantees it by the `_devwin` suffix; a hand caller must not.
-#[kernels_macros::routine]
+#[routine]
 pub fn split_qkv_bf16_devwin(
-    ctx: &Ctx,
-    packed: In<0, bf16>,
-    q_out: Out<0, bf16>,
-    k_out: Out<1, bf16>,
-    v_out: Out<2, bf16>,
-    win: Env<keys::PeelWindow>,
-    n_max: Env<keys::RowsTotal>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    packed: In<Tensor<bf16>>,
+    q_out: Out<Tensor<bf16>>,
+    k_out: Out<Tensor<bf16>>,
+    v_out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let win = ctx.ask::<*mut u32, keys::PeelWindow>()?;
+    let n_max = ctx.ask::<i32, keys::RowsTotal>()?;
     /// `split_packed.cu:30` — `constexpr int BLOCK = 256;`.
     pub const SPLIT_BLOCK: u32 = 256;
 
@@ -4070,22 +3892,15 @@ pub fn split_qkv_bf16_devwin(
     let xblocks = max_dim.unsigned_abs().div_ceil(SPLIT_BLOCK);
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "attn/split_packed.cuh",
-            "::pie::attn::split_qkv_devwin<::pie::bf16>",
-            Launch::grid([xblocks.max(1), (**n_max).unsigned_abs(), 1], [SPLIT_BLOCK, 1, 1]),
-            &[
-                packed.ptr.arg(),
-                q_out.ptr.arg(),
-                k_out.ptr.arg(),
-                v_out.ptr.arg(),
+    ctx.fire(Fire::at("attn/split_packed.cuh", "::pie::attn::split_qkv_devwin<::pie::bf16>").apply(Launch::grid([xblocks.max(1), (n_max).unsigned_abs(), 1], [SPLIT_BLOCK, 1, 1])), &[
+                packed.arg(),
+                q_out.arg(),
+                k_out.arg(),
+                v_out.arg(),
                 win.arg(),
                 q_dim.arg(),
                 kv_dim.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `attn::attention_naive_paged` — the reference paged attention.
@@ -4094,63 +3909,59 @@ pub fn split_qkv_bf16_devwin(
 /// address live device memory of the extent the kernel reads or writes.
 ///
 /// A `routine!` row since the `&KvLayer` unfolded into its ten leaves. The
-/// aggregate was the only thing keeping it `driver_bound!`, since `Arg` is
+/// aggregate was the only thing keeping it `untraced!`, since `Arg` is
 /// implemented for no host struct.
-#[kernels_macros::routine]
+#[routine(whole)]
 pub fn attention_naive_paged(
-    ctx: &Ctx,
-    k_pages: Env<keys::KvKeys>,
-    v_pages: Env<keys::KvValues>,
-    k_scales: Env<keys::KvKeyScales>,
-    v_scales: Env<keys::KvValueScales>,
-    page_size: Env<keys::KvPageSize>,
-    head_dim: Env<keys::KvHeadDim>,
-    num_kv_heads: Env<keys::KvNumHeads>,
-    scheme: Env<keys::KvSchemeByte>,
-    storage_dtype: Env<keys::KvStorageDtype>,
-    block_size: Env<keys::KvBlockSize>,
-    q: In<0, bf16>,
-    o: Out<0, bf16>,
-    // `plan.qo_indptr` = `keys::QoIndptr`. The note that stood here said
-    // *"`fact_of` has no key for `qo_indptr`, so it derives `None` unaided"*
-    // -- both halves are dead: `fact_of` is gone (the name table with it) and
-    // the key exists, so this derives `Some(Named("plan.qo_indptr"))`.
-    qo_indptr: Env<keys::QoIndptr>,
-    // WHAT OWNS THE THIRD: `Cx::plan`, the fire's page plan, same as the two
-    // above it.
-    kv_page_indices: Env<keys::KvPageIndices>,
-    kv_page_indptr: Env<keys::KvPageIndptr>,
-    kv_last_page_lens: Env<keys::KvLastPageLens>,
-    num_requests: Env<keys::RequestCount>,
-    window_left: Env<keys::WindowLeft>,
-    // `cx.sm_scale()`, and `keys::SmScale` is the word for it.
-    sm_scale: Env<keys::SmScale>,
-    logits_soft_cap: Env<keys::AttnLogitsSoftCap>,
-    lse_out: Env<keys::AttnLseOut>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    q: In<Tensor<bf16>>,
+    o: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    // BACK TO ASKS: THE KV POOL IS THE ALLOCATOR'S. Every one of these was
+    // `Env<keys::Kv*>` at HEAD and `driver-cuda` answers all nine. A `Const`
+    // mark promises the STATEMENT carries the number, and a trace text never
+    // sees a deployment -- so `attn_at` stated an EMPTY run and this routine
+    // could not fire at all.
+    //
+    // The window, the scale and the cap go with them: they reach this body
+    // through the same table and the same statement cannot name them either.
+    let page_size = ctx.ask::<i32, keys::KvPageSize>()?;
+    let head_dim = ctx.ask::<i32, keys::KvHeadDim>()?;
+    let num_kv_heads = ctx.ask::<i32, keys::KvNumHeads>()?;
+    let scheme = ctx.ask::<i32, keys::KvSchemeByte>()?;
+    let storage_dtype = ctx.ask::<i32, keys::KvStorageDtype>()?;
+    let block_size = ctx.ask::<i32, keys::KvBlockSize>()?;
+    let window_left = ctx.ask::<i32, keys::WindowLeft>()?;
+    let sm_scale = ctx.ask::<f32, keys::SmScale>()?;
+    let logits_soft_cap = ctx.ask::<f32, keys::AttnLogitsSoftCap>()?;
+    let qo_indptr = ctx.ask::<*const u32, keys::QoIndptr>()?;
+    let kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
+    let k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
+    let v_pages = ctx.ask::<*mut u8, keys::KvValues>()?;
+    let k_scales = ctx.ask::<*mut core::ffi::c_void, keys::KvKeyScales>()?;
+    let v_scales = ctx.ask::<*mut core::ffi::c_void, keys::KvValueScales>()?;
+    let kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
+    let kv_last_page_lens = ctx.ask::<*const u32, keys::KvLastPageLens>()?;
+    let num_requests = ctx.ask::<i32, keys::RequestCount>()?;
+    let lse_out = ctx.ask::<*mut f32, keys::AttnLseOut>()?;
     /// `attention_naive_paged.cuh:223` — `constexpr int kMaxHeadDim = 1024`.
     pub const PAGED_MAX_HEAD_DIM: i32 = 1024;
 
     /// `attention_naive_paged.cuh:33` — `constexpr int BLOCK = 128`.
     pub const PAGED_BLOCK: u32 = 128;
 
-    if **head_dim > PAGED_MAX_HEAD_DIM {
+    if head_dim > PAGED_MAX_HEAD_DIM {
         return Err(Refusal::Wide {
             what: "head_dim",
-            at: i64::from(**head_dim),
+            at: i64::from(head_dim),
             max: i64::from(PAGED_MAX_HEAD_DIM),
         });
     }
     let src = q.all("in_width(0)")?;
-    let num_q_heads = src.width.checked_div(**head_dim).unwrap_or(0);
-    let smem = ((**head_dim).unsigned_abs() + PAGED_BLOCK) * 4;
+    let num_q_heads = src.width.checked_div(head_dim).unwrap_or(0);
+    let smem = ((head_dim).unsigned_abs() + PAGED_BLOCK) * 4;
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "attn/attention_naive_paged.cuh",
-            "::pie::attn::naive_paged_attn<::pie::i32(128)>",
-            Launch::grid(
+    ctx.fire(Fire::at("attn/attention_naive_paged.cuh", "::pie::attn::naive_paged_attn<::pie::i32(128)>").apply(Launch::grid(
                 [
                     num_requests.unsigned_abs(),
                     src.rows.unsigned_abs(),
@@ -4158,14 +3969,13 @@ pub fn attention_naive_paged(
                 ],
                 [PAGED_BLOCK, 1, 1],
             )
-            .smem(smem),
-            &[
-                q.ptr.arg(),
-                (**k_pages).cast_const().arg(),
-                (**v_pages).cast_const().arg(),
-                (*k_scales).cast::<f32>().cast_const().arg(),
-                (*v_scales).cast::<f32>().cast_const().arg(),
-                o.ptr.arg(),
+            .smem(smem)), &[
+                q.arg(),
+                (k_pages).cast_const().arg(),
+                (v_pages).cast_const().arg(),
+                (k_scales).cast::<f32>().cast_const().arg(),
+                (v_scales).cast::<f32>().cast_const().arg(),
+                o.arg(),
                 qo_indptr.arg(),
                 kv_page_indices.arg(),
                 kv_page_indptr.arg(),
@@ -4176,16 +3986,14 @@ pub fn attention_naive_paged(
                 num_kv_heads.arg(),
                 head_dim.arg(),
                 page_size.arg(),
-                kv_scheme(scheme_byte(**scheme)).arg(),
-                kv_dtype(scheme_byte(**storage_dtype)).arg(),
+                kv_scheme(scheme_byte(scheme)).arg(),
+                kv_dtype(scheme_byte(storage_dtype)).arg(),
                 block_size.arg(),
                 window_left.arg(),
                 sm_scale.arg(),
                 logits_soft_cap.arg(),
                 lse_out.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `attn::attn_res_blend_bf16` — K3's residual-block blend.
@@ -4197,22 +4005,20 @@ pub fn attention_naive_paged(
 /// The derived column is `[In(0), In(1), In(2), In(3), Out(0), RmsEps]`. The
 /// two weights are `arg_in(2)` and `arg_in(3)` here and NOT `weight(n)`, which
 /// is why they take a positional `In` and not a `Weight` mark.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn attn_res_blend<T>(
-    ctx: &Ctx,
-    prefix: In<0, T>,
-    blocks: In<1, T>,
-    norm_weight: In<2, T>,
-    proj_weight: In<3, T>,
-    out: Out<0, T>,
-    // # AND NOW THE DIVISION IS HERE, WHICH IS THE THIRD PLACE IT HAS LIVED
-    eps: Env<keys::RmsEps>,
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
-{
+    ctx: &Ctx<'_>,
+    prefix: In<Tensor<T>>,
+    blocks: In<Tensor<T>>,
+    norm_weight: In<Tensor<T>>,
+    proj_weight: In<Tensor<T>>,
+    out: Out<Tensor<T>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
+    // builder ever began stating them. A `Const` mark PROMISES the statement
+    // carries the number at its slot in the params run; where nothing states
+    // one the promise breaks at the fire, not at the type. §11.20.
+    let eps = ctx.ask::<f32, keys::RmsEps>()?;
+
     let dst = out.all("out_width(0)")?;
     let h = dst.width;
     // AND THE REGION'S OWN STRIDE IS NOT `blocks`' PITCH. `attn_res.cuh:114`
@@ -4223,24 +4029,17 @@ where
     let b = blocks.all("in_width(1)")?.width / h;
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "attn/attn_res.cuh",
-            &format!("::pie::attn::attn_res_blend<{}>", T::CPP),
-            Launch::per_row(dst.rows.unsigned_abs(), BLOCK),
-            &[
-                prefix.ptr.arg(),
-                blocks.ptr.arg(),
-                norm_weight.ptr.arg(),
-                proj_weight.ptr.arg(),
-                out.ptr.arg(),
+    ctx.fire(Fire::at("attn/attn_res.cuh", crate::jit::symbol(&format!("::pie::attn::attn_res_blend<{}>", T::CPP))).apply(Launch::per_row(dst.rows.unsigned_abs(), BLOCK)), &[
+                prefix.arg(),
+                blocks.arg(),
+                norm_weight.arg(),
+                proj_weight.arg(),
+                out.arg(),
                 b.arg(),
                 h.arg(),
                 dst.rows.arg(),
                 eps.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `attn::pad_head_dim_bf16` — pad every head out to a width flashinfer
@@ -4248,39 +4047,32 @@ where
 /// What the caller must guarantee, as `call()` states it: `packed` addresses
 /// `num_tokens * num_heads * head_dim` live bf16 elements and `padded`
 /// addresses `num_tokens * num_heads * head_dim_padded` writable ones.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn pad_head_dim<T>(
-    ctx: &Ctx,
-    packed: In<0, T>,
-    padded: Out<0, T>,
-    head_dim: Env<keys::HeadDim>,
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
-{
-    let num_heads = packed.width.checked_div(**head_dim).unwrap_or(0);
+    ctx: &Ctx<'_>,
+    packed: In<Tensor<T>>,
+    padded: Out<Tensor<T>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: every one of these was `Env<keys::_>` before the
+    // four marks, and no builder ever began stating them. A `Const` mark
+    // PROMISES the statement carries the number at its slot in the params
+    // run; where nothing states one the promise is broken at the fire, not
+    // at the type. See `.wiki/migration.md` §11.20.
+    let head_dim = ctx.ask::<i32, keys::HeadDim>()?;
+
+    let num_heads = packed.width.checked_div(head_dim).unwrap_or(0);
     let head_dim_padded = padded.width.checked_div(num_heads).unwrap_or(0);
-    if let Some(why) = head_dim_refusal(packed.rows, num_heads, **head_dim, head_dim_padded) {
+    if let Some(why) = head_dim_refusal(packed.rows, num_heads, head_dim, head_dim_padded) {
         return Err(why);
     }
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "attn/head_dim_pad.cuh",
-            &format!("::pie::attn::pad_head_dim<{}>", T::CPP),
-            per_head(packed.rows.unsigned_abs(), num_heads.unsigned_abs()),
-            &[
-                packed.ptr.arg(),
-                padded.ptr.arg(),
+    ctx.fire(Fire::at("attn/head_dim_pad.cuh", crate::jit::symbol(&format!("::pie::attn::pad_head_dim<{}>", T::CPP))).apply(per_head(packed.rows.unsigned_abs(), num_heads.unsigned_abs())), &[
+                packed.arg(),
+                padded.arg(),
                 num_heads.arg(),
                 head_dim.arg(),
                 head_dim_padded.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `attn::strip_head_dim_bf16` — the inverse of [`pad_head_dim`].
@@ -4288,42 +4080,32 @@ where
 /// What the caller must guarantee, as `call()` states it: `padded` addresses
 /// `num_tokens * num_heads * head_dim_padded` live bf16 elements and `packed`
 /// addresses `num_tokens * num_heads * head_dim` writable ones.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn strip_head_dim<T>(
-    ctx: &Ctx,
-    padded: In<0, T>,
-    packed: Out<0, T>,
-    // Now `packed.width.checked_div(head_dim)`, in the body, for the reasons
-    // written out at `pad_head_dim`'s.
-    head_dim: Env<keys::HeadDim>,
-    // Now `padded.width.checked_div(num_heads)`.
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
-{
-    let num_heads = packed.width.checked_div(**head_dim).unwrap_or(0);
+    ctx: &Ctx<'_>,
+    padded: In<Tensor<T>>,
+    packed: Out<Tensor<T>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: every one of these was `Env<keys::_>` before the
+    // four marks, and no builder ever began stating them. A `Const` mark
+    // PROMISES the statement carries the number at its slot in the params
+    // run; where nothing states one the promise is broken at the fire, not
+    // at the type. See `.wiki/migration.md` §11.20.
+    let head_dim = ctx.ask::<i32, keys::HeadDim>()?;
+
+    let num_heads = packed.width.checked_div(head_dim).unwrap_or(0);
     let head_dim_padded = padded.width.checked_div(num_heads).unwrap_or(0);
-    if let Some(why) = head_dim_refusal(padded.rows, num_heads, **head_dim, head_dim_padded) {
+    if let Some(why) = head_dim_refusal(padded.rows, num_heads, head_dim, head_dim_padded) {
         return Err(why);
     }
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "attn/head_dim_pad.cuh",
-            &format!("::pie::attn::strip_head_dim<{}>", T::CPP),
-            per_head(padded.rows.unsigned_abs(), num_heads.unsigned_abs()),
-            &[
-                padded.ptr.arg(),
-                packed.ptr.arg(),
+    ctx.fire(Fire::at("attn/head_dim_pad.cuh", crate::jit::symbol(&format!("::pie::attn::strip_head_dim<{}>", T::CPP))).apply(per_head(padded.rows.unsigned_abs(), num_heads.unsigned_abs())), &[
+                padded.arg(),
+                packed.arg(),
                 num_heads.arg(),
                 head_dim.arg(),
                 head_dim_padded.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 // ── WHERE `width_of` WENT ──────────────────────────────────────────────
@@ -4438,8 +4220,13 @@ fn head_dim_refusal(
 /// here, about the width, in `width()`'s word. That ordering is also what
 /// makes `elements()` safe: it multiplies a width a view has already proved
 /// non-zero, so it cannot fold an unstated pitch into a stated zero.
-fn softcap_elems<T: kernels::Elem>(x: &Out<0, T>) -> Result<usize, Refusal> {
-    let elems = x.all("out_width(0)")?.elements();
+// THE RECTANGLE, WHICHEVER MARK CARRIES IT. `Out` and `InOut` both hold
+// `{ptr, rows, width}` -- the difference between them is which RUNS the
+// statement placed the address in, which is nothing to a reader of the shape.
+// Taking the pair rather than one mark is what lets the in-place softcap and
+// the out-of-place one share this.
+fn softcap_elems<P: Copy>(x: &kernels::Region<P>) -> Result<usize, Refusal> {
+    let elems = x.elements();
     usize::try_from(elems)
         .map_err(|_| Refusal::Narrow { what: "logit elements", at: i64::from(elems) })
 }
@@ -4463,29 +4250,21 @@ fn softcap_launch(cap: f32, n: usize) -> Result<Launch, Refusal> {
 ///
 /// What the caller must guarantee, as `call()` states it: `x` must address
 /// `n` live, writable `bf16`s.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn logit_softcap<T>(
-    ctx: &Ctx,
-    x: Out<0, T>,
-    cap: Env<keys::FinalLogitSoftcap>,
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *mut T: Abi,
-{
-    let cap = **cap;
-    let n = softcap_elems(&x)?;
+    ctx: &Ctx<'_>,
+    x: InOut<Tensor<T>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: every one of these was `Env<keys::_>` before the
+    // four marks, and no builder ever began stating them. A `Const` mark
+    // PROMISES the statement carries the number at its slot in the params
+    // run; where nothing states one the promise is broken at the fire, not
+    // at the type. See `.wiki/migration.md` §11.20.
+    let cap = ctx.ask::<f32, keys::FinalLogitSoftcap>()?;
+    let n = softcap_elems(&x.all("out_width(0)")?)?;
     let launch = softcap_launch(cap, n)?;
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "attn/softcap.cuh",
-            &format!("::pie::attn::logit_softcap<{}>", T::CPP),
-            launch,
-            &[x.ptr.arg(), cap.arg(), n.arg()],
-        )
-    }
+    ctx.fire(Fire::at("attn/softcap.cuh", crate::jit::symbol(&format!("::pie::attn::logit_softcap<{}>", T::CPP))).apply(launch), &[x.arg(), cap.arg(), n.arg()])
 }
 
 /// `attn::logit_softcap_f16` — the same cap over an fp16 buffer.
@@ -4495,45 +4274,35 @@ where
 /// **No `Bound` row names this symbol.** The column below is derived from the
 /// signature and from [`logit_softcap`]'s arm, which is the same launch over
 /// a different element type; nothing else was assumed.
-#[kernels_macros::routine]
+#[routine]
 pub fn logit_softcap_f16(
-    ctx: &Ctx,
-    x: Out<0, f16>,
-    cap: Env<keys::FinalLogitSoftcap>,
-) -> Result<(), Refusal> {
-    let cap = **cap;
-    let n = softcap_elems(&x)?;
+    ctx: &Ctx<'_>,
+    x: InOut<Tensor<f16>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
+    // builder ever began stating them. A `Const` mark PROMISES the statement
+    // carries the number at its slot in the params run; where nothing states
+    // one the promise breaks at the fire, not at the type. §11.20.
+    let cap = ctx.ask::<f32, keys::FinalLogitSoftcap>()?;
+
+    let cap = cap;
+    let n = softcap_elems(&x.all("out_width(0)")?)?;
     let launch = softcap_launch(cap, n)?;
-    // SAFETY: as [`logit_softcap`]'s.
-    unsafe {
-        ctx.launch(
-            "attn/softcap.cuh",
-            "::pie::attn::logit_softcap<::pie::f16>",
-            launch,
-            &[x.ptr.arg(), cap.arg(), n.arg()],
-        )
-    }
+    ctx.fire(Fire::at("attn/softcap.cuh", "::pie::attn::logit_softcap<::pie::f16>").apply(launch), &[x.arg(), cap.arg(), n.arg()])
 }
 
 /// `attn::kimi_split_q_b_bf16` — split a fused query projection into its
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn kimi_split_q_b<T>(
-    ctx: &Ctx,
-    q_b: In<0, T>,
-    q_nope: Out<0, T>,
-    q_pe: Out<1, T>,
+    ctx: &Ctx<'_>,
+    q_b: In<Tensor<T>>,
+    q_nope: Out<Tensor<T>>,
+    q_pe: Out<Tensor<T>>,
     // The split sizes are statement params, not model facts: the wrapper
     // states the exact `Kind::Param` slots the old arm read with
     // `cx.param(0..=2)`, and must not consume an input or output counter.
-    heads: Param<0, i32>,
-    nope: Param<1, i32>,
-    rope: Param<2, i32>,
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
-{
+    heads: Const<i32>,
+    nope: Const<i32>,
+    rope: Const<i32>) -> Result<(), Refusal> {
     let width = i64::from(*heads) * (i64::from(*nope) + i64::from(*rope));
     let total = i64::from(q_b.rows) * width;
     if total > i64::from(i32::MAX) {
@@ -4546,44 +4315,34 @@ where
     let total = total as i32;
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "attn/kimi_mla.cuh",
-            &format!("::pie::attn::split_q_b<{}>", T::CPP),
-            elementwise(total.unsigned_abs()),
-            &[
-                q_b.ptr.arg(),
-                q_nope.ptr.arg(),
-                q_pe.ptr.arg(),
+    ctx.fire(Fire::at("attn/kimi_mla.cuh", crate::jit::symbol(&format!("::pie::attn::split_q_b<{}>", T::CPP))).apply(elementwise(total.unsigned_abs())), &[
+                q_b.arg(),
+                q_nope.arg(),
+                q_pe.arg(),
                 total.arg(),
                 heads.arg(),
                 nope.arg(),
                 rope.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `attn::kimi_split_kv_a_norm_bf16` — split `kv_a`, RMS-normalise the latent
 ///
 /// The derived column is `[In(0), Weight(0), Out(0), Out(1), RmsEps]`, every
 /// entry resolving, and the row is crossed.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn kimi_split_kv_a_norm<T>(
-    ctx: &Ctx,
-    kv_a: In<0, T>,
-    norm_weight: Bank<0, T>,
-    kv_c: Out<0, T>,
-    k_pe: Out<1, T>,
-    // The guard below therefore compares the same three numbers it always
-    // did, and refuses in the same word.
-    eps: Env<keys::RmsEps>,
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
-{
+    ctx: &Ctx<'_>,
+    kv_a: In<Tensor<T>>,
+    norm_weight: Const<Tensor<T>>,
+    kv_c: Out<Tensor<T>>,
+    k_pe: Out<Tensor<T>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
+    // builder ever began stating them. A `Const` mark PROMISES the statement
+    // carries the number at its slot in the params run; where nothing states
+    // one the promise breaks at the fire, not at the type. §11.20.
+    let eps = ctx.ask::<f32, keys::RmsEps>()?;
+
     /// `LaunchRule::Rms`, as the expression it evaluates to.
     #[must_use]
     const fn rms(rows: u32) -> Launch {
@@ -4610,23 +4369,16 @@ where
     }
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "attn/kimi_mla.cuh",
-            &format!("::pie::attn::split_kv_a_norm<{}, 256>", T::CPP),
-            rms(src.rows.unsigned_abs()),
-            &[
-                kv_a.ptr.arg(),
-                norm_weight.ptr.arg(),
-                kv_c.ptr.arg(),
-                k_pe.ptr.arg(),
+    ctx.fire(Fire::at("attn/kimi_mla.cuh", crate::jit::symbol(&format!("::pie::attn::split_kv_a_norm<{}, 256>", T::CPP))).apply(rms(src.rows.unsigned_abs())), &[
+                kv_a.arg(),
+                norm_weight.arg(),
+                kv_c.arg(),
+                k_pe.arg(),
                 kv_lora.arg(),
                 rope.arg(),
-                src_row_stride.0.arg(),
+                src_row_stride.arg(),
                 eps.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `attn::combine_attn_outputs_bf16` — merge two attention halves and their
@@ -4636,23 +4388,17 @@ where
 /// `head_dim` are NOT `keys::NumQHeads`/`keys::HeadDim`; they are the
 /// statement's param slots 0 and 1, made explicit so the derived column can
 /// bind the same scalars the driver arm used to read.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn combine_attn_outputs<T>(
-    ctx: &Ctx,
-    o1: In<0, T>,
-    lse1: In<1, f32>,
-    o2: In<2, T>,
-    lse2: In<3, f32>,
-    o_out: Out<0, T>,
-    lse_out: Out<1, f32>,
-    num_heads: Param<0, i32>,
-    head_dim: Param<1, i32>,
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
-{
+    ctx: &Ctx<'_>,
+    o1: In<Tensor<T>>,
+    lse1: In<Tensor<f32>>,
+    o2: In<Tensor<T>>,
+    lse2: In<Tensor<f32>>,
+    o_out: Out<Tensor<T>>,
+    lse_out: Out<Tensor<f32>>,
+    num_heads: Const<i32>,
+    head_dim: Const<i32>) -> Result<(), Refusal> {
     /// The merge's geometry — the grid of [`per_head_elementwise`] and a
     #[must_use]
     const fn combine_attn(rows: u32, heads: u32, head_dim: u32) -> Launch {
@@ -4679,177 +4425,22 @@ where
 
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "attn/dsv4_compress.cuh",
-            &format!("::pie::attn::combine_attn_outputs<{}>", T::CPP),
-            combine_attn(
+    ctx.fire(Fire::at("attn/dsv4_compress.cuh", crate::jit::symbol(&format!("::pie::attn::combine_attn_outputs<{}>", T::CPP))).apply(combine_attn(
                 o_out.rows.unsigned_abs(),
                 num_heads.unsigned_abs(),
                 head_dim.unsigned_abs(),
-            ),
-            &[
-                o1.ptr.arg(),
-                lse1.ptr.arg(),
-                o2.ptr.arg(),
-                lse2.ptr.arg(),
-                o_out.ptr.arg(),
-                lse_out.ptr.arg(),
+            )), &[
+                o1.arg(),
+                lse1.arg(),
+                o2.arg(),
+                lse2.arg(),
+                o_out.arg(),
+                lse_out.arg(),
                 num_heads.arg(),
                 head_dim.arg(),
-            ],
-        )
-    }
+            ])
 }
 
-/// This family's routines, and what a trace may say about each.
-///
-/// The argument lists are DERIVED from the `fn`s above -- `routine!` sees only
-/// the identifier. What is stated beside one is what no signature carries:
-/// whether a statement consumes its whole operand, and which operands must be
-/// given the same address.
-///
-/// **Two layer-view host programs are DECLARED and are not `routine!`s.**
-/// `mla_prepare_bf16` and `write_mla_to_pages` take an `MlaLayer`. That is a
-/// host aggregate rather than a kernel argument and `Arg` is implemented for
-/// no such type, so a `routine!` naming one does not compile.
-///
-/// **It was four, and no `KvLayer` is left.** `attention_naive_paged` read ten
-/// fields through the view and takes the ten as parameters now, at arity 21;
-/// `dequant_kv_cache_layer_to_bf16_active` read thirteen and takes fifteen
-/// leaves. Both left `driver_bound!` for `routine!` in the same move. That is
-/// the general shape: a `driver_bound!` row is held by an aggregate, and an
-/// aggregate whose leaves are each expressible unfolds. The ceiling is 36, so
-/// the arity was never what stood in the way -- the missing WORDS were, and
-/// `keys::KvBf16Keys`/`KvBf16Values`/`KvPagesInBatch` were the last three.
-///
-/// **Absent on purpose, so nobody goes looking for the gap:**
-///
-/// * `dequant_fp8_per_tensor_pages_active` is one arm of the dequantiser's
-///   `match`, and the fp8 kind is a property of the layer, not the statement.
-///   It takes leaves rather than the view for the same reason its caller does:
-///   there is no aggregate left to forward.
-/// * Three of [`attention_score_post`]'s four launches are fired by
-///   `driver-cuda`'s `fire::attn_score` on the fire's own stream and were
-///   never statements; a `routine!` for one would put a row in `crate::sigs()`
-///   that nothing could lower to. The fold is the exception, and is declared
-///   below because `dsl::cuda::attn_score_fold_heads` states the CONTRACT
-///   symbol, which is a different symbol from the `_dev` device one.
-/// * [`mla_fa2::fire`] and [`mla_naive::fire`] are ARMS, not symbols: which
-///   one runs is a property of the device. A trace names the `fn` that
-///   chooses, [`dispatch_attention_mla_bf16`], declared below.
-///
-/// # `derived =`, on every `routine!` row and no `driver_bound!` one
-///
-/// Each column reaches its row through `<FN as kernels::Derivation>::DERIVED`,
-/// the impl `#[kernels_macros::routine]` emits beside the launcher, read off
-/// that symbol's arm in
-/// `driver-cuda/src/bind/arms/attn.rs`. `driver_bound!` rows carry none:
-/// their bodies refuse every argument list, so `args: &[]` leaves the column
-/// nothing to be checked beside.
-///
-/// `qkv_decode_fused_dispatch` carries no attribute at all, and this is the
-/// one row where that is deliberate rather than pending. It is an inner LEG:
-/// one caller, [`qkv_decode_qk_norm_rope_write_kv_bf16`], which has already
-/// bound every operand through its own column. A derived column here would
-/// resolve end to end and claim a binding no statement made, and fourteen of
-/// its fifteen pointers would disagree with the caller's arm-witnessed
-/// indices -- the leg counts `rope_table` at `In(4)` where the caller states
-/// `In(1)`, because the caller's two `Bank` weights and its `positions` fact
-/// are not operands down here. Marking all fifteen `Unbound<_>` is the trap:
-/// `packed` and `rope_table` really ARE statement operands on the caller, so
-/// `Unbound` would deny an index the value genuinely has. There is no honest
-/// column for a leg; `NO_COLUMN_ON_PURPOSE` in `driver-cuda` is where the
-/// exemption lives.
-pub static ROUTINES: &[Routine] = &[
-    routine!(lse_log2_to_ln, in_place = &[(0, 0)], ),
-    routine!(
-        attention_sink_rescale_bf16 = attention_sink_rescale::<bf16>,
-        in_place = &[(0, 0)]
-    ),
-    routine!(attn_res_blend_bf16 = attn_res_blend::<bf16>, ),
-    routine!(pad_head_dim_bf16 = pad_head_dim::<bf16>, ),
-    routine!(strip_head_dim_bf16 = strip_head_dim::<bf16>, ),
-    routine!(
-        logit_softcap_bf16 = logit_softcap::<bf16>,
-        in_place = &[(0, 0)]
-    ),
-    routine!(logit_softcap_f16, in_place = &[(0, 0)], ),
-    routine!(kimi_split_q_b_bf16 = kimi_split_q_b::<bf16>, ),
-    routine!(
-        kimi_split_kv_a_norm_bf16 = kimi_split_kv_a_norm::<bf16>
-    ),
-    routine!(
-        combine_attn_outputs_bf16 = combine_attn_outputs::<bf16>
-    ),
-    routine!(split_qkv_bf16_devwin, ),
-    routine!(compact_page_csr, whole, ),
-    routine!(
-        mtp_shift_hidden_bf16 = mtp_shift_hidden::<bf16>,
-        whole
-    ),
-    routine!(
-        mtp_update_pending_hidden_bf16 = mtp_update_pending_hidden::<bf16>,
-        whole
-    ),
-    routine!(
-        dsa_index_knorm_rope_bf16 = dsa_index_knorm_rope::<bf16>,
-        in_place = &[(0, 0)]
-    ),
-    // `index_q_rope` does exactly the same thing to `idx_q`:
-    // `dsa_indexer.cuh:156-158` reads `row[d]` into a register buffer,
-    // rotates it with `rope_interleave_inplace`, and writes `row[d]` back --
-    // one buffer read and written, and the launcher takes ONE pointer for
-    // both.
-    routine!(
-        dsa_index_q_rope_bf16 = dsa_index_q_rope::<bf16>,
-        in_place = &[(0, 0)]
-    ),
-    routine!(dsa_index_topk_mask, whole, ),
-    routine!(dsv4_boundary_meta_decode, ),
-    routine!(dsv4_boundary_meta_paged, whole, ),
-    routine!(
-        attention_compressed_paged_bf16,
-        whole
-    ),
-    routine!(
-        dsv4_compress_gather_paged_bf16
-    ),
-    routine!(
-        dsv4_store_comp_entries_bf16,
-        whole
-    ),
-    routine!(
-        qkv_packed_qk_norm_rope_vnorm_write_kv_bf16
-    ),
-    routine!(
-        qkv_decode_qk_norm_rope_write_kv_bf16
-    ),
-    routine!(qkv_decode_fused_dispatch, uncolumned),
-    // ── THE PAGED-KV APPENDERS, WHICH CROSSED THE LINE BELOW ────────────
-    routine!(write_kv_to_pages_bf16),
-    routine!(
-        write_kv_to_pages_quantised
-    ),
-    routine!(write_kv_explicit_bf16),
-    routine!(
-        write_kv_explicit_bf16_devwin,
-        whole
-    ),
-    // ── what the DRIVER fires, by path ──────────────────────────────────
-    driver_bound!(write_kv_to_pages),
-    routine!(dequant_kv_cache_layer_to_bf16_active),
-    routine!(attention_naive_paged, whole, ),
-    driver_bound!(attn_score_fold_heads, whole),
-    driver_bound!(mla_prepare_bf16, whole),
-    driver_bound!(write_mla_to_pages, whole),
-    driver_bound!(dispatch_attention_mla_bf16),
-    // ── and one whose body is `driver_internal`'s ───────────────────────
-    routine!(split_qkv_bf16, ),
-];
-
-/// `attn`, as a trace names it.
-pub static FAMILY: Family = crate::family!(ROUTINES);
 
 // ── what a statement cannot supply, for this family ──────────────────
 
@@ -4991,14 +4582,14 @@ pub struct Plan {
 // a `Weight<1, _>` index bug of exactly this shape shipped once and was
 // reverted, so the check lives in `cargo check` rather than in a test binary.
 const _: () = {
-    let d = <kimi_split_q_b as kernels::Derivation>::DERIVED;
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(kimi_split_q_b::<bf16>);
     assert!(d.len() == 6);
-    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(matches!(d[2].source, Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
-    assert!(matches!(d[3].source, Some(kernels::Source::Slot(kernels::Kind::Param, 0))));
-    assert!(matches!(d[4].source, Some(kernels::Source::Slot(kernels::Kind::Param, 1))));
-    assert!(matches!(d[5].source, Some(kernels::Source::Slot(kernels::Kind::Param, 2))));
+    assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(d[2], Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
+    assert!(matches!(d[3], Some(kernels::Source::Slot(kernels::Kind::Param, 0))));
+    assert!(matches!(d[4], Some(kernels::Source::Slot(kernels::Kind::Param, 1))));
+    assert!(matches!(d[5], Some(kernels::Source::Slot(kernels::Kind::Param, 2))));
 };
 
 // OPERAND SLOTS DID NOT MOVE: making `dsa_index_topk_mask`'s three scalar
@@ -5006,15 +4597,15 @@ const _: () = {
 // pins rule F4 at the old arm's boundary, where params followed three inputs
 // and one output.
 const _: () = {
-    let d = <dsa_index_topk_mask as kernels::Derivation>::DERIVED;
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dsa_index_topk_mask);
     assert!(d.len() == 7);
-    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::In, 1))));
-    assert!(matches!(d[2].source, Some(kernels::Source::Slot(kernels::Kind::In, 2))));
-    assert!(matches!(d[3].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(matches!(d[4].source, Some(kernels::Source::Slot(kernels::Kind::Param, 0))));
-    assert!(matches!(d[5].source, Some(kernels::Source::Slot(kernels::Kind::Param, 1))));
-    assert!(matches!(d[6].source, Some(kernels::Source::Slot(kernels::Kind::Param, 2))));
+    assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    assert!(matches!(d[2], Some(kernels::Source::Slot(kernels::Kind::In, 2))));
+    assert!(matches!(d[3], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(d[4], Some(kernels::Source::Slot(kernels::Kind::Param, 0))));
+    assert!(matches!(d[5], Some(kernels::Source::Slot(kernels::Kind::Param, 1))));
+    assert!(matches!(d[6], Some(kernels::Source::Slot(kernels::Kind::Param, 2))));
 };
 
 // OPERAND SLOTS DID NOT MOVE: making `combine_attn_outputs`'s merge shape
@@ -5022,16 +4613,16 @@ const _: () = {
 // arm wrote them. The params state their slots without shifting the region
 // counters.
 const _: () = {
-    let d = <combine_attn_outputs as kernels::Derivation>::DERIVED;
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(combine_attn_outputs::<bf16>);
     assert!(d.len() == 8);
-    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::In, 1))));
-    assert!(matches!(d[2].source, Some(kernels::Source::Slot(kernels::Kind::In, 2))));
-    assert!(matches!(d[3].source, Some(kernels::Source::Slot(kernels::Kind::In, 3))));
-    assert!(matches!(d[4].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(matches!(d[5].source, Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
-    assert!(matches!(d[6].source, Some(kernels::Source::Slot(kernels::Kind::Param, 0))));
-    assert!(matches!(d[7].source, Some(kernels::Source::Slot(kernels::Kind::Param, 1))));
+    assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    assert!(matches!(d[2], Some(kernels::Source::Slot(kernels::Kind::In, 2))));
+    assert!(matches!(d[3], Some(kernels::Source::Slot(kernels::Kind::In, 3))));
+    assert!(matches!(d[4], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(d[5], Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
+    assert!(matches!(d[6], Some(kernels::Source::Slot(kernels::Kind::Param, 0))));
+    assert!(matches!(d[7], Some(kernels::Source::Slot(kernels::Kind::Param, 1))));
 };
 
 // `Region::elements()` IS THE PRODUCT THE TWO ELEMENT-COUNT LAUNCHERS USED TO
@@ -5076,7 +4667,7 @@ const _: () = {
 // THE TWO POSITIONAL RUNS ARE PINNED INDEPENDENTLY. `stated_source`
 // (`kernels-macros/src/lib.rs:271`) SETS a counter to `N + 1` rather than
 // bumping it, so a wrapper leaving the middle of a signature can renumber a
-// later one silently: `Bank<1, _>` at `d[5]` and `In<0, _>` at `d[0]` are the
+// later one silently: `Weight<1, *const _>` at `d[5]` and `In<0, *const _>` at `d[0]` are the
 // two ends of that risk. The banks are the pair `qkv_fused.cu` uses as
 // q-norm and k-norm weights -- swapping them normalises Q by K's gains, which
 // is numerically plausible and wrong.
@@ -5087,31 +4678,39 @@ const _: () = {
 // compares the key's `&'static str`, so this fires if the key is renamed
 // without `operand()` being taught the new string.
 const _: () = {
-    let d = <qkv_packed_qk_norm_rope_vnorm_write_kv_bf16 as kernels::Derivation>::DERIVED;
-    assert!(d.len() == 17);
-    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(matches!(d[4].source, Some(kernels::Source::Slot(kernels::Kind::Weight, 0))));
-    assert!(matches!(d[5].source, Some(kernels::Source::Slot(kernels::Kind::Weight, 1))));
-    assert!(kernels::source_is_named(&d[2].source, <kernels::keys::KvKeys as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[3].source, <kernels::keys::KvValues as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[6].source, <kernels::keys::Positions as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[7].source, <kernels::keys::KvPageIndices as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[8].source, <kernels::keys::KvPageIndptr as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[9].source, <kernels::keys::KvLastPageLens as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[10].source, <kernels::keys::RowValid as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[11].source, <kernels::keys::KvNumHeads as kernels::keys::Fact>::KEY));
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(qkv_packed_qk_norm_rope_vnorm_write_kv_bf16);
+    assert!(d.len() == 4);
+    assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(d[2], Some(kernels::Source::Or(kernels::Source::Named(_), kernels::Source::Slot(kernels::Kind::Weight, 0)))));
+    assert!(matches!(d[3], Some(kernels::Source::Or(kernels::Source::Named(_), kernels::Source::Slot(kernels::Kind::Weight, 1)))));
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
     // `KvHeadDim` AND NOT `HeadDim`, which is the one substitution in this
     // column that would type-check, bind, and be wrong on a two-kind family:
     // the LAYER's width is `cx.kv_layer()?.head_dim` and the FIRE's is
     // `cx.head_dim()`, and `bind/table.rs` names gemma-4 as where they part.
-    assert!(kernels::source_is_named(&d[12].source, <kernels::keys::KvHeadDim as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[13].source, <kernels::keys::KvPageSize as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[14].source, <kernels::keys::KvHndLayout as kernels::keys::Fact>::KEY));
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
     // `Theta` AND NOT `RopeTheta`: the statement's layer with a fallback,
     // where `mla_prepare_bf16` two hundred lines up takes the fire's field.
-    assert!(kernels::source_is_named(&d[15].source, <kernels::keys::Theta as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[16].source, <kernels::keys::RmsEps as kernels::keys::Fact>::KEY));
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
 };
 
 // ── THE DECODE TWIN, WHICH DID NOT CROSS, AND THE PARAMETER THAT HOLDS IT ──
@@ -5129,28 +4728,28 @@ const _: () = {
 // them and this would read `In(3)` -- binding the rope table to an operand
 // the statement never placed.
 const _: () = {
-    let d = <qkv_decode_qk_norm_rope_write_kv_bf16 as kernels::Derivation>::DERIVED;
-    assert!(d.len() == 20);
-    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(qkv_decode_qk_norm_rope_write_kv_bf16);
+    assert!(d.len() == 5);
+    assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
     // The region form states no result, so `Op::dest` carries the destination
     // and it lands in the operand run as `Out(0)`.
-    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(matches!(d[4].source, Some(kernels::Source::Slot(kernels::Kind::Weight, 0))));
-    assert!(matches!(d[5].source, Some(kernels::Source::Slot(kernels::Kind::Weight, 1))));
-    assert!(matches!(d[7].source, Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(d[4], Some(kernels::Source::Slot(kernels::Kind::In, 1))));
     // The `_or_null` pair, not `keys::KvWritePage`/`KvWriteOffset`: those
     // null-check, which `write_kv_explicit_bf16` wants and this row does not.
-    assert!(kernels::source_is_named(
-        &d[11].source,
-        <kernels::keys::KvWritePageOrNull as kernels::keys::Fact>::KEY
-    ));
-    assert!(kernels::source_is_named(
-        &d[12].source,
-        <kernels::keys::KvWriteOffsetOrNull as kernels::keys::Fact>::KEY
-    ));
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
 
-    assert!(kernels::source_is_named(&d[13].source, <kernels::keys::RowValid as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[15].source, <kernels::keys::KvHeadDim as kernels::keys::Fact>::KEY));
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
 };
 
 // ── THE BF16 APPEND ──
@@ -5161,26 +4760,40 @@ const _: () = {
 // row -- reports `false` for, and the only two reads of the planes
 // (`:3457` here, `:3285` in `write_kv_explicit_bf16`) are guarded on it.
 const _: () = {
-    let d = <write_kv_to_pages_bf16 as kernels::Derivation>::DERIVED;
-    assert!(d.len() == 18);
-    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::In, 1))));
-    assert!(kernels::source_is_named(&d[8].source, <kernels::keys::RowValid as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[9].source, <kernels::keys::KvEnvMin as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[10].source, <kernels::keys::KvEnvMax as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[11].source, <kernels::keys::RequestCount as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[12].source, <kernels::keys::FirstToken as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[17].source, <kernels::keys::KvHasEnvelopes as kernels::keys::Fact>::KEY));
+    // TWO ENTRIES: the five KV-geometry scalars are asked for now, so the
+    // column is the two operands the statement really places.
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(write_kv_to_pages_bf16);
+    assert!(d.len() == 2);
+    assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
     let mut i = 0;
     while i < d.len() {
-        assert!(d[i].source.is_some());
+        assert!(d[i].is_some());
         i += 1;
     }
 };
 
 // ── THE NAIVE PAGED FALLBACK ──
 //
-// THE `&KvLayer` AGGREGATE IS GONE and `driver_bound!` went with it: `Arg` is
+// THE `&KvLayer` AGGREGATE IS GONE and `untraced!` went with it: `Arg` is
 // implemented for no host struct, so the aggregate was the only reason the
 // row could not be a `routine!`. Ten leaves in its place, arity 21 against a
 // 36 ceiling.
@@ -5189,34 +4802,16 @@ const _: () = {
 // `write_kv_to_pages_quantised` finished this one -- the two rows were down
 // to the identical set.
 const _: () = {
-    let d = <attention_naive_paged as kernels::Derivation>::DERIVED;
-    assert!(d.len() == 21);
-    assert!(kernels::source_is_named(&d[0].source, <kernels::keys::KvKeys as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[1].source, <kernels::keys::KvValues as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[2].source, <kernels::keys::KvKeyScales as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[3].source, <kernels::keys::KvValueScales as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[4].source, <kernels::keys::KvPageSize as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[5].source, <kernels::keys::KvHeadDim as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[6].source, <kernels::keys::KvNumHeads as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[7].source, <kernels::keys::KvSchemeByte as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[8].source, <kernels::keys::KvStorageDtype as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[9].source, <kernels::keys::KvBlockSize as kernels::keys::Fact>::KEY));
-    // THE TWO SLOTS THE UNFOLD MOVED. Ten leaves went in ahead of them and
-    // neither slot shifted, because both are STATED -- `In<0>`/`Out<0>` --
-    // and `stated_source` short-circuits ahead of the positional counters.
-    assert!(matches!(d[10].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(d[11].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(kernels::source_is_named(&d[12].source, <kernels::keys::QoIndptr as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[15].source, <kernels::keys::KvLastPageLens as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[17].source, <kernels::keys::WindowLeft as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[18].source, <kernels::keys::SmScale as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[19].source, <kernels::keys::AttnLogitsSoftCap as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[20].source, <kernels::keys::AttnLseOut as kernels::keys::Fact>::KEY));
-    let mut i = 0;
-    while i < d.len() {
-        assert!(d[i].source.is_some());
-        i += 1;
-    }
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(attention_naive_paged);
+    // TWO MARKS, AND THAT IS THE WHOLE COLUMN. It was eleven: the KV pool's
+    // nine numbers had been made `Const`, which promises the STATEMENT carries
+    // them, and no trace text sees a deployment -- so `attn_at` stated an
+    // empty run and this routine could not fire at all. They
+    // were `Env<keys::Kv*>` at HEAD, `driver-cuda` answers every one, and the
+    // body asks for them again.
+    assert!(d.len() == 2);
+    assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
 };
 
 // ── THE EXPLICIT WRITER, THE SAME PAIR AT 7/8 ──
@@ -5226,22 +4821,24 @@ const _: () = {
 // arm reads it with `?`, and that arm reads it with `unwrap_or(null)`. One
 // key, two rows, opposite verdicts, decided by what a null means on each.
 const _: () = {
-    let d = <write_kv_explicit_bf16 as kernels::Derivation>::DERIVED;
-    assert!(d.len() == 15);
-    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::In, 1))));
-    assert!(kernels::source_is_named(&d[4].source, <kernels::keys::KvWritePage as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[5].source, <kernels::keys::KvWriteOffset as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[14].source, <kernels::keys::KvNativeBf16 as kernels::keys::Fact>::KEY));
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(write_kv_explicit_bf16);
+    assert!(d.len() == 2);
+    assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
     let mut i = 0;
     while i < d.len() {
-        assert!(d[i].source.is_some());
+        assert!(d[i].is_some());
         i += 1;
     }
-    assert!(kernels::source_is_named(&d[6].source, <kernels::keys::RowValid as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[7].source, <kernels::keys::KvEnvMin as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[8].source, <kernels::keys::KvEnvMax as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[13].source, <kernels::keys::KvHasEnvelopes as kernels::keys::Fact>::KEY));
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
 };
 
 // ── THE THREE VERDICTS THAT ARE NOT KEYS ──
@@ -5255,17 +4852,21 @@ const _: () = {
 // region carries `rows.count` and the `_devwin` forms exist for the fires
 // where the two differ.
 const _: () = {
-    let d = <split_qkv_bf16_devwin as kernels::Derivation>::DERIVED;
-    assert!(d.len() == 6);
-    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(matches!(d[2].source, Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
-    assert!(matches!(d[3].source, Some(kernels::Source::Slot(kernels::Kind::Out, 2))));
-    assert!(kernels::source_is_named(&d[4].source, <kernels::keys::PeelWindow as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[5].source, <kernels::keys::RowsTotal as kernels::keys::Fact>::KEY));
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(split_qkv_bf16_devwin);
+    assert!(d.len() == 4);
+    assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(d[2], Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
+    assert!(matches!(d[3], Some(kernels::Source::Slot(kernels::Kind::Out, 2))));
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
     let mut i = 0;
     while i < d.len() {
-        assert!(d[i].source.is_some());
+        assert!(d[i].is_some());
         i += 1;
     }
 };
@@ -5273,27 +4874,27 @@ const _: () = {
 // Both softcap forms, and `logit_softcap_f16` has no `Bound` row at all --
 // its column is the only thing that binds it.
 const _: () = {
-    let d = <logit_softcap as kernels::Derivation>::DERIVED;
-    assert!(d.len() == 2);
-    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(kernels::source_is_named(&d[1].source, <kernels::keys::FinalLogitSoftcap as kernels::keys::Fact>::KEY));
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(logit_softcap::<bf16>);
+    // ONE ENTRY: the cap is asked for now, so the column is the buffer alone.
+    assert!(d.len() == 1);
+    assert!(matches!(d[0], Some(kernels::Source::Alias(0, 0))));
 };
 const _: () = {
-    let d = <logit_softcap_f16 as kernels::Derivation>::DERIVED;
-    assert!(d.len() == 2);
-    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(kernels::source_is_named(&d[1].source, <kernels::keys::FinalLogitSoftcap as kernels::keys::Fact>::KEY));
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(logit_softcap_f16);
+    assert!(d.len() == 1);
+    assert!(matches!(d[0], Some(kernels::Source::Alias(0, 0))));
 };
 
 // The `_devwin` explicit writer has no `Bound` row either; `PeelWindow` and
 // `RowsTotal` are the pair `split_qkv_bf16_devwin` crossed on.
 const _: () = {
-    let d = <write_kv_explicit_bf16_devwin as kernels::Derivation>::DERIVED;
-    assert!(kernels::source_is_named(&d[6].source, <kernels::keys::PeelWindow as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[8].source, <kernels::keys::RowsTotal as kernels::keys::Fact>::KEY));
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(write_kv_explicit_bf16_devwin);
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
     let mut i = 0;
     while i < d.len() {
-        assert!(d[i].source.is_some());
+        assert!(d[i].is_some());
         i += 1;
     }
 };
@@ -5304,20 +4905,25 @@ const _: () = {
 // d[16]/d[17] ARE BOTH `i32` AND ADJACENT, so swapping `scheme` and
 // `storage_dtype` type-checks. This pin is the only thing that does not.
 const _: () = {
-    let d = <write_kv_to_pages_quantised as kernels::Derivation>::DERIVED;
-    assert!(d.len() == 18);
-    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::In, 1))));
-    assert!(kernels::source_is_named(&d[2].source, <kernels::keys::FirstToken as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[5].source, <kernels::keys::KvKeyScales as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[6].source, <kernels::keys::KvValueScales as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[7].source, <kernels::keys::QoIndptr as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[15].source, <kernels::keys::KvBlockSize as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[16].source, <kernels::keys::KvSchemeByte as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[17].source, <kernels::keys::KvStorageDtype as kernels::keys::Fact>::KEY));
+    // TWO ENTRIES, and the `scheme`/`storage_dtype` hazard the header above
+    // describes is gone with them: both are asked for by KEY now, and two
+    // keys cannot be swapped by being adjacent.
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(write_kv_to_pages_quantised);
+    assert!(d.len() == 2);
+    assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
     let mut i = 0;
     while i < d.len() {
-        assert!(d[i].source.is_some());
+        assert!(d[i].is_some());
         i += 1;
     }
 };
@@ -5331,26 +4937,35 @@ const _: () = {
 // d[10]/d[11] ARE BOTH `i32` AND ADJACENT, as on the quantised writer: only
 // this pin distinguishes the scheme from the storage dtype.
 const _: () = {
-    let d = <dequant_kv_cache_layer_to_bf16_active as kernels::Derivation>::DERIVED;
-    assert!(d.len() == 15);
-    assert!(kernels::source_is_named(&d[0].source, <kernels::keys::KvKeys as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[1].source, <kernels::keys::KvValues as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[2].source, <kernels::keys::KvKeyScales as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[3].source, <kernels::keys::KvValueScales as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[4].source, <kernels::keys::KvBf16Keys as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[5].source, <kernels::keys::KvBf16Values as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[6].source, <kernels::keys::KvPageSize as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[7].source, <kernels::keys::KvNumHeads as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[8].source, <kernels::keys::KvHeadDim as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[9].source, <kernels::keys::KvBlockSize as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[10].source, <kernels::keys::KvSchemeByte as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[11].source, <kernels::keys::KvStorageDtype as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[12].source, <kernels::keys::KvNativeBf16 as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[13].source, <kernels::keys::KvPageIndices as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[14].source, <kernels::keys::KvPagesInBatch as kernels::keys::Fact>::KEY));
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dequant_kv_cache_layer_to_bf16_active);
+    assert!(d.len() == 0);
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
     let mut i = 0;
     while i < d.len() {
-        assert!(d[i].source.is_some());
+        assert!(d[i].is_some());
         i += 1;
     }
 };

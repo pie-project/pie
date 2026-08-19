@@ -87,6 +87,21 @@ impl Geometry {
 /// that needs a command buffer to compute.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Dispatch<'a> {
+    /// The artifact the module is loaded from.
+    ///
+    /// Stated by the routine body, which composed it out of an entrypoint and
+    /// the tier this adapter advertises. Borrowed from the plan on the
+    /// plan-ordered path, where the artifact is the symbol's baseline module.
+    ///
+    /// # WHY THE FILE TRAVELS BESIDE THE SYMBOL
+    ///
+    /// The recording pass builds a pipeline per dispatch and needs the module
+    /// bytes to do it. Deriving them from [`Self::symbol`] a second time is
+    /// what the crate header's tier bug was: a name spelled by a rule in one
+    /// place and by another rule somewhere else, agreeing until they did not.
+    /// Carrying the body's own answer is what makes the module a pipeline is
+    /// built from the module the body chose.
+    pub file: std::borrow::Cow<'a, str>,
     /// The entrypoint to run: borrowed from [`Lowered::kernels`] on the
     /// plan-ordered path, or owned when a routine composes its own spelling
     /// (e.g. `affine_qmm_t_bf16_gs_128_b_4`) whose `String` must outlive the
@@ -97,8 +112,8 @@ pub struct Dispatch<'a> {
     /// Which of [`Self::buffers`] the shader may WRITE through, in the same
     /// order and of the same length.
     ///
-    /// Read off the kernel row's operand types — [`kernels::Ty::BufMut`] is
-    /// "the launcher may write through this" and everything else is a read;
+    /// Read off the kernel row's operand types — a writable one is "the
+    /// launcher may write through this" and everything else is a read;
     /// SPIR-V does not carry this usefully since most of this tree's shaders
     /// omit the `readonly` qualifier `slangc` needs to decorate it.
     ///

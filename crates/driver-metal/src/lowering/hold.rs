@@ -33,9 +33,11 @@
 //! `model/` and again in `launch.rs`, compared nowhere"*.
 
 use kernels::routine::Refusal;
-use kernels_metal::routine::{
-    Buf, BufMut,
-};
+// `Buf` AND `BufMut` STOOD HERE AND ARE DELETED. They were newtypes over a
+// `u32` handle whose only reader took the `.0` straight back out, and the
+// direction they claimed is the MARK's now -- `In`, `Out`, `InOut`, `Const` --
+// carried in the `Ty` column the binder already walks. What crosses this
+// boundary is the handle.
 
 use model_compiler::lower::{Arg, Launch};
 
@@ -326,10 +328,46 @@ impl<'a> Handles<'a> {
     ///
     /// [`Refusal::Absent`] when the statement has fewer, which is an arm
     /// asking for an operand its trace does not carry.
-    pub fn input(&mut self, i: usize) -> Result<Buf, Refusal> {
+    pub fn input(&mut self, i: usize) -> Result<u32, Refusal> {
         let at = self.ins.get(i).copied();
         self.pick(at.as_ref(), "an input the statement does not carry")
-            .map(Buf)
+    }
+
+    /// Elements per row of the statement's `i`-th INPUT.
+    ///
+    /// THE HALF A HANDLE DOES NOT CARRY. `input` above answers WHICH buffer
+    /// and this answers how wide its rows are, and until `Tensor<E>` arrived
+    /// only the first was ever asked for: a body took the width as a separate
+    /// scalar parameter (`Kind::InWidth`, or an `Env` beside the handle). The
+    /// mark carries the rectangle now, so the binder asks both here, and a
+    /// backend that answered only the first bound every operand at width
+    /// ZERO -- which every body reading `x.width` then refused as `Empty`.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Absent`] when the statement carries no such input.
+    pub fn in_width(&self, i: usize) -> Result<i32, Refusal> {
+        self.width_at(self.ins.get(i).copied(), "an input the statement does not carry")
+    }
+
+    /// Elements per row of the statement's `i`-th RESULT. See [`Self::in_width`].
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Absent`] when the statement declares no such result.
+    pub fn out_width(&self, i: usize) -> Result<i32, Refusal> {
+        self.width_at(self.outs.get(i).copied(), "a result the statement does not declare")
+    }
+
+    /// The `i`-th result's width, read off the argument the launch bound.
+    fn width_at(&self, at: Option<usize>, what: &'static str) -> Result<i32, Refusal> {
+        let at = at.ok_or(Refusal::Absent { what })?;
+        let arg = self.args.get(at).ok_or(Refusal::Absent { what })?;
+        i32::try_from(arg.width).map_err(|_| Refusal::Wide {
+            what: "an operand's row width",
+            at: i64::from(arg.width),
+            max: i64::from(i32::MAX),
+        })
     }
 
     /// The statement's `i`-th result.
@@ -337,11 +375,10 @@ impl<'a> Handles<'a> {
     /// # Errors
     ///
     /// [`Refusal::Absent`] when the statement has fewer.
-    pub fn output(&mut self, i: usize) -> Result<BufMut, Refusal> {
+    pub fn output(&mut self, i: usize) -> Result<u32, Refusal> {
         self.asked = self.asked.max(i + 1);
         let at = self.outs.get(i).copied();
         self.pick(at.as_ref(), "a result the statement does not carry")
-            .map(BufMut)
     }
 
     /// The statement's `i`-th result, read rather than written.
@@ -353,11 +390,10 @@ impl<'a> Handles<'a> {
     /// # Errors
     ///
     /// [`Refusal::Absent`] when the statement has fewer.
-    pub fn output_read(&mut self, i: usize) -> Result<Buf, Refusal> {
+    pub fn output_read(&mut self, i: usize) -> Result<u32, Refusal> {
         self.asked = self.asked.max(i + 1);
         let at = self.outs.get(i).copied();
         self.pick(at.as_ref(), "a result the statement does not carry")
-            .map(Buf)
     }
 
     /// The `i`-th weight the statement names.
@@ -365,10 +401,9 @@ impl<'a> Handles<'a> {
     /// # Errors
     ///
     /// [`Refusal::Absent`] when the statement names fewer.
-    pub fn weight(&mut self, i: usize) -> Result<Buf, Refusal> {
+    pub fn weight(&mut self, i: usize) -> Result<u32, Refusal> {
         let at = self.weights.get(i).copied();
         self.pick(at.as_ref(), "a weight the statement does not name")
-            .map(Buf)
     }
 
     /// One of the FIRE's tables: the token ids, the positions, the sampled
@@ -439,15 +474,15 @@ impl<'a> Handles<'a> {
 
     /// A handle for a slice the driver resolved itself -- a fire table, a KV
     /// page range.
-    pub fn state(&mut self, slice: Option<Slice>) -> Buf {
+    pub fn state(&mut self, slice: Option<Slice>) -> u32 {
         let bound = slice.map_or(NOTHING, |slice| BoundArg { slice, width: 0 });
-        Buf(self.take(bound))
+        self.take(bound)
     }
 
     /// The same, written.
-    pub fn state_mut(&mut self, slice: Option<Slice>) -> BufMut {
+    pub fn state_mut(&mut self, slice: Option<Slice>) -> u32 {
         let bound = slice.map_or(NOTHING, |slice| BoundArg { slice, width: 0 });
-        BufMut(self.take(bound))
+        self.take(bound)
     }
 
     /// The statement's scalars, as the one packed struct a kernel reads them
@@ -470,14 +505,14 @@ impl<'a> Handles<'a> {
     /// dereferences the pointer whether or not it reads a field -- and an
     /// argument slot left unbound holds whatever address the previous
     /// dispatch put there, which is a wild read rather than a dead one.
-    pub fn params_block(&mut self) -> Buf {
+    pub fn params_block(&mut self) -> u32 {
         self.words = self.params.iter().map(|p| p.unwrap_or(0)).collect();
         if self.words.is_empty() {
             self.words.push(0);
         }
         let at = self.take(NOTHING);
         self.block = Some(at);
-        Buf(at)
+        at
     }
 
     /// The statement's `i`-th scalar, as the signed number a kernel reads.

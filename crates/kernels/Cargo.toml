@@ -35,6 +35,11 @@ path = "src/lib.rs"
 # real dependency graph, which `lib.rs:1522` is careful about: *"the macro
 # lives in `kernels-macros` because `routine!` takes a PATH"*.
 kernels-macros = { path = "../kernels-macros" }
+# `#[routine]` REGISTERS ITS ROW BY EXISTING, through a distributed slice, so a
+# test that exercises the attribute needs the slice's crate the same way a real
+# plane does. A dev-dependency: `src` gains no edge, and the floor stays a
+# floor.
+linkme.workspace = true
 kernels-metal = { path = "../kernels-metal" }
 kernels-vulkan = { path = "../kernels-vulkan" }
 kernels-wgpu = { path = "../kernels-wgpu" }

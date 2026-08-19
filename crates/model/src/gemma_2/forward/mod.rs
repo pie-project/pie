@@ -114,14 +114,14 @@ pub fn gemma2_cuda(facts: &Gemma2Facts, class: FireClass) -> ForwardPlan {
             // The pre-attention query scale is its OWN launch, and every
             // gemma-2 applies it.
             let q = dsl::cuda::scalar_mul(&q, &format!("layer.{l}.query_scale"), None);
-            let (q, k) = dsl::cuda::rope(&q, &k);
+            let (q, k) = dsl::cuda::rope(&q, &k, facts.attn.heads, facts.attn.kv_heads, facts.attn.head_dim);
             let kv = dsl::Kv::at(t, l);
             dsl::cuda::write_kv_to_pages(&k, &v, &kv);
             dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
             // The attention logit softcap rides HERE, as a dispatch
             // parameter — see the module doc on why it is not a
             // statement of its own.
-            let o = dsl::cuda::attention_for(class, &q, &kv, window_left, facts.attn.head_dim)
+            let o = dsl::cuda::attention_for(class, &q, &kv, window_left, facts.attn.head_dim, crate::gemma_2::project::ATTN_LOGIT_SOFTCAP, 0.0)
                 .expect("a plain attention statement produces its value");
             let o = dsl::attention_landing(&o, &w.o_proj, l);
             // The POST norm, then an explicit add — gemma's pair.

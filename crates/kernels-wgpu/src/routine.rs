@@ -30,15 +30,23 @@ impl Backend for Wgpu {
     type Value = ArgValue;
     type Ctx<'a> = dyn Encode + 'a;
 
-    // NO SHAPE TO GIVE, and refusing is the whole of the correct answer.
-    //
-    // A region is `{address, rows, width}` and this backend's bound value is
-    // an address alone; wgpu and metal carry the launch's two widths as
-    // `Facts` fields instead, which is a per-LAUNCH statement rather than a
-    // per-operand one. Until a table here spells a fat `In<N, _>` this refusal
-    // is unreachable, and the first that does finds out at the first fire.
-    fn region(_value: &ArgValue, _at: usize) -> Result<Extent, Refusal> {
-        Err(Refusal::Absent { what: "a region's shape: the wgpu binder binds addresses only" })
+    // THIS PLANE MINTS REGION-SHAPED VALUES NOW, and that is §7 of
+    // `.wiki/migration.md` settled. It used to bind addresses alone and refuse
+    // here, so its marks answered zero for `rows` and `width` and every
+    // rectangle had to arrive as a separate parameter keyed to `keys::Width`,
+    // `keys::InWidth` or `keys::OutWidth0`. The widths were always there --
+    // `Holds::in_width` and `out_width` answered them for a `Kind::InWidth`
+    // slot -- they simply reached a parameter instead of the operand they
+    // describe.
+    fn region(value: &ArgValue) -> Result<Extent, Refusal> {
+        match *value {
+            ArgValue::Shaped { rows, width, .. } => Ok(Extent { rows, width }),
+            // `Absent`, not `Kind`: a plain handle carries no `Ty` mismatch,
+            // just no shape to report.
+            _ => Err(Refusal::Absent {
+                what: "a region's shape: the bound value carries only a handle",
+            }),
+        }
     }
 }
 
@@ -68,7 +76,39 @@ pub enum ArgValue {
     /// `vec2<u32>` — two words, low first. The width is why it is its own
     /// variant.
     Usize(u64),
+    /// A DEVICE ALLOCATION AND THE RECTANGLE THE STATEMENT GAVE IT.
+    ///
+    /// Minted by [`kernels::bind`] for an operand slot, and consumed by the
+    /// mark that unpacks it: `In<Tensor<bf16>>` keeps the shape, so `x.width`
+    /// is where a body reads its own operand's pitch. That is what took
+    /// `Width`, `InWidth` and `OutWidth0` off 337 parameter lists -- they were
+    /// a fact the operand beside them already implied, and the only reason
+    /// they could not come off the mark was that this plane bound addresses
+    /// alone.
+    ///
+    /// # It never reaches `Encode::fire`
+    ///
+    /// A body re-emits its operands through [`kernels::Bind::arg`], which
+    /// mints a plain [`Self::Buffer`]. So the shape exists between `bind` and
+    /// `unpack` and nowhere else, and no encoder has to know about it.
+    Shaped {
+        /// The caller's index for the allocation.
+        handle: u32,
+        /// Rows in this launch's rectangle.
+        rows: i32,
+        /// Elements per row. Zero where the statement gave none.
+        width: i32,
+    },
 }
+
+/// NO ABSENT VALUE TO MINT, and the default is the whole of the answer.
+///
+/// This plane binds HANDLES: every operand a statement places resolves to one,
+/// and a statement that placed none produces no value at all rather than an
+/// empty one. So `Option<M>` here always unpacks as `Some`, which is what
+/// [`kernels::routine::Absent`]'s default says. A plane that later grows a
+/// sentinel handle overrides both halves together.
+impl kernels::routine::Absent for ArgValue {}
 
 impl ArgValue {
     /// What this value is, for a refusal to name.
@@ -76,6 +116,7 @@ impl ArgValue {
     pub const fn kind(self) -> &'static str {
         match self {
             Self::Buffer(_) => "a buffer",
+            Self::Shaped { .. } => "a buffer",
             Self::I32(_) => "an i32",
             Self::U32(_) => "a u32",
             Self::F32(_) => "an f32",
@@ -84,27 +125,11 @@ impl ArgValue {
     }
 }
 
-/// One dispatch, as a routine body states it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Fire<'a> {
-    /// The shader file the entrypoint lives in, as [`mod@crate::source`] keys it —
-    /// `"rope/neox.wgsl"`.
-    pub module: &'a str,
-    /// The entrypoint, whole. A body that varies over an instantiation axis
-    /// picks the spelling itself; nothing pastes a suffix on afterwards.
-    pub entrypoint: &'a str,
-    /// LANES in each dimension -- elements of work, not workgroups.
-    ///
-    /// The division into workgroups is the driver's, because the divisor is a
-    /// property of the shader TEXT: `@workgroup_size` is declared in the WGSL
-    /// and recovered by reflection, so a body dividing by it would carry a
-    /// second copy of a number it cannot see.
-    ///
-    /// A body must not state a zero here. `dispatch_workgroups(0, 1, 1)` is
-    /// legal WebGPU that runs nothing and reports success, so a body with
-    /// nothing to do returns [`Refusal::Empty`] instead.
-    pub lanes: [u32; 3],
-}
+// THE PLANE'S OWN `Fire` STOOD HERE. It is `kernels::routine::Fire` now,
+// which CUDA states too -- the four facts were always the same four, and the
+// only difference was that CUDA passed them positionally. See that type for
+// what the shared `lanes`/`group` pair means.
+
 
 /// What a routine body dispatches through.
 ///
@@ -121,7 +146,26 @@ pub trait Encode {
     /// # Errors
     ///
     /// Whatever the device or the binding refused, as a [`Refusal`].
-    fn dispatch(&self, fire: Fire<'_>, args: &[ArgValue]) -> Result<(), Refusal>;
+    fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal>;
+
+    /// ONE VALUE, RESOLVED FROM THE COLUMN'S OWN VOCABULARY.
+    ///
+    /// What a body reaches through `ctx.ask::<C, keys::X>()` and
+    /// `ctx.params()`. The ANSWERING side is unchanged by this: the driver
+    /// already resolves a `(Ty, Source)` pair for every argument it binds --
+    /// `kernels::bind::one`, over its own `Holds` -- and this is that call,
+    /// made for a body instead of for a column.
+    ///
+    /// It exists because most of what used to be an `Env` parameter was
+    /// checkpoint configuration the statement now carries as a `Const`, and
+    /// what is left -- the batch, the plan, the allocator -- needed an ANSWER
+    /// rather than a parameter.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Unstated`] when this backend answers no such fact, and
+    /// whatever the fact's own absence means otherwise.
+    fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal>;
 }
 
 /// This backend's value, as the shared operand types read it.
@@ -134,6 +178,7 @@ pub trait Encode {
 impl ShaderValue for ArgValue {
     fn as_buffer(self) -> Option<u32> {
         match self {
+            Self::Shaped { handle, .. } => Some(handle),
             Self::Buffer(h) => Some(h),
             _ => None,
         }
@@ -161,6 +206,18 @@ impl ShaderValue for ArgValue {
             Self::Usize(v) => Some(v),
             _ => None,
         }
+    }
+    fn as_extent(self) -> Option<(i32, i32)> {
+        match self {
+            Self::Shaped { rows, width, .. } => Some((rows, width)),
+            _ => None,
+        }
+    }
+    fn buffer_at(handle: u32, rows: i32, width: i32) -> Self {
+        Self::Shaped { handle, rows, width }
+    }
+    fn buffer_mut_at(handle: u32, rows: i32, width: i32) -> Self {
+        Self::Shaped { handle, rows, width }
     }
     fn buffer(handle: u32) -> Self {
         Self::Buffer(handle)
@@ -192,6 +249,15 @@ impl kernels::shader::Lang for Wgpu {
     const U8S: &'static str = "array<u8>";
     const F32S: &'static str = "array<f32>";
     const F32S_MUT: &'static str = "array<f32>";
+    // `array<u32>`, AND IT IS NOT A PLACEHOLDER. WGSL has no 16-bit scalar at
+    // all, so an activation buffer really is declared as words and the shader
+    // unpacks halves -- `rope/neox.wgsl`'s `x: array<u32>` is the whole of it.
+    // The access mode rides the `var<storage, ..>` and not the type, which is
+    // why these two agree, exactly as `F32S`/`F32S_MUT` do.
+    const BF16S: &'static str = "array<u32>";
+    const BF16S_MUT: &'static str = "array<u32>";
+    const F16S: &'static str = "array<u32>";
+    const F16S_MUT: &'static str = "array<u32>";
     const I32: &'static str = "i32";
     const U32: &'static str = "u32";
     const F32: &'static str = "f32";
@@ -202,7 +268,12 @@ impl kernels::shader::Lang for Wgpu {
 /// The operand vocabulary, from the crate that holds it once. Re-exported
 /// rather than named through `kernels::shader` at every use, so a body's
 /// signature reads as this backend's own and a family file imports one module.
-pub use kernels::shader::{Bind, Buf, BufMut, F32s, F32sMut, I32s, InPacked, U8s, U32s, Usize};
+pub use kernels::shader::{Bind, InPacked, Tensor, Usize, bf16, f16};
+
+/// The two launch rules a body states its rectangle with, on this plane's own
+/// path — the same names `kernels-metal` and `kernels-vulkan` re-export, so a
+/// body reads the same on all three.
+pub use kernels::shader::{elementwise, elementwise_rows};
 
 /// What a routine body dispatches through, spelled as a body writes it.
 ///
@@ -212,34 +283,37 @@ pub use kernels::shader::{Bind, Buf, BufMut, F32s, F32sMut, I32s, InPacked, U8s,
 /// `'static` and a plain `dyn Encode` could not name it.
 pub type Ctx<'a> = dyn Encode + 'a;
 
+// THE ASKING SIDE, over the one method the driver implements.
+//
+// `Asks` is blanket-implemented for every `Answers`, so this is the whole of
+// what a plane states to give its bodies `ctx.ask::<C, keys::X>()`,
+// `ctx.params()` and `ctx.absent()`.
+impl kernels::routine::Answers<Wgpu> for Ctx<'_> {
+    fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
+        Encode::resolve(self, ty, source)
+    }
+}
+
 /// One routine, in this backend's instantiation of the machinery.
 pub type Routine = kernels::routine::Routine<Wgpu>;
 
-/// The backend's wrapper over [`kernels::routine!`], with [`Wgpu`] filled in
-/// so a declaration names only the `fn`:
+
+/// The fact keys a BODY asks the runtime with — `ctx.ask::<i32, keys::Rows>()`.
 ///
-/// ```ignore
-/// pub static ROUTINES: &[Routine] = &[
-///     routine!(rms_single_row),
-///     routine!(rope_neox_decode, in_place = &[(0, 0)]),
-/// ];
-/// ```
-#[macro_export]
-macro_rules! routine {
-    ($body:ident $(, $($fact:tt)*)?) => {
-        ::kernels::routine!($crate::routine::Wgpu, $body $(, $($fact)*)?)
-    };
-}
-
-/// The provenance of an argument, re-exported so a routine signature can say
-/// `Env<I32s>` without naming the machinery crate.
-pub use kernels::routine::Env;
-
-/// The slot marks, re-exported for the same reason: a routine signature states
-/// `OutSlot<0, BufMut>` or `Weight<2, F32s>` so the operand slot the arm binds
-/// this pointer from is a fact of the type, not of the hand-written arm alone.
+/// Not what a signature binds its scalars from any more: a scalar the
+/// checkpoint fixes is a `Const` the statement carries, and a key names only
+/// what a fire decides.
 pub use kernels::keys;
-pub use kernels::routine::{Ask, Block, Else, Held, InSlot, Nth, Null, OutSlot, Over, Param, ParamF32, ParamOr, ParamOrLit, Reckoned, Say, Times, Weight};
+pub use kernels::routine::{Const, Fire, In, InOut, Out};
 
-/// Re-exported for the same reason.
-pub use kernels::routine::Provenance as Supplier;
+/// What a body asks the runtime for, once `Env` is out of the parameter list.
+pub use kernels::routine::{Answers, Asks};
+
+
+// THE PLANE'S `routine!` WRAPPER STOOD HERE AND HAS NO CALLERS.
+//
+// It filled this backend in so a membership list could name only the
+// `fn`. There is no membership list: `#[routine]` builds the row beside
+// the `fn` and a distributed slice collects it, so the only caller of
+// `kernels::routine!` is the attribute, which names the backend through
+// `crate::Plane`.

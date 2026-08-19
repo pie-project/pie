@@ -548,7 +548,7 @@ fn what_the_plan_states_and_what_the_module_binds_account_for_each_other() {
             // of the statement, not of a retired row, and stated on the
             // routine for exactly that reason. `routine_for` is the join.
             let aliases =
-                driver_vulkan::hold::routine_for(symbol).map_or(0, |r| r.in_place.len());
+                driver_vulkan::hold::routine_for(symbol).map_or(0, |r| r.in_place().len());
             let args = args - u32::try_from(aliases).expect("a routine states few aliases");
             let Some(code) = kernels_vulkan::code(symbol, kernels_vulkan::Capability::Baseline)
             else {

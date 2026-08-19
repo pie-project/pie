@@ -86,12 +86,27 @@ use kernels_vulkan::Capability;
 /// have a cooperative-matrix module and 16 deliberately does not. A tier
 /// that changes nothing when you switch to it is a tier that is not running.
 pub trait Modules {
+    /// The module a body named, by the artifact it stated.
+    ///
+    /// THE FIRE PATH'S WHOLE LOOKUP. A routine composes this name from an
+    /// entrypoint and the tier [`crate::encode::Reflect::best`] gave it, so by
+    /// the time it arrives the choice is made and there is nothing left to
+    /// decide. No walk, no rule to spell a name with, and a name that names
+    /// nothing is a refusal — which is what keeps a mis-named artifact an
+    /// error instead of a silently slower kernel.
+    fn at(&self, file: &str) -> Option<&[u8]>;
+
     /// The best module for an entrypoint at `tier`, or `None`.
     ///
     /// Walks [`Capability::PREFERENCE`] from `tier` downward and takes the
     /// first the store has, so a device at `Coopmat` still gets the baseline
     /// module for an entrypoint that was never compiled with the extension --
     /// which is most of them, and is what "tiers are additive" means.
+    ///
+    /// **Not the fire path.** [`Self::at`] is. This survives for the plan's
+    /// own questions -- whether a symbol has a module at all, and which tier
+    /// answered -- which are asked of a name a plan carries rather than of one
+    /// a body composed.
     fn code(&self, symbol: &str, tier: Capability) -> Option<&[u8]>;
 
     /// WHICH capability supplied [`Self::code`]'s answer.
@@ -106,6 +121,11 @@ pub trait Modules {
 }
 
 impl Modules for BTreeMap<String, Vec<u8>> {
+    fn at(&self, file: &str) -> Option<&[u8]> {
+        self.get(file.strip_suffix(".spv").unwrap_or(file))
+            .map(Vec::as_slice)
+    }
+
     fn code(&self, symbol: &str, tier: Capability) -> Option<&[u8]> {
         Capability::PREFERENCE
             .iter()
@@ -143,6 +163,10 @@ impl Modules for BTreeMap<String, Vec<u8>> {
 pub struct Embedded;
 
 impl Modules for Embedded {
+    fn at(&self, file: &str) -> Option<&[u8]> {
+        kernels_vulkan::module::at(file)
+    }
+
     fn code(&self, symbol: &str, tier: Capability) -> Option<&[u8]> {
         Capability::PREFERENCE
             .iter()
@@ -167,6 +191,10 @@ impl Modules for Embedded {
 /// dozen `M: Modules` signatures below would have to become `M: ?Sized`, which
 /// is a change to the whole seam in order to say one thing about one caller.
 impl<T: Modules + ?Sized> Modules for Box<T> {
+    fn at(&self, file: &str) -> Option<&[u8]> {
+        (**self).at(file)
+    }
+
     fn code(&self, symbol: &str, tier: Capability) -> Option<&[u8]> {
         (**self).code(symbol, tier)
     }
@@ -920,7 +948,11 @@ fn record<M: Modules>(
         // `modules.code` answered for this symbol in pass one, so it answers
         // here.
         if pipelines.peek(symbol, tier).is_none() {
-            let code = modules.code(symbol, tier).unwrap_or_default();
+            // BY THE FILE THE BODY NAMED, not by a rule re-applied to the
+            // symbol. `Reflect::of` loaded these bytes from this same name a
+            // pass ago; spelling them a second way is what let the tier and
+            // the module disagree for the life of this crate.
+            let code = modules.at(d.file.as_ref()).unwrap_or_default();
             pipelines
                 .get(device, symbol, code, push, b.len() as u32, tier)
                 .map_err(|why| Unfired::Refused { at, why })?;
@@ -1317,13 +1349,23 @@ impl<'m, M: Modules> Reflection<'m, M> {
 }
 
 impl<M: Modules> crate::encode::Reflect for Reflection<'_, M> {
-    fn of(&self, entrypoint: &str) -> Option<Reflected> {
-        if let Some(held) = self.seen.borrow().get(entrypoint) {
+    fn best(&self) -> Capability {
+        self.tier
+    }
+
+    fn of(&self, file: &str, entrypoint: &str) -> Option<Reflected> {
+        if let Some(held) = self.seen.borrow().get(file) {
             return held.clone();
         }
+        // THE BODY ALREADY CHOSE. `kernels_vulkan::module::path` stepped down
+        // from this adapter's ceiling to what the build compiled, and `file`
+        // is that answer; loading it exactly is what keeps the body's choice
+        // and the loaded words the same fact. The walk that used to be here
+        // could only re-decide it, and for the life of this crate it decided
+        // wrong -- see the crate header on 146 modules that were never read.
         let made = self
             .modules
-            .code(entrypoint, self.tier)
+            .at(file)
             .and_then(|code| {
                 crate::spirv::words(code)
                     .and_then(|w| crate::spirv::declared(&w))
@@ -1340,7 +1382,7 @@ impl<M: Modules> crate::encode::Reflect for Reflection<'_, M> {
             });
         self.seen
             .borrow_mut()
-            .insert(entrypoint.to_owned(), made.clone());
+            .insert(file.to_owned(), made.clone());
         made
     }
 }
@@ -1534,17 +1576,30 @@ pub fn plan_routine<'a, R: Resolve, M: Modules>(
 
     drop(facts_span);
     let bind_span = crate::phase::span("fire/plan/routine/bind");
-    let mut handles = crate::hold::Handles::new(&bound, &ins, &outs, &weights, &params, resolver);
-    let values = crate::bind::bind(&routine.args, &routine.sources, &mut handles, facts)
-        .map_err(|why| Undispatchable::Refused {
-            symbol: symbol.to_owned(),
-            why,
-        })?;
+    // `RefCell`, BECAUSE A BODY MAY STILL ASK. With `Env` out of the parameter
+    // list a fact only the fire can answer is no longer bound into `values`
+    // before the body runs -- the body asks for it, and answering MINTS: a
+    // staged fact takes a handle. The binder's own borrow ends on this line,
+    // so the two never overlap.
+    let handles = core::cell::RefCell::new(crate::hold::Handles::new(
+        &bound, &ins, &outs, &weights, &params, resolver,
+    ));
+    let values = crate::bind::bind(
+        &routine.args,
+        &routine.sources,
+        &mut handles.borrow_mut(),
+        facts,
+    )
+    .map_err(|why| Undispatchable::Refused {
+        symbol: symbol.to_owned(),
+        why,
+    })?;
     drop(bind_span);
     let body_span = crate::phase::span("fire/plan/routine/body");
-    let taken = handles.bound().to_vec();
-    let staged = handles.staged();
-    let encoder = crate::encode::Encoder::new(reflection, &taken, &staged, launch.op);
+    let taken = handles.borrow().bound().to_vec();
+    let staged = handles.borrow().staged();
+    let encoder = crate::encode::Encoder::new(reflection, &taken, &staged, launch.op)
+        .answering(&handles, facts);
     (routine.body)(&encoder, &values).map_err(|why| Undispatchable::Refused {
         symbol: symbol.to_owned(),
         why,

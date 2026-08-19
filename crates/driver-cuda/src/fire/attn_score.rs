@@ -5,8 +5,7 @@
 // stderr is the C++'s refusal channel for these messages.
 #![allow(clippy::print_stderr)]
 
-use kernels::keys::{self, Fact};
-use kernels::routine::{Env, Unbound};
+
 use crate::fire::sideband_arena::{DeviceMemory, Region, SidebandArena};
 
 /// One layer's attention scores — the read side of `AttnScore`. `values` is
@@ -180,7 +179,7 @@ fn or_panic(what: &str, fired: Result<(), kernels::Refusal>) {
 ///
 /// The caller of `publish` must hold the fire's stream live across the launch.
 #[cfg(feature = "_cuda")]
-fn ctx_on(stream: *mut std::ffi::c_void) -> kernels_cuda::jit::Ctx {
+fn ctx_on<'a>(stream: *mut std::ffi::c_void) -> kernels_cuda::jit::Ctx<'a> {
     // SAFETY: as stated above.
     unsafe { kernels_cuda::jit::Ctx::on(stream) }
 }
@@ -284,7 +283,7 @@ impl ScoreOps for LiveScoreOps {
                 &ctx_on(self.stream),
                 scores,
                 score_indptr_d,
-                Env(qo_indptr_d),
+                qo_indptr_d,
                 kv_page_indptr_d,
                 kv_last_page_lens_d,
                 page_size,
@@ -333,7 +332,7 @@ impl ScoreOps for LiveScoreOps {
                 scores,
                 folded,
                 score_indptr_d,
-                Env(qo_indptr_d),
+                qo_indptr_d,
                 kv_page_indptr_d,
                 kv_last_page_lens_d,
                 page_size,
@@ -376,12 +375,12 @@ impl ScoreOps for LiveScoreOps {
             attn_score_fold_heads(
                 &ctx_on(self.stream),
                 raw,
-                Unbound { ptr: score_indptr_d },
-                keys::KvPageIndptr::env(kv_page_indptr_d),
-                Unbound { ptr: kv_last_page_lens_d },
-                keys::KvPageSize::env(page_size),
-                keys::RequestCount::env(num_requests),
-                keys::NumQHeads::env(num_q_heads),
+                score_indptr_d,
+                kv_page_indptr_d,
+                kv_last_page_lens_d,
+                page_size,
+                num_requests,
+                num_q_heads,
                 folded,
             ),
         );

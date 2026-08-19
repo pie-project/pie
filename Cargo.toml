@@ -454,6 +454,18 @@ rust-version = "1.91"
 # covered them all, and `Part::bytes` hands back a `Cow` rather than a
 # lookalike of one.
 [workspace.dependencies]
+# THE ROUTINE REGISTRY. `#[routine]` emits a row beside its `fn`, and a
+# distributed slice is what collects them without a list: each row lands in a
+# `linkme_ROUTINES` link section and the linker hands back the bounds, so
+# nothing enumerates and nothing can be left out of an enumeration.
+#
+# Chosen over `inventory` because it needs no life-before-main constructor --
+# the slice IS the section, resolved at link time, so the first read costs
+# nothing. Its two documented hazards do not reach this tree: every crate here
+# is an `rlib` (no `staticlib` a foreign linker would half-swallow), and the
+# collection was measured surviving `lto = "thin"`, `lto = "fat"`,
+# `strip = "symbols"` and `--gc-sections`.
+linkme = "0.3"
 ztensor = "2.1.1"
 ztensor-compat = "2.1.1"
 

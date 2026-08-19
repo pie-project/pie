@@ -22,6 +22,7 @@
 /// type to build it.
 pub mod merge_states;
 
+use kernels::{Bind, Fire};
 use core::ptr::NonNull;
 
 use crate::jit::{Ctx, Launch};
@@ -164,7 +165,7 @@ const fn merge_varlen_inst(head_dim: u32) -> Option<&'static str> {
 /// must outlive the launch. `s_merged` may be null — `cascade.cuh:253`,
 /// `:337` test it.
 pub fn merge_states(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     v: *mut bf16,
     s: *mut f32,
     v_merged: *mut bf16,
@@ -172,8 +173,7 @@ pub fn merge_states(
     num_index_sets: u32,
     seq_len: u32,
     num_heads: u32,
-    head_dim: u32,
-) -> Result<(), Refusal> {
+    head_dim: u32) -> Result<(), Refusal> {
     /// The widest block CUDA will launch, `cascade.cuh:661`'s implicit bound.
     const MAX_BLOCK_THREADS: u32 = 1024;
 
@@ -189,21 +189,14 @@ pub fn merge_states(
         let instantiation = merge_large_inst(head_dim).ok_or(NO_ROW)?;
         // SAFETY: the caller's contract -- every pointer bound here addresses
         // live device memory of the extent the kernel reads it as.
-        return unsafe {
-            ctx.launch(
-                "cascade/merge_states.cuh",
-                instantiation,
-                Launch::grid([seq_len, num_heads, 1], [bdx, bdy, 1]).smem(smem),
-                &[
+        return ctx.fire(Fire::at("cascade/merge_states.cuh", instantiation).apply(Launch::grid([seq_len, num_heads, 1], [bdx, bdy, 1]).smem(smem)), &[
                     v.arg(),
                     s.arg(),
                     v_merged.arg(),
                     NonNull::new(s_merged).arg(),
                     num_index_sets.arg(),
                     num_heads.arg(),
-                ],
-            )
-        };
+                ]);
     }
 
     // `cascade.cuh:659-664`. `bdy` is `num_heads` here, so the block width is
@@ -226,13 +219,7 @@ pub fn merge_states(
     // `:663`. Seven operands: this is the arm where `head_dim` is a parameter
     // rather than a template argument.
     //
-    // SAFETY: as above.
-    unsafe {
-        ctx.launch(
-            "cascade/merge_states.cuh",
-            instantiation,
-            Launch::grid([seq_len, 1, 1], [bdx, num_heads, 1]),
-            &[
+    ctx.fire(Fire::at("cascade/merge_states.cuh", instantiation).apply(Launch::grid([seq_len, 1, 1], [bdx, num_heads, 1])), &[
                 v.arg(),
                 s.arg(),
                 v_merged.arg(),
@@ -240,9 +227,7 @@ pub fn merge_states(
                 num_index_sets.arg(),
                 num_heads.arg(),
                 head_dim.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `VariableLengthMergeStates`, `cascade.cuh:686-736` — the ragged fold, and
@@ -290,7 +275,7 @@ pub fn merge_states(
 /// `seq_len` is a DEVICE `uint32_t*` overriding `max_seq_len`, or null
 /// (`cascade.cuh:375`). `ctx`'s stream must outlive the launch.
 pub fn merge_states_varlen(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     v: *mut bf16,
     s: *mut f32,
     indptr: *mut i32,
@@ -299,8 +284,7 @@ pub fn merge_states_varlen(
     max_seq_len: u32,
     seq_len: *mut u32,
     num_heads: u32,
-    head_dim: u32,
-) -> Result<(), Refusal> {
+    head_dim: u32) -> Result<(), Refusal> {
     let (_, bdx, bdy) = geometry(head_dim).ok_or(NO_ROW)?;
     let smem = smem_bytes(head_dim).ok_or(NO_ROW)?;
     let instantiation = merge_varlen_inst(head_dim).ok_or(NO_ROW)?;
@@ -316,12 +300,7 @@ pub fn merge_states_varlen(
     //
     // SAFETY: the caller's contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "cascade/merge_states.cuh",
-            instantiation,
-            Launch::grid([blocks, 1, 1], [bdx, bdy, 1]).smem(smem),
-            &[
+    ctx.fire(Fire::at("cascade/merge_states.cuh", instantiation).apply(Launch::grid([blocks, 1, 1], [bdx, bdy, 1]).smem(smem)), &[
                 v.arg(),
                 s.arg(),
                 indptr.arg(),
@@ -330,9 +309,7 @@ pub fn merge_states_varlen(
                 max_seq_len.arg(),
                 NonNull::new(seq_len).arg(),
                 num_heads.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// A required operand, refused by name rather than faulted inside the kernel.

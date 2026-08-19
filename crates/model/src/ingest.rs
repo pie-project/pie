@@ -561,6 +561,15 @@ const MODEL_TYPES: &[(&str, &str)] = &[
     ("qwen3", "qwen3"),
     ("qwen3_moe", "qwen3"),
     ("qwen3_5", "qwen3_5"),
+    // The DENSE text config, which was the one row missing: every other
+    // family with a `text_config` has its `_text` spelling here
+    // (`gemma3_text`, `gemma3n_text`, `gemma4_text`, `qwen3_5_moe_text`,
+    // `qwen3_vl_text`) because the compatibility probe reads
+    // `text_config.model_type` FIRST and only falls back to the top level.
+    // `Qwen/Qwen3.6-27B` states `qwen3_5` at the top and `qwen3_5_text`
+    // inside, so it read as unsupported while its own generation was right
+    // here.
+    ("qwen3_5_text", "qwen3_5"),
     ("qwen3_5_moe", "qwen3_5"),
     ("qwen3_5_moe_text", "qwen3_5"),
     ("qwen3_vl", "qwen3_5"),
@@ -685,7 +694,7 @@ fn hf_ingest(model_type: &str, names: &[&str]) -> Result<Vec<Ingest>, Error> {
             Some(pie) => out.push(Ingest::Rename(pie)),
             None if respells => {
                 return Err(Error::Contract(format!(
-                    "`{model_type}` publishes `{name}`, and this build's table for it has no                      row -- so pie has no name of its own to store it under. The table respells                      at least one tensor, so passing the name through would leave the artifact                      half in each vocabulary. Add the row in                      `crates/model/src/{generation}/import.rs`"
+                    "`{model_type}` publishes `{name}`, and this build's table for it has no row -- so pie has no name of its own to store it under. The table respells at least one tensor, so passing the name through would leave the artifact half in each vocabulary. Add the row in `crates/model/src/{generation}/import.rs`"
                 )));
             }
             None => out.push(Ingest::Rename((*name).to_string())),
@@ -822,7 +831,7 @@ mod tests {
         for generation in &gathered {
             assert!(
                 FAMILIES.iter().any(|f| f.generation == *generation),
-                "{generation} is gathered by the catalog and has no row in `FAMILIES` --                  add `crates/model/src/{generation}/import.rs` and a row here"
+                "{generation} is gathered by the catalog and has no row in `FAMILIES` -- add `crates/model/src/{generation}/import.rs` and a row here"
             );
         }
         for family in FAMILIES {
@@ -905,7 +914,7 @@ mod tests {
                     let wanted = spec.name.trim_end_matches(".bias");
                     assert!(
                         covered.iter().any(|c| c == wanted),
-                        "{} asks for `{}` and `crates/model/src/{}/import.rs` has no row                          that lowers to it",
+                        "{} asks for `{}` and `crates/model/src/{}/import.rs` has no row that lowers to it",
                         row.id(),
                         spec.name,
                         family.generation

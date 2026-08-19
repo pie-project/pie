@@ -19,14 +19,19 @@ pub mod keys;
 // in metal, vulkan and wgpu, generic over `shader::ShaderValue`. Not CUDA's.
 pub mod shader;
 
-pub use routine::{Arg, Backend, Env, KernelFn, Provenance, Refusal, Routine};
+pub use routine::{Answers, Arg, Asks, Backend, KernelFn, Refusal, Routine};
 // `Layout` is the ALLOCATION's shape; `Stride` is a row pitch deliberately not
 // an `i32`.
 pub use routine::{Elem, Layout, Region, Stride};
-// The CUDA plane's operand wrappers, which carry a whole rectangle. The shader
-// planes' `InSlot`/`OutSlot`/`InRow`/`OutRow` carry an address instead and live
-// in `routine` beside these; the two vocabularies are disjoint in use.
-pub use routine::{Aux, Bank, In, InOut, Out, Param, ParamF32, Unbound, Weight};
+// How a routine names the thing it runs, and how it hands values over. Shared
+// by all four planes: `Fire` carries the file, the entrypoint and the geometry,
+// `Geometry` is how a plane's own grid helper applies to one, and `Bind` is the
+// single spelling every argument answers `.arg()` with.
+pub use routine::{Bind, BindMut, Fire, Geometry, Grid};
+// The operand vocabulary, identical on every plane. Each carries the rectangle
+// its plane can carry -- CUDA a whole region, the shader planes a handle -- and
+// `Elem` is where that difference lives, not here.
+pub use routine::{Const, ConstRun, In, InOut, Out};
 
 /// A capability a seam may ask of the kernel covering its rows. Named after
 /// the seam vocabulary (`.wiki/tart/dsl.md` ①), because that is what a
@@ -760,48 +765,56 @@ impl Ty {
 }
 
 
-/// One operand as `#[routine]` read it off the launcher's own signature.
+/// What the SIGNATURE knows and a type cannot say.
 ///
-/// The same three questions [`Operand`] answers, asked of a Rust `fn`: what is
-/// this parameter called, may it be null, and where does a driver get it.
-/// There is no `ty` -- `KernelFn::ARGS` already carries it, and a second copy
-/// would only be a way to disagree.
+/// # What is not here any more
+///
+/// `source` and `stated` were. Both are answers a TYPE gives now:
+/// [`routine::Arg::CLAIM`] says which slot a mark wants and
+/// [`routine::KernelFn::SOURCES`] hands out the numbers, so a proc macro
+/// reading SYNTAX had nothing left to add. It had been adding a second,
+/// disagreeing copy -- CUDA bound from this column while the three shader
+/// planes bound from `sources`, and a dump of the two showed rows where one
+/// said `Slot(In, 0)` and the other said nothing.
+///
+/// What is left is what a type genuinely cannot reach: the parameter's own
+/// NAME, which lives in a `fn` the value-position `routine!` never sees, and
+/// whether a null may land there.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Derived {
-    /// The Rust parameter's name, which is also how the fact was recognised.
+    /// The Rust parameter's name, which is what a refusal is spelled with.
     pub name: &'static str,
     /// The parameter's type admits a null: `Option<NonNull<_>>` or
-    /// `MaybeConst<_>`. The same claim [`Operand::nullable`] makes by hand,
-    /// except that here the compiler is the one asserting it. Nothing reads
-    /// it, so it is a measurement rather than a switch a binder may act on.
-    /// `Or<_>` was a third spelling that REFUSED a null where these permit
-    /// one; it is deleted.
+    /// `MaybeConst<_>`. The claim [`Operand::nullable`] used to make by hand,
+    /// except that here the compiler is the one asserting it.
     pub nullable: bool,
-    /// Where a driver would bind this slot from, or `None` if the
-    /// signature does not say. A weight is never derived — see the
-    /// macro's docs, and [`Ty::binds`], which has always said that a weight
-    /// and an input are both `const T*`.
-    pub source: Option<Source>,
-    /// The signature SAID this, rather than the macro counting to it.
-    ///
-    /// NOT the same as `source.is_some()`: a bare `*const T` derives `In(0)`
-    /// and is unstated, and an `Env<f32>` named `rms_eps` derives from its
-    /// NAME and is also unstated. Only positional sources are walked.
-    pub stated: bool,
 }
 
-/// The operand column `#[routine]` read off a launcher's signature.
-///
-/// `#[routine]` emits `impl Derivation for <fn>` against a unit struct of the
-/// SAME spelling: Rust's value and type namespaces are separate, so the name
-/// is the function in expression position and the marker in type position.
-///
-/// `KernelFn::ARGS` cannot carry this. `ARGS` is built from parameter TYPES,
-/// and a source is not a type -- `#[source(..)]` is consumed at expansion, and
-/// a bare `*const T` is the same type at every position it could derive from.
 pub trait Derivation {
     /// The column, in the order the signature takes it.
     const DERIVED: &'static [Derived];
+
+    /// Where each argument's answer comes from, in the same order.
+    ///
+    /// Beside [`Derivation::DERIVED`] and not inside a [`Derived`] row,
+    /// because the two are computed differently: a row is what `#[routine]`
+    /// reads off the SYNTAX, and a source is what `resolve()` walks out of the
+    /// argument TYPES. Keeping them apart is what stopped the two columns
+    /// disagreeing; reaching both from the same marker is what lets a pin name
+    /// an index and a key in one place.
+    const SOURCES: &'static [Option<Source>];
+
+    /// The facts this routine's BODY asks the runtime for, by key.
+    ///
+    /// The column's `Env` half became `ctx.ask::<_, keys::X>()`, which is a
+    /// call and not a declaration — so the driver cross-check that walks
+    /// `SOURCES` asking *"does this backend answer every fact its own kernels
+    /// name"* would have lost half its subject. `#[routine]` scans the body
+    /// for the turbofish and emits the list here instead.
+    ///
+    /// Defaults to empty for the hand-written rows, which have no body to
+    /// scan.
+    const ASKED: &'static [&'static str] = &[];
 }
 
 /// Is this source the named fact `key`, in a `const` context?
@@ -917,6 +930,18 @@ pub enum Source {
     /// span, `width * rows`, and a probe moving facts one at a time sees the
     /// argument move twice and can name neither.
     Times(&'static Source, &'static Source),
+    /// ONE ADDRESS IN TWO SLOTS: the statement's `.0`th operand, which is
+    /// also its `.1`th result.
+    ///
+    /// What `in_place = &[(out, in)]` said on the row, said instead at the
+    /// parameter that is both -- see [`routine::InOut`]. The binder resolves
+    /// it as the INPUT, because that is the address the statement placed; the
+    /// allocator reads the pair and gives the result the same offset.
+    ///
+    /// Carried as two `u8`s rather than a chain of two `Source`s: a chain
+    /// means *"this one, or failing that, that one"*, and these are not
+    /// alternatives. They are one buffer with two names.
+    Alias(u8, u8),
     /// A QUOTIENT of two sources, refused when the divisor is zero.
     ///
     /// `rms_strided_head_row` normalizes each head of a row separately and
@@ -952,12 +977,6 @@ pub struct KernelSig {
     /// buffer) is not row-offsettable. `model-compiler`'s `OpKind::Peel` is
     /// the op this refuses, and its `check_plan` is what enforces the refusal.
     pub whole: bool,
-    /// Which OUTPUTS this kernel writes over which INPUTS, as
-    /// `(output index, input index)` pairs.
-    ///
-    /// A fact about the KERNEL and not about any statement using it -- every
-    /// call of `residual_add` is in-place -- which is why it lives here.
-    pub in_place: &'static [(u32, u32)],
     /// On a union tail layer this dispatch pairs the DEPTH PREFIX plan (and
     /// its dedicated workspace) instead of the fire's own plan.
     pub depth_prefix_plan: bool,
@@ -967,11 +986,20 @@ pub struct KernelSig {
     /// DERIVED, from [`routine::KernelFn::ARGS`], so it cannot disagree with
     /// the body. Empty means the row was written by hand — the three tables
     /// that predate the routine shape — and not that the routine is nullary.
-    pub args: &'static [(Ty, Provenance)],
-    /// Which side of the statement each argument sits on, in the same order.
+    pub args: &'static [Ty],
+    /// Where each argument comes from, in [`Self::args`] order.
     ///
-    /// DERIVED, from [`routine::KernelFn::SIDES`]. See [`routine::Side`].
-    pub sides: &'static [routine::Side],
+    /// Carries the ALIASING, which `in_place` used to state beside it: a
+    /// [`Source::Alias`] is one address wearing an operand slot and a result
+    /// slot. Same fact, read off the signature that is it.
+    pub sources: &'static [Option<Source>],
+    /// The parameter names and their NULLABILITY, in [`Self::args`] order.
+    ///
+    /// See [`routine::Declared::derived`]: a nullable operand is one the
+    /// statement need not place, so a reader comparing the signature's
+    /// operand count against the statement's needs it to know which of the
+    /// two is allowed to be short.
+    pub derived: &'static [Derived],
     /// The axes `symbol` is instantiated over, if it names a FAMILY of
     /// entrypoints rather than one.
     ///
@@ -1101,10 +1129,10 @@ mod tests {
         name: "",
         symbol: "",
         whole: false,
-        in_place: &[],
         depth_prefix_plan: false,
         args: &[],
-        sides: &[],
+        sources: &[],
+        derived: &[],
         axes: &[],
     };
 

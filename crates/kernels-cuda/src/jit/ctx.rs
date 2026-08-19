@@ -9,6 +9,7 @@
 //! capability) are process-wide statics in `jit/device.rs`, reached through
 //! methods here.
 
+use kernels::routine::Fire;
 use core::ffi::c_void;
 
 use kernels::routine::{Backend, Extent, Refusal};
@@ -25,17 +26,36 @@ pub struct Cuda;
 
 impl Backend for Cuda {
     type Value = ArgValue;
-    type Ctx<'a> = Ctx;
+    type Ctx<'a> = Ctx<'a>;
 
-    fn region(value: &ArgValue, _at: usize) -> Result<Extent, Refusal> {
+    fn region(value: &ArgValue) -> Result<Extent, Refusal> {
         match *value {
             ArgValue::Region { rows, width, .. } => Ok(Extent { rows, width }),
             // `Absent`, not `Kind`: the value carries no `Ty` mismatch, just
-            // no width/rows to report, so the position argument goes unused.
+            // no width/rows to report.
             _ => Err(Refusal::Absent {
                 what: "a region's shape: the bound value carries only an address",
             }),
         }
+    }
+}
+
+// THE ASKING SIDE, over the resolver the driver lent. `Asks` is
+// blanket-implemented for every `Answers`, so this is the whole of what this
+// plane states to give its bodies `ctx.ask::<C, keys::X>()`, `ctx.params()`
+// and `ctx.absent()`.
+impl kernels::routine::Answers<Cuda> for Ctx<'_> {
+    fn resolve(
+        &self,
+        ty: kernels::Ty,
+        source: kernels::Source,
+    ) -> Result<ArgValue, Refusal> {
+        self.env
+            .ok_or(Refusal::Unstated {
+                what: "a fact, on a context built for a hand-written call: \
+                       nothing behind it holds this fire's answers",
+            })?
+            .resolve(ty, source)
     }
 }
 
@@ -51,6 +71,12 @@ pub struct Launch {
     /// Every block of this grid must be resident at once — `grid.sync()`.
     /// A per-launch attribute: the same entry point can be launched either way.
     pub cooperative: bool,
+}
+
+impl kernels::routine::Geometry for Launch {
+    fn apply_to(self, fire: Fire) -> Fire {
+        self.apply_to_impl(fire)
+    }
 }
 
 impl Launch {
@@ -89,6 +115,48 @@ impl Launch {
         self
     }
 
+    /// This geometry, applied to a [`Fire`].
+    ///
+    /// `Fire` counts LANES and CUDA counts BLOCKS, which is the same pair from
+    /// the other end: `lanes = grid * block`, and `Fire::grid()` divides back
+    /// to exactly the grid stated here.
+    #[must_use]
+    fn apply_to_impl(self, fire: Fire) -> Fire {
+        fire.geometry(
+            [
+                self.grid[0].saturating_mul(self.block[0]),
+                self.grid[1].saturating_mul(self.block[1]),
+                self.grid[2].saturating_mul(self.block[2]),
+            ],
+            self.block,
+            self.smem,
+            self.cooperative,
+        )
+    }
+
+    /// This geometry, as the shared [`Fire`] at `file`'s `entrypoint`.
+    ///
+    /// `Fire` counts LANES and CUDA counts BLOCKS, which is the same pair from
+    /// the other end: `lanes = grid * block`, and `Fire::grid()` divides back
+    /// to exactly the grid stated here. Counting the total is what lets one
+    /// field mean one thing on four planes.
+    #[must_use]
+    pub const fn at(self, file: &'static str, entrypoint: &'static str) -> Fire {
+        Fire {
+            file,
+            entrypoint,
+            unit: "",
+            lanes: [
+                self.grid[0].saturating_mul(self.block[0]),
+                self.grid[1].saturating_mul(self.block[1]),
+                self.grid[2].saturating_mul(self.block[2]),
+            ],
+            group: self.block,
+            smem: self.smem,
+            cooperative: self.cooperative,
+        }
+    }
+
     /// Nothing to launch — an axis is zero.
     #[must_use]
     pub const fn empty(&self) -> bool {
@@ -108,13 +176,31 @@ impl Launch {
 /// collective's). The scratch allocator, multiprocessor count and compute
 /// capability are device-wide facts, not per-call, so they stay process-wide
 /// statics in `jit/device.rs` reached through a method here instead.
-pub struct Ctx {
+pub struct Ctx<'a> {
     stream: *mut c_void,
     cublas: *mut c_void,
     comm: Option<Plane>,
+    /// WHAT THIS FIRE ANSWERS, for a body that asks.
+    ///
+    /// `None` on a context built for a hand-written call, which is every
+    /// `Ctx::on` in a driver arm: those pass their arguments directly and ask
+    /// nothing. A body that asks on one of them gets [`Refusal::Unstated`],
+    /// which is the honest answer -- there is no fire behind it to ask.
+    ///
+    /// A trait object because `kernels-cuda` cannot name the driver's
+    /// resolver, exactly as the shader planes cannot name their encoder.
+    env: Option<&'a (dyn kernels::routine::Answers<Cuda> + 'a)>,
+    /// What the three raw pointers above are borrowed FROM.
+    ///
+    /// The stream and the cuBLAS handle already had to outlive every launch
+    /// made through this value -- `Ctx::on`'s `# Safety` says so in prose. A
+    /// lifetime says it to the compiler instead, and makes this plane's `&Ctx`
+    /// read as the other three planes' `&Ctx<'_>`, which is what a shader
+    /// plane's `dyn Encode + 'a` has always spelled.
+    held: core::marker::PhantomData<&'a ()>,
 }
 
-impl Ctx {
+impl<'a> Ctx<'a> {
     /// A context for one call, on `stream`, with no cuBLAS handle and no
     /// plane.
     ///
@@ -125,7 +211,13 @@ impl Ctx {
     /// asynchronous and ends when the stream is synchronised.
     #[must_use]
     pub const unsafe fn on(stream: *mut c_void) -> Self {
-        Self { stream, cublas: core::ptr::null_mut(), comm: None }
+        Self {
+            stream,
+            cublas: core::ptr::null_mut(),
+            comm: None,
+            env: None,
+            held: core::marker::PhantomData,
+        }
     }
 
     /// The same context, carrying the engine's cuBLAS handle.
@@ -164,6 +256,19 @@ impl Ctx {
     #[must_use]
     pub const unsafe fn with_comm(mut self, plane: Plane) -> Self {
         self.comm = Some(plane);
+        self
+    }
+
+    /// The same context, able to ANSWER a body that asks.
+    ///
+    /// What `Env` parameters used to arrive through. The driver resolves a
+    /// `(Ty, Source)` pair for every argument it binds already — that is
+    /// `kernels::bind::one` over its own `Holds` — and this lends the same
+    /// resolver to the body, so a fact only the fire can answer stops having
+    /// to be a parameter for the column to carry it.
+    #[must_use]
+    pub const fn with_env(mut self, env: &'a (dyn kernels::routine::Answers<Cuda> + 'a)) -> Self {
+        self.env = Some(env);
         self
     }
 
@@ -280,36 +385,48 @@ impl Ctx {
     /// once per instantiation, because a refusing kernel is fired once per
     /// layer per token.
     ///
-    /// # Safety
+    /// # The pointer obligation, and where it lives
     ///
     /// Every [`ArgValue::Ptr`] in `args` must address live device memory of
     /// the extent the kernel reads it as, and must stay live across the
     /// launch. Nothing here checks that; it is the same obligation every
     /// `<<<>>>` carried.
-    pub unsafe fn launch(
-        &self,
-        file: &'static str,
-        instantiation: &str,
-        launch: Launch,
-        args: &[ArgValue],
-    ) -> Result<(), Refusal> {
-        let Some(root) = Root::of(file) else {
-            return Err(Refusal::Undeclared);
+    ///
+    /// It is the ROUTINE's obligation and not this call's, which is why this
+    /// is not `unsafe fn`. A routine takes its pointers as `In<E>`/`Out<E>`
+    /// and documents them under its own `# Safety`; the `unsafe { }` that used
+    /// to sit here wrapped the whole argument list and so marked no particular
+    /// pointer, while making a CUDA body legible as a CUDA body at a glance --
+    /// four hundred and sixty-five of them, against none on the other three
+    /// planes running the same dispatch.
+    pub fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
+        // A NAMED UNIT OR THE FILE'S OWN. `Root::variant` is how FA2 and XQA
+        // reach a point in a file they compile several ways; everything else
+        // states no unit and the file names its root.
+        let root = if fire.unit.is_empty() {
+            match Root::of(fire.file) {
+                Some(root) => root,
+                None => return Err(Refusal::Undeclared),
+            }
+        } else {
+            Root::variant(fire.unit, fire.file)
         };
-        // SAFETY: the caller's obligation, forwarded.
-        unsafe { self.launch_at(&root, instantiation, launch, args) }
+        let launch = Launch {
+            grid: fire.grid(),
+            block: fire.group,
+            smem: fire.smem,
+            cooperative: fire.cooperative,
+        };
+        // SAFETY: the routine's obligation, forwarded -- see this method's doc.
+        unsafe { self.launch_at(&root, fire.entrypoint, launch, args) }
     }
 
-    /// The same, for a root that is not one carried file compiled one way.
-    ///
-    /// The two lattices only: FA2 and XQA name their points apart from the
-    /// file they share, so a point cannot be reached by naming a file. See
-    /// [`Root::variant`].
+    /// The same, for a root the caller already holds.
     ///
     /// # Safety
     ///
-    /// [`Ctx::launch`]'s.
-    pub unsafe fn launch_at(
+    /// [`Ctx::fire`]'s obligation, which is the routine's.
+    unsafe fn launch_at(
         &self,
         root: &Root,
         instantiation: &str,
@@ -320,11 +437,17 @@ impl Ctx {
             return Err(Refusal::Empty { what: "the grid" });
         }
         // SAFETY: the caller's obligation, forwarded.
-        unsafe { self.fire(root, instantiation, launch, args) }
+        unsafe { self.issue(root, instantiation, launch, args) }
     }
 
+    /// Resolve `instantiation` in `root` and issue it.
+    ///
+    /// Private and named apart from [`Ctx::fire`]: that one is the ROUTINE's
+    /// door and takes a [`Fire`], this one is what it calls once the module is
+    /// known. They were both `fire` for a while, which is one inherent impl
+    /// with two methods of one name.
     #[cfg(feature = "_cuda")]
-    unsafe fn fire(
+    unsafe fn issue(
         &self,
         root: &Root,
         instantiation: &str,
@@ -349,9 +472,10 @@ impl Ctx {
         }
     }
 
+    /// [`Ctx::issue`] where the build selected no CUDA runtime.
     #[cfg(not(feature = "_cuda"))]
     #[allow(clippy::unused_self, clippy::needless_pass_by_value)]
-    unsafe fn fire(
+    unsafe fn issue(
         &self,
         _root: &Root,
         _instantiation: &str,

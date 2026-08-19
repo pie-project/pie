@@ -123,6 +123,7 @@ pub const VARIANTS: &[KimiK3] = &[KimiK3 {
             value_head_dim: 128,
             conv_kernel: 4,
             gate_lower_bound_milli: 0,
+            norm_eps_micro: 10,
         },
         moe: spec::KimiK3MoeFacts {
             num_experts: 64,

@@ -4,11 +4,12 @@
 //! Every row here is one entrypoint. The dtype axis has a single point and
 //! carries no information today; it is declared rather than baked into the
 //! symbol so that a second activation dtype is a point, not eleven new names.
-#![allow(clippy::too_many_arguments)]
 
+use kernels_macros::routine;
+use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, InOut, Out, Tensor, bf16, elementwise, elementwise_rows, keys};
+use kernels::KernelSig;
 use kernels::routine::Refusal;
 
-use crate::routine::{Else, Nth, Over, Reckoned, Say, keys, Ask, Bind, Block, Buf, BufMut, Ctx, Env, Fire, I32s, InSlot, OutSlot, Param, ParamOr, Routine, Weight};
 
 /// The entrypoints this family's crossed routines spell, now that their
 /// rows are gone. See [`crate::RETIRED`].
@@ -138,22 +139,26 @@ fn per_head_row(heads: i32, rows: i32) -> Result<[u32; 3], Refusal> {
 /// # Errors
 ///
 /// See [`per_axis`].
+#[routine]
 pub fn rms_single_row(
     ctx: &Ctx<'_>,
-    x: InSlot<0, Buf>,
-    w: Weight<0, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    width: Ask<keys::Width, i32>,
-    axis: ParamOr<1, keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "rms_single_row_bfloat16",
-            lanes: per_axis(*width, *axis, *rows)?,
-        },
-        &[x.v(), w.v(), out.v(), params.v()],
+    x: In<Tensor<bf16>>,
+    w: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    // THE STRUCT'S FIRST TWO FIELDS, DECLARED SO THE SECOND ONE'S SLOT EXISTS.
+    // The body forwards `ctx.params()` whole, but the AXIS is the norm's own
+    // width and it is `params[1]` -- `ParamOr<1, ..>` at HEAD. `eps` holds
+    // slot 0 open for it. `x.width` is a row, which is the axis only when a
+    // row holds ONE norm; the strided twin below shows why that is not a rule.
+    eps: Const<f32>,
+    axis: Const<i32>) -> Result<(), Refusal> {
+    let _ = eps;
+    let params = ctx.params()?;
+    let width = x.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(crate::routine::module_path("rms_single_row_bfloat16", ctx.best()), "rms_single_row_bfloat16").apply(per_axis(width, *axis, rows)?),
+        &[x.arg(), w.arg(), out.arg(), params],
     )
 }
 
@@ -168,21 +173,30 @@ pub fn rms_single_row(
 /// # Errors
 ///
 /// See [`per_row`].
+#[routine]
 pub fn rms_strided_row(
     ctx: &Ctx<'_>,
-    x: InSlot<0, Buf>,
-    w: Weight<0, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    row_pitch: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "rms_strided_row_bfloat16",
-            lanes: per_row(*rows)?,
-        },
-        &[x.v(), w.v(), out.v(), params.v(), row_pitch.v()],
+    x: In<Tensor<bf16>>,
+    w: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    // THE STRUCT'S FIRST TWO FIELDS, DECLARED SO THE SLOTS EXIST.
+    // The body forwards `ctx.params()` whole -- the shader reads a struct --
+    // and neither scalar is read here: this plane's group size is the
+    // shader's own, so the launch is `per_row(rows)` and the axis never
+    // reaches a grid. Metal's twin DOES read it, because there the threadgroup
+    // width is the body's to choose (`rms_threads(*axis)`), and that
+    // difference is the whole reason both are declared: the statement carries
+    // the same two scalars to every plane, so the slots have to line up
+    // whether or not a given body has a use for them.
+    eps: Const<f32>,
+    axis: Const<i32>) -> Result<(), Refusal> {
+    let _ = (eps, axis);
+    let params = ctx.params()?;
+    let row_pitch = x.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(crate::routine::module_path("rms_strided_row_bfloat16", ctx.best()), "rms_strided_row_bfloat16").apply(per_row(rows)?),
+        &[x.arg(), w.arg(), out.arg(), params, row_pitch.arg()],
     )
 }
 
@@ -197,22 +211,30 @@ pub fn rms_strided_row(
 /// # Errors
 ///
 /// See [`per_head_row`].
+#[routine]
 pub fn rms_strided_head_row(
     ctx: &Ctx<'_>,
-    x: InSlot<0, Buf>,
-    w: Weight<0, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    row_pitch: Ask<keys::Width, i32>,
-    heads: Reckoned<Over<Say<keys::Width>, Else<Nth<1>, Say<keys::Width>>>, Env<i32>>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "rms_strided_head_row_bfloat16",
-            lanes: per_head_row(**heads, *rows)?,
-        },
-        &[x.v(), w.v(), out.v(), params.v(), row_pitch.v()],
+    x: In<Tensor<bf16>>,
+    w: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    // THE STRUCT'S FIRST TWO FIELDS, DECLARED SO THE SECOND ONE'S SLOT EXISTS.
+    // The body forwards `ctx.params()` whole -- the shader reads a struct --
+    // but the AXIS is the norm's own width and the body needs it to size the
+    // group, and it is NOT `x.width`: a strided row holds several norms and
+    // `x.width` is the pitch across all of them. `eps` is declared only to
+    // hold slot 0 open for it, and metal's twin declares both the same way.
+    eps: Const<f32>,
+    axis: Const<i32>) -> Result<(), Refusal> {
+    let _ = eps;
+    let params = ctx.params()?;
+    let row_pitch = x.width;
+    // HOW MANY NORMS FIT THE ROW -- the division HEAD spelled `Over<Say<Width>,
+    // Else<Nth<1>, ..>>`, which no driver answers as a fact.
+    let heads = if *axis > 0 { row_pitch / *axis } else { 0 };
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(crate::routine::module_path("rms_strided_head_row_bfloat16", ctx.best()), "rms_strided_head_row_bfloat16").apply(per_head_row(heads, rows)?),
+        &[x.arg(), w.arg(), out.arg(), params, row_pitch.arg()],
     )
 }
 
@@ -277,7 +299,7 @@ fn per_head_row_rotating(
 ///
 /// # The operand order is the SHADER's
 ///
-/// `x, w, params, position`, and `x` is bound once as a `BufMut` because the
+/// `x, w, params, position`, and `x` is bound once as a `Buf` because the
 /// rotation is in place, which is `rope.rs`'s convention and not
 /// [`rms_strided_head_row`]'s. The norm alone is out-of-place and states an
 /// input and an output; the fused form cannot be, because the rotation reads
@@ -300,34 +322,31 @@ fn per_head_row_rotating(
 /// # Errors
 ///
 /// See [`per_head_row_rotating`].
+#[routine]
 pub fn rms_rope(
     ctx: &Ctx<'_>,
-    x: OutSlot<0, BufMut>,
-    w: Weight<0, Buf>,
-    params: Block<Buf>,
-    position: Ask<keys::Positions, I32s>,
-    axis: ParamOr<1, keys::Width, i32>,
-    row_pitch: ParamOr<5, keys::Width, i32>,
-    rotary: ParamOr<6, keys::RotaryWidth, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
+    x: InOut<Tensor<bf16>>,
+    w: Const<Tensor<bf16>>,
+    rotary: Const<i32>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let position = ctx.ask::<Tensor<i32>, keys::Positions>()?;
+    let axis = x.width;
+    let row_pitch = x.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
     // The head count is `row_pitch / axis` and BOTH terms are read off the
     // params run rather than one off the run and one off the rectangle. They
     // are the same numbers either way when a text is right, and when it is
     // wrong the grid and the block would disagree silently -- a shader
     // indexing by one and a launch sized by the other.
-    let heads = if *axis > 0 { *row_pitch / *axis } else { 0 };
-    ctx.dispatch(
-        Fire {
-            entrypoint: "rms_rope_bfloat16",
-            lanes: per_head_row_rotating(heads, *rows, *rotary, *axis)?,
-        },
+    let heads = if axis > 0 { row_pitch / axis } else { 0 };
+    ctx.fire(
+        Fire::at(crate::routine::module_path("rms_rope_bfloat16", ctx.best()), "rms_rope_bfloat16").apply(per_head_row_rotating(heads, rows, *rotary, axis)?),
         // Four operands and NO scalars. Everything this kernel takes rides
         // the block, which `driver-vulkan`'s `encode` mints as the
         // statement's whole params run -- so the nine fields of
         // `RmsRopeParams` are nine stated params, in order, and the routine
         // adds nothing after them.
-        &[x.v(), w.v(), params.v(), position.v()],
+        &[x.arg(), w.arg(), params, position.arg()],
     )
 }
 
@@ -341,23 +360,20 @@ pub fn rms_rope(
 /// # Errors
 ///
 /// See [`per_axis`].
+#[routine]
 pub fn rms_residual(
     ctx: &Ctx<'_>,
-    x: InSlot<0, Buf>,
-    w: Weight<0, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    r: InSlot<1, Buf>,
-    width: Ask<keys::Width, i32>,
-    axis: ParamOr<1, keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "rms_residual_bfloat16",
-            lanes: per_axis(*width, *axis, *rows)?,
-        },
-        &[x.v(), w.v(), out.v(), params.v(), r.v()],
+    x: In<Tensor<bf16>>,
+    w: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    r: In<Tensor<bf16>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let width = x.width;
+    let axis = x.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(crate::routine::module_path("rms_residual_bfloat16", ctx.best()), "rms_residual_bfloat16").apply(per_axis(width, axis, rows)?),
+        &[x.arg(), w.arg(), out.arg(), params, r.arg()],
     )
 }
 
@@ -371,24 +387,21 @@ pub fn rms_residual(
 /// # Errors
 ///
 /// See [`per_axis`].
+#[routine]
 pub fn rms_residual_scaled(
     ctx: &Ctx<'_>,
-    x: InSlot<0, Buf>,
-    w: Weight<0, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    r: InSlot<1, Buf>,
-    s: InSlot<2, Buf>,
-    width: Ask<keys::Width, i32>,
-    axis: ParamOr<1, keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "rms_residual_scaled_bfloat16",
-            lanes: per_axis(*width, *axis, *rows)?,
-        },
-        &[x.v(), w.v(), out.v(), params.v(), r.v(), s.v()],
+    x: In<Tensor<bf16>>,
+    w: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    r: In<Tensor<bf16>>,
+    s: In<Tensor<bf16>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let width = x.width;
+    let axis = x.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(crate::routine::module_path("rms_residual_scaled_bfloat16", ctx.best()), "rms_residual_scaled_bfloat16").apply(per_axis(width, axis, rows)?),
+        &[x.arg(), w.arg(), out.arg(), params, r.arg(), s.arg()],
     )
 }
 
@@ -402,21 +415,18 @@ pub fn rms_residual_scaled(
 /// # Errors
 ///
 /// See [`per_axis`].
+#[routine]
 pub fn vnorm_single_row(
     ctx: &Ctx<'_>,
-    x: InSlot<0, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    width: Ask<keys::Width, i32>,
-    axis: ParamOr<1, keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "vnorm_single_row_bfloat16",
-            lanes: per_axis(*width, *axis, *rows)?,
-        },
-        &[x.v(), out.v(), params.v()],
+    x: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let width = x.width;
+    let axis = x.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(crate::routine::module_path("vnorm_single_row_bfloat16", ctx.best()), "vnorm_single_row_bfloat16").apply(per_axis(width, axis, rows)?),
+        &[x.arg(), out.arg(), params],
     )
 }
 
@@ -435,22 +445,24 @@ pub fn vnorm_single_row(
 /// # Errors
 ///
 /// See [`per_head_row`].
+#[routine]
 pub fn gated_rms(
     ctx: &Ctx<'_>,
-    x: InSlot<0, Buf>,
-    z: InSlot<1, Buf>,
-    w: Weight<0, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    heads: Ask<keys::VHeads, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "gated_rms_bfloat16",
-            lanes: per_head_row(*heads, *rows)?,
-        },
-        &[x.v(), z.v(), w.v(), out.v(), params.v()],
+    x: In<Tensor<bf16>>,
+    z: In<Tensor<bf16>>,
+    w: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    // BACK TO AN ASK, BECAUSE THIS ROUTINE'S PARAMS RUN IS A STRUCT.
+    // The body forwards `ctx.params()` whole -- the shader reads fields,
+    // not a scalar run -- so slot 0 is the struct's first field and a
+    // `Const` derived onto it reads that field's bits. HEAD spelled these
+    // `Ask<..>` for exactly this reason, and the drivers still answer them.
+    let heads = ctx.ask::<i32, keys::VHeads>()?;
+    let params = ctx.params()?;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(crate::routine::module_path("gated_rms_bfloat16", ctx.best()), "gated_rms_bfloat16").apply(per_head_row(heads, rows)?),
+        &[x.arg(), z.arg(), w.arg(), out.arg(), params],
     )
 }
 
@@ -462,23 +474,25 @@ pub fn gated_rms(
 /// # Errors
 ///
 /// See [`per_head_row`].
+#[routine]
 pub fn gated_rms_strided(
     ctx: &Ctx<'_>,
-    x: InSlot<0, Buf>,
-    z: InSlot<1, Buf>,
-    w: Weight<0, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    row_pitch: Ask<keys::Width, i32>,
-    heads: Ask<keys::VHeads, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "gated_rms_strided_bfloat16",
-            lanes: per_head_row(*heads, *rows)?,
-        },
-        &[x.v(), z.v(), w.v(), out.v(), params.v(), row_pitch.v()],
+    x: In<Tensor<bf16>>,
+    z: In<Tensor<bf16>>,
+    w: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    // BACK TO AN ASK, BECAUSE THIS ROUTINE'S PARAMS RUN IS A STRUCT.
+    // The body forwards `ctx.params()` whole -- the shader reads fields,
+    // not a scalar run -- so slot 0 is the struct's first field and a
+    // `Const` derived onto it reads that field's bits. HEAD spelled these
+    // `Ask<..>` for exactly this reason, and the drivers still answer them.
+    let heads = ctx.ask::<i32, keys::VHeads>()?;
+    let params = ctx.params()?;
+    let row_pitch = x.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(crate::routine::module_path("gated_rms_strided_bfloat16", ctx.best()), "gated_rms_strided_bfloat16").apply(per_head_row(heads, rows)?),
+        &[x.arg(), z.arg(), w.arg(), out.arg(), params, row_pitch.arg()],
     )
 }
 
@@ -491,21 +505,18 @@ pub fn gated_rms_strided(
 /// # Errors
 ///
 /// See [`crate::routine::elementwise`].
+#[routine]
 pub fn layer_scalar_mul(
     ctx: &Ctx<'_>,
-    x: InSlot<0, Buf>,
-    scalar: Weight<0, Buf>,
-    out: OutSlot<0, BufMut>,
-    _params: Block<Buf>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "layer_scalar_mul_bfloat16",
-            lanes: crate::routine::elementwise(*width, *rows)?,
-        },
-        &[x.v(), scalar.v(), out.v()],
+    x: In<Tensor<bf16>>,
+    scalar: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let _params = ctx.params()?;
+    let width = x.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(crate::routine::module_path("layer_scalar_mul_bfloat16", ctx.best()), "layer_scalar_mul_bfloat16").apply(elementwise(width, rows)?),
+        &[x.arg(), scalar.arg(), out.arg()],
     )
 }
 
@@ -518,20 +529,17 @@ pub fn layer_scalar_mul(
 /// # Errors
 ///
 /// See [`crate::routine::elementwise`].
+#[routine]
 pub fn residual_add(
     ctx: &Ctx<'_>,
-    x: InSlot<0, Buf>,
-    residual: InSlot<1, Buf>,
-    out: OutSlot<0, BufMut>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "residual_add_bfloat16",
-            lanes: crate::routine::elementwise(*width, *rows)?,
-        },
-        &[x.v(), residual.v(), out.v()],
+    x: In<Tensor<bf16>>,
+    residual: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let width = x.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(crate::routine::module_path("residual_add_bfloat16", ctx.best()), "residual_add_bfloat16").apply(elementwise(width, rows)?),
+        &[x.arg(), residual.arg(), out.arg()],
     )
 }
 
@@ -546,28 +554,29 @@ pub fn residual_add(
 /// # Errors
 ///
 /// See [`crate::routine::elementwise_rows`].
+#[routine]
 pub fn residual_add_strided(
     ctx: &Ctx<'_>,
-    x: InSlot<0, Buf>,
-    residual: InSlot<1, Buf>,
-    out: OutSlot<0, BufMut>,
-    row_pitch: Param<0, i32>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "residual_add_strided_bfloat16",
-            lanes: crate::routine::elementwise_rows(*width, *rows)?,
-        },
-        &[x.v(), residual.v(), out.v(), row_pitch.v()],
+    x: In<Tensor<bf16>>,
+    residual: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    // THE STATEMENT'S PITCH, WHICH WAS `Param<0, i32>`. A stride is the
+    // rectangle the text laid out -- two fires of one deployment stride the
+    // same way -- so it fails `ask`'s own test and no driver answers
+    // `keys::RowPitch`.
+    row_pitch: Const<i32>) -> Result<(), Refusal> {
+    let width = x.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(crate::routine::module_path("residual_add_strided_bfloat16", ctx.best()), "residual_add_strided_bfloat16").apply(elementwise_rows(width, rows)?),
+        &[x.arg(), residual.arg(), out.arg(), row_pitch.arg()],
     )
 }
 
 /// The Qwen-2 family's attention biases, IN PLACE over the value they bias.
 ///
 /// One buffer that is both the input and the result -- which is why `out` is
-/// the only activation here and why it is `BufMut`. The bias is one vector of
+/// the only activation here and why it is `Buf`. The bias is one vector of
 /// `width`, broadcast down every row.
 ///
 /// `width` is a real argument and not an extent: the shader reads it from the
@@ -579,62 +588,95 @@ pub fn residual_add_strided(
 /// # Errors
 ///
 /// See [`crate::routine::elementwise_rows`].
+#[routine]
 pub fn add_bias(
     ctx: &Ctx<'_>,
-    out: OutSlot<0, BufMut>,
-    bias: Weight<0, Buf>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "add_bias_bfloat16",
-            lanes: crate::routine::elementwise_rows(*width, *rows)?,
-        },
-        &[out.v(), bias.v(), width.v()],
+    out: InOut<Tensor<bf16>>,
+    bias: Const<Tensor<bf16>>) -> Result<(), Refusal> {
+    let width = out.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(crate::routine::module_path("add_bias_bfloat16", ctx.best()), "add_bias_bfloat16").apply(elementwise_rows(width, rows)?),
+        &[out.arg(), bias.arg(), width.arg()],
     )
 }
 
-/// The twelve, in the order the rows above name them.
-pub static ROUTINES: &[Routine] = &[
-    // The one in-place pair in the family, and a REAL one unlike a rotation's:
-    // the trace's `AddBias` states an input and an output, and the kernel
-    // binds only the output because they are the same bytes. A rotation binds
-    // one `BufMut` too, but its statement has no input to alias -- which is
-    // why `rope` states nothing here and this does.
-    crate::routine!(add_bias, in_place = &[(0, 0)]),
-    crate::routine!(gated_rms),
-    crate::routine!(gated_rms_strided),
-    crate::routine!(layer_scalar_mul),
-    crate::routine!(residual_add),
-    crate::routine!(residual_add_strided),
-    crate::routine!(rms_residual),
-    // In place, like every rotation and unlike every other norm: the trace
-    // states the tensor as an input and an output and the kernel binds one
-    // `BufMut` for both, because the rotation reads what the norm just wrote
-    // and there is no second buffer between them to name.
-    crate::routine!(rms_rope, in_place = &[(0, 0)]),
-    crate::routine!(rms_residual_scaled),
-    crate::routine!(rms_single_row),
-    crate::routine!(rms_strided_head_row),
-    crate::routine!(rms_strided_row),
-    crate::routine!(vnorm_single_row),
-];
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routine::{ArgValue, Encode};
-    use core::cell::RefCell;
+    use crate::routine::{ArgValue, Const, Encode, Tensor};
+    use core::cell::{Cell, RefCell};
 
     type Call = (String, [u32; 3], Vec<ArgValue>);
 
-    #[derive(Default)]
-    struct Seen(RefCell<Vec<Call>>);
+    /// An `Encode` that remembers, and answers the facts this family's bodies
+    /// ask for.
+    ///
+    /// `rows` backs every routine's `ctx.ask::<i32, keys::Rows>()`; the two
+    /// families that ask something else -- `rms_strided_head_row`'s
+    /// `HeadsPerRow` and `residual_add_strided`'s `RowPitch` -- get a field of
+    /// their own. `HeadsPerRow`'s own `Source` is a chain
+    /// (`width / (params[1] or width)`, see `keys::HeadsPerRow`), so it is
+    /// matched by comparing the whole `Source` rather than by a `Named`
+    /// string. `ctx.params()`, which every routine but `residual_add` and
+    /// `residual_add_strided` calls for a block none of these tests inspect
+    /// the CONTENTS of, is answered generically by `Ty` alone.
+    struct Seen {
+        calls: RefCell<Vec<Call>>,
+        rows: Cell<i32>,
+        vheads: Cell<i32>,
+        heads_per_row: Cell<i32>,
+        row_pitch: Cell<i32>,
+    }
+
+    impl Default for Seen {
+        fn default() -> Self {
+            Self {
+                calls: RefCell::default(),
+                rows: Cell::new(1),
+                vheads: Cell::new(8),
+                heads_per_row: Cell::new(1),
+                row_pitch: Cell::new(1),
+            }
+        }
+    }
 
     impl Encode for Seen {
-        fn dispatch(&self, fire: Fire<'_>, args: &[ArgValue]) -> Result<(), Refusal> {
-            self.0
+        fn resolve(
+            &self,
+            ty: kernels::Ty,
+            source: kernels::Source,
+        ) -> Result<ArgValue, Refusal> {
+            // The statement's own scalars, read by index where the params run
+            // is the shader's struct -- see `Asks::param`.
+            if let kernels::Source::Slot(kernels::Kind::Param, n) = source {
+                let _ = n;
+                return Ok(ArgValue::I32(4096));
+            }
+            use kernels::keys::Fact;
+            // The geometry these bodies read now that their params run is a
+            // STRUCT and no slot in it is theirs to take.
+            if source == <keys::VHeads as Fact>::SOURCE {
+                return Ok(ArgValue::I32(self.vheads.get()));
+            }
+            if source == <keys::Rows as Fact>::SOURCE {
+                return Ok(ArgValue::I32(self.rows.get()));
+            }
+            if source == <keys::HeadsPerRow as Fact>::SOURCE {
+                return Ok(ArgValue::I32(self.heads_per_row.get()));
+            }
+            if matches!(ty, kernels::Ty::Buf) {
+                return Ok(ArgValue::Buffer { handle: 900, writes: false, rows: 0, width: 0 });
+            }
+            // Anything else is refused: a probe that invented an answer to a
+            // fact it does not know would let a body pass under test while
+            // the same fact went unanswered on a real driver.
+            Err(Refusal::Unstated { what: "a fact this probe does not answer" })
+        }
+
+        fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
+            self.calls
                 .borrow_mut()
                 .push((fire.entrypoint.to_string(), fire.lanes, args.to_vec()));
             Ok(())
@@ -655,20 +697,26 @@ mod tests {
     #[test]
     fn a_reduction_is_launched_by_the_workgroup_and_an_elementwise_op_by_the_lane() {
         let seen = Seen::default();
+        seen.rows.set(3);
         rms_single_row(
             &seen,
-            InSlot::new(Buf(0)),
-            Weight::new(Buf(1)),
-            OutSlot::new(BufMut(2)),
-            Block::new(Buf(3)),
-            Ask::new(128),
-            ParamOr::new(128),
-            Ask::new(3),
+            In { ptr: Tensor::<bf16>::new(0), rows: 3, width: 128 },
+            Const::new(Tensor::<bf16>::new(1)),
+            Out { ptr: Tensor::<bf16>::new(2), rows: 3, width: 128 },
+            // The struct's first two fields: this row holds ONE norm, so the
+            // axis is the row's own 128.
+            Const::new(1e-5),
+            Const::new(128))
+        .expect("a launch");
+        residual_add(
+            &seen,
+            In { ptr: Tensor::<bf16>::new(0), rows: 3, width: 128 },
+            In { ptr: Tensor::<bf16>::new(1), rows: 3, width: 128 },
+            Out { ptr: Tensor::<bf16>::new(2), rows: 3, width: 128 },
         )
         .expect("a launch");
-        residual_add(&seen, InSlot::new(Buf(0)), InSlot::new(Buf(1)), OutSlot::new(BufMut(2)), Ask::new(128), Ask::new(3)).expect("a launch");
 
-        let calls = seen.0.borrow();
+        let calls = seen.calls.borrow();
         assert_eq!(
             (calls[0].1, calls[1].1),
             ([768, 1, 1], [384, 1, 1]),
@@ -690,30 +738,32 @@ mod tests {
     #[test]
     fn a_two_level_norm_carries_the_head_on_its_own_grid_axis() {
         let seen = Seen::default();
+        seen.rows.set(5);
         rms_strided_head_row(
             &seen,
-            InSlot::new(Buf(0)),
-            Weight::new(Buf(1)),
-            OutSlot::new(BufMut(2)),
-            Block::new(Buf(3)),
-            Ask::new(4096),
-            Reckoned::new(Env(8)),
-            Ask::new(5),
+            In { ptr: Tensor::<bf16>::new(0), rows: 5, width: 4096 },
+            Const::new(Tensor::<bf16>::new(1)),
+            Out { ptr: Tensor::<bf16>::new(2), rows: 5, width: 4096 },
+            // The struct's first two fields. Eight heads across a 4096-wide
+            // row is a 512-wide norm, and the body divides one by the other
+            // rather than being told the count a second time.
+            Const::new(1e-5),
+            Const::new(512),
         )
         .expect("a launch");
+        // `gated_rms` takes its head count as a `Const<i32>` parameter, not
+        // an ask -- unlike the strided form beside it, it reads the head
+        // count back out of the GRID rather than the row, so there is no
+        // `x.width` here for it to derive one from.
         gated_rms(
             &seen,
-            InSlot::new(Buf(0)),
-            InSlot::new(Buf(1)),
-            Weight::new(Buf(2)),
-            OutSlot::new(BufMut(3)),
-            Block::new(Buf(4)),
-            Ask::new(8),
-            Ask::new(5),
-        )
+            In { ptr: Tensor::<bf16>::new(0), rows: 5, width: 0 },
+            In { ptr: Tensor::<bf16>::new(1), rows: 5, width: 0 },
+            Const::new(Tensor::<bf16>::new(2)),
+            Out { ptr: Tensor::<bf16>::new(3), rows: 5, width: 0 })
         .expect("a launch");
 
-        let calls = seen.0.borrow();
+        let calls = seen.calls.borrow();
         assert_eq!(
             (calls[0].1, calls[1].1),
             ([256, 8, 5], [256, 8, 5]),
@@ -733,11 +783,24 @@ mod tests {
     #[test]
     fn a_strided_elementwise_op_is_a_rectangle_and_a_flat_one_is_a_run() {
         let seen = Seen::default();
-        residual_add(&seen, InSlot::new(Buf(0)), InSlot::new(Buf(1)), OutSlot::new(BufMut(2)), Ask::new(128), Ask::new(3)).expect("a launch");
-        residual_add_strided(&seen, InSlot::new(Buf(0)), InSlot::new(Buf(1)), OutSlot::new(BufMut(2)), Param::new(4096), Ask::new(128), Ask::new(3))
-            .expect("a launch");
+        seen.rows.set(3);
+        residual_add(
+            &seen,
+            In { ptr: Tensor::<bf16>::new(0), rows: 3, width: 128 },
+            In { ptr: Tensor::<bf16>::new(1), rows: 3, width: 128 },
+            Out { ptr: Tensor::<bf16>::new(2), rows: 3, width: 128 },
+        )
+        .expect("a launch");
+        seen.row_pitch.set(4096);
+        residual_add_strided(
+            &seen,
+            In { ptr: Tensor::<bf16>::new(0), rows: 3, width: 128 },
+            In { ptr: Tensor::<bf16>::new(1), rows: 3, width: 128 },
+            Out { ptr: Tensor::<bf16>::new(2), rows: 3, width: 128 },
+         Const::new(4096))
+        .expect("a launch");
 
-        let calls = seen.0.borrow();
+        let calls = seen.calls.borrow();
         assert_eq!(
             (calls[0].1, calls[1].1),
             ([384, 1, 1], [128, 3, 1]),
@@ -757,9 +820,15 @@ mod tests {
     #[test]
     fn a_bias_is_launched_on_the_width_it_is_told() {
         let seen = Seen::default();
-        add_bias(&seen, OutSlot::new(BufMut(0)), Weight::new(Buf(1)), Ask::new(640), Ask::new(7)).expect("a launch");
+        seen.rows.set(7);
+        add_bias(
+            &seen,
+            InOut { ptr: Tensor::<bf16>::new(0), rows: 7, width: 640 },
+            Const::new(Tensor::<bf16>::new(1)),
+        )
+        .expect("a launch");
 
-        let call = &seen.0.borrow()[0];
+        let call = &seen.calls.borrow()[0];
         assert_eq!(call.1, [640, 7, 1], "the grid is the pushed width by rows");
         assert_eq!(
             call.2.last(),

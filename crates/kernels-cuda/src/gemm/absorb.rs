@@ -15,13 +15,15 @@
 //! [`crate::jit::ArgValue`], so no trace statement could name one. It comes
 //! off [`Ctx::cublas`], which refuses for a context built without one.
 
+use kernels_macros::routine;
 use core::ffi::c_void;
 
 use crate::jit::Ctx;
+use crate::jit::abi::Tensor;
 use kernels::keys;
-use kernels::routine::{Bank, Env, In, Out};
+use kernels::routine::{Asks, Const, In, Out};
 use kernels::Refusal;
-// Both launchers spell the attribute in full as `#[kernels_macros::routine]`:
+// Both launchers spell the attribute in full as `#[routine]`:
 // there is deliberately no `use crate::routine` here, so `layout.rs:13-20`'s
 // collision cannot arise.
 
@@ -122,45 +124,40 @@ unsafe fn absorb(
 /// `kv_b_proj` the whole `heads * (qk_nope_dim + v_head_dim) * kv_lora_rank`
 /// bank, and `q_latent` `tokens * heads * kv_lora_rank` writable elements —
 /// all live across the launch, which is asynchronous on the handle's stream.
-#[allow(clippy::too_many_arguments)]
-#[kernels_macros::routine]
+#[routine]
 pub fn mla_absorb_q_to_latent_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     // `bind/mod.rs`'s `mla_absorb` passes `b.args[0]`, which is input zero of
     // the trace's operand run (inputs, outputs, weights, in that order).
-    q_nope: In<0, c_void>,
+    q_nope: In<Tensor<c_void>>,
     // THE POSITIONAL BANK, NOT THE NAMED ONE. This is bound from
     // `b.args[spec.n_in + spec.n_out]` — a position in the statement's own
     // operand list. `Weight<0, _>` would reach `f.weight_named(0)`, a
     // different table holding a different pointer.
-    kv_b_proj: Bank<0, c_void>,
+    kv_b_proj: Const<Tensor<c_void>>,
     // `b.args[spec.n_in]` — output zero of the same run, read positionally.
-    q_latent: Out<0, c_void>,
-    // `mla_absorb` passes `rows`, which is this: `f.rows.count`, the rows this
-    // launch serves — NOT `f.rows.total`, the whole fire's count. `keys::Rows`
-    // is the fallback spelling for a signature with no region to read the row
-    // count off, and this one has none: the head pitch is not any operand's
-    // extent, so a region here would carry a true row count and a fictional
-    // width.
-    tokens: Env<keys::Rows>,
-    // THE FOUR THAT KEEP THIS ROW OFF THE TABLE PATH, and the reason moved
-    // in Stage 3. `mla_absorb` reads them as `spec.params[0..4]`, which
-    // `operand` now ANSWERS (`bind/table.rs:1054-1070`) -- so `Param<0, i32>`
-    // through `Param<3, i32>` would be true of every one of them, and the
-    // family header records why they still say `i32`: `bind/mod.rs:1404-1414`
-    // spells this signature out as a `call:` fn-pointer type with four bare
-    // `i32`s, and that type is the driver's. They stay unsourced until the
-    // two edits can land together.
-    //
-    // What has NOT changed is why they ride the param channel at all: each
-    // absorb takes the WHOLE `kv_b_proj` bank and slices it itself, so the
-    // head pitch is not any operand's extent and no `InWidth`/`OutWidth`
-    // could reach them.
+    q_latent: Out<Tensor<c_void>>,
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<i32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
     heads: i32,
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<i32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
     qk_nope_dim: i32,
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<i32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
     v_head_dim: i32,
-    kv_lora_rank: i32,
-) -> Result<(), Refusal> {
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<i32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
+    kv_lora_rank: i32) -> Result<(), Refusal> {
+    let tokens = ctx.ask::<i32, keys::Rows>()?;
     let handle = ctx.cublas()?;
     // The archive's `if (tokens <= 0 || heads <= 0) return;`, which was a
     // bare return under `()`. This function's own `# Errors` has always said
@@ -169,7 +166,7 @@ pub fn mla_absorb_q_to_latent_bf16(
     // archive's `tokens <= 0 || heads <= 0`" -- so the doc, the caller and
     // `gemm_service_parity`'s degenerate rows all named a refusal that the
     // body never made. It fell through to cuBLAS with a zero extent instead.
-    if **tokens <= 0 {
+    if tokens <= 0 {
         return Err(Refusal::Empty { what: "tokens" });
     }
     if heads <= 0 {
@@ -182,11 +179,11 @@ pub fn mla_absorb_q_to_latent_bf16(
         absorb(
             handle,
             cublasOperation_t::CUBLAS_OP_N,
-            kv_b_proj.ptr,
+            kv_b_proj.v,
             q_nope.ptr,
             q_latent.ptr,
             kv_lora_rank,
-            **tokens,
+            tokens,
             qk_nope_dim,
             kv_lora_rank,
             i64::from(qk_nope_dim + v_head_dim) * i64::from(kv_lora_rank),
@@ -200,7 +197,7 @@ pub fn mla_absorb_q_to_latent_bf16(
     }
     #[cfg(not(feature = "_cuda"))]
     let _ =
-        (handle, q_nope.ptr, kv_b_proj.ptr, q_latent.ptr, *tokens, heads, qk_nope_dim, v_head_dim, kv_lora_rank);
+        (handle, q_nope.ptr, kv_b_proj.v, q_latent.ptr, tokens, heads, qk_nope_dim, v_head_dim, kv_lora_rank);
     Ok(())
 }
 
@@ -214,30 +211,36 @@ pub fn mla_absorb_q_to_latent_bf16(
 ///
 /// As [`mla_absorb_q_to_latent_bf16`]'s, with `attn_latent` in place of
 /// `q_nope` and `attn_v` (`tokens * heads * v_head_dim`) as the output.
-#[allow(clippy::too_many_arguments)]
-#[kernels_macros::routine]
+#[routine]
 pub fn mla_absorb_latent_to_v_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     // As [`mla_absorb_q_to_latent_bf16`]'s `q_nope`: `bind/mod.rs` runs both
     // symbols through one `mla_absorb` helper, so one binding decides both.
-    attn_latent: In<0, c_void>,
+    attn_latent: In<Tensor<c_void>>,
     // The same positional bank, decided by the same binding.
-    kv_b_proj: Bank<0, c_void>,
-    attn_v: Out<0, c_void>,
-    // The twin of [`mla_absorb_q_to_latent_bf16`]'s `tokens`; the reasoning is
-    // written once, there.
-    tokens: Env<keys::Rows>,
-    // `spec.params[0..4]`, as above -- answerable as `Param<0..3, i32>` and
-    // unsourced until `bind/mod.rs:1404-1414`'s fn-pointer type can move with
-    // them. This row is the PROOF of the reason they ride the param channel:
-    // `qk_nope_dim` and `kv_lora_rank` are used below to OFFSET INSIDE the
-    // bank rather than to describe an operand, and an extent that names a
-    // slice of a weight is not a fact about any region the statement placed.
+    kv_b_proj: Const<Tensor<c_void>>,
+    attn_v: Out<Tensor<c_void>>,
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<i32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
     heads: i32,
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<i32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
     qk_nope_dim: i32,
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<i32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
     v_head_dim: i32,
-    kv_lora_rank: i32,
-) -> Result<(), Refusal> {
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<i32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
+    kv_lora_rank: i32) -> Result<(), Refusal> {
+    let tokens = ctx.ask::<i32, keys::Rows>()?;
     let handle = ctx.cublas()?;
     // The archive's `if (tokens <= 0 || heads <= 0) return;`, which was a
     // bare return under `()`. This function's own `# Errors` has always said
@@ -246,18 +249,18 @@ pub fn mla_absorb_latent_to_v_bf16(
     // archive's `tokens <= 0 || heads <= 0`" -- so the doc, the caller and
     // `gemm_service_parity`'s degenerate rows all named a refusal that the
     // body never made. It fell through to cuBLAS with a zero extent instead.
-    if **tokens <= 0 {
+    if tokens <= 0 {
         return Err(Refusal::Empty { what: "tokens" });
     }
     if heads <= 0 {
         return Err(Refusal::Empty { what: "heads" });
     }
     // SAFETY: the offset lands inside the same bank the caller guaranteed —
-    // `W_v` begins after `W_k`'s `qk_nope_dim * kv_lora_rank` bf16 elements,
+    // `W_v` begins after `W_k`'s `qk_nope_dim kv_lora_rank` bf16 elements,
     // which is twice that many BYTES.
     let wv = unsafe {
         kv_b_proj
-            .ptr
+            .v
             .cast::<u8>()
             .add(2 * (qk_nope_dim as usize) * (kv_lora_rank as usize))
             .cast::<c_void>()
@@ -273,7 +276,7 @@ pub fn mla_absorb_latent_to_v_bf16(
             attn_latent.ptr,
             attn_v.ptr,
             v_head_dim,
-            **tokens,
+            tokens,
             kv_lora_rank,
             kv_lora_rank,
             i64::from(qk_nope_dim + v_head_dim) * i64::from(kv_lora_rank),
@@ -287,6 +290,6 @@ pub fn mla_absorb_latent_to_v_bf16(
     }
     #[cfg(not(feature = "_cuda"))]
     let _ =
-        (handle, wv, attn_latent.ptr, attn_v.ptr, *tokens, heads, qk_nope_dim, v_head_dim, kv_lora_rank);
+        (handle, wv, attn_latent.ptr, attn_v.ptr, tokens, heads, qk_nope_dim, v_head_dim, kv_lora_rank);
     Ok(())
 }

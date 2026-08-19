@@ -673,29 +673,54 @@ fn plan_routine<'a, S: Resolver>(
     // What makes the count trustworthy rather than merely plausible is
     // `routine::tests::every_arm_binds_the_slot_its_signature_states`: it
     // runs all ninety-one arms and asserts, for each, that the number of
-    // parameters marked `Declared` equals the highest result index the arm
-    // asks for plus one. Those two agree only while each result appears in a
-    // signature exactly once, which is a property nothing else enforces --
-    // so the probe was not deleted until the thing that replaces it was
-    // checked against it.
+    // declared results equals the highest result index the arm asks for plus
+    // one. Those two agree only while each result appears in a signature
+    // exactly once, which is a property nothing else enforces -- so the probe
+    // was not deleted until the thing that replaces it was checked against it.
+    //
+    // THE COLUMN IT IS READ OFF CHANGED AND THE FACT DID NOT. `Side` was a
+    // second column restating what the mark beside it already said, and it is
+    // deleted; the `Source` a mark resolves to carries the same fact and
+    // cannot drift from it. `Out` resolves to `Slot(Kind::Out, _)` and `InOut`
+    // to `Alias(_, _)` -- one address wearing both slots, which is still a
+    // result the statement declares.
     let results = routine
-        .sides
+        .sources
         .iter()
-        .filter(|side| **side == kernels::routine::Side::Declared)
+        .filter(|s| {
+            matches!(
+                s,
+                Some(kernels::Source::Slot(kernels::Kind::Out, _) | kernels::Source::Alias(..))
+            )
+        })
         .count();
     let (ins, outs, weights) = crate::lowering::hold::split(args, results);
     let mut handles =
         crate::lowering::hold::Handles::new(&bound.args, &ins, &outs, &weights, &params, resolver);
     let values = crate::lowering::bind::bind(routine.args, routine.sources, &mut handles, facts)
         .map_err(refused)?;
-    let staged = handles.staged();
+    let bound = handles.bound().to_vec();
+    // THE STAGED BLOCK IS COPIED OUT BEFORE THE MOVE. `Staged<'_>` borrows the
+    // word run, and the cell below takes the `Handles` by value; the planner
+    // holds the block for the whole body, so it cannot be a borrow of
+    // something the cell owns.
+    let (block, words) = {
+        let s = handles.staged();
+        (s.block, s.words.to_vec())
+    };
+    // `RefCell`, BECAUSE A BODY MAY STILL ASK. With `Env` out of the parameter
+    // list a fact only the fire can answer is no longer bound into `values`
+    // before the body runs -- the body asks for it, and answering MINTS.
+    let handles = core::cell::RefCell::new(handles);
+    let staged = crate::lowering::hold::Staged { block, words: &words };
     let planner = crate::lowering::routine::Planner::new(
         routine,
-        handles.bound(),
+        &bound,
         staged,
         launch.layers.clone(),
         launch.op,
-    );
+    )
+    .answering(&handles, facts);
     (routine.body)(&planner, &values).map_err(refused)?;
     let plan = planner.finish();
     // The two spellings, held to each other.
@@ -831,6 +856,8 @@ mod tests {
             structural: Vec::new(),
             residue: Vec::new(),
             conds: Vec::new(),
+            // A dispatch fixture states no attention schedule to raise.
+            preps: Vec::new(),
         }
     }
 
@@ -1160,11 +1187,18 @@ mod tests {
     fn the_two_rotations_no_row_could_reach_now_dispatch() {
         let scale = 1.0f32.to_bits();
         let base = 500_000.0f32.to_bits();
-        let arena = vec![Arg::Arena {
+        // TWICE, BECAUSE THE ROTATION IS IN PLACE. `x` is an `InOut` and
+        // claims an operand slot AND a result slot at one address, so the
+        // statement lists the buffer on both sides -- inputs then outputs,
+        // which is the order `Handles` splits `args` by. One entry gave the
+        // binder an output and no input, and `Source::Alias(0, 0)` asks for
+        // both.
+        let cell = Arg::Arena {
             at: 0,
             width: 256,
             bytes: 2,
-        }];
+        };
+        let arena = vec![cell.clone(), cell];
 
         let mut prop = one("neox_prop_mb_bfloat16", 5, arena.clone());
         prop.launches[0].params = 0..4;
@@ -1320,8 +1354,14 @@ mod tests {
                 },
             ],
         );
-        lowered.launches[0].params = 0..1;
-        lowered.params = vec![64];
+        // `[group, bits]`, which is the run this routine's two `Const` marks
+        // claim. It was `[64]` alone -- one number where two are read -- and a
+        // statement short of a scalar is refused before the spelling this case
+        // is about can be composed at all. 64 and 4 are what the geometry
+        // below says, so the composed name is `_gs_64_b_4` against the traced
+        // `_gs_128_b_8`, which is the disagreement.
+        lowered.launches[0].params = 0..2;
+        lowered.params = vec![64, 4];
 
         let why = plan(
             &lowered,

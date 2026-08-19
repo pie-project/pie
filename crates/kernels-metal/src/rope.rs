@@ -12,12 +12,12 @@
 //! so no statement places either and §6.2's arity rule would count two
 //! operands against a statement that carries none.
 
-#![allow(clippy::too_many_arguments)]
 
+use kernels::Grid;
+use kernels_macros::routine;
 use kernels::routine::Refusal;
 
-use crate::routine::{keys, Ask, Bind, Buf, BufMut, Ctx, Fire, I32s, Param, ParamF32, ParamOr, Routine};
-use crate::routine::OutSlot;
+use crate::routine::{Asks, Bind, Const, Ctx, Fire, InOut, Tensor, bf16, keys};
 
 /// The shaders this family's routines reach: `(file, entrypoint)`, one pair
 /// per instantiated name.
@@ -107,7 +107,7 @@ const NEOX_FILE: &str = "rope/neox.metal";
 /// The geometric ladder, one row, in place.
 ///
 /// In place on ONE tensor: buffer 0 is both the input and the result, which is
-/// why `x` is the only buffer and why it is `BufMut`.
+/// why `x` is the only buffer and why it is `Buf`.
 ///
 /// A `rows` of one is not an argument here but a fact of the SYMBOL: the
 /// decode body assigns `m = 0`, so a taller grid would rotate row zero `rows`
@@ -118,25 +118,20 @@ const NEOX_FILE: &str = "rope/neox.metal";
 /// # Errors
 ///
 /// See [`rope_grid`].
+#[routine]
 pub fn neox_decode(
     ctx: &Ctx<'_>,
-    x: OutSlot<0, BufMut>,
-    position: Ask<keys::Positions, I32s>,
-    scale: ParamF32<0>,
-    base: ParamF32<1>,
-    head_dim: ParamOr<2, keys::HeadDim, i32>,
-    rotary: ParamOr<3, keys::RotaryWidth, i32>,
-    width: Ask<keys::Width, i32>,
-) -> Result<(), Refusal> {
-    let lanes = rope_grid(*rotary, *width, *head_dim, 1)?;
-    ctx.dispatch(
-        Fire {
-            entrypoint: "neox_decode_bfloat16",
-            file: NEOX_FILE,
-            lanes,
-            group: rope_group(lanes),
-        },
-        &[x.v(), position.v(), scale.v(), base.v(), head_dim.v()],
+    x: InOut<Tensor<bf16>>,
+    scale: Const<f32>,
+    base: Const<f32>,
+    head_dim: Const<i32>,
+    rotary: Const<i32>) -> Result<(), Refusal> {
+    let position = ctx.ask::<Tensor<i32>, keys::Positions>()?;
+    let width = x.width;
+    let lanes = rope_grid(*rotary, width, *head_dim, 1)?;
+    ctx.fire(
+        Fire::at(NEOX_FILE, "neox_decode_bfloat16").apply(Grid::of(lanes, rope_group(lanes))),
+        &[x.arg(), position.arg(), scale.arg(), base.arg(), head_dim.arg()],
     )
 }
 
@@ -146,26 +141,21 @@ pub fn neox_decode(
 /// # Errors
 ///
 /// See [`rope_grid`].
+#[routine]
 pub fn neox_mb(
     ctx: &Ctx<'_>,
-    x: OutSlot<0, BufMut>,
-    position: Ask<keys::Positions, I32s>,
-    scale: ParamF32<0>,
-    base: ParamF32<1>,
-    head_dim: ParamOr<2, keys::HeadDim, i32>,
-    rotary: ParamOr<3, keys::RotaryWidth, i32>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    let lanes = rope_grid(*rotary, *width, *head_dim, *rows)?;
-    ctx.dispatch(
-        Fire {
-            entrypoint: "neox_mb_bfloat16",
-            file: NEOX_FILE,
-            lanes,
-            group: rope_group(lanes),
-        },
-        &[x.v(), position.v(), scale.v(), base.v(), head_dim.v()],
+    x: InOut<Tensor<bf16>>,
+    scale: Const<f32>,
+    base: Const<f32>,
+    head_dim: Const<i32>,
+    rotary: Const<i32>) -> Result<(), Refusal> {
+    let position = ctx.ask::<Tensor<i32>, keys::Positions>()?;
+    let width = x.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    let lanes = rope_grid(*rotary, width, *head_dim, rows)?;
+    ctx.fire(
+        Fire::at(NEOX_FILE, "neox_mb_bfloat16").apply(Grid::of(lanes, rope_group(lanes))),
+        &[x.arg(), position.arg(), scale.arg(), base.arg(), head_dim.arg()],
     )
 }
 
@@ -186,32 +176,33 @@ pub fn neox_mb(
 /// # Errors
 ///
 /// See [`rope_grid`].
+#[routine]
 pub fn neox_freqs_decode(
     ctx: &Ctx<'_>,
-    x: OutSlot<0, BufMut>,
-    position: Ask<keys::Positions, I32s>,
-    scale: ParamF32<0>,
-    inv_freq: Ask<keys::RopeFrequencies, Buf>,
-    head_dim: ParamOr<1, keys::HeadDim, i32>,
-    mscale: ParamF32<2>,
-    rotary: ParamOr<3, keys::RotaryWidth, i32>,
-    width: Ask<keys::Width, i32>,
-) -> Result<(), Refusal> {
-    let lanes = rope_grid(*rotary, *width, *head_dim, 1)?;
-    ctx.dispatch(
-        Fire {
-            entrypoint: "neox_freqs_decode_bfloat16",
-            file: NEOX_FILE,
-            lanes,
-            group: rope_group(lanes),
-        },
+    x: InOut<Tensor<bf16>>,
+    scale: Const<f32>,
+    head_dim: Const<i32>,
+    mscale: Const<f32>,
+    rotary: Const<i32>) -> Result<(), Refusal> {
+    // THE FIRE'S FREQUENCY TABLE, ASKED FOR. `Ask<keys::RopeFrequencies, Buf>`
+    // before the marks: a table the driver builds once per fire, not a weight
+    // the checkpoint carries and no builder places one. As a
+    // `Const<Tensor<f32>>` it asked the statement for a weight operand that
+    // is not there, and every gpt-oss rotation refused.
+    let inv_freq = ctx.ask::<Tensor<f32>, keys::RopeFrequencies>()?;
+
+    let position = ctx.ask::<Tensor<i32>, keys::Positions>()?;
+    let width = x.width;
+    let lanes = rope_grid(*rotary, width, *head_dim, 1)?;
+    ctx.fire(
+        Fire::at(NEOX_FILE, "neox_freqs_decode_bfloat16").apply(Grid::of(lanes, rope_group(lanes))),
         &[
-            x.v(),
-            position.v(),
-            scale.v(),
-            inv_freq.v(),
-            head_dim.v(),
-            mscale.v(),
+            x.arg(),
+            position.arg(),
+            scale.arg(),
+            inv_freq.arg(),
+            head_dim.arg(),
+            mscale.arg(),
         ],
     )
 }
@@ -229,33 +220,34 @@ pub fn neox_freqs_decode(
 /// # Errors
 ///
 /// See [`rope_grid`].
+#[routine]
 pub fn neox_freqs_mb(
     ctx: &Ctx<'_>,
-    x: OutSlot<0, BufMut>,
-    position: Ask<keys::Positions, I32s>,
-    scale: ParamF32<0>,
-    inv_freq: Ask<keys::RopeFrequencies, Buf>,
-    head_dim: ParamOr<1, keys::HeadDim, i32>,
-    mscale: ParamF32<2>,
-    rotary: ParamOr<3, keys::RotaryWidth, i32>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    let lanes = rope_grid(*rotary, *width, *head_dim, *rows)?;
-    ctx.dispatch(
-        Fire {
-            entrypoint: "neox_freqs_mb_bfloat16",
-            file: NEOX_FILE,
-            lanes,
-            group: rope_group(lanes),
-        },
+    x: InOut<Tensor<bf16>>,
+    scale: Const<f32>,
+    head_dim: Const<i32>,
+    mscale: Const<f32>,
+    rotary: Const<i32>) -> Result<(), Refusal> {
+    // THE FIRE'S FREQUENCY TABLE, ASKED FOR. `Ask<keys::RopeFrequencies, Buf>`
+    // before the marks: a table the driver builds once per fire, not a weight
+    // the checkpoint carries and no builder places one. As a
+    // `Const<Tensor<f32>>` it asked the statement for a weight operand that
+    // is not there, and every gpt-oss rotation refused.
+    let inv_freq = ctx.ask::<Tensor<f32>, keys::RopeFrequencies>()?;
+
+    let position = ctx.ask::<Tensor<i32>, keys::Positions>()?;
+    let width = x.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    let lanes = rope_grid(*rotary, width, *head_dim, rows)?;
+    ctx.fire(
+        Fire::at(NEOX_FILE, "neox_freqs_mb_bfloat16").apply(Grid::of(lanes, rope_group(lanes))),
         &[
-            x.v(),
-            position.v(),
-            scale.v(),
-            inv_freq.v(),
-            head_dim.v(),
-            mscale.v(),
+            x.arg(),
+            position.arg(),
+            scale.arg(),
+            inv_freq.arg(),
+            head_dim.arg(),
+            mscale.arg(),
         ],
     )
 }
@@ -274,25 +266,20 @@ pub fn neox_freqs_mb(
 /// # Errors
 ///
 /// See [`rope_grid`].
+#[routine]
 pub fn neox_prop_decode(
     ctx: &Ctx<'_>,
-    x: OutSlot<0, BufMut>,
-    position: Ask<keys::Positions, I32s>,
-    scale: ParamF32<0>,
-    base: ParamF32<1>,
-    head_dim: ParamOr<2, keys::HeadDim, i32>,
-    rotary: ParamOr<3, keys::RotaryWidth, i32>,
-    width: Ask<keys::Width, i32>,
-) -> Result<(), Refusal> {
-    let lanes = rope_grid(*rotary, *width, *head_dim, 1)?;
-    ctx.dispatch(
-        Fire {
-            entrypoint: "neox_prop_decode_bfloat16",
-            file: NEOX_FILE,
-            lanes,
-            group: rope_group(lanes),
-        },
-        &[x.v(), position.v(), scale.v(), base.v(), head_dim.v()],
+    x: InOut<Tensor<bf16>>,
+    scale: Const<f32>,
+    base: Const<f32>,
+    head_dim: Const<i32>,
+    rotary: Const<i32>) -> Result<(), Refusal> {
+    let position = ctx.ask::<Tensor<i32>, keys::Positions>()?;
+    let width = x.width;
+    let lanes = rope_grid(*rotary, width, *head_dim, 1)?;
+    ctx.fire(
+        Fire::at(NEOX_FILE, "neox_prop_decode_bfloat16").apply(Grid::of(lanes, rope_group(lanes))),
+        &[x.arg(), position.arg(), scale.arg(), base.arg(), head_dim.arg()],
     )
 }
 
@@ -307,26 +294,21 @@ pub fn neox_prop_decode(
 /// # Errors
 ///
 /// See [`rope_grid`].
+#[routine]
 pub fn neox_prop_mb(
     ctx: &Ctx<'_>,
-    x: OutSlot<0, BufMut>,
-    position: Ask<keys::Positions, I32s>,
-    scale: ParamF32<0>,
-    base: ParamF32<1>,
-    head_dim: ParamOr<2, keys::HeadDim, i32>,
-    rotary: ParamOr<3, keys::RotaryWidth, i32>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    let lanes = rope_grid(*rotary, *width, *head_dim, *rows)?;
-    ctx.dispatch(
-        Fire {
-            entrypoint: "neox_prop_mb_bfloat16",
-            file: NEOX_FILE,
-            lanes,
-            group: rope_group(lanes),
-        },
-        &[x.v(), position.v(), scale.v(), base.v(), head_dim.v()],
+    x: InOut<Tensor<bf16>>,
+    scale: Const<f32>,
+    base: Const<f32>,
+    head_dim: Const<i32>,
+    rotary: Const<i32>) -> Result<(), Refusal> {
+    let position = ctx.ask::<Tensor<i32>, keys::Positions>()?;
+    let width = x.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    let lanes = rope_grid(*rotary, width, *head_dim, rows)?;
+    ctx.fire(
+        Fire::at(NEOX_FILE, "neox_prop_mb_bfloat16").apply(Grid::of(lanes, rope_group(lanes))),
+        &[x.arg(), position.arg(), scale.arg(), base.arg(), head_dim.arg()],
     )
 }
 
@@ -346,85 +328,111 @@ pub fn neox_prop_mb(
 /// row it strides over -- which would make consecutive rows overlap rather
 /// than tile, and is the one thing about this kernel that cannot be seen from
 /// the grid.
+#[routine]
 pub fn neox_strided(
     ctx: &Ctx<'_>,
-    x: OutSlot<0, BufMut>,
-    position: Ask<keys::Positions, I32s>,
-    scale: ParamF32<0>,
-    base: ParamF32<1>,
-    head_dim: ParamOr<2, keys::HeadDim, i32>,
-    row_pitch: Param<4, i32>,
-    rotary: ParamOr<3, keys::RotaryWidth, i32>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    if *row_pitch < *width {
+    x: InOut<Tensor<bf16>>,
+    scale: Const<f32>,
+    base: Const<f32>,
+    head_dim: Const<i32>,
+    rotary: Const<i32>,
+    // THE STATEMENT'S, AND IT WAS `Param<4, i32>`. A pitch is the rectangle
+    // the text laid out, not something this batch made -- two fires of one
+    // deployment stride the same way -- so it fails `ask`'s own test and no
+    // driver answers `keys::RowPitch`. `the_two_rotations_no_row_could_reach_
+    // now_dispatch` states it at `params[4]` and expects a refusal without it,
+    // which is the slot this mark derives.
+    row_pitch: Const<i32>) -> Result<(), Refusal> {
+    let position = ctx.ask::<Tensor<i32>, keys::Positions>()?;
+    let width = x.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    if *row_pitch < width {
         return Err(Refusal::Narrow {
             what: "row_pitch is narrower than the row it strides over",
             at: i64::from(*row_pitch),
         });
     }
-    let lanes = rope_grid(*rotary, *width, *head_dim, *rows)?;
-    ctx.dispatch(
-        Fire {
-            entrypoint: "neox_strided_bfloat16",
-            file: NEOX_FILE,
-            lanes,
-            group: rope_group(lanes),
-        },
+    let lanes = rope_grid(*rotary, width, *head_dim, rows)?;
+    ctx.fire(
+        Fire::at(NEOX_FILE, "neox_strided_bfloat16").apply(Grid::of(lanes, rope_group(lanes))),
         &[
-            x.v(),
-            position.v(),
-            scale.v(),
-            base.v(),
-            head_dim.v(),
-            row_pitch.v(),
+            x.arg(),
+            position.arg(),
+            scale.arg(),
+            base.arg(),
+            head_dim.arg(),
+            row_pitch.arg(),
         ],
     )
 }
 
-/// This family's routines.
-///
-/// Every one of them states `in_place = &[(0, 0)]`, and the reason is worth
-/// a line because this doc used to say the exact opposite. It argued that
-/// "a rotation has only one operand -- an `Out`; there is no input to alias
-/// it to", and that was true of the SIGNATURE and false of the STATEMENT.
-/// `in_place` pairs TRACE operands, not parameters: the trace states the
-/// tensor going in and the rotated tensor coming out, and the pair is what
-/// says they are one buffer. A rotation has exactly the two the pair needs.
-///
-/// The old reading cost the family every fire it had. Believing there was
-/// no input to alias, `model-dsl`'s `rope_one` stated the rotation with one
-/// input and NO result, and `arity_problem` reads a routine that writes one
-/// pointer against a statement declaring none. Both halves of its message
-/// fired at once. CUDA's `rope_bf16` is the same shape spelled correctly --
-/// two `Out`s, no `In`s, `in_place = &[(0, 0), (1, 1)]` -- and its
-/// statement declares two inputs and two results.
-pub static ROUTINES: &[Routine] = &[
-    crate::routine!(neox_decode, in_place = &[(0, 0)]),
-    crate::routine!(neox_freqs_decode, in_place = &[(0, 0)]),
-    crate::routine!(neox_freqs_mb, in_place = &[(0, 0)]),
-    crate::routine!(neox_mb, in_place = &[(0, 0)]),
-    crate::routine!(neox_prop_decode, in_place = &[(0, 0)]),
-    crate::routine!(neox_prop_mb, in_place = &[(0, 0)]),
-    crate::routine!(neox_strided, in_place = &[(0, 0)]),
-];
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routine::{ArgValue, Encode};
-    use core::cell::RefCell;
+    use crate::routine::{ArgValue, Const, Encode, Tensor};
+    use core::cell::{Cell, RefCell};
 
     /// The entrypoint, the lanes, the group and the arguments.
     type Call = (&'static str, [u32; 3], [u32; 3], Vec<ArgValue>);
 
-    #[derive(Default)]
-    struct Seen(RefCell<Vec<Call>>);
+    /// An `Encode` that remembers what it was asked to do, and answers the
+    /// three facts every rotation in this file asks for: where each token
+    /// sits (`Positions`, every routine), how many rows the batched forms
+    /// cover (`Rows`, the `_mb` and strided forms), and the stride the
+    /// strided form's rows do not touch each other's channels at
+    /// (`RowPitch`, `neox_strided` alone).
+    struct Seen {
+        calls: RefCell<Vec<Call>>,
+        positions: Cell<u32>,
+        rows: Cell<i32>,
+        row_pitch: Cell<i32>,
+    /// The fire's rope frequency table, as a handle.
+    inv_freq: Cell<u32>,
+    }
+
+    impl Default for Seen {
+        fn default() -> Self {
+            Self {
+                calls: RefCell::default(),
+                positions: Cell::new(2),
+                rows: Cell::new(4),
+                row_pitch: Cell::new(4096),
+                // The fire's frequency table, which `neox_freqs_*` asks for.
+                inv_freq: Cell::new(3),
+            }
+        }
+    }
 
     impl Encode for Seen {
-        fn dispatch(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
-            self.0
+        fn resolve(&self, _ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
+            // The statement's own scalars, read by index where the params run
+            // is the shader's struct -- see `Asks::param`.
+            if let kernels::Source::Slot(kernels::Kind::Param, n) = source {
+                let _ = n;
+                return Ok(ArgValue::I32(4096));
+            }
+            use kernels::keys::Fact;
+            if source == <keys::Positions as Fact>::SOURCE {
+                return Ok(ArgValue::Buffer(self.positions.get()));
+            }
+            if source == <keys::Rows as Fact>::SOURCE {
+                return Ok(ArgValue::I32(self.rows.get()));
+            }
+            // THE FIRE'S FREQUENCY TABLE. `inv_freq` was a parameter and is
+            // an ask now: it is built once per fire, not carried by the
+            // checkpoint, so no statement places it.
+            if source == <keys::RopeFrequencies as Fact>::SOURCE {
+                return Ok(ArgValue::Buffer(self.inv_freq.get()));
+            }
+            // Anything else is refused: a probe that invented an answer to a
+            // fact it does not know would let a body pass under test while
+            // the same fact went unanswered on a real driver.
+            Err(Refusal::Unstated { what: "a fact this probe does not answer" })
+        }
+
+        fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
+            self.calls
                 .borrow_mut()
                 .push((fire.entrypoint, fire.lanes, fire.group, args.to_vec()));
             Ok(())
@@ -443,33 +451,25 @@ mod tests {
     #[test]
     fn a_decode_rotation_takes_one_row_and_its_twin_takes_all_of_them() {
         let seen = Seen::default();
+        seen.rows.set(37);
         neox_freqs_decode(
             &seen,
-            OutSlot::new(BufMut(1)),
-            Ask::new(I32s(2)),
-            ParamF32::new(1.0),
-            Ask::new(Buf(3)),
-            ParamOr::new(128),
-            ParamF32::new(1.0),
-            ParamOr::new(128),
-            Ask::new(2048),
-        )
+            InOut { ptr: Tensor::<bf16>::new(1), rows: 0, width: 2048 },
+            Const::new(1.0),
+            Const::new(128),
+            Const::new(1.0),
+            Const::new(128))
         .expect("a launch");
         neox_freqs_mb(
             &seen,
-            OutSlot::new(BufMut(1)),
-            Ask::new(I32s(2)),
-            ParamF32::new(1.0),
-            Ask::new(Buf(3)),
-            ParamOr::new(128),
-            ParamF32::new(1.0),
-            ParamOr::new(128),
-            Ask::new(2048),
-            Ask::new(37),
-        )
+            InOut { ptr: Tensor::<bf16>::new(1), rows: 0, width: 2048 },
+            Const::new(1.0),
+            Const::new(128),
+            Const::new(1.0),
+            Const::new(128))
         .expect("a launch");
 
-        let calls = seen.0.borrow();
+        let calls = seen.calls.borrow();
         assert_eq!(calls[0].0, "neox_freqs_decode_bfloat16");
         assert_eq!(
             calls[0].1,
@@ -498,18 +498,14 @@ mod tests {
         for rotary in [64, 128, 256] {
             neox_mb(
                 &seen,
-                OutSlot::new(BufMut(1)),
-                Ask::new(I32s(2)),
-                ParamF32::new(1.0),
-                ParamF32::new(10_000.0),
-                ParamOr::new(128),
-                ParamOr::new(rotary),
-                Ask::new(2048),
-                Ask::new(4),
-            )
+                InOut { ptr: Tensor::<bf16>::new(1), rows: 0, width: 2048 },
+                Const::new(1.0),
+                Const::new(10_000.0),
+                Const::new(128),
+                Const::new(rotary))
             .expect("a launch");
         }
-        for (_, lanes, group, _) in seen.0.borrow().iter() {
+        for (_, lanes, group, _) in seen.calls.borrow().iter() {
             assert_eq!(*group, [lanes[0], 1, 1]);
         }
     }
@@ -524,14 +520,11 @@ mod tests {
         let seen = Seen::default();
         let refused = neox_decode(
             &seen,
-            OutSlot::new(BufMut(1)),
-            Ask::new(I32s(2)),
-            ParamF32::new(1.0),
-            ParamF32::new(10_000.0),
-            ParamOr::new(128),
-            ParamOr::new(65),
-            Ask::new(2048),
-        )
+            InOut::new(Tensor::<bf16>::new(1)),
+            Const::new(1.0),
+            Const::new(10_000.0),
+            Const::new(128),
+            Const::new(65))
         .expect_err("65 is not a whole number of pairs");
         assert!(
             matches!(
@@ -546,14 +539,11 @@ mod tests {
 
         let refused = neox_decode(
             &seen,
-            OutSlot::new(BufMut(1)),
-            Ask::new(I32s(2)),
-            ParamF32::new(1.0),
-            ParamF32::new(10_000.0),
-            ParamOr::new(128),
-            ParamOr::new(64),
-            Ask::new(2000),
-        )
+            InOut { ptr: Tensor::<bf16>::new(1), rows: 0, width: 2000 },
+            Const::new(1.0),
+            Const::new(10_000.0),
+            Const::new(128),
+            Const::new(64))
         .expect_err("2000 is not a whole number of 128-wide heads");
         assert!(
             matches!(
@@ -565,7 +555,7 @@ mod tests {
             ),
             "got {refused:?}"
         );
-        assert!(seen.0.borrow().is_empty(), "and neither was encoded");
+        assert!(seen.calls.borrow().is_empty(), "and neither was encoded");
     }
 
     /// The two forms that had NO operand statement before this file get one,
@@ -574,36 +564,38 @@ mod tests {
     /// `neox_prop_mb` and `neox_strided` were bare rows -- nothing anywhere
     /// said what they bind. These orders were read off `rope/neox.metal`, where
     /// `rope_neox_strided` declares `row_pitch` at buffer 5, after `head_dim`.
+    /// KNOWN FAILING, upstream of this crate: `x`'s `ArgValue::BufferMut(1)`
+    /// below is the correct claim for what an `InOut<Tensor<bf16>>` SHOULD
+    /// produce; `mlp::tests::all_four_bodies_bind_gate_up_and_out_at_zero_one_and_two`
+    /// documents in full why `Tensor<E>`'s one `handle` field and its
+    /// direction-blind `Bind` impl (`crates/kernels/src/shader.rs`, outside
+    /// this crate) mean no positional argument a routine body binds itself
+    /// can presently come out mutable, on any plane.
     #[test]
     fn the_two_unstated_rotations_bind_what_the_shader_declares() {
         let seen = Seen::default();
         neox_prop_mb(
             &seen,
-            OutSlot::new(BufMut(1)),
-            Ask::new(I32s(2)),
-            ParamF32::new(0.5),
-            ParamF32::new(10_000.0),
-            ParamOr::new(256),
-            ParamOr::new(128),
-            Ask::new(2048),
-            Ask::new(5),
-        )
+            InOut { ptr: Tensor::<bf16>::new(1), rows: 0, width: 2048 },
+            Const::new(0.5),
+            Const::new(10_000.0),
+            Const::new(256),
+            Const::new(128))
         .expect("a launch");
         neox_strided(
             &seen,
-            OutSlot::new(BufMut(1)),
-            Ask::new(I32s(2)),
-            ParamF32::new(0.5),
-            ParamF32::new(10_000.0),
-            ParamOr::new(256),
-            Param::new(4096),
-            ParamOr::new(128),
-            Ask::new(2048),
-            Ask::new(5),
-        )
+            InOut { ptr: Tensor::<bf16>::new(1), rows: 0, width: 2048 },
+            Const::new(0.5),
+            Const::new(10_000.0),
+            Const::new(256),
+            Const::new(128),
+            // THE PITCH IS THE STATEMENT'S NOW, not a fact the probe answers.
+            // 4096 is what the probe used to hand back and what the assertion
+            // below still names -- two 2048-wide rows to a stride.
+            Const::new(4096))
         .expect("a launch");
 
-        let calls = seen.0.borrow();
+        let calls = seen.calls.borrow();
         assert_eq!(
             calls[0].3,
             vec![
@@ -638,16 +630,14 @@ mod tests {
         let seen = Seen::default();
         let refused = neox_strided(
             &seen,
-            OutSlot::new(BufMut(1)),
-            Ask::new(I32s(2)),
-            ParamF32::new(0.5),
-            ParamF32::new(10_000.0),
-            ParamOr::new(256),
-            Param::new(1024),
-            ParamOr::new(128),
-            Ask::new(2048),
-            Ask::new(5),
-        )
+            InOut { ptr: Tensor::<bf16>::new(1), rows: 0, width: 2048 },
+            Const::new(0.5),
+            Const::new(10_000.0),
+            Const::new(256),
+            Const::new(128),
+            // The narrow pitch this case is about, stated rather than set on
+            // the probe: the statement carries it.
+            Const::new(1024))
         .expect_err("a 1024 pitch cannot tile 2048-wide rows");
         assert!(
             matches!(
@@ -659,6 +649,6 @@ mod tests {
             ),
             "got {refused:?}"
         );
-        assert!(seen.0.borrow().is_empty());
+        assert!(seen.calls.borrow().is_empty());
     }
 }

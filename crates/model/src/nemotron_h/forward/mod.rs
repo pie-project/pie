@@ -155,6 +155,7 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
                         &z,
                         &w.gate_norm.name,
                         mb.intermediate(),
+                        mb.n_groups,
                     );
                     y += matmul(&o, &w.out_proj);
                 }
@@ -162,11 +163,11 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
                     let q = matmul(&x, &w.q_proj);
                     let k = matmul(&x, &w.k_proj);
                     let v = matmul(&x, &w.v_proj);
-                    let (q, k) = dsl::cuda::rope(&q, &k);
+                    let (q, k) = dsl::cuda::rope(&q, &k, facts.attn.heads, facts.attn.kv_heads, facts.attn.head_dim);
                     let kv = dsl::Kv::at(t, l);
                     dsl::cuda::write_kv_to_pages(&k, &v, &kv);
                     dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
-                    let o = dsl::cuda::attention_for(class, &q, &kv, window_left, facts.attn.head_dim)
+                    let o = dsl::cuda::attention_for(class, &q, &kv, window_left, facts.attn.head_dim, 0.0, 0.0)
                         .expect("a plain attention statement produces its value");
                     dsl::seam(o.trace(), &dsl::seam::ATTN_OUT, &[&o], Some(l));
                     y += matmul(&o, &w.o_proj);

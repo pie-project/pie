@@ -43,11 +43,21 @@ pub unsafe fn grouped_gemm_bf16(
         return match kernels_cuda::moe::moe_grouped_gemm::<bf16>(
             &ctx,
             kernels::routine::In { ptr: a.cast::<bf16>(), rows: 0, width: k },
-            kernels::routine::Weight { ptr: bank.cast::<bf16>() },
-            kernels::routine::Out { ptr: c.cast::<bf16>(), rows: 0, width: n },
+            kernels::routine::Const { v: bank.cast::<bf16>() },
             kernels::routine::In { ptr: expert_ids.cast::<i32>(), rows: 0, width: 0 },
-            max_blocks,
-            m,
+            // ONE ADDRESS IN BOTH RUNS, and LAST: the grouped GEMM
+            // accumulates into the statement's third input, which is what
+            // `in_place = &[(0, 2)]` used to say beside the row.
+            kernels::routine::InOut { ptr: c.cast::<bf16>(), rows: 0, width: n },
+            // The alignment's own two numbers, which the signature takes as
+            // `Const` because no driver answers `keys::MoeMaxBlocks` or
+            // `keys::MoeAlignedRows` — see `kernels-cuda/src/moe.rs`. This
+            // caller is the alignment, so it is the one that has them.
+            //
+            // Adjacent, same-typed and swappable: `max_blocks` is the block
+            // ceiling and `m` the ALIGNED row count, in that order.
+            kernels::routine::Const { v: max_blocks },
+            kernels::routine::Const { v: m },
         ) {
             Ok(()) => Ok(()),
             Err(why) => Err(why),

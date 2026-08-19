@@ -9,6 +9,7 @@
 //! is `unsigned long long`, a different type from `size_t` on LP64, so the
 //! one conversion happens at the one call site, cast explicitly.
 
+use kernels::{Bind, Fire};
 use core::ffi::c_void;
 
 use crate::jit::{Ctx, Launch, Root};
@@ -34,11 +35,10 @@ const ARM: Launch = Launch::grid([1, 1, 1], [1, 1, 1]);
 /// `preds` must address a live device predicate word with at least `slot + 1`
 /// bytes, live across the launch, and `ctx`'s stream must outlive it.
 pub fn supergraph_set_cond(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     handle: usize,
     preds: *const c_void,
-    slot: i32,
-) -> Result<(), Refusal> {
+    slot: i32) -> Result<(), Refusal> {
     arm(ctx, "::pie::graph::supergraph_set_cond", handle, preds, slot)
 }
 
@@ -58,11 +58,10 @@ pub fn supergraph_set_cond(
 /// # Safety
 /// [`supergraph_set_cond`]'s.
 pub fn supergraph_set_switch(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     handle: usize,
     preds: *const c_void,
-    slot: i32,
-) -> Result<(), Refusal> {
+    slot: i32) -> Result<(), Refusal> {
     arm(ctx, "::pie::graph::supergraph_set_switch", handle, preds, slot)
 }
 
@@ -112,12 +111,11 @@ pub fn warm() -> Result<(), Refusal> {
 /// list is `(handle, preds, slot)`; the stream is the launch's, not one of
 /// them, just as it was the `<<<>>>`'s.
 fn arm(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     instantiation: &'static str,
     handle: usize,
     preds: *const c_void,
-    slot: i32,
-) -> Result<(), Refusal> {
+    slot: i32) -> Result<(), Refusal> {
     // A negative slot is `preds[-1]`, a device read off the front of the
     // predicate word — refused rather than clamped, per [`supergraph_set_switch`].
     if slot < 0 {
@@ -125,9 +123,7 @@ fn arm(
     }
     // SAFETY: the caller's assertion, forwarded — `preds` addresses the live
     // predicate word and the stream outlives the launch.
-    unsafe {
-        ctx.launch("graph/supergraph.cuh", instantiation, ARM, &[handle.arg(), preds.cast::<u8>().arg(), slot.arg()])
-    }
+    ctx.fire(Fire::at("graph/supergraph.cuh", instantiation).apply(ARM), &[handle.arg(), preds.cast::<u8>().arg(), slot.arg()])
 }
 
 #[cfg(test)]

@@ -1,10 +1,11 @@
-#![allow(clippy::too_many_arguments)]
 //! Gated DeltaNet: the recurrent state kernels and their prep.
 //!
 //! `gdn` is an algorithm and not a model, so it takes no model qualifier --
 //! the same call the CUDA table makes for `delta_attn_kda` and `indexer_dsa`.
 
+use kernels_macros::routine;
 use kernels::KernelSig;
+use kernels::BindMut;
 
 pub static KERNELS: &[KernelSig] = &[
     // 1 in gdn_core.wgsl
@@ -45,8 +46,7 @@ pub static ENTRYPOINTS: &[&str] = &[
     "gdn_prep_slotted_bfloat16",
 ];
 
-use crate::routine::{keys, Ask, Bind, Block, Buf, BufMut, Ctx, Env, F32s, F32sMut, Fire, Held, Param, Routine, U32s};
-use crate::routine::{InSlot, OutSlot, Reckoned, Say, Weight};
+use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, Out, Tensor, bf16, keys};
 use kernels::routine::Refusal;
 
 /// The nine `(LANES, VROWS)` shapes the prefill scan is compiled for, in the
@@ -183,43 +183,44 @@ const WARP: u32 = 32;
 /// # Errors
 ///
 /// See `gdn_grid`.
+#[routine]
 pub fn gdn_core(
     ctx: &Ctx<'_>,
-    mixed: InSlot<0, Buf>,
-    conv_state: Held<keys::ConvState, F32s>,
-    rstate: Held<keys::RecurrentState, F32sMut>,
-    core_out: OutSlot<0, BufMut>,
-    conv_w: Weight<0, Buf>,
-    conv_b: Weight<1, Buf>,
-    a_log: Weight<2, F32s>,
-    dt_bias: Weight<3, Buf>,
-    a_gate: InSlot<1, Buf>,
-    b_gate: InSlot<2, Buf>,
-    new_conv_state: Held<keys::NewConvState, F32sMut>,
-    params: Block<Buf>,
-    rows: Ask<keys::Rows, i32>,
-    v_heads: Ask<keys::VHeads, i32>,
-    v_dim: Ask<keys::VDim, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            module: "ssm/gdn_core.wgsl",
-            entrypoint: "gdn_core_bfloat16",
-            lanes: gdn_grid(*rows, *v_heads, *v_dim)?,
-        },
+    mixed: In<Tensor<bf16>>,
+    core_out: Out<Tensor<bf16>>,
+    conv_w: Const<Tensor<bf16>>,
+    conv_b: Const<Tensor<bf16>>,
+    a_log: Const<Tensor<f32>>,
+    dt_bias: Const<Tensor<bf16>>,
+    a_gate: In<Tensor<bf16>>,
+    b_gate: In<Tensor<bf16>>) -> Result<(), Refusal> {
+    // BACK TO AN ASK, BECAUSE THIS ROUTINE'S PARAMS RUN IS A STRUCT.
+    // The body forwards `ctx.params()` whole -- the shader reads fields,
+    // not a scalar run -- so slot 0 is the struct's first field and a
+    // `Const` derived onto it reads that field's bits. HEAD spelled these
+    // `Ask<..>` for exactly this reason, and the drivers still answer them.
+    let v_heads = ctx.ask::<i32, keys::VHeads>()?;
+    let v_dim = ctx.ask::<i32, keys::VDim>()?;
+    let conv_state = ctx.ask::<Tensor<f32>, keys::ConvState>()?;
+    let rstate = ctx.ask::<Tensor<f32>, keys::RecurrentState>()?;
+    let new_conv_state = ctx.ask::<Tensor<f32>, keys::NewConvState>()?;
+    let params = ctx.params()?;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("ssm/gdn_core.wgsl", "gdn_core_bfloat16").apply(gdn_grid(rows, v_heads, v_dim)?),
         &[
-            mixed.v(),
-            conv_state.v(),
-            rstate.v(),
-            core_out.v(),
-            conv_w.v(),
-            conv_b.v(),
-            a_log.v(),
-            dt_bias.v(),
-            a_gate.v(),
-            b_gate.v(),
-            new_conv_state.v(),
-            params.v(),
+            mixed.arg(),
+            conv_state.arg(),
+            rstate.arg_mut(),
+            core_out.arg(),
+            conv_w.arg(),
+            conv_b.arg(),
+            a_log.arg(),
+            dt_bias.arg(),
+            a_gate.arg(),
+            b_gate.arg(),
+            new_conv_state.arg_mut(),
+            params,
         ],
     )
 }
@@ -234,45 +235,46 @@ pub fn gdn_core(
 /// # Errors
 ///
 /// See `gdn_grid`.
+#[routine]
 pub fn gdn_core_slotted(
     ctx: &Ctx<'_>,
-    mixed: InSlot<0, Buf>,
-    conv_state: Ask<keys::ConvState, F32s>,
-    rstate: Ask<keys::RecurrentState, F32sMut>,
-    core_out: OutSlot<0, BufMut>,
-    conv_w: Weight<0, Buf>,
-    conv_b: Weight<1, Buf>,
-    a_log: Weight<2, F32s>,
-    dt_bias: Weight<3, Buf>,
-    a_gate: InSlot<1, Buf>,
-    b_gate: InSlot<2, Buf>,
-    new_conv_state: Ask<keys::NewConvState, F32sMut>,
-    params: Block<Buf>,
-    slot_ids: Ask<keys::RecurrentSlots, U32s>,
-    rows: Ask<keys::Rows, i32>,
-    v_heads: Ask<keys::VHeads, i32>,
-    v_dim: Ask<keys::VDim, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            module: "ssm/gdn_core.wgsl",
-            entrypoint: "gdn_core_slotted_bfloat16",
-            lanes: gdn_grid(*rows, *v_heads, *v_dim)?,
-        },
+    mixed: In<Tensor<bf16>>,
+    core_out: Out<Tensor<bf16>>,
+    conv_w: Const<Tensor<bf16>>,
+    conv_b: Const<Tensor<bf16>>,
+    a_log: Const<Tensor<f32>>,
+    dt_bias: Const<Tensor<bf16>>,
+    a_gate: In<Tensor<bf16>>,
+    b_gate: In<Tensor<bf16>>) -> Result<(), Refusal> {
+    // BACK TO AN ASK, BECAUSE THIS ROUTINE'S PARAMS RUN IS A STRUCT.
+    // The body forwards `ctx.params()` whole -- the shader reads fields,
+    // not a scalar run -- so slot 0 is the struct's first field and a
+    // `Const` derived onto it reads that field's bits. HEAD spelled these
+    // `Ask<..>` for exactly this reason, and the drivers still answer them.
+    let v_heads = ctx.ask::<i32, keys::VHeads>()?;
+    let v_dim = ctx.ask::<i32, keys::VDim>()?;
+    let conv_state = ctx.ask::<Tensor<f32>, keys::ConvState>()?;
+    let rstate = ctx.ask::<Tensor<f32>, keys::RecurrentState>()?;
+    let new_conv_state = ctx.ask::<Tensor<f32>, keys::NewConvState>()?;
+    let params = ctx.params()?;
+    let slot_ids = ctx.ask::<Tensor<u32>, keys::RecurrentSlots>()?;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("ssm/gdn_core.wgsl", "gdn_core_slotted_bfloat16").apply(gdn_grid(rows, v_heads, v_dim)?),
         &[
-            mixed.v(),
-            conv_state.v(),
-            rstate.v(),
-            core_out.v(),
-            conv_w.v(),
-            conv_b.v(),
-            a_log.v(),
-            dt_bias.v(),
-            a_gate.v(),
-            b_gate.v(),
-            new_conv_state.v(),
-            params.v(),
-            slot_ids.v(),
+            mixed.arg(),
+            conv_state.arg(),
+            rstate.arg_mut(),
+            core_out.arg(),
+            conv_w.arg(),
+            conv_b.arg(),
+            a_log.arg(),
+            dt_bias.arg(),
+            a_gate.arg(),
+            b_gate.arg(),
+            new_conv_state.arg_mut(),
+            params,
+            slot_ids.arg(),
         ],
     )
 }
@@ -282,7 +284,7 @@ pub fn gdn_core_slotted(
 /// Every value channel of a head recomputes the same convolution, the same
 /// pair of L2 norms and the same gates, so the split stages them once into
 /// three f32 scratch slabs and [`gdn_core_recurrent`] reads them back. The
-/// slabs are `F32sMut` here and `F32s` there, which is the direction of the
+/// slabs are `F32s` here and `F32s` there, which is the direction of the
 /// seam written into the types.
 ///
 /// The two halves also SPLIT the convolution writeback: this one rolls the q
@@ -297,44 +299,45 @@ pub fn gdn_core_slotted(
 /// # Errors
 ///
 /// See `gdn_grid`.
+#[routine]
 pub fn gdn_prep(
     ctx: &Ctx<'_>,
-    mixed: InSlot<0, Buf>,
-    conv_state: Held<keys::ConvState, F32s>,
-    conv_w: Weight<0, Buf>,
-    conv_b: Weight<1, Buf>,
-    a_log: Weight<2, F32s>,
-    dt_bias: Weight<3, Buf>,
-    a_gate: InSlot<1, Buf>,
-    b_gate: InSlot<2, Buf>,
-    pre_q: OutSlot<0, F32sMut>,
-    pre_k: OutSlot<1, F32sMut>,
-    pre_gate: OutSlot<2, F32sMut>,
-    new_conv_state: Held<keys::NewConvState, F32sMut>,
-    params: Block<Buf>,
-    rows: Ask<keys::Rows, i32>,
-    v_heads: Ask<keys::VHeads, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            module: "ssm/gdn_prep.wgsl",
-            entrypoint: "gdn_prep_bfloat16",
-            lanes: prep_grid(*rows, *v_heads)?,
-        },
+    mixed: In<Tensor<bf16>>,
+    conv_w: Const<Tensor<bf16>>,
+    conv_b: Const<Tensor<bf16>>,
+    a_log: Const<Tensor<f32>>,
+    dt_bias: Const<Tensor<bf16>>,
+    a_gate: In<Tensor<bf16>>,
+    b_gate: In<Tensor<bf16>>,
+    pre_q: Out<Tensor<f32>>,
+    pre_k: Out<Tensor<f32>>,
+    pre_gate: Out<Tensor<f32>>) -> Result<(), Refusal> {
+    // BACK TO AN ASK, BECAUSE THIS ROUTINE'S PARAMS RUN IS A STRUCT.
+    // The body forwards `ctx.params()` whole -- the shader reads fields,
+    // not a scalar run -- so slot 0 is the struct's first field and a
+    // `Const` derived onto it reads that field's bits. HEAD spelled these
+    // `Ask<..>` for exactly this reason, and the drivers still answer them.
+    let v_heads = ctx.ask::<i32, keys::VHeads>()?;
+    let conv_state = ctx.ask::<Tensor<f32>, keys::ConvState>()?;
+    let new_conv_state = ctx.ask::<Tensor<f32>, keys::NewConvState>()?;
+    let params = ctx.params()?;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("ssm/gdn_prep.wgsl", "gdn_prep_bfloat16").apply(prep_grid(rows, v_heads)?),
         &[
-            mixed.v(),
-            conv_state.v(),
-            conv_w.v(),
-            conv_b.v(),
-            a_log.v(),
-            dt_bias.v(),
-            a_gate.v(),
-            b_gate.v(),
-            pre_q.v(),
-            pre_k.v(),
-            pre_gate.v(),
-            new_conv_state.v(),
-            params.v(),
+            mixed.arg(),
+            conv_state.arg(),
+            conv_w.arg(),
+            conv_b.arg(),
+            a_log.arg(),
+            dt_bias.arg(),
+            a_gate.arg(),
+            b_gate.arg(),
+            pre_q.arg(),
+            pre_k.arg(),
+            pre_gate.arg(),
+            new_conv_state.arg_mut(),
+            params,
         ],
     )
 }
@@ -345,46 +348,47 @@ pub fn gdn_prep(
 /// # Errors
 ///
 /// See `gdn_grid`.
+#[routine]
 pub fn gdn_prep_slotted(
     ctx: &Ctx<'_>,
-    mixed: InSlot<0, Buf>,
-    conv_state: Held<keys::ConvState, F32s>,
-    conv_w: Weight<0, Buf>,
-    conv_b: Weight<1, Buf>,
-    a_log: Weight<2, F32s>,
-    dt_bias: Weight<3, Buf>,
-    a_gate: InSlot<1, Buf>,
-    b_gate: InSlot<2, Buf>,
-    pre_q: OutSlot<0, F32sMut>,
-    pre_k: OutSlot<1, F32sMut>,
-    pre_gate: OutSlot<2, F32sMut>,
-    new_conv_state: Held<keys::NewConvState, F32sMut>,
-    params: Block<Buf>,
-    slot_ids: Held<keys::RecurrentSlots, U32s>,
-    rows: Ask<keys::Rows, i32>,
-    v_heads: Ask<keys::VHeads, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            module: "ssm/gdn_prep.wgsl",
-            entrypoint: "gdn_prep_slotted_bfloat16",
-            lanes: prep_grid(*rows, *v_heads)?,
-        },
+    mixed: In<Tensor<bf16>>,
+    conv_w: Const<Tensor<bf16>>,
+    conv_b: Const<Tensor<bf16>>,
+    a_log: Const<Tensor<f32>>,
+    dt_bias: Const<Tensor<bf16>>,
+    a_gate: In<Tensor<bf16>>,
+    b_gate: In<Tensor<bf16>>,
+    pre_q: Out<Tensor<f32>>,
+    pre_k: Out<Tensor<f32>>,
+    pre_gate: Out<Tensor<f32>>) -> Result<(), Refusal> {
+    // BACK TO AN ASK, BECAUSE THIS ROUTINE'S PARAMS RUN IS A STRUCT.
+    // The body forwards `ctx.params()` whole -- the shader reads fields,
+    // not a scalar run -- so slot 0 is the struct's first field and a
+    // `Const` derived onto it reads that field's bits. HEAD spelled these
+    // `Ask<..>` for exactly this reason, and the drivers still answer them.
+    let v_heads = ctx.ask::<i32, keys::VHeads>()?;
+    let conv_state = ctx.ask::<Tensor<f32>, keys::ConvState>()?;
+    let new_conv_state = ctx.ask::<Tensor<f32>, keys::NewConvState>()?;
+    let params = ctx.params()?;
+    let slot_ids = ctx.ask::<Tensor<u32>, keys::RecurrentSlots>()?;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("ssm/gdn_prep.wgsl", "gdn_prep_slotted_bfloat16").apply(prep_grid(rows, v_heads)?),
         &[
-            mixed.v(),
-            conv_state.v(),
-            conv_w.v(),
-            conv_b.v(),
-            a_log.v(),
-            dt_bias.v(),
-            a_gate.v(),
-            b_gate.v(),
-            pre_q.v(),
-            pre_k.v(),
-            pre_gate.v(),
-            new_conv_state.v(),
-            params.v(),
-            slot_ids.v(),
+            mixed.arg(),
+            conv_state.arg(),
+            conv_w.arg(),
+            conv_b.arg(),
+            a_log.arg(),
+            dt_bias.arg(),
+            a_gate.arg(),
+            b_gate.arg(),
+            pre_q.arg(),
+            pre_k.arg(),
+            pre_gate.arg(),
+            new_conv_state.arg_mut(),
+            params,
+            slot_ids.arg(),
         ],
     )
 }
@@ -403,50 +407,51 @@ pub fn gdn_prep_slotted(
 /// # Errors
 ///
 /// See `gdn_grid`.
+#[routine]
 pub fn gdn_prep_prefill(
     ctx: &Ctx<'_>,
-    mixed: InSlot<0, Buf>,
-    conv_state: Ask<keys::ConvState, F32s>,
-    conv_w: Weight<0, Buf>,
-    conv_b: Weight<1, Buf>,
-    a_log: Weight<2, F32s>,
-    dt_bias: Weight<3, Buf>,
-    a_gate: InSlot<1, Buf>,
-    b_gate: InSlot<2, Buf>,
-    pre_q: OutSlot<0, F32sMut>,
-    pre_k: OutSlot<1, F32sMut>,
-    pre_gate: OutSlot<2, F32sMut>,
-    new_conv_state: Ask<keys::NewConvState, F32sMut>,
-    params: Block<Buf>,
-    slot_ids: Ask<keys::RecurrentSlots, U32s>,
-    row_pitch: Ask<keys::InWidth, i32>,
-    n_scan: Ask<keys::Rows, i32>,
-    rows: Reckoned<Say<keys::Rows>, Env<i32>>,
-    v_heads: Ask<keys::VHeads, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            module: "ssm/gdn_prep.wgsl",
-            entrypoint: "gdn_prep_prefill_bfloat16",
-            lanes: prep_grid(**rows, *v_heads)?,
-        },
+    mixed: In<Tensor<bf16>>,
+    conv_w: Const<Tensor<bf16>>,
+    conv_b: Const<Tensor<bf16>>,
+    a_log: Const<Tensor<f32>>,
+    dt_bias: Const<Tensor<bf16>>,
+    a_gate: In<Tensor<bf16>>,
+    b_gate: In<Tensor<bf16>>,
+    pre_q: Out<Tensor<f32>>,
+    pre_k: Out<Tensor<f32>>,
+    pre_gate: Out<Tensor<f32>>) -> Result<(), Refusal> {
+    // BACK TO AN ASK, BECAUSE THIS ROUTINE'S PARAMS RUN IS A STRUCT.
+    // The body forwards `ctx.params()` whole -- the shader reads fields,
+    // not a scalar run -- so slot 0 is the struct's first field and a
+    // `Const` derived onto it reads that field's bits. HEAD spelled these
+    // `Ask<..>` for exactly this reason, and the drivers still answer them.
+    let v_heads = ctx.ask::<i32, keys::VHeads>()?;
+    let conv_state = ctx.ask::<Tensor<f32>, keys::ConvState>()?;
+    let new_conv_state = ctx.ask::<Tensor<f32>, keys::NewConvState>()?;
+    let params = ctx.params()?;
+    let slot_ids = ctx.ask::<Tensor<u32>, keys::RecurrentSlots>()?;
+    let row_pitch = mixed.width;
+    let n_scan = ctx.ask::<i32, keys::Rows>()?;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("ssm/gdn_prep.wgsl", "gdn_prep_prefill_bfloat16").apply(prep_grid(rows, v_heads)?),
         &[
-            mixed.v(),
-            conv_state.v(),
-            conv_w.v(),
-            conv_b.v(),
-            a_log.v(),
-            dt_bias.v(),
-            a_gate.v(),
-            b_gate.v(),
-            pre_q.v(),
-            pre_k.v(),
-            pre_gate.v(),
-            new_conv_state.v(),
-            params.v(),
-            slot_ids.v(),
-            row_pitch.v(),
-            n_scan.v(),
+            mixed.arg(),
+            conv_state.arg(),
+            conv_w.arg(),
+            conv_b.arg(),
+            a_log.arg(),
+            dt_bias.arg(),
+            a_gate.arg(),
+            b_gate.arg(),
+            pre_q.arg(),
+            pre_k.arg(),
+            pre_gate.arg(),
+            new_conv_state.arg_mut(),
+            params,
+            slot_ids.arg(),
+            row_pitch.arg(),
+            n_scan.arg(),
         ],
     )
 }
@@ -463,41 +468,42 @@ pub fn gdn_prep_prefill(
 /// # Errors
 ///
 /// See `gdn_grid`.
+#[routine]
 pub fn gdn_core_recurrent(
     ctx: &Ctx<'_>,
-    mixed: InSlot<0, Buf>,
-    conv_state: Held<keys::ConvState, F32s>,
-    rstate: Held<keys::RecurrentState, F32sMut>,
-    core_out: OutSlot<0, BufMut>,
-    conv_w: Weight<0, Buf>,
-    conv_b: Weight<1, Buf>,
-    pre_q: InSlot<1, F32s>,
-    pre_k: InSlot<2, F32s>,
-    pre_gate: InSlot<3, F32s>,
-    new_conv_state: Held<keys::NewConvState, F32sMut>,
-    params: Block<Buf>,
-    rows: Ask<keys::Rows, i32>,
-    v_heads: Ask<keys::VHeads, i32>,
-    v_dim: Ask<keys::VDim, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            module: "ssm/gdn_prep.wgsl",
-            entrypoint: "gdn_core_recurrent_bfloat16",
-            lanes: gdn_grid(*rows, *v_heads, *v_dim)?,
-        },
+    mixed: In<Tensor<bf16>>,
+    core_out: Out<Tensor<bf16>>,
+    conv_w: Const<Tensor<bf16>>,
+    conv_b: Const<Tensor<bf16>>,
+    pre_q: In<Tensor<f32>>,
+    pre_k: In<Tensor<f32>>,
+    pre_gate: In<Tensor<f32>>) -> Result<(), Refusal> {
+    // BACK TO AN ASK, BECAUSE THIS ROUTINE'S PARAMS RUN IS A STRUCT.
+    // The body forwards `ctx.params()` whole -- the shader reads fields,
+    // not a scalar run -- so slot 0 is the struct's first field and a
+    // `Const` derived onto it reads that field's bits. HEAD spelled these
+    // `Ask<..>` for exactly this reason, and the drivers still answer them.
+    let v_heads = ctx.ask::<i32, keys::VHeads>()?;
+    let v_dim = ctx.ask::<i32, keys::VDim>()?;
+    let conv_state = ctx.ask::<Tensor<f32>, keys::ConvState>()?;
+    let rstate = ctx.ask::<Tensor<f32>, keys::RecurrentState>()?;
+    let new_conv_state = ctx.ask::<Tensor<f32>, keys::NewConvState>()?;
+    let params = ctx.params()?;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("ssm/gdn_prep.wgsl", "gdn_core_recurrent_bfloat16").apply(gdn_grid(rows, v_heads, v_dim)?),
         &[
-            mixed.v(),
-            conv_state.v(),
-            rstate.v(),
-            core_out.v(),
-            conv_w.v(),
-            conv_b.v(),
-            pre_q.v(),
-            pre_k.v(),
-            pre_gate.v(),
-            new_conv_state.v(),
-            params.v(),
+            mixed.arg(),
+            conv_state.arg(),
+            rstate.arg_mut(),
+            core_out.arg(),
+            conv_w.arg(),
+            conv_b.arg(),
+            pre_q.arg(),
+            pre_k.arg(),
+            pre_gate.arg(),
+            new_conv_state.arg_mut(),
+            params,
         ],
     )
 }
@@ -508,43 +514,44 @@ pub fn gdn_core_recurrent(
 /// # Errors
 ///
 /// See `gdn_grid`.
+#[routine]
 pub fn gdn_core_recurrent_slotted(
     ctx: &Ctx<'_>,
-    mixed: InSlot<0, Buf>,
-    conv_state: Held<keys::ConvState, F32s>,
-    rstate: Held<keys::RecurrentState, F32sMut>,
-    core_out: OutSlot<0, BufMut>,
-    conv_w: Weight<0, Buf>,
-    conv_b: Weight<1, Buf>,
-    pre_q: InSlot<1, F32s>,
-    pre_k: InSlot<2, F32s>,
-    pre_gate: InSlot<3, F32s>,
-    new_conv_state: Held<keys::NewConvState, F32sMut>,
-    params: Block<Buf>,
-    slot_ids: Held<keys::RecurrentSlots, U32s>,
-    rows: Ask<keys::Rows, i32>,
-    v_heads: Ask<keys::VHeads, i32>,
-    v_dim: Ask<keys::VDim, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            module: "ssm/gdn_prep.wgsl",
-            entrypoint: "gdn_core_recurrent_slotted_bfloat16",
-            lanes: gdn_grid(*rows, *v_heads, *v_dim)?,
-        },
+    mixed: In<Tensor<bf16>>,
+    core_out: Out<Tensor<bf16>>,
+    conv_w: Const<Tensor<bf16>>,
+    conv_b: Const<Tensor<bf16>>,
+    pre_q: In<Tensor<f32>>,
+    pre_k: In<Tensor<f32>>,
+    pre_gate: In<Tensor<f32>>) -> Result<(), Refusal> {
+    // BACK TO AN ASK, BECAUSE THIS ROUTINE'S PARAMS RUN IS A STRUCT.
+    // The body forwards `ctx.params()` whole -- the shader reads fields,
+    // not a scalar run -- so slot 0 is the struct's first field and a
+    // `Const` derived onto it reads that field's bits. HEAD spelled these
+    // `Ask<..>` for exactly this reason, and the drivers still answer them.
+    let v_heads = ctx.ask::<i32, keys::VHeads>()?;
+    let v_dim = ctx.ask::<i32, keys::VDim>()?;
+    let conv_state = ctx.ask::<Tensor<f32>, keys::ConvState>()?;
+    let rstate = ctx.ask::<Tensor<f32>, keys::RecurrentState>()?;
+    let new_conv_state = ctx.ask::<Tensor<f32>, keys::NewConvState>()?;
+    let params = ctx.params()?;
+    let slot_ids = ctx.ask::<Tensor<u32>, keys::RecurrentSlots>()?;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("ssm/gdn_prep.wgsl", "gdn_core_recurrent_slotted_bfloat16").apply(gdn_grid(rows, v_heads, v_dim)?),
         &[
-            mixed.v(),
-            conv_state.v(),
-            rstate.v(),
-            core_out.v(),
-            conv_w.v(),
-            conv_b.v(),
-            pre_q.v(),
-            pre_k.v(),
-            pre_gate.v(),
-            new_conv_state.v(),
-            params.v(),
-            slot_ids.v(),
+            mixed.arg(),
+            conv_state.arg(),
+            rstate.arg_mut(),
+            core_out.arg(),
+            conv_w.arg(),
+            conv_b.arg(),
+            pre_q.arg(),
+            pre_k.arg(),
+            pre_gate.arg(),
+            new_conv_state.arg_mut(),
+            params,
+            slot_ids.arg(),
         ],
     )
 }
@@ -577,65 +584,66 @@ pub fn gdn_core_recurrent_slotted(
 ///
 /// [`Refusal::Narrow`] for a `(lanes, vrows)` that is not compiled (see
 /// `scan_point`), and [`Refusal::Empty`] for an empty extent.
+#[routine]
 pub fn gdn_core_recurrent_prefill(
     ctx: &Ctx<'_>,
-    rstate: Ask<keys::RecurrentState, F32sMut>,
-    core_out: OutSlot<0, BufMut>,
-    pre_q: InSlot<1, F32s>,
-    pre_k: InSlot<2, F32s>,
-    pre_gate: InSlot<3, F32s>,
-    params: Block<Buf>,
-    slot_ids: Ask<keys::RecurrentSlots, U32s>,
-    row_pitch: Ask<keys::InWidth, i32>,
-    n_scan: Ask<keys::Rows, i32>,
-    lanes: Param<11, i32>,
-    vrows: Param<12, i32>,
-    dv: Reckoned<Say<keys::VDim>, Env<i32>>,
-    hv: Reckoned<Say<keys::VHeads>, Env<i32>>,
-) -> Result<(), Refusal> {
-    let point = scan_point(*lanes, *vrows)?;
-    if **dv <= 0 {
+    // THE STATEMENT'S INPUT 0, WHICH THIS SCAN DOES NOT READ. The text places
+    // `[mixed, pre_q, pre_k, pre_gate]` and the scan takes the three prepared
+    // planes only; the mark is here because the slot is a POSITION now, and
+    // without it `pre_q` would bind `mixed`.
+    #[allow(unused_variables)]
+    pad: In<Tensor<bf16>>,
+    core_out: Out<Tensor<bf16>>,
+    pre_q: In<Tensor<f32>>,
+    pre_k: In<Tensor<f32>>,
+    pre_gate: In<Tensor<f32>>) -> Result<(), Refusal> {
+    // BACK TO ASKS, AS METAL'S TWIN. This routine's params run is a struct the
+    // shader reads by field, so slot 0 is not `dv`'s to take -- and the two
+    // planes must ask the binder the same questions, which is what
+    // `kernels`'s `two_backends_that_crossed_the_same_kernel_agree_on_its_signature` says.
+    let hv = ctx.ask::<i32, keys::VHeads>()?;
+    let dv = ctx.ask::<i32, keys::VDim>()?;
+    let rstate = ctx.ask::<Tensor<f32>, keys::RecurrentState>()?;
+    let params = ctx.params()?;
+    let slot_ids = ctx.ask::<Tensor<u32>, keys::RecurrentSlots>()?;
+    let row_pitch = pre_q.width;
+    let n_scan = ctx.ask::<i32, keys::Rows>()?;
+    // THE TILING, READ OUT OF THE STATEMENT'S OWN RUN. These were
+    // `Param<11, i32>` and `Param<12, i32>` -- words of the struct this body
+    // forwards whole -- and the migration turned them into `keys::Lanes` and
+    // `keys::Vrows`, which no driver answers, so every prefill scan refused
+    // `Unstated`. They cannot be `Const` marks either: the run is the
+    // shader's layout and slots 0..10 are its fields, not this body's.
+    let lanes = ctx.param(11)?;
+    let vrows = ctx.param(12)?;
+    let point = scan_point(lanes, vrows)?;
+    if dv <= 0 {
         return Err(Refusal::Empty { what: "dv" });
     }
-    if **hv <= 0 {
+    if hv <= 0 {
         return Err(Refusal::Empty { what: "hv" });
     }
     let per_group = (32 / lanes.unsigned_abs()) * vrows.unsigned_abs();
-    ctx.dispatch(
-        Fire {
-            module: "ssm/gdn_prep.wgsl",
-            entrypoint: SCAN[point],
-            lanes: [
+    ctx.fire(
+        Fire::at("ssm/gdn_prep.wgsl", SCAN[point]).apply([
                 32,
                 dv.unsigned_abs().div_ceil(per_group),
                 hv.unsigned_abs(),
-            ],
-        },
+            ]),
         &[
-            rstate.v(),
-            core_out.v(),
-            pre_q.v(),
-            pre_k.v(),
-            pre_gate.v(),
-            params.v(),
-            slot_ids.v(),
-            row_pitch.v(),
-            n_scan.v(),
+            rstate.arg_mut(),
+            core_out.arg(),
+            pre_q.arg(),
+            pre_k.arg(),
+            pre_gate.arg(),
+            params,
+            slot_ids.arg(),
+            row_pitch.arg(),
+            n_scan.arg(),
         ],
     )
 }
 
-/// The eight, in the order the rows above name them.
-pub static ROUTINES: &[Routine] = &[
-    crate::routine!(gdn_core),
-    crate::routine!(gdn_core_recurrent),
-    crate::routine!(gdn_core_recurrent_prefill),
-    crate::routine!(gdn_core_recurrent_slotted),
-    crate::routine!(gdn_core_slotted),
-    crate::routine!(gdn_prep),
-    crate::routine!(gdn_prep_prefill),
-    crate::routine!(gdn_prep_slotted),
-];
 
 #[cfg(test)]
 mod tests {

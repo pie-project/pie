@@ -66,10 +66,10 @@ fn from_the_table() -> BTreeSet<String> {
 ///
 /// This reads text rather than the routine table because a body picks its
 /// entrypoint while RUNNING, from the widths it is handed; there is no static
-/// field to read. The scan is narrow — the `entrypoint:` field of a `Fire`
-/// literal, comments stripped first — because the last raw-text scan this
-/// crate grew matched the comment that explained the fix rather than the
-/// code, and the first version of THIS one matched a function parameter.
+/// field to read. The scan is narrow — the second argument of a `Fire::at(..)`
+/// call, comments stripped first — because the last raw-text scan this crate
+/// grew matched the comment that explained the fix rather than the code, and
+/// the first version of THIS one matched a function parameter.
 ///
 /// A body that computed its entrypoint instead of spelling it would be
 /// unreadable this way, so [`resolve`] returns `None` and this PANICS rather
@@ -96,7 +96,111 @@ fn from_the_routines() -> BTreeSet<String> {
     found
 }
 
-/// Every `Fire`, with whether its `lanes` came from a FLAT `elementwise` call.
+/// One `Fire::at(..)` call read out of source, with its chained `.apply(..)`
+/// swallowed into the same match if one follows immediately: the line the
+/// call opens on, the RAW TEXT of its second argument (the entrypoint), the
+/// RAW TEXT of the whole construction -- both calls' argument lists,
+/// concatenated -- and the RAW TEXT since the PREVIOUS match (or the file's
+/// start, for the first). A caller wanting to know whether a geometry came
+/// from a FLAT `elementwise` call needs both of the last two: the call
+/// usually reads `.apply(elementwise(w, r)?)` and the whole span holds it,
+/// but four of `layout.rs`'s bodies compute it a line earlier --
+/// `let lanes = elementwise(hidden, rows)?;` -- and reference it by name in
+/// `.apply(lanes)`, where only the PRELUDE holds the call.
+///
+/// A body now spells its point as `Fire::at(file, entrypoint).apply(geometry)`
+/// -- a CALL, not the `Fire { file: .., entrypoint: .., .. }` struct literal
+/// every scan in this file used to anchor on. There is no brace left to find:
+/// `rg 'Fire \{' crates/kernels-wgpu/src` is empty over the whole crate, every
+/// family having crossed to the call form. So the region tracked is the
+/// call's own delimiters -- parens for the call, brackets too for a table
+/// index like `EMBED_GATHER[..]` or a geometry array like `[lanes, 1, 1]` --
+/// counted from `Fire::at(`'s own opening paren rather than from a `{`. The
+/// two arguments split on the first comma AT THAT DEPTH, so a comma inside
+/// `affine_point(*group, *bits)?` -- itself an argument -- does not end the
+/// first one early.
+fn fire_calls(text: &str) -> Vec<(usize, String, String, String)> {
+    let code: String = text
+        .lines()
+        .map(|l| l.split_once("//").map_or(l, |(before, _)| before))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let bytes = code.as_bytes();
+
+    /// The index one past the delimiter matching `bytes[open]`, itself one of
+    /// `( [ {`. A quoted string's own brackets do not count, so a table name
+    /// or an entrypoint literal holding one -- none do today, but the scan
+    /// should not break the day one needs a `[` in its name -- is inert.
+    fn matching_close(bytes: &[u8], open: usize) -> usize {
+        let mut depth = 1i32;
+        let mut in_str = false;
+        let mut i = open + 1;
+        while depth > 0 {
+            match bytes[i] {
+                b'"' => in_str = !in_str,
+                b'(' | b'[' | b'{' if !in_str => depth += 1,
+                b')' | b']' | b'}' if !in_str => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        i
+    }
+
+    /// The first comma this argument list holds at ITS OWN depth, i.e. not
+    /// inside a nested call or index.
+    fn top_level_comma(bytes: &[u8]) -> Option<usize> {
+        let mut depth = 0i32;
+        let mut in_str = false;
+        for (i, &b) in bytes.iter().enumerate() {
+            match b {
+                b'"' => in_str = !in_str,
+                b'(' | b'[' | b'{' if !in_str => depth += 1,
+                b')' | b']' | b'}' if !in_str => depth -= 1,
+                b',' if !in_str && depth == 0 => return Some(i),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = code[from..].find("Fire::at(") {
+        let start = from + rel;
+        let prelude = code[from..start].to_owned();
+        let open = start + "Fire::at".len();
+        let close = matching_close(bytes, open);
+        let args = &code[open + 1..close - 1];
+        let entrypoint = match top_level_comma(args.as_bytes()) {
+            Some(c) => args[c + 1..].trim(),
+            None => args.trim(),
+        };
+        let after = &code[close..];
+        let pad = after.len() - after.trim_start().len();
+        let whole_end = if after.trim_start().starts_with(".apply(") {
+            matching_close(bytes, close + pad + ".apply".len())
+        } else {
+            close
+        };
+        let line = code[..start].matches('\n').count() + 1;
+        out.push((line, entrypoint.to_owned(), code[start..whole_end].to_owned(), prelude));
+        from = whole_end;
+    }
+    out
+}
+
+/// The `entrypoint` arguments of `Fire::at(..)` calls in one module, with the
+/// line each opens on.
+fn fire_entrypoints(text: &str) -> Vec<(usize, String)> {
+    fire_calls(text)
+        .into_iter()
+        .map(|(line, entrypoint, ..)| (line, entrypoint))
+        .collect()
+}
+
+/// Every `Fire::at(..)`, with whether its geometry came from a FLAT
+/// `elementwise` call.
 ///
 /// `elementwise` is `[width * rows, 1, 1]`; `elementwise_rows` is
 /// `[width, rows, 1]`. The two differ by a suffix, so the match is on the
@@ -106,64 +210,34 @@ fn from_the_routines() -> BTreeSet<String> {
 type Fired = (usize, String, bool);
 
 fn elementwise_fires(text: &str) -> Vec<Fired> {
-    let mut out = Vec::new();
-    /// Brace depth, the entrypoint seen so far, and whether a flat
-    /// `elementwise` call was seen — the state of one open `Fire { .. }`.
-    type Open = (i32, Option<(usize, String)>, bool);
-    let mut depth: Option<Open> = None;
-    for (n, line) in text.lines().enumerate() {
-        let code = line.split_once("//").map_or(line, |(before, _)| before);
-        if depth.is_none() && code.contains("Fire {") {
-            depth = Some((0, None, false));
-        }
-        let Some((level, named, flat)) = depth.as_mut() else {
-            continue;
-        };
-        if let Some((_, rest)) = code.split_once("entrypoint:") {
-            *named = Some((n + 1, rest.trim().trim_end_matches(',').to_owned()));
-        }
-        if code.contains("elementwise(") {
-            *flat = true;
-        }
-        *level += i32::try_from(code.matches('{').count()).expect("few braces");
-        *level -= i32::try_from(code.matches('}').count()).expect("few braces");
-        if *level <= 0 {
-            if let Some((at, value)) = named.take() {
-                out.push((at, value, *flat));
+    fire_calls(text)
+        .into_iter()
+        .map(|(line, entrypoint, whole, prelude)| {
+            // The usual shape: `.apply(elementwise(w, r)?)`, the call inline
+            // in the argument this fire's own text holds.
+            let mut flat = whole.contains("elementwise(");
+            // `layout.rs`'s `embed_gather_4bit` and `embed_gather_scaled_4bit`
+            // compute it a line earlier instead -- `let lanes =
+            // elementwise(hidden, rows)?;` -- and pass the name to `.apply`,
+            // so the call is in the PRELUDE, not the fire's own text. Only a
+            // BARE name in `.apply(..)` is worth the lookup: a nested call or
+            // index there (`.apply(head_grid(..)?)`) is never this shape.
+            if !flat {
+                if let Some(open) = whole.rfind(".apply(") {
+                    let arg = whole[open + ".apply(".len()..whole.len() - 1].trim();
+                    let bare = !arg.is_empty()
+                        && arg.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                        && arg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                    if bare {
+                        flat = prelude.contains(&format!("let {arg} = elementwise("))
+                            || prelude
+                                .contains(&format!("let {arg} = kernels::shader::elementwise("));
+                    }
+                }
             }
-            depth = None;
-        }
-    }
-    out
-}
-
-/// The `entrypoint:` fields of `Fire` literals in one module, with the line.
-///
-/// Scoped to `Fire { .. }` rather than matching `entrypoint:` anywhere,
-/// because the first version of this scan flagged `fn spell(entrypoint: &str)`
-/// — a parameter, not a field. Brace depth is counted from the `Fire {` so a
-/// literal nested inside one still ends in the right place.
-fn fire_entrypoints(text: &str) -> Vec<(usize, String)> {
-    let mut out = Vec::new();
-    let mut depth: Option<i32> = None;
-    for (n, line) in text.lines().enumerate() {
-        let code = line.split_once("//").map_or(line, |(before, _)| before);
-        if depth.is_none() && code.contains("Fire {") {
-            depth = Some(0);
-        }
-        let Some(level) = depth.as_mut() else {
-            continue;
-        };
-        if let Some((_, rest)) = code.split_once("entrypoint:") {
-            out.push((n + 1, rest.trim().trim_end_matches(',').to_owned()));
-        }
-        *level += i32::try_from(code.matches('{').count()).expect("few braces");
-        *level -= i32::try_from(code.matches('}').count()).expect("few braces");
-        if *level <= 0 {
-            depth = None;
-        }
-    }
-    out
+            (line, entrypoint, flat)
+        })
+        .collect()
 }
 
 /// This crate's Rust sources, where routine bodies live.
@@ -1141,18 +1215,21 @@ fn a_flat_rows_shader_does_not_read_its_row_off_the_y_axis() {
     // `kernels` and `KERNELS` is empty, so there is neither a column to read
     // nor a row to read it on.
     //
-    // It counted every row whose `LaunchRule` was `Elementwise` and added
-    // that row's entrypoints to the set the y-axis scan below runs over. It
-    // did not become TRUE, it went BLIND -- and it had been contributing zero
-    // for as long as the table has been empty, which is why the count below
-    // does not move.
-    //
     // A routine says FLAT by calling `kernels::shader::elementwise`, which
-    // returns the same `[width * rows, 1, 1]` the rule did, so the property
-    // moved from the row to the body as each family crossed and the body
-    // half read below is now the whole of it. `mlp` was four of them, every
-    // one an `elementwise` body, and `geglu_tanh_strided`'s header is where
-    // this defect was measured at 21 rows in the first place.
+    // returns the same `[width * rows, 1, 1]` a row's `LaunchRule::Elementwise`
+    // did, so the property moved from the row to the body as each family
+    // crossed and the body half read below is now the whole of it. The call
+    // is usually inline in the `Fire::at(..).apply(..)` this scan reads --
+    // `mlp` is four of them, every one an `elementwise` body, and
+    // `geglu_tanh_strided`'s header is where this defect was measured at 21
+    // rows in the first place -- but `layout.rs`'s `embed_gather_4bit` and
+    // `embed_gather_scaled_4bit` bind the call to `lanes` a line earlier and
+    // `.apply(lanes)` by name, so `elementwise_fires` also looks one call's
+    // PRELUDE back for that shape. `ple_combine` computes the same product by
+    // hand instead of calling the helper and so is not found here at all --
+    // a real gap in what this scan can prove, not one this migration opened,
+    // since a text scan was never going to see through hand-rolled
+    // arithmetic to the shape it means.
     let mut flat_points: Vec<String> = Vec::new();
     let mut flat = 0usize;
     // The crossed bodies, whose rows are gone.
@@ -1225,18 +1302,20 @@ fn a_flat_rows_shader_does_not_read_its_row_off_the_y_axis() {
         }
     }
     assert!(
-        flat == 10 && checked >= 10,
+        flat == 11 && checked >= 21,
         "{flat} flat kernels over {checked} entrypoints is not this tree. \
-         Every one of them now states an `elementwise` body; a family \
-         crossing used to move one from the row count to the body count and \
-         must not drop it. It was 10 while this read only rows and `mlp`'s \
-         bodies -- reading every crossed body found four more, in families \
-         whose rows stated no launch rule at all and which this check had \
-         therefore never covered. `layout` retiring moved three of its six \
-         from the row side to the body side and dropped the three that are \
-         `elementwise_rows`, which were never flat. The rows contributed zero \
-         for as long as the table has been empty, so their sweep retiring \
-         does not move this"
+         Every one of them now states an `elementwise` body -- the property \
+         moved from the row to the body as each family crossed, and the row \
+         side is gone (`KERNELS` is empty). `mlp` is four of them, `attn` \
+         one, `quant` four, and `layout` two (`embed_gather_4bit` and \
+         `embed_gather_scaled_4bit`; `ple_combine` is a third that is flat \
+         but escapes this SCAN, computing its grid by hand rather than \
+         calling `elementwise`). `embed_gather_4bit` and \
+         `embed_gather_scaled_4bit` each name their point as a table index \
+         (`EMBED_GATHER[..]`), which `resolve` can only widen to the whole \
+         table -- six entrypoints apiece -- rather than the one point the \
+         runtime value actually picks, which is why `checked` runs so far \
+         ahead of `flat`."
     );
 }
 

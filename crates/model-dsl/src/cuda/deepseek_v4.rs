@@ -286,9 +286,26 @@ pub fn dequant_fp8_e4m3(
     rows: u32,
     cols: u32,
     scale: Fp8Scale,
+    per_tensor_scale: f32,
 ) -> Val {
-    // `params[1]` and not `[0]`: the per-tensor form spends `[0]` on its
-    // `scale`, read as f32.
+    // THE FIRST SLOT IS A VALUE NOW, NOT A HOLE.
+    //
+    // It used to be `vec![0, rows, cols]` -- a literal zero held open so that
+    // `rows` would land at index 1, with a comment above it because nothing in
+    // the type system said so. The routine's `scale` was
+    // `Env<f32, keys::DequantScale>`, a `fact!(stated ..)` key resolving
+    // through `Source::Named` that NO DRIVER ANSWERS, so the launcher was
+    // unreachable and the hole never showed.
+    //
+    // `Const<f32>` at parameter 3 puts the scale where it always belonged --
+    // `params[0]`, read through the float channel, which is the reading
+    // `Handles::param_f32` already gives that slot -- and the arity of the run
+    // is declared by the signature, so `model-ir`'s `arity_problem` refuses a
+    // statement that carries too few at PLAN time instead of binding a zero.
+    //
+    // The bits and not the number: the run is a `Vec<u32>` and the BITS are
+    // the value. `1.0f32` rides as `0x3f80_0000`, and a conversion would hand
+    // the kernel 1065353216.0.
     record_with_params(
         t,
         Some(l),
@@ -299,7 +316,7 @@ pub fn dequant_fp8_e4m3(
         },
         vec![weight.to_string()],
         None,
-        vec![0, rows, cols],
+        vec![per_tensor_scale.to_bits(), rows, cols],
         vec![],
         Some((Shape(vec![Dim::Const(rows), Dim::Const(cols)]), DType::BF16)),
     )

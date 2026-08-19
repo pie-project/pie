@@ -26,19 +26,30 @@
 //!
 //! # What is Vulkan's alone
 //!
-//! **The tier does not appear anywhere here.** One entrypoint compiles to up
-//! to three `.spv` modules — `Baseline`, `Fp16`, `Coopmat` — and
-//! [`crate::Capability::module`] keys them by entrypoint name plus a tag. A
-//! body names the ENTRYPOINT; the driver walks `Capability::PREFERENCE` and
-//! takes the best tier the device advertises. A body that could name a tier
-//! could name one the device lacks, and this backend has already paid for
-//! that once: an unadvertised cooperative-matrix shape is a SIGSEGV inside
-//! `vkCreateComputePipelines` with the validation layer entirely silent.
+//! **The tier, which the BODY resolves.** One entrypoint compiles to up to
+//! three `.spv` modules — `Baseline`, `Fp16`, `Coopmat` — named by
+//! [`crate::Capability::module`] as the entrypoint plus a tag. A body asks
+//! [`Encode::best`] for the ceiling this device advertises, hands it to
+//! [`crate::module::path`], and fires the artifact that comes back. The file
+//! it names is the file that runs.
 //!
-//! There is also no `module` field beside the entrypoint, which wgpu needs and
-//! this backend does not: a WGSL file holds many entrypoints, while `build.rs`
-//! here emits one `.spv` per entrypoint per tier, so the entrypoint alone is
-//! the key.
+//! It was the other way round until `driver-vulkan`'s `Modules::code` walked
+//! `Capability::PREFERENCE` behind the body, and that walk could not reach a
+//! tiered artifact at all: 146 cooperative-matrix modules and 20 fp16 ones
+//! were dead on every device from the first commit, found by measuring prefill
+//! rather than by anything failing. A body that names its module cannot have
+//! that bug.
+//!
+//! A body still cannot name a tier the device lacks — that is an unadvertised
+//! cooperative-matrix shape and a SIGSEGV inside `vkCreateComputePipelines`
+//! with the validation layer entirely silent — because the only tier it can
+//! compose with is the one `best()` handed it.
+//!
+//! The FILE beside the entrypoint is the artifact, not a source: `build.rs`
+//! here emits one `.spv` per entrypoint per tier, so `norm/rms.slang` is a
+//! build input and `rms_single_row_bfloat16.coopmat.spv` is what a fire loads.
+//! wgpu states a `.wgsl` in the same position for the opposite reason — one
+//! source holds many entrypoints and it compiles at run time.
 
 #[cfg(test)]
 use kernels::Ty;
@@ -46,6 +57,8 @@ use kernels::Ty;
 use kernels::routine::Arg;
 use kernels::routine::{Backend, Extent, Refusal};
 use kernels::shader::ShaderValue;
+
+pub use crate::Capability;
 
 /// This backend, as the machinery names it.
 ///
@@ -58,12 +71,23 @@ impl Backend for Vulkan {
     type Value = ArgValue;
     type Ctx<'a> = dyn Encode + 'a;
 
-    // A region is `{address, rows, width}`; this backend's bound value is an
-    // address alone. The other two already live per-launch in `Facts`
-    // (`bind/table.rs:592`), so this refusal stays unreachable until a table
-    // asks for a fat `In<N, _>` — which then fails at first fire, not compile time.
-    fn region(_value: &ArgValue, _at: usize) -> Result<Extent, Refusal> {
-        Err(Refusal::Absent { what: "a region's shape: the vulkan binder binds addresses only" })
+    // THIS PLANE MINTS REGION-SHAPED VALUES NOW, and that is §7 of
+    // `.wiki/migration.md` settled. It used to bind addresses alone and refuse
+    // here, so its marks answered zero for `rows` and `width` and every
+    // rectangle had to arrive as a separate parameter keyed to `keys::Width`,
+    // `keys::InWidth` or `keys::OutWidth0`. The widths were always there --
+    // `Holds::in_width` and `out_width` answered them for a `Kind::InWidth`
+    // slot -- they simply reached a parameter instead of the operand they
+    // describe.
+    fn region(value: &ArgValue) -> Result<Extent, Refusal> {
+        match *value {
+            ArgValue::Buffer { rows, width, .. } => Ok(Extent { rows, width }),
+            // `Absent`, not `Kind`: a plain handle carries no `Ty` mismatch,
+            // just no shape to report.
+            _ => Err(Refusal::Absent {
+                what: "a region's shape: the bound value carries only a handle",
+            }),
+        }
     }
 }
 
@@ -91,13 +115,42 @@ pub enum ArgValue {
     /// pair costs 8 microseconds each on this card, measured at 3.8 ms of a
     /// 7.2 ms decode. Under `kernel!` the fact came off the row's operand
     /// types, and a routine states it in the argument TYPE instead -- so the
-    /// `Buf`/`BufMut` distinction has to survive the trip through a value,
+    /// `Buf`/`Buf` distinction has to survive the trip through a value,
     /// which is all the driver sees.
+    ///
+    /// # ONE VARIANT, BECAUSE A SECOND ONE LOST BOTH FACTS
+    ///
+    /// The rectangle used to ride a separate `Shaped` variant, minted by
+    /// `kernels::bind` for every operand slot. Two things went wrong with it,
+    /// and neither could fail loudly.
+    ///
+    /// `Shaped` had no `writes`, and `ShaderValue::buffer_at` and
+    /// `buffer_mut_at` had identical bodies -- so every operand that carried a
+    /// shape arrived with its DIRECTION erased, which is the one fact the
+    /// barrier decision reads.
+    ///
+    /// And `crate::encode`'s recording pass splits arguments with
+    /// `if let ArgValue::Buffer { .. }`. An `if let` does not have to be
+    /// exhaustive, so `Shaped` did not fail to compile there: it was silently
+    /// skipped, never pushed to `buffers`, and never written into a descriptor
+    /// set. `kernels::bind`'s `shaped` is on the path for `Kind::In`,
+    /// `Kind::Out` and `Source::Alias` -- every operand of every routine --
+    /// so only weights, which still minted a plain buffer, reached the shader.
+    ///
+    /// Merging the two is what makes both impossible to reintroduce: there is
+    /// one buffer variant, it always carries its direction, and a rectangle it
+    /// was never given is `0`, which [`Extent`] already treats as absent.
     Buffer {
         /// The caller's index for the allocation.
         handle: u32,
         /// Whether the shader may write through this binding.
         writes: bool,
+        /// Rows in this launch's rectangle. Zero where the binder had none to
+        /// give — a weight, or a plane's own re-emission through
+        /// [`kernels::Bind::arg`].
+        rows: i32,
+        /// Elements per row. Zero where the statement gave none.
+        width: i32,
     },
     /// A 32-bit signed scalar.
     I32(i32),
@@ -108,6 +161,15 @@ pub enum ArgValue {
     /// A 64-bit stride or extent, which is what [`Ty::Usize`] means here.
     Usize(u64),
 }
+
+/// NO ABSENT VALUE TO MINT, and the default is the whole of the answer.
+///
+/// This plane binds HANDLES: every operand a statement places resolves to one,
+/// and a statement that placed none produces no value at all rather than an
+/// empty one. So `Option<M>` here always unpacks as `Some`, which is what
+/// [`kernels::routine::Absent`]'s default says. A plane that later grows a
+/// sentinel handle overrides both halves together.
+impl kernels::routine::Absent for ArgValue {}
 
 impl ArgValue {
     /// What this value is, for a refusal to name.
@@ -123,32 +185,11 @@ impl ArgValue {
     }
 }
 
-/// One dispatch, as a routine body states it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Fire<'a> {
-    /// The entrypoint, whole, as its `// pie:instantiate` line spells it.
-    ///
-    /// A body that varies over an instantiation axis picks the spelling
-    /// itself; nothing pastes a suffix on afterwards, which is what `kernel!`
-    /// did with `axes`. The TIER is not part of it — see the module docs.
-    pub entrypoint: &'a str,
-    /// LANES in each dimension — elements of work, not workgroups.
-    ///
-    /// The division into workgroups is the driver's, because the divisor is a
-    /// property of the shader TEXT rather than of the launch: `[numthreads]`
-    /// is declared in the `.slang`, lands in the SPIR-V as `OpExecutionMode
-    /// LocalSize`, and `driver-vulkan/src/spirv.rs` already recovers it and
-    /// already calls it "the divisor a grid is built with". A body that
-    /// divided by it would carry a second copy of a number it cannot see.
-    ///
-    /// A body must not state a zero here. `vkCmdDispatch(0, 1, 1)` is legal
-    /// Vulkan that runs nothing and reports success — the failure this whole
-    /// surface exists to make impossible, and one this backend has met twice:
-    /// a truncated group count left a shared expert's gate at its buffer's
-    /// zeros, and every routed token was then combined under `sigmoid(0)`. A
-    /// body with nothing to do returns [`Refusal::Empty`] instead.
-    pub lanes: [u32; 3],
-}
+// THE PLANE'S OWN `Fire` STOOD HERE. It is `kernels::routine::Fire` now,
+// which CUDA states too -- the four facts were always the same four, and the
+// only difference was that CUDA passed them positionally. See that type for
+// what the shared `lanes`/`group` pair means.
+
 
 /// What a routine body dispatches through.
 ///
@@ -170,7 +211,47 @@ pub trait Encode {
     /// # Errors
     ///
     /// Whatever the device or the binding refused, as a [`Refusal`].
-    fn dispatch(&self, fire: Fire<'_>, args: &[ArgValue]) -> Result<(), Refusal>;
+    fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal>;
+
+    /// ONE VALUE, RESOLVED FROM THE COLUMN'S OWN VOCABULARY.
+    ///
+    /// What a body reaches through `ctx.ask::<C, keys::X>()` and
+    /// `ctx.params()`. The ANSWERING side is unchanged by this: the driver
+    /// already resolves a `(Ty, Source)` pair for every argument it binds --
+    /// `kernels::bind::one`, over its own `Holds` -- and this is that call,
+    /// made for a body instead of for a column.
+    ///
+    /// It exists because most of what used to be an `Env` parameter was
+    /// checkpoint configuration the statement now carries as a `Const`, and
+    /// what is left -- the batch, the plan, the allocator -- needed an ANSWER
+    /// rather than a parameter.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Unstated`] when this backend answers no such fact, and
+    /// whatever the fact's own absence means otherwise.
+    fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal>;
+
+    /// The highest tier THIS DEVICE advertises.
+    ///
+    /// A body picks its own artifact — [`crate::module::path`] steps down from
+    /// this to the best tier the build compiled — so the ceiling has to reach
+    /// the body rather than stopping at the driver. It is the device's answer
+    /// and never the text's: a body may not name a tier it did not get from
+    /// here, because a module declaring a capability the device left disabled
+    /// faults inside `vkCreateComputePipelines` with the validation layer
+    /// silent.
+    ///
+    /// This is what `kernels-cuda`'s bodies have always had in a different
+    /// spelling: `mma_supported(..)` asks whether a shape fits the tile, then
+    /// the body fires one kernel or the other. The question differs, the shape
+    /// of the answer does not.
+    ///
+    /// Defaults to [`Capability::Baseline`], which is what a test double that
+    /// records fires rather than running them should say.
+    fn best(&self) -> Capability {
+        Capability::Baseline
+    }
 }
 
 /// This backend's value, as the shared operand types read it.
@@ -210,17 +291,23 @@ impl ShaderValue for ArgValue {
             _ => None,
         }
     }
-    fn buffer(handle: u32) -> Self {
-        Self::Buffer {
-            handle,
-            writes: false,
+    fn as_extent(self) -> Option<(i32, i32)> {
+        match self {
+            Self::Buffer { rows, width, .. } => Some((rows, width)),
+            _ => None,
         }
     }
+    fn buffer_at(handle: u32, rows: i32, width: i32) -> Self {
+        Self::Buffer { handle, writes: false, rows, width }
+    }
+    fn buffer_mut_at(handle: u32, rows: i32, width: i32) -> Self {
+        Self::Buffer { handle, writes: true, rows, width }
+    }
+    fn buffer(handle: u32) -> Self {
+        Self::Buffer { handle, writes: false, rows: 0, width: 0 }
+    }
     fn buffer_mut(handle: u32) -> Self {
-        Self::Buffer {
-            handle,
-            writes: true,
-        }
+        Self::Buffer { handle, writes: true, rows: 0, width: 0 }
     }
     fn i32(v: i32) -> Self {
         Self::I32(v)
@@ -253,6 +340,16 @@ impl kernels::shader::Lang for Vulkan {
     const U8S: &'static str = "StructuredBuffer<uint8_t>";
     const F32S: &'static str = "StructuredBuffer<float>";
     const F32S_MUT: &'static str = "RWStructuredBuffer<float>";
+    // WHAT `PIE_ACT` EXPANDS TO, and the reason the two spellings above are
+    // not the same string. `common/bf16.slang` defines it `uint16_t` -- Slang
+    // has no bf16, so the sixteen bits are declared as an integer and
+    // `bf16_to_f32` shifts them into place. A signature naming the element
+    // gets the expansion; one naming an opaque buffer gets the macro, which
+    // is a spelling no `.slang` line contains.
+    const BF16S: &'static str = "StructuredBuffer<uint16_t>";
+    const BF16S_MUT: &'static str = "RWStructuredBuffer<uint16_t>";
+    const F16S: &'static str = "StructuredBuffer<uint16_t>";
+    const F16S_MUT: &'static str = "RWStructuredBuffer<uint16_t>";
     const I32: &'static str = "int";
     const U32: &'static str = "uint";
     const F32: &'static str = "float";
@@ -265,7 +362,7 @@ impl kernels::shader::Lang for Vulkan {
 /// Re-exported rather than named through `kernels::shader` at every use, so a
 /// body's signature reads as this backend's own and a family file imports one
 /// module.
-pub use kernels::shader::{Bind, Buf, BufMut, F32s, F32sMut, I32s, InPacked, U8s, U32s, Usize};
+pub use kernels::shader::{Bind, InPacked, Tensor, Usize, bf16, f16};
 
 /// What a routine body dispatches through, spelled as a body writes it.
 ///
@@ -278,100 +375,49 @@ pub use kernels::shader::{Bind, Buf, BufMut, F32s, F32sMut, I32s, InPacked, U8s,
 /// Bodies take `&Ctx<'_>`.
 pub type Ctx<'a> = dyn Encode + 'a;
 
+// THE ASKING SIDE, over the one method the driver implements.
+//
+// `Asks` is blanket-implemented for every `Answers`, so this is the whole of
+// what a plane states to give its bodies `ctx.ask::<C, keys::X>()`,
+// `ctx.params()` and `ctx.absent()`.
+impl kernels::routine::Answers<Vulkan> for Ctx<'_> {
+    fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
+        Encode::resolve(self, ty, source)
+    }
+}
+
 /// One routine, in this backend's instantiation of the machinery.
 pub type Routine = kernels::routine::Routine<Vulkan>;
 
-/// The backend's wrapper over [`kernels::routine!`], with [`Vulkan`] filled in
-/// so a declaration names only the `fn`:
-///
-/// ```ignore
-/// pub static ROUTINES: &[Routine] = &[
-///     routine!(rms_single_row),
-///     routine!(neox_decode, in_place = &[(0, 0)]),
-/// ];
-/// ```
-#[macro_export]
-macro_rules! routine {
-    ($body:ident $(, $($fact:tt)*)?) => {
-        ::kernels::routine!($crate::routine::Vulkan, $body $(, $($fact)*)?)
-    };
-}
 
-/// `LaunchRule::Elementwise`: one lane per element of the whole rectangle, on
-/// one axis.
-///
-/// The two launch rules this crate's elementwise kernels use are written here
-/// once rather than in each family, because they are not per-family facts:
-/// they are the two shapes `driver-vulkan`'s `geometry::lanes` has always
-/// computed, and the point of a body stating its own grid is that the
-/// statement is the same one, not a new one.
-///
-/// A lane count is in THREADS. The division into workgroups belongs to
-/// whoever knows `[numthreads]`, which is the SPIR-V and so the driver, and
-/// this crate deliberately does not reflect it -- see
-/// `driver-vulkan::encode`, which does the `div_ceil`.
-///
-/// # Errors
-///
-/// [`Refusal::Empty`] when either extent is zero or negative, and
-/// [`Refusal::Grid`] when the product does not fit the `u32` that
-/// `vkCmdDispatch` takes.
-///
-/// Both are refusals rather than clamps because both fail SILENTLY otherwise.
-/// `vkCmdDispatch(0, 1, 1)` runs nothing and returns success over a buffer
-/// that keeps whatever it held; a product that wrapped covers a fraction of
-/// the rectangle and also returns success. An extent of zero arrives here
-/// honestly -- a routed expert that won no tokens has zero rows -- so this is
-/// a value the caller reads, not a panic.
-pub fn elementwise(width: i32, rows: i32) -> Result<[u32; 3], Refusal> {
-    let [w, r] = rectangle(width, rows)?;
-    let n = u64::from(w) * u64::from(r);
-    let n = u32::try_from(n).map_err(|_| Refusal::Grid {
-        what: "width * rows",
-        at: i64::try_from(n).unwrap_or(i64::MAX),
-    })?;
-    Ok([n, 1, 1])
-}
 
-/// `LaunchRule::ElementwiseRows`: the rows on their own axis.
+/// The two launch rules a shader-plane body states its rectangle with.
 ///
-/// # Errors
+/// Re-exported and not re-written. Both of these, and the `rectangle` check
+/// under them, stood here character for character in `kernels-metal`,
+/// `kernels-vulkan` and `kernels/src/shader.rs` — one function in three
+/// copies, reached by three different paths, so a body could be told apart by
+/// which spelling it used. There is one now, and it is the shared one.
+pub use kernels::shader::{elementwise, elementwise_rows};
+
+/// The fact keys a BODY asks the runtime with — `ctx.ask::<i32, keys::Rows>()`.
 ///
-/// [`Refusal::Empty`], as [`elementwise`]. No `Grid` refusal is possible:
-/// neither extent is multiplied, and each already fits a `u32`.
-pub fn elementwise_rows(width: i32, rows: i32) -> Result<[u32; 3], Refusal> {
-    let [w, r] = rectangle(width, rows)?;
-    Ok([w, r, 1])
-}
-
-/// The extents both rules share, checked once.
-fn rectangle(width: i32, rows: i32) -> Result<[u32; 2], Refusal> {
-    if width <= 0 {
-        return Err(Refusal::Empty { what: "width" });
-    }
-    if rows <= 0 {
-        return Err(Refusal::Empty { what: "rows" });
-    }
-    Ok([width.unsigned_abs(), rows.unsigned_abs()])
-}
-
-/// The provenance of an argument, re-exported so a routine signature can say
-/// `Env<I32s>` without naming the machinery crate.
-pub use kernels::routine::Env;
-
-/// The slot marks, re-exported for the same reason: a routine signature states
-/// `OutSlot<0, BufMut>` or `Weight<2, F32s>` so the operand slot the arm binds
-/// this pointer from is a fact of the type, not of the hand-written arm alone.
+/// Not what a signature binds its scalars from any more: a scalar the
+/// checkpoint fixes is a `Const` the statement carries, and a key names only
+/// what a fire decides.
 pub use kernels::keys;
-pub use kernels::routine::{Ask, Block, Else, Held, InSlot, Nth, Null, OutSlot, Over, Param, ParamF32, ParamOr, ParamOrLit, Reckoned, Say, Times, Weight};
+pub use kernels::routine::{Const, Fire, In, InOut, Out};
 
-/// Re-exported for the same reason.
-pub use kernels::routine::Provenance as Supplier;
+/// Where a body turns an entrypoint and a tier into the artifact it fires.
+pub use crate::module::path as module_path;
+
+/// What a body asks the runtime for, once `Env` is out of the parameter list.
+pub use kernels::routine::{Answers, Asks};
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kernels::routine::Provenance;
 
     /// Every argument kind refuses a value of another kind, by position (the
     /// width check described on [`ArgValue`]).
@@ -392,34 +438,38 @@ mod tests {
             })
         );
         assert_eq!(
-            <Buf as Arg<Vulkan>>::unpack(&ArgValue::F32(1.0), 7),
+            <Tensor<bf16> as Arg<Vulkan>>::unpack(&ArgValue::F32(1.0), 7),
             Err(Refusal::Kind {
                 at: 7,
-                want: Ty::Buf
+                want: Ty::Bf16s
             })
         );
         // And a buffer handle is accepted by every buffer kind, because the
         // handle carries no element type -- the TYPE does, which is what makes
         // a body handed the wrong one fail to compile rather than at runtime.
         assert_eq!(
-            <Buf as Arg<Vulkan>>::unpack(
+            <Tensor<bf16> as Arg<Vulkan>>::unpack(
                 &ArgValue::Buffer {
                     handle: 9,
-                    writes: false
+                    writes: false,
+                    rows: 0,
+                    width: 0
                 },
                 0
             ),
-            Ok(Buf(9))
+            Ok(Tensor::<bf16>::new(9))
         );
         assert_eq!(
-            <U32s as Arg<Vulkan>>::unpack(
+            <Tensor<u32> as Arg<Vulkan>>::unpack(
                 &ArgValue::Buffer {
                     handle: 9,
-                    writes: false
+                    writes: false,
+                    rows: 0,
+                    width: 0
                 },
                 0
             ),
-            Ok(U32s(9))
+            Ok(Tensor::<u32>::new(9))
         );
     }
 
@@ -442,12 +492,14 @@ mod tests {
         );
     }
 
-    /// `Env` marks the supplier and changes nothing else.
+    /// The ELEMENT decides the `Ty`, and nothing else does.
     #[test]
-    fn the_environment_wrapper_carries_the_type_and_states_the_supplier() {
-        assert_eq!(<Env<I32s> as Arg<Vulkan>>::TY, Ty::I32s);
-        assert_eq!(<Env<I32s> as Arg<Vulkan>>::PROV, Provenance::Env);
-        assert_eq!(<I32s as Arg<Vulkan>>::PROV, Provenance::Trace);
+    fn a_tensor_takes_its_argument_type_from_its_element() {
+        // `Tensor<i32>` IS THE CARRIER NOW, and it has no provenance to
+        // assert: `Env` and `Provenance` are both deleted, so what is left
+        // to check is that the element decides the `Ty`.
+        assert_eq!(<Tensor<i32> as Arg<Vulkan>>::TY, Ty::I32s);
+        assert_eq!(<Tensor<u8> as Arg<Vulkan>>::TY, Ty::U8s);
     }
 
     /// The declared spellings are the shader tree's, not invented.
@@ -458,17 +510,38 @@ mod tests {
     /// which is worth nothing if the strings were guessed.
     #[test]
     fn the_spellings_are_the_ones_the_slang_tree_declares() {
-        assert_eq!(<Buf as Arg<Vulkan>>::SPELLING, "StructuredBuffer<PIE_ACT>");
+        // ONE CONST, ONE VALUE. The line under the first of these used to
+        // assert the SAME const equalled `"RWStructuredBuffer<PIE_ACT>"` --
+        // two contradictory claims about `<Buf as Arg<Vulkan>>::SPELLING`,
+        // which is a single string. It is the residue of the `Buf`/`BufMut`
+        // merge: the second line read `BufMut` until `BufMut` stopped
+        // existing and the rename swept it into its neighbour. The direction
+        // now rides the MARK, so the writable spelling is `Lang::BF16S_MUT`
+        // and no type names it. `Tensor<bf16>`'s own reading routes through
+        // `Element::SPELL`, which is `Lang::BF16S` and not `Lang::BUF` --
+        // Slang has no bf16 storage type, so both halves it and `f16` alike
+        // as `uint16_t`, which is why this is not `PIE_ACT`: that macro is
+        // `common/bf16.slang`'s own name for the same expansion, and the
+        // element decides the `Ty` on a string the SIGNATURE never sees.
+        assert_eq!(<Tensor<bf16> as Arg<Vulkan>>::SPELLING, "StructuredBuffer<uint16_t>");
         assert_eq!(
-            <BufMut as Arg<Vulkan>>::SPELLING,
-            "RWStructuredBuffer<PIE_ACT>"
+            <Vulkan as kernels::shader::Lang>::BF16S_MUT,
+            "RWStructuredBuffer<uint16_t>"
         );
-        assert_eq!(<I32s as Arg<Vulkan>>::SPELLING, "StructuredBuffer<int>");
-        assert_eq!(<U32s as Arg<Vulkan>>::SPELLING, "StructuredBuffer<uint>");
-        assert_eq!(<U8s as Arg<Vulkan>>::SPELLING, "StructuredBuffer<uint8_t>");
+        assert_eq!(<Tensor<i32> as Arg<Vulkan>>::SPELLING, "StructuredBuffer<int>");
+        assert_eq!(<Tensor<u32> as Arg<Vulkan>>::SPELLING, "StructuredBuffer<uint>");
+        assert_eq!(<Tensor<u8> as Arg<Vulkan>>::SPELLING, "StructuredBuffer<uint8_t>");
         // Empty, and deliberately: nothing in the tree declares a 64-bit
         // shader integer, so there is no spelling to record. A guess here
         // would be worse than the gap.
         assert_eq!(<Usize as Arg<Vulkan>>::SPELLING, "");
     }
 }
+
+// THE PLANE'S `routine!` WRAPPER STOOD HERE AND HAS NO CALLERS.
+//
+// It filled this backend in so a membership list could name only the
+// `fn`. There is no membership list: `#[routine]` builds the row beside
+// the `fn` and a distributed slice collects it, so the only caller of
+// `kernels::routine!` is the attribute, which names the backend through
+// `crate::Plane`.

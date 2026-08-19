@@ -24,7 +24,14 @@ use super::runtime::Region;
 ///
 /// The five side arrays are indexed `lane * INTRINSIC_SLOTS + intr`, so this is
 /// a stride: getting it wrong misdirects every intrinsic of every lane but the first.
-pub const INTRINSIC_SLOTS: usize = 16;
+///
+/// PROJECTED FROM THE ABI, not written. It was a literal `16` while the
+/// emitted kernel strides by `IntrinsicId::SLOTS` -- `AttnScore + 1`, which is
+/// EIGHT -- so host and kernel disagreed by a factor of two. Lane zero
+/// coincides at every intrinsic (`0 * 16 + i == 0 * 8 + i`), which is why a
+/// single-lane fire never showed it and the test below asserted the wrong
+/// number against its own stated rule.
+pub const INTRINSIC_SLOTS: usize = driver::tensor_ir::op::IntrinsicId::SLOTS as usize;
 
 /// The sixteen arguments a generated fused region takes.
 const FUSED_ARITY: usize = 16;
@@ -595,7 +602,8 @@ mod tests {
     #[test]
     fn the_intrinsic_stride_is_the_slot_count_the_abi_declares() {
         assert_eq!(
-            INTRINSIC_SLOTS, 16,
+            INTRINSIC_SLOTS,
+            tensor_compiler::codegen::cuda::fused::PTIR_INTRINSIC_SLOTS as usize,
             "PTIR_INTRINSIC_SLOTS is PTIR_INTR_ATTN_SCORE + 1; a stride that \
              disagrees with the kernel's misdirects every intrinsic of every \
              lane but the first"

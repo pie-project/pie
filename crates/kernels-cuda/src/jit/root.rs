@@ -344,8 +344,8 @@ const fn strip_cuh(file: &'static str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::Root;
     use crate::source::DEVICE_HEADERS;
+    use super::Root;
 
     const TEXT: &str = "__global__ void nothing() {}";
     const R: Root = Root::from_parts("test/root", TEXT, "test/root.cuh");

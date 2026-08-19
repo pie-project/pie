@@ -12,16 +12,17 @@
 //! five ways under different `-D`s ([`Root::options`]). The JIT's
 //! `--fmad=false` (the archive passed none) makes it stricter, not bit-exact.
 
+use kernels::{Bind, Fire};
+use kernels_macros::routine;
 use crate::by_value;
 use core::ffi::c_void;
 
-use crate::jit::{Ctx, Family, Launch, Root, Routine};
-use crate::routine;
-use crate::jit::Abi;
+use crate::jit::{Ctx, Launch, Root};
 use crate::jit::abi::MaybeConst;
+use crate::jit::abi::Tensor;
 use kernels::Refusal;
 use kernels::keys;
-use kernels::routine::{Env, In, Out};
+use kernels::routine::{Asks, Const, In, Out};
 
 /// A device address held as an opaque word.
 pub use crate::jit::abi::DevicePtr;
@@ -95,6 +96,22 @@ impl crate::jit::Abi for *const XqaIoHead {
 // `const IOHead*` reads, `OutputHead*` writes — an asymmetry `ptr_abi!` has no
 // arm for, so `Abi` is written by hand; `Elem` restates it for `In`/`Out`.
 impl kernels::Elem for XqaIoHead {
+    // THE ASYMMETRY IS IN THE CARRIERS TOO: a read is a `const IOHead*` and a
+    // write an `OutputHead*`, which is why this pair is written out rather
+    // than stamped.
+    type Read = *const XqaIoHead;
+    type Write = *mut XqaIoHead;
+
+    unsafe fn advance_read(read: Self::Read, elems: usize) -> Self::Read {
+        // SAFETY: the trait's obligation, forwarded to the caller.
+        unsafe { read.add(elems) }
+    }
+
+    unsafe fn advance_write(write: Self::Write, elems: usize) -> Self::Write {
+        // SAFETY: as above.
+        unsafe { write.add(elems) }
+    }
+
     const CPP_CONST: &'static str = "const IOHead*";
     const CPP_MUT: &'static str = "OutputHead*";
     const TY_CONST: Ty = Ty::Buf;
@@ -642,7 +659,7 @@ fn carve(
 /// `at` must address `bytes` of live device memory, and this context's stream
 /// must be live across the call.
 #[cfg(feature = "_cuda")]
-unsafe fn zero_on_stream(ctx: &Ctx, at: *mut c_void, bytes: usize) -> Result<(), Refusal> {
+unsafe fn zero_on_stream(ctx: &Ctx<'_>, at: *mut c_void, bytes: usize) -> Result<(), Refusal> {
     use cudarc::runtime::sys::{cudaError, cudaMemsetAsync};
 
     // SAFETY: the caller's obligation, forwarded.
@@ -660,7 +677,7 @@ unsafe fn zero_on_stream(ctx: &Ctx, at: *mut c_void, bytes: usize) -> Result<(),
 ///
 /// None to discharge: this build has no runtime to memset through.
 #[cfg(not(feature = "_cuda"))]
-unsafe fn zero_on_stream(_ctx: &Ctx, _at: *mut c_void, _bytes: usize) -> Result<(), Refusal> {
+unsafe fn zero_on_stream(_ctx: &Ctx<'_>, _at: *mut c_void, _bytes: usize) -> Result<(), Refusal> {
     Err(Refusal::Device { why: "this build selected no CUDA runtime" })
 }
 
@@ -683,7 +700,7 @@ unsafe fn zero_on_stream(_ctx: &Ctx, _at: *mut c_void, _bytes: usize) -> Result<
 /// rather than launching — and whatever the compile, load or launch refuses.
 #[allow(clippy::too_many_arguments)]
 pub fn build_xqa_metadata(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     kv_page_indices: *const u32,
     kv_page_indptr: *const u32,
     kv_last_page_lens: *const u32,
@@ -691,8 +708,7 @@ pub fn build_xqa_metadata(
     seq_lens: *mut u32,
     num_requests: i32,
     max_pages_per_seq: i32,
-    page_size: i32,
-) -> Result<(), Refusal> {
+    page_size: i32) -> Result<(), Refusal> {
     /// The metadata build's block width — `attention_xqa.cu`'s literal `128`.
     ///
     /// Not a derived value: the page loop strides by `blockDim.x` and the
@@ -703,12 +719,7 @@ pub fn build_xqa_metadata(
     let bucket = page_bucket(max_pages_per_seq);
     // SAFETY: `call()`'s contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "attn/attention_xqa.cuh",
-            "::pie::attn::build_xqa_metadata",
-            Launch::per_row(num_requests.unsigned_abs(), METADATA_BLOCK),
-            &[
+    ctx.fire(Fire::at("attn/attention_xqa.cuh", "::pie::attn::build_xqa_metadata").apply(Launch::per_row(num_requests.unsigned_abs(), METADATA_BLOCK)), &[
                 kv_page_indices.arg(),
                 kv_page_indptr.arg(),
                 kv_last_page_lens.arg(),
@@ -717,9 +728,7 @@ pub fn build_xqa_metadata(
                 num_requests.arg(),
                 bucket.arg(),
                 page_size.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `attn::attention_xqa_decode_bf16_prepared` — the paged decode, and the
@@ -754,46 +763,43 @@ pub fn build_xqa_metadata(
 /// set; [`Refusal::Null`]/[`Refusal::Wide`] for a missing or overflowing
 /// workspace half; and whatever the compile, load or launch refuses — all
 /// raised before the first launch, so a refusal enqueues nothing.
-#[allow(clippy::too_many_arguments)]
-#[kernels_macros::routine]
+#[routine(whole)]
 pub fn attention_xqa_decode_bf16_prepared(
-    ctx: &Ctx,
-    q: In<0, XqaIoHead>,
-    o: Out<0, XqaIoHead>,
-    k_pages: Env<keys::KvKeys>,
-    v_pages: Env<keys::KvValues>,
-    kv_page_indices: Env<keys::KvPageIndices>,
-    kv_page_indptr: Env<keys::KvPageIndptr>,
-    kv_last_page_lens: Env<keys::KvLastPageLens>,
-    // `float_bytes`/`int_bytes` are keyed to their own buffer, so a size
-    // meant for one workspace half can't be spent against the other. This
-    // decode launcher may claim the whole workspace unconditionally; fa2's
-    // prefill launchers may not, since concurrent prefill plans can share
-    // and clobber one.
-    float_buffer: Env<keys::AttnWorkspaceFloat>,
-    float_bytes: Env<keys::AttnWorkspaceFloatBytes>,
-    int_buffer: Env<keys::AttnWorkspaceInt>,
-    int_bytes: Env<keys::AttnWorkspaceIntBytes>,
-    num_requests: Env<keys::RequestCount>,
-    // Adjacent and both plain per-fire counts; a GQA shape is exactly where
-    // these two diverge, so a reordering would launch the wrong kernel.
-    num_q_heads: Env<keys::NumQHeads>,
-    num_kv_heads: Env<keys::KvNumHeads>,
-    head_dim: Env<keys::KvHeadDim>,
-    page_size: Env<keys::KvPageSize>,
-    // The per-request maximum, computed where the CSR is built — distinct
-    // from `Cx::num_pages_in_batch`'s batch-wide bound.
-    max_pages_per_seq: Env<keys::KvMaxPagesPerRequest>,
-    // The softmax scale the fire was planned with, not one this statement states.
-    sm_scale: Env<keys::SmScale>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    q: In<Tensor<XqaIoHead>>,
+    o: Out<Tensor<XqaIoHead>>) -> Result<(), Refusal> {
+    // BACK TO ASKS: THE POOL AND THE HEAD COUNTS ARE THE FIRE'S TABLE. Every
+    // one was `Env<keys::*>` at HEAD and `driver-cuda` answers all six. A
+    // `Const` mark promises the STATEMENT carries the number, and a trace text
+    // never sees a deployment -- so `attention_xqa_decode` stated an EMPTY run
+    // and this routine could not fire at all.
+    //
+    // The two head counts are adjacent and both plain per-fire numbers; a GQA
+    // shape is exactly where they diverge, so a swap would launch the wrong
+    // kernel and nothing about the grid would say so.
+    let num_q_heads = ctx.ask::<i32, keys::NumQHeads>()?;
+    let num_kv_heads = ctx.ask::<i32, keys::KvNumHeads>()?;
+    let head_dim = ctx.ask::<i32, keys::KvHeadDim>()?;
+    let page_size = ctx.ask::<i32, keys::KvPageSize>()?;
+    let max_pages_per_seq = ctx.ask::<i32, keys::KvMaxPagesPerRequest>()?;
+    let sm_scale = ctx.ask::<f32, keys::SmScale>()?;
+    let float_buffer = ctx.ask::<*mut core::ffi::c_void, keys::AttnWorkspaceFloat>()?;
+    let k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
+    let v_pages = ctx.ask::<*mut u8, keys::KvValues>()?;
+    let kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
+    let kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
+    let kv_last_page_lens = ctx.ask::<*const u32, keys::KvLastPageLens>()?;
+    let float_bytes = ctx.ask::<usize, keys::AttnWorkspaceFloatBytes>()?;
+    let int_buffer = ctx.ask::<*mut core::ffi::c_void, keys::AttnWorkspaceInt>()?;
+    let int_bytes = ctx.ask::<usize, keys::AttnWorkspaceIntBytes>()?;
+    let num_requests = ctx.ask::<i32, keys::RequestCount>()?;
     // Unwrapped once, up front: `**` is `Env`'s two `Deref` hops to the fact
     // inside it.
-    let (k_pages, v_pages) = (**k_pages, **v_pages);
+    let (k_pages, v_pages) = (k_pages, v_pages);
     let (kv_page_indices, kv_page_indptr, kv_last_page_lens) =
-        (**kv_page_indices, **kv_page_indptr, **kv_last_page_lens);
-    let (float_buffer, float_bytes) = (**float_buffer, **float_bytes);
-    let (int_buffer, int_bytes) = (**int_buffer, **int_bytes);
+        (kv_page_indices, kv_page_indptr, kv_last_page_lens);
+    let (float_buffer, float_bytes) = (float_buffer, float_bytes);
+    let (int_buffer, int_bytes) = (int_buffer, int_bytes);
 
     /// `xqa/mha.cu`'s `ctaTile.x` — the sequence-length step one CTA covers:
     /// `warpTile.x (64) * ctaShapeInWarps.x (4)` = 256, the denominator in
@@ -809,19 +815,19 @@ pub fn attention_xqa_decode_bf16_prepared(
     // arguments are same-typed and positional — a swap compiles clean and
     // silently checks the wrong shape.
     if !decode_supported(
-        **num_q_heads,
-        **num_kv_heads,
-        **head_dim,
-        **page_size,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
         -1,
         0.0,
-        **sm_scale,
+        sm_scale,
         major,
     ) {
         return Err(Refusal::Device { why: "XQA serves neither this shape nor this device" });
     }
-    let ratio = **num_q_heads / **num_kv_heads;
-    let Some(member) = XqaMember::dispatch(ratio, **page_size, major) else {
+    let ratio = num_q_heads / num_kv_heads;
+    let Some(member) = XqaMember::dispatch(ratio, page_size, major) else {
         return Err(Refusal::Device { why: "XQA serves neither this shape nor this device" });
     };
     let Some(root_at) = member.enrolled_at() else {
@@ -835,7 +841,7 @@ pub fn attention_xqa_decode_bf16_prepared(
     let batch = num_requests.unsigned_abs();
     let kv_heads = num_kv_heads.unsigned_abs();
 
-    let regions = carve(float_buffer, float_bytes, **num_requests, **max_pages_per_seq)?;
+    let regions = carve(float_buffer, float_bytes, num_requests, max_pages_per_seq)?;
     let bucket = regions.bucket;
     let max_seq_len = bucket.unsigned_abs() * page_size.unsigned_abs();
 
@@ -863,9 +869,9 @@ pub fn attention_xqa_decode_bf16_prepared(
         kv_last_page_lens,
         regions.page_table,
         regions.seq_lens,
-        **num_requests,
-        **max_pages_per_seq,
-        **page_size,
+        num_requests,
+        max_pages_per_seq,
+        page_size,
     )?;
 
     // SAFETY: the budget check above is what makes this extent right.
@@ -899,17 +905,16 @@ pub fn attention_xqa_decode_bf16_prepared(
     //
     // SAFETY: `call()`'s contract — every pointer here addresses live device
     // memory of the extent the kernel reads it as; `cache` outlives the launch.
-    unsafe {
-        ctx.launch_at(
-            ROOTS[root_at],
-            inst::MHA[root_at],
-            Launch::grid([sub_seqs, kv_heads, batch], XQA_BLOCK).smem(XQA_SMEM_BYTES),
-            &[
+    ctx.fire(
+        Fire::at(ROOTS[root_at].file, inst::MHA[root_at])
+            .unit(ROOTS[root_at].name)
+            .apply(Launch::grid([sub_seqs, kv_heads, batch], XQA_BLOCK).smem(XQA_SMEM_BYTES)),
+        &[
                 kv_heads.arg(),
                 1.0f32.arg(),
                 MaybeConst::<f32>::none().arg(),
-                o.ptr.arg(),
-                q.ptr.arg(),
+                o.arg(),
+                q.arg(),
                 MaybeConst::<f32>::none().arg(),
                 cache.arg(),
                 batch.arg(),
@@ -920,248 +925,6 @@ pub fn attention_xqa_decode_bf16_prepared(
                 stride_head.arg(),
                 semaphores.arg(),
                 regions.scratch.arg(),
-            ],
-        )
-    }
-}
-
-/// XQA's one trace symbol.
-///
-/// [`build_xqa_metadata`] is deliberately absent: it's a launch this routine
-/// issues, not a statement anything lowers to. `whole` because the build
-/// walks `kv_page_indptr`/`kv_last_page_lens`, which are request-shaped, so
-/// a row window would point that arithmetic at another request.
-///
-/// # The derived column
-///
-/// Every parameter resolves. `q`/`o` are stated slots (`In(0)`, `Out(0)`);
-/// the rest are `Env<keys::_>` types rather than `#[source(..)]` marks, so a
-/// rename cannot go quiet the way a name-table lookup could. The `const _`
-/// pin below checks both the slot and the key at every index, so a
-/// parameter reorder cannot rebind an operand silently.
-pub static ROUTINES: &[Routine] = &[routine!(
-    attention_xqa_decode_bf16_prepared,
-    whole
-)];
-
-// Pins the derivation column so a parameter reorder or a resolution
-// regression fails to compile instead of rebinding an operand silently.
-const _: () = {
-    let d = <attention_xqa_decode_bf16_prepared as kernels::Derivation>::DERIVED;
-    assert!(d.len() == 18);
-    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(kernels::source_is_named(&d[2].source, <keys::KvKeys as keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[3].source, <keys::KvValues as keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[4].source, <keys::KvPageIndices as keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[5].source, <keys::KvPageIndptr as keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[6].source, <keys::KvLastPageLens as keys::Fact>::KEY));
-    // Buffer, its budget, buffer, its budget: this pairing is what stops a
-    // float buffer being sized against the int budget, or vice versa.
-    assert!(kernels::source_is_named(&d[7].source, <keys::AttnWorkspaceFloat as keys::Fact>::KEY));
-    assert!(kernels::source_is_named(
-        &d[8].source,
-        <keys::AttnWorkspaceFloatBytes as keys::Fact>::KEY
-    ));
-    assert!(kernels::source_is_named(&d[9].source, <keys::AttnWorkspaceInt as keys::Fact>::KEY));
-    assert!(kernels::source_is_named(
-        &d[10].source,
-        <keys::AttnWorkspaceIntBytes as keys::Fact>::KEY
-    ));
-    assert!(kernels::source_is_named(&d[11].source, <keys::RequestCount as keys::Fact>::KEY));
-    // `NumQHeads` then `KvNumHeads`: adjacent and same-shaped, and a GQA
-    // family is exactly where swapping them would go unnoticed.
-    assert!(kernels::source_is_named(&d[12].source, <keys::NumQHeads as keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[13].source, <keys::KvNumHeads as keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[14].source, <keys::KvHeadDim as keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[15].source, <keys::KvPageSize as keys::Fact>::KEY));
-    // The page table's row stride: this key must mean that, not
-    // `Cx::num_pages_in_batch`'s batch-wide bound.
-    assert!(kernels::source_is_named(
-        &d[16].source,
-        <keys::KvMaxPagesPerRequest as keys::Fact>::KEY
-    ));
-    assert!(kernels::source_is_named(&d[17].source, <keys::SmScale as keys::Fact>::KEY));
-};
-
-/// XQA's symbol is `attn`'s, as a trace names it.
-///
-/// A second family under the same namespace as [`crate::attn`]; `Family::routine`
-/// resolves by name after the prefix, and `sigs()`'s duplicate test still
-/// catches a collision. Kept separate rather than merged into `attn`'s own,
-/// much larger file.
-pub static FAMILY: Family = crate::family!(ROUTINES);
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        MAX_PAGE_BUCKET, OPTIONS, ROOTS, ROUTINES, SCRATCH_ALIGN, XQA_LATTICE, XQA_ROOT, XqaMember,
-        carve, decode_supported, inst, page_bucket,
-    };
-    use kernels::Refusal;
-
-    /// Five roots for six lattice members, and every one of them is the same
-    /// text under a different option set.
-    #[test]
-    fn the_roots_and_the_lattice_agree() {
-        assert_eq!(ROOTS.len(), XQA_LATTICE.len() - 1, "the Hopper member has no root");
-        for (at, root) in ROOTS.iter().enumerate() {
-            assert_eq!(root.name, XQA_LATTICE[at].unit);
-            assert_eq!(inst::MHA[at], XQA_LATTICE[at].entry);
-            assert_eq!(root.text, XQA_ROOT, "one text, five roots");
-            assert_eq!(root.options, OPTIONS[at], "and the options are what differ");
-            assert_eq!(root.headers, crate::jit::Headers::LibraryAndUpstream);
-        }
-        assert!(XqaMember::Gqa8Page32Sm90.enrolled_at().is_none());
-        assert_eq!(XqaMember::Gqa8Page32.enrolled_at(), Some(4));
-    }
-
-    /// One text five ways is five cubins, and the cache key is what says so.
-    #[test]
-    fn the_five_roots_key_apart() {
-        let keys: Vec<String> = ROOTS.iter().map(|r| r.key(inst::MHA[0], "sm_90")).collect();
-        for (at, key) in keys.iter().enumerate() {
-            for other in &keys[at + 1..] {
-                assert_ne!(key, other, "two members would share a cubin");
-            }
-        }
-    }
-
-    /// `xqa_decode_page_bucket` — `attention_xqa.cu`'s bucket loop.
-    #[test]
-    fn the_page_bucket_is_a_clamped_power_of_two() {
-        assert_eq!(page_bucket(0), 1, "and the floor is on `pages`, not on `bucket`");
-        assert_eq!(page_bucket(1), 1);
-        assert_eq!(page_bucket(3), 4);
-        assert_eq!(page_bucket(32), 32);
-        assert_eq!(page_bucket(33), 64);
-        assert_eq!(page_bucket(MAX_PAGE_BUCKET), MAX_PAGE_BUCKET);
-        assert_eq!(page_bucket(MAX_PAGE_BUCKET + 1), MAX_PAGE_BUCKET, "clamped, not rounded up");
-    }
-
-    /// Ratio 8 selects a body nothing hosts, on the only devices XQA runs on.
-    #[test]
-    fn ratio_eight_selects_a_body_nothing_hosts() {
-        assert_eq!(XqaMember::dispatch(8, 32, 9), Some(XqaMember::Gqa8Page32Sm90));
-        assert_eq!(XqaMember::pick(8, 32, 9), None, "and `pick` refuses rather than falling back");
-        assert_eq!(XqaMember::dispatch(8, 32, 8), Some(XqaMember::Gqa8Page32));
-        assert!(!decode_supported(64, 8, 128, 32, -1, 0.0, 0.0, 9), "so the gate refuses it");
-        assert!(decode_supported(16, 8, 128, 32, -1, 0.0, 0.0, 9), "ratio 2 is unaffected");
-        assert!(!decode_supported(16, 8, 128, 32, -1, 0.0, 0.0, 8), "and the floor is SM90");
-    }
-
-    /// One symbol, and it is the one a trace states.
-    ///
-    /// `build_xqa_metadata` is a launch this family issues, not a symbol
-    /// anything lowers to, so a second row here would be a declaration no
-    /// trace could produce.
-    #[test]
-    fn the_family_declares_the_decode_and_only_the_decode() {
-        assert_eq!(ROUTINES.len(), 1);
-        assert_eq!(ROUTINES[0].name, "attention_xqa_decode_bf16_prepared");
-        assert_eq!(super::FAMILY.symbol(&ROUTINES[0]), "attn::attention_xqa_decode_bf16_prepared");
-        assert!(ROUTINES[0].whole, "the build walks an R-shaped CSR");
-    }
-
-    /// The derived column, pinned where the ledger's argument lives.
-    ///
-    /// `head_dim`/`num_kv_heads` are the reason this is a test and not just
-    /// prose: `operand()` answers both off the cache's layer view rather
-    /// than the fire, so a "tidy-up" that swapped their accessors would
-    /// still type-check and could pass every existing checkpoint.
-    #[test]
-    fn the_derived_column_says_which_head_dim_it_means() {
-        use kernels::{Kind, Source, keys};
-
-        let d = ROUTINES[0].derived;
-        assert_eq!(d.len(), 18, "one entry per parameter, `ctx` excepted");
-
-        let at = |name: &str| {
-            d.iter().find(|e| e.name == name).unwrap_or_else(|| panic!("no `{name}` parameter"))
-        };
-        assert_eq!(at("q").source, Some(Source::Slot(Kind::In, 0)));
-        assert_eq!(at("o").source, Some(Source::Slot(Kind::Out, 0)));
-        assert!(
-            at("o").nullable,
-            "`Out<0, _>` is §6.2's permitted-not-required, and here it is what \
-             `accepts_an_unstated_result` reads before a value-producing guard hands \
-             this launch its buffer -- see the parameter"
-        );
-        assert_eq!(at("num_requests").source, Some(Source::Named(<keys::RequestCount as keys::Fact>::KEY)));
-        assert_eq!(at("num_q_heads").source, Some(Source::Named(<keys::NumQHeads as keys::Fact>::KEY)));
-        assert_eq!(at("page_size").source, Some(Source::Named(<keys::KvPageSize as keys::Fact>::KEY)));
-
-        // The cache's shape, not the fire's — see this test's own doc.
-        assert_eq!(at("head_dim").source, Some(Source::Named(<keys::KvHeadDim as keys::Fact>::KEY)));
-        assert_eq!(at("num_kv_heads").source, Some(Source::Named(<keys::KvNumHeads as keys::Fact>::KEY)));
-
-        assert_eq!(at("kv_last_page_lens").source, Some(Source::Named(<keys::KvLastPageLens as keys::Fact>::KEY)));
-        assert_eq!(at("sm_scale").source, Some(Source::Named(<keys::SmScale as keys::Fact>::KEY)));
-
-        // Asserted positively for the reason the `const _` block below the
-        // ledger gives: the buffer/budget pairing is what stops a swap
-        // between workspace halves from being silent.
-        assert_eq!(
-            at("float_buffer").source,
-            Some(Source::Named(<keys::AttnWorkspaceFloat as keys::Fact>::KEY))
-        );
-        assert_eq!(
-            at("float_bytes").source,
-            Some(Source::Named(<keys::AttnWorkspaceFloatBytes as keys::Fact>::KEY))
-        );
-        assert_eq!(
-            at("int_buffer").source,
-            Some(Source::Named(<keys::AttnWorkspaceInt as keys::Fact>::KEY))
-        );
-        assert_eq!(
-            at("int_bytes").source,
-            Some(Source::Named(<keys::AttnWorkspaceIntBytes as keys::Fact>::KEY))
-        );
-
-        let why = "has no word, and saying so is the point";
-        assert!(at("max_pages_per_seq").source.is_none(), "`max_pages_per_seq` {why}");
-    }
-
-    /// The carve lays three regions end to end, and they do not overlap.
-    #[test]
-    fn the_carve_lays_three_regions_end_to_end() {
-        let base = 1 << 20;
-        let buffer = core::ptr::without_provenance_mut::<core::ffi::c_void>(base);
-        let regions = carve(buffer, 1 << 20, 4, 30).expect("a megabyte holds four 32-page rows");
-        assert_eq!(regions.bucket, 32, "30 pages round up to a 32-page stride");
-        assert_eq!(regions.page_table.addr(), base);
-        assert_eq!(regions.seq_lens.addr(), base + 4 * 32 * 4, "the table, then the lengths");
-        assert_eq!(
-            regions.scratch.addr(),
-            (base + 4 * 32 * 4 + 4 * 4).next_multiple_of(SCRATCH_ALIGN),
-            "and the scratch is 256-aligned",
-        );
-    }
-
-    /// A workspace too small refuses rather than panics, and an empty
-    /// scratch refuses too — that's the `>=`.
-    #[test]
-    fn the_carve_refuses_rather_than_panicking() {
-        let buffer = core::ptr::without_provenance_mut::<core::ffi::c_void>(1 << 20);
-        assert!(matches!(carve(buffer, 16, 4, 30), Err(Refusal::Wide { .. })));
-        // Exactly enough for the two written regions and nothing after them:
-        // the scratch would start at the last byte and have nothing in it.
-        let full = 4 * 32 * 4 + 4 * 4;
-        assert!(matches!(carve(buffer, full, 4, 30), Err(Refusal::Wide { .. })));
-        assert!(matches!(
-            carve(core::ptr::null_mut(), 1 << 20, 4, 30),
-            Err(Refusal::Null { .. }),
-        ));
-    }
-
-    /// The scale is checked against `1/sqrt(head_dim)`, never applied.
-    #[test]
-    fn a_caller_supplied_scale_is_an_equality_test() {
-        let default = 1.0f32 / 128.0f32.sqrt();
-        assert!(decode_supported(16, 8, 128, 32, -1, 0.0, default, 9));
-        assert!(decode_supported(16, 8, 128, 32, -1, 0.0, 0.0, 9), "unset passes");
-        assert!(!decode_supported(16, 8, 128, 32, -1, 0.0, default * 2.0, 9));
-        assert!(!decode_supported(16, 8, 128, 32, 0, 0.0, default, 9), "a window refuses");
-        assert!(!decode_supported(16, 8, 128, 32, -1, 30.0, default, 9), "a soft cap refuses");
-    }
+        ],
+    )
 }

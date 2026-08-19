@@ -289,8 +289,8 @@ pub fn lm_head_gemv_argmax_int8(
         as_region(hidden_states, f.rows.count, hidden),
         lm_head_weight,
         scale_inv,
+        // `vocab` is ASKED for now, so it is not the statement's to bind.
         as_region(token_ids, f.rows.count, o.out_width(0).unwrap_or(0)),
-        ArgValue::I32(f.vocab()?),
     ])
 }
 
@@ -335,31 +335,30 @@ pub fn split_qwen_gdn_ba_bf16(
     ])
 }
 
-/// `layout::embed_bf16`. Both derive as `const T*`, not `In(0)`/`In(1)`.
+/// `layout::embed_bf16`, as the STATEMENT sources it.
+///
+/// The token ids and the vocabulary left this list when they became asks: a
+/// column carries what the statement placed, and a fact the body asks for
+/// reaches the kernel through `Answering` instead. Comparing the column
+/// against a hand list that still held them compared two different questions.
 #[cfg(test)]
 pub fn embed_bf16(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Refusal> {
-    let token_ids = ArgValue::Ptr(f.token_ids()?.cast_mut().cast::<c_void>());
     let weight = ArgValue::Ptr(f.weight_named(0)?);
     let y = o.output(0)?;
     let hidden = o.out_width(0)?;
-    Ok(vec![
-        token_ids,
-        weight,
-        as_region(y, f.rows.count, hidden),
-        ArgValue::I32(f.vocab()?),
-    ])
+    Ok(vec![weight, as_region(y, f.rows.count, hidden)])
 }
 
 /// `layout::gather_bf16_rows`. `row_indices` derives as `In(1)`, `*const i32`.
 #[cfg(test)]
 pub fn gather_bf16_rows(o: &mut Handles<'_>, f: Facts) -> Result<Vec<ArgValue>, Refusal> {
     let src = o.input(0)?;
-    let row_indices = ArgValue::Ptr(f.sampling_indices()?.cast_mut().cast::<c_void>());
     let dst = o.output(0)?;
     let width = o.out_width(0)?;
+    // `row_indices` is ASKED for (`keys::SamplingIndices`), so it is not the
+    // statement's to bind.
     Ok(vec![
         as_region(src, f.rows.count, o.in_width(0).unwrap_or(0)),
-        row_indices,
         as_region(dst, f.rows.count, width),
     ])
 }
@@ -373,10 +372,10 @@ pub fn transpose_bf16_nld_to_lnd(
     let src = o.input(0)?;
     let dst = o.output(0)?;
     let width = o.in_width(0)?;
+    // `ple_dim` is ASKED for now, so it is not the statement's to bind.
     Ok(vec![
         as_region(src, f.rows.count, width),
         as_region(dst, f.rows.count, o.out_width(0).unwrap_or(0)),
-        ArgValue::I32(f.ple_dim()?),
     ])
 }
 
@@ -391,25 +390,33 @@ pub fn operands(
     o: &mut Handles<'_>,
     f: Facts,
     derived: &[Derived],
-    args: &[(kernels::Ty, kernels::Provenance)],
+    sources: &[Option<Source>],
+    args: &[kernels::Ty],
 ) -> Result<Vec<ArgValue>, Refusal> {
     if derived.is_empty() {
         return Err(Refusal::Unstated { what: "an operand column: the row states no `derived`" });
     }
+    // THE SAME COLUMN THE THREE SHADER PLANES BIND FROM. It used to be a
+    // second one: `#[routine]` read the SYNTAX and filled `Derived::source`,
+    // while `KernelFn::SOURCES` read the TYPES, and CUDA bound from the first.
+    // A dump of the two found rows where they disagreed. `derived` carries
+    // what a type cannot -- the parameter's name, and whether a null may land
+    // there -- and the source comes from here.
     derived
         .iter()
+        .zip(sources.iter().copied().chain(core::iter::repeat(None)))
         .enumerate()
-        .map(|(i, d)| {
+        .map(|(i, (d, source))| {
             // A NULLABLE PARAMETER WHOSE SOURCE IS ABSENT TAKES THE NULL, and
             // `Derived::nullable` comes from the parameter's own type. Narrowed
             // to `Absent` deliberately: any other refusal a null would bury.
-            let v = match operand(o, f, d) {
+            let v = match operand(o, f, d, source) {
                 Err(Refusal::Absent { .. }) if d.nullable => {
                     ArgValue::Ptr(core::ptr::null_mut())
                 }
                 other => other?,
             };
-            Ok(as_declared(args.get(i).map(|a| a.0), v))
+            Ok(as_declared(args.get(i).copied(), v))
         })
         .collect()
 }
@@ -607,7 +614,12 @@ pub(crate) fn fa2_prefill_leaves(cx: &Cx<'_>) -> Result<Fa2PrefillLeaves, Refusa
 /// through the accessors the hand arms use and refuse in the same words. The
 /// aggregates refuse by design — they cannot be `Copy` and lifetime-free — so
 /// a symbol needing one keeps its hand arm. The binder computes nothing.
-fn operand(o: &mut Handles<'_>, f: Facts<'_>, d: &Derived) -> Result<ArgValue, Refusal> {
+fn operand(
+    o: &mut Handles<'_>,
+    f: Facts<'_>,
+    d: &Derived,
+    source: Option<Source>,
+) -> Result<ArgValue, Refusal> {
     let ptr = |p: *const i32| ArgValue::Ptr(p.cast_mut().cast::<c_void>());
     /// The same, for a fact whose declared pointee is not `i32`.
     fn anyptr<T>(p: *const T) -> ArgValue {
@@ -623,7 +635,14 @@ fn operand(o: &mut Handles<'_>, f: Facts<'_>, d: &Derived) -> Result<ArgValue, R
         ArgValue::Ptr(p) => ArgValue::Region { ptr: p, rows: f.rows.count, width },
         other => other,
     };
-    match d.source {
+    match source {
+        // ONE ADDRESS IN TWO SLOTS, resolved as the INPUT: that is the address
+        // the statement placed, and the allocator has already given the result
+        // the same offset off the same `Source::Alias`.
+        Some(Source::Alias(n, _)) => {
+            let width = o.in_width(n as usize).unwrap_or(0);
+            o.input(n as usize).map(|v| region(v, width))
+        }
         // The statement's own three.
         Some(Source::Slot(Kind::In, n)) => {
             let width = o.in_width(n as usize).unwrap_or(0);
@@ -638,6 +657,45 @@ fn operand(o: &mut Handles<'_>, f: Facts<'_>, d: &Derived) -> Result<ArgValue, R
         Some(Source::Named(<keys::NamedWeight as keys::Fact>::KEY)) => f.weight_named(0).map(ArgValue::Ptr),
         // The second bank: `sample::lm_head_gemv_argmax_int8` names two weights.
         Some(Source::Named(<keys::NamedWeight2 as keys::Fact>::KEY)) => f.weight_named(1).map(ArgValue::Ptr),
+
+        // THE WEIGHT CHAIN: the named bank first, the positional one after.
+        //
+        // Both halves are arms directly above, and for the five marks that was
+        // the whole of it — `Weight<N, _>` derived the named one and
+        // `Bank<N, _>` the positional one, so each reached its own arm and no
+        // chain existed to resolve. The four marks resolve ONE mark to BOTH:
+        // `Const<Tensor<E>>` derives `Or(Named("weight"), Slot(Kind::Weight,
+        // 0))` for every weight a routine takes. Without this arm that chain
+        // fell to the catch-all and EVERY weight refused "nothing states
+        // weight" — `layout::embed_bf16`, the first launch of every fire, so
+        // no model reached its second kernel.
+        //
+        // `kernels::bind` carries the same arm for the shader planes and says
+        // the same thing; this is the CUDA half of it.
+        //
+        // Order matters, and so does what each half COSTS. `Facts` accessors
+        // read and mint nothing, so a discarded first half shifts no handle;
+        // `o.weight(n)` is the one that numbers into `taken`, and it is
+        // reached only on the fallback.
+        Some(Source::Or(&Source::Named(key), fallback)) => {
+            match operand(o, f, d, Some(Source::Named(key))) {
+                Ok(v) => Ok(v),
+                Err(_) => operand(o, f, d, Some(*fallback)),
+            }
+        }
+        // THE SCALAR CHAIN: the statement's own scalar first, a fact or a
+        // literal after. ZERO IS ABSENT — a grid axis of zero launches
+        // nothing, so a statement carrying one is stating no preference.
+        //
+        // Safe for the reason the weight chain is, and the reason is the other
+        // way round: `param` reads the wire run and mints nothing at all, so
+        // it is the FALLBACK here that may number a handle, and it runs once.
+        Some(Source::Or(&Source::Slot(Kind::Param, n), fallback)) => {
+            match f.cx.param(n as usize).ok().filter(|v| *v > 0) {
+                Some(stated) => Ok(ArgValue::U32(stated)),
+                None => operand(o, f, d, Some(*fallback)),
+            }
+        }
 
         // Extents the statement carries. Not arithmetic -- a width is read.
         Some(Source::Slot(Kind::InWidth, n)) => o.in_width(n as usize).map(ArgValue::I32),
@@ -1076,21 +1134,171 @@ pub unsafe fn dispatch(
     stream: *mut c_void,
 ) -> Option<Result<(), Refusal>> {
     let mut handles = Handles::over(&bound.args, spec.n_in, spec.n_out);
+    // THE ROUTED SYMBOL, NOT THE STATED ONE.
+    //
+    // A trace may state a name that stands for a CHOICE rather than a
+    // routine: `attn::write_kv_to_pages` is declared by an `untraced!` row so
+    // `check_plan` can measure a text against it, and `Boot::route` resolves
+    // it to `_bf16` or `_quantised` from the KV dtype the boot settled. That
+    // resolution already happened -- `spec.route` holds the row it landed on
+    // -- and looking the COLUMN up by `bound.kernel` threw it away, found the
+    // declaration-only row, and refused with "nothing states an operand
+    // column" at the sixth launch of every fire.
+    //
+    // The routed row's own `symbol` is the concrete one, so the column comes
+    // from the routine that is about to run rather than from the name the
+    // text happened to spell.
+    let symbol = match spec.route {
+        crate::bind::arms::Route::Bound(entry) => entry.symbol,
+        _ => bound.kernel,
+    };
     // `None`, NOT a refusal, for a row with no column: `None` means "take the
     // path you take today", `Some(Err(_))` means "this fire cannot run".
-    let row = kernels_cuda::routine(bound.kernel)?;
+    let row = kernels_cuda::routine(symbol)?;
     if row.derived.is_empty() {
         return None;
     }
-    let args = operands(&mut handles, Facts::at(cx), row.derived, row.args);
+    let args = operands(&mut handles, Facts::at(cx), row.derived, row.sources, row.args);
     let args = match args {
         Ok(args) => args,
         Err(why) => return Some(Err(why)),
     };
+    // THE WHOLE BOUND LIST, on request. A wrong ADDRESS is invisible: the
+    // launch succeeds and the numbers come out wrong, which is the one failure
+    // a refusal-driven bring-up cannot see. `PIE_TRACE_BINDS=1` prints it.
+    if std::env::var_os("PIE_TRACE_BINDS").is_some() {
+        eprintln!("[bind] {symbol} n_in={} n_out={} -> {args:?}", spec.n_in, spec.n_out);
+    }
+    // AND WHAT THE LAUNCH LEFT IN ITS RESULTS. A binding can be right in every
+    // address and still run on the wrong NUMBERS; `PIE_TRACE_VALUES=1` reads
+    // the first few bf16 of every region back after the launch, which is the
+    // only way to see where a forward pass stops being arithmetic.
+    //
+    // Deliberately expensive: it synchronises the stream. A diagnostic that
+    // changed the schedule it is measuring would be worse than none.
+    let peek = std::env::var_os("PIE_TRACE_VALUES").is_some();
+    // WHAT THE BODY MAY STILL ASK FOR. `Env` left the parameter list, so a
+    // fact only the fire can answer is no longer bound into `args` above --
+    // the body asks, and this lends it the same `Handles` and `Facts` the
+    // column was just bound from.
+    let answering = Answering {
+        handles: core::cell::RefCell::new(handles),
+        facts: Facts::at(cx),
+    };
     // SAFETY: this function's own contract, forwarded unchanged. Every pointer
     // the column bound came from `bound.args` or a `Facts` field the dispatch
     // site resolved; anything from nowhere at all is a refusal, not a null.
-    Some(unsafe { kernels_cuda::call_with_cublas(bound.kernel, &args, stream, cx.cublas()) })
+    let fired = unsafe {
+        kernels_cuda::call_answering(
+            symbol,
+            &args,
+            stream,
+            cx.cublas(),
+            Some(&answering),
+        )
+    };
+    if peek && fired.is_ok() {
+        peek_results(symbol, &args, spec.n_in, stream);
+    }
+    Some(fired)
+}
+
+/// Read the head of every REGION this launch bound back off the device.
+///
+/// A diagnostic, and the only one that can answer "where do the numbers stop
+/// being right". Synchronises the stream and copies sixteen bytes per region;
+/// reached only when `PIE_TRACE_VALUES` is set.
+fn peek_results(symbol: &str, args: &[ArgValue], n_in: usize, stream: *mut c_void) {
+    // SAFETY: `stream` is the fire's own and live; the sync is what makes the
+    // reads below observe the launch that just ran.
+    unsafe {
+        cudarc::runtime::sys::cudaStreamSynchronize(stream.cast());
+    }
+    let mut shown = 0usize;
+    for (i, a) in args.iter().enumerate() {
+        let ArgValue::Region { ptr, rows, width } = *a else {
+            continue;
+        };
+        if ptr.is_null() || rows <= 0 || width <= 0 {
+            continue;
+        }
+        let mut host = [0u16; 8];
+        // SAFETY: the region's own claim -- `rows * width` live bf16 at `ptr`.
+        let rc = unsafe {
+            cudarc::runtime::sys::cudaMemcpy(
+                host.as_mut_ptr().cast(),
+                ptr.cast_const().cast(),
+                core::mem::size_of_val(&host),
+                cudarc::runtime::sys::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+            )
+        };
+        if rc != cudarc::runtime::sys::cudaError::cudaSuccess {
+            continue;
+        }
+        let f: Vec<f32> = host.iter().map(|b| bf16_to_f32(*b)).collect();
+        let role = if i < n_in { "in " } else { "out" };
+        eprintln!("[val] {symbol} {role}{i} rows={rows} w={width} {f:.4?}");
+        shown += 1;
+        if shown >= 6 {
+            break;
+        }
+    }
+}
+
+/// A bf16 bit pattern as the float it stands for.
+fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits(u32::from(bits) << 16)
+}
+
+/// THIS FIRE'S ANSWERS, for a body that asks.
+///
+/// The answering side of the `Env` -> `ask` move, and it answers with exactly
+/// what the column answered with: [`operand`], over the same [`Handles`] and
+/// the same [`Facts`]. Nothing new resolves — what changed is only that the
+/// question can now be asked from inside a body instead of having to be a
+/// parameter for the column to carry it.
+///
+/// `RefCell` because answering MINTS -- a staged fact takes a handle -- while
+/// a body holds only a `&self`. The column's own borrow has ended by the time
+/// the body runs, so the two never overlap.
+pub(crate) struct Answering<'a> {
+    handles: core::cell::RefCell<Handles<'a>>,
+    facts: Facts<'a>,
+}
+
+impl<'a> Answering<'a> {
+    /// THE FIRE'S ANSWERS WITH NO OPERANDS BEHIND THEM.
+    ///
+    /// For a hand-written arm: it places its own pointers and asks only for
+    /// facts, so the handle side is empty and a body that reaches for a SLOT
+    /// on one of these is refused -- which is the honest answer, there being
+    /// no statement here to have placed one.
+    #[must_use]
+    pub(crate) fn over_facts(cx: &'a Cx<'a>) -> Self {
+        Self {
+            handles: core::cell::RefCell::new(Handles::over(&[], 0, 0)),
+            facts: Facts::at(cx),
+        }
+    }
+}
+
+impl kernels::routine::Answers<kernels_cuda::jit::Cuda> for Answering<'_> {
+    fn resolve(&self, ty: kernels::Ty, source: Source) -> Result<ArgValue, Refusal> {
+        // A NAME THE REFUSAL CAN USE. `Derived` carries the parameter's own
+        // identifier, and an asked fact has no parameter -- so it says so
+        // rather than borrowing a neighbour's name.
+        const ASKED: Derived = Derived { name: "a fact the body asked for", nullable: false };
+        let v = operand(&mut self.handles.borrow_mut(), self.facts, &ASKED, Some(source))?;
+        let v = as_declared(Some(ty), v);
+        // WHAT A BODY ACTUALLY GOT, on request. An ask resolves silently and a
+        // wrong ANSWER is invisible where a missing one is a refusal — so the
+        // one thing that cannot be read off a failing fire is the number the
+        // kernel ran on. `PIE_TRACE_ASKS=1` prints it.
+        if std::env::var_os("PIE_TRACE_ASKS").is_some() {
+            eprintln!("[ask] {source:?} -> {v:?}");
+        }
+        Ok(v)
+    }
 }
 
 /// The arm a crossed symbol names instead of a hand-written one.
@@ -1347,8 +1555,18 @@ mod tests {
             .collect()
     }
 
-    fn decl(symbol: &str) -> &'static [(kernels::Ty, kernels::Provenance)] {
+    fn decl(symbol: &str) -> &'static [kernels::Ty] {
         kernels_cuda::routine(symbol).map_or(&[][..], |r| r.args)
+    }
+
+    /// The row's SOURCE column, which `operands` takes beside the names.
+    ///
+    /// One column split in two: `Derived` carries the name and the
+    /// nullability, `Source` where the value comes from. `#[routine]` reads
+    /// the first off the syntax and the second off the types, which is what
+    /// keeps them from drifting -- see `operands`.
+    fn srcs(symbol: &str) -> &'static [Option<Source>] {
+        kernels_cuda::routine(symbol).map_or(&[][..], |r| r.sources)
     }
 
     fn operand(n: usize, width: u32) -> BoundArg {
@@ -1369,7 +1587,11 @@ mod tests {
                 })
         };
 
-        // One per crossed family, so a family losing its crossing fails by name.
+        // One per crossed family, so a family losing its crossing fails by
+        // name. TWELVE OF THE THIRTEEN ARM FAMILIES ARE HERE, which is all of
+        // them but `fa2` — see the negative block below for why that one is
+        // absent rather than forgotten.
+        assert!(crossed("rope::rope_bf16"));
         assert!(crossed("layout::embed_bf16"));
         assert!(crossed("sample::lm_head_gemv_argmax_int8"));
         assert!(crossed("norm::add_bias_bf16"));
@@ -1377,11 +1599,26 @@ mod tests {
         assert!(crossed("moe::topk_softmax_bf16"));
         assert!(crossed("quant::bf16_to_fp16"));
         assert!(crossed("ssm::nemotron_mamba_split_bf16"));
+        assert!(crossed("attn::split_qkv_bf16"));
+        // XQA is a second family under `attn`'s namespace, so it needs its own
+        // line: `attn::split_qkv_bf16` above would keep passing if this one
+        // lost its crossing.
+        assert!(crossed("attn::attention_xqa_decode_bf16_prepared"));
+        assert!(crossed("gemm::act_x_wt_bf16_out_fp32"));
+        assert!(crossed("dist::all_reduce_bf16"));
 
-        // A `layout` routine the table shape cannot express.
+        // A `layout` routine the table shape cannot express. DECLARED and not
+        // crossed, which is the case this line is for: it has a `ROUTINES` row
+        // and no `Bound` row at all, so `route` answers `Route::Rows`.
         assert!(!crossed("layout::copy_if_valid_slot"));
-        // A family whose arms still call their `fn` directly.
-        assert!(!crossed("rope::rope_bf16"));
+        // THE TWO FAMILIES WHOSE ARMS STILL CALL THEIR `fn` DIRECTLY. `fa2`'s
+        // eight are the ones that never cross — its header names four blockers
+        // and none is a fact. `quant` keeps ONE, and not for an extent: the
+        // two `Env`s carrying `mxfp4_moe_gate_up_decode_bf16`'s bias planes
+        // name no key, and an export shipping neither must bind NULL rather
+        // than refuse.
+        assert!(!crossed("attn::dispatch_attention_flashinfer_decode"));
+        assert!(!crossed("quant::mxfp4_moe_gate_up_decode_bf16"));
         // AND THE SYMBOL THAT WAS BLOCKED ON ONE MISSING ANSWER: its second
         // output is `Out<1, f16>` now rather than an optional argument.
         assert!(crossed("norm::rmsnorm_bf16_with_fp16"));
@@ -1390,9 +1627,13 @@ mod tests {
 
         // Reproducible without running this test, which matters under a
         // check-only regime: `crossed` is exactly the `Bound::derived` rows.
+        // There are 127 of them and the routine registry declares every one,
+        // so the two counts coincide today — they need not, and a
+        // `Bound::derived` naming a symbol nothing declares would be invisible
+        // here while still answering `Route::Bound` at load.
         let n = kernels_cuda::sigs().iter().filter(|s| crossed(s.symbol)).count();
         assert_eq!(
-            n, 123,
+            n, 127,
             "{n} declared symbols are crossed onto the derived column. \
              Crossing one changes how a real fire is planned, so the count \
              moves only on purpose."
@@ -1401,118 +1642,20 @@ mod tests {
 
     /// How many slots are still reached by COUNTING rather than stated.
     ///
-    /// The gate that deleted `alias()`; at zero nothing is left to correct. A
-    /// FACT IS NOT A SLOT. `driver_bound!` rows are invisible here, which is no
-    /// hole: [`operands`] refuses them before it reads an index.
-    #[test]
-    fn the_counted_slots_are_counted_and_the_count_falls_on_purpose() {
-        let mut counted: Vec<&'static str> = Vec::new();
-        let mut stated_slots = 0usize;
+    // TWO CENSUSES STOOD HERE AND BOTH MEASURED A STATE THAT NO LONGER
+    // EXISTS.
+    //
+    // `the_counted_slots_are_counted_and_the_count_falls_on_purpose` split
+    // every `In`/`Out` slot into ones a signature STATED and ones the macro
+    // COUNTED to, and pinned the second at zero. `the_facts_that_came_from_a_
+    // name_...` pinned the parameter-NAME table at zero beside it.
+    //
+    // `kernels::routine::resolve` ended the first: a mark carries a `Claim`
+    // and no number, so every slot is derived from position and there is no
+    // second way for one to arrive. The name table went with `Derived::source`
+    // -- the column these read is `name` and `nullable` now, because a type
+    // answers the rest.
 
-        for sig in kernels_cuda::sigs() {
-            let Some(row) = kernels_cuda::routine(sig.symbol) else { continue };
-            for d in row.derived {
-                if !matches!(d.source, Some(Source::Slot(Kind::In | Kind::Out, _))) {
-                    continue;
-                }
-                if d.stated {
-                    stated_slots += 1;
-                } else {
-                    counted.push(sig.symbol);
-                }
-            }
-        }
-
-        counted.sort_unstable();
-        counted.dedup();
-
-        // The failure message carries the BREAKDOWN, by family.
-        let mut by_family: std::collections::BTreeMap<&str, usize> = Default::default();
-        for s in &counted {
-            *by_family.entry(s.split("::").next().unwrap_or(s)).or_default() += 1;
-        }
-        let breakdown = by_family
-            .iter()
-            .map(|(f, n)| format!("{f} {n}"))
-            .collect::<Vec<_>>()
-            .join(" · ");
-
-        // THE TWO HALVES ASSERT SEPARATELY: the counted half is a one-way door,
-        // the stated half churns on every family's edits.
-        assert!(
-            counted.is_empty(),
-            "{} symbols still derive a slot by counting. This reached zero and \
-             `alias()` was deleted on the strength of it; a non-zero reading here \
-             means a column can now be mis-bound with nothing left to correct it.\n\
-             by family: {breakdown}",
-            counted.len(),
-        );
-
-        assert_eq!(
-            (counted.len(), stated_slots),
-            (COUNTED_SLOT_SYMBOLS, STATED_SLOTS),
-            "{} symbols still derive a slot by counting, over {stated_slots} stated. \
-             Both halves move only on purpose: the first falls as families \
-             convert to regions, and `alias()` deleted when it reached zero.\n\
-             by family: {breakdown}",
-            counted.len(),
-        );
-    }
-
-    /// Symbols with at least one `In(_)`/`Out(_)` the macro counted to. Zero,
-    /// which is what licensed deleting `alias()`.
-    const COUNTED_SLOT_SYMBOLS: usize = 0;
-
-    /// Slot indices a signature wrote down rather than a counter reached. NOT
-    /// THE LIVE CENSUS — `kernels_cuda::slot_census()` is, recomputed every
-    /// build — which is how `488` survived while the real number moved. It has
-    /// sat one under the live figure since Kilimanjaro III and the gap is not
-    /// explained; the live pin is the one to trust.
-    const STATED_SLOTS: usize = 522;
-
-    /// Facts the macro reached through the PARAMETER NAME table.
-    ///
-    /// The live check is `kernels_cuda::name_table_hits()`, pinned at zero. A
-    /// name table couples a parameter's spelling to a launch's behaviour:
-    /// rename `eps` to `e` and the binding silently becomes `None`.
-    #[test]
-    fn the_facts_that_came_from_a_name_are_counted_and_the_count_falls() {
-        let mut by_name: Vec<(&'static str, &'static str)> = Vec::new();
-
-        for sig in kernels_cuda::sigs() {
-            let Some(row) = kernels_cuda::routine(sig.symbol) else { continue };
-            for d in row.derived {
-                if d.stated {
-                    continue;
-                }
-                if matches!(d.source, Some(Source::Slot(Kind::In | Kind::Out, _)) | None) {
-                    continue;
-                }
-                by_name.push((sig.symbol, d.name));
-            }
-        }
-
-        // The breakdown is by FACT: a name-table hit is a per-fact coupling.
-        let mut per_fact: std::collections::BTreeMap<String, usize> = Default::default();
-        for (_, name) in &by_name {
-            *per_fact.entry((*name).to_string()).or_default() += 1;
-        }
-        let breakdown = per_fact
-            .iter()
-            .map(|(f, n)| format!("{f} {n}"))
-            .collect::<Vec<_>>()
-            .join(" · ");
-
-        assert_eq!(
-            by_name.len(),
-            NAMED_FACTS,
-            "{} parameters still reach a fact through `fact_of`, the parameter-name \
-             table. `fact_of` is DELETED, so a hit here means somebody built \
-             a new one.\n\
-             by parameter name: {breakdown}",
-            by_name.len(),
-        );
-    }
 
     /// Parameters whose fact came from their name rather than their type. Zero,
     /// and `fact_of` is deleted, so this is a one-way door. `Env<keys::…>` is
@@ -1544,8 +1687,8 @@ mod tests {
                 ArgValue::Region { ptr: at(0), rows: 7, width: 4096 },
                 ArgValue::Ptr(at(8)),
                 ArgValue::Ptr(at(9)),
+                // `vocab` is asked for, so it is not in the column.
                 ArgValue::Region { ptr: at(1), rows: 7, width: 1 },
-                ArgValue::I32(128_256),
             ]
         );
         assert_eq!(
@@ -1605,11 +1748,15 @@ mod tests {
         );
 
         // And a fact the fire does not state refuses by NAME, in `Cx`'s words.
+        // `embed_bf16`'s remaining fact is its named WEIGHT: the token ids and
+        // the vocabulary are asks now, so the column no longer reaches for
+        // them and this probe reaches the next one that is still the
+        // statement's.
         let args = [operand(0, 64), operand(1, 64)];
         let mut o = Handles::over(&args, 1, 1);
         assert_eq!(
             embed_bf16(&mut o, Facts::at(&cx)),
-            Err(Refusal::Unstated { what: "the fire's token ids" })
+            Err(Refusal::Absent { what: "a named weight" })
         );
     }
 
@@ -1642,12 +1789,13 @@ mod tests {
         let cx = Cx::new(&fire);
         let f = Facts::at(&cx);
 
-        let hand = embed_bf16(&mut Handles::over(&args, 1, 1), f).expect("the hand arm binds");
+        let hand = embed_bf16(&mut Handles::over(&args, 0, 1), f).expect("the hand arm binds");
         let made = operands(
-            &mut Handles::over(&args, 1, 1),
+            &mut Handles::over(&args, 0, 1),
             f,
             <kernels_cuda::layout::embed_bf16 as ::kernels::Derivation>::DERIVED,
-            decl("embed_bf16"),
+            srcs("layout::embed_bf16"),
+            decl("layout::embed_bf16"),
         );
         assert_eq!(
             made.as_deref().map(addressed),
@@ -1670,7 +1818,8 @@ mod tests {
             &mut Handles::over(&args, 1, 1),
             f,
             <kernels_cuda::layout::gather_bf16_rows as ::kernels::Derivation>::DERIVED,
-            decl("gather_bf16_rows"),
+            srcs("layout::gather_bf16_rows"),
+            decl("layout::gather_bf16_rows"),
         );
         assert_eq!(made.as_deref().map(addressed), Ok(addressed(&hand)));
     }
@@ -1725,6 +1874,7 @@ mod tests {
                 &mut Handles::over(&args, n_in, n_out),
                 f,
                 column,
+                srcs(what),
                 decl(what),
             )
             .map(|v| addressed(&v));
@@ -1755,14 +1905,14 @@ mod tests {
 
     #[test]
     fn the_derived_column_reaches_most_of_the_surface() {
-        // A ROW WITH NO COLUMN IS TWO DIFFERENT FACTS: `driver_bound!` has no
+        // A ROW WITH NO COLUMN IS TWO DIFFERENT FACTS: `untraced!` has no
         // signature to derive from; a `routine!` row without one is work to do.
-        let mut driver_bound = Vec::new();
+        let mut untraced = Vec::new();
         let mut uncolumned = Vec::new();
         let mut reachable = Vec::new();
-        let mut blocked: Vec<(&str, &Derived)> = Vec::new();
+        let mut blocked: Vec<(&str, &Derived, Option<Source>)> = Vec::new();
         // Resolved by `operand`, refused by the ABI. See the loop below.
-        let mut mistyped: Vec<(&str, &Derived)> = Vec::new();
+        let mut mistyped: Vec<(&str, &Derived, Option<Source>)> = Vec::new();
 
         // Thirty-six operands, every `Facts` field filled. THE PROBE MUST BE
         // WIDER THAN THE WIDEST SIGNATURE: 12/12 of 24 left the weight run empty.
@@ -1775,7 +1925,7 @@ mod tests {
         for sig in kernels_cuda::sigs() {
             let Some(row) = kernels_cuda::routine(sig.symbol) else { continue };
             if row.derived.is_empty() {
-                if row.args.is_empty() { &mut driver_bound } else { &mut uncolumned }.push(sig.symbol);
+                if row.args.is_empty() { &mut untraced } else { &mut uncolumned }.push(sig.symbol);
                 continue;
             }
             // PROBE WITH EVERYTHING STATED, BECAUSE A DEFAULT CANNOT TELL THE
@@ -1783,24 +1933,25 @@ mod tests {
             let mut why = None;
             let mut wrong_kind = None;
             for (i, d) in row.derived.iter().enumerate() {
-                match super::operand(&mut Handles::over(&args, 12, 12), stated, d) {
+                let src = row.sources.get(i).copied().flatten();
+                match super::operand(&mut Handles::over(&args, 12, 12), stated, d, src) {
                     Err(_) => {
-                        why = Some(d);
+                        why = Some((d, src));
                         break;
                     }
                     // RESOLVING IS NOT BINDING: `call()` refuses a wrong kind.
                     Ok(v) => {
-                        let t = sig.args.get(i).map(|a| a.0);
+                        let t = sig.args.get(i).copied();
                         if !abi_admits(t, &super::as_declared(t, v)) {
-                            wrong_kind = Some(d);
+                            wrong_kind = Some((d, src));
                             break;
                         }
                     }
                 }
             }
             match (why, wrong_kind) {
-                (Some(d), _) => blocked.push((sig.symbol, d)),
-                (None, Some(d)) => mistyped.push((sig.symbol, d)),
+                (Some(d), _) => blocked.push((sig.symbol, d.0, d.1)),
+                (None, Some(d)) => mistyped.push((sig.symbol, d.0, d.1)),
                 (None, None) => reachable.push(sig.symbol),
             }
         }
@@ -1815,16 +1966,16 @@ mod tests {
             blocked.len(),
             mistyped.len(),
             uncolumned.len(),
-            driver_bound.len()
+            untraced.len()
         );
-        for (symbol, d) in &mistyped {
+        for (symbol, d, src) in &mistyped {
             println!(
                 "  mistyped {symbol}  -- `{}` resolves {:?}, wrong ABI kind",
-                d.name, d.source
+                d.name, src
             );
         }
-        for (symbol, d) in &blocked {
-            println!("  blocked  {symbol}  -- `{}` is {:?}", d.name, d.source);
+        for (symbol, d, src) in &blocked {
+            println!("  blocked  {symbol}  -- `{}` is {src:?}", d.name);
         }
 
         // EVERY `routine!` ROW HAS A COLUMN. `attn::qkv_decode_fused_dispatch`
@@ -1837,17 +1988,17 @@ mod tests {
             missing.is_empty(),
             "these `routine!` rows carry an empty column: {missing:?}. Every \
              row built from a `fn` signature reads one off `Derivation`; only \
-             `driver_bound!` rows, which have no signature to derive from, \
+             `untraced!` rows, which have no signature to derive from, \
              and a row spelled `uncolumned` do not."
         );
 
         // THE CLAIM: A BLOCKED PARAMETER IS `None` OR AT THE BOUNDARY. `None`
         // says `#[routine]` had no name for a scalar; anything else is a source
         // this binder should answer. The allowance is what `Facts` cannot carry.
-        for (symbol, d) in &blocked {
+        for (symbol, d, src) in &blocked {
             assert!(
                 matches!(
-                    d.source,
+                    src,
                     // Only what `Facts` cannot hold — the rest are answered.
                     None | Some(
                         Source::Slot(Kind::Aux | Kind::Param | Kind::ParamF32, _)
@@ -1864,7 +2015,7 @@ mod tests {
                  cannot carry -- so this binder should answer it and does \
                  not. Fix `operand`, not the launcher",
                 d.name,
-                d.source
+                src
             );
         }
 
@@ -1885,7 +2036,7 @@ mod tests {
         let cx = Cx::new(&fire);
         let args = [operand(0, 16)];
         assert_eq!(
-            operands(&mut Handles::over(&args, 1, 0), Facts::at(&cx), &[], &[]),
+            operands(&mut Handles::over(&args, 1, 0), Facts::at(&cx), &[], &[], &[]),
             Err(Refusal::Unstated { what: "an operand column: the row states no `derived`" })
         );
     }

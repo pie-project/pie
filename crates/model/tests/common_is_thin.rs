@@ -146,6 +146,17 @@ const SHARED: &[&str] = &[
 /// Files that name families ON PURPOSE, with the reason each does.
 const NOT_SHARED: &[(&str, &str)] = &[
     (
+        "shared/vocabulary.rs",
+        "THE TYPE A GENERATION STATES ITS NAMES IN, and its doc argues from \
+         the generations that differ: `nemotron_h` publishes \
+         `backbone.layers.{}.mixer.q_proj`, `csm` publishes five towers, and \
+         llama.cpp ships four of the families and not the rest. Those \
+         sentences are the REASON the table has the shape it has, and a \
+         reader who cannot see which generations disagree cannot check it. \
+         No CODE here names one -- the names are the columns a generation \
+         fills, and the module fills none of them.",
+    ),
+    (
         "lib.rs",
         "the crate doc, which names the generations it declares",
     ),

@@ -13,12 +13,12 @@
 //! `quantized_qmv.metal` now, with the evidence for widening rather than
 //! refusing. `.wiki/kernel-metal-refactor.md` §9 records it.
 
-#![allow(clippy::too_many_arguments)]
 
+use kernels::Grid;
+use kernels_macros::routine;
 use kernels::routine::Refusal;
 
-use crate::routine::{keys, Ask, Bind, Block, Buf, BufMut, Ctx, Env, Fire, Null, Param, ParamOr, Routine};
-use crate::routine::{InSlot, OutSlot, Weight};
+use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, Out, Tensor, bf16, keys};
 
 /// The shaders this family's routines reach: `(file, entrypoint)`, one pair
 /// per instantiated name.
@@ -585,33 +585,33 @@ const MXFP4_QMM: &[&str] = &[
 /// # Errors
 ///
 /// See [`router_lanes`], and [`Refusal::Empty`] for an empty row count.
+#[routine]
 pub fn router_topk(
     ctx: &Ctx<'_>,
-    logits: InSlot<0, Buf>,
-    expert_ids: OutSlot<0, BufMut>,
-    expert_weights: OutSlot<1, BufMut>,
-    params: Block<Buf>,
-    per_expert_scale: Null<Env<Buf>>,
-    n_experts: Ask<keys::NumExperts, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    let w = router_lanes(*n_experts)?;
-    if *rows <= 0 {
+    logits: In<Tensor<bf16>>,
+    expert_ids: Out<Tensor<i32>>,
+    expert_weights: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    // BACK TO AN ASK, BECAUSE THIS ROUTINE'S PARAMS RUN IS A STRUCT.
+    // The body forwards `ctx.params()` whole -- the shader reads fields,
+    // not a scalar run -- so slot 0 is the struct's first field and a
+    // `Const` derived onto it reads that field's bits. HEAD spelled these
+    // `Ask<..>` for exactly this reason, and the drivers still answer them.
+    let n_experts = ctx.ask::<i32, keys::NumExperts>()?;
+    let params = ctx.params()?;
+    let per_expert_scale = ctx.absent()?;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    let w = router_lanes(n_experts)?;
+    if rows <= 0 {
         return Err(Refusal::Empty { what: "rows" });
     }
-    ctx.dispatch(
-        Fire {
-            entrypoint: "router_topk_bfloat16",
-            file: ROUTE_FILE,
-            lanes: [w, rows.unsigned_abs(), 1],
-            group: [w, 1, 1],
-        },
+    ctx.fire(
+        Fire::at(ROUTE_FILE, "router_topk_bfloat16").apply(Grid::of([w, rows.unsigned_abs(), 1], [w, 1, 1])),
         &[
-            logits.v(),
-            expert_ids.v(),
-            expert_weights.v(),
-            params.v(),
-            per_expert_scale.v(),
+            logits.arg(),
+            expert_ids.arg(),
+            expert_weights.arg(),
+            params,
+            per_expert_scale,
         ],
     )
 }
@@ -622,33 +622,33 @@ pub fn router_topk(
 /// # Errors
 ///
 /// See [`router_topk`].
+#[routine]
 pub fn router_topk_scaled(
     ctx: &Ctx<'_>,
-    logits: InSlot<0, Buf>,
-    expert_ids: OutSlot<0, BufMut>,
-    expert_weights: OutSlot<1, BufMut>,
-    params: Block<Buf>,
-    per_expert_scale: Weight<0, Buf>,
-    n_experts: Ask<keys::NumExperts, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    let w = router_lanes(*n_experts)?;
-    if *rows <= 0 {
+    logits: In<Tensor<bf16>>,
+    expert_ids: Out<Tensor<i32>>,
+    expert_weights: Out<Tensor<bf16>>,
+    per_expert_scale: Const<Tensor<bf16>>) -> Result<(), Refusal> {
+    // BACK TO AN ASK, BECAUSE THIS ROUTINE'S PARAMS RUN IS A STRUCT.
+    // The body forwards `ctx.params()` whole -- the shader reads fields,
+    // not a scalar run -- so slot 0 is the struct's first field and a
+    // `Const` derived onto it reads that field's bits. HEAD spelled these
+    // `Ask<..>` for exactly this reason, and the drivers still answer them.
+    let n_experts = ctx.ask::<i32, keys::NumExperts>()?;
+    let params = ctx.params()?;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    let w = router_lanes(n_experts)?;
+    if rows <= 0 {
         return Err(Refusal::Empty { what: "rows" });
     }
-    ctx.dispatch(
-        Fire {
-            entrypoint: "router_topk_scaled_bfloat16",
-            file: ROUTE_FILE,
-            lanes: [w, rows.unsigned_abs(), 1],
-            group: [w, 1, 1],
-        },
+    ctx.fire(
+        Fire::at(ROUTE_FILE, "router_topk_scaled_bfloat16").apply(Grid::of([w, rows.unsigned_abs(), 1], [w, 1, 1])),
         &[
-            logits.v(),
-            expert_ids.v(),
-            expert_weights.v(),
-            params.v(),
-            per_expert_scale.v(),
+            logits.arg(),
+            expert_ids.arg(),
+            expert_weights.arg(),
+            params,
+            per_expert_scale.arg(),
         ],
     )
 }
@@ -670,31 +670,31 @@ pub fn router_topk_scaled(
 /// # Errors
 ///
 /// See [`router_lanes`].
+#[routine]
 pub fn route_sort(
     ctx: &Ctx<'_>,
-    expert_ids: InSlot<0, Buf>,
-    perm: OutSlot<0, BufMut>,
-    row_expert: OutSlot<1, BufMut>,
-    tile_expert: OutSlot<2, BufMut>,
-    params: Block<Buf>,
-    inv: OutSlot<3, BufMut>,
-    n_experts: Ask<keys::NumExperts, i32>,
-) -> Result<(), Refusal> {
-    let w = router_lanes(*n_experts)?;
-    ctx.dispatch(
-        Fire {
-            entrypoint: "route_sort",
-            file: ROUTE_FILE,
-            lanes: [w, 1, 1],
-            group: [w, 1, 1],
-        },
+    expert_ids: In<Tensor<i32>>,
+    perm: Out<Tensor<i32>>,
+    row_expert: Out<Tensor<i32>>,
+    tile_expert: Out<Tensor<i32>>,
+    inv: Out<Tensor<i32>>) -> Result<(), Refusal> {
+    // BACK TO AN ASK, BECAUSE THIS ROUTINE'S PARAMS RUN IS A STRUCT.
+    // The body forwards `ctx.params()` whole -- the shader reads fields,
+    // not a scalar run -- so slot 0 is the struct's first field and a
+    // `Const` derived onto it reads that field's bits. HEAD spelled these
+    // `Ask<..>` for exactly this reason, and the drivers still answer them.
+    let n_experts = ctx.ask::<i32, keys::NumExperts>()?;
+    let params = ctx.params()?;
+    let w = router_lanes(n_experts)?;
+    ctx.fire(
+        Fire::at(ROUTE_FILE, "route_sort").apply(Grid::of([w, 1, 1], [w, 1, 1])),
         &[
-            expert_ids.v(),
-            perm.v(),
-            row_expert.v(),
-            tile_expert.v(),
-            params.v(),
-            inv.v(),
+            expert_ids.arg(),
+            perm.arg(),
+            row_expert.arg(),
+            tile_expert.arg(),
+            params,
+            inv.arg(),
         ],
     )
 }
@@ -709,24 +709,19 @@ pub fn route_sort(
 /// # Errors
 ///
 /// See [`route_rows`].
+#[routine]
 pub fn route_gather(
     ctx: &Ctx<'_>,
-    x: InSlot<0, Buf>,
-    out: OutSlot<0, BufMut>,
-    perm: InSlot<1, Buf>,
-    params: Block<Buf>,
-    width: Ask<keys::Width, i32>,
-    padded: ParamOr<4, keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    let (lanes, group) = route_rows(*width, *padded)?;
-    ctx.dispatch(
-        Fire {
-            entrypoint: "route_gather",
-            file: ROUTE_FILE,
-            lanes,
-            group,
-        },
-        &[x.v(), out.v(), perm.v(), params.v()],
+    x: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    perm: In<Tensor<i32>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let width = x.width;
+    let padded = ctx.ask::<i32, keys::Rows>()?;
+    let (lanes, group) = route_rows(width, padded)?;
+    ctx.fire(
+        Fire::at(ROUTE_FILE, "route_gather").apply(Grid::of(lanes, group)),
+        &[x.arg(), out.arg(), perm.arg(), params],
     )
 }
 
@@ -739,25 +734,20 @@ pub fn route_gather(
 /// # Errors
 ///
 /// See [`route_rows`].
+#[routine]
 pub fn combine_sorted(
     ctx: &Ctx<'_>,
-    y: InSlot<0, Buf>,
-    expert_weights: InSlot<1, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    inv: InSlot<2, Buf>,
-    width: Ask<keys::Width, i32>,
-    tokens: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    let (lanes, group) = route_rows(*width, *tokens)?;
-    ctx.dispatch(
-        Fire {
-            entrypoint: "combine_sorted",
-            file: ROUTE_FILE,
-            lanes,
-            group,
-        },
-        &[y.v(), expert_weights.v(), out.v(), params.v(), inv.v()],
+    y: In<Tensor<bf16>>,
+    expert_weights: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    inv: In<Tensor<i32>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let width = y.width;
+    let tokens = ctx.ask::<i32, keys::Rows>()?;
+    let (lanes, group) = route_rows(width, tokens)?;
+    ctx.fire(
+        Fire::at(ROUTE_FILE, "combine_sorted").apply(Grid::of(lanes, group)),
+        &[y.arg(), expert_weights.arg(), out.arg(), params, inv.arg()],
     )
 }
 
@@ -773,24 +763,19 @@ pub fn combine_sorted(
 /// # Errors
 ///
 /// See [`route_rows`].
+#[routine]
 pub fn shared_expert_combine(
     ctx: &Ctx<'_>,
-    routed: InSlot<0, Buf>,
-    shared: InSlot<1, Buf>,
-    gate: InSlot<2, Buf>,
-    out: OutSlot<0, BufMut>,
-    width: ParamOr<0, keys::Width, u32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    let (lanes, group) = route_rows((*width).try_into().unwrap_or(i32::MAX), *rows)?;
-    ctx.dispatch(
-        Fire {
-            entrypoint: "shared_expert_combine",
-            file: ROUTE_FILE,
-            lanes,
-            group,
-        },
-        &[routed.v(), shared.v(), gate.v(), out.v(), width.v()],
+    routed: In<Tensor<bf16>>,
+    shared: In<Tensor<bf16>>,
+    gate: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let width = routed.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    let (lanes, group) = route_rows((width).try_into().unwrap_or(i32::MAX), rows)?;
+    ctx.fire(
+        Fire::at(ROUTE_FILE, "shared_expert_combine").apply(Grid::of(lanes, group)),
+        &[routed.arg(), shared.arg(), gate.arg(), out.arg(), width.arg()],
     )
 }
 
@@ -799,31 +784,30 @@ pub fn shared_expert_combine(
 /// # Errors
 ///
 /// See [`route_rows`].
+#[routine]
 pub fn shared_expert_combine_strided(
     ctx: &Ctx<'_>,
-    routed: InSlot<0, Buf>,
-    shared: InSlot<1, Buf>,
-    gate: InSlot<2, Buf>,
-    out: OutSlot<0, BufMut>,
-    width: ParamOr<0, keys::Width, u32>,
-    row_pitch: Param<1, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    let (lanes, group) = route_rows((*width).try_into().unwrap_or(i32::MAX), *rows)?;
-    ctx.dispatch(
-        Fire {
-            entrypoint: "shared_expert_combine_strided",
-            file: ROUTE_FILE,
-            lanes,
-            group,
-        },
+    routed: In<Tensor<bf16>>,
+    shared: In<Tensor<bf16>>,
+    gate: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let width = routed.width;
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<1>` named.
+    // This body forwards `ctx.params()` as a STRUCT, so the run is the
+    // shader's layout and no `Const` mark can name a word inside it; the
+    // migration made this `keys::RowPitch`, which no driver answers.
+    let row_pitch = ctx.param(1)?;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    let (lanes, group) = route_rows((width).try_into().unwrap_or(i32::MAX), rows)?;
+    ctx.fire(
+        Fire::at(ROUTE_FILE, "shared_expert_combine_strided").apply(Grid::of(lanes, group)),
         &[
-            routed.v(),
-            shared.v(),
-            gate.v(),
-            out.v(),
-            width.v(),
-            row_pitch.v(),
+            routed.arg(),
+            shared.arg(),
+            gate.arg(),
+            out.arg(),
+            width.arg(),
+            row_pitch.arg(),
         ],
     )
 }
@@ -842,42 +826,47 @@ pub fn shared_expert_combine_strided(
 /// # Errors
 ///
 /// See [`routed_qmv_grid`].
+#[routine]
 pub fn qmv_routed(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    x: InSlot<0, Buf>,
-    y: OutSlot<0, BufMut>,
-    in_vec_size: Param<0, i32>,
-    out_vec_size: Param<1, i32>,
-    bias: Null<Env<Buf>>,
-    expert_ids: InSlot<1, Buf>,
-    x_slot_stride: Param<2, i32>,
-    x_row_stride: Param<3, i32>,
-    slots_per_row: Param<4, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "affine_qmv_routed_bfloat16_gs_64_b_4",
-            file: QMV_FILE,
-            lanes: routed_qmv_grid(*rows, *out_vec_size, *slots_per_row)?,
-            group: SIMD_PAIR,
-        },
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    x: In<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>,
+    // THE SORTED STACK'S THREE STRIDES, WHICH THE STATEMENT CARRIES. All
+    // three were `Param<N, i32>` and the migration read them as a fire's
+    // facts, so the body asked for keys no driver answers and every routed
+    // matvec refused `Unstated`. They are the mixture's own geometry, which
+    // `dsl::metal::routed_qmv` computes and states: a row is `k` slots wide
+    // and a slot is one, so `x_slot_stride` is the input's width, the row
+    // stride is `k` of them, and `slots_per_row` is `k`.
+    //
+    // `in_vec_size` and `out_vec_size` stood before them and correctly left:
+    // they are `x.width` and `y.width`, which the marks carry.
+    x_slot_stride: Const<i32>,
+    x_row_stride: Const<i32>,
+    slots_per_row: Const<i32>,
+    expert_ids: In<Tensor<i32>>) -> Result<(), Refusal> {
+    let in_vec_size = x.width;
+    let out_vec_size = y.width;
+    let bias = ctx.absent()?;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMV_FILE, "affine_qmv_routed_bfloat16_gs_64_b_4").apply(Grid::of(routed_qmv_grid(rows, out_vec_size, *slots_per_row)?, SIMD_PAIR)),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            x.v(),
-            y.v(),
-            in_vec_size.v(),
-            out_vec_size.v(),
-            bias.v(),
-            expert_ids.v(),
-            x_slot_stride.v(),
-            x_row_stride.v(),
-            slots_per_row.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            x.arg(),
+            y.arg(),
+            in_vec_size.arg(),
+            out_vec_size.arg(),
+            bias,
+            expert_ids.arg(),
+            x_slot_stride.arg(),
+            x_row_stride.arg(),
+            slots_per_row.arg(),
         ],
     )
 }
@@ -887,42 +876,47 @@ pub fn qmv_routed(
 /// # Errors
 ///
 /// See [`routed_qmv_grid`].
+#[routine]
 pub fn qmv_routed_bias(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    x: InSlot<0, Buf>,
-    y: OutSlot<0, BufMut>,
-    in_vec_size: Param<0, i32>,
-    out_vec_size: Param<1, i32>,
-    bias: Weight<3, Buf>,
-    expert_ids: InSlot<1, Buf>,
-    x_slot_stride: Param<2, i32>,
-    x_row_stride: Param<3, i32>,
-    slots_per_row: Param<4, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "affine_qmv_routed_bias_bfloat16_gs_64_b_4",
-            file: QMV_FILE,
-            lanes: routed_qmv_grid(*rows, *out_vec_size, *slots_per_row)?,
-            group: SIMD_PAIR,
-        },
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    x: In<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>,
+    bias: Const<Tensor<bf16>>,
+    // THE SORTED STACK'S THREE STRIDES, WHICH THE STATEMENT CARRIES. All
+    // three were `Param<N, i32>` and the migration read them as a fire's
+    // facts, so the body asked for keys no driver answers and every routed
+    // matvec refused `Unstated`. They are the mixture's own geometry, which
+    // `dsl::metal::routed_qmv` computes and states: a row is `k` slots wide
+    // and a slot is one, so `x_slot_stride` is the input's width, the row
+    // stride is `k` of them, and `slots_per_row` is `k`.
+    //
+    // `in_vec_size` and `out_vec_size` stood before them and correctly left:
+    // they are `x.width` and `y.width`, which the marks carry.
+    x_slot_stride: Const<i32>,
+    x_row_stride: Const<i32>,
+    slots_per_row: Const<i32>,
+    expert_ids: In<Tensor<i32>>) -> Result<(), Refusal> {
+    let in_vec_size = x.width;
+    let out_vec_size = y.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMV_FILE, "affine_qmv_routed_bias_bfloat16_gs_64_b_4").apply(Grid::of(routed_qmv_grid(rows, out_vec_size, *slots_per_row)?, SIMD_PAIR)),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            x.v(),
-            y.v(),
-            in_vec_size.v(),
-            out_vec_size.v(),
-            bias.v(),
-            expert_ids.v(),
-            x_slot_stride.v(),
-            x_row_stride.v(),
-            slots_per_row.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            x.arg(),
+            y.arg(),
+            in_vec_size.arg(),
+            out_vec_size.arg(),
+            bias.arg(),
+            expert_ids.arg(),
+            x_slot_stride.arg(),
+            x_row_stride.arg(),
+            slots_per_row.arg(),
         ],
     )
 }
@@ -940,42 +934,47 @@ pub fn qmv_routed_bias(
 /// # Errors
 ///
 /// See [`routed_qmv_grid`].
+#[routine]
 pub fn mxfp4_qmv_routed_bias(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Null<Env<Buf>>,
-    x: InSlot<0, Buf>,
-    y: OutSlot<0, BufMut>,
-    in_vec_size: Param<0, i32>,
-    out_vec_size: Param<1, i32>,
-    bias: Weight<2, Buf>,
-    expert_ids: InSlot<1, Buf>,
-    x_slot_stride: Param<2, i32>,
-    x_row_stride: Param<3, i32>,
-    slots_per_row: Param<4, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4",
-            file: QMV_FILE,
-            lanes: routed_qmv_grid(*rows, *out_vec_size, *slots_per_row)?,
-            group: SIMD_PAIR,
-        },
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<u8>>,
+    x: In<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>,
+    bias: Const<Tensor<bf16>>,
+    // THE SORTED STACK'S THREE STRIDES, WHICH THE STATEMENT CARRIES. All
+    // three were `Param<N, i32>` and the migration read them as a fire's
+    // facts, so the body asked for keys no driver answers and every routed
+    // matvec refused `Unstated`. They are the mixture's own geometry, which
+    // `dsl::metal::routed_qmv` computes and states: a row is `k` slots wide
+    // and a slot is one, so `x_slot_stride` is the input's width, the row
+    // stride is `k` of them, and `slots_per_row` is `k`.
+    //
+    // `in_vec_size` and `out_vec_size` stood before them and correctly left:
+    // they are `x.width` and `y.width`, which the marks carry.
+    x_slot_stride: Const<i32>,
+    x_row_stride: Const<i32>,
+    slots_per_row: Const<i32>,
+    expert_ids: In<Tensor<i32>>) -> Result<(), Refusal> {
+    let biases = ctx.absent()?;
+    let in_vec_size = x.width;
+    let out_vec_size = y.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMV_FILE, "mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4").apply(Grid::of(routed_qmv_grid(rows, out_vec_size, *slots_per_row)?, SIMD_PAIR)),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            x.v(),
-            y.v(),
-            in_vec_size.v(),
-            out_vec_size.v(),
-            bias.v(),
-            expert_ids.v(),
-            x_slot_stride.v(),
-            x_row_stride.v(),
-            slots_per_row.v(),
+            w.arg(),
+            scales.arg(),
+            biases,
+            x.arg(),
+            y.arg(),
+            in_vec_size.arg(),
+            out_vec_size.arg(),
+            bias.arg(),
+            expert_ids.arg(),
+            x_slot_stride.arg(),
+            x_row_stride.arg(),
+            slots_per_row.arg(),
         ],
     )
 }
@@ -1005,45 +1004,40 @@ pub fn mxfp4_qmv_routed_bias(
 /// The instantiation is checked FIRST, as `ssm.rs`'s scan checks its tiling:
 /// an entrypoint Metal has no `[[host_name]]` for makes `newFunctionWithName:`
 /// return nil at run time, inside a fire, after the plan was accepted.
+#[routine]
 pub fn qmm_t_routed(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    x: InSlot<0, Buf>,
-    y: OutSlot<0, BufMut>,
-    pad: InSlot<1, Buf>,
-    tile_expert: InSlot<2, Buf>,
-    k: Param<0, i32>,
-    n: Param<1, i32>,
-    rows: Ask<keys::Rows, i32>,
-    group: Ask<keys::QuantGroup, i32>,
-    bits: Ask<keys::QuantBits, i32>,
-    tile_m: Ask<keys::TileM, i32>,
-    tile_n: Ask<keys::TileN, i32>,
-) -> Result<(), Refusal> {
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    x: In<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>,
+    pad: In<Tensor<bf16>>,
+    tile_expert: In<Tensor<i32>>,
+    group: Const<i32>,
+    bits: Const<i32>,
+    tile_m: Const<i32>,
+    tile_n: Const<i32>) -> Result<(), Refusal> {
+    let k = x.width;
+    let n = y.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
     let point = affine_qmm_point(*group, *bits, *tile_m, *tile_n)?;
-    ctx.dispatch(
-        Fire {
-            entrypoint: AFFINE_QMM[point],
-            file: QMM_FILE,
-            lanes: routed_qmm_grid(*rows, *n, *tile_m, *tile_n)?,
-            group: QMM_GROUP,
-        },
+    ctx.fire(
+        Fire::at(QMM_FILE, AFFINE_QMM[point]).apply(Grid::of(routed_qmm_grid(rows, n, *tile_m, *tile_n)?, QMM_GROUP)),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            x.v(),
-            y.v(),
-            k.v(),
-            n.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            tile_expert.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            x.arg(),
+            y.arg(),
+            k.arg(),
+            n.arg(),
+            pad.arg(),
+            pad.arg(),
+            pad.arg(),
+            pad.arg(),
+            pad.arg(),
+            tile_expert.arg(),
         ],
     )
 }
@@ -1058,43 +1052,38 @@ pub fn qmm_t_routed(
 /// # Errors
 ///
 /// [`Refusal::Narrow`] from [`tile_point`], and see [`routed_qmm_grid`].
+#[routine]
 pub fn qmm_t_routed_fp16(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    x: InSlot<0, Buf>,
-    y: OutSlot<0, BufMut>,
-    pad: InSlot<1, Buf>,
-    tile_expert: InSlot<2, Buf>,
-    k: Param<0, i32>,
-    n: Param<1, i32>,
-    rows: Ask<keys::Rows, i32>,
-    tile_m: Ask<keys::TileM, i32>,
-    tile_n: Ask<keys::TileN, i32>,
-) -> Result<(), Refusal> {
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    x: In<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>,
+    pad: In<Tensor<bf16>>,
+    tile_expert: In<Tensor<i32>>,
+    tile_m: Const<i32>,
+    tile_n: Const<i32>) -> Result<(), Refusal> {
+    let k = x.width;
+    let n = y.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
     let point = tile_point(*tile_m, *tile_n)?;
-    ctx.dispatch(
-        Fire {
-            entrypoint: FP16_QMM[point],
-            file: QMM_FILE,
-            lanes: routed_qmm_grid(*rows, *n, *tile_m, *tile_n)?,
-            group: QMM_GROUP,
-        },
+    ctx.fire(
+        Fire::at(QMM_FILE, FP16_QMM[point]).apply(Grid::of(routed_qmm_grid(rows, n, *tile_m, *tile_n)?, QMM_GROUP)),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            x.v(),
-            y.v(),
-            k.v(),
-            n.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            tile_expert.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            x.arg(),
+            y.arg(),
+            k.arg(),
+            n.arg(),
+            pad.arg(),
+            pad.arg(),
+            pad.arg(),
+            pad.arg(),
+            pad.arg(),
+            tile_expert.arg(),
         ],
     )
 }
@@ -1109,43 +1098,42 @@ pub fn qmm_t_routed_fp16(
 /// # Errors
 ///
 /// [`Refusal::Narrow`] from [`tile_point`], and see [`routed_qmm_grid`].
+#[routine]
 pub fn mxfp4_qmm_t_routed_bias(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    exponents: Weight<1, Buf>,
-    pad: InSlot<1, Buf>,
-    x: InSlot<0, Buf>,
-    y: OutSlot<0, BufMut>,
-    bias: Weight<2, Buf>,
-    tile_expert: InSlot<2, Buf>,
-    k: Param<0, i32>,
-    n: Param<1, i32>,
-    rows: Ask<keys::Rows, i32>,
-    tile_m: Ask<keys::TileM, i32>,
-    tile_n: Ask<keys::TileN, i32>,
-) -> Result<(), Refusal> {
+    w: Const<Tensor<u32>>,
+    exponents: Const<Tensor<u8>>,
+    // THE ORDER IS THE SLOT: `x` is the statement's input 0, `pad` its
+    // input 1 and `tile_expert` its input 2. `InSlot<0, _>`/`InSlot<1, _>`
+    // used to say that against the declaration order; the marks say it by
+    // sitting in it.
+    x: In<Tensor<bf16>>,
+    pad: In<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>,
+    bias: Const<Tensor<bf16>>,
+    tile_expert: In<Tensor<i32>>,
+    tile_m: Const<i32>,
+    tile_n: Const<i32>) -> Result<(), Refusal> {
+    let k = pad.width;
+    let n = y.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
     let point = tile_point(*tile_m, *tile_n)?;
-    ctx.dispatch(
-        Fire {
-            entrypoint: MXFP4_QMM[point],
-            file: QMM_FILE,
-            lanes: routed_qmm_grid(*rows, *n, *tile_m, *tile_n)?,
-            group: QMM_GROUP,
-        },
+    ctx.fire(
+        Fire::at(QMM_FILE, MXFP4_QMM[point]).apply(Grid::of(routed_qmm_grid(rows, n, *tile_m, *tile_n)?, QMM_GROUP)),
         &[
-            w.v(),
-            exponents.v(),
-            pad.v(),
-            x.v(),
-            y.v(),
-            k.v(),
-            n.v(),
-            bias.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            tile_expert.v(),
+            w.arg(),
+            exponents.arg(),
+            pad.arg(),
+            x.arg(),
+            y.arg(),
+            k.arg(),
+            n.arg(),
+            bias.arg(),
+            pad.arg(),
+            pad.arg(),
+            pad.arg(),
+            pad.arg(),
+            tile_expert.arg(),
         ],
     )
 }
@@ -1162,39 +1150,85 @@ const ROUTE_FILE: &str = "moe/route.metal";
 const QMV_FILE: &str = "quant/qmv.metal";
 const QMM_FILE: &str = "quant/qmm_t.metal";
 
-/// The family, in the order the rows above state it.
-pub static ROUTINES: &[Routine] = &[
-    crate::routine!(combine_sorted),
-    crate::routine!(route_gather),
-    crate::routine!(route_sort),
-    crate::routine!(mxfp4_qmm_t_routed_bias),
-    crate::routine!(mxfp4_qmv_routed_bias),
-    crate::routine!(qmm_t_routed),
-    crate::routine!(qmm_t_routed_fp16),
-    crate::routine!(qmv_routed),
-    crate::routine!(qmv_routed_bias),
-    crate::routine!(router_topk),
-    crate::routine!(router_topk_scaled),
-    crate::routine!(shared_expert_combine),
-    crate::routine!(shared_expert_combine_strided),
-];
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routine::{ArgValue, Encode};
-    use core::cell::RefCell;
+    use crate::routine::{ArgValue, Const, Encode, Tensor};
+    use core::cell::{Cell, RefCell};
 
     /// One recorded dispatch: the fire, and the argument list.
     type Call = (Fire, Vec<ArgValue>);
 
-    /// An `Encode` that remembers what it was asked to do.
-    #[derive(Default)]
-    struct Seen(RefCell<Vec<Call>>);
+    /// An `Encode` that remembers what it was asked to do, and answers the
+    /// three facts this file's TESTED bodies ask for: the staged scalar
+    /// block every one of them but `qmm_t_routed`/`mxfp4_qmm_t_routed_bias`
+    /// takes with `ctx.params()`, `router_topk`'s unread per-expert scale
+    /// with `ctx.absent()`, and `Rows` -- which `router_topk`, the gather,
+    /// the combine and both routed GEMMs all ask under that one name whether
+    /// the caller thinks of it as a row count, a padded stack, or a fire's
+    /// own token count.
+    struct Seen {
+        calls: RefCell<Vec<Call>>,
+        params_handle: Cell<u32>,
+        /// THE STATEMENT\'S SCALAR RUN, for a body that reads a word by
+        /// index. Empty means "4096 at every slot", which is a plausible
+        /// stride for the rows these tests build; a case that means a
+        /// particular tiling or split count sets its own.
+        words: RefCell<Vec<i32>>,
+        absent_handle: Cell<u32>,
+        rows: Cell<i32>,
+        n_experts: Cell<i32>,
+    }
+
+    impl Default for Seen {
+        fn default() -> Self {
+            Self {
+                calls: RefCell::default(),
+                params_handle: Cell::new(800),
+                words: RefCell::default(),
+                absent_handle: Cell::new(900),
+                rows: Cell::new(4),
+                n_experts: Cell::new(60),
+            }
+        }
+    }
 
     impl Encode for Seen {
-        fn dispatch(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
-            self.0.borrow_mut().push((fire, args.to_vec()));
+        fn resolve(&self, _ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
+            use kernels::keys::Fact;
+            // THE STATEMENT'S OWN SCALARS, which a body reads by index when its
+            // params run is a struct and no `Const` mark can name a word inside
+            // it -- see `Asks::param`. The probe answers a number that is
+            // plausible for every reader: a stride wide enough for the rows
+            // these tests build, and a positive tiling.
+            if let kernels::Source::Slot(kernels::Kind::Param, n) = source {
+                return Ok(ArgValue::I32(
+                    self.words.borrow().get(usize::from(n)).copied().unwrap_or(4096),
+                ));
+            }
+            if source == kernels::Source::Slot(kernels::Kind::Params, 0) {
+                return Ok(ArgValue::Buffer(self.params_handle.get()));
+            }
+            if source == kernels::Source::Lit(kernels::Lit::Null) {
+                return Ok(ArgValue::Buffer(self.absent_handle.get()));
+            }
+            // The geometry these bodies read now that their params run is a
+            // STRUCT and no slot in it is theirs to take.
+            if source == <keys::NumExperts as Fact>::SOURCE {
+                return Ok(ArgValue::I32(self.n_experts.get()));
+            }
+            if source == <keys::Rows as Fact>::SOURCE {
+                return Ok(ArgValue::I32(self.rows.get()));
+            }
+            // Anything else is refused: a probe that invented an answer to a
+            // fact it does not know would let a body pass under test while
+            // the same fact went unanswered on a real driver.
+            Err(Refusal::Unstated { what: "a fact this probe does not answer" })
+        }
+
+        fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
+            self.calls.borrow_mut().push((fire, args.to_vec()));
             Ok(())
         }
     }
@@ -1209,43 +1243,36 @@ mod tests {
     #[test]
     fn a_routed_gemm_pads_every_slot_its_entrypoint_leaves_empty() {
         let seen = Seen::default();
-        let pad = Buf(99);
+        seen.rows.set(32);
+        let pad = Tensor::<bf16>::new(99);
         qmm_t_routed(
             &seen,
-            Weight::new(Buf(1)),
-            Weight::new(Buf(2)),
-            Weight::new(Buf(3)),
-            InSlot::new(Buf(4)),
-            OutSlot::new(BufMut(5)),
-            InSlot::new(pad),
-            InSlot::new(Buf(6)),
-            Param::new(2048),
-            Param::new(64),
-            Ask::new(32),
-            Ask::new(64),
-            Ask::new(4),
-            Ask::new(32),
-            Ask::new(32),
-        )
+            Const::new(Tensor::<u32>::new(1)),
+            Const::new(Tensor::<bf16>::new(2)),
+            Const::new(Tensor::<bf16>::new(3)),
+            In::new(Tensor::<bf16>::new(4)),
+            Out { ptr: Tensor::<bf16>::new(5), rows: 0, width: 32 },
+            In::new(pad),
+            In::new(Tensor::<i32>::new(6)),
+            Const::new(64),
+            Const::new(4),
+            Const::new(32),
+            Const::new(32))
         .expect("a launch");
         mxfp4_qmm_t_routed_bias(
             &seen,
-            Weight::new(Buf(1)),
-            Weight::new(Buf(2)),
-            InSlot::new(pad),
-            InSlot::new(Buf(4)),
-            OutSlot::new(BufMut(5)),
-            Weight::new(Buf(7)),
-            InSlot::new(Buf(6)),
-            Param::new(2048),
-            Param::new(64),
-            Ask::new(32),
-            Ask::new(32),
-            Ask::new(32),
-        )
+            Const::new(Tensor::<u32>::new(1)),
+            Const::new(Tensor::<u8>::new(2)),
+            In::new(Tensor::<bf16>::new(4)),
+            In::new(pad),
+            Out { ptr: Tensor::<bf16>::new(5), rows: 0, width: 32 },
+            Const::new(Tensor::<bf16>::new(7)),
+            In::new(Tensor::<i32>::new(6)),
+            Const::new(32),
+            Const::new(32))
         .expect("a launch");
 
-        let calls = seen.0.borrow();
+        let calls = seen.calls.borrow();
         for (fire, args) in calls.iter() {
             assert_eq!(
                 args.len(),
@@ -1333,18 +1360,14 @@ mod tests {
     #[test]
     fn the_router_rounds_its_threadgroup_to_a_whole_simdgroup() {
         let seen = Seen::default();
+        seen.rows.set(7);
         router_topk(
             &seen,
-            InSlot::new(Buf(1)),
-            OutSlot::new(BufMut(2)),
-            OutSlot::new(BufMut(3)),
-            Block::new(Buf(4)),
-            Null::new(Env(Buf(5))),
-            Ask::new(60),
-            Ask::new(7),
-        )
+            In::new(Tensor::<bf16>::new(1)),
+            Out::new(Tensor::<i32>::new(2)),
+            Out::new(Tensor::<bf16>::new(3)))
         .expect("a launch");
-        let calls = seen.0.borrow();
+        let calls = seen.calls.borrow();
         let (fire, args) = &calls[0];
         assert_eq!(fire.group, [64, 1, 1], "60 experts is two whole simdgroups");
         assert_eq!(fire.lanes, [64, 7, 1], "and a threadgroup per row");
@@ -1367,16 +1390,13 @@ mod tests {
         let seen = Seen::default();
         route_sort(
             &seen,
-            InSlot::new(Buf(1)),
-            OutSlot::new(BufMut(2)),
-            OutSlot::new(BufMut(3)),
-            OutSlot::new(BufMut(4)),
-            Block::new(Buf(5)),
-            OutSlot::new(BufMut(6)),
-            Ask::new(128),
-        )
+            In::new(Tensor::<i32>::new(1)),
+            Out::new(Tensor::<i32>::new(2)),
+            Out::new(Tensor::<i32>::new(3)),
+            Out::new(Tensor::<i32>::new(4)),
+            Out::new(Tensor::<i32>::new(6)))
         .expect("a launch");
-        let calls = seen.0.borrow();
+        let calls = seen.calls.borrow();
         let (fire, args) = &calls[0];
         assert_eq!(
             fire.lanes, fire.group,
@@ -1393,20 +1413,22 @@ mod tests {
     #[test]
     fn the_gather_and_the_combine_state_two_different_row_counts() {
         let seen = Seen::default();
-        route_gather(&seen, InSlot::new(Buf(1)), OutSlot::new(BufMut(2)), InSlot::new(Buf(3)), Block::new(Buf(4)), Ask::new(2048), ParamOr::new(64))
-            .expect("a launch");
+        seen.rows.set(64);
+        route_gather(
+            &seen,
+            In { ptr: Tensor::<bf16>::new(1), rows: 0, width: 2048 },
+            Out::new(Tensor::<bf16>::new(2)),
+            In::new(Tensor::<i32>::new(3)))
+        .expect("a launch");
+        seen.rows.set(16);
         combine_sorted(
             &seen,
-            InSlot::new(Buf(1)),
-            InSlot::new(Buf(2)),
-            OutSlot::new(BufMut(3)),
-            Block::new(Buf(4)),
-            InSlot::new(Buf(5)),
-            Ask::new(2048),
-            Ask::new(16),
-        )
+            In { ptr: Tensor::<bf16>::new(1), rows: 0, width: 2048 },
+            In::new(Tensor::<bf16>::new(2)),
+            Out::new(Tensor::<bf16>::new(3)),
+            In::new(Tensor::<i32>::new(5)))
         .expect("a launch");
-        let calls = seen.0.borrow();
+        let calls = seen.calls.borrow();
         assert_eq!(calls[0].0.lanes, [2048, 64, 1], "the padded stack");
         assert_eq!(calls[1].0.lanes, [2048, 16, 1], "the fire's own tokens");
         assert_eq!(calls[0].0.group, [256, 1, 1]);

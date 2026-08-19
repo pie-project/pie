@@ -4268,7 +4268,10 @@
         11
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "dest": [
+        12
+      ]
     },
     {
       "kind": {
@@ -4288,7 +4291,10 @@
         11
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "dest": [
+        12
+      ]
     },
     {
       "kind": {
@@ -4308,7 +4314,10 @@
         11
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "dest": [
+        12
+      ]
     },
     {
       "kind": {
@@ -4592,7 +4601,10 @@
         29
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "dest": [
+        30
+      ]
     },
     {
       "kind": {
@@ -4612,7 +4624,10 @@
         29
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "dest": [
+        30
+      ]
     },
     {
       "kind": {
@@ -4632,7 +4647,10 @@
         29
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "dest": [
+        30
+      ]
     },
     {
       "kind": {
@@ -4916,7 +4934,10 @@
         47
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "dest": [
+        48
+      ]
     },
     {
       "kind": {
@@ -4936,7 +4957,10 @@
         47
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "dest": [
+        48
+      ]
     },
     {
       "kind": {
@@ -4956,7 +4980,10 @@
         47
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "dest": [
+        48
+      ]
     },
     {
       "kind": {
@@ -5258,6 +5285,20 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 256
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
@@ -5265,7 +5306,8 @@
             "layer": 3
           },
           "params": [
-            4294967295
+            0,
+            1031798784
           ]
         }
       },
@@ -5555,7 +5597,10 @@
         82
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "dest": [
+        83
+      ]
     },
     {
       "kind": {
@@ -5575,7 +5620,10 @@
         82
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "dest": [
+        83
+      ]
     },
     {
       "kind": {
@@ -5595,7 +5643,10 @@
         82
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "dest": [
+        83
+      ]
     },
     {
       "kind": {
@@ -5879,7 +5930,10 @@
         100
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "dest": [
+        101
+      ]
     },
     {
       "kind": {
@@ -5899,7 +5953,10 @@
         100
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "dest": [
+        101
+      ]
     },
     {
       "kind": {
@@ -5919,7 +5976,10 @@
         100
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "dest": [
+        101
+      ]
     },
     {
       "kind": {
@@ -6203,7 +6263,10 @@
         118
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "dest": [
+        119
+      ]
     },
     {
       "kind": {
@@ -6223,7 +6286,10 @@
         118
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "dest": [
+        119
+      ]
     },
     {
       "kind": {
@@ -6243,7 +6309,10 @@
         118
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "dest": [
+        119
+      ]
     },
     {
       "kind": {
@@ -6545,6 +6614,20 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 256
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
@@ -6552,7 +6635,8 @@
             "layer": 7
           },
           "params": [
-            4294967295
+            0,
+            1031798784
           ]
         }
       },
@@ -6842,7 +6926,10 @@
         153
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "dest": [
+        154
+      ]
     },
     {
       "kind": {
@@ -6862,7 +6949,10 @@
         153
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "dest": [
+        154
+      ]
     },
     {
       "kind": {
@@ -6882,7 +6972,10 @@
         153
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "dest": [
+        154
+      ]
     },
     {
       "kind": {
@@ -7166,7 +7259,10 @@
         171
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "dest": [
+        172
+      ]
     },
     {
       "kind": {
@@ -7186,7 +7282,10 @@
         171
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "dest": [
+        172
+      ]
     },
     {
       "kind": {
@@ -7206,7 +7305,10 @@
         171
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "dest": [
+        172
+      ]
     },
     {
       "kind": {
@@ -7490,7 +7592,10 @@
         189
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "dest": [
+        190
+      ]
     },
     {
       "kind": {
@@ -7510,7 +7615,10 @@
         189
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "dest": [
+        190
+      ]
     },
     {
       "kind": {
@@ -7530,7 +7638,10 @@
         189
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "dest": [
+        190
+      ]
     },
     {
       "kind": {
@@ -7832,6 +7943,20 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 256
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
@@ -7839,7 +7964,8 @@
             "layer": 11
           },
           "params": [
-            4294967295
+            0,
+            1031798784
           ]
         }
       },
@@ -8129,7 +8255,10 @@
         224
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "dest": [
+        225
+      ]
     },
     {
       "kind": {
@@ -8149,7 +8278,10 @@
         224
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "dest": [
+        225
+      ]
     },
     {
       "kind": {
@@ -8169,7 +8301,10 @@
         224
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "dest": [
+        225
+      ]
     },
     {
       "kind": {
@@ -8453,7 +8588,10 @@
         242
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "dest": [
+        243
+      ]
     },
     {
       "kind": {
@@ -8473,7 +8611,10 @@
         242
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "dest": [
+        243
+      ]
     },
     {
       "kind": {
@@ -8493,7 +8634,10 @@
         242
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "dest": [
+        243
+      ]
     },
     {
       "kind": {
@@ -8777,7 +8921,10 @@
         260
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "dest": [
+        261
+      ]
     },
     {
       "kind": {
@@ -8797,7 +8944,10 @@
         260
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "dest": [
+        261
+      ]
     },
     {
       "kind": {
@@ -8817,7 +8967,10 @@
         260
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "dest": [
+        261
+      ]
     },
     {
       "kind": {
@@ -9119,6 +9272,20 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 256
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
@@ -9126,7 +9293,8 @@
             "layer": 15
           },
           "params": [
-            4294967295
+            0,
+            1031798784
           ]
         }
       },
@@ -9416,7 +9584,10 @@
         295
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "dest": [
+        296
+      ]
     },
     {
       "kind": {
@@ -9436,7 +9607,10 @@
         295
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "dest": [
+        296
+      ]
     },
     {
       "kind": {
@@ -9456,7 +9630,10 @@
         295
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "dest": [
+        296
+      ]
     },
     {
       "kind": {
@@ -9740,7 +9917,10 @@
         313
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "dest": [
+        314
+      ]
     },
     {
       "kind": {
@@ -9760,7 +9940,10 @@
         313
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "dest": [
+        314
+      ]
     },
     {
       "kind": {
@@ -9780,7 +9963,10 @@
         313
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "dest": [
+        314
+      ]
     },
     {
       "kind": {
@@ -10064,7 +10250,10 @@
         331
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "dest": [
+        332
+      ]
     },
     {
       "kind": {
@@ -10084,7 +10273,10 @@
         331
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "dest": [
+        332
+      ]
     },
     {
       "kind": {
@@ -10104,7 +10296,10 @@
         331
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "dest": [
+        332
+      ]
     },
     {
       "kind": {
@@ -10406,6 +10601,20 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 256
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
@@ -10413,7 +10622,8 @@
             "layer": 19
           },
           "params": [
-            4294967295
+            0,
+            1031798784
           ]
         }
       },
@@ -10703,7 +10913,10 @@
         366
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "dest": [
+        367
+      ]
     },
     {
       "kind": {
@@ -10723,7 +10936,10 @@
         366
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "dest": [
+        367
+      ]
     },
     {
       "kind": {
@@ -10743,7 +10959,10 @@
         366
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "dest": [
+        367
+      ]
     },
     {
       "kind": {
@@ -11027,7 +11246,10 @@
         384
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "dest": [
+        385
+      ]
     },
     {
       "kind": {
@@ -11047,7 +11269,10 @@
         384
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "dest": [
+        385
+      ]
     },
     {
       "kind": {
@@ -11067,7 +11292,10 @@
         384
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "dest": [
+        385
+      ]
     },
     {
       "kind": {
@@ -11351,7 +11579,10 @@
         402
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "dest": [
+        403
+      ]
     },
     {
       "kind": {
@@ -11371,7 +11602,10 @@
         402
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "dest": [
+        403
+      ]
     },
     {
       "kind": {
@@ -11391,7 +11625,10 @@
         402
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "dest": [
+        403
+      ]
     },
     {
       "kind": {
@@ -11693,6 +11930,20 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 256
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_prefill_bf16",
           "state": {
@@ -11700,7 +11951,8 @@
             "layer": 23
           },
           "params": [
-            4294967295
+            0,
+            1031798784
           ]
         }
       },
@@ -11909,7 +12161,7 @@
     {
       "seam": "attn.out",
       "layer": 3,
-      "op": 72,
+      "op": 73,
       "values": [
         63
       ]
@@ -11917,7 +12169,7 @@
     {
       "seam": "attn.q",
       "layer": 4,
-      "op": 85,
+      "op": 86,
       "values": [
         78
       ]
@@ -11925,7 +12177,7 @@
     {
       "seam": "attn.out",
       "layer": 4,
-      "op": 90,
+      "op": 91,
       "values": [
         78
       ]
@@ -11933,7 +12185,7 @@
     {
       "seam": "attn.q",
       "layer": 5,
-      "op": 104,
+      "op": 105,
       "values": [
         96
       ]
@@ -11941,7 +12193,7 @@
     {
       "seam": "attn.out",
       "layer": 5,
-      "op": 109,
+      "op": 110,
       "values": [
         96
       ]
@@ -11949,7 +12201,7 @@
     {
       "seam": "attn.q",
       "layer": 6,
-      "op": 123,
+      "op": 124,
       "values": [
         114
       ]
@@ -11957,7 +12209,7 @@
     {
       "seam": "attn.out",
       "layer": 6,
-      "op": 128,
+      "op": 129,
       "values": [
         114
       ]
@@ -11965,7 +12217,7 @@
     {
       "seam": "attn.q",
       "layer": 7,
-      "op": 143,
+      "op": 144,
       "values": [
         134
       ]
@@ -11973,7 +12225,7 @@
     {
       "seam": "attn.out",
       "layer": 7,
-      "op": 149,
+      "op": 151,
       "values": [
         134
       ]
@@ -11981,7 +12233,7 @@
     {
       "seam": "attn.q",
       "layer": 8,
-      "op": 162,
+      "op": 164,
       "values": [
         149
       ]
@@ -11989,7 +12241,7 @@
     {
       "seam": "attn.out",
       "layer": 8,
-      "op": 167,
+      "op": 169,
       "values": [
         149
       ]
@@ -11997,7 +12249,7 @@
     {
       "seam": "attn.q",
       "layer": 9,
-      "op": 181,
+      "op": 183,
       "values": [
         167
       ]
@@ -12005,7 +12257,7 @@
     {
       "seam": "attn.out",
       "layer": 9,
-      "op": 186,
+      "op": 188,
       "values": [
         167
       ]
@@ -12013,7 +12265,7 @@
     {
       "seam": "attn.q",
       "layer": 10,
-      "op": 200,
+      "op": 202,
       "values": [
         185
       ]
@@ -12021,7 +12273,7 @@
     {
       "seam": "attn.out",
       "layer": 10,
-      "op": 205,
+      "op": 207,
       "values": [
         185
       ]
@@ -12029,7 +12281,7 @@
     {
       "seam": "attn.q",
       "layer": 11,
-      "op": 220,
+      "op": 222,
       "values": [
         205
       ]
@@ -12037,7 +12289,7 @@
     {
       "seam": "attn.out",
       "layer": 11,
-      "op": 226,
+      "op": 229,
       "values": [
         205
       ]
@@ -12045,7 +12297,7 @@
     {
       "seam": "attn.q",
       "layer": 12,
-      "op": 239,
+      "op": 242,
       "values": [
         220
       ]
@@ -12053,7 +12305,7 @@
     {
       "seam": "attn.out",
       "layer": 12,
-      "op": 244,
+      "op": 247,
       "values": [
         220
       ]
@@ -12061,7 +12313,7 @@
     {
       "seam": "attn.q",
       "layer": 13,
-      "op": 258,
+      "op": 261,
       "values": [
         238
       ]
@@ -12069,7 +12321,7 @@
     {
       "seam": "attn.out",
       "layer": 13,
-      "op": 263,
+      "op": 266,
       "values": [
         238
       ]
@@ -12077,7 +12329,7 @@
     {
       "seam": "attn.q",
       "layer": 14,
-      "op": 277,
+      "op": 280,
       "values": [
         256
       ]
@@ -12085,7 +12337,7 @@
     {
       "seam": "attn.out",
       "layer": 14,
-      "op": 282,
+      "op": 285,
       "values": [
         256
       ]
@@ -12093,7 +12345,7 @@
     {
       "seam": "attn.q",
       "layer": 15,
-      "op": 297,
+      "op": 300,
       "values": [
         276
       ]
@@ -12101,7 +12353,7 @@
     {
       "seam": "attn.out",
       "layer": 15,
-      "op": 303,
+      "op": 307,
       "values": [
         276
       ]
@@ -12109,7 +12361,7 @@
     {
       "seam": "attn.q",
       "layer": 16,
-      "op": 316,
+      "op": 320,
       "values": [
         291
       ]
@@ -12117,7 +12369,7 @@
     {
       "seam": "attn.out",
       "layer": 16,
-      "op": 321,
+      "op": 325,
       "values": [
         291
       ]
@@ -12125,7 +12377,7 @@
     {
       "seam": "attn.q",
       "layer": 17,
-      "op": 335,
+      "op": 339,
       "values": [
         309
       ]
@@ -12133,7 +12385,7 @@
     {
       "seam": "attn.out",
       "layer": 17,
-      "op": 340,
+      "op": 344,
       "values": [
         309
       ]
@@ -12141,7 +12393,7 @@
     {
       "seam": "attn.q",
       "layer": 18,
-      "op": 354,
+      "op": 358,
       "values": [
         327
       ]
@@ -12149,7 +12401,7 @@
     {
       "seam": "attn.out",
       "layer": 18,
-      "op": 359,
+      "op": 363,
       "values": [
         327
       ]
@@ -12157,7 +12409,7 @@
     {
       "seam": "attn.q",
       "layer": 19,
-      "op": 374,
+      "op": 378,
       "values": [
         347
       ]
@@ -12165,7 +12417,7 @@
     {
       "seam": "attn.out",
       "layer": 19,
-      "op": 380,
+      "op": 385,
       "values": [
         347
       ]
@@ -12173,7 +12425,7 @@
     {
       "seam": "attn.q",
       "layer": 20,
-      "op": 393,
+      "op": 398,
       "values": [
         362
       ]
@@ -12181,7 +12433,7 @@
     {
       "seam": "attn.out",
       "layer": 20,
-      "op": 398,
+      "op": 403,
       "values": [
         362
       ]
@@ -12189,7 +12441,7 @@
     {
       "seam": "attn.q",
       "layer": 21,
-      "op": 412,
+      "op": 417,
       "values": [
         380
       ]
@@ -12197,7 +12449,7 @@
     {
       "seam": "attn.out",
       "layer": 21,
-      "op": 417,
+      "op": 422,
       "values": [
         380
       ]
@@ -12205,7 +12457,7 @@
     {
       "seam": "attn.q",
       "layer": 22,
-      "op": 431,
+      "op": 436,
       "values": [
         398
       ]
@@ -12213,7 +12465,7 @@
     {
       "seam": "attn.out",
       "layer": 22,
-      "op": 436,
+      "op": 441,
       "values": [
         398
       ]
@@ -12221,7 +12473,7 @@
     {
       "seam": "attn.q",
       "layer": 23,
-      "op": 451,
+      "op": 456,
       "values": [
         418
       ]
@@ -12229,7 +12481,7 @@
     {
       "seam": "attn.out",
       "layer": 23,
-      "op": 457,
+      "op": 463,
       "values": [
         418
       ]

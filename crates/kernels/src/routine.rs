@@ -15,12 +15,37 @@
 use crate::Derived;
 use crate::Ty;
 
+/// WHAT AN OPERAND THAT IS NOT THERE LOOKS LIKE, ASKED OF THE VALUE.
+///
+/// `Option<M>` is how a signature says an operand may be absent; this is the
+/// half only a backend's own value can answer, because nothing in this crate
+/// can look inside one. CUDA's absence is a null pointer; a handle plane's is
+/// whatever its binder mints for an operand the statement left empty.
+///
+/// Both methods default to *"this plane cannot express absence"*, which makes
+/// `Option<M>` there always `Some` — the honest reading, since a binder that
+/// cannot mint an absent value never produces one.
+///
+/// On the VALUE and not on [`Backend`] because [`Bind`] names no backend: a
+/// body re-emitting a `None` has only the value type to ask.
+pub trait Absent: Sized {
+    /// Whether this is the absent value.
+    fn is_absent(&self) -> bool {
+        false
+    }
+
+    /// The absent value, where this plane has one.
+    fn absent() -> Option<Self> {
+        None
+    }
+}
+
 /// One backend's two concrete types, so the machinery can be written once.
 ///
 /// The implementor is a marker: it is never constructed and carries no state.
 pub trait Backend: Copy + 'static {
     /// A value bound to one argument — the backend's `ArgValue`.
-    type Value: Copy;
+    type Value: Copy + Absent;
     /// What a routine body launches through.
     ///
     /// `?Sized`, because it is only ever named behind a reference and a
@@ -32,17 +57,35 @@ pub trait Backend: Copy + 'static {
     /// that crate to take a `wgpu` dependency it exists not to have.
     type Ctx<'a>: ?Sized;
 
-    /// The shape the value at `at` carries, if it carries one.
+    /// The shape this value carries, if it carries one.
     ///
     /// On the backend and not on [`Arg`] because nothing in this crate can
     /// look inside `Self::Value` — it is an associated type and `kernels`
     /// names no backend.
     ///
+    /// # BINDING ADDRESSES ALONE IS THE DEFAULT
+    ///
+    /// A region is `{address, rows, width}`, and a plane whose bound value is
+    /// an address alone has no shape to give: refusing is the whole of its
+    /// correct answer. The handle planes carry the launch's two widths as
+    /// `Facts` fields, a per-LAUNCH statement rather than a per-operand one,
+    /// which is a better place for them. Stating that per plane only produced
+    /// three prose variants of one fact — and a required method every plane
+    /// had to answer made *"which backend is this"* readable off the answer.
+    ///
+    /// The refusal stays unreachable until a table spells a fat `In<N, _>`,
+    /// and the first that does finds out at its first fire. Only a plane that
+    /// mints region-shaped values overrides.
+    ///
     /// # Errors
     ///
     /// [`Refusal::Kind`] when the value is not region-shaped —
-    /// [`Refusal::Unstated`] when this backend has no region shape at all.
-    fn region(value: &Self::Value, at: usize) -> Result<Extent, Refusal>;
+    /// [`Refusal::Absent`] when this backend has no region shape at all.
+    fn region(value: &Self::Value) -> Result<Extent, Refusal> {
+        let _ = value;
+        Err(Refusal::Absent { what: "a region's shape: this binder binds addresses only" })
+    }
+
 }
 
 /// How many rows a region has and how wide each one is, in elements.
@@ -79,7 +122,6 @@ where
     i32: Arg<B>,
 {
     const TY: Ty = <i32 as Arg<B>>::TY;
-    const PROV: Provenance = <i32 as Arg<B>>::PROV;
     const SPELLING: &'static str = <i32 as Arg<B>>::SPELLING;
 
     fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
@@ -161,50 +203,20 @@ const _: () = {
     assert!(none.row_pitch().0 == 0);
 };
 
-/// Who supplies an argument.
-///
-/// The distinction is not "who owns the memory" but "who can be asked for it
-/// at trace time": a [`Provenance::Trace`] argument is stated by the program
-/// being run, and an [`Provenance::Env`] one is a fact about the execution
-/// environment — a position vector, a plan, a workspace — which the program
-/// never names and the runtime always has.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Provenance {
-    /// The statement supplies it.
-    Trace,
-    /// The execution environment supplies it.
-    Env,
-    /// The statement supplies it IF it states one, and the environment has a
-    /// standing answer if it does not.
-    ///
-    /// `Source::Or`'s spelling in a signature, and a third case rather than
-    /// a shade of the other two: FA2's `o` is the statement's result on a text
-    /// that names one and the guard-owned arena on a text that does not, and
-    /// the SAME symbol serves both. A rule reading this column counts an
-    /// `Either` argument as permitted, not required.
-    ///
-    Either,
-}
-
-/// Which SIDE of a statement an argument sits on — the operand question,
-/// asked separately from the direction question.
-///
-/// The wrapper says which OPERAND, the pointer says which DIRECTION the kernel
-/// drives it, and the two are independent facts. `In<0, *mut T>` occupies
-/// input slot 0 and is written through; a rule partitioning by pointer
-/// mutability reads it as a result the statement forgot to declare, which it
-/// is not. Three routines spell that shape. The arity rule reads this SLOT for
-/// anything a position wrapper claims and falls back to [`crate::Ty::binds`]
-/// otherwise.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Side {
-    /// No position wrapper claimed it — ask the type which way it binds.
-    OfType,
-    /// An operand the statement PLACES: an input or a weight.
-    Placed,
-    /// A result the statement DECLARES.
-    Declared,
-}
+// `Provenance` AND `Side` STOOD HERE AND ARE BOTH DELETED.
+//
+// `Provenance` answered *"who supplies this argument"* — the statement, the
+// environment, or either. With `Env` out of the parameter list EVERY parameter
+// is the statement's, so the column had one value at every row and
+// `arity_problem` had nothing left to filter.
+//
+// `Side` answered *"which side of the statement does it sit on"* — placed,
+// declared, or ask the type. The MARK says: `In` and `Const` place, `Out` and
+// `InOut` declare, and there is no third case now that a parameter cannot be
+// unmarked. It was a column on every routine restating what the mark beside it
+// already carried, and `Source` — which every reader already walks — carries
+// the same fact as `Slot(Kind::In, _)`, `Slot(Kind::Out, _)`,
+// `Slot(Kind::Weight, _)`, `Slot(Kind::Param, _)` and `Alias(_, _)`.
 
 /// Why a routine did not launch.
 ///
@@ -323,23 +335,21 @@ impl core::error::Error for Refusal {}
 pub trait Arg<B: Backend>: Sized {
     /// What this argument is, in the table's vocabulary.
     const TY: Ty;
-    /// Who supplies it.
-    ///
-    /// Defaults to [`Provenance::Trace`]; only [`Env`] and [`Aux`] override
-    /// it. The position wrappers — [`In`], [`Out`], [`InOut`], [`Weight`],
-    /// [`Bank`], [`Unbound`] — forward `T::PROV`, which is what makes them
-    /// arity-inert: they answer WHERE an argument sits and nothing about who
-    /// supplies it.
-    const PROV: Provenance = Provenance::Trace;
 
     /// The question this type claims, or `None` when no type claims one.
-    const SOURCE: Option<crate::Source> = None;
-    /// Which side of the statement it sits on, when a position wrapper says.
     ///
-    /// Defaults to [`Side::OfType`] — "nothing claimed a slot, read the
-    /// type" — and is overridden by the six POSITION wrappers, which are the
-    /// only things that know. See [`Side`] for what the answer is for.
-    const SIDE: Side = Side::OfType;
+    /// A mark that claims a SLOT answers `None` here and states its
+    /// [`Arg::CLAIM`] instead: the slot's index is not a property of the type,
+    /// it is a property of where the type sits, and only the signature knows
+    /// that. [`KernelFn::SOURCES`] is where the two meet.
+    const SOURCE: Option<crate::Source> = None;
+    /// What position this mark claims, before its index is known.
+    ///
+    /// Defaults to [`Claim::Fixed`] — "this argument's source, if any, is
+    /// already settled" — and is overridden by the four marks. Since every
+    /// parameter of a columned routine IS a mark, `Fixed` is only ever the
+    /// carriers' own answer, read through the mark that wraps them.
+    const CLAIM: Claim = Claim::Fixed;
     /// How the backend's shader language spells this type, whole — the
     /// `const` and the star included.
     ///
@@ -356,278 +366,779 @@ pub trait Arg<B: Backend>: Sized {
     fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal>;
 }
 
-/// The environment supplies this argument, not the statement.
+// `Env<T, K>` AND `Keyed` STOOD HERE AND ARE DELETED.
+//
+// `Env` was the mark that named a SUPPLIER where the other four named a
+// quality, and it was the one mark that was not positional. Most of what it
+// wrapped was never the environment's: 71 keys over 936 uses are checkpoint
+// configuration fixed the moment the model is read, and they were `Env` only
+// because the statement had no channel to carry them. [`Const`] is that
+// channel.
+//
+// What genuinely varies per fire — the batch, the plan and the allocator's
+// addresses — did not need a PARAMETER, only an answer. A body asks for those
+// through [`Asks::ask`], which routes to the same `Holds::fact` the column
+// used to route to: the ANSWERING side is unchanged, only the asking side.
+//
+// With `Env` gone every parameter is positional and every mark is the same
+// kind of word, which is the whole of what this refactor is for.
+
+/// THE RUNTIME'S SIDE OF AN ASK: one value, resolved from the column's own
+/// vocabulary.
 ///
-/// A wrapper rather than a table column, so that the fact is stated exactly
-/// where the argument is — in the signature — and derives from there.
-#[derive(Clone, Copy, Debug)]
-pub struct Env<T>(pub T);
-
-impl<T> Env<T> {
-    /// The wrapped argument.
-    pub fn into_inner(self) -> T {
-        self.0
-    }
-}
-
-impl<T> core::ops::Deref for Env<T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        &self.0
-    }
-}
-
-impl<B: Backend, T: Arg<B>> Arg<B> for Env<T> {
-    const TY: Ty = T::TY;
-    const SIDE: Side = T::SIDE;
-    const PROV: Provenance = Provenance::Env;
-    const SPELLING: &'static str = T::SPELLING;
-    // Absence does not change WHICH question is asked, so the wrapper
-    // forwards rather than shadowing what it wraps.
-    const SOURCE: Option<crate::Source> = T::SOURCE;
-
-    fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-        T::unpack(value, at).map(Env)
-    }
-}
-
-/// The statement's `N`th operand: its address AND the shape it was given.
+/// The answering side of this refactor does NOT change. A driver already
+/// resolves a `(Ty, Source)` pair for every argument it binds — that is
+/// [`crate::bind::one`], and [`crate::bind::Holds::fact`] is the one method it
+/// implements to answer a [`crate::Source::Named`]. What changes is that a
+/// BODY can now ask the same question, instead of the question having to be a
+/// parameter for the column to carry it.
 ///
-/// A bare `*const T` derives `Source::In` of the next unused index, which is
-/// right until a signature puts a pointer where the counting does not expect
-/// one. AN INDEX IS A FACT, AND COUNTING IS HOW A DESIGN GUESSES ONE:
-/// `residual_add` and `geglu_tanh` have identical parameter shapes and
-/// identical `in_place` rows and need different indices, so no correction
-/// derives both.
+/// Object-safe on purpose: three of the four planes reach their driver through
+/// a `dyn` trait, so the resolver crosses as a trait object too.
+pub trait Answers<B: Backend> {
+    /// The value this `(Ty, Source)` pair binds to, for this fire.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Unstated`] when this backend answers no such fact, and
+    /// whatever the fact's own absence means otherwise.
+    fn resolve(&self, ty: Ty, source: crate::Source) -> Result<B::Value, Refusal>;
+}
+
+/// WHAT ONLY THE ENGINE'S RUNTIME CAN ANSWER, asked by the body that needs it.
+///
+/// # The rule
+///
+/// **`ask` is for what only the engine's runtime can answer.** A fact the
+/// checkpoint fixes at load time is a constant, and a constant belongs in the
+/// statement — as a [`Const`] parameter, positional like every other.
+/// `keys::HeadDim` is not asked, because a head dimension is not something
+/// this batch made; `keys::Rows` is, because two batches differ.
+///
+/// The test for anything added later: *"two fires of the same model, on the
+/// same deployment, can see different answers here"*. `Rows` passes.
+/// `KvKeys` passes — the allocator moved. `HeadDim` does not, and no amount of
+/// the driver knowing it makes it pass.
+///
+/// # Why the carrier is written at the call
+///
+/// Because a fact's `Value` is one concrete type and a plane's carrier is not.
+/// `keys::Positions` declares `*const i32`; that IS the carrier on CUDA and is
+/// meaningless on a plane that binds a handle. So the call names both, in the
+/// order `Env<T, K>` named them — the carrier first, because it is the half
+/// that is always there:
+///
+/// ```ignore
+/// let positions = ctx.ask::<Tensor<i32>, keys::Positions>()?;   // a plane's handle
+/// let rows      = ctx.ask::<i32, keys::Rows>()?;                // this batch's count
+/// ```
+///
+/// # What it costs
+///
+/// `ask` is a CALL, not a declaration, so the derived column no longer
+/// enumerates it and a driver test can no longer walk that column to ask
+/// *"does this backend answer every fact its own kernels name"*. `#[routine]`
+/// collects `ask::<_, keys::X>` out of the body instead — same fidelity as the
+/// parameter run, and it cannot drift from the calls — but it misses a fact
+/// asked inside a helper. That is a real step down from a type-system
+/// guarantee to a syntactic one, and it is accepted deliberately.
+pub trait Asks<B: Backend>: Answers<B> {
+    /// The environment's answer to `K`, in the carrier `C` this plane binds.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Unstated`] when this backend answers no such fact;
+    /// [`Refusal::Kind`] when the answer is not of `C`'s kind.
+    fn ask<C: Arg<B>, K: crate::keys::Fact>(&self) -> Result<C, Refusal> {
+        // THE KEY'S OWN SOURCE, WHICH IS NOT ALWAYS A `Named`.
+        // `keys::WindowOrNone` is `Or(Named("window_left"), Lit(-1))`, and
+        // `keys::GqaFactor` was arithmetic over two facts. Resolving the
+        // SOURCE rather than the string is what keeps a chain a chain.
+        let v = self.resolve(C::TY, <K as crate::keys::Fact>::SOURCE)?;
+        C::unpack(&v, 0)
+    }
+
+    /// The statement's whole scalar run, as the one buffer a kernel that reads
+    /// a struct takes.
+    ///
+    /// What `Env<Buf, keys::Params>` spelled at 97 signatures. It is not a
+    /// fact and never was: the block is the statement's own params run, staged
+    /// by the driver because six of this tree's shader modules read their
+    /// parameters out of a storage block rather than a push range.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Unstated`] on a plane that stages no such block — which is
+    /// CUDA, where scalars are passed one at a time.
+    fn params(&self) -> Result<B::Value, Refusal> {
+        self.resolve(Ty::Buf, crate::Source::Slot(crate::Kind::Params, 0))
+    }
+
+    /// The statement's `n`-th scalar, read as an `i32`.
+    ///
+    /// # Why a body ever reaches past its own marks
+    ///
+    /// Because a routine that forwards [`Self::params`] as a STRUCT has no
+    /// slots to spare. Its params run is the shader's own layout — read by
+    /// field, not by position — so a `Const<i32>` derived onto slot 0 reads
+    /// that struct's first word, and there is no mark that can name the
+    /// eleventh. `Param<11, i32>` said exactly this before the marks, and
+    /// `gdn_core_recurrent_prefill`'s tiling is where it still has to be said:
+    /// the body picks its compiled point from two words the SHADER also reads.
+    ///
+    /// **Not a general escape hatch.** A number a routine can take as a
+    /// `Const` should be one — the mark is what makes the arity checkable, and
+    /// `check_plan` counts marks. This is for the case where the same run
+    /// serves two readers and the other one is a struct.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Unstated`] when the statement carries no such scalar.
+    fn param(&self, n: u8) -> Result<i32, Refusal>
+    where
+        i32: Arg<B>,
+    {
+        <i32 as Arg<B>>::unpack(
+            &self.resolve(<i32 as Arg<B>>::TY, crate::Source::Slot(crate::Kind::Param, n))?,
+            usize::from(n),
+        )
+    }
+
+    /// The operand this routine deliberately leaves ABSENT.
+    ///
+    /// An argument list is positional, so an absence still occupies a cell —
+    /// which is what `Env<Buf, keys::Absent>` was for at eighteen signatures,
+    /// and `Env<*const T, keys::Unstated>` at fifty-three. Neither was a
+    /// question and neither had an answerer; both were a launcher supplying
+    /// its own null. A body says so where it says everything else about its
+    /// argument list.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Unstated`] on a plane whose binder mints no null.
+    fn absent(&self) -> Result<B::Value, Refusal> {
+        self.resolve(Ty::Buf, crate::Source::Lit(crate::Lit::Null))
+    }
+}
+
+// EVERY ANSWERER ASKS. `Asks` carries no state of its own -- it is the
+// vocabulary a body writes, over the one method a plane implements -- so
+// there is nothing for a plane to get wrong by implementing it itself.
+impl<B: Backend, T: Answers<B> + ?Sized> Asks<B> for T {}
+
+/// ONE DISPATCH, as a routine body states it — on every plane.
+///
+/// # What it replaced
+///
+/// Two entry points that carried the same four facts. CUDA's was four
+/// POSITIONAL arguments:
+///
+/// ```ignore
+/// ctx.launch("norm/rmsnorm.cuh", "::pie::norm::rmsnorm<bf16, 256>", per_row(rows), &args)
+/// ```
+///
+/// and the shader planes' was already a struct, so the difference was never
+/// in what a body knew — only in how it said it. The positional form is also
+/// the one that could go wrong quietly: `file` and `entrypoint` are both
+/// `&str`, so a swap type-checks.
+///
+/// # The two counts
+///
+/// [`Self::lanes`] is TOTAL WORK and [`Self::group`] its divisor, on every
+/// plane. CUDA bodies used to state the grid — how many BLOCKS — and the
+/// block size beside it; the same pair, counted from the other end. Stating
+/// the total and the divisor is what makes the field mean one thing
+/// everywhere: the driver divides, and `lanes / group` returns the grid the
+/// body would have written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fire {
+    /// The file the point lives in — a `.cuh`, a `.metal`, a `.wgsl`, a `.spv`.
+    ///
+    /// Stated on every plane. What it names differs with what the plane loads:
+    /// CUDA, Metal and wgpu name a SOURCE that holds many points and gets
+    /// compiled, while vulkan names the compiled ARTIFACT, because its build
+    /// emits one module per entrypoint per tier. A vulkan body composes it
+    /// from the tier its `Ctx` reports, which is how tier selection reads off
+    /// the body rather than happening behind it.
+    pub file: &'static str,
+    /// Which point in it: an entrypoint name, or on CUDA the fully qualified
+    /// template-id NVRTC is asked to lower.
+    pub entrypoint: &'static str,
+    /// The TRANSLATION UNIT's own name, where it is not the file's.
+    ///
+    /// Empty means "the file names it", which is every point but two lattices:
+    /// FA2 and XQA compile one file several ways, so a point there is reached
+    /// by a name the file does not carry. Said HERE rather than by a second
+    /// dispatch method taking a resolved root -- one such method existed, was
+    /// `unsafe`, and was the only reason three routine bodies on one plane
+    /// carried an `unsafe` block the other three planes had no counterpart
+    /// for.
+    pub unit: &'static str,
+    /// Total work in each dimension, in ELEMENTS of work.
+    ///
+    /// A body must not state a zero. `vkCmdDispatch(0, 1, 1)` is legal Vulkan
+    /// that runs nothing and reports success — the failure this surface exists
+    /// to make impossible, met twice on that backend. A body with nothing to
+    /// do returns [`Refusal::Empty`].
+    pub lanes: [u32; 3],
+    /// The divisor: threads per block, per threadgroup, per workgroup.
+    ///
+    /// `[0, 0, 0]` where the SHADER TEXT declares it and the driver recovers
+    /// it — `[numthreads]` lands in the SPIR-V as `OpExecutionMode LocalSize`,
+    /// and a body that restated it would carry a second copy of a number it
+    /// cannot see.
+    pub group: [u32; 3],
+    /// Dynamic shared memory, in bytes. Zero on a plane that has none.
+    pub smem: u32,
+    /// The launch needs every block resident at once. CUDA's only.
+    pub cooperative: bool,
+}
+
+impl Fire {
+    /// The point `entrypoint` in `file`, with nothing else stated.
+    #[must_use]
+    pub const fn at(file: &'static str, entrypoint: &'static str) -> Self {
+        Self {
+            file,
+            entrypoint,
+            unit: "",
+            lanes: [0, 0, 0],
+            group: [0, 0, 0],
+            smem: 0,
+            cooperative: false,
+        }
+    }
+
+    /// This fire, in the translation unit called `unit` rather than the one
+    /// the file names.
+    #[must_use]
+    pub const fn unit(mut self, unit: &'static str) -> Self {
+        self.unit = unit;
+        self
+    }
+
+    /// This fire, over `lanes` elements of work.
+    #[must_use]
+    pub const fn lanes(mut self, lanes: [u32; 3]) -> Self {
+        self.lanes = lanes;
+        self
+    }
+
+    /// This fire, divided `group` ways.
+    #[must_use]
+    pub const fn group(mut self, group: [u32; 3]) -> Self {
+        self.group = group;
+        self
+    }
+
+    /// This fire, with `smem` bytes of dynamic shared memory.
+    #[must_use]
+    pub const fn smem(mut self, smem: u32) -> Self {
+        self.smem = smem;
+        self
+    }
+
+    /// This fire, needing every block resident at once.
+    #[must_use]
+    pub const fn cooperative(mut self) -> Self {
+        self.cooperative = true;
+        self
+    }
+
+    /// ONE THREAD PER ELEMENT, in groups of `group`.
+    #[must_use]
+    pub const fn flat(self, n: u32, group: u32) -> Self {
+        self.lanes([n, 1, 1]).group([group, 1, 1])
+    }
+
+    /// ONE GROUP PER ROW, `group` threads wide.
+    ///
+    /// The lane count is the PRODUCT, because `lanes` is total work: a row per
+    /// group and `group` threads in it is `rows * group` elements.
+    #[must_use]
+    pub const fn per_row(self, rows: u32, group: u32) -> Self {
+        self.lanes([rows.saturating_mul(group), 1, 1]).group([group, 1, 1])
+    }
+
+    /// A grid stated as GROUPS on all three axes, with the divisor beside it.
+    ///
+    /// What a CUDA body used to write as `Launch::grid(grid, block)`. The
+    /// lanes are the componentwise product; [`Self::grid`] divides back.
+    #[must_use]
+    pub const fn groups(self, grid: [u32; 3], group: [u32; 3]) -> Self {
+        self.lanes([
+            grid[0].saturating_mul(group[0]),
+            grid[1].saturating_mul(group[1]),
+            grid[2].saturating_mul(group[2]),
+        ])
+        .group(group)
+    }
+
+    /// This fire, with a geometry a helper computed.
+    ///
+    /// The one place a plane's own grid type meets the shared one: CUDA's
+    /// families keep helpers like `elementwise(width, rows)` that return a
+    /// `Launch`, and `Launch::into_fire` feeds it here rather than making
+    /// every helper return a `Fire` it has no file or entrypoint for.
+    #[must_use]
+    pub const fn geometry(mut self, lanes: [u32; 3], group: [u32; 3], smem: u32, cooperative: bool) -> Self {
+        self.lanes = lanes;
+        self.group = group;
+        self.smem = smem;
+        self.cooperative = cooperative;
+        self
+    }
+
+    /// This fire, with a geometry the plane's own helper computed.
+    ///
+    /// The one place a backend's grid type meets the shared one. CUDA's
+    /// families keep helpers like `elementwise(width, rows)` that answer with
+    /// a `Launch`; this takes it rather than making every helper name a file
+    /// and an entrypoint it knows nothing about.
+    #[must_use]
+    pub fn apply<G: Geometry>(self, g: G) -> Self {
+        g.apply_to(self)
+    }
+
+    /// How many groups the driver will launch: `lanes / group`, rounded up.
+    ///
+    /// The grid a CUDA body used to state. Componentwise, and a zero divisor
+    /// answers the lane count unchanged — which is the shader planes' case,
+    /// where the text declares the divisor and this is not consulted.
+    #[must_use]
+    pub const fn grid(&self) -> [u32; 3] {
+        let mut out = [0u32; 3];
+        let mut i = 0;
+        while i < 3 {
+            out[i] = if self.group[i] == 0 {
+                self.lanes[i]
+            } else {
+                self.lanes[i].div_ceil(self.group[i])
+            };
+            i += 1;
+        }
+        out
+    }
+}
+
+
+
+
+
+// `Clone`/`Copy` BY HAND, BECAUSE `derive` PUTS THE BOUND ON THE PARAMETER.
+// A derived `Copy` on `In<E>` asks for `E: Copy` -- the ELEMENT -- when what
+// has to be `Copy` is the carrier the element names. `bf16` is a pointee that
+// nothing copies; `*const bf16` is.
+impl<E: Elem> Clone for In<E> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<E: Elem> Copy for In<E> {}
+
+impl<E: Elem> Clone for Out<E> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<E: Elem> Copy for Out<E> {}
+
+impl<E: Elem> Clone for InOut<E> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<E: Elem> Copy for InOut<E> {}
+
+
+/// A carrier, as the value a launch is given.
+///
+/// THE INVERSE OF [`Arg::unpack`], and one name on four planes. It was two:
+/// CUDA's `Abi::arg` and the shader planes' `Bind::v`, doing the same job
+/// under different words, so a body could be told apart by which one it
+/// called. The marks delegate through it, which is why a body writes
+/// `x.arg()` and not `x.ptr.arg()` -- a mark says which SLOT a carrier came
+/// from, which is the table's business and never the encoder's.
+pub trait Bind<V>: Copy {
+    /// This carrier, as a bound value.
+    fn arg(self) -> V;
+}
+
+// THE MARKS BIND AS THEIR CARRIERS DO, on every plane.
+impl<V, E: Elem> Bind<V> for In<E>
+where
+    E::Read: Bind<V>,
+{
+    fn arg(self) -> V {
+        self.ptr.arg()
+    }
+}
+
+/// A carrier bound the way a WRITE binds it.
+///
+/// [`Elem::Write`] is `*mut T` on CUDA and `Tensor<E>` on the shader planes,
+/// and on the shader planes it is *the same type* as [`Elem::Read`] -- one
+/// handle, one `Bind` impl. So `Out` and `InOut` binding through `Bind` alone
+/// erased the direction on exactly the planes whose value type carries it:
+/// every operand came out `ArgValue::Buffer` and none came out `BufferMut`.
+///
+/// That is not cosmetic. `driver-metal`'s `touches` reads `ArgValue::BufferMut`
+/// to learn WHICH BUFFERS A DISPATCH WRITES, so a plane that never produces one
+/// tells the driver every dispatch writes nothing -- and the hazard tracking
+/// that answer feeds is the whole of what orders one encoder's work.
+///
+/// The mark picks the trait; the trait picks the constructor. On CUDA both
+/// arrive at the same place, because there `*const T` and `*mut T` already
+/// differ.
+pub trait BindMut<V>: Copy {
+    /// This carrier, as a bound value a launch may WRITE.
+    fn arg_mut(self) -> V;
+}
+
+// A POINTER ALREADY SAYS IT. `*mut T` is not `*const T`, so CUDA's direction
+// survives `Bind` and this is the identity.
+impl<V, T> BindMut<V> for *mut T
+where
+    *mut T: Bind<V>,
+{
+    fn arg_mut(self) -> V {
+        self.arg()
+    }
+}
+
+impl<V, E: Elem> Bind<V> for Out<E>
+where
+    E::Write: BindMut<V>,
+{
+    fn arg(self) -> V {
+        self.ptr.arg_mut()
+    }
+}
+
+impl<V, E: Elem> Bind<V> for InOut<E>
+where
+    E::Write: BindMut<V>,
+{
+    fn arg(self) -> V {
+        self.ptr.arg_mut()
+    }
+}
+
+// A `Const` BINDS AS WHAT IT HOLDS: a weight plane's handle, or the scalar
+// the statement placed in its params run.
+impl<V, C: ConstRun> Bind<V> for Const<C>
+where
+    C::Held: Bind<V>,
+{
+    fn arg(self) -> V {
+        self.v.arg()
+    }
+}
+
+/// A backend's own launch geometry, as a [`Fire`] can take it.
+///
+/// One method, so a plane that computes grids in its own vocabulary can hand
+/// one over without every helper learning what a file is.
+pub trait Geometry {
+    /// This geometry, applied to `fire`.
+    #[must_use]
+    fn apply_to(self, fire: Fire) -> Fire;
+}
+
+// THE SHARED FORM APPLIES AS ITSELF, so a plane whose helpers already answer
+// in lanes and groups needs no type of its own.
+impl Geometry for [u32; 3] {
+    fn apply_to(self, fire: Fire) -> Fire {
+        fire.lanes(self)
+    }
+}
+
+/// Lanes AND the divisor, for a plane whose shader text does not declare one.
+///
+/// # Why this exists rather than a second builder call
+///
+/// [`Fire::group`] is a method and a body could chain it, and for a while one
+/// plane did: metal wrote `.lanes(x).group(y)` at ninety-nine sites while the
+/// other three wrote `.lanes(x)` and CUDA wrote `.apply(..)`. Three spellings
+/// of "how big is this launch", and which one a file used named the backend.
+///
+/// The DIFFERENCE IS REAL and belongs somewhere: `[numthreads]` lands in the
+/// SPIR-V and the WGSL, so vulkan and wgpu have nothing to say about the
+/// divisor, and metal must state it. So it is said in the HELPER'S RETURN
+/// TYPE, where a plane fact belongs, and every body on every plane reads
+/// `.apply(g)` and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Grid {
+    /// Total work in each dimension.
+    pub lanes: [u32; 3],
+    /// The divisor.
+    pub group: [u32; 3],
+}
+
+impl Grid {
+    /// `lanes` elements of work, divided `group` ways.
+    #[must_use]
+    pub const fn of(lanes: [u32; 3], group: [u32; 3]) -> Self {
+        Self { lanes, group }
+    }
+}
+
+impl Geometry for Grid {
+    fn apply_to(self, fire: Fire) -> Fire {
+        fire.lanes(self.lanes).group(self.group)
+    }
+}
+
+/// What position a mark claims, before its index is known.
+///
+/// # Why the index is not on the type
+///
+/// It used to be: `In<0, T>`, `Out<1, T>`. Every one of those numbers was
+/// written by hand, 1,271 of them, and a wrong one COMPILES -- it binds the
+/// operand at another index, and `quant.rs` carries the warning in prose:
+/// *"`In(0)` here would compile and bind the index run where the activation
+/// belongs."*
+///
+/// The numbers were measured before they were deleted. Across 185 CUDA
+/// routines the stated index equalled the position in the signature at every
+/// site but thirteen, and every one of the thirteen was the SAME hole: a
+/// trace operand that no parameter named, because an output was standing in
+/// for it. [`InOut`] names it, and with that the two agree everywhere.
+///
+/// So the index is not stated. It is the mark's position among the marks,
+/// which is a fact the signature already carries and cannot get wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Claim {
+    /// No position: the source is settled by the type, or there is none.
+    Fixed,
+    /// The next operand the statement places.
+    In,
+    /// The next result it declares.
+    Out,
+    /// The next operand AND the next result, at one address.
+    InOut,
+    /// The next weight — what a [`Const`] over a tensor carrier claims.
+    Weight,
+    /// The next scalar in the statement's params run.
+    ///
+    /// [`Const`]'s other run. The params run lost its mark when `Param<N, T>`
+    /// was deleted and the eighteen scalars that used it became
+    /// `fact!(stated ..)` keys resolving through [`crate::Source::Named`] —
+    /// which no driver answers, so every routine taking one was unreachable.
+    /// This is the mark those scalars had been missing.
+    Param,
+    /// The same slot, read as a FLOAT.
+    ///
+    /// The params run is an untyped `u32` run and a scale is a float, so the
+    /// READING is a different channel rather than a different type at one.
+    ParamF32,
+}
+
+/// One operand the statement places: its carrier AND the shape it was given.
+///
+/// `T` IS THE CARRIER AND NOT THE POINTEE. `In<*const bf16>` on CUDA and
+/// `In<Buf>` on a shader plane are the same type: the two differ only in what
+/// a launch can SEE of the operand, and that is what `rows` and `width`
+/// already say. A plane whose binder carries no rectangle answers zero for
+/// both, which is the value [`Region`] already refuses on.
 ///
 /// It carries `rows` and `width` because the statement gave them; tearing
 /// them off is what put `#[source(OutWidth(0))] width: i32` in forty-seven
 /// signatures. It does not `Deref`: with three fields, picking the address
 /// would make `y.rows` and `*y` two kinds of access to one value.
-///
-#[derive(Clone, Copy, Debug)]
-pub struct In<const N: usize, E: Elem> {
-    /// The device address.
-    pub ptr: *const E,
-    /// Rows in this launch's rectangle.
+#[derive(Debug)]
+pub struct In<E: Elem> {
+    /// The carrier the element names for a READ: a `*const E` on CUDA, a
+    /// binding index on a shader plane. See [`Elem::Read`].
+    pub ptr: E::Read,
+    /// Rows in this launch's rectangle. Zero where the plane states none.
     pub rows: i32,
     /// Elements per row. Zero where the statement gave none.
     pub width: i32,
 }
 
-/// The statement's `N`th result. [`In`]'s counterpart, and fat for the same
-/// reason.
-#[derive(Clone, Copy, Debug)]
-pub struct Out<const N: usize, E: Elem> {
-    /// The device address.
-    pub ptr: *mut E,
-    /// Rows in this launch's rectangle.
+/// One result the statement declares. [`In`]'s counterpart, and fat for the
+/// same reason.
+#[derive(Debug)]
+pub struct Out<E: Elem> {
+    /// The carrier the element names for a WRITE. See [`Elem::Write`].
+    pub ptr: E::Write,
+    /// Rows in this launch's rectangle. Zero where the plane states none.
     pub rows: i32,
     /// Elements per row. Zero where the statement gave none.
     pub width: i32,
 }
 
-/// The routine's weight, named rather than positional.
+/// ONE ADDRESS WEARING BOTH SLOTS: the statement places it and declares it.
 ///
-/// Derives `WeightNamed`, not `Weight(n)`, and the difference is real: an
+/// # What this replaced
+///
+/// `in_place = &[(0, 0)]`, stated on the routine's ROW, forty-five times.
+/// The row sat forty lines from the parameters its numbers indexed, so it had
+/// to re-identify them in prose -- `norm.rs` explains that `(1, 0)` means
+/// *"output 1 is one past the only declared result"*, an index for a result
+/// that does not exist, written to say that an input is also written.
+///
+/// The measurement said the signature already knew. Of fifty-five stated
+/// pairs, fifty-two described ONE parameter standing in two slots, and the
+/// proof was the hole it left: `residual_add` takes `In<1>` with no `In<0>`,
+/// because output 0 IS input 0. A mark that says so closes the hole and the
+/// pair derives -- see [`crate::Source::Alias`].
+///
+/// Not `in_place`, which was the ALLOCATOR's record of the same fact, read
+/// off the row. This is the fact itself, at the parameter that is it.
+#[derive(Debug)]
+pub struct InOut<E: Elem> {
+    /// The carrier for a WRITE: an aliased operand is driven both ways, and
+    /// the writing form is the one that can do both.
+    pub ptr: E::Write,
+    /// Rows in this launch's rectangle. Zero where the plane states none.
+    pub rows: i32,
+    /// Elements per row. Zero where the statement gave none.
+    pub width: i32,
+}
+
+/// The routine's next weight, named OR positional.
+///
+/// One mark over two reads, and the chain is what makes that honest: an
 /// `OpKind::Launch` puts a weight in the operand list where it is positional,
 /// while a semantic op like `OpKind::Rmsnorm` carries only a NAME on
-/// `LaunchSpec::weight`. Reading only the first is what made gemma-4 refuse
-/// at its PLE prologue for a statement that named one.
+/// `LaunchSpec::weight`. Two marks meant a routine had to know which shape of
+/// op would reach it -- reading only the name is what made gemma-4 refuse at
+/// its PLE prologue.
 ///
-/// See [`Bank`] for the positional spelling.
-
-#[derive(Clone, Copy, Debug)]
-pub struct Weight<const N: usize, T: ?Sized> {
-    /// The device address. A weight is READ, so the direction is settled.
+/// [`crate::Source::Or`] already resolves *"the first if the statement
+/// carries one, the second otherwise"*, and the binder already had an arm for
+/// each half. So the two reads are one source and the caller states neither.
+/// THE STATEMENT PLACED IT AND THE LAUNCH ONLY READS IT.
+///
+/// The fourth mark, and a QUALITY like the other three. `Weight` was the one
+/// domain noun in a set of qualities, and beside it `Env` named a supplier
+/// rather than a direction — so the set said three different kinds of thing.
+/// `Const` says one: *"the statement carries this and the fire cannot change
+/// it"*. Which RUN it lands in is the carrier's business, not the mark's:
+///
+/// | carrier | run | example |
+/// | --- | --- | --- |
+/// | `Tensor<E>` | the weights | `Const<Tensor<bf16>>` — a weight plane |
+/// | `i32`, `u32`, `bool` | the params | `Const<i32>` — a scalar at `params[n]` |
+/// | `f32` | the params, read as float | `Const<f32>` — the same slot's bits |
+///
+/// # Why the scalar half had to exist
+///
+/// Because most of what this tree called *"the environment"* is checkpoint
+/// configuration that never changes after load, and it was `Env` only because
+/// the statement had no channel to carry it. A head dimension is not something
+/// this batch made. Asking for one costs three things: a `Holds::fact` arm in
+/// all four drivers, a guard the type could have made — a value that arrives
+/// by ask can be absent, so the body checks — and the provenance question,
+/// re-opened. `Const` is the channel, and a fact the statement carries cannot
+/// be absent, because `arity_problem` refused the statement first.
+///
+/// # The named weight chain is inherited, not replaced
+///
+/// An `OpKind::Launch` puts a weight in the operand list where it is
+/// positional, while a semantic op like `OpKind::Rmsnorm` carries only a NAME.
+/// [`resolve`] gives a tensor `Const` the same [`crate::Source::Or`] chain
+/// `Weight` had — the named bank first and the positional one after.
+#[derive(Debug)]
+pub struct Const<C: ConstRun> {
+    /// What arrived: a read carrier for a tensor, the number for a scalar.
     ///
-    /// `T` is a POINTEE on CUDA — `Weight<0, bf16>` holds a `*const bf16`,
-    /// spelled by `Elem` — and the bound argument type on the shader planes,
-    /// where `Weight<0, Buf>` holds a handle with no const/mut pair.
-    pub ptr: T,
+    /// A body reads a scalar through [`Deref`](core::ops::Deref) — `*head_dim`
+    /// — and a tensor through [`Bind::arg`], exactly as the mark it replaced.
+    pub v: C::Held,
 }
 
-/// A parameter with no source, said out loud.
+/// Which run a [`Const`] lands in, and what it holds when it gets there.
 ///
-/// For POINTERS only. A scalar with no source already derives none, so the
-/// wrapper would be noise; a bare `*const T` is different — `derive_all`
-/// counts it into the next input slot, so a driver-owned pointer that says
-/// nothing is read as an operand the statement placed. This says nothing
-/// loudly enough to stop that.
-
-#[derive(Clone, Copy, Debug)]
-pub struct Unbound<T> {
-    /// The device address.
-    pub ptr: T,
+/// The one trait a mark's carrier is asked about, because `Const` is the one
+/// mark whose run depends on its carrier. A `Tensor<E>` is a weight, a scalar
+/// is a param, and an `f32` is a param read through the float channel.
+///
+/// `Tensor<E>` implements this in the PLANE that declares it — CUDA's holds a
+/// pointer where a shader's holds a binding index, which is the same split
+/// [`Elem`] already carries and for the same reason.
+pub trait ConstRun {
+    /// Which run the statement placed this in.
+    const RUN: Claim;
+    /// How the argument binds.
+    const TY: Ty;
+    /// What a `Const` of this carrier holds.
+    type Held: Copy;
 }
 
-/// The positional weight bank: `b.args[spec.n_in + spec.n_out + N]`.
-///
-/// [`Weight`] and this are one word in English and two reads at runtime. A
-/// statement saying `weights: [w]` puts `w` in `Facts::weight_named[0]`, which
-/// [`Weight`] reads; a statement placing its weights positionally puts them
-/// after every input and output, which this reads.
-
-#[derive(Clone, Copy, Debug)]
-pub struct Bank<const N: usize, E: Elem> {
-    /// The device address. A bank is READ, so the direction is settled.
-    pub ptr: *const E,
+// THE SCALAR RUN. `i32`, `u32` and `bool` share the params channel and `f32`
+// takes the float reading of the same slot -- the run is a `Vec<u32>` and the
+// BITS are the value, which `Handles::param_f32` already reads back.
+impl ConstRun for i32 {
+    const RUN: Claim = Claim::Param;
+    const TY: Ty = Ty::I32;
+    type Held = i32;
 }
 
-// `Rows`, `Width<S>` AND `mod slot` STOOD HERE, and a region deleted all
-// three. `Rows` was `Facts::rows.count` as a parameter and `Width<slot::
-// Out<0>>` was a parameter whose entire content was *"the shape of the
-// parameter two lines up"*; `y.rows` and `y.width` are the same two numbers
-// reached through the region that proves the launch HAS that result, which is
-// rule E1: *"a body that wants a width asks the region it already holds."*
-//
-// ONE GUARD DIED WITH THEM AND HAD TO BE PUT BACK BY HAND. `Width<slot::
-// Out<0>>` derived `OutWidth(0)`, which the binder answered with `?`; a
-// region's width is `unwrap_or(0)`. `kernels-cuda/src/rope.rs`'s private
-// `q_heads` is that refusal restored beside the division it protects, which
-// is where it should have been all along.
-
-/// The driver's `N`th aux slab for this layer.
-///
-/// # Why the index cannot be derived and must be written
-///
-/// The INDEX is not in the name and cannot be: `fact_of` keys on a spelling,
-/// `Aux` carries a `u8`, and `dt` is the zeroth slot only by the join's
-/// convention. The const comes FIRST because the index is the fact being
-/// stated and the pointee is the plumbing.
-///
-/// [`Provenance::Env`] is not optional here: an aux slab is handed over by
-/// the driver, no statement places it, and dropping it would change the arity
-/// §6.2 checks.
-#[derive(Clone, Copy, Debug)]
-pub struct Aux<const N: usize, T>(pub T);
-
-/// The `N`th scalar the statement carries — [`Kind::Param`]'s spelling.
-///
-/// Not `In<N, i32>`: [`In`]'s `N` indexes the operand run and this one indexes
-/// `spec.params[]`. ONE INDEX OVER TWO ARRAYS shipped as a bug once already,
-/// `Weight<1, _>` on `gemv_bf16`'s bias resolving against the wrong table.
-///
-/// A scalar needs the wrapper even though [`Unbound`] argued otherwise: an
-/// unmarked scalar meant both "the statement states this" and "this is the
-/// launcher's own constant". After this, unmarked means only the second.
-///
-/// [`Kind::Param`]: crate::Kind::Param
-#[derive(Clone, Copy, Debug)]
-pub struct Param<const N: usize, T>(pub T);
-
-/// The `N`th param slot read as a FLOAT — [`Kind::ParamF32`]'s spelling.
-///
-/// A separate type and not `Param<N, f32>`, mirroring the `Kind` split: the
-/// params channel is a byte run with no element type, so *"the Nth param,
-/// read as f32"* is a different CHANNEL from *"the Nth param"* rather than a
-/// different reading of the same one. `Kind` makes that distinction and a
-/// type parameter would erase it back.
-///
-/// [`Kind::ParamF32`]: crate::Kind::ParamF32
-#[derive(Clone, Copy, Debug)]
-pub struct ParamF32<const N: usize>(pub f32);
-
-/// AN OPERAND THE LAUNCH READS AND WRITES, said out loud.
-///
-/// The three sites where direction is not the wrapper's fact are all one
-/// shape: a statement declares a buffer as an INPUT, the kernel writes through
-/// it, and no result is declared. `In<N, *mut T>` reads as a typo rather than
-/// as a claim.
-///
-/// It derives `Source::Slot(Kind::In, N)` like [`In`] does; what changes is
-/// that the mutation is stated where a reader looks for it.
-///
-/// Not `in_place`, which is the ALLOCATOR's record that two operands share an
-/// address. This is one operand both read and written.
-#[derive(Clone, Copy, Debug)]
-pub struct InOut<const N: usize, E: Elem> {
-    /// The device address.
-    pub ptr: *mut E,
-    /// Rows in this launch's rectangle.
-    pub rows: i32,
-    /// Elements per row. Zero where the statement gave none.
-    pub width: i32,
+impl ConstRun for u32 {
+    const RUN: Claim = Claim::Param;
+    const TY: Ty = Ty::U32;
+    type Held = u32;
 }
 
-impl<const N: usize, E: Elem> InOut<N, E> {
-    /// A WINDOW into the operand: `count` rows starting at row `start`.
-    ///
-    /// An offset is `start * stride * size_of::<E>()`, which needs the element
-    /// type in the wrapper; before that a windowed view had to be handed the
-    /// element size, and `gemm/lora.rs` wrote the arithmetic by hand with `* 2`
-    /// for `bf16` spelled as a literal.
-    ///
-    /// Named `window` and not `rows` because [`Out`] has a `rows` FIELD, and a
-    /// reader looking at `x.rows` could not tell which they were getting.
-    ///
-    /// # Errors
-    ///
-    /// [`Refusal::Absent`] naming `what` when the statement gave no row width,
-    /// and [`Refusal::Wide`] when the window runs past the operand's rows.
-    pub fn window(
-        &self,
-        start: u32,
-        count: i32,
-        what: &'static str,
-    ) -> Result<Region<*mut E>, Refusal> {
-        if self.width <= 0 {
-            return Err(Refusal::Absent { what });
-        }
-        let end = i64::from(start).saturating_add(i64::from(count.max(0)));
-        if end > i64::from(self.rows) {
-            return Err(Refusal::Wide { what, at: end, max: i64::from(self.rows) });
-        }
-        // SAFETY: the bound above proves `start` is within the operand's own
-        // rows, and `width` is its pitch, so the product is an offset the
-        // allocation covers.
-        let ptr = unsafe { self.ptr.add(start as usize * self.width as usize) };
-        Ok(Region { ptr, rows: count, width: self.width, stride: Stride(self.width) })
+impl ConstRun for f32 {
+    const RUN: Claim = Claim::ParamF32;
+    const TY: Ty = Ty::F32;
+    type Held = f32;
+}
+
+impl ConstRun for bool {
+    const RUN: Claim = Claim::Param;
+    const TY: Ty = Ty::Bool;
+    type Held = bool;
+}
+
+impl ConstRun for i64 {
+    const RUN: Claim = Claim::Param;
+    const TY: Ty = Ty::I64;
+    type Held = i64;
+}
+
+impl ConstRun for usize {
+    const RUN: Claim = Claim::Param;
+    const TY: Ty = Ty::Usize;
+    type Held = u64;
+}
+
+impl<C: ConstRun> Clone for Const<C> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<C: ConstRun> Copy for Const<C> {}
+
+impl<C: ConstRun> Const<C> {
+    /// Carry `v` as the statement's constant.
+    pub const fn new(v: C::Held) -> Self {
+        Self { v }
     }
 
-    /// See [`In::all`].
-    ///
-    /// # Errors
-    ///
-    /// [`Refusal::Absent`] naming `what`.
-    /// This launch's whole view of the operand. See [`In::all`].
-    ///
-    /// # Errors
-    ///
-    /// [`Refusal::Absent`] naming `what`.
-    pub fn all(&self, what: &'static str) -> Result<Region<*mut E>, Refusal> {
-        if self.width <= 0 {
-            return Err(Refusal::Absent { what });
-        }
-        Ok(Region { ptr: self.ptr, rows: self.rows, width: self.width, stride: Stride(self.width) })
-    }
-
-    /// See [`In::layout`].
-    #[must_use]
-    pub const fn layout(&self) -> Layout {
-        Layout::packed(self.rows, self.width)
+    /// What the statement carried.
+    pub const fn get(self) -> C::Held {
+        self.v
     }
 }
 
-impl<const N: usize, B: Backend, E: Elem> Arg<B> for InOut<N, E>
-where
-    *mut E: Arg<B>,
-{
-    const TY: Ty = E::TY_MUT;
-    const PROV: Provenance = <*mut E as Arg<B>>::PROV;
-    // `Placed`, with `In`: the statement PLACES this operand. That it is also
-    // written is a fact about the KERNEL, and `Side` answers "which end of the
-    // statement", which has one answer here.
-    const SIDE: Side = Side::Placed;
-    const SPELLING: &'static str = E::CPP_MUT;
+// A SCALAR `Const` DEREFS AND A TENSOR ONE DOES NOT NEED TO. `*head_dim` is
+// how every body already read the number, and the carrier for a tensor is a
+// handle a body passes on rather than reads through.
+impl<C: ConstRun> core::ops::Deref for Const<C> {
+    type Target = C::Held;
 
-    fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-        let ptr = <*mut E as Arg<B>>::unpack(value, at)?;
-        let Extent { rows, width } = B::region(value, at)?;
-        Ok(InOut { ptr, rows, width })
+    fn deref(&self) -> &C::Held {
+        &self.v
     }
 }
+
+
+
 
 /// A pointee: something a device address can point at, with both of its
 /// pointer ABIs.
@@ -636,476 +1147,94 @@ where
 /// text spells a type — and has implementors that are pure markers with no
 /// pointer ABI at all. This is the host-side pair.
 
-// ── The shader planes' slot vocabulary ──
+// `Held<Q, T>` STOOD HERE AND WAS THE LAST OF THE FIFTEEN. It set
+// `SOURCE = Q::SOURCE` while forwarding `PROV = T::PROV`, and its doc said
+// why: *"The op DOES carry an operand for `conv_state` and the arity checker
+// counts it; the driver just never reads it."* THE PREMISE WAS NOT TRUE, and
+// the same doc had already named the way to find out -- *"an operand the
+// driver never reads is an operand doing nothing, and the fix is upstream in
+// whatever emits the op."*
 //
-// Disjoint from `In`/`Out`/`Weight` above, which take a POINTEE and derive the
-// C++ spelling from `Elem`. These take the bound argument type and claim only
-// an index, which is what metal, vulkan and wgpu bind.
-
-/// A source spelled as a type, so that [`Reckoned`] can state one.
-pub trait Says {
-    /// The source this marker spells.
-    const SOURCE: crate::Source;
-}
-
-/// The fact `Q`, by name: `Say<keys::Width>`.
-#[derive(Clone, Copy, Debug)]
-pub struct Say<Q>(core::marker::PhantomData<Q>);
-
-impl<Q: crate::keys::Fact> Says for Say<Q> {
-    const SOURCE: crate::Source = crate::Source::Named(Q::KEY);
-}
-
-/// The statement's `N`th scalar: `Nth<1>`.
-#[derive(Clone, Copy, Debug)]
-pub struct Nth<const N: usize>;
-
-impl<const N: usize> Says for Nth<N> {
-    const SOURCE: crate::Source = crate::Source::Slot(crate::Kind::Param, N as u8);
-}
-
-/// `A` if the statement carries it, else `B`: `Else<Nth<1>, Say<keys::Width>>`.
-#[derive(Clone, Copy, Debug)]
-pub struct Else<A, B>(core::marker::PhantomData<(A, B)>);
-
-impl<A: Says, B: Says> Says for Else<A, B> {
-    const SOURCE: crate::Source = crate::Source::Or(&A::SOURCE, &B::SOURCE);
-}
-
-/// `A` times `B`: `Times<Say<keys::Width>, Say<keys::Rows>>`.
-#[derive(Clone, Copy, Debug)]
-pub struct Times<A, B>(core::marker::PhantomData<(A, B)>);
-
-impl<A: Says, B: Says> Says for Times<A, B> {
-    const SOURCE: crate::Source = crate::Source::Times(&A::SOURCE, &B::SOURCE);
-}
-
-/// `A` over `B`, refused when `B` is zero: `Over<Say<keys::Width>, Nth<1>>`.
-#[derive(Clone, Copy, Debug)]
-pub struct Over<A, B>(core::marker::PhantomData<(A, B)>);
-
-impl<A: Says, B: Says> Says for Over<A, B> {
-    const SOURCE: crate::Source = crate::Source::Over(&A::SOURCE, &B::SOURCE);
-}
-
-/// Input slot `N`, with no claim about its shape.
-///
-/// [`In`] says "input `N`, a `rows × width` rectangle"; this says only the
-/// first half. Both set `Derived::stated`, so both stop the macro counting.
-///
-/// A separate type and not an `Option` on [`In`]: roughly half the parameters
-/// the macro reaches by position have no honest rectangle to offer. DO NOT
-/// MANUFACTURE ONE -- invented rows and width are worse than a counted index,
-/// because the launcher will believe them. At the TYPE, reading `x.width`
-/// fails to compile; at the VALUE it would compile and unwrap.
-///
-/// Like [`In`], a stated index SETS the counter to `N + 1`.
-#[derive(Clone, Copy, Debug)]
-pub struct InSlot<const N: usize, T> {
-    /// The device address.
-    pub ptr: T,
-}
-
-/// Output slot `N`, with no claim about its shape.
-///
-/// [`InSlot`]'s doc carries the argument; this is its other half. The one
-/// thing worth adding is that an output with no stated extent is the more
-/// common case rather than the rarer one, because a result's rows and width
-/// are what the STATEMENT placed and a launcher that writes through a
-/// pointer it was handed often has no business restating them.
-///
-/// `norm::rmsnorm_bf16_with_fp16`'s `y_fp16` is the shape to keep in mind:
-/// it is `Option<NonNull<_>>`, and wrapping it here preserves that, because
-/// `classify` reads `nullable` from the WRAPPED type. A slot mark states
-/// which result it is and says nothing about whether the statement placed
-/// one — those are different questions and `Or<T>` answers the second.
-#[derive(Clone, Copy, Debug)]
-pub struct OutSlot<const N: usize, T> {
-    /// The device address.
-    pub ptr: T,
-}
-
-/// Input `N`, with its row WIDTH and no claim about how many rows.
-///
-/// The third shape between [`In`]'s whole rectangle and [`InSlot`]'s bare
-/// address: a signature must be able to accept the half of a region that is
-/// true. A REGION THAT CANNOT BE HALF-BUILT IS A FACT ABOUT THE STRUCT, NOT
-/// ABOUT THE WORLD.
-///
-/// It is NOT `Slot(Kind::InWidth, n)` under another name -- that would be a
-/// SELECTOR, and the set would grow per (kind, index). This derives
-/// `Source::Slot(Kind::In, N)` like [`In`] does; the selection lives in the
-/// type, not in the row.
-///
-/// The rows are ABSENT rather than zero because a zero would be a claim: the
-/// binder mints regions with `unwrap_or(0)`, so a fictional `rows` reads as a
-/// number rather than a refusal. The field is not here, so the mistake is not
-/// available.
-#[derive(Clone, Copy, Debug)]
-pub struct InRow<const N: usize, T> {
-    /// The device address.
-    pub ptr: T,
-    /// Elements per row. Zero where the statement gave none.
-    pub width: i32,
-}
-
-/// Result `N`, with its row width and no claim about how many rows.
-///
-/// [`InRow`]'s counterpart and its doc carries the argument. The one thing
-/// worth adding is that the output side is where the hole was found: the
-/// fourteen width and shape marks that Stage 3 could not dispose of are
-/// mostly `OutWidth(n)`, and `gemv_bf16` carries one of each.
-#[derive(Clone, Copy, Debug)]
-pub struct OutRow<const N: usize, T> {
-    /// The device address.
-    pub ptr: T,
-    /// Elements per row. Zero where the statement gave none.
-    pub width: i32,
-}
-
-
-
-/// An optional pointer this routine leaves ABSENT: `Null<Buf>`.
-///
-/// Fourteen arguments in the metal plane are bound from `state(None)` --
-/// gpt-oss's per-head sink logits on a family that has none, a routed
-/// matmul's bias on the form without one, six ring-buffer slots a paged
-/// append does not use. The arm reaches for nothing on purpose, and until
-/// now the row said nothing at all, which reads the same as an argument
-/// nobody has got round to.
-///
-/// This is `Source::Lit(Lit::Null)`, and it is the one source that needs no
-/// resolver: the answer is the absence.
-#[derive(Clone, Copy, Debug)]
-#[repr(transparent)]
-pub struct Null<T> {
-    /// The value, which is whatever the backend spells an absent pointer.
-    pub v: T,
-}
-
-impl<T> Null<T> {
-    /// Carry `v` as the pointer this routine leaves absent.
-    pub const fn new(v: T) -> Self {
-        Self { v }
-    }
-}
-
-impl<T> core::ops::Deref for Null<T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        &self.v
-    }
-}
-
-impl<B: Backend, T: Arg<B>> Arg<B> for Null<T> {
-    const TY: Ty = T::TY;
-    const SIDE: Side = T::SIDE;
-    const PROV: Provenance = T::PROV;
-    const SPELLING: &'static str = T::SPELLING;
-    const SOURCE: Option<crate::Source> = Some(crate::Source::Lit(crate::Lit::Null));
-
-    fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-        T::unpack(value, at).map(Self::new)
-    }
-}
-
-
-
-/// The statement's `N`th scalar IF IT CARRIES ONE, else the fact `Q`:
-/// `ParamOr<3, keys::RotaryWidth, i32>`.
-///
-/// [`Param`] says the statement MUST carry it; this says it MAY, and names
-/// what stands in when it does not.
-///
-/// A chain and not a default: gemma-4 rotates a quarter of each full-attention
-/// head and all of each sliding one, so a fire-wide `rotary_width` describes
-/// neither layer -- while every single-shape deployment states nothing and
-/// means the fire's number. The chain is the only thing true about both.
-///
-/// Zero is absent. See [`Source::Or`](crate::Source::Or).
-#[derive(Clone, Copy, Debug)]
-#[repr(transparent)]
-pub struct ParamOr<const N: usize, Q, T> {
-    /// The value.
-    pub v: T,
-    ask: core::marker::PhantomData<Q>,
-}
-
-impl<const N: usize, Q, T> ParamOr<N, Q, T> {
-    /// Carry `v` as the statement's `N`th scalar or `Q`'s answer.
-    pub const fn new(v: T) -> Self {
-        Self {
-            v,
-            ask: core::marker::PhantomData,
-        }
-    }
-}
-
-impl<const N: usize, Q, T> core::ops::Deref for ParamOr<N, Q, T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        &self.v
-    }
-}
-
-impl<const N: usize, B: Backend, Q: crate::keys::Fact, T: Arg<B>> Arg<B> for ParamOr<N, Q, T> {
-    const TY: Ty = T::TY;
-    const SIDE: Side = T::SIDE;
-    // The statement carries it when it has an opinion, so the trace is
-    // where it comes from when it comes from anywhere placeable.
-    const PROV: Provenance = Provenance::Trace;
-    const SPELLING: &'static str = T::SPELLING;
-    const SOURCE: Option<crate::Source> = Some(crate::Source::Or(
-        &crate::Source::Slot(crate::Kind::Param, N as u8),
-        &crate::Source::Named(Q::KEY),
-    ));
-
-    fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-        T::unpack(value, at).map(Self::new)
-    }
-}
-
-/// The statement's `N`th scalar IF IT CARRIES ONE, else the literal `L`:
-/// `ParamOrLit<4, -1, i32>`.
-///
-/// The other half of [`ParamOr`], and the measurement is what separated
-/// them: seven of the paged-attention sites fell back to a number no move of
-/// the fire's geometry could shift, which is what a literal looks like from
-/// outside. `-1` is "no sliding window" and `0` is "no mask stride"; both are
-/// sentinels the shader reads, not shapes anything derives.
-#[derive(Clone, Copy, Debug)]
-#[repr(transparent)]
-pub struct ParamOrLit<const N: usize, const L: i32, T> {
-    /// The value.
-    pub v: T,
-}
-
-impl<const N: usize, const L: i32, T> ParamOrLit<N, L, T> {
-    /// Carry `v` as the statement's `N`th scalar or the literal `L`.
-    pub const fn new(v: T) -> Self {
-        Self { v }
-    }
-}
-
-impl<const N: usize, const L: i32, T> core::ops::Deref for ParamOrLit<N, L, T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        &self.v
-    }
-}
-
-impl<const N: usize, const L: i32, B: Backend, T: Arg<B>> Arg<B> for ParamOrLit<N, L, T> {
-    const TY: Ty = T::TY;
-    const SIDE: Side = T::SIDE;
-    const PROV: Provenance = Provenance::Trace;
-    const SPELLING: &'static str = T::SPELLING;
-    const SOURCE: Option<crate::Source> = Some(crate::Source::Or(
-        &crate::Source::Slot(crate::Kind::Param, N as u8),
-        &crate::Source::Lit(crate::Lit::I32(L)),
-    ));
-
-    fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-        T::unpack(value, at).map(Self::new)
-    }
-}
-
-/// An argument the driver COMPUTES from what it already knows:
-/// `Reckoned<Times<Say<keys::Width>, Say<keys::Rows>>, i32>`.
-///
-/// The provenance forwards, as it does for [`Held`] and [`Null`]: whether a
-/// row places this argument is a property of the argument, and the arithmetic
-/// that reaches it changes nothing about that.
-#[derive(Clone, Copy, Debug)]
-#[repr(transparent)]
-pub struct Reckoned<E, T> {
-    /// The value.
-    pub v: T,
-    how: core::marker::PhantomData<E>,
-}
-
-impl<E, T> Reckoned<E, T> {
-    /// Carry `v` as the number `E` computes.
-    pub const fn new(v: T) -> Self {
-        Self {
-            v,
-            how: core::marker::PhantomData,
-        }
-    }
-}
-
-impl<E, T> core::ops::Deref for Reckoned<E, T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        &self.v
-    }
-}
-
-impl<E: Says, B: Backend, T: Arg<B>> Arg<B> for Reckoned<E, T> {
-    const TY: Ty = T::TY;
-    const SIDE: Side = T::SIDE;
-    const PROV: Provenance = T::PROV;
-    const SPELLING: &'static str = T::SPELLING;
-    const SOURCE: Option<crate::Source> = Some(E::SOURCE);
-
-    fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-        T::unpack(value, at).map(Self::new)
-    }
-}
-
-
-
-
-
-
-
-/// The driver's own answer to `Q`, at an argument the STATEMENT still places:
-/// `Held<keys::ConvState, F32s>`.
-///
-/// Not [`Ask`], which sets `Provenance::Env` -- a claim that the trace names
-/// no operand here. The op DOES carry an operand for `conv_state` and the
-/// arity checker counts it; the driver just never reads it, resolving the slab
-/// from its own pool. So the source is named while the provenance stays the
-/// carrier's, and moving it to `Env` would fail arity on every `gdn` op.
-///
-/// That the two disagree is a finding: an operand the driver never reads is an
-/// operand doing nothing, and the fix is upstream in whatever emits the op.
-#[derive(Clone, Copy, Debug)]
-#[repr(transparent)]
-pub struct Held<Q, T> {
-    /// The value.
-    pub v: T,
-    of: core::marker::PhantomData<Q>,
-}
-
-impl<Q, T> Held<Q, T> {
-    /// Carry `v` as the driver's answer to `Q`.
-    pub const fn new(v: T) -> Self {
-        Self {
-            v,
-            of: core::marker::PhantomData,
-        }
-    }
-}
-
-impl<Q, T> core::ops::Deref for Held<Q, T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        &self.v
-    }
-}
-
-impl<B: Backend, Q: crate::keys::Fact, T: Arg<B>> Arg<B> for Held<Q, T> {
-    const TY: Ty = T::TY;
-    const SIDE: Side = T::SIDE;
-    // FORWARDED, and that is the whole point -- see the type's doc.
-    const PROV: Provenance = T::PROV;
-    const SPELLING: &'static str = T::SPELLING;
-    const SOURCE: Option<crate::Source> = Some(Q::SOURCE);
-
-    fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-        T::unpack(value, at).map(Self::new)
-    }
-}
-
-/// [`Env`] with the question filled in: `Ask<keys::TokenIds, I32s>`.
-///
-/// Not `Env<keys::TokenIds>`, which is the CUDA spelling and does not compile
-/// on a shader plane: a fact's `Value` is the pointer CUDA passes, and a
-/// shader carrier is a BINDING INDEX, `Buf(9)`, that the encoder's ordering
-/// makes mean an address. There is no honest `unpack` between them.
-///
-/// So the fact and the carrier are stated separately, and the fact is the same
-/// `keys::` type CUDA names -- which is the point: `"token_ids"` appears once
-/// in the tree.
-///
-/// It sets [`Provenance::Env`] itself rather than sitting inside an `Env<_>`;
-/// `Env<Ask<_, _>>` would be the provenance twice, once vaguely.
-#[derive(Clone, Copy, Debug)]
-#[repr(transparent)]
-pub struct Ask<Q, T> {
-    /// The carrier, in the plane's own vocabulary.
-    pub ptr: T,
-    /// The question. A [`crate::keys::Fact`], carried in the type only.
-    pub of: core::marker::PhantomData<Q>,
-}
-
-impl<Q, T> core::ops::Deref for Ask<Q, T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        &self.ptr
-    }
-}
-
-impl<B: Backend, Q: crate::keys::Fact, T: Arg<B>> Arg<B> for Ask<Q, T> {
-    const TY: Ty = T::TY;
-    const SIDE: Side = T::SIDE;
-    const PROV: Provenance = Provenance::Env;
-    const SPELLING: &'static str = T::SPELLING;
-    const SOURCE: Option<crate::Source> = Some(Q::SOURCE);
-
-    fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-        T::unpack(value, at).map(|ptr| Ask { ptr, of: core::marker::PhantomData })
-    }
-}
-
-/// The staged parameter block: `Block<Buf>`.
-///
-/// Every scalar the statement carries, laid out as one struct and bound as
-/// one buffer. `Env<Buf>` said only that the binder supplies it, which is the
-/// same thing it said about the KV pool and the rope frequencies; this says
-/// which. See [`Kind::Params`].
-///
-/// [`Kind::Params`]: crate::Kind::Params
-#[derive(Clone, Copy, Debug)]
-#[repr(transparent)]
-pub struct Block<T> {
-    /// The buffer.
-    pub v: T,
-}
-
-impl<T> Block<T> {
-    /// Wrap the block the binder staged.
-    pub const fn new(v: T) -> Self {
-        Self { v }
-    }
-}
-
-impl<T> core::ops::Deref for Block<T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        &self.v
-    }
-}
-
-impl<B: Backend, T: Arg<B>> Arg<B> for Block<T> {
-    const TY: Ty = T::TY;
-    const SIDE: Side = T::SIDE;
-    // The `Env<_>` this replaces was already saying it, exactly as `Aux`
-    // does; leaving it at the default would be a silent arity change.
-    const PROV: Provenance = Provenance::Env;
-    const SPELLING: &'static str = T::SPELLING;
-    const SOURCE: Option<crate::Source> = Some(crate::Source::Slot(crate::Kind::Params, 0));
-
-    fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-        T::unpack(value, at).map(|v| Self { v })
-    }
-}
+// Upstream says: `TraceBuilder::gdn_prep` pushes `vec![qkv, a, b]` and no
+// state slab, and `model-ir::kernels::arity_problem` only runs on
+// `OpKind::Launch` -- so on the semantic ops that reach `gdn_core` the
+// provenance was never read at all. On the ops that ARE launched it was read
+// and was wrong: `kv_append`'s cache pair and positions arrive on
+// `OpKind::Launch::state`, which is a FIELD beside `inputs` and not one of
+// them, so a `Trace` provenance counted three reads against the two operands
+// the statement places. `Env` is what those parameters always were.
+//
+// So the row a wrapper existed to produce was a row no reader wanted. It is
+// `Env<T, Q>` now, which says the same thing about the source and the honest
+// thing about who supplies it.
 
 pub trait Elem: 'static {
+    /// What a launch that READS this element is handed.
+    ///
+    /// # Why the carrier is here and not in the signature
+    ///
+    /// Because the direction is the MARK's, and it was being said twice.
+    /// CUDA wrote `In<*const bf16>` and `Out<*mut bf16>`; the shader planes
+    /// wrote `In<Buf>` and `Out<BufMut>` -- four spellings for two facts, and
+    /// a `BufMut` differs from a `Buf` in nothing a shader body can observe
+    /// (both are `ArgValue::Buffer(handle)`, and every body only calls `.v()`).
+    ///
+    /// It could not simply be deleted, because on CUDA the mutability is
+    /// Rust's own type system doing real work: a body writes `y.ptr.cast_
+    /// const()` and could not if `ptr` were already `*const`. So the element
+    /// names both carriers and the mark picks the one its direction needs.
+    ///
+    /// # What the mark did NOT unify, and cannot
+    ///
+    /// The ELEMENT. This doc used to claim that *"`In<bf16>` gets a `*const
+    /// bf16` on CUDA and a `Buf` on a shader plane, from the same signature"*,
+    /// and the type system does not permit it: `Read` is ONE associated type
+    /// with no backend parameter, so `kernels_cuda::jit::abi::bf16` resolves
+    /// it to a pointer on every plane and [`crate::shader::bf16`] resolves it
+    /// to a binding index on every plane. No signature is shared, and none
+    /// ever was -- no shader routine has ever written `In<bf16>` meaning
+    /// CUDA's.
+    ///
+    /// What the marks unified is the DIRECTION, and that is the whole of it.
+    /// The two `bf16`s are deliberately spelled alike -- one element, one
+    /// word, whichever file you are in -- and that is a convention this trait
+    /// enforces nothing about. Making it a guarantee would take an
+    /// `Elem<B: Backend>`, which puts a backend parameter on every mark.
+    type Read: Copy;
+    /// What a launch that WRITES it is handed. [`Self::Read`]'s counterpart.
+    type Write: Copy;
+
+    /// This carrier, advanced by `elems` elements.
+    ///
+    /// # Why the element has to say
+    ///
+    /// Because a window is `start * pitch` elements along, and how you go
+    /// along depends on what the carrier IS. CUDA offsets a pointer; a shader
+    /// plane binds a whole buffer and its handle does not move, so the window
+    /// has to reach the shader as a scalar instead -- which is what those
+    /// planes already do, and why their handles answer with themselves.
+    ///
+    /// # Safety
+    ///
+    /// On a pointer carrier the result must stay inside the allocation. Every
+    /// caller here proves that first: [`In::window`] bounds `start` against
+    /// the operand's own rows before it asks.
+    unsafe fn advance_read(read: Self::Read, elems: usize) -> Self::Read;
+
+    /// [`Self::advance_read`], for the writing carrier.
+    ///
+    /// # Safety
+    ///
+    /// [`Self::advance_read`]'s.
+    unsafe fn advance_write(write: Self::Write, elems: usize) -> Self::Write;
+
     /// How the device text spells a `const` pointer to this.
     const CPP_CONST: &'static str;
     /// How it spells a mutable one.
     const CPP_MUT: &'static str;
-    /// The [`Ty`] a `*const` to this binds as.
+    /// The [`Ty`] a read binds as.
     const TY_CONST: Ty;
-    /// The [`Ty`] a `*mut` to this binds as.
+    /// The [`Ty`] a write binds as.
     const TY_MUT: Ty;
 }
 
@@ -1121,6 +1250,21 @@ pub trait Elem: 'static {
 macro_rules! prim_elem {
     ($t:ty, $cc:literal, $cm:literal, $tc:ident, $tm:ident) => {
         impl Elem for $t {
+            // A POINTEE'S CARRIERS ARE ITS TWO POINTERS. This is the CUDA
+            // shape, and the shader planes give their handles `Read = Write =
+            // Self` instead -- a binding index has no second form.
+            type Read = *const $t;
+            type Write = *mut $t;
+
+            unsafe fn advance_read(read: Self::Read, elems: usize) -> Self::Read {
+                // SAFETY: the trait's obligation, forwarded to the caller.
+                unsafe { read.add(elems) }
+            }
+
+            unsafe fn advance_write(write: Self::Write, elems: usize) -> Self::Write {
+                // SAFETY: as above.
+                unsafe { write.add(elems) }
+            }
             const CPP_CONST: &'static str = $cc;
             const CPP_MUT: &'static str = $cm;
             const TY_CONST: Ty = Ty::$tc;
@@ -1165,6 +1309,18 @@ prim_elem!(core::ffi::c_void, "const void*", "void*", Buf, BufMut);
 macro_rules! ptr_elem {
     ($t:ty, $cc:literal, $cm:literal, $tc:ident, $tm:ident) => {
         impl Elem for $t {
+            type Read = *const $t;
+            type Write = *mut $t;
+
+            unsafe fn advance_read(read: Self::Read, elems: usize) -> Self::Read {
+                // SAFETY: the trait's obligation, forwarded to the caller.
+                unsafe { read.add(elems) }
+            }
+
+            unsafe fn advance_write(write: Self::Write, elems: usize) -> Self::Write {
+                // SAFETY: as above.
+                unsafe { write.add(elems) }
+            }
             const CPP_CONST: &'static str = $cc;
             const CPP_MUT: &'static str = $cm;
             const TY_CONST: Ty = Ty::$tc;
@@ -1222,15 +1378,16 @@ impl<P> Region<P> {
 // name the FACT that was missing, and a generic message would say only which
 // operand failed.
 
-impl<const N: usize, E: Elem> In<N, E> {
+impl<E: Elem> In<E> {
     /// This operand's view over a row count the CALLER supplies: the half of
     /// a region a signature can state, with the other half supplied where it
-    /// is known. [`InRow`] states the same half in the signature itself.
+    /// is known. The other half is `self.width`, which the plane fills where it
+    /// states a rectangle and leaves zero where it does not.
     ///
     /// # Errors
     ///
     /// [`Refusal::Absent`] naming `what`.
-    pub fn over(&self, rows: i32, what: &'static str) -> Result<Region<*const E>, Refusal> {
+    pub fn over(&self, rows: i32, what: &'static str) -> Result<Region<E::Read>, Refusal> {
         if self.width <= 0 {
             return Err(Refusal::Absent { what });
         }
@@ -1255,7 +1412,7 @@ impl<const N: usize, E: Elem> In<N, E> {
         start: u32,
         count: i32,
         what: &'static str,
-    ) -> Result<Region<*const E>, Refusal> {
+    ) -> Result<Region<E::Read>, Refusal> {
         if self.width <= 0 {
             return Err(Refusal::Absent { what });
         }
@@ -1266,7 +1423,8 @@ impl<const N: usize, E: Elem> In<N, E> {
         // SAFETY: the bound above proves `start` is within the operand's own
         // rows, and `width` is its pitch, so the product is an offset the
         // allocation covers.
-        let ptr = unsafe { self.ptr.add(start as usize * self.width as usize) };
+        // SAFETY: the bound above proves the offset lies inside the operand.
+        let ptr = unsafe { E::advance_read(self.ptr, start as usize * self.width as usize) };
         Ok(Region { ptr, rows: count, width: self.width, stride: Stride(self.width) })
     }
 
@@ -1277,7 +1435,7 @@ impl<const N: usize, E: Elem> In<N, E> {
     /// [`Refusal::Absent`] naming `what` when the statement gave no row
     /// width. That is `stated_width`'s refusal, made where the view is built
     /// instead of at each reader.
-    pub fn all(&self, what: &'static str) -> Result<Region<*const E>, Refusal> {
+    pub fn all(&self, what: &'static str) -> Result<Region<E::Read>, Refusal> {
         if self.width <= 0 {
             return Err(Refusal::Absent { what });
         }
@@ -1285,21 +1443,21 @@ impl<const N: usize, E: Elem> In<N, E> {
     }
 }
 
-impl<const N: usize, E: Elem> Out<N, E> {
+impl<E: Elem> Out<E> {
     /// This operand's view over a row count the CALLER supplies. See
     /// [`In::over`].
     ///
     /// # Errors
     ///
     /// [`Refusal::Absent`] naming `what`.
-    pub fn over(&self, rows: i32, what: &'static str) -> Result<Region<*mut E>, Refusal> {
+    pub fn over(&self, rows: i32, what: &'static str) -> Result<Region<E::Write>, Refusal> {
         if self.width <= 0 {
             return Err(Refusal::Absent { what });
         }
         Ok(Region { ptr: self.ptr, rows, width: self.width, stride: Stride(self.width) })
     }
 
-    pub fn all(&self, what: &'static str) -> Result<Region<*mut E>, Refusal> {
+    pub fn all(&self, what: &'static str) -> Result<Region<E::Write>, Refusal> {
         if self.width <= 0 {
             return Err(Refusal::Absent { what });
         }
@@ -1319,7 +1477,7 @@ impl<const N: usize, E: Elem> Out<N, E> {
 // strides, `layout()` stops calling `packed` and starts reading what arrived,
 // inside these four impls, with no signature moving.
 
-impl<const N: usize, E: Elem> In<N, E> {
+impl<E: Elem> In<E> {
     /// The allocation's shape, as much of it as the transport delivered.
     #[must_use]
     pub const fn layout(&self) -> Layout {
@@ -1327,7 +1485,7 @@ impl<const N: usize, E: Elem> In<N, E> {
     }
 }
 
-impl<const N: usize, E: Elem> Out<N, E> {
+impl<E: Elem> Out<E> {
     /// See [`In::layout`].
     #[must_use]
     pub const fn layout(&self) -> Layout {
@@ -1347,196 +1505,297 @@ impl<const N: usize, E: Elem> Out<N, E> {
 // per wrapper and saved no lines while hiding which `Provenance` each one
 // takes. The impls are mechanical; that is not the same as being repetitive.
 
-impl<const N: usize, B: Backend, E: Elem> Arg<B> for In<N, E>
+// THE FIVE MARKS' IMPLS.
+//
+// Each states its `Claim` and nothing about an index: the carrier states the
+// `Ty`, the spelling and how the value is recovered, and the mark states which
+// KIND of slot it wants. `resolve` hands out the numbers, because only the
+// signature knows the order and a type cannot see it.
+//
+// THE COMPOSITION RULE, stated once because it is the whole of what replaced
+// fifteen wrappers: A MARK'S SOURCE IS ITS OWN SLOT, OR THE QUESTION ITS KEY
+// NAMES. A mark that claims a slot -- `In`, `Out`, `InOut`, `Weight` -- has
+// its position for a source and needs no key; `Env<T, K>` has no position and
+// takes its source, and its PROVENANCE, from `K`.
+//
+// A CHAIN IS THE KEY'S, NOT A WRAPPER'S. `keys::WindowOrNone` is
+// `Or(Named("window_left"), Lit(-1))` in one place, where `Param<4, Env<i32,
+// keys::NoSlidingWindow>>` spelled the same chain at twenty-one signatures --
+// twenty-one chances to spell a different fallback for one question. Nesting
+// carriers said WHERE to look before WHO answers; a key says who answers, and
+// where is that answerer's business.
+
+impl<B: Backend, E: Elem> Arg<B> for In<E>
 where
-    *const E: Arg<B>,
+    E::Read: Arg<B>,
 {
-    // F3: THE ELEMENT IS THE PARAMETER, THE DIRECTION IS THE WRAPPER'S. The
-    // `Ty` used to come from a pointer type the signature restated at 494 of
-    // 497 sites; it comes from the element and the side now, which is the
-    // pair `ptr_abi!` already wrote on one line.
+    // THE ELEMENT STATES THE TYPE, THE MARK THE DIRECTION -- which is what
+    // took `*const`/`*mut` and `Buf`/`BufMut` out of every signature.
     const TY: Ty = E::TY_CONST;
-    const PROV: Provenance = <*const E as Arg<B>>::PROV;
-    const SIDE: Side = Side::Placed;
-    const SPELLING: &'static str = E::CPP_CONST;
+    // THE ELEMENT'S C++ WORD, OR THE CARRIER'S OWN. CUDA's elements name a
+    // pointer spelling and a shader plane's name none -- a shading language's
+    // spelling belongs to the `Lang`, which only the carrier's own `Arg` impl
+    // can see. Taking the first non-empty gives every plane the spelling it
+    // actually has, instead of the empty string three of them used to derive.
+    const SPELLING: &'static str = spelling(E::CPP_CONST, <E::Read as Arg<B>>::SPELLING);
+    // NOT the slot -- `resolve` supplies that. What survives here is the
+    // CARRIER's source, which the chain needs as its second half.
+    const SOURCE: Option<crate::Source> = <E::Read as Arg<B>>::SOURCE;
+    const CLAIM: Claim = Claim::In;
 
     fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-        let ptr = <*const E as Arg<B>>::unpack(value, at)?;
-        let Extent { rows, width } = B::region(value, at)?;
+        let ptr = <E::Read as Arg<B>>::unpack(value, at)?;
+        let Extent { rows, width } = extent_of::<B>(value)?;
         Ok(In { ptr, rows, width })
     }
 }
 
-impl<const N: usize, B: Backend, E: Elem> Arg<B> for Out<N, E>
+impl<B: Backend, E: Elem> Arg<B> for Out<E>
 where
-    *mut E: Arg<B>,
+    E::Write: Arg<B>,
 {
-    /// See [`In`]'s impl: the element states the type, the wrapper the side.
     const TY: Ty = E::TY_MUT;
-    const PROV: Provenance = <*mut E as Arg<B>>::PROV;
-    const SIDE: Side = Side::Declared;
-    const SPELLING: &'static str = E::CPP_MUT;
+    const SPELLING: &'static str = spelling(E::CPP_MUT, <E::Write as Arg<B>>::SPELLING);
+    const SOURCE: Option<crate::Source> = <E::Write as Arg<B>>::SOURCE;
+    const CLAIM: Claim = Claim::Out;
 
     fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-        let ptr = <*mut E as Arg<B>>::unpack(value, at)?;
-        let Extent { rows, width } = B::region(value, at)?;
+        let ptr = <E::Write as Arg<B>>::unpack(value, at)?;
+        let Extent { rows, width } = extent_of::<B>(value)?;
         Ok(Out { ptr, rows, width })
     }
 }
 
-impl<const N: usize, B: Backend, E: Elem> Arg<B> for Weight<N, *const E>
+impl<B: Backend, E: Elem> Arg<B> for InOut<E>
 where
-    *const E: Arg<B>,
+    E::Write: Arg<B>,
 {
-    const TY: Ty = E::TY_CONST;
-    const PROV: Provenance = <*const E as Arg<B>>::PROV;
-    const SIDE: Side = Side::Placed;
-    const SPELLING: &'static str = E::CPP_CONST;
-    const SOURCE: Option<crate::Source> = Some(crate::Source::Slot(crate::Kind::Weight, N as u8));
+    const TY: Ty = E::TY_MUT;
+    // `Declared`, WITH `Out` AND NOT WITH `In`, and the arity rule is why.
+    // `arity_problem` reads this to decide whether the parameter counts
+    // against the operands the statement places or the results it declares.
+    // An aliased buffer is ONE address the statement placed once; counting it
+    // on both sides would make every routine that aliases read one operand
+    // more than the statement carries. The input slot it also wears is an
+    // ALIASING fact, which `Source::Alias` carries and the allocator reads.
+    const SPELLING: &'static str = spelling(E::CPP_MUT, <E::Write as Arg<B>>::SPELLING);
+    const SOURCE: Option<crate::Source> = <E::Write as Arg<B>>::SOURCE;
+    const CLAIM: Claim = Claim::InOut;
 
     fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-        <*const E as Arg<B>>::unpack(value, at).map(|ptr| Weight { ptr })
+        let ptr = <E::Write as Arg<B>>::unpack(value, at)?;
+        let Extent { rows, width } = extent_of::<B>(value)?;
+        Ok(InOut { ptr, rows, width })
     }
 }
 
-// BOTH TRANSPARENT, INCLUDING `PROV`, and for `Unbound` that is a decision
-// rather than a default taken. `Aux` above overrides `PROV` to `Env` because
-// the `Env<_>` it replaced was already saying so; `Unbound` replaces a BARE
-// pointer, which counts as a read in `arity_problem`, and an `Env` here
-// would silence that count by claiming the runtime always supplies one.
-// That is a stronger claim than the evidence at these parameters supports,
-// and the point of the wrapper is to move a mark into the compiler's reach
-// WITHOUT moving anything else.
-impl<const N: usize, B: Backend, E: Elem> Arg<B> for Bank<N, E>
+// THE FOURTH MARK'S IMPL, AND THE ONLY ONE WHOSE CLAIM IS NOT A CONSTANT OF
+// THE MARK. `ConstRun` is asked, and a `Tensor<E>` answers `Claim::Weight`
+// where a scalar answers `Claim::Param` -- which is what makes one mark serve
+// the weight run and the params run without a second word for it.
+impl<B: Backend, C: ConstRun> Arg<B> for Const<C>
 where
-    *const E: Arg<B>,
+    C::Held: Arg<B>,
 {
-    const TY: Ty = E::TY_CONST;
-    const PROV: Provenance = <*const E as Arg<B>>::PROV;
-    const SIDE: Side = Side::Placed;
-    const SPELLING: &'static str = E::CPP_CONST;
+    const TY: Ty = C::TY;
+    const SPELLING: &'static str = <C::Held as Arg<B>>::SPELLING;
+    const SOURCE: Option<crate::Source> = <C::Held as Arg<B>>::SOURCE;
+    const CLAIM: Claim = C::RUN;
 
     fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-        <*const E as Arg<B>>::unpack(value, at).map(|ptr| Bank { ptr })
+        <C::Held as Arg<B>>::unpack(value, at).map(|v| Const { v })
     }
 }
 
-// THE SLOT PAIR is transparent for the same reason the others are, and
-// differs from `In`/`Out` in one respect only: those call
-// `B::region(value, at)?` to fill `rows` and `width`, and these do not, so a
-// launch whose statement carries no extent at this position still unpacks. A
-// shape that does not exist should not be reachable, and should also not be
-// REQUIRED.
-//
-// THE MIDDLE PAIR calls `B::region` and then THROWS THE ROWS AWAY. That is
-// not waste: `region` is one query answering both extents together, so there
-// is nothing cheaper to ask for, and what changes is what the launcher can
-// SEE. They refuse exactly where `In`/`Out` refuse, unlike the slot pair --
-// which is right, because a wrapper asking for a width against a statement
-// that states no rectangle has none to give.
-impl<B: Backend, T: Arg<B>> Arg<B> for Unbound<T> {
-    const TY: Ty = T::TY;
-    const SIDE: Side = T::SIDE;
-    // `Either`, AND IT USED TO BE `T::PROV` WITH `Or<_>` WRITTEN INSIDE TO GET
-    // HERE. Three sites spelled `Unbound<Or<*const T>>`, which is this type
-    // counting a parameter as a placed read and the inner wrapper taking the
-    // count back off -- two halves of one claim, on one parameter, disagreeing.
-    //
-    // The claim `Unbound` makes is that NOTHING supplies this argument. A
-    // thing nothing supplies is not a thing the STATEMENT places, so counting
-    // it in `arity_problem`'s `reads` was the error and `Or` was the patch.
-    //
-    // Not `Env`, and the old doc's reason stands: `Env` claims the runtime
-    // always supplies one, which is a stronger statement than these
-    // parameters support. `Either` says only that the statement may not have
-    // placed it, which is exactly what `Unbound` already means.
-    const PROV: Provenance = Provenance::Either;
-    const SPELLING: &'static str = T::SPELLING;
+/// AN OPERAND THAT MAY NOT BE THERE, SPELLED IN THE LANGUAGE'S OWN OPTIONAL.
+///
+/// `Option<Const<Tensor<f32>>>` is a bias a checkpoint may or may not carry;
+/// `Option<In<Tensor<bf16>>>` is an input a statement may or may not place.
+/// The mark keeps saying which run and which direction, and the `Option` says
+/// the one thing left — whether it arrived.
+///
+/// # WHY THIS REPLACED A TYPE PER SPELLING
+///
+/// CUDA carried `MaybeConst<T>`, which was `Option<NonNull<T>>` inside a
+/// newtype, and it existed for a reason that has since gone: back when a
+/// nullable `const` pointer had to be told apart from a nullable mutable one
+/// by its TYPE, because there was no mark to say the direction. `Const` says
+/// it now, so `Const<Tensor<MaybeConst<f32>>>` stated const twice and absence
+/// in a spelling nothing else in the tree used — 22 sites of `MaybeConst`
+/// beside 9 of a bare `Option<NonNull<T>>` for the same idea.
+///
+/// It also could not reach the other three marks. A nullable INPUT had no
+/// spelling at all, because `MaybeConst` was a const pointer by construction.
+/// Wrapping the mark instead of the pointee is what makes one word serve all
+/// four.
+///
+/// # The two halves, and which side answers each
+///
+/// The signature says *may be absent*; only the backend knows what an absent
+/// VALUE looks like, so [`Backend::is_absent`] and [`Backend::absent`] answer
+/// A plane that has no such value never produces one, its `is_absent` is
+/// `false`, and every `Option` there unpacks as `Some` — which is what a plane
+/// whose binder cannot mint an absence should say.
+impl<B: Backend, M: Arg<B>> Arg<B> for Option<M> {
+    const TY: Ty = M::TY;
+    const SPELLING: &'static str = M::SPELLING;
+    const SOURCE: Option<crate::Source> = M::SOURCE;
+    const CLAIM: Claim = M::CLAIM;
 
     fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-        T::unpack(value, at).map(|ptr| Unbound { ptr })
+        if value.is_absent() {
+            return Ok(None);
+        }
+        M::unpack(value, at).map(Some)
     }
 }
 
-impl<const N: usize, T> core::ops::Deref for Aux<N, T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        &self.0
+/// The same, on the way out: an operand a body did not get is re-emitted as
+/// the backend's own absent value.
+///
+/// A plane with no such value cannot be holding a `None` — nothing could have
+/// produced it — so the `unwrap_or_else` is unreachable rather than lenient,
+/// and it panics with the sentence that says why.
+impl<V: Absent, M: Bind<V>> Bind<V> for Option<M> {
+    fn arg(self) -> V {
+        match self {
+            Some(m) => m.arg(),
+            None => V::absent().expect(
+                "a body holds `None` for an operand on a plane whose binder cannot mint one",
+            ),
+        }
     }
 }
 
-impl<B: Backend, const N: usize, T: Arg<B>> Arg<B> for Aux<N, T> {
-    const TY: Ty = T::TY;
-    // The one wrapper below that is not transparent to provenance. See the
-    // type's doc: the `Env<_>` this replaces was already saying it, so
-    // leaving it at the default would be a silent arity change rather than a
-    // preserved one.
-    const PROV: Provenance = Provenance::Env;
-    const SPELLING: &'static str = T::SPELLING;
 
-    fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-        T::unpack(value, at).map(Aux)
+/// The element's own C++ word, or the carrier's, whichever was written down.
+///
+/// [`Arg::SPELLING`] reserves the empty string for *"this backend has not
+/// written one down"*, so taking the first non-empty is exactly "ask the one
+/// that knows".
+const fn spelling(elem: &'static str, carrier: &'static str) -> &'static str {
+    if elem.is_empty() { carrier } else { elem }
+}
+
+/// The carrier's source, with the absent case given a shape.
+///
+/// [`crate::Source::Or`] holds `&'static Source`, so a chain needs its second
+/// half as a VALUE first. The `None` arm is never read: every caller matches
+/// on the carrier's source before asking, and the arm exists because a
+/// `const fn` returns one type.
+const fn or_null(inner: Option<crate::Source>) -> crate::Source {
+    match inner {
+        Some(s) => s,
+        None => crate::Source::Lit(crate::Lit::Null),
     }
 }
 
-impl<const N: usize, T> core::ops::Deref for Param<N, T> {
-    type Target = T;
+// THE TWO NAMED WEIGHT CHAINS, AS `static`s BECAUSE `Source::Or` HOLDS
+// REFERENCES. `Facts` carries `w_named` and `w_named2` and nothing else, so a
+// third weight has no NAME to be reached by -- only the positional bank. That
+// used to be a `compile_error!` in the macro; here it is the shorter arm of
+// the match below.
+static NAMED_W0: crate::Source =
+    crate::Source::Named(<crate::keys::NamedWeight as crate::keys::Fact>::KEY);
+static NAMED_W1: crate::Source =
+    crate::Source::Named(<crate::keys::NamedWeight2 as crate::keys::Fact>::KEY);
+static BANK_0: crate::Source = crate::Source::Slot(crate::Kind::Weight, 0);
+static BANK_1: crate::Source = crate::Source::Slot(crate::Kind::Weight, 1);
 
-    fn deref(&self) -> &T {
-        &self.0
+/// The launch's rectangle at `at`, or zeros on a plane that states none.
+///
+/// A PLANE WITH NO REGION SHAPE IS NOT A REFUSAL. `In` used to propagate
+/// `B::region`'s error, which is why the handle planes needed a second pair of
+/// marks: their binders bind addresses only and every operand would have
+/// refused. Zero is already this crate's word for *"the statement gave no
+/// width"* -- [`Region`] refuses on it and `Layout::packed(0, 0)` is a legal
+/// empty -- so the absent case lands on the value every reader already checks.
+fn extent_of<B: Backend>(value: &B::Value) -> Result<Extent, Refusal> {
+    match B::region(value) {
+        Ok(e) => Ok(e),
+        Err(Refusal::Absent { .. } | Refusal::Unstated { .. }) => Ok(Extent { rows: 0, width: 0 }),
+        Err(e) => Err(e),
     }
 }
 
-impl<const N: usize> core::ops::Deref for ParamF32<N> {
-    type Target = f32;
-
-    fn deref(&self) -> &f32 {
-        &self.0
+/// Hand out the slot numbers, in signature order.
+///
+/// THE ONE PLACE AN INDEX IS DECIDED. Every mark says which KIND of slot it
+/// wants and nothing more; the order they appear in is the order the statement
+/// placed them, so the running counters ARE the indices. That is what the
+/// measurement said before the const generics came off: at 172 of 185 CUDA
+/// routines the hand-written number already equalled this count, and all
+/// thirteen exceptions were operands an alias had hidden.
+///
+/// `carriers` rides along because a mark's source may be a CHAIN -- the slot
+/// if the statement fills it, the carrier's own question if it does not.
+#[must_use]
+pub const fn resolve<const N: usize>(
+    claims: [Claim; N],
+    carriers: [Option<crate::Source>; N],
+) -> [Option<crate::Source>; N] {
+    let mut out = [None; N];
+    let (mut ins, mut outs, mut weights) = (0u8, 0u8, 0u8);
+    // ONE COUNTER FOR THE PARAMS RUN, NOT TWO. `Claim::Param` and
+    // `Claim::ParamF32` are two READINGS of one channel -- the run is a
+    // `Vec<u32>` and the bits are the value -- so a float and an integer
+    // constant that follow one another occupy slots `n` and `n + 1`, which is
+    // what `model-dsl` writes and what `Handles::param`/`param_f32` read back.
+    let mut params = 0u8;
+    let mut i = 0;
+    while i < N {
+        out[i] = match claims[i] {
+            Claim::Fixed => carriers[i],
+            Claim::In => {
+                let at = ins;
+                ins += 1;
+                Some(crate::Source::Slot(crate::Kind::In, at))
+            }
+            Claim::Out => {
+                let at = outs;
+                outs += 1;
+                Some(crate::Source::Slot(crate::Kind::Out, at))
+            }
+            // BOTH COUNTERS MOVE, which is the whole of what the mark says:
+            // the statement placed an operand here AND declared a result here,
+            // at one address. `Source::Alias` carries the pair so the
+            // allocator can give them one offset.
+            Claim::InOut => {
+                let (i_at, o_at) = (ins, outs);
+                ins += 1;
+                outs += 1;
+                Some(crate::Source::Alias(i_at, o_at))
+            }
+            // THE PARAMS RUN, WHICH `Param<N, T>` USED TO NUMBER BY HAND.
+            // The slot is the mark's position among the params marks, exactly
+            // as an operand's is among the operand marks -- which is what
+            // closes the hole `vec![0, rows, cols]` was holding open in
+            // `model-dsl`, a placeholder written so `rows` would land at 1.
+            Claim::Param => {
+                let at = params;
+                params += 1;
+                Some(crate::Source::Slot(crate::Kind::Param, at))
+            }
+            Claim::ParamF32 => {
+                let at = params;
+                params += 1;
+                Some(crate::Source::Slot(crate::Kind::ParamF32, at))
+            }
+            Claim::Weight => {
+                let at = weights;
+                weights += 1;
+                // The named bank first and the positional one after, in the
+                // order the binder already tried them.
+                match at {
+                    0 => Some(crate::Source::Or(&NAMED_W0, &BANK_0)),
+                    1 => Some(crate::Source::Or(&NAMED_W1, &BANK_1)),
+                    n => Some(crate::Source::Slot(crate::Kind::Weight, n)),
+                }
+            }
+        };
+        i += 1;
     }
-}
-
-// TRANSPARENT TO PROVENANCE, AND THAT IS THE POINT. A param is the
-// STATEMENT's — `Provenance::Trace`, which is `Arg`'s default and what a bare
-// scalar already derives — so wrapping one changes the `Source` and nothing
-// else. `Aux` overrides `PROV` because it replaced an `Env<_>` that was
-// already claiming the driver supplies it; there is no such claim here.
-//
-// `Side::OfType` and not `Placed`: a param sits on neither side of the
-// statement, because it is not an operand. `Side` answers "which end of the
-// rectangle" for something that has no rectangle, so the honest answer is the
-// one that says nothing was claimed.
-impl<const N: usize, B: Backend, T: Arg<B>> Arg<B> for Param<N, T> {
-    const TY: Ty = T::TY;
-    const PROV: Provenance = T::PROV;
-    const SPELLING: &'static str = T::SPELLING;
-    const SOURCE: Option<crate::Source> = Some(crate::Source::Slot(crate::Kind::Param, N as u8));
-
-    fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-        T::unpack(value, at).map(Param)
-    }
-}
-
-impl<const N: usize, B: Backend> Arg<B> for ParamF32<N>
-where
-    f32: Arg<B>,
-{
-    const TY: Ty = <f32 as Arg<B>>::TY;
-    const PROV: Provenance = <f32 as Arg<B>>::PROV;
-    const SPELLING: &'static str = <f32 as Arg<B>>::SPELLING;
-    // THE SAME LINE `Param<N, T>` CARRIES, and it went missing here when the
-    // slot vocabulary was restored beside CUDA's. Without it this inherits
-    // `Arg`'s default `None`, and `bind` refuses every argument with no
-    // source: `Unstated { what: "an argument whose signature does not say
-    // where it comes from" }`. `neox_mb` takes two `ParamF32`, so the refusal
-    // landed on rope and took 19 of `driver-wgpu`'s 23 serving tests with it
-    // — and would have taken `kernels-metal`'s too, whose `neox_mb` has the
-    // identical signature.
-    const SOURCE: Option<crate::Source> = Some(crate::Source::Slot(crate::Kind::Param, N as u8));
-
-    fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-        <f32 as Arg<B>>::unpack(value, at).map(ParamF32)
-    }
+    out
 }
 
 /// A `fn` that can serve as a routine body.
@@ -1554,14 +1813,7 @@ pub trait KernelFn<B: Backend, M>: Copy {
     /// positional inference has nowhere to live, since `*const T` is the same
     /// type at every position. Sources travel with
     /// [`Derivation`](crate::Derivation) instead.
-    const ARGS: &'static [(Ty, Provenance)];
-    /// Which side of the statement each argument sits on, in the same order.
-    ///
-    /// A SECOND array rather than a third column on [`Self::ARGS`], because
-    /// the pair is read by `driver-metal`'s encoder as well and widening a
-    /// tuple two crates destructure would touch every one of them to say one
-    /// new thing about three routines.
-    const SIDES: &'static [Side];
+    const ARGS: &'static [Ty];
     /// WHICH of the environment's questions each argument is, where a type
     /// says. See [`Ask`].
     const SOURCES: &'static [Option<crate::Source>];
@@ -1584,9 +1836,13 @@ macro_rules! impl_kernel_fn {
         where
             F: for<'x> Fn(&'x B::Ctx<'x>, $($arg),*) -> Result<(), Refusal> + Copy,
         {
-            const ARGS: &'static [(Ty, Provenance)] = &[$(($arg::TY, $arg::PROV)),*];
-            const SIDES: &'static [Side] = &[$($arg::SIDE),*];
-            const SOURCES: &'static [Option<crate::Source>] = &[$($arg::SOURCE),*];
+            const ARGS: &'static [Ty] = &[$($arg::TY),*];
+            // THE ONE PLACE THE INDICES ARE DECIDED. A mark carries a `Claim`
+            // and no number, so the column cannot be a per-type map any more:
+            // `resolve` walks the claims IN SIGNATURE ORDER and hands out the
+            // slots. See [`resolve`] for why the order is the answer.
+            const SOURCES: &'static [Option<crate::Source>] =
+                &const { resolve([$($arg::CLAIM),*], [$($arg::SOURCE),*]) };
             const SPELLING: &'static [&'static str] = &[$($arg::SPELLING),*];
 
             fn invoke<'x>(self, ctx: &'x B::Ctx<'x>, args: &[B::Value]) -> Result<(), Refusal> {
@@ -2336,12 +2592,24 @@ pub type Body<B> =
 /// STATED: they are facts about how a trace may use the routine, which no
 /// signature carries.
 pub struct Routine<B: Backend> {
-    /// The routine's name, which is the `fn`'s name.
+    /// The routine's name, which is the `fn`'s name — or, for a generic body,
+    /// that name with its instantiation joined on.
     pub name: &'static str,
+    /// What a trace prefixes this routine's symbol with.
+    ///
+    /// DERIVED FROM `module_path!()` AT THE `fn`, which is what retired
+    /// `Family`. A family was a container holding one namespace and a group of
+    /// routines, and the namespace was already computed from the module the
+    /// group was declared in -- so attaching it per-routine left the container
+    /// holding nothing but the list.
+    ///
+    /// It also settles a question the grouping had to explain: `attn::xqa` and
+    /// `attn::fa2` were two families sharing one namespace, described in a
+    /// comment on `FAMILIES`. `namespace` takes the first segment after the
+    /// crate root, so both simply answer `"attn"`.
+    pub namespace: &'static str,
     /// Its arguments, derived from the signature.
-    pub args: &'static [(Ty, Provenance)],
-    /// Which side of the statement each argument sits on. See [`Side`].
-    pub sides: &'static [Side],
+    pub args: &'static [Ty],
     /// WHICH of the environment's questions each argument is, where a type
     /// says. See [`Ask`] and [`KernelFn::SOURCES`].
     pub sources: &'static [Option<crate::Source>],
@@ -2354,16 +2622,6 @@ pub struct Routine<B: Backend> {
     pub whole: bool,
     /// This statement participates in the depth-prefix plan.
     pub depth_prefix_plan: bool,
-    /// `(output, input)` pairs that must be given the same address.
-    ///
-    /// OUTPUT FIRST, which three readers fix. Almost every pair is `(0, 0)`
-    /// and symmetric; `apply_per_expert_scale`'s `(0, 1)` and
-    /// `token_batched_weighted_sum_add`'s `(0, 2)` are the two that are not.
-    ///
-    /// In TRACE-OPERAND indices, not argument positions: a routine takes its
-    /// arguments in whatever order the kernel wants, and the aliasing is a
-    /// fact about the statement. So this is stated, not derived.
-    pub in_place: &'static [(u32, u32)],
     /// What `#[routine]` read off the launcher's signature, if the row says.
     ///
     /// It IS derived — that is [`Derived`]'s whole subject — and it no longer
@@ -2379,7 +2637,106 @@ pub struct Routine<B: Backend> {
     pub derived: &'static [Derived],
 }
 
+/// The first path segment after the crate root, out of a `module_path!()`.
+///
+/// `kernels_cuda::attn::fa2` -> `attn`. Written as a byte scan over
+/// `as_bytes()` because this runs in a `const` initialiser, where
+/// `str::split` and `Iterator::nth` are not available.
+///
+/// It lived in `kernels-cuda` as `segment_after_crate`, private to the
+/// `Family` it fed. The routines carry their own namespace now, so it belongs
+/// where the routines are defined and the two `unsafe` blocks are the same
+/// two: a range on `::` boundaries, both ends ASCII, so no multi-byte
+/// sequence can be cut.
+///
+/// # Panics
+///
+/// If `module_path` names the crate root itself, which has no family segment
+/// to take -- every symbol it offered would be a bare routine name that no
+/// trace can state. A `const` call makes that a build failure.
+#[must_use]
+pub const fn namespace(module_path: &'static str) -> &'static str {
+    let bytes = module_path.as_bytes();
+    let mut start = 0;
+    while start + 1 < bytes.len() {
+        if bytes[start] == b':' && bytes[start + 1] == b':' {
+            start += 2;
+            break;
+        }
+        start += 1;
+    }
+    assert!(
+        start > 0 && start < bytes.len(),
+        "a routine at the crate root has no namespace"
+    );
+    let mut end = start;
+    while end + 1 < bytes.len() {
+        if bytes[end] == b':' && bytes[end + 1] == b':' {
+            break;
+        }
+        end += 1;
+    }
+    if end + 1 == bytes.len() {
+        end = bytes.len();
+    }
+    // SAFETY: `start..end` lies on `::` boundaries or on the string's ends,
+    // and `:` is ASCII, so the range begins and ends on a char boundary.
+    unsafe {
+        core::str::from_utf8_unchecked(core::slice::from_raw_parts(
+            bytes.as_ptr().add(start),
+            end - start,
+        ))
+    }
+}
+
+/// The `(output, input)` pairs one source column aliases.
+///
+/// DERIVED, where `in_place = &[(0, 0)]` used to be stated on the row. Free
+/// rather than a method so that [`Routine`] and [`Declared`] share one
+/// definition; both hold the same column.
+///
+/// Output first, as every reader expects.
+#[must_use]
+pub fn aliased(sources: &[Option<crate::Source>]) -> Vec<(u32, u32)> {
+    sources
+        .iter()
+        .filter_map(|s| match s {
+            Some(crate::Source::Alias(i, o)) => Some((u32::from(*o), u32::from(*i))),
+            _ => None,
+        })
+        .collect()
+}
+
 impl<B: Backend> Routine<B> {
+    /// This routine's trace symbol: `namespace::name`.
+    ///
+    /// `Family::symbol` was this, from the outside. It is the routine's own
+    /// answer now, because the routine carries both halves.
+    #[must_use]
+    pub fn symbol(&self) -> String {
+        format!("{}::{}", self.namespace, self.name)
+    }
+
+    /// Whether `symbol` names this routine.
+    ///
+    /// Compares without building the `String` that [`Self::symbol`] would,
+    /// because this is asked once per launched op of every model that loads.
+    #[must_use]
+    pub fn answers(&self, symbol: &str) -> bool {
+        symbol
+            .strip_prefix(self.namespace)
+            .and_then(|t| t.strip_prefix("::"))
+            .is_some_and(|t| t == self.name)
+    }
+
+    /// Which of this routine's results share an address with an operand.
+    ///
+    /// See [`aliased`], and [`InOut`] for what replaced the stated column.
+    #[must_use]
+    pub fn in_place(&self) -> Vec<(u32, u32)> {
+        aliased(self.sources)
+    }
+
     /// This routine, marked as consuming its whole operand.
     #[must_use]
     pub const fn whole(mut self) -> Self {
@@ -2394,13 +2751,6 @@ impl<B: Backend> Routine<B> {
         self
     }
 
-    /// This routine, with its aliasing pairs stated.
-    #[must_use]
-    pub const fn in_place(mut self, pairs: &'static [(u32, u32)]) -> Self {
-        self.in_place = pairs;
-        self
-    }
-
     /// This routine, with `#[routine]`'s operand column attached.
     ///
     /// Kept as a builder because `kernels::routine!` is backend-agnostic and
@@ -2409,6 +2759,28 @@ impl<B: Backend> Routine<B> {
     #[must_use]
     pub const fn derived(mut self, operands: &'static [Derived]) -> Self {
         self.derived = operands;
+        self
+    }
+
+    /// This routine, with its source column STATED rather than derived.
+    ///
+    /// # For rows that have no signature to derive one from
+    ///
+    /// [`untraced`] rows are the whole of the audience: their bodies are
+    /// typed calls the driver makes, not `fn`s whose parameters are marks, so
+    /// `sources` is empty and everything read out of it -- [`aliased`] above
+    /// all -- comes back empty too. One row needs it not to:
+    /// `comm::all_reduce_residual_rmsnorm_bf16` updates the residual IN PLACE
+    /// and declares a result, which the row used to say beside it as
+    /// `in_place = &[(0, 1)]`, and an allocator that does not hear it hands
+    /// the launch a fresh buffer for a result the kernel never writes.
+    ///
+    /// Not a way back to stating what a signature says. A `#[routine]` row
+    /// derives its column and this would be shadowed by it; the only caller
+    /// is a row that has no column at all.
+    #[must_use]
+    pub const fn stating(mut self, sources: &'static [Option<crate::Source>]) -> Self {
+        self.sources = sources;
         self
     }
 }
@@ -2426,12 +2798,12 @@ impl<B: Backend> Routine<B> {
 // are all `==` and which nothing puts in a set.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Declared {
-    /// The routine's name, which is the `fn`'s name.
+    /// The routine's name.
     pub name: &'static str,
+    /// What a trace prefixes it with. See [`Routine::namespace`].
+    pub namespace: &'static str,
     /// Its arguments, derived from the signature.
-    pub args: &'static [(Ty, Provenance)],
-    /// Which side of the statement each argument sits on. See [`Side`].
-    pub sides: &'static [Side],
+    pub args: &'static [Ty],
     /// WHICH of the environment's questions each argument is, where a type
     /// says. See [`Ask`] and [`KernelFn::SOURCES`].
     pub sources: &'static [Option<crate::Source>],
@@ -2439,11 +2811,25 @@ pub struct Declared {
     pub whole: bool,
     /// This statement participates in the depth-prefix plan.
     pub depth_prefix_plan: bool,
-    /// `(output, input)` pairs that must be given the same address.
+    /// The parameter names and their NULLABILITY, in [`Self::args`] order.
     ///
-    /// OUTPUT FIRST; see [`Routine::in_place`] for the three readers that fix
-    /// the order.
-    pub in_place: &'static [(u32, u32)],
+    /// Carried here because a nullable operand is an OPTIONAL one: the
+    /// statement need not place it, and a reader comparing the signature's
+    /// operand count against the statement's has to know which of the two
+    /// counts is allowed to be short. `Provenance::Either` said this before
+    /// the marks, on a wrapper; the carrier says it now, and this is how it
+    /// reaches a reader outside the crate.
+    pub derived: &'static [crate::Derived],
+}
+
+impl Declared {
+    /// Which of this row's results share an address with an operand.
+    ///
+    /// See [`aliased`].
+    #[must_use]
+    pub fn in_place(&self) -> Vec<(u32, u32)> {
+        aliased(self.sources)
+    }
 }
 
 impl<B: Backend> Routine<B> {
@@ -2452,12 +2838,12 @@ impl<B: Backend> Routine<B> {
     pub const fn declared(&self) -> Declared {
         Declared {
             name: self.name,
+            namespace: self.namespace,
             args: self.args,
-            sides: self.sides,
             sources: self.sources,
             whole: self.whole,
             depth_prefix_plan: self.depth_prefix_plan,
-            in_place: self.in_place,
+            derived: self.derived,
         }
     }
 }
@@ -2469,7 +2855,6 @@ impl<B: Backend> core::fmt::Debug for Routine<B> {
             .field("args", &self.args)
             .field("whole", &self.whole)
             .field("depth_prefix_plan", &self.depth_prefix_plan)
-            .field("in_place", &self.in_place)
             .finish_non_exhaustive()
     }
 }
@@ -2479,14 +2864,8 @@ impl<B: Backend> core::fmt::Debug for Routine<B> {
 /// The value is discarded: a `fn` item is a zero-sized type, and everything
 /// wanted is in its type.
 #[must_use]
-pub const fn describe<B: Backend, M, F: KernelFn<B, M>>(_body: F) -> &'static [(Ty, Provenance)] {
+pub const fn describe<B: Backend, M, F: KernelFn<B, M>>(_body: F) -> &'static [Ty] {
     F::ARGS
-}
-
-/// The same signature's SLOTS, in the same order. See [`Side`].
-#[must_use]
-pub const fn sides<B: Backend, M, F: KernelFn<B, M>>(_body: F) -> &'static [Side] {
-    F::SIDES
 }
 
 /// The same signature's QUESTIONS, in the same order. See [`Ask`].
@@ -2516,7 +2895,39 @@ pub const fn spell<B: Backend, M, F: KernelFn<B, M>>(_body: F) -> &'static [&'st
 /// its driver calls by path. The `fn` is NAMED, so deleting it fails this
 /// expansion rather than leaving a symbol nothing runs.
 #[macro_export]
-macro_rules! driver_bound {
+macro_rules! untraced {
+    // THE FORM `#[routine(untraced)]` EMITS.
+    ($backend:ty, $name:literal, $body:expr, namespace = $ns:expr $(, $fact:ident $(= $value:expr)?)* $(,)?) => {{
+        // The point of naming `$body` rather than only stringifying it: a
+        // declaration whose `fn` has been deleted is the defect this table was
+        // rebuilt to make impossible.
+        #[allow(dead_code)]
+        fn names_a_real_fn() {
+            let _ = $body;
+        }
+        fn by_path<'x>(
+            _ctx: &'x <$backend as $crate::routine::Backend>::Ctx<'x>,
+            _args: &[<$backend as $crate::routine::Backend>::Value],
+        ) -> ::core::result::Result<(), $crate::routine::Refusal> {
+            ::core::result::Result::Err($crate::routine::Refusal::Absent {
+                what: "a statement-bound body: this symbol is declared so a model \
+                       text may name it, and fired by the driver through a typed \
+                       call rather than by string",
+            })
+        }
+        $crate::routine::Routine::<$backend> {
+            name: $name,
+            namespace: $ns,
+            args: &[],
+            sources: &[],
+            spelling: &[],
+            body: by_path,
+            whole: false,
+            depth_prefix_plan: false,
+            derived: &[],
+        }
+        $(.$fact($($value)?))*
+    }};
     ($backend:ty, $body:ident $(, $fact:ident $(= $value:expr)?)* $(,)?) => {{
         // The point of naming `$body` rather than only stringifying it. A
         // declaration whose `fn` has been deleted is the defect this whole
@@ -2539,13 +2950,11 @@ macro_rules! driver_bound {
         $crate::routine::Routine::<$backend> {
             name: ::core::stringify!($body),
             args: &[],
-            sides: &[],
             sources: &[],
             spelling: &[],
             body: by_path,
             whole: false,
             depth_prefix_plan: false,
-            in_place: &[],
             derived: &[],
         }
         $(.$fact($($value)?))*
@@ -2554,19 +2963,21 @@ macro_rules! driver_bound {
 
 /// One routine's row, from its `fn` and nothing else.
 ///
-/// Backends wrap this with their own [`Backend`] type filled in, so that a
-/// routine declaration names only the `fn`:
+/// # Not a public surface
 ///
-/// ```ignore
-/// macro_rules! routine {
-///     ($f:ident $(, $($rest:tt)*)?) => {
-///         ::kernels::routine!($crate::Cuda, $f $(, $($rest)*)?)
-///     };
-/// }
-/// ```
+/// `#[routine]` is the only caller, and the only one there should be: it is
+/// where a routine's name, namespace, facts and registration are decided
+/// together. Four backends used to wrap this with their own [`Backend`] filled
+/// in, so a membership list could name only the `fn`; there is no membership
+/// list, so there is nothing to wrap.
 ///
 /// Trailing facts are the `const` builders of [`Routine`], named:
-/// `routine!(B, rope_bf16, whole, in_place = &[(0, 0)])`.
+/// `routine!(B, rope_bf16, whole)`.
+///
+/// `in_place` IS NOT AMONG THEM ANY MORE. It was, forty-five times, and it is
+/// [`InOut`] now: the pairs derive from the parameter that wears both slots,
+/// through [`crate::Source::Alias`], so the numbers cannot disagree with the
+/// signature they index.
 ///
 /// A generic body answers several symbols, as
 /// `routine!(B, rope_bf16 = rope::<bf16, 256>)`; the name is written out
@@ -2575,6 +2986,28 @@ macro_rules! driver_bound {
 /// where the instantiation is chosen, so the two cannot drift.
 #[macro_export]
 macro_rules! routine {
+    // THE FORM `#[routine]` EMITS: a composed name, an instantiated body and
+    // the namespace the attribute read off `module_path!()`.
+    ($backend:ty, $name:literal, $body:expr, namespace = $ns:expr $(, $fact:ident $(= $value:expr)?)* $(,)?) => {{
+        fn shim<'x>(
+            ctx: &'x <$backend as $crate::routine::Backend>::Ctx<'x>,
+            args: &[<$backend as $crate::routine::Backend>::Value],
+        ) -> ::core::result::Result<(), $crate::routine::Refusal> {
+            <_ as $crate::routine::KernelFn<$backend, _>>::invoke($body, ctx, args)
+        }
+        $crate::routine::Routine::<$backend> {
+            name: $name,
+            namespace: $ns,
+            args: $crate::routine::describe::<$backend, _, _>($body),
+            sources: $crate::routine::sources::<$backend, _, _>($body),
+            spelling: $crate::routine::spell::<$backend, _, _>($body),
+            body: shim,
+            whole: false,
+            depth_prefix_plan: false,
+            derived: &[],
+        }
+        $(.$fact($($value)?))*
+    }};
     ($backend:ty, $name:ident = $body:expr $(, $fact:ident $(= $value:expr)?)* $(,)?) => {{
         fn shim<'x>(
             ctx: &'x <$backend as $crate::routine::Backend>::Ctx<'x>,
@@ -2584,14 +3017,16 @@ macro_rules! routine {
         }
         $crate::routine::Routine::<$backend> {
             name: ::core::stringify!($name),
+            // EMPTY, AND SAID SO. A row written by hand states no module, and
+            // `namespace` is what `#[routine]` reads off `module_path!()` --
+            // there is nothing here to read it off.
+            namespace: "",
             args: $crate::routine::describe::<$backend, _, _>($body),
-            sides: $crate::routine::sides::<$backend, _, _>($body),
             sources: $crate::routine::sources::<$backend, _, _>($body),
             spelling: $crate::routine::spell::<$backend, _, _>($body),
             body: shim,
             whole: false,
             depth_prefix_plan: false,
-            in_place: &[],
             derived: &[],
         }
         $(.$fact($($value)?))*
@@ -2607,14 +3042,15 @@ macro_rules! routine {
         }
         $crate::routine::Routine::<$backend> {
             name: ::core::stringify!($body),
+            // EMPTY, AND SAID SO. See the arm above: a row written by hand
+            // states no module, and there is nothing here to read one off.
+            namespace: "",
             args: $crate::routine::describe::<$backend, _, _>($body),
-            sides: $crate::routine::sides::<$backend, _, _>($body),
             sources: $crate::routine::sources::<$backend, _, _>($body),
             spelling: $crate::routine::spell::<$backend, _, _>($body),
             body: shim,
             whole: false,
             depth_prefix_plan: false,
-            in_place: &[],
             derived: &[],
         }
         $(.$fact($($value)?))*
@@ -2644,130 +3080,83 @@ const _: () = {
     assert!(start + (count - 1) <= rows);
 };
 
-// ── The slot vocabulary's impls ──
-
-impl<const N: usize, B: Backend, T: Arg<B>> Arg<B> for InRow<N, T> {
-    const TY: Ty = T::TY;
-    const PROV: Provenance = T::PROV;
-    const SPELLING: &'static str = T::SPELLING;
-
-    fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-        let ptr = T::unpack(value, at)?;
-        let Extent { width, .. } = B::region(value, at)?;
-        Ok(InRow { ptr, width })
-    }
-}
-
-impl<const N: usize, B: Backend, T: Arg<B>> Arg<B> for OutRow<N, T> {
-    const TY: Ty = T::TY;
-    const PROV: Provenance = T::PROV;
-    const SPELLING: &'static str = T::SPELLING;
-
-    fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-        let ptr = T::unpack(value, at)?;
-        let Extent { width, .. } = B::region(value, at)?;
-        Ok(OutRow { ptr, width })
-    }
-}
-
-impl<const N: usize, B: Backend, T: Arg<B>> Arg<B> for InSlot<N, T> {
-    const TY: Ty = T::TY;
-    const PROV: Provenance = T::PROV;
-    const SIDE: Side = Side::Placed;
-    const SPELLING: &'static str = T::SPELLING;
-    // The slot IS the source, and STAGE 2 already proved it against every
-    // arm. Forwarding `T::SOURCE` left that proof out of the column the
-    // binder reads.
-    const SOURCE: Option<crate::Source> =
-        Some(crate::Source::Slot(crate::Kind::In, N as u8));
-
-    fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-        T::unpack(value, at).map(|ptr| InSlot { ptr })
-    }
-}
-
-impl<const N: usize, B: Backend, T: Arg<B>> Arg<B> for OutSlot<N, T> {
-    const TY: Ty = T::TY;
-    const PROV: Provenance = T::PROV;
-    const SIDE: Side = Side::Declared;
-    const SPELLING: &'static str = T::SPELLING;
-    // The slot IS the source, and STAGE 2 already proved it against every
-    // arm. Forwarding `T::SOURCE` left that proof out of the column the
-    // binder reads.
-    const SOURCE: Option<crate::Source> =
-        Some(crate::Source::Slot(crate::Kind::Out, N as u8));
-
-    fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-        T::unpack(value, at).map(|ptr| OutSlot { ptr })
-    }
-}
-
-impl<const N: usize, T> core::ops::Deref for InSlot<N, T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        &self.ptr
-    }
-}
-
-impl<const N: usize, T> core::ops::Deref for OutSlot<N, T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        &self.ptr
-    }
-}
-
-impl<const N: usize, T> core::ops::Deref for Weight<N, T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        &self.ptr
-    }
-}
-
 // ── Constructors, for the fixtures that build a row by hand ──
 
-impl<const N: usize, T> Param<N, T> {
-    /// Wrap a value the statement carried in param slot `N`.
+
+impl<E: Elem> In<E> {
+    /// Wear the next input slot for this carrier, with no rectangle stated.
+    pub const fn new(ptr: E::Read) -> Self {
+        Self { ptr, rows: 0, width: 0 }
+    }
+}
+
+impl<E: Elem> Out<E> {
+    /// Wear the next result slot, with no rectangle stated.
+    pub const fn new(ptr: E::Write) -> Self {
+        Self { ptr, rows: 0, width: 0 }
+    }
+}
+
+impl<E: Elem> InOut<E> {
+    /// Wear both slots at one address, with no rectangle stated.
+    pub const fn new(ptr: E::Write) -> Self {
+        Self { ptr, rows: 0, width: 0 }
+    }
+
+    /// A WINDOW into the operand: `count` rows starting at row `start`. See
+    /// [`In::window`].
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Absent`] naming `what` when the statement gave no row width,
+    /// and [`Refusal::Wide`] when the window runs past the operand's rows.
+    pub fn window(
+        &self,
+        start: u32,
+        count: i32,
+        what: &'static str,
+    ) -> Result<Region<E::Write>, Refusal> {
+        if self.width <= 0 {
+            return Err(Refusal::Absent { what });
+        }
+        let end = i64::from(start).saturating_add(i64::from(count.max(0)));
+        if end > i64::from(self.rows) {
+            return Err(Refusal::Wide { what, at: end, max: i64::from(self.rows) });
+        }
+        // SAFETY: the bound above proves the offset lies inside the operand.
+        let ptr = unsafe { E::advance_write(self.ptr, start as usize * self.width as usize) };
+        Ok(Region { ptr, rows: count, width: self.width, stride: Stride(self.width) })
+    }
+
+    /// This operand's view over a row count the CALLER supplies. See
+    /// [`In::over`].
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Absent`] naming `what`.
+    pub fn over(&self, rows: i32, what: &'static str) -> Result<Region<E::Write>, Refusal> {
+        if self.width <= 0 {
+            return Err(Refusal::Absent { what });
+        }
+        Ok(Region { ptr: self.ptr, rows, width: self.width, stride: Stride(self.width) })
+    }
+
+    /// This launch's whole view of the operand. See [`In::all`].
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Absent`] naming `what`.
+    pub fn all(&self, what: &'static str) -> Result<Region<E::Write>, Refusal> {
+        if self.width <= 0 {
+            return Err(Refusal::Absent { what });
+        }
+        Ok(Region { ptr: self.ptr, rows: self.rows, width: self.width, stride: Stride(self.width) })
+    }
+
+    /// See [`In::layout`].
     #[must_use]
-    pub const fn new(v: T) -> Self {
-        Self(v)
+    pub const fn layout(&self) -> Layout {
+        Layout::packed(self.rows, self.width)
     }
 }
 
-impl<const N: usize> ParamF32<N> {
-    /// Wrap a float the statement carried.
-    #[must_use]
-    pub const fn new(v: f32) -> Self {
-        Self(v)
-    }
-}
-
-impl<const N: usize, T> InSlot<N, T> {
-    /// Wear slot `N` for this pointer.
-    pub const fn new(ptr: T) -> Self {
-        Self { ptr }
-    }
-}
-
-impl<const N: usize, T> OutSlot<N, T> {
-    /// Wear result slot `N` for this pointer.
-    pub const fn new(ptr: T) -> Self {
-        Self { ptr }
-    }
-}
-
-impl<const N: usize, T> Weight<N, T> {
-    /// Wear named-weight slot `N` for this pointer.
-    pub const fn new(ptr: T) -> Self {
-        Self { ptr }
-    }
-}
-
-impl<Q, T> Ask<Q, T> {
-    /// Carry `ptr` as the answer to question `Q`.
-    pub const fn new(ptr: T) -> Self {
-        Self { ptr, of: core::marker::PhantomData }
-    }
-}

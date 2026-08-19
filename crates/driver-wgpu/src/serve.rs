@@ -88,11 +88,23 @@ use kernels_wgpu::Capability;
 /// that checks what happens to a module `naga` will not take has no other way to
 /// produce one.
 pub trait Modules {
+    /// The source for the point a body named, by the file it named it in.
+    ///
+    /// THE FIRE PATH'S LOOKUP. A body states both halves — `Fire::at` takes
+    /// the file and the entrypoint — so this is a lookup in one source rather
+    /// than a scan across every embedded one, and two files declaring the same
+    /// entrypoint name can no longer resolve to whichever came first.
+    fn at(&self, file: &str, entrypoint: &str, tier: Capability) -> Option<String>;
+
     /// The source for an entrypoint at a tier.
     ///
     /// `None` means this store has not got it, which for a tier above
     /// [`Capability::Baseline`] is the ordinary answer and the caller's cue to
     /// ask again at baseline.
+    ///
+    /// **Not the fire path.** [`Self::at`] is. This answers for a name that
+    /// arrives without a file — the plan's own symbol, and the reflection a
+    /// server does before any body has run.
     fn source(&self, entrypoint: &str, tier: Capability) -> Option<String>;
 }
 
@@ -105,6 +117,10 @@ pub trait Modules {
 pub struct Embedded;
 
 impl Modules for Embedded {
+    fn at(&self, file: &str, entrypoint: &str, tier: Capability) -> Option<String> {
+        kernels_wgpu::source::at(file, entrypoint, tier).ok()
+    }
+
     fn source(&self, entrypoint: &str, tier: Capability) -> Option<String> {
         kernels_wgpu::entrypoint_source(entrypoint, tier).ok()
     }

@@ -369,6 +369,47 @@ impl<'a> Handles<'a> {
         Ok(self.take(at))
     }
 
+    /// Elements per row of the statement's `n`th INPUT.
+    ///
+    /// THE HALF A HANDLE DOES NOT CARRY, and the reason it is asked for at
+    /// all: `Tensor<E>` gives a mark the rectangle as well as the buffer, so
+    /// `bind`'s `shaped` asks both questions where it used to ask one. A
+    /// backend that answers only the first binds every operand at width ZERO,
+    /// and every body reading `x.width` refuses `Empty`.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Empty`] when the statement carries no such input.
+    pub fn in_width(&self, n: usize) -> Result<i32, Refusal> {
+        self.width_at(self.ins.get(n).copied(), "an input operand the arm asked for")
+    }
+
+    /// Elements per row of the statement's `n`th RESULT. See [`Self::in_width`].
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Empty`] when the statement declares no such result.
+    pub fn out_width(&self, n: usize) -> Result<i32, Refusal> {
+        self.width_at(self.outs.get(n).copied(), "a result the arm asked for")
+    }
+
+    /// One operand's row width, off the argument the lowering stated.
+    ///
+    /// A WEIGHT HAS NONE, and answers zero rather than refusing: its extents
+    /// are the checkpoint's and the statement does not restate them.
+    fn width_at(&self, at: Option<usize>, what: &'static str) -> Result<i32, Refusal> {
+        let at = at.ok_or(Refusal::Empty { what })?;
+        let width = match self.args.get(at).ok_or(Refusal::Empty { what })? {
+            Arg::Arena { width, .. } | Arg::Named { width, .. } => *width,
+            Arg::Weight(_) => 0,
+        };
+        i32::try_from(width).map_err(|_| Refusal::Wide {
+            what: "an operand's row width",
+            at: i64::from(width),
+            max: i64::from(i32::MAX),
+        })
+    }
+
     /// The `n`th OUTPUT, as a handle.
     ///
     /// # Errors
@@ -1288,14 +1329,17 @@ mod tests {
         // minted in order -- so asserting it proves nothing on its own. What
         // it does pin is that the body asked four times and got four
         // distinct slots.
+        // BOUND AS `Shaped`, AND THE ROW COUNT IS NOT HERE. Each operand now
+        // carries the rectangle the statement gave it -- that is what a mark
+        // binds on this plane -- and the `U32(7)` that used to close the run
+        // was the row count, which the body asks the fire for.
         assert_eq!(
             args,
             vec![
-                ArgValue::Buffer(0),
-                ArgValue::Buffer(1),
-                ArgValue::Buffer(2),
-                ArgValue::Buffer(3),
-                ArgValue::U32(7),
+                ArgValue::Shaped { handle: 0, rows: 7, width: 1 },
+                ArgValue::Shaped { handle: 1, rows: 7, width: 1 },
+                ArgValue::Shaped { handle: 2, rows: 7, width: 1 },
+                ArgValue::Shaped { handle: 3, rows: 7, width: 1 },
             ]
         );
 

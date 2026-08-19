@@ -3252,7 +3252,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            8,
+            2,
+            256
           ]
         }
       },
@@ -3305,7 +3307,8 @@
             "layer": 0
           },
           "params": [
-            4294967295
+            0,
+            1031798784
           ]
         }
       },
@@ -3459,7 +3462,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "mlp::gaussian_topk_bf16"
+          "kernel": "mlp::gaussian_topk_bf16",
+          "params": [
+            1070762640
+          ]
         }
       },
       "inputs": [
@@ -4075,7 +4081,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            8,
+            2,
+            256
           ]
         }
       },
@@ -4128,7 +4136,8 @@
             "layer": 1
           },
           "params": [
-            4294967295
+            0,
+            1031798784
           ]
         }
       },
@@ -4282,7 +4291,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "mlp::gaussian_topk_bf16"
+          "kernel": "mlp::gaussian_topk_bf16",
+          "params": [
+            1070762640
+          ]
         }
       },
       "inputs": [
@@ -4898,7 +4910,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            8,
+            2,
+            256
           ]
         }
       },
@@ -4951,7 +4965,8 @@
             "layer": 2
           },
           "params": [
-            4294967295
+            0,
+            1031798784
           ]
         }
       },
@@ -5105,7 +5120,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "mlp::gaussian_topk_bf16"
+          "kernel": "mlp::gaussian_topk_bf16",
+          "params": [
+            1070762640
+          ]
         }
       },
       "inputs": [
@@ -5721,7 +5739,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            8,
+            2,
+            256
           ]
         }
       },
@@ -5774,7 +5794,8 @@
             "layer": 3
           },
           "params": [
-            4294967295
+            0,
+            1031798784
           ]
         }
       },
@@ -6530,7 +6551,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            8,
+            2,
+            256
           ]
         }
       },
@@ -6583,7 +6606,8 @@
             "layer": 4
           },
           "params": [
-            4294967295
+            0,
+            1031798784
           ]
         }
       },
@@ -7339,7 +7363,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            8,
+            2,
+            256
           ]
         }
       },
@@ -7392,7 +7418,8 @@
             "layer": 5
           },
           "params": [
-            4294967295
+            0,
+            1031798784
           ]
         }
       },

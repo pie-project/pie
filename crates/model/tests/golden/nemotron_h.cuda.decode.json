@@ -1143,7 +1143,8 @@
       },
       "inputs": [
         5,
-        7
+        7,
+        9
       ],
       "outputs": [
         10,
@@ -1163,7 +1164,12 @@
       },
       "inputs": [
         6,
-        10
+        10,
+        5,
+        7,
+        8,
+        9,
+        11
       ],
       "outputs": [
         12
@@ -1566,7 +1572,8 @@
       },
       "inputs": [
         36,
-        38
+        38,
+        40
       ],
       "outputs": [
         41,
@@ -1586,7 +1593,12 @@
       },
       "inputs": [
         37,
-        41
+        41,
+        36,
+        38,
+        39,
+        40,
+        42
       ],
       "outputs": [
         43
@@ -1898,7 +1910,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            16,
+            4,
+            128
           ]
         }
       },
@@ -1944,15 +1958,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 128,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 3
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -2279,7 +2305,8 @@
       },
       "inputs": [
         84,
-        86
+        86,
+        88
       ],
       "outputs": [
         89,
@@ -2299,7 +2326,12 @@
       },
       "inputs": [
         85,
-        89
+        89,
+        84,
+        86,
+        87,
+        88,
+        90
       ],
       "outputs": [
         91
@@ -2669,7 +2701,7 @@
     {
       "seam": "attn.out",
       "layer": 3,
-      "op": 57,
+      "op": 58,
       "values": [
         65
       ]
@@ -2677,7 +2709,7 @@
     {
       "seam": "attn.out",
       "layer": 4,
-      "op": 78,
+      "op": 79,
       "values": [
         91
       ]

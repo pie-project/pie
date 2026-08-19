@@ -385,6 +385,22 @@ impl Lowerer<'_> {
                     .unwrap_or(u32::MAX);
                 }
             }
+        } else {
+            // A SEMANTIC OP'S OWN NUMBERS, WHICH ONLY THIS BRANCH CAN PLACE.
+            //
+            // A statement's scalars used to be an `OpKind::Launch` thing
+            // ONLY, because `params` is a field on that variant and on no
+            // other. That was survivable while the routines took their
+            // numbers as facts; it stopped being so when the marks became
+            // four, because a `Const<i32>` PROMISES the statement carries the
+            // number and a semantic op had no way to keep the promise.
+            //
+            // Most of them still have not: the fix for those is that the
+            // routine asks, because the op does not hold the number to give
+            // (`OpKind::Embed` carries a weight name and nothing else). This
+            // arm is for the ones that DO hold it, where refusing to pass it
+            // on would be the lowering losing a fact it was handed.
+            self.params.extend_from_slice(&semantics::semantic_params(&op.kind));
         }
         self.launches.push(Launch {
             kernel: id,

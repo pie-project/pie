@@ -2,11 +2,11 @@
 //! shader text cannot produce because they predate a region, so they are
 //! declared here by hand rather than lowered.
 
+use kernels_macros::routine;
 use kernels::KernelSig;
 use kernels::routine::{Refusal};
 
-use crate::routine::{keys, Ask, Bind, Block, Buf, BufMut, Ctx, Fire, Routine};
-use crate::routine::{InSlot, OutSlot};
+use crate::routine::{Asks, Bind, Ctx, Fire, In, Out, Tensor, bf16, keys};
 
 /// EMPTY: this family's row has been RETIRED.
 ///
@@ -41,35 +41,28 @@ pub static ENTRYPOINTS: &[&str] = &["copy_logits_bf16"];
 /// [`Refusal::Empty`] for no rows or an empty vocabulary, and
 /// [`Refusal::Narrow`] for an odd one: an odd pitch starts the next row inside
 /// the previous row's last word.
+#[routine]
 pub fn copy_logits_bf16(
-    ctx: &Ctx,
-    source: InSlot<0, Buf>,
-    destination: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    vocab: Ask<keys::Width, u32>,
-    rows: Ask<keys::Rows, u32>,
-) -> Result<(), Refusal> {
-    if *rows == 0 {
+    ctx: &Ctx<'_>,
+    source: In<Tensor<bf16>>,
+    destination: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let vocab = source.width.unsigned_abs();
+    let rows = ctx.ask::<u32, keys::Rows>()?;
+    if rows == 0 {
         return Err(Refusal::Empty { what: "rows" });
     }
-    if *vocab == 0 {
+    if vocab == 0 {
         return Err(Refusal::Empty { what: "vocab" });
     }
-    if !(*vocab).is_multiple_of(2) {
+    if !(vocab).is_multiple_of(2) {
         return Err(Refusal::Narrow {
             what: "vocab",
-            at: i64::from(*vocab),
+            at: i64::from(vocab),
         });
     }
-    ctx.dispatch(
-        Fire {
-            module: "ptir/logits_copy.wgsl",
-            entrypoint: "copy_logits_bf16",
-            lanes: [*vocab / 2, *rows, 1],
-        },
-        &[source.v(), destination.v(), params.v()],
+    ctx.fire(
+        Fire::at("ptir/logits_copy.wgsl", "copy_logits_bf16").apply([vocab / 2, rows, 1]),
+        &[source.arg(), destination.arg(), params],
     )
 }
-
-/// This family's routines.
-pub static ROUTINES: &[Routine] = &[crate::routine!(copy_logits_bf16)];

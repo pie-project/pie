@@ -10,6 +10,9 @@ pub static ARMS: &[Bound] = &[
     // nothing declares the `_gate_second` twin, so the `true` branch is
     // unreachable from any trace.
     Bound::derived("mlp::chunked_swiglu_bf16"),
+    // The same kernel over a destination the statement places; see the
+    // routine for why one mark could not serve both shapes.
+    Bound::derived("mlp::chunked_swiglu_into_bf16"),
     Bound::derived("mlp::relu2_bf16"),
     // `gate: In<0, T>` must state its index: `in_place = &[(0, 0)]` spends BOTH
     // pointers on the aliased buffer, the case the alias walk excludes, so a

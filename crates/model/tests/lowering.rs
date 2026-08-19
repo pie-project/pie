@@ -1645,7 +1645,7 @@ const SEMANTIC_CENSUS: &[&str] = &[
     // did not get a kernel or a port -- their host programs have been in
     // `kernels_cuda::driver_internal` all along, and that module DECLARED
     // nothing, so four symbols these very arms name had no row on the backend
-    // every one of them is spelled for. They are `driver_bound!` lines in
+    // every one of them is spelled for. They are `untraced!` lines in
     // `attn`, `layout`, `mlp` and `ssm` now. Nothing about the lowering
     // changed; what changed is that the census can no longer be read as "CUDA
     // cannot do these", which is what four `-`s in a table headed "declares or
@@ -1668,8 +1668,13 @@ const SEMANTIC_CENSUS: &[&str] = &[
     "attn::split_qkv_bf16 ....................... cuda yes metal -",
     "rope::rope_partial_bf16 .................... cuda yes metal -",
     "rope::rope_bf16 ............................ cuda yes metal -",
-    "gemm::act_x_w_acc .......................... cuda - metal -",
-    "gemm::act_x_w .............................. cuda - metal -",
+    // `cuda yes`, AND IT WAS ALREADY: both are `#[routine]`s in
+    // `kernels-cuda/src/gemm`, and both had a `routine!` row before that.
+    // The `-` here was a census taken when the pair had no row and never
+    // retaken — the kind of staleness this list exists to catch, caught on
+    // itself the first time the tree compiled well enough to run it.
+    "gemm::act_x_w_acc .......................... cuda yes metal -",
+    "gemm::act_x_w .............................. cuda yes metal -",
     "moe::moe_grouped_gemm_bf16 ................. cuda yes metal -",
     "moe::topk_softmax_bf16 ..................... cuda yes metal -",
     "moe::token_batched_weighted_sum_bf16 ....... cuda yes metal -",

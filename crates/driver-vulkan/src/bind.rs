@@ -48,7 +48,7 @@ pub struct Held<'a, 'h, 'o> {
 /// Whatever the binder refuses with: an operand the statement does not carry,
 /// a fact this backend does not answer, a carrier a value does not fit.
 pub fn bind(
-    args: &[(Ty, kernels::Provenance)],
+    args: &[Ty],
     sources: &[Option<kernels::Source>],
     o: &mut Handles<'_, '_>,
     f: Facts,
@@ -57,21 +57,42 @@ pub fn bind(
     kernels::bind::bind::<ArgValue, _>(args, sources, &mut held)
 }
 
+/// ONE value, for a body that ASKS rather than a column that declares.
+///
+/// The same resolver, entered at one argument instead of a list: `ctx.ask::<C,
+/// keys::X>()` resolves the key's own `Source`, `ctx.params()` the staged
+/// block, and `ctx.absent()` a null. Nothing new answers — what changed is
+/// only where the question is asked from.
+///
+/// # Errors
+///
+/// [`Refusal::Unstated`] for a fact this backend does not answer, and whatever
+/// the fact's own absence means otherwise.
+pub fn one(
+    ty: Ty,
+    source: kernels::Source,
+    o: &mut Handles<'_, '_>,
+    f: Facts,
+) -> Result<ArgValue, Refusal> {
+    let mut held = Held { o, f };
+    kernels::bind::one::<ArgValue, _>(ty, source, &mut held)
+}
+
 impl Holds for Held<'_, '_, '_> {
     fn input(&mut self, n: usize) -> Result<u32, Refusal> {
-        self.o.input(n).map(|b| b.0)
+        self.o.input(n)
     }
 
     fn output(&mut self, n: usize) -> Result<u32, Refusal> {
-        self.o.output(n).map(|b| b.0)
+        self.o.output(n)
     }
 
     fn output_read(&mut self, n: usize) -> Result<u32, Refusal> {
-        self.o.output_read(n).map(|b| b.0)
+        self.o.output_read(n)
     }
 
     fn weight(&mut self, n: usize) -> Result<u32, Refusal> {
-        self.o.weight(n).map(|b| b.0)
+        self.o.weight(n)
     }
 
     fn params_block(&mut self) -> u32 {
@@ -81,7 +102,7 @@ impl Holds for Held<'_, '_, '_> {
         // here at all -- and a routine that names one gets this driver's
         // unbound placeholder, which is what `Handles::params_block` has
         // always returned.
-        self.o.params_block().0
+        self.o.params_block()
     }
 
     fn param(&self, n: usize) -> Result<i32, Refusal> {
@@ -93,7 +114,7 @@ impl Holds for Held<'_, '_, '_> {
     }
 
     fn null(&mut self) -> u32 {
-        self.o.unbound().0
+        self.o.unbound()
     }
 
     fn fact(&mut self, key: &'static str) -> Option<Result<Answer, Refusal>> {
@@ -175,8 +196,8 @@ fn named(key: &'static str, o: &mut Handles<'_, '_>, f: Facts) -> Result<Answer,
         });
     };
     Ok(match from {
-        Whence::Table(which) => Answer::Handle(o.table(which)?.0),
-        Whence::Kv(values) => Answer::Handle(o.kv(f.layer, values)?.0),
+        Whence::Table(which) => Answer::Handle(o.table(which)?),
+        Whence::Kv(values) => Answer::Handle(o.kv(f.layer, values)?),
         Whence::Slab(name) => Answer::Handle(o.slab(f.layer, name)?),
         // `Wide` rather than `Number` because a stride is a byte count and
         // the signature says whether it fits: `Usize` takes it whole and a
@@ -184,7 +205,7 @@ fn named(key: &'static str, o: &mut Handles<'_, '_>, f: Facts) -> Result<Answer,
         // which is the honest answer where a cast is a silent truncation.
         Whence::Pooled(which) => Answer::Wide(u64::from(o.number(which)?)),
         Whence::Geometry(n) => Answer::Number(n),
-        Whence::Partials => Answer::Handle(o.table(FireTable::AttnPartials)?.0),
+        Whence::Partials => Answer::Handle(o.table(FireTable::AttnPartials)?),
         // NOT A LOOKUP, and that is why it lives here rather than in a
         // signature. How many ways to fold a decode's key range is a
         // judgement about THIS fire -- its history depth against its head

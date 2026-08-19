@@ -29,14 +29,14 @@ pub enum ArgValue {
     ///
     /// A statement places a region: an address, a row count and a pitch,
     /// which arrive together and describe one thing. The old signatures took
-    /// them apart -- `y: *mut bf16` next to `#[source(OutWidth(0))] width:
-    /// i32` -- and paid for it in the only currency this file cares about,
-    /// which is that the two halves could then be bound from different
-    /// places. Forty-seven parameters existed to carry back a number the
-    /// pointer beside them already implied.
+    /// them apart -- `y: *mut bf16` next to `width: Env<i32,
+    /// keys::OutWidth0>` -- and paid for it in the only currency this file
+    /// cares about, which is that the two halves could then be bound from
+    /// different places. Forty-seven parameters existed to carry back a
+    /// number the pointer beside them already implied.
     ///
     /// So the binder mints one of these for every operand it resolves, and
-    /// the SIGNATURE decides how much of it to keep: `In<0, bf16>`
+    /// the SIGNATURE decides how much of it to keep: `In<0, *const bf16>`
     /// takes all three, a bare `*const bf16` takes the address and drops the
     /// rest (`jit/abi.rs`'s `ptr_abi!`). Nothing is lost by minting it for a
     /// launcher that does not ask.
@@ -177,5 +177,19 @@ impl Bound {
     /// The array as `cuLaunchKernelEx` takes it.
     pub fn slots_mut(&mut self) -> &mut [*mut c_void] {
         &mut self.slots
+    }
+}
+
+/// A NULL POINTER IS THIS PLANE'S ABSENCE, and it always was — `MaybeConst<T>`
+/// existed to carry exactly this and nothing else once `Const` took over
+/// saying the direction. `Option<In<..>>` and its three siblings reach it
+/// through here now.
+impl kernels::routine::Absent for ArgValue {
+    fn is_absent(&self) -> bool {
+        matches!(self, Self::Ptr(p) if p.is_null())
+    }
+
+    fn absent() -> Option<Self> {
+        Some(Self::Ptr(core::ptr::null_mut()))
     }
 }

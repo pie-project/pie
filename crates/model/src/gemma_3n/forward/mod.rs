@@ -180,11 +180,11 @@ pub fn gemma3n_cuda(facts: &Gemma3nFacts, class: FireClass) -> ForwardPlan {
             // The value takes the SCALE-LESS norm: gemma3n norms v too,
             // and with no gamma.
             let v = dsl::cuda::rmsnorm_no_scale(&v);
-            let (q, kk) = dsl::cuda::rope(&q, &kk);
+            let (q, kk) = dsl::cuda::rope(&q, &kk, facts.attn.heads, facts.attn.kv_heads, facts.attn.head_dim);
             let kv = dsl::Kv::at(t, l);
             dsl::cuda::write_kv_to_pages(&kk, &v, &kv);
             dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
-            let o = dsl::cuda::attention_for(class, &q, &kv, window_left, facts.attn.head_dim)
+            let o = dsl::cuda::attention_for(class, &q, &kv, window_left, facts.attn.head_dim, 0.0, 0.0)
                 .expect("a plain attention statement produces its value");
             let o = dsl::attention_landing(&o, &w.o_proj, l);
             let o = dsl::cuda::rmsnorm(&o, &w.post_attn_norm);

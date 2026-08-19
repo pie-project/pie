@@ -19,6 +19,13 @@ use crate::routine::{Arg, Backend, Refusal};
 /// Asserted by `the_vocabulary_is_the_size_this_module_says_it_is`, so the
 /// sentence above cannot drift from the list below — which it did once, from
 /// ten to twelve, when `ssm` crossed and brought the float arrays with it.
+///
+/// It had drifted again by the time the census could run: the duplicated
+/// `mod tests` below kept this file's tests from compiling, so `12` sat here
+/// over a vocabulary of TEN -- `BufMut`, `F32sMut`, `I32sMut` and `U32sMut`
+/// were deleted when the direction moved to the mark and this did not follow.
+/// The two half-width elements bring it back to twelve, which is now a
+/// measured number rather than a coincidence.
 pub const COUNT: usize = 12;
 
 /// The little a shared operand type needs to know about a backend's value.
@@ -38,8 +45,43 @@ pub trait ShaderValue: Copy {
     /// The 64-bit extent this value is, if it is one.
     fn as_usize(self) -> Option<u64>;
 
+    /// The rectangle the statement gave this operand, if it gave one.
+    ///
+    /// `(rows, width)`, and both zero is the honest answer for a statement
+    /// that stated neither -- [`crate::Region`] refuses on a zero width and
+    /// `Layout::packed(0, 0)` is a legal empty, so the absent case lands on
+    /// the value every reader already checks.
+    ///
+    /// # Why a handle plane answers this at all
+    ///
+    /// Because `Width`, `InWidth` and `OutWidth0` were 337 uses of a fact the
+    /// operand beside them already implied, and the reason they could not come
+    /// off the mark was that only CUDA minted region-shaped values. Now
+    /// [`bind`](crate::bind::bind) mints them here too, out of the same
+    /// `Holds::in_width`/`out_width` a `Kind::InWidth` slot already read.
+    fn as_extent(self) -> Option<(i32, i32)> {
+        None
+    }
+
     /// A value naming a buffer the launcher only reads.
     fn buffer(handle: u32) -> Self;
+
+    /// The same, carrying the rectangle the statement gave it.
+    ///
+    /// Defaults to dropping the shape, which is what a plane that has nowhere
+    /// to put it must do. A plane that overrides gets `x.width` in its bodies.
+    #[must_use]
+    fn buffer_at(handle: u32, rows: i32, width: i32) -> Self {
+        let _ = (rows, width);
+        Self::buffer(handle)
+    }
+
+    /// [`Self::buffer_mut`], carrying the rectangle. See [`Self::buffer_at`].
+    #[must_use]
+    fn buffer_mut_at(handle: u32, rows: i32, width: i32) -> Self {
+        let _ = (rows, width);
+        Self::buffer_mut(handle)
+    }
     /// A value naming a buffer the launcher may WRITE through.
     ///
     /// Defaults to [`Self::buffer`]: wgpu binds every storage entry the same
@@ -88,7 +130,7 @@ pub trait ShaderValue: Copy {
     }
 }
 
-/// How one shader LANGUAGE spells the twelve operand types.
+/// How one shader LANGUAGE spells the operand types.
 ///
 /// The vocabulary is one closed set; the SPELLINGS are not, there being three
 /// languages. One shared constant would have to be one of the three and
@@ -119,6 +161,31 @@ pub trait Lang: Backend {
     /// declares the binding, not in the type. So `Wgpu` spells these two the
     /// same, and that is the language rather than an omission.
     const F32S_MUT: &'static str;
+    /// A read-only array of the ACTIVATION element.
+    ///
+    /// Spelled per language because no language has a bf16 storage type and
+    /// each works around it differently: Slang declares the sixteen bits as
+    /// `uint16_t`, MSL has a real `bfloat`, and WGSL has no 16-bit type at all
+    /// and packs pairs into `array<u32>`. Three workarounds, one element.
+    ///
+    /// This is what [`Self::BUF`] used to carry. `BUF` spells the activation
+    /// on every plane -- `StructuredBuffer<PIE_ACT>`, `const device T*` -- so
+    /// the type a signature named "an opaque buffer" was never opaque; it was
+    /// the activation with its name withheld. See [`crate::shader::bf16`].
+    const BF16S: &'static str;
+    /// [`Self::BF16S`], where the launcher may write through it.
+    const BF16S_MUT: &'static str;
+    /// A read-only array of the OTHER half-width float, where a launcher
+    /// casts into it rather than reading the activation as it stands.
+    ///
+    /// `quant`'s `*_fp16_precast` family is the whole of it: it narrows bf16
+    /// to fp16 once and multiplies in fp16 after, so its scratch is a
+    /// different element from the activation beside it. The two are both
+    /// sixteen bits and Slang declares both `uint16_t`, which is exactly why
+    /// the SIGNATURE has to distinguish them -- the shader cannot.
+    const F16S: &'static str;
+    /// [`Self::F16S`], where the launcher may write through it.
+    const F16S_MUT: &'static str;
     /// A 32-bit signed scalar.
     const I32: &'static str;
     /// A 32-bit unsigned scalar.
@@ -136,183 +203,242 @@ pub trait Lang: Backend {
     const IN_PACKED: &'static str;
 }
 
-/// A typed argument, back as the value a dispatch carries.
+pub use crate::routine::Bind;
+
+
+/// WHAT A SHADER-PLANE TENSOR IS MADE OF.
 ///
-/// The inverse of [`Arg::unpack`]. A trait rather than a method per type so
-/// that a body passes its arguments straight through — `x.v()` reads the same
-/// for a buffer and a scalar, which is what keeps an argument list from having
-/// to remember which is which.
-pub trait Bind<V: ShaderValue>: Copy {
-    /// This argument as a bound value.
-    fn v(self) -> V;
+/// The element half of [`Tensor`], and the whole of what used to be seven
+/// ad-hoc buffer names — `Buf`, `bf16`, `f16`, `I32s`, `U32s`, `U8s`, `F32s`.
+/// They were one constructor spelled seven ways, and the cost of that was
+/// measured: `kernels-wgpu`'s `is_buffer` listed five of them twice each and
+/// omitted `Bf16s`, which is what a naming habit costs when the names are not
+/// related by construction.
+///
+/// `Tensor<f32>` and `f32` are related by construction. `F32s` and `f32` were
+/// related by a habit.
+pub trait Element: 'static {
+    /// The [`Ty`] a READ of a tensor of this element binds as.
+    const TY_CONST: Ty;
+    /// The [`Ty`] a WRITE binds as.
+    ///
+    /// The value cannot tell the two apart — `ArgValue::Buffer(handle)` either
+    /// way — and the TABLE must, because the driver reads it to decide hazards
+    /// and barriers. The mark says which; this is the pair it picks from.
+    const TY_MUT: Ty;
+    /// Which of [`Lang`]'s spellings names it.
+    const SPELL: Spell;
 }
 
-/// Declare one buffer-shaped operand type.
-macro_rules! buffer_arg {
-    ($(#[$m:meta])* $name:ident, $ty:expr, $spelling:ident, $bind:ident) => {
-        $(#[$m])*
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        pub struct $name(
-            /// The driver's handle.
-            pub u32,
-        );
+/// One element's place in a [`Lang`]'s spelling table.
+///
+/// An enum and not a `&'static str`, because the string is the LANGUAGE's and
+/// the element is the tensor's: Slang says `StructuredBuffer<uint16_t>` where
+/// MSL says `const device bfloat*`, and one shared constant would have to be
+/// one of the three and therefore wrong in the other two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Spell {
+    /// The activation element.
+    Bf16,
+    /// The other half-width float, which is NOT the activation.
+    F16,
+    /// A float array.
+    F32,
+    /// A signed 32-bit array.
+    I32,
+    /// An unsigned 32-bit array — the CSR/indptr family.
+    U32,
+    /// A byte array — the per-row validity masks.
+    U8,
+}
 
-        impl<B: Lang> Arg<B> for $name
-        where
-            B::Value: ShaderValue,
-        {
-            const TY: Ty = $ty;
-            const SPELLING: &'static str = B::$spelling;
+/// How `B` spells a READ of this element.
+const fn spell_read<B: Lang>(s: Spell) -> &'static str {
+    match s {
+        Spell::Bf16 => B::BF16S,
+        Spell::F16 => B::F16S,
+        Spell::F32 => B::F32S,
+        Spell::I32 => B::I32S,
+        Spell::U32 => B::U32S,
+        Spell::U8 => B::U8S,
+    }
+}
 
-            fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-                value
-                    .as_buffer()
-                    .map(Self)
-                    .ok_or(Refusal::Kind { at, want: $ty })
-            }
-        }
+// THERE IS NO `spell_write`. A `RWStructuredBuffer<T>` and a
+// `StructuredBuffer<T>` are one VALUE -- `ArgValue::Buffer(handle)` either way
+// -- and which way the launch drives the operand is the MARK's answer, carried
+// in the `Ty` column as `Bf16s` against `Bf16sMut`. `Lang`'s `*_MUT` spellings
+// stay declared because a generated cross-check against the real shader
+// declaration needs them; nothing in the signature picks between them.
 
-        impl<V: ShaderValue> Bind<V> for $name {
-            fn v(self) -> V {
-                V::$bind(self.0)
-            }
-        }
-
-        // A shader plane spells its weights `Weight<N, Buf>` -- the bound
-        // ARGUMENT type -- where CUDA spells `Weight<N, *const bf16>`, the
-        // POINTEE. The two are disjoint, so both impls sit in the floor.
-        impl<const N: usize, B: crate::Backend> crate::routine::Arg<B>
-            for crate::routine::Weight<N, $name>
-        where
-            $name: crate::routine::Arg<B>,
-        {
-            const TY: Ty = <$name as crate::routine::Arg<B>>::TY;
-            const PROV: crate::routine::Provenance =
-                <$name as crate::routine::Arg<B>>::PROV;
-            const SIDE: crate::routine::Side = crate::routine::Side::Placed;
-            const SPELLING: &'static str =
-                <$name as crate::routine::Arg<B>>::SPELLING;
-            const SOURCE: Option<crate::Source> =
-                Some(crate::Source::Slot(crate::Kind::Weight, N as u8));
-
-            fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-                <$name as crate::routine::Arg<B>>::unpack(value, at)
-                    .map(|ptr| crate::routine::Weight { ptr })
-            }
-        }
-
-        // The same weight when the row may leave it out.
-        impl<const N: usize, B: crate::Backend> crate::routine::Arg<B>
-            for crate::routine::Weight<N, crate::routine::Env<$name>>
-        where
-            crate::routine::Env<$name>: crate::routine::Arg<B>,
-        {
-            const TY: Ty = <crate::routine::Env<$name> as crate::routine::Arg<B>>::TY;
-            const PROV: crate::routine::Provenance =
-                <crate::routine::Env<$name> as crate::routine::Arg<B>>::PROV;
-            const SIDE: crate::routine::Side = crate::routine::Side::Placed;
-            const SPELLING: &'static str =
-                <crate::routine::Env<$name> as crate::routine::Arg<B>>::SPELLING;
-            const SOURCE: Option<crate::Source> =
-                Some(crate::Source::Slot(crate::Kind::Weight, N as u8));
-
-            fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-                <crate::routine::Env<$name> as crate::routine::Arg<B>>::unpack(value, at)
-                    .map(|ptr| crate::routine::Weight { ptr })
-            }
+/// Declare one element.
+macro_rules! element {
+    ($(#[$m:meta])* $name:ty, $ty:expr, $ty_mut:expr, $spell:ident) => {
+        impl Element for $name {
+            const TY_CONST: Ty = $ty;
+            const TY_MUT: Ty = $ty_mut;
+            const SPELL: Spell = Spell::$spell;
         }
     };
 }
 
-buffer_arg!(
-    /// An opaque device buffer the launcher may WRITE through.
-    BufMut,
-    Ty::BufMut,
-    BUF_MUT,
-    buffer_mut
-);
-buffer_arg!(
-    /// An opaque device buffer the launcher only reads.
-    Buf,
-    Ty::Buf,
-    BUF,
-    buffer
-);
-buffer_arg!(
-    /// A read-only device array of `i32` — positions, and the like.
-    I32s,
-    Ty::I32s,
-    I32S,
-    buffer
-);
-buffer_arg!(
-    /// A read-only device array of `u32` — the CSR/indptr family.
-    U32s,
-    Ty::U32s,
-    U32S,
-    buffer
-);
-buffer_arg!(
-    /// A read-only device array of `u8` — the per-row validity masks.
-    ///
-    /// Neither WGSL nor Slang has an 8-bit storage type, so the shader reads
-    /// this as packed 32-bit words. The DECLARED width is what makes a
-    /// mismatch an error here rather than a stride bug on the device.
-    U8s,
-    Ty::U8s,
-    U8S,
-    buffer
-);
+/// THE ACTIVATION ELEMENT.
+///
+/// A marker and not a number: nothing host-side holds a bf16, and the point of
+/// the type is that a signature can NAME the element the shader declares.
+/// `Buf` was never opaque — Slang's [`Lang::BUF`] is
+/// `StructuredBuffer<PIE_ACT>` and MSL's is `const device T*` — so 381 vulkan
+/// operands, 379 wgpu ones and 389 metal ones declared "a buffer" where the
+/// text declared an activation, while CUDA spelled the same operand
+/// `In<bf16>` throughout.
+///
+/// Lowercase, and matching CUDA's: `kernels_cuda::jit::abi::bf16` is the
+/// element a CUDA signature names and this is the element a shader signature
+/// names. They cannot be ONE type — [`crate::routine::Elem`] has a single
+/// `Read` carrier and CUDA's is a pointer where a shader's is a binding index
+/// — but they can read alike, and a reader crossing the two files should not
+/// have to learn a second word for one element.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct bf16;
 
-buffer_arg!(
-    /// A read-only device array of `f32` — recurrent state, staged scratch.
-    F32s,
-    Ty::F32s,
-    F32S,
-    buffer
-);
-buffer_arg!(
-    /// A device array of `f32` the launcher may WRITE through.
-    ///
-    /// Distinct from [`BufMut`] in the ELEMENT type and from [`F32s`] in the
-    /// access: `gdn`'s recurrent state is read and written by the same
-    /// dispatch, and it is the `Mut` half that tells the driver a barrier is
-    /// owed before whoever reads it next.
-    F32sMut,
-    Ty::F32sMut,
-    F32S_MUT,
-    buffer_mut
-);
+/// The other half-width float, which is NOT the activation.
+///
+/// Its own element because `quant`'s `*_fp16_precast` routines hold both at
+/// once — `half_in` beside `x` — and Slang spells them the same, `uint16_t`.
+/// A signature that called both the activation would be stating that the
+/// narrowing does not happen.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct f16;
 
-/// Declare one scalar operand over an existing Rust type.
-macro_rules! scalar_arg {
-    ($rust:ty, $ty:expr, $read:ident, $make:ident, $spelling:ident) => {
-        impl<B: Lang> Arg<B> for $rust
-        where
-            B::Value: ShaderValue,
-        {
-            const TY: Ty = $ty;
-            const SPELLING: &'static str = B::$spelling;
+element!(bf16, Ty::Bf16s, Ty::Bf16sMut, Bf16);
+element!(f16, Ty::F16s, Ty::F16sMut, F16);
+element!(f32, Ty::F32s, Ty::F32sMut, F32);
+element!(i32, Ty::I32s, Ty::I32sMut, I32);
+element!(u32, Ty::U32s, Ty::U32sMut, U32);
+// NEITHER WGSL NOR SLANG HAS AN 8-BIT STORAGE TYPE, so the shader reads a byte
+// array as packed 32-bit words. The DECLARED width is what makes a mismatch an
+// error here rather than a stride bug on the device.
+element!(u8, Ty::U8s, Ty::U8sMut, U8);
 
-            fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
-                value.$read().ok_or(Refusal::Kind { at, want: $ty })
-            }
-        }
-
-        impl<V: ShaderValue> Bind<V> for $rust {
-            fn v(self) -> V {
-                V::$make(self)
-            }
-        }
-    };
+/// A DEVICE ARRAY OF `E`, as a shader plane binds one.
+///
+/// One constructor over the same element set the scalars use, and the reason
+/// it had to exist is [`crate::routine::Const`]: once the mark stopped
+/// implying buffer-ness — `Const<Tensor<bf16>>` is a weight and `Const<i32>` a
+/// scalar the statement carries — the CARRIER had to say which it was.
+/// `Tensor<E>` is that saying.
+///
+/// It holds the driver's handle and the rectangle the statement gave it. The
+/// rectangle is why [`Backend::region`] is implemented on these planes at all:
+/// with `Width`, `InWidth` and `OutWidth0` off the parameter list, `x.width`
+/// is where a body reads its own operand's pitch, and 606 uses collapse into
+/// the marks.
+#[derive(Debug)]
+pub struct Tensor<E: Element> {
+    /// The driver's handle for the allocation.
+    pub handle: u32,
+    /// Which element it holds — a marker, never a value.
+    held: core::marker::PhantomData<E>,
 }
 
-scalar_arg!(i32, Ty::I32, as_i32, i32, I32);
-scalar_arg!(u32, Ty::U32, as_u32, u32, U32);
-scalar_arg!(f32, Ty::F32, as_f32, f32, F32);
+// `Clone`/`Copy`/`PartialEq` BY HAND, BECAUSE `derive` PUTS THE BOUND ON THE
+// PARAMETER. A derived `Copy` here would ask for `E: Copy` -- the ELEMENT --
+// when an element is a marker nothing copies and the only field is a `u32`.
+impl<E: Element> Clone for Tensor<E> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<E: Element> Copy for Tensor<E> {}
 
-/// A 64-bit stride or extent.
-///
+impl<E: Element> PartialEq for Tensor<E> {
+    fn eq(&self, other: &Self) -> bool {
+        self.handle == other.handle
+    }
+}
+impl<E: Element> Eq for Tensor<E> {}
+
+impl<E: Element> Tensor<E> {
+    /// This handle, as a tensor of `E`.
+    #[must_use]
+    pub const fn new(handle: u32) -> Self {
+        Self { handle, held: core::marker::PhantomData }
+    }
+}
+
+impl<B: Lang, E: Element> Arg<B> for Tensor<E>
+where
+    B::Value: ShaderValue,
+{
+    const TY: Ty = E::TY_CONST;
+    const SPELLING: &'static str = spell_read::<B>(E::SPELL);
+
+    fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
+        value
+            .as_buffer()
+            .map(Self::new)
+            .ok_or(Refusal::Kind { at, want: E::TY_CONST })
+    }
+}
+
+impl<V: ShaderValue, E: Element> Bind<V> for Tensor<E> {
+    fn arg(self) -> V {
+        V::buffer(self.handle)
+    }
+}
+
+// AND THE SAME HANDLE, BOUND AS A WRITE. One type serves both directions here
+// -- `Elem::Read` and `Elem::Write` are both `Tensor<E>` -- so the direction
+// can only come from WHICH TRAIT the mark reaches for. `Out` and `InOut` reach
+// for this one; `In` and `Const` reach for `Bind` above.
+impl<V: ShaderValue, E: Element> crate::routine::BindMut<V> for Tensor<E> {
+    fn arg_mut(self) -> V {
+        V::buffer_mut(self.handle)
+    }
+}
+
+// A HANDLE IS AN ELEMENT WITH ONE CARRIER, and that is the whole of what
+// distinguishes this plane from CUDA. A pointee has two forms -- `*const E` to
+// read and `*mut E` to write -- and a binding index has one:
+// `ArgValue::Buffer(handle)` either way. So `Read` and `Write` are both `Self`,
+// and the `Ty` still splits, because the TABLE must say which way the launch
+// drives the operand even where the value cannot.
+impl<E: Element> crate::routine::Elem for Tensor<E> {
+    type Read = Self;
+    type Write = Self;
+
+    // A HANDLE DOES NOT MOVE. The driver binds a whole buffer and the shader
+    // indexes into it, so a windowed view reaches the device as a scalar
+    // rather than as an offset carrier -- which is what these planes already
+    // do. Answering with the handle unchanged is the honest reading of
+    // "advance a thing that has no inside".
+    unsafe fn advance_read(read: Self::Read, _elems: usize) -> Self::Read {
+        read
+    }
+
+    unsafe fn advance_write(write: Self::Write, _elems: usize) -> Self::Write {
+        write
+    }
+
+    // EMPTY: a C++ spelling is CUDA's, and these planes state theirs through
+    // `Arg::SPELLING`, which is the one that can see the `Lang`.
+    const CPP_CONST: &'static str = "";
+    const CPP_MUT: &'static str = "";
+    const TY_CONST: Ty = E::TY_CONST;
+    const TY_MUT: Ty = E::TY_MUT;
+}
+
+// A TENSOR IS THE WEIGHT RUN'S CARRIER. `Const<Tensor<bf16>>` claims the next
+// weight and inherits the named-bank chain `Weight` had; a scalar `Const`
+// claims the next slot of the params run. One mark, two runs, decided here.
+impl<E: Element> crate::routine::ConstRun for Tensor<E> {
+    const RUN: crate::routine::Claim = crate::routine::Claim::Weight;
+    const TY: Ty = E::TY_CONST;
+    type Held = Self;
+}
+
 /// Its own type rather than `u64` so the width is stated where the argument
 /// is. Neither WGSL nor Slang has a 64-bit integer in these kernels, so the
 /// shader reads it as two 32-bit words, low first — and a value that arrived
@@ -339,11 +465,18 @@ where
 }
 
 impl<V: ShaderValue> Bind<V> for Usize {
-    fn v(self) -> V {
+    fn arg(self) -> V {
         V::usize(self.0)
     }
 }
 
+/// A `u32` that rides a FIELD of a struct some earlier buffer binds, rather
+/// than the scalar block.
+///
+/// The width is a `u32`'s; the difference is WHERE the value goes, which the
+/// driver's binding decides and a routine does not. One row uses it, in all
+/// three backends — `refactor-bigplan.md` §10 leaves open whether it should
+/// stay a type at all once the ports are done.
 /// A `u32` that rides a FIELD of a struct some earlier buffer binds, rather
 /// than the scalar block.
 ///
@@ -373,14 +506,8 @@ where
 }
 
 impl<V: ShaderValue> Bind<V> for InPacked {
-    fn v(self) -> V {
+    fn arg(self) -> V {
         V::u32(self.0)
-    }
-}
-
-impl<V: ShaderValue, T: Bind<V>> Bind<V> for crate::routine::Env<T> {
-    fn v(self) -> V {
-        self.0.v()
     }
 }
 
@@ -436,10 +563,41 @@ fn rectangle(width: i32, rows: i32) -> Result<[u32; 2], Refusal> {
     Ok([width.unsigned_abs(), rows.unsigned_abs()])
 }
 
+
+/// Declare one scalar operand over an existing Rust type.
+macro_rules! scalar_arg {
+    ($rust:ty, $ty:expr, $read:ident, $make:ident, $spelling:ident) => {
+        impl<B: Lang> Arg<B> for $rust
+        where
+            B::Value: ShaderValue,
+        {
+            const TY: Ty = $ty;
+            const SPELLING: &'static str = B::$spelling;
+
+            fn unpack(value: &B::Value, at: usize) -> Result<Self, Refusal> {
+                value.$read().ok_or(Refusal::Kind { at, want: $ty })
+            }
+        }
+
+        impl<V: ShaderValue> Bind<V> for $rust {
+            fn arg(self) -> V {
+                V::$make(self)
+            }
+        }
+    };
+}
+
+scalar_arg!(i32, Ty::I32, as_i32, i32, I32);
+scalar_arg!(u32, Ty::U32, as_u32, u32, U32);
+scalar_arg!(f32, Ty::F32, as_f32, f32, F32);
+
+
+
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routine::{Env, Provenance};
 
     /// The vocabulary is the size this module says it is.
     ///
@@ -449,7 +607,7 @@ mod tests {
     #[test]
     fn the_vocabulary_is_the_size_this_module_says_it_is() {
         let src = include_str!("shader.rs");
-        let declared = src.matches("\nbuffer_arg!(").count()
+        let declared = src.matches("\nelement!(").count()
             + src.matches("\nscalar_arg!(").count()
             // The ones written out by hand, because their unpacking is not
             // the shape either macro stamps. Matched on the `Arg<B> for` and
@@ -573,13 +731,10 @@ mod tests {
     impl Backend for Shader {
         type Value = V;
         type Ctx<'a> = ();
-
-        // This harness exists to check SPELLINGS, and a spelling has no
-        // shape. Every table it drives is a shader table.
-        fn region(_value: &V, _at: usize) -> Result<crate::routine::Extent, Refusal> {
-            Err(Refusal::Absent { what: "a region's shape: this harness binds spellings" })
-        }
     }
+
+    /// This harness binds spellings, and a spelling is never absent.
+    impl crate::routine::Absent for V {}
 
     /// Spellings that are recognisably no real language's, so a test that
     /// asserted one by accident reads as obviously wrong.
@@ -591,6 +746,10 @@ mod tests {
         const U8S: &'static str = "u8s";
         const F32S: &'static str = "f32s";
         const F32S_MUT: &'static str = "f32s_mut";
+        const BF16S: &'static str = "bf16s";
+        const BF16S_MUT: &'static str = "bf16s_mut";
+        const F16S: &'static str = "f16s";
+        const F16S_MUT: &'static str = "f16s_mut";
         const I32: &'static str = "i32";
         const U32: &'static str = "u32";
         const F32: &'static str = "f32";
@@ -622,10 +781,10 @@ mod tests {
             })
         );
         assert_eq!(
-            <Buf as Arg<Shader>>::unpack(&V::F32(1.0), 7),
+            <Tensor<bf16> as Arg<Shader>>::unpack(&V::F32(1.0), 7),
             Err(Refusal::Kind {
                 at: 7,
-                want: Ty::Buf
+                want: Ty::Bf16s
             })
         );
     }
@@ -636,23 +795,37 @@ mod tests {
     /// compile rather than at runtime — the handle would have been accepted.
     #[test]
     fn a_buffer_handle_is_accepted_by_every_buffer_kind() {
-        assert_eq!(<Buf as Arg<Shader>>::unpack(&V::Buffer(9), 0), Ok(Buf(9)));
-        assert_eq!(<U32s as Arg<Shader>>::unpack(&V::Buffer(9), 0), Ok(U32s(9)));
-        assert_eq!(<U8s as Arg<Shader>>::unpack(&V::Buffer(9), 0), Ok(U8s(9)));
+        assert_eq!(
+            <Tensor<bf16> as Arg<Shader>>::unpack(&V::Buffer(9), 0),
+            Ok(Tensor::<bf16>::new(9))
+        );
+        assert_eq!(
+            <Tensor<u32> as Arg<Shader>>::unpack(&V::Buffer(9), 0),
+            Ok(Tensor::<u32>::new(9))
+        );
+        assert_eq!(
+            <Tensor<u8> as Arg<Shader>>::unpack(&V::Buffer(9), 0),
+            Ok(Tensor::<u8>::new(9))
+        );
     }
 
     /// Binding and unpacking are inverse, for every kind.
     #[test]
     fn what_a_body_binds_is_what_a_signature_recovers() {
-        assert_eq!(Bind::<V>::v(Buf(4)), V::Buffer(4));
-        assert_eq!(Bind::<V>::v(BufMut(4)), V::Buffer(4));
-        assert_eq!(Bind::<V>::v(-3i32), V::I32(-3));
-        assert_eq!(Bind::<V>::v(3u32), V::U32(3));
-        assert_eq!(Bind::<V>::v(0.5f32), V::F32(0.5));
-        assert_eq!(Bind::<V>::v(Usize(1 << 40)), V::Usize(1 << 40));
+        assert_eq!(Bind::<V>::arg(Tensor::<bf16>::new(4)), V::Buffer(4));
+        // `BufMut(4)` STOOD HERE and was the same assertion twice over: the
+        // two types merged into one when the direction moved to the mark, so
+        // the rename left a second `Buf`. The element carriers are what a
+        // second line here can now say something new about.
+        assert_eq!(Bind::<V>::arg(Tensor::<bf16>::new(4)), V::Buffer(4));
+        assert_eq!(Bind::<V>::arg(Tensor::<f16>::new(4)), V::Buffer(4));
+        assert_eq!(Bind::<V>::arg(-3i32), V::I32(-3));
+        assert_eq!(Bind::<V>::arg(3u32), V::U32(3));
+        assert_eq!(Bind::<V>::arg(0.5f32), V::F32(0.5));
+        assert_eq!(Bind::<V>::arg(Usize(1 << 40)), V::Usize(1 << 40));
         // `InPacked` binds as a `u32`: the width is a `u32`'s and only the
         // PLACE differs, which the driver decides.
-        assert_eq!(Bind::<V>::v(InPacked(7)), V::U32(7));
+        assert_eq!(Bind::<V>::arg(InPacked(7)), V::U32(7));
     }
 
     /// `InPacked` takes a `u32`'s value and is not the `u32` operand.
@@ -669,12 +842,25 @@ mod tests {
         );
     }
 
-    /// `Env` marks the supplier and changes nothing else.
+    /// THE ELEMENT DECIDES THE ARGUMENT TYPE, and nothing else does.
+    ///
+    /// This used to assert what `Env` claimed about a SUPPLIER — that a keyed
+    /// wrapper carried `Provenance::Env` while its carrier carried `Trace`.
+    /// Both the wrapper and the provenance column are deleted: every parameter
+    /// is the statement's now, and a fact only the fire can answer is asked
+    /// for in the body rather than declared beside the operands.
+    ///
+    /// What is left to check is the fact that replaced it — one constructor
+    /// over the scalar element set, with the element choosing the `Ty` and the
+    /// mark choosing the direction.
     #[test]
-    fn the_environment_wrapper_carries_the_type_and_states_the_supplier() {
-        assert_eq!(<Env<I32s> as Arg<Shader>>::TY, Ty::I32s);
-        assert_eq!(<Env<I32s> as Arg<Shader>>::PROV, Provenance::Env);
-        assert_eq!(<I32s as Arg<Shader>>::PROV, Provenance::Trace);
-        assert_eq!(Bind::<V>::v(Env(Buf(2))), V::Buffer(2));
+    fn a_tensor_takes_its_argument_type_from_its_element() {
+        assert_eq!(<Tensor<i32> as Arg<Shader>>::TY, Ty::I32s);
+        assert_eq!(<Tensor<u8> as Arg<Shader>>::TY, Ty::U8s);
+        assert_eq!(<Tensor<f32> as Arg<Shader>>::TY, Ty::F32s);
+        // The DIRECTION is the mark's, and the element carries both readings
+        // for it to pick from.
+        assert_eq!(<Tensor<i32> as crate::Elem>::TY_MUT, Ty::I32sMut);
+        assert_eq!(Bind::<V>::arg(Tensor::<bf16>::new(2)), V::Buffer(2));
     }
 }

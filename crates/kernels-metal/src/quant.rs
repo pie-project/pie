@@ -10,12 +10,12 @@
 //! `host_name` lines typed out at `quant/qmm_t.metal:1356-1408` rather
 //! than stamped, so they are five kernels and get five rows.
 
-#![allow(clippy::too_many_arguments)]
 
+use kernels::Grid;
+use kernels_macros::routine;
 use kernels::routine::Refusal;
 
-use crate::routine::{keys, Ask, Bind, Block, Buf, BufMut, Ctx, Env, Fire, Param, Routine};
-use crate::routine::{InSlot, OutSlot, Weight};
+use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, Out, Tensor, bf16, elementwise, elementwise_rows, f16, keys};
 
 /// The shaders this family's routines reach: `(file, entrypoint)`, one pair
 /// per instantiated name.
@@ -1773,29 +1773,24 @@ const TRANSCODE_FILE: &str = "quant/transcode.metal";
 ///
 /// [`Refusal::Narrow`] for a point the shader tree does not carry, and
 /// whatever [`qmm_grid`] refuses.
+#[routine]
 pub fn qmm_t(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    x: InSlot<0, Buf>,
-    y: OutSlot<0, BufMut>,
-    k: Param<0, i32>,
-    n: Param<1, i32>,
-    group: Ask<keys::QuantGroup, i32>,
-    bits: Ask<keys::QuantBits, i32>,
-    bm: Ask<keys::TileM, i32>,
-    bn: Ask<keys::TileN, i32>,
-    m: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: QMM_T[qmm_point(*group, *bits, *bm, *bn)?],
-            file: QMM_FILE,
-            lanes: qmm_grid(*n, *bn, *m, *bm, 1)?,
-            group: QMM_GROUP,
-        },
-        &[w.v(), scales.v(), biases.v(), x.v(), y.v(), k.v(), n.v()],
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    x: In<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>,
+    group: Const<i32>,
+    bits: Const<i32>,
+    bm: Const<i32>,
+    bn: Const<i32>) -> Result<(), Refusal> {
+    let k = x.width;
+    let n = y.width;
+    let m = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMM_FILE, QMM_T[qmm_point(*group, *bits, *bm, *bn)?]).apply(Grid::of(qmm_grid(n, *bn, m, *bm, 1)?, QMM_GROUP)),
+        &[w.arg(), scales.arg(), biases.arg(), x.arg(), y.arg(), k.arg(), n.arg()],
     )
 }
 
@@ -1809,38 +1804,33 @@ pub fn qmm_t(
 ///
 /// [`Refusal::Narrow`] for a point the shader tree does not carry, and
 /// whatever [`qmm_grid`] refuses.
+#[routine]
 pub fn qmm_t_bias(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    x: InSlot<0, Buf>,
-    y: OutSlot<0, BufMut>,
-    bias: Weight<3, Buf>,
-    k: Param<0, i32>,
-    n: Param<1, i32>,
-    group: Ask<keys::QuantGroup, i32>,
-    bits: Ask<keys::QuantBits, i32>,
-    bm: Ask<keys::TileM, i32>,
-    bn: Ask<keys::TileN, i32>,
-    m: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: QMM_T_BIAS[qmm_point(*group, *bits, *bm, *bn)?],
-            file: QMM_FILE,
-            lanes: qmm_grid(*n, *bn, *m, *bm, 1)?,
-            group: QMM_GROUP,
-        },
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    x: In<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>,
+    bias: Const<Tensor<bf16>>,
+    group: Const<i32>,
+    bits: Const<i32>,
+    bm: Const<i32>,
+    bn: Const<i32>) -> Result<(), Refusal> {
+    let k = x.width;
+    let n = y.width;
+    let m = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMM_FILE, QMM_T_BIAS[qmm_point(*group, *bits, *bm, *bn)?]).apply(Grid::of(qmm_grid(n, *bn, m, *bm, 1)?, QMM_GROUP)),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            x.v(),
-            y.v(),
-            k.v(),
-            n.v(),
-            bias.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            x.arg(),
+            y.arg(),
+            k.arg(),
+            n.arg(),
+            bias.arg(),
         ],
     )
 }
@@ -1856,38 +1846,33 @@ pub fn qmm_t_bias(
 ///
 /// [`Refusal::Narrow`] for a point the shader tree does not carry, and
 /// whatever [`qmm_grid`] refuses.
+#[routine]
 pub fn qmm_t_residual(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    x: InSlot<0, Buf>,
-    y: OutSlot<0, BufMut>,
-    k: Param<0, i32>,
-    n: Param<1, i32>,
-    residual: InSlot<1, Buf>,
-    group: Ask<keys::QuantGroup, i32>,
-    bits: Ask<keys::QuantBits, i32>,
-    bm: Ask<keys::TileM, i32>,
-    bn: Ask<keys::TileN, i32>,
-    m: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: QMM_T_RESIDUAL[qmm_point(*group, *bits, *bm, *bn)?],
-            file: QMM_FILE,
-            lanes: qmm_grid(*n, *bn, *m, *bm, 1)?,
-            group: QMM_GROUP,
-        },
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    x: In<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>,
+    residual: In<Tensor<bf16>>,
+    group: Const<i32>,
+    bits: Const<i32>,
+    bm: Const<i32>,
+    bn: Const<i32>) -> Result<(), Refusal> {
+    let k = x.width;
+    let n = y.width;
+    let m = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMM_FILE, QMM_T_RESIDUAL[qmm_point(*group, *bits, *bm, *bn)?]).apply(Grid::of(qmm_grid(n, *bn, m, *bm, 1)?, QMM_GROUP)),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            x.v(),
-            y.v(),
-            k.v(),
-            n.v(),
-            residual.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            x.arg(),
+            y.arg(),
+            k.arg(),
+            n.arg(),
+            residual.arg(),
         ],
     )
 }
@@ -1904,41 +1889,35 @@ pub fn qmm_t_residual(
 ///
 /// [`Refusal::Narrow`] for a point the shader tree does not carry, and
 /// whatever [`qmm_grid`] refuses.
+#[routine]
 pub fn qmm_t_fp16_precast(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    pad: Weight<0, Env<Buf>>,
-    y: OutSlot<0, BufMut>,
-    half_in: InSlot<0, Buf>,
-    k: Param<0, i32>,
-    n: Param<1, i32>,
-    bm: Ask<keys::TileM, i32>,
-    bn: Ask<keys::TileN, i32>,
-    m: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: QMM_T_FP16_PRECAST[tile_point(*bm, *bn)?],
-            file: QMM_FILE,
-            lanes: qmm_grid(*n, *bn, *m, *bm, 1)?,
-            group: QMM_GROUP,
-        },
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>,
+    half_in: In<Tensor<f16>>,
+    bm: Const<i32>,
+    bn: Const<i32>) -> Result<(), Refusal> {
+    let k = half_in.width;
+    let n = y.width;
+    let m = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMM_FILE, QMM_T_FP16_PRECAST[tile_point(*bm, *bn)?]).apply(Grid::of(qmm_grid(n, *bn, m, *bm, 1)?, QMM_GROUP)),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            pad.v(),
-            y.v(),
-            k.v(),
-            n.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            half_in.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            w.arg(),
+            y.arg(),
+            k.arg(),
+            n.arg(),
+            w.arg(),
+            w.arg(),
+            w.arg(),
+            w.arg(),
+            w.arg(),
+            half_in.arg(),
         ],
     )
 }
@@ -1949,42 +1928,36 @@ pub fn qmm_t_fp16_precast(
 ///
 /// [`Refusal::Narrow`] for a point the shader tree does not carry, and
 /// whatever [`qmm_grid`] refuses.
+#[routine]
 pub fn qmm_t_bias_fp16_precast(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    pad: Weight<0, Env<Buf>>,
-    y: OutSlot<0, BufMut>,
-    bias: Weight<3, Buf>,
-    half_in: InSlot<0, Buf>,
-    k: Param<0, i32>,
-    n: Param<1, i32>,
-    bm: Ask<keys::TileM, i32>,
-    bn: Ask<keys::TileN, i32>,
-    m: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: QMM_T_BIAS_FP16_PRECAST[tile_point(*bm, *bn)?],
-            file: QMM_FILE,
-            lanes: qmm_grid(*n, *bn, *m, *bm, 1)?,
-            group: QMM_GROUP,
-        },
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>,
+    bias: Const<Tensor<bf16>>,
+    half_in: In<Tensor<f16>>,
+    bm: Const<i32>,
+    bn: Const<i32>) -> Result<(), Refusal> {
+    let k = half_in.width;
+    let n = y.width;
+    let m = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMM_FILE, QMM_T_BIAS_FP16_PRECAST[tile_point(*bm, *bn)?]).apply(Grid::of(qmm_grid(n, *bn, m, *bm, 1)?, QMM_GROUP)),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            pad.v(),
-            y.v(),
-            k.v(),
-            n.v(),
-            bias.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            half_in.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            w.arg(),
+            y.arg(),
+            k.arg(),
+            n.arg(),
+            bias.arg(),
+            w.arg(),
+            w.arg(),
+            w.arg(),
+            w.arg(),
+            half_in.arg(),
         ],
     )
 }
@@ -1995,42 +1968,38 @@ pub fn qmm_t_bias_fp16_precast(
 ///
 /// [`Refusal::Narrow`] for a point the shader tree does not carry, and
 /// whatever [`qmm_grid`] refuses.
+#[routine]
 pub fn qmm_t_residual_fp16_precast(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    pad: Weight<0, Env<Buf>>,
-    y: OutSlot<0, BufMut>,
-    residual: InSlot<1, Buf>,
-    half_in: InSlot<0, Buf>,
-    k: Param<0, i32>,
-    n: Param<1, i32>,
-    bm: Ask<keys::TileM, i32>,
-    bn: Ask<keys::TileN, i32>,
-    m: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: QMM_T_RESIDUAL_FP16_PRECAST[tile_point(*bm, *bn)?],
-            file: QMM_FILE,
-            lanes: qmm_grid(*n, *bn, *m, *bm, 1)?,
-            group: QMM_GROUP,
-        },
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>,
+    // `half_in` FIRST: it is the statement's input 0 and the residual its
+    // input 1, whatever order the shader's buffer table wants them in.
+    half_in: In<Tensor<f16>>,
+    residual: In<Tensor<bf16>>,
+    bm: Const<i32>,
+    bn: Const<i32>) -> Result<(), Refusal> {
+    let k = residual.width;
+    let n = y.width;
+    let m = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMM_FILE, QMM_T_RESIDUAL_FP16_PRECAST[tile_point(*bm, *bn)?]).apply(Grid::of(qmm_grid(n, *bn, m, *bm, 1)?, QMM_GROUP)),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            pad.v(),
-            y.v(),
-            k.v(),
-            n.v(),
-            residual.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            half_in.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            w.arg(),
+            y.arg(),
+            k.arg(),
+            n.arg(),
+            residual.arg(),
+            w.arg(),
+            w.arg(),
+            w.arg(),
+            w.arg(),
+            half_in.arg(),
         ],
     )
 }
@@ -2050,43 +2019,49 @@ pub fn qmm_t_residual_fp16_precast(
 ///
 /// [`Refusal::Narrow`] for a point the shader tree does not carry, and
 /// whatever [`qmm_grid`] refuses.
+#[routine]
 pub fn qmm_t_splitk(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    pad: Weight<0, Buf>,
-    x: InSlot<0, Buf>,
-    out: OutSlot<0, BufMut>,
-    k: Param<0, i32>,
-    n: Param<1, i32>,
-    k_partition_size: Param<3, i32>,
-    split_k_partition_stride: Param<4, i32>,
-    split_k: Param<5, i32>,
-    group: Ask<keys::QuantGroup, i32>,
-    bits: Ask<keys::QuantBits, i32>,
-    bm: Ask<keys::TileM, i32>,
-    m: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: QMM_T_SPLITK[wide_point(*group, *bits, *bm)?],
-            file: QMM_FILE,
-            lanes: qmm_grid(*n, WIDE_BN, *m, *bm, *split_k)?,
-            group: QMM_GROUP,
-        },
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    x: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    group: Const<i32>,
+    bits: Const<i32>,
+    bm: Const<i32>) -> Result<(), Refusal> {
+    let k = x.width;
+    let n = out.width;
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<3>` named.
+    // This body forwards `ctx.params()` as a STRUCT, so the run is the
+    // shader's layout and no `Const` mark can name a word inside it; the
+    // migration made this `keys::KPartitionSize`, which no driver answers.
+    let k_partition_size = ctx.param(3)?;
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<4>` named.
+    // This body forwards `ctx.params()` as a STRUCT, so the run is the
+    // shader's layout and no `Const` mark can name a word inside it; the
+    // migration made this `keys::SplitKPartitionStride`, which no driver answers.
+    let split_k_partition_stride = ctx.param(4)?;
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<5>` named.
+    // This body forwards `ctx.params()` as a STRUCT, so the run is the
+    // shader's layout and no `Const` mark can name a word inside it; the
+    // migration made this `keys::SplitK`, which no driver answers.
+    let split_k = ctx.param(5)?;
+    let m = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMM_FILE, QMM_T_SPLITK[wide_point(*group, *bits, *bm)?]).apply(Grid::of(qmm_grid(n, WIDE_BN, m, *bm, split_k)?, QMM_GROUP)),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            x.v(),
-            pad.v(),
-            k.v(),
-            n.v(),
-            pad.v(),
-            out.v(),
-            k_partition_size.v(),
-            split_k_partition_stride.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            x.arg(),
+            w.arg(),
+            k.arg(),
+            n.arg(),
+            w.arg(),
+            out.arg(),
+            k_partition_size.arg(),
+            split_k_partition_stride.arg(),
         ],
     )
 }
@@ -2101,43 +2076,49 @@ pub fn qmm_t_splitk(
 ///
 /// [`Refusal::Narrow`] for a point the shader tree does not carry, and
 /// whatever [`qmm_grid`] refuses.
+#[routine]
 pub fn qmm_t_splitk_f32(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    pad: Weight<0, Buf>,
-    x: InSlot<0, Buf>,
-    out: OutSlot<0, BufMut>,
-    k: Param<0, i32>,
-    n: Param<1, i32>,
-    k_partition_size: Param<3, i32>,
-    split_k_partition_stride: Param<4, i32>,
-    split_k: Param<5, i32>,
-    group: Ask<keys::QuantGroup, i32>,
-    bits: Ask<keys::QuantBits, i32>,
-    bm: Ask<keys::TileM, i32>,
-    m: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: QMM_T_SPLITK_F32[wide_point(*group, *bits, *bm)?],
-            file: QMM_FILE,
-            lanes: qmm_grid(*n, WIDE_BN, *m, *bm, *split_k)?,
-            group: QMM_GROUP,
-        },
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    x: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    group: Const<i32>,
+    bits: Const<i32>,
+    bm: Const<i32>) -> Result<(), Refusal> {
+    let k = x.width;
+    let n = out.width;
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<3>` named.
+    // This body forwards `ctx.params()` as a STRUCT, so the run is the
+    // shader's layout and no `Const` mark can name a word inside it; the
+    // migration made this `keys::KPartitionSize`, which no driver answers.
+    let k_partition_size = ctx.param(3)?;
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<4>` named.
+    // This body forwards `ctx.params()` as a STRUCT, so the run is the
+    // shader's layout and no `Const` mark can name a word inside it; the
+    // migration made this `keys::SplitKPartitionStride`, which no driver answers.
+    let split_k_partition_stride = ctx.param(4)?;
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<5>` named.
+    // This body forwards `ctx.params()` as a STRUCT, so the run is the
+    // shader's layout and no `Const` mark can name a word inside it; the
+    // migration made this `keys::SplitK`, which no driver answers.
+    let split_k = ctx.param(5)?;
+    let m = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMM_FILE, QMM_T_SPLITK_F32[wide_point(*group, *bits, *bm)?]).apply(Grid::of(qmm_grid(n, WIDE_BN, m, *bm, split_k)?, QMM_GROUP)),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            x.v(),
-            pad.v(),
-            k.v(),
-            n.v(),
-            pad.v(),
-            out.v(),
-            k_partition_size.v(),
-            split_k_partition_stride.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            x.arg(),
+            w.arg(),
+            k.arg(),
+            n.arg(),
+            w.arg(),
+            out.arg(),
+            k_partition_size.arg(),
+            split_k_partition_stride.arg(),
         ],
     )
 }
@@ -2148,43 +2129,49 @@ pub fn qmm_t_splitk_f32(
 ///
 /// [`Refusal::Narrow`] for a point the shader tree does not carry, and
 /// whatever [`qmm_grid`] refuses.
+#[routine]
 pub fn qmm_t_splitk_fp16_precast(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    pad: Weight<0, Env<Buf>>,
-    out: OutSlot<0, BufMut>,
-    half_in: InSlot<0, Buf>,
-    k: Param<0, i32>,
-    n: Param<1, i32>,
-    k_partition_size: Param<3, i32>,
-    split_k_partition_stride: Param<4, i32>,
-    split_k: Param<5, i32>,
-    bm: Ask<keys::TileM, i32>,
-    m: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: QMM_T_SPLITK_FP16_PRECAST[row_tile_point(*bm)?],
-            file: QMM_FILE,
-            lanes: qmm_grid(*n, WIDE_BN, *m, *bm, *split_k)?,
-            group: QMM_GROUP,
-        },
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    half_in: In<Tensor<f16>>,
+    bm: Const<i32>) -> Result<(), Refusal> {
+    let k = half_in.width;
+    let n = out.width;
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<3>` named.
+    // This body forwards `ctx.params()` as a STRUCT, so the run is the
+    // shader's layout and no `Const` mark can name a word inside it; the
+    // migration made this `keys::KPartitionSize`, which no driver answers.
+    let k_partition_size = ctx.param(3)?;
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<4>` named.
+    // This body forwards `ctx.params()` as a STRUCT, so the run is the
+    // shader's layout and no `Const` mark can name a word inside it; the
+    // migration made this `keys::SplitKPartitionStride`, which no driver answers.
+    let split_k_partition_stride = ctx.param(4)?;
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<5>` named.
+    // This body forwards `ctx.params()` as a STRUCT, so the run is the
+    // shader's layout and no `Const` mark can name a word inside it; the
+    // migration made this `keys::SplitK`, which no driver answers.
+    let split_k = ctx.param(5)?;
+    let m = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMM_FILE, QMM_T_SPLITK_FP16_PRECAST[row_tile_point(*bm)?]).apply(Grid::of(qmm_grid(n, WIDE_BN, m, *bm, split_k)?, QMM_GROUP)),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            pad.v(),
-            pad.v(),
-            k.v(),
-            n.v(),
-            pad.v(),
-            out.v(),
-            k_partition_size.v(),
-            split_k_partition_stride.v(),
-            pad.v(),
-            half_in.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            w.arg(),
+            w.arg(),
+            k.arg(),
+            n.arg(),
+            w.arg(),
+            out.arg(),
+            k_partition_size.arg(),
+            split_k_partition_stride.arg(),
+            w.arg(),
+            half_in.arg(),
         ],
     )
 }
@@ -2195,43 +2182,49 @@ pub fn qmm_t_splitk_fp16_precast(
 ///
 /// [`Refusal::Narrow`] for a point the shader tree does not carry, and
 /// whatever [`qmm_grid`] refuses.
+#[routine]
 pub fn qmm_t_splitk_fp16_precast_f32(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    pad: Weight<0, Env<Buf>>,
-    out: OutSlot<0, BufMut>,
-    half_in: InSlot<0, Buf>,
-    k: Param<0, i32>,
-    n: Param<1, i32>,
-    k_partition_size: Param<3, i32>,
-    split_k_partition_stride: Param<4, i32>,
-    split_k: Param<5, i32>,
-    bm: Ask<keys::TileM, i32>,
-    m: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: QMM_T_SPLITK_FP16_PRECAST_F32[row_tile_point(*bm)?],
-            file: QMM_FILE,
-            lanes: qmm_grid(*n, WIDE_BN, *m, *bm, *split_k)?,
-            group: QMM_GROUP,
-        },
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    half_in: In<Tensor<f16>>,
+    bm: Const<i32>) -> Result<(), Refusal> {
+    let k = half_in.width;
+    let n = out.width;
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<3>` named.
+    // This body forwards `ctx.params()` as a STRUCT, so the run is the
+    // shader's layout and no `Const` mark can name a word inside it; the
+    // migration made this `keys::KPartitionSize`, which no driver answers.
+    let k_partition_size = ctx.param(3)?;
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<4>` named.
+    // This body forwards `ctx.params()` as a STRUCT, so the run is the
+    // shader's layout and no `Const` mark can name a word inside it; the
+    // migration made this `keys::SplitKPartitionStride`, which no driver answers.
+    let split_k_partition_stride = ctx.param(4)?;
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<5>` named.
+    // This body forwards `ctx.params()` as a STRUCT, so the run is the
+    // shader's layout and no `Const` mark can name a word inside it; the
+    // migration made this `keys::SplitK`, which no driver answers.
+    let split_k = ctx.param(5)?;
+    let m = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMM_FILE, QMM_T_SPLITK_FP16_PRECAST_F32[row_tile_point(*bm)?]).apply(Grid::of(qmm_grid(n, WIDE_BN, m, *bm, split_k)?, QMM_GROUP)),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            pad.v(),
-            pad.v(),
-            k.v(),
-            n.v(),
-            pad.v(),
-            out.v(),
-            k_partition_size.v(),
-            split_k_partition_stride.v(),
-            pad.v(),
-            half_in.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            w.arg(),
+            w.arg(),
+            k.arg(),
+            n.arg(),
+            w.arg(),
+            out.arg(),
+            k_partition_size.arg(),
+            split_k_partition_stride.arg(),
+            w.arg(),
+            half_in.arg(),
         ],
     )
 }
@@ -2246,39 +2239,36 @@ pub fn qmm_t_splitk_fp16_precast_f32(
 ///
 /// [`Refusal::Narrow`] for a point the shader tree does not carry, and
 /// whatever [`qmm_grid`] refuses.
+#[routine]
 pub fn qmm_t_strided(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    pad: Weight<0, Buf>,
-    x: InSlot<0, Buf>,
-    y: OutSlot<0, BufMut>,
-    k: Param<0, i32>,
-    n: Param<1, i32>,
-    row_stride: Param<2, i32>,
-    group: Ask<keys::QuantGroup, i32>,
-    bits: Ask<keys::QuantBits, i32>,
-    bm: Ask<keys::TileM, i32>,
-    m: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: QMM_T_STRIDED[wide_point(*group, *bits, *bm)?],
-            file: QMM_FILE,
-            lanes: qmm_grid(*n, WIDE_BN, *m, *bm, 1)?,
-            group: QMM_GROUP,
-        },
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    x: In<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>,
+    group: Const<i32>,
+    bits: Const<i32>,
+    bm: Const<i32>) -> Result<(), Refusal> {
+    let k = x.width;
+    let n = y.width;
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<2>` named.
+    // The run is the shader's struct layout, so no `Const` mark can name a
+    // word inside it, and `keys::RowStride` is answered by no driver.
+    let row_stride = ctx.param(2)?;
+    let m = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMM_FILE, QMM_T_STRIDED[wide_point(*group, *bits, *bm)?]).apply(Grid::of(qmm_grid(n, WIDE_BN, m, *bm, 1)?, QMM_GROUP)),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            x.v(),
-            y.v(),
-            k.v(),
-            n.v(),
-            pad.v(),
-            row_stride.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            x.arg(),
+            y.arg(),
+            k.arg(),
+            n.arg(),
+            w.arg(),
+            row_stride.arg(),
         ],
     )
 }
@@ -2290,39 +2280,37 @@ pub fn qmm_t_strided(
 ///
 /// [`Refusal::Narrow`] for a point the shader tree does not carry, and
 /// whatever [`qmm_grid`] refuses.
+#[routine]
 pub fn qmm_t_strided_residual(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    x: InSlot<0, Buf>,
-    y: OutSlot<0, BufMut>,
-    residual: InSlot<1, Buf>,
-    k: Param<0, i32>,
-    n: Param<1, i32>,
-    row_stride: Param<2, i32>,
-    group: Ask<keys::QuantGroup, i32>,
-    bits: Ask<keys::QuantBits, i32>,
-    bm: Ask<keys::TileM, i32>,
-    m: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: QMM_T_STRIDED_RESIDUAL[wide_point(*group, *bits, *bm)?],
-            file: QMM_FILE,
-            lanes: qmm_grid(*n, WIDE_BN, *m, *bm, 1)?,
-            group: QMM_GROUP,
-        },
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    x: In<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>,
+    residual: In<Tensor<bf16>>,
+    group: Const<i32>,
+    bits: Const<i32>,
+    bm: Const<i32>) -> Result<(), Refusal> {
+    let k = x.width;
+    let n = y.width;
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<2>` named.
+    // The run is the shader's struct layout, so no `Const` mark can name a
+    // word inside it, and `keys::RowStride` is answered by no driver.
+    let row_stride = ctx.param(2)?;
+    let m = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMM_FILE, QMM_T_STRIDED_RESIDUAL[wide_point(*group, *bits, *bm)?]).apply(Grid::of(qmm_grid(n, WIDE_BN, m, *bm, 1)?, QMM_GROUP)),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            x.v(),
-            y.v(),
-            k.v(),
-            n.v(),
-            residual.v(),
-            row_stride.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            x.arg(),
+            y.arg(),
+            k.arg(),
+            n.arg(),
+            residual.arg(),
+            row_stride.arg(),
         ],
     )
 }
@@ -2333,41 +2321,38 @@ pub fn qmm_t_strided_residual(
 ///
 /// [`Refusal::Narrow`] for a point the shader tree does not carry, and
 /// whatever [`qmm_grid`] refuses.
+#[routine]
 pub fn qmm_t_strided_fp16_precast(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    pad: Weight<0, Env<Buf>>,
-    y: OutSlot<0, BufMut>,
-    half_in: InSlot<0, Buf>,
-    k: Param<0, i32>,
-    n: Param<1, i32>,
-    row_stride: Param<2, i32>,
-    bm: Ask<keys::TileM, i32>,
-    m: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: QMM_T_STRIDED_FP16_PRECAST[row_tile_point(*bm)?],
-            file: QMM_FILE,
-            lanes: qmm_grid(*n, WIDE_BN, *m, *bm, 1)?,
-            group: QMM_GROUP,
-        },
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>,
+    half_in: In<Tensor<f16>>,
+    bm: Const<i32>) -> Result<(), Refusal> {
+    let k = half_in.width;
+    let n = y.width;
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<2>` named.
+    // The run is the shader's struct layout, so no `Const` mark can name a
+    // word inside it, and `keys::RowStride` is answered by no driver.
+    let row_stride = ctx.param(2)?;
+    let m = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMM_FILE, QMM_T_STRIDED_FP16_PRECAST[row_tile_point(*bm)?]).apply(Grid::of(qmm_grid(n, WIDE_BN, m, *bm, 1)?, QMM_GROUP)),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            pad.v(),
-            y.v(),
-            k.v(),
-            n.v(),
-            pad.v(),
-            row_stride.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            half_in.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            w.arg(),
+            y.arg(),
+            k.arg(),
+            n.arg(),
+            w.arg(),
+            row_stride.arg(),
+            w.arg(),
+            w.arg(),
+            w.arg(),
+            half_in.arg(),
         ],
     )
 }
@@ -2378,42 +2363,40 @@ pub fn qmm_t_strided_fp16_precast(
 ///
 /// [`Refusal::Narrow`] for a point the shader tree does not carry, and
 /// whatever [`qmm_grid`] refuses.
+#[routine]
 pub fn qmm_t_strided_fp16_precast_residual(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    pad: Weight<0, Env<Buf>>,
-    y: OutSlot<0, BufMut>,
-    residual: InSlot<1, Buf>,
-    half_in: InSlot<0, Buf>,
-    k: Param<0, i32>,
-    n: Param<1, i32>,
-    row_stride: Param<2, i32>,
-    bm: Ask<keys::TileM, i32>,
-    m: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: QMM_T_STRIDED_FP16_PRECAST_RESIDUAL[row_tile_point(*bm)?],
-            file: QMM_FILE,
-            lanes: qmm_grid(*n, WIDE_BN, *m, *bm, 1)?,
-            group: QMM_GROUP,
-        },
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>,
+    // As [`qmm_t_residual_fp16_precast`]: input 0 then input 1.
+    half_in: In<Tensor<f16>>,
+    residual: In<Tensor<bf16>>,
+    bm: Const<i32>) -> Result<(), Refusal> {
+    let k = residual.width;
+    let n = y.width;
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<2>` named.
+    // The run is the shader's struct layout, so no `Const` mark can name a
+    // word inside it, and `keys::RowStride` is answered by no driver.
+    let row_stride = ctx.param(2)?;
+    let m = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMM_FILE, QMM_T_STRIDED_FP16_PRECAST_RESIDUAL[row_tile_point(*bm)?]).apply(Grid::of(qmm_grid(n, WIDE_BN, m, *bm, 1)?, QMM_GROUP)),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            pad.v(),
-            y.v(),
-            k.v(),
-            n.v(),
-            residual.v(),
-            row_stride.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            half_in.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            w.arg(),
+            y.arg(),
+            k.arg(),
+            n.arg(),
+            residual.arg(),
+            row_stride.arg(),
+            w.arg(),
+            w.arg(),
+            w.arg(),
+            half_in.arg(),
         ],
     )
 }
@@ -2427,36 +2410,38 @@ pub fn qmm_t_strided_fp16_precast_residual(
 /// # Errors
 ///
 /// Whatever [`crate::routine::elementwise_rows`] refuses.
+#[routine]
 pub fn qmm_splitk_reduce(
     ctx: &Ctx<'_>,
-    y: OutSlot<0, BufMut>,
-    partial: InSlot<0, Buf>,
-    pad: InSlot<0, Buf>,
-    n: Param<1, i32>,
-    split_k_partition_stride: Param<3, i32>,
-    split_k: Param<4, i32>,
-    m: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "qmm_splitk_reduce_bfloat16",
-            file: QMM_FILE,
-            lanes: crate::routine::elementwise_rows(*n, *m)?,
-            group: [GROUP_X, 1, 1],
-        },
+    y: Out<Tensor<bf16>>,
+    partial: In<Tensor<bf16>>) -> Result<(), Refusal> {
+    let n = y.width;
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<3>` named.
+    // This body forwards `ctx.params()` as a STRUCT, so the run is the
+    // shader's layout and no `Const` mark can name a word inside it; the
+    // migration made this `keys::SplitKPartitionStride`, which no driver answers.
+    let split_k_partition_stride = ctx.param(3)?;
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<4>` named.
+    // This body forwards `ctx.params()` as a STRUCT, so the run is the
+    // shader's layout and no `Const` mark can name a word inside it; the
+    // migration made this `keys::SplitK`, which no driver answers.
+    let split_k = ctx.param(4)?;
+    let m = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMM_FILE, "qmm_splitk_reduce_bfloat16").apply(Grid::of(elementwise_rows(n, m)?, [GROUP_X, 1, 1])),
         &[
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            y.v(),
-            pad.v(),
-            n.v(),
-            pad.v(),
-            partial.v(),
-            pad.v(),
-            split_k_partition_stride.v(),
-            split_k.v(),
+            partial.arg(),
+            partial.arg(),
+            partial.arg(),
+            partial.arg(),
+            y.arg(),
+            partial.arg(),
+            n.arg(),
+            partial.arg(),
+            partial.arg(),
+            partial.arg(),
+            split_k_partition_stride.arg(),
+            split_k.arg(),
         ],
     )
 }
@@ -2470,36 +2455,38 @@ pub fn qmm_splitk_reduce(
 /// # Errors
 ///
 /// Whatever [`crate::routine::elementwise_rows`] refuses.
+#[routine]
 pub fn qmm_splitk_reduce_f32(
     ctx: &Ctx<'_>,
-    y: OutSlot<0, BufMut>,
-    partial: InSlot<0, Buf>,
-    pad: InSlot<0, Buf>,
-    n: Param<1, i32>,
-    split_k_partition_stride: Param<3, i32>,
-    split_k: Param<4, i32>,
-    m: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "qmm_splitk_reduce_f32_bfloat16",
-            file: QMM_FILE,
-            lanes: crate::routine::elementwise_rows(*n, *m)?,
-            group: [GROUP_X, 1, 1],
-        },
+    y: Out<Tensor<bf16>>,
+    partial: In<Tensor<f32>>) -> Result<(), Refusal> {
+    let n = y.width;
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<3>` named.
+    // This body forwards `ctx.params()` as a STRUCT, so the run is the
+    // shader's layout and no `Const` mark can name a word inside it; the
+    // migration made this `keys::SplitKPartitionStride`, which no driver answers.
+    let split_k_partition_stride = ctx.param(3)?;
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<4>` named.
+    // This body forwards `ctx.params()` as a STRUCT, so the run is the
+    // shader's layout and no `Const` mark can name a word inside it; the
+    // migration made this `keys::SplitK`, which no driver answers.
+    let split_k = ctx.param(4)?;
+    let m = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMM_FILE, "qmm_splitk_reduce_f32_bfloat16").apply(Grid::of(elementwise_rows(n, m)?, [GROUP_X, 1, 1])),
         &[
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            y.v(),
-            pad.v(),
-            n.v(),
-            pad.v(),
-            partial.v(),
-            pad.v(),
-            split_k_partition_stride.v(),
-            split_k.v(),
+            partial.arg(),
+            partial.arg(),
+            partial.arg(),
+            partial.arg(),
+            y.arg(),
+            partial.arg(),
+            n.arg(),
+            partial.arg(),
+            partial.arg(),
+            partial.arg(),
+            split_k_partition_stride.arg(),
+            split_k.arg(),
         ],
     )
 }
@@ -2531,35 +2518,32 @@ pub fn qmm_splitk_reduce_f32(
 /// # Errors
 ///
 /// Whatever [`crate::routine::elementwise`] refuses.
+#[routine]
 pub fn cast_qmm_input_bfloat16_to_float16(
     ctx: &Ctx<'_>,
-    pad: InSlot<0, Buf>,
-    cast_in: InSlot<0, Buf>,
-    half_out: OutSlot<0, BufMut>,
-    count: Param<3, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "cast_qmm_input_bfloat16_to_float16",
-            file: QMM_FILE,
-            lanes: crate::routine::elementwise(*count, 1)?,
-            group: [GROUP_X, 1, 1],
-        },
+    cast_in: In<Tensor<bf16>>,
+    half_out: Out<Tensor<f16>>) -> Result<(), Refusal> {
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<3>` named.
+    // The run is the shader's struct layout, so no `Const` mark can name a
+    // word inside it, and `keys::Count` is answered by no driver.
+    let count = ctx.param(3)?;
+    ctx.fire(
+        Fire::at(QMM_FILE, "cast_qmm_input_bfloat16_to_float16").apply(Grid::of(elementwise(count, 1)?, [GROUP_X, 1, 1])),
         &[
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            cast_in.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            half_out.v(),
-            count.v(),
+            cast_in.arg(),
+            cast_in.arg(),
+            cast_in.arg(),
+            cast_in.arg(),
+            cast_in.arg(),
+            cast_in.arg(),
+            cast_in.arg(),
+            cast_in.arg(),
+            cast_in.arg(),
+            cast_in.arg(),
+            cast_in.arg(),
+            cast_in.arg(),
+            half_out.arg(),
+            count.arg(),
         ],
     )
 }
@@ -2576,36 +2560,34 @@ pub fn cast_qmm_input_bfloat16_to_float16(
 /// # Errors
 ///
 /// Whatever [`crate::routine::elementwise_rows`] refuses.
+#[routine]
 pub fn cast_qmm_input_strided_bfloat16_to_float16(
     ctx: &Ctx<'_>,
-    pad: InSlot<0, Env<Buf>>,
-    cast_in: InSlot<0, Buf>,
-    half_out: OutSlot<0, BufMut>,
-    k: Param<0, i32>,
-    row_stride: Param<2, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "cast_qmm_input_strided_bfloat16_to_float16",
-            file: QMM_FILE,
-            lanes: crate::routine::elementwise_rows(*k, *rows)?,
-            group: [GROUP_X, 1, 1],
-        },
+    cast_in: In<Tensor<bf16>>,
+    half_out: Out<Tensor<f16>>,
+    // THE SOURCE'S ROW PITCH, WHICH THE STATEMENT CARRIES. It was
+    // `Param<2, i32>` and the migration made it an ask no driver answers; it
+    // is the activation's own stride, which the text knows and the fire does
+    // not.
+    row_stride: Const<i32>) -> Result<(), Refusal> {
+    let k = cast_in.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMM_FILE, "cast_qmm_input_strided_bfloat16_to_float16").apply(Grid::of(elementwise_rows(k, rows)?, [GROUP_X, 1, 1])),
         &[
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            cast_in.v(),
-            pad.v(),
-            k.v(),
-            pad.v(),
-            pad.v(),
-            row_stride.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            half_out.v(),
+            cast_in.arg(),
+            cast_in.arg(),
+            cast_in.arg(),
+            cast_in.arg(),
+            cast_in.arg(),
+            k.arg(),
+            cast_in.arg(),
+            cast_in.arg(),
+            row_stride.arg(),
+            cast_in.arg(),
+            cast_in.arg(),
+            cast_in.arg(),
+            half_out.arg(),
         ],
     )
 }
@@ -2621,34 +2603,29 @@ pub fn cast_qmm_input_strided_bfloat16_to_float16(
 ///
 /// [`Refusal::Narrow`] for a point the shader tree does not carry, and
 /// whatever [`qmv_grid`] refuses.
+#[routine]
 pub fn qmv_fast(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    x: InSlot<0, Buf>,
-    y: OutSlot<0, BufMut>,
-    in_vec_size: Param<0, i32>,
-    out_vec_size: Param<1, i32>,
-    group: Ask<keys::QuantGroup, i32>,
-    bits: Ask<keys::QuantBits, i32>,
-    vecs: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: QMV_FAST[codec_point(*group, *bits)?],
-            file: QMV_FILE,
-            lanes: qmv_grid(*vecs, *out_vec_size)?,
-            group: QMV_GROUP,
-        },
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    x: In<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>,
+    group: Const<i32>,
+    bits: Const<i32>) -> Result<(), Refusal> {
+    let in_vec_size = x.width;
+    let out_vec_size = y.width;
+    let vecs = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMV_FILE, QMV_FAST[codec_point(*group, *bits)?]).apply(Grid::of(qmv_grid(vecs, out_vec_size)?, QMV_GROUP)),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            x.v(),
-            y.v(),
-            in_vec_size.v(),
-            out_vec_size.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            x.arg(),
+            y.arg(),
+            in_vec_size.arg(),
+            out_vec_size.arg(),
         ],
     )
 }
@@ -2660,36 +2637,31 @@ pub fn qmv_fast(
 ///
 /// [`Refusal::Narrow`] for a point the shader tree does not carry, and
 /// whatever [`qmv_grid`] refuses.
+#[routine]
 pub fn qmv_fast_residual(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    x: InSlot<0, Buf>,
-    y: OutSlot<0, BufMut>,
-    in_vec_size: Param<0, i32>,
-    out_vec_size: Param<1, i32>,
-    residual: InSlot<1, Buf>,
-    group: Ask<keys::QuantGroup, i32>,
-    bits: Ask<keys::QuantBits, i32>,
-    vecs: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: QMV_FAST_RESIDUAL[codec_point(*group, *bits)?],
-            file: QMV_FILE,
-            lanes: qmv_grid(*vecs, *out_vec_size)?,
-            group: QMV_GROUP,
-        },
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    x: In<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>,
+    residual: In<Tensor<bf16>>,
+    group: Const<i32>,
+    bits: Const<i32>) -> Result<(), Refusal> {
+    let in_vec_size = x.width;
+    let out_vec_size = y.width;
+    let vecs = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMV_FILE, QMV_FAST_RESIDUAL[codec_point(*group, *bits)?]).apply(Grid::of(qmv_grid(vecs, out_vec_size)?, QMV_GROUP)),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            x.v(),
-            y.v(),
-            in_vec_size.v(),
-            out_vec_size.v(),
-            residual.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            x.arg(),
+            y.arg(),
+            in_vec_size.arg(),
+            out_vec_size.arg(),
+            residual.arg(),
         ],
     )
 }
@@ -2704,39 +2676,33 @@ pub fn qmv_fast_residual(
 ///
 /// [`Refusal::Narrow`] for a point the shader tree does not carry, and
 /// whatever [`qmv_grid`] refuses.
+#[routine]
 pub fn qmv_tail(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    pad: Weight<0, Buf>,
-    x: InSlot<0, Buf>,
-    y: OutSlot<0, BufMut>,
-    in_vec_size: Param<0, i32>,
-    out_vec_size: Param<1, i32>,
-    bits: Ask<keys::QuantBits, i32>,
-    vecs: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: QMV_TAIL[bits_point(*bits)?],
-            file: QMV_FILE,
-            lanes: qmv_grid(*vecs, *out_vec_size)?,
-            group: QMV_GROUP,
-        },
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    x: In<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>,
+    bits: Const<i32>) -> Result<(), Refusal> {
+    let in_vec_size = x.width;
+    let out_vec_size = y.width;
+    let vecs = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMV_FILE, QMV_TAIL[bits_point(*bits)?]).apply(Grid::of(qmv_grid(vecs, out_vec_size)?, QMV_GROUP)),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            x.v(),
-            y.v(),
-            in_vec_size.v(),
-            out_vec_size.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            x.arg(),
+            y.arg(),
+            in_vec_size.arg(),
+            out_vec_size.arg(),
+            w.arg(),
+            w.arg(),
+            w.arg(),
+            w.arg(),
+            w.arg(),
         ],
     )
 }
@@ -2747,40 +2713,34 @@ pub fn qmv_tail(
 ///
 /// [`Refusal::Narrow`] for a point the shader tree does not carry, and
 /// whatever [`qmv_grid`] refuses.
+#[routine]
 pub fn qmv_tail_bias(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    pad: Weight<0, Buf>,
-    x: InSlot<0, Buf>,
-    y: OutSlot<0, BufMut>,
-    bias: Weight<3, Buf>,
-    in_vec_size: Param<0, i32>,
-    out_vec_size: Param<1, i32>,
-    bits: Ask<keys::QuantBits, i32>,
-    vecs: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: QMV_TAIL_BIAS[bits_point(*bits)?],
-            file: QMV_FILE,
-            lanes: qmv_grid(*vecs, *out_vec_size)?,
-            group: QMV_GROUP,
-        },
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    x: In<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>,
+    bias: Const<Tensor<bf16>>,
+    bits: Const<i32>) -> Result<(), Refusal> {
+    let in_vec_size = x.width;
+    let out_vec_size = y.width;
+    let vecs = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMV_FILE, QMV_TAIL_BIAS[bits_point(*bits)?]).apply(Grid::of(qmv_grid(vecs, out_vec_size)?, QMV_GROUP)),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            x.v(),
-            y.v(),
-            in_vec_size.v(),
-            out_vec_size.v(),
-            bias.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
-            pad.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            x.arg(),
+            y.arg(),
+            in_vec_size.arg(),
+            out_vec_size.arg(),
+            bias.arg(),
+            w.arg(),
+            w.arg(),
+            w.arg(),
+            w.arg(),
         ],
     )
 }
@@ -2799,38 +2759,35 @@ pub fn qmv_tail_bias(
 ///
 /// [`Refusal::Narrow`] for a point the shader tree does not carry, and
 /// whatever [`qmv_grid`] refuses.
+#[routine]
 pub fn qmv_wide_strided(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    pad: Weight<0, Buf>,
-    x: InSlot<0, Buf>,
-    y: OutSlot<0, BufMut>,
-    in_vec_size: Param<0, i32>,
-    out_vec_size: Param<1, i32>,
-    row_stride: Param<2, i32>,
-    m: Ask<keys::Rows, i32>,
-    bits: Ask<keys::QuantBits, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: QMV_WIDE_STRIDED[bits_point(*bits)?],
-            file: QMM_FILE,
-            lanes: qmv_grid(quarters(*m), *out_vec_size)?,
-            group: QMV_GROUP,
-        },
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    x: In<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>,
+    bits: Const<i32>) -> Result<(), Refusal> {
+    let in_vec_size = x.width;
+    let out_vec_size = y.width;
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<2>` named.
+    // The run is the shader's struct layout, so no `Const` mark can name a
+    // word inside it, and `keys::RowStride` is answered by no driver.
+    let row_stride = ctx.param(2)?;
+    let m = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMM_FILE, QMV_WIDE_STRIDED[bits_point(*bits)?]).apply(Grid::of(qmv_grid(quarters(m), out_vec_size)?, QMV_GROUP)),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            x.v(),
-            y.v(),
-            in_vec_size.v(),
-            out_vec_size.v(),
-            pad.v(),
-            row_stride.v(),
-            m.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            x.arg(),
+            y.arg(),
+            in_vec_size.arg(),
+            out_vec_size.arg(),
+            w.arg(),
+            row_stride.arg(),
+            m.arg(),
         ],
     )
 }
@@ -2845,25 +2802,20 @@ pub fn qmv_wide_strided(
 /// # Errors
 ///
 /// Whatever [`qmm_grid`] refuses.
+#[routine]
 pub fn qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    x: InSlot<0, Buf>,
-    y: OutSlot<0, BufMut>,
-    k: Param<0, i32>,
-    n: Param<1, i32>,
-    m: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "affine_qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4",
-            file: QMM_FILE,
-            lanes: qmm_grid(*n, 32, *m, 128, 1)?,
-            group: QMM_GROUP,
-        },
-        &[w.v(), scales.v(), biases.v(), x.v(), y.v(), k.v(), n.v()],
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    x: In<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let k = x.width;
+    let n = y.width;
+    let m = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMM_FILE, "affine_qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4").apply(Grid::of(qmm_grid(n, 32, m, 128, 1)?, QMM_GROUP)),
+        &[w.arg(), scales.arg(), biases.arg(), x.arg(), y.arg(), k.arg(), n.arg()],
     )
 }
 
@@ -2877,25 +2829,20 @@ pub fn qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4(
 /// # Errors
 ///
 /// Whatever [`qmm_grid`] refuses.
+#[routine]
 pub fn qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    x: InSlot<0, Buf>,
-    y: OutSlot<0, BufMut>,
-    k: Param<0, i32>,
-    n: Param<1, i32>,
-    m: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2",
-            file: QMM_FILE,
-            lanes: qmm_grid(*n, 32, *m, 32, 1)?,
-            group: QMM_GROUP,
-        },
-        &[w.v(), scales.v(), biases.v(), x.v(), y.v(), k.v(), n.v()],
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    x: In<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let k = x.width;
+    let n = y.width;
+    let m = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMM_FILE, "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2").apply(Grid::of(qmm_grid(n, 32, m, 32, 1)?, QMM_GROUP)),
+        &[w.arg(), scales.arg(), biases.arg(), x.arg(), y.arg(), k.arg(), n.arg()],
     )
 }
 
@@ -2909,25 +2856,20 @@ pub fn qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2(
 /// # Errors
 ///
 /// Whatever [`qmm_grid`] refuses.
+#[routine]
 pub fn qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    x: InSlot<0, Buf>,
-    y: OutSlot<0, BufMut>,
-    k: Param<0, i32>,
-    n: Param<1, i32>,
-    m: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2",
-            file: QMM_FILE,
-            lanes: qmm_grid(*n, 32, *m, 64, 1)?,
-            group: QMM_GROUP,
-        },
-        &[w.v(), scales.v(), biases.v(), x.v(), y.v(), k.v(), n.v()],
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    x: In<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let k = x.width;
+    let n = y.width;
+    let m = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMM_FILE, "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2").apply(Grid::of(qmm_grid(n, 32, m, 64, 1)?, QMM_GROUP)),
+        &[w.arg(), scales.arg(), biases.arg(), x.arg(), y.arg(), k.arg(), n.arg()],
     )
 }
 
@@ -2941,25 +2883,20 @@ pub fn qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2(
 /// # Errors
 ///
 /// Whatever [`qmm_grid`] refuses.
+#[routine]
 pub fn qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    x: InSlot<0, Buf>,
-    y: OutSlot<0, BufMut>,
-    k: Param<0, i32>,
-    n: Param<1, i32>,
-    m: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1",
-            file: QMM_FILE,
-            lanes: qmm_grid(*n, 32, *m, 64, 1)?,
-            group: QMM_GROUP,
-        },
-        &[w.v(), scales.v(), biases.v(), x.v(), y.v(), k.v(), n.v()],
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    x: In<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let k = x.width;
+    let n = y.width;
+    let m = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMM_FILE, "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1").apply(Grid::of(qmm_grid(n, 32, m, 64, 1)?, QMM_GROUP)),
+        &[w.arg(), scales.arg(), biases.arg(), x.arg(), y.arg(), k.arg(), n.arg()],
     )
 }
 
@@ -2973,25 +2910,20 @@ pub fn qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1(
 /// # Errors
 ///
 /// Whatever [`qmm_grid`] refuses.
+#[routine]
 pub fn qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    x: InSlot<0, Buf>,
-    y: OutSlot<0, BufMut>,
-    k: Param<0, i32>,
-    n: Param<1, i32>,
-    m: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4",
-            file: QMM_FILE,
-            lanes: qmm_grid(*n, 64, *m, 64, 1)?,
-            group: QMM_GROUP,
-        },
-        &[w.v(), scales.v(), biases.v(), x.v(), y.v(), k.v(), n.v()],
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    x: In<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let k = x.width;
+    let n = y.width;
+    let m = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(QMM_FILE, "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4").apply(Grid::of(qmm_grid(n, 64, m, 64, 1)?, QMM_GROUP)),
+        &[w.arg(), scales.arg(), biases.arg(), x.arg(), y.arg(), k.arg(), n.arg()],
     )
 }
 
@@ -3004,23 +2936,18 @@ pub fn qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4(
 /// # Errors
 ///
 /// Whatever [`crate::routine::elementwise`] refuses.
+#[routine]
 pub fn encode_u4_bf16(
     ctx: &Ctx<'_>,
-    input: InSlot<0, Buf>,
-    codes: OutSlot<0, BufMut>,
-    scales: OutSlot<1, BufMut>,
-    biases: OutSlot<2, BufMut>,
-    params: Block<Buf>,
-    groups: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "affine_encode_u4_bf16",
-            file: TRANSCODE_FILE,
-            lanes: crate::routine::elementwise(*groups, 1)?,
-            group: [GROUP_X, 1, 1],
-        },
-        &[input.v(), codes.v(), scales.v(), biases.v(), params.v()],
+    input: In<Tensor<bf16>>,
+    codes: Out<Tensor<u32>>,
+    scales: Out<Tensor<bf16>>,
+    biases: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let groups = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(TRANSCODE_FILE, "affine_encode_u4_bf16").apply(Grid::of(elementwise(groups, 1)?, [GROUP_X, 1, 1])),
+        &[input.arg(), codes.arg(), scales.arg(), biases.arg(), params],
     )
 }
 
@@ -3033,23 +2960,18 @@ pub fn encode_u4_bf16(
 /// # Errors
 ///
 /// Whatever [`crate::routine::elementwise`] refuses.
+#[routine]
 pub fn encode_u4_f32(
     ctx: &Ctx<'_>,
-    input: InSlot<0, Buf>,
-    codes: OutSlot<0, BufMut>,
-    scales: OutSlot<1, BufMut>,
-    biases: OutSlot<2, BufMut>,
-    params: Block<Buf>,
-    groups: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "affine_encode_u4_f32",
-            file: TRANSCODE_FILE,
-            lanes: crate::routine::elementwise(*groups, 1)?,
-            group: [GROUP_X, 1, 1],
-        },
-        &[input.v(), codes.v(), scales.v(), biases.v(), params.v()],
+    input: In<Tensor<bf16>>,
+    codes: Out<Tensor<u32>>,
+    scales: Out<Tensor<bf16>>,
+    biases: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let groups = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(TRANSCODE_FILE, "affine_encode_u4_f32").apply(Grid::of(elementwise(groups, 1)?, [GROUP_X, 1, 1])),
+        &[input.arg(), codes.arg(), scales.arg(), biases.arg(), params],
     )
 }
 
@@ -3061,76 +2983,94 @@ pub fn encode_u4_f32(
 /// # Errors
 ///
 /// Whatever [`crate::routine::elementwise`] refuses.
+#[routine]
 pub fn mxfp4_dequant_bf16(
     ctx: &Ctx<'_>,
-    payload: InSlot<0, Buf>,
-    exponents: InSlot<1, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    blocks: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "mxfp4_dequant_bf16",
-            file: TRANSCODE_FILE,
-            lanes: crate::routine::elementwise(*blocks, 1)?,
-            group: [GROUP_X, 1, 1],
-        },
-        &[payload.v(), exponents.v(), out.v(), params.v()],
+    payload: In<Tensor<u8>>,
+    exponents: In<Tensor<u8>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let blocks = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(TRANSCODE_FILE, "mxfp4_dequant_bf16").apply(Grid::of(elementwise(blocks, 1)?, [GROUP_X, 1, 1])),
+        &[payload.arg(), exponents.arg(), out.arg(), params],
     )
 }
 
-/// The family, in the order the rows above state it.
-pub static ROUTINES: &[Routine] = &[
-    crate::routine!(cast_qmm_input_bfloat16_to_float16),
-    crate::routine!(cast_qmm_input_strided_bfloat16_to_float16),
-    crate::routine!(encode_u4_bf16),
-    crate::routine!(encode_u4_f32),
-    crate::routine!(mxfp4_dequant_bf16),
-    crate::routine!(qmm_splitk_reduce),
-    crate::routine!(qmm_splitk_reduce_f32),
-    crate::routine!(qmm_t),
-    crate::routine!(qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4),
-    crate::routine!(qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2),
-    crate::routine!(qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2),
-    crate::routine!(qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1),
-    crate::routine!(qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4),
-    crate::routine!(qmm_t_bias),
-    crate::routine!(qmm_t_bias_fp16_precast),
-    crate::routine!(qmm_t_fp16_precast),
-    crate::routine!(qmm_t_residual),
-    crate::routine!(qmm_t_residual_fp16_precast),
-    crate::routine!(qmm_t_splitk),
-    crate::routine!(qmm_t_splitk_f32),
-    crate::routine!(qmm_t_splitk_fp16_precast),
-    crate::routine!(qmm_t_splitk_fp16_precast_f32),
-    crate::routine!(qmm_t_strided),
-    crate::routine!(qmm_t_strided_fp16_precast),
-    crate::routine!(qmm_t_strided_fp16_precast_residual),
-    crate::routine!(qmm_t_strided_residual),
-    crate::routine!(qmv_fast),
-    crate::routine!(qmv_fast_residual),
-    crate::routine!(qmv_tail),
-    crate::routine!(qmv_tail_bias),
-    crate::routine!(qmv_wide_strided),
-];
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routine::{ArgValue, Encode};
-    use core::cell::RefCell;
+    use crate::routine::{ArgValue, Const, Encode, Tensor};
+    use core::cell::{Cell, RefCell};
 
     /// One recorded dispatch: the fire, and the argument list.
     type Call = (Fire, Vec<ArgValue>);
 
-    /// An `Encode` that remembers what it was asked to do.
-    #[derive(Default)]
-    struct Seen(RefCell<Vec<Call>>);
+    /// An `Encode` that remembers what it was asked to do, and answers the
+    /// facts this file's TESTED bodies ask for: the staged scalar block
+    /// every routine but the tiled/vector matmuls takes with `ctx.params()`,
+    /// and the five scalars the tiled and vector forms ask under their own
+    /// names -- `Rows` (every one of them, as a row count, a vector count or
+    /// a group count), `RowStride` (the strided forms), and the split-K
+    /// triple `qmm_t_splitk` alone reads.
+    struct Seen {
+        calls: RefCell<Vec<Call>>,
+        params_handle: Cell<u32>,
+        /// THE STATEMENT\'S SCALAR RUN, for a body that reads a word by
+        /// index. Empty means "4096 at every slot", which is a plausible
+        /// stride for the rows these tests build; a case that means a
+        /// particular tiling or split count sets its own.
+        words: RefCell<Vec<i32>>,
+        rows: Cell<i32>,
+        row_stride: Cell<i32>,
+        k_partition_size: Cell<i32>,
+        split_k_partition_stride: Cell<i32>,
+        split_k: Cell<i32>,
+    }
+
+    impl Default for Seen {
+        fn default() -> Self {
+            Self {
+                calls: RefCell::default(),
+                params_handle: Cell::new(800),
+                words: RefCell::default(),
+                rows: Cell::new(4),
+                row_stride: Cell::new(8192),
+                k_partition_size: Cell::new(512),
+                split_k_partition_stride: Cell::new(65536),
+                split_k: Cell::new(8),
+            }
+        }
+    }
 
     impl Encode for Seen {
-        fn dispatch(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
-            self.0.borrow_mut().push((fire, args.to_vec()));
+        fn resolve(&self, _ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
+            use kernels::keys::Fact;
+            // THE STATEMENT'S OWN SCALARS, which a body reads by index when its
+            // params run is a struct and no `Const` mark can name a word inside
+            // it -- see `Asks::param`. The probe answers a number that is
+            // plausible for every reader: a stride wide enough for the rows
+            // these tests build, and a positive tiling.
+            if let kernels::Source::Slot(kernels::Kind::Param, n) = source {
+                return Ok(ArgValue::I32(
+                    self.words.borrow().get(usize::from(n)).copied().unwrap_or(4096),
+                ));
+            }
+            if source == kernels::Source::Slot(kernels::Kind::Params, 0) {
+                return Ok(ArgValue::Buffer(self.params_handle.get()));
+            }
+            if source == <keys::Rows as Fact>::SOURCE {
+                return Ok(ArgValue::I32(self.rows.get()));
+            }
+            // Anything else is refused: a probe that invented an answer to a
+            // fact it does not know would let a body pass under test while
+            // the same fact went unanswered on a real driver.
+            Err(Refusal::Unstated { what: "a fact this probe does not answer" })
+        }
+
+        fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
+            self.calls.borrow_mut().push((fire, args.to_vec()));
             Ok(())
         }
     }
@@ -3216,24 +3156,19 @@ mod tests {
         );
         assert_eq!(wide_point(128, 8, 64), Ok(17));
         let seen = Seen::default();
+        seen.rows.set(32);
         qmm_t_strided(
             &seen,
-            Weight::new(Buf(1)),
-            Weight::new(Buf(2)),
-            Weight::new(Buf(3)),
-            Weight::new(Buf(4)),
-            InSlot::new(Buf(5)),
-            OutSlot::new(BufMut(6)),
-            Param::new(4096),
-            Param::new(2048),
-            Param::new(8192),
-            Ask::new(64),
-            Ask::new(4),
-            Ask::new(32),
-            Ask::new(64),
-        )
+            Const::new(Tensor::<u32>::new(1)),
+            Const::new(Tensor::<bf16>::new(2)),
+            Const::new(Tensor::<bf16>::new(3)),
+            In::new(Tensor::<bf16>::new(5)),
+            Out { ptr: Tensor::<bf16>::new(6), rows: 0, width: 2048 },
+            Const::new(64),
+            Const::new(4),
+            Const::new(32))
         .expect("a launch");
-        let calls = seen.0.borrow();
+        let calls = seen.calls.borrow();
         let (fire, _) = &calls[0];
         assert_eq!(
             fire.lanes[0],
@@ -3262,31 +3197,35 @@ mod tests {
     #[test]
     fn a_split_k_matmul_states_its_partitions_on_the_grid() {
         let seen = Seen::default();
+        seen.rows.set(32);
+        // THE RUN THIS CASE IS ABOUT, at the words HEAD's `Param<N>` named:
+        // a K partition of 16, a partial stride of 65536 and eight splits.
+        // The body reads them by index because its params run is the shader's
+        // struct -- see `Asks::param`.
+        {
+            let mut w = seen.words.borrow_mut();
+            w.resize(6, 4096);
+            w[3] = 16;
+            w[4] = 65_536;
+            w[5] = 8;
+        }
         qmm_t_splitk(
             &seen,
-            Weight::new(Buf(1)),
-            Weight::new(Buf(2)),
-            Weight::new(Buf(3)),
-            Weight::new(Buf(4)),
-            InSlot::new(Buf(5)),
-            OutSlot::new(BufMut(6)),
-            Param::new(4096),
-            Param::new(2048),
-            Param::new(512),
-            Param::new(65536),
-            Param::new(8),
-            Ask::new(64),
-            Ask::new(4),
-            Ask::new(32),
-            Ask::new(64),
-        )
+            Const::new(Tensor::<u32>::new(1)),
+            Const::new(Tensor::<bf16>::new(2)),
+            Const::new(Tensor::<bf16>::new(3)),
+            In::new(Tensor::<bf16>::new(5)),
+            Out { ptr: Tensor::<bf16>::new(6), rows: 0, width: 32 },
+            Const::new(64),
+            Const::new(4),
+            Const::new(32))
         .expect("a launch");
-        let calls = seen.0.borrow();
+        let calls = seen.calls.borrow();
         let (fire, args) = &calls[0];
         assert_eq!(fire.lanes[2], 8 * QMM_GROUP[2], "eight partitions of k");
         assert_eq!(
             args[10],
-            65536.v(),
+            65536.arg(),
             "slot 10 is the partial buffer's stride, which is what the \
              shader declares there"
         );
@@ -3302,25 +3241,25 @@ mod tests {
     #[test]
     fn a_matvec_binds_the_weight_planes_ahead_of_the_activation() {
         let seen = Seen::default();
+        seen.rows.set(1);
         qmv_fast(
             &seen,
-            Weight::new(Buf(10)),
-            Weight::new(Buf(11)),
-            Weight::new(Buf(12)),
-            InSlot::new(Buf(13)),
-            OutSlot::new(BufMut(14)),
-            Param::new(2048),
-            Param::new(4096),
-            Ask::new(64),
-            Ask::new(4),
-            Ask::new(1),
-        )
+            Const::new(Tensor::<u32>::new(10)),
+            Const::new(Tensor::<bf16>::new(11)),
+            Const::new(Tensor::<bf16>::new(12)),
+            In::new(Tensor::<bf16>::new(13)),
+            Out { ptr: Tensor::<bf16>::new(14), rows: 0, width: 4096 },
+            Const::new(64),
+            Const::new(4))
         .expect("a launch");
-        let calls = seen.0.borrow();
+        let calls = seen.calls.borrow();
         let (fire, args) = &calls[0];
-        assert_eq!(args[0], Buf(10).v(), "the packed weight");
-        assert_eq!(args[3], Buf(13).v(), "then the activation");
-        assert_eq!(args[4], BufMut(14).v(), "then the result");
+        assert_eq!(args[0], Tensor::<bf16>::new(10).arg(), "the packed weight");
+        assert_eq!(args[3], Tensor::<bf16>::new(13).arg(), "then the activation");
+        // BOUND AS THE MARK BINDS IT. `Tensor::arg()` is the READ form; this
+        // operand is an `Out`, and an `Out` reaches for `BindMut` so the
+        // driver can tell which buffers a dispatch writes.
+        assert_eq!(args[4], Out::<Tensor<bf16>>::new(Tensor::<bf16>::new(14)).arg(), "then the result");
         assert_eq!(fire.entrypoint, "affine_qmv_fast_bfloat16_gs_64_b_4");
         assert_eq!(fire.lanes, [32, 1024, 1], "one group per eight output rows");
     }
@@ -3341,22 +3280,19 @@ mod tests {
             "and left alone so qmv_grid does the refusing"
         );
         let seen = Seen::default();
+        // The stride this case asserts, at the word the body reads it from.
+        seen.words.borrow_mut().extend([4096, 4096, 8192]);
+        seen.rows.set(9);
         qmv_wide_strided(
             &seen,
-            Weight::new(Buf(1)),
-            Weight::new(Buf(2)),
-            Weight::new(Buf(3)),
-            Weight::new(Buf(4)),
-            InSlot::new(Buf(5)),
-            OutSlot::new(BufMut(6)),
-            Param::new(2048),
-            Param::new(4096),
-            Param::new(8192),
-            Ask::new(9),
-            Ask::new(4),
-        )
+            Const::new(Tensor::<u32>::new(1)),
+            Const::new(Tensor::<bf16>::new(2)),
+            Const::new(Tensor::<bf16>::new(3)),
+            In::new(Tensor::<bf16>::new(5)),
+            Out { ptr: Tensor::<bf16>::new(6), rows: 0, width: 4096 },
+            Const::new(4))
         .expect("a launch");
-        let calls = seen.0.borrow();
+        let calls = seen.calls.borrow();
         let (fire, args) = &calls[0];
         assert_eq!(
             fire.lanes[0],
@@ -3367,8 +3303,8 @@ mod tests {
         // buffer 8 and `M` at 9, with 7 declared by nothing -- which is the
         // `pad` this call now passes. The count is still stated; the table
         // grew a hole in front of it.
-        assert_eq!(args[8], 8192.v(), "the row stride the shader reads at 8");
-        assert_eq!(args[9], 9.v(), "and the kernel is told there are nine");
+        assert_eq!(args[8], 8192.arg(), "the row stride the shader reads at 8");
+        assert_eq!(args[9], 9.arg(), "and the kernel is told there are nine");
         assert_eq!(
             fire.file, QMM_FILE,
             "it lives with the tiles, not the other matvecs"
@@ -3384,21 +3320,21 @@ mod tests {
     #[test]
     fn the_affine_encoder_writes_three_planes() {
         let seen = Seen::default();
+        seen.rows.set(1024);
         encode_u4_bf16(
             &seen,
-            InSlot::new(Buf(1)),
-            OutSlot::new(BufMut(2)),
-            OutSlot::new(BufMut(3)),
-            OutSlot::new(BufMut(4)),
-            Block::new(Buf(5)),
-            Ask::new(1024),
-        )
+            In::new(Tensor::<bf16>::new(1)),
+            Out::new(Tensor::<u32>::new(2)),
+            Out::new(Tensor::<bf16>::new(3)),
+            Out::new(Tensor::<bf16>::new(4)))
         .expect("a launch");
-        let calls = seen.0.borrow();
+        let calls = seen.calls.borrow();
         let (fire, args) = &calls[0];
-        assert_eq!(args[1], BufMut(2).v(), "the codes");
-        assert_eq!(args[2], BufMut(3).v(), "then the scales");
-        assert_eq!(args[3], BufMut(4).v(), "then the biases");
+        // All three are `Out`s -- the test's own name says so -- so all three
+        // bind through `BindMut`. `Tensor::arg()` would be the read form.
+        assert_eq!(args[1], Out::<Tensor<u32>>::new(Tensor::<u32>::new(2)).arg(), "the codes");
+        assert_eq!(args[2], Out::<Tensor<bf16>>::new(Tensor::<bf16>::new(3)).arg(), "then the scales");
+        assert_eq!(args[3], Out::<Tensor<bf16>>::new(Tensor::<bf16>::new(4)).arg(), "then the biases");
         assert_eq!(fire.lanes, [1024, 1, 1], "one group per lane");
     }
 }

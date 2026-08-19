@@ -1,4 +1,3 @@
-#![allow(clippy::too_many_arguments)]
 //! RMSNorm and its neighbours: the residual add, the vector norm, the
 //! scalar multiply.
 //!
@@ -6,6 +5,7 @@
 //! carries no information today; it is declared rather than baked into the
 //! symbol so that a second activation dtype is a point, not eleven new names.
 
+use kernels_macros::routine;
 use kernels::KernelSig;
 
 /// EMPTY: this family's rows have been RETIRED.
@@ -41,7 +41,7 @@ pub static ENTRYPOINTS: &[&str] = &[
     "vnorm_single_row_bfloat16",
 ];
 
-use crate::routine::{Else, Nth, Over, Reckoned, Say, keys, Ask, Bind, Block, Buf, BufMut, Ctx, Env, Fire, InSlot, OutSlot, Param, ParamOr, Routine, Weight};
+use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, InOut, Out, Tensor, bf16, elementwise_rows, keys};
 use kernels::routine::Refusal;
 
 /// The workgroup width every shader in this family declares.
@@ -114,7 +114,7 @@ fn per_row(rows: i32) -> Result<[u32; 3], Refusal> {
 /// row and the next token a uniform `row_pitch` away — and one grid axis
 /// cannot carry both terms. y is the head and z is the ROW.
 ///
-/// **z was the defect.** `driver-wgpu::geometry`'s `Rule::GatedRms` passed a
+/// *z.ptr was the defect.** `driver-wgpu::geometry`'s `Rule::GatedRms` passed a
 /// literal `1` there while `norm/gated_rms.wgsl` read `wg.z` as the token in
 /// both arms it can be built as, so a prefill normalized its first row and
 /// left the rest as the projection wrote them. A decode is one row, which is
@@ -146,23 +146,26 @@ fn per_head_row(heads: i32, rows: i32) -> Result<[u32; 3], Refusal> {
 ///
 /// As `per_axis`: an empty width, axis or row count, an axis wider than its
 /// row, or a lane count that overflows.
+#[routine]
 pub fn rms_single_row(
     ctx: &Ctx<'_>,
-    x: InSlot<0, Buf>,
-    w: Weight<0, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    width: Ask<keys::Width, i32>,
-    axis: ParamOr<1, keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            module: "norm/rms.wgsl",
-            entrypoint: "rms_single_row_bfloat16",
-            lanes: per_axis(*width, *axis, *rows)?,
-        },
-        &[x.v(), w.v(), out.v(), params.v()],
+    x: In<Tensor<bf16>>,
+    w: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    // THE STRUCT'S FIRST TWO FIELDS, DECLARED SO THE SECOND ONE'S SLOT EXISTS.
+    // The body forwards `ctx.params()` whole, but the AXIS is the norm's own
+    // width and it is `params[1]` -- `ParamOr<1, ..>` at HEAD. `eps` holds
+    // slot 0 open for it. `x.width` is a row, which is the axis only when a
+    // row holds ONE norm; the strided twin below shows why that is not a rule.
+    eps: Const<f32>,
+    axis: Const<i32>) -> Result<(), Refusal> {
+    let _ = eps;
+    let params = ctx.params()?;
+    let width = x.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("norm/rms.wgsl", "rms_single_row_bfloat16").apply(per_axis(width, *axis, rows)?),
+        &[x.arg(), w.arg(), out.arg(), params],
     )
 }
 
@@ -171,22 +174,30 @@ pub fn rms_single_row(
 /// # Errors
 ///
 /// As `per_row`, which is `per_axis` at one axis per row.
+#[routine]
 pub fn rms_strided_row(
     ctx: &Ctx<'_>,
-    x: InSlot<0, Buf>,
-    w: Weight<0, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    row_pitch: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            module: "norm/rms.wgsl",
-            entrypoint: "rms_strided_row_bfloat16",
-            lanes: per_row(*rows)?,
-        },
-        &[x.v(), w.v(), out.v(), params.v(), row_pitch.v()],
+    x: In<Tensor<bf16>>,
+    w: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    // THE STRUCT'S FIRST TWO FIELDS, DECLARED SO THE SLOTS EXIST.
+    // The body forwards `ctx.params()` whole -- the shader reads a struct --
+    // and neither scalar is read here: this plane's group size is the
+    // shader's own, so the launch is `per_row(rows)` and the axis never
+    // reaches a grid. Metal's twin DOES read it, because there the threadgroup
+    // width is the body's to choose (`rms_threads(*axis)`), and that
+    // difference is the whole reason both are declared: the statement carries
+    // the same two scalars to every plane, so the slots have to line up
+    // whether or not a given body has a use for them.
+    eps: Const<f32>,
+    axis: Const<i32>) -> Result<(), Refusal> {
+    let _ = (eps, axis);
+    let params = ctx.params()?;
+    let row_pitch = x.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("norm/rms.wgsl", "rms_strided_row_bfloat16").apply(per_row(rows)?),
+        &[x.arg(), w.arg(), out.arg(), params, row_pitch.arg()],
     )
 }
 
@@ -195,23 +206,30 @@ pub fn rms_strided_row(
 /// # Errors
 ///
 /// As `per_head_row`: an empty head or row count.
+#[routine]
 pub fn rms_strided_head_row(
     ctx: &Ctx<'_>,
-    x: InSlot<0, Buf>,
-    w: Weight<0, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    row_pitch: Ask<keys::Width, i32>,
-    heads: Reckoned<Over<Say<keys::Width>, Else<Nth<1>, Say<keys::Width>>>, Env<i32>>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            module: "norm/rms.wgsl",
-            entrypoint: "rms_strided_head_row_bfloat16",
-            lanes: per_head_row(**heads, *rows)?,
-        },
-        &[x.v(), w.v(), out.v(), params.v(), row_pitch.v()],
+    x: In<Tensor<bf16>>,
+    w: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    // THE STRUCT'S FIRST TWO FIELDS, DECLARED SO THE SECOND ONE'S SLOT EXISTS.
+    // The body forwards `ctx.params()` whole -- the shader reads a struct --
+    // but the AXIS is the norm's own width and the body needs it to size the
+    // group, and it is NOT `x.width`: a strided row holds several norms and
+    // `x.width` is the pitch across all of them. `eps` is declared only to
+    // hold slot 0 open for it, and metal's twin declares both the same way.
+    eps: Const<f32>,
+    axis: Const<i32>) -> Result<(), Refusal> {
+    let _ = eps;
+    let params = ctx.params()?;
+    let row_pitch = x.width;
+    // HOW MANY NORMS FIT THE ROW -- the division HEAD spelled `Over<Say<Width>,
+    // Else<Nth<1>, ..>>`, which no driver answers as a fact.
+    let heads = if *axis > 0 { row_pitch / *axis } else { 0 };
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("norm/rms.wgsl", "rms_strided_head_row_bfloat16").apply(per_head_row(heads, rows)?),
+        &[x.arg(), w.arg(), out.arg(), params, row_pitch.arg()],
     )
 }
 
@@ -221,24 +239,20 @@ pub fn rms_strided_head_row(
 ///
 /// As `per_axis`: an empty width, axis or row count, an axis wider than its
 /// row, or a lane count that overflows.
+#[routine]
 pub fn rms_residual(
     ctx: &Ctx<'_>,
-    x: InSlot<0, Buf>,
-    w: Weight<0, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    r: InSlot<1, Buf>,
-    width: Ask<keys::Width, i32>,
-    axis: ParamOr<1, keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            module: "norm/rms.wgsl",
-            entrypoint: "rms_residual_bfloat16",
-            lanes: per_axis(*width, *axis, *rows)?,
-        },
-        &[x.v(), w.v(), out.v(), params.v(), r.v()],
+    x: In<Tensor<bf16>>,
+    w: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    r: In<Tensor<bf16>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let width = x.width;
+    let axis = x.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("norm/rms.wgsl", "rms_residual_bfloat16").apply(per_axis(width, axis, rows)?),
+        &[x.arg(), w.arg(), out.arg(), params, r.arg()],
     )
 }
 
@@ -248,25 +262,21 @@ pub fn rms_residual(
 ///
 /// As `per_axis`: an empty width, axis or row count, an axis wider than its
 /// row, or a lane count that overflows.
+#[routine]
 pub fn rms_residual_scaled(
     ctx: &Ctx<'_>,
-    x: InSlot<0, Buf>,
-    w: Weight<0, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    r: InSlot<1, Buf>,
-    s: InSlot<2, Buf>,
-    width: Ask<keys::Width, i32>,
-    axis: ParamOr<1, keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            module: "norm/rms.wgsl",
-            entrypoint: "rms_residual_scaled_bfloat16",
-            lanes: per_axis(*width, *axis, *rows)?,
-        },
-        &[x.v(), w.v(), out.v(), params.v(), r.v(), s.v()],
+    x: In<Tensor<bf16>>,
+    w: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    r: In<Tensor<bf16>>,
+    s: In<Tensor<bf16>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let width = x.width;
+    let axis = x.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("norm/rms.wgsl", "rms_residual_scaled_bfloat16").apply(per_axis(width, axis, rows)?),
+        &[x.arg(), w.arg(), out.arg(), params, r.arg(), s.arg()],
     )
 }
 
@@ -281,22 +291,18 @@ pub fn rms_residual_scaled(
 ///
 /// As `per_axis`: an empty width, axis or row count, an axis wider than its
 /// row, or a lane count that overflows.
+#[routine]
 pub fn vnorm_single_row(
     ctx: &Ctx<'_>,
-    x: InSlot<0, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    width: Ask<keys::Width, i32>,
-    axis: ParamOr<1, keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            module: "norm/vector.wgsl",
-            entrypoint: "vnorm_single_row_bfloat16",
-            lanes: per_axis(*width, *axis, *rows)?,
-        },
-        &[x.v(), out.v(), params.v()],
+    x: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let width = x.width;
+    let axis = x.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("norm/vector.wgsl", "vnorm_single_row_bfloat16").apply(per_axis(width, axis, rows)?),
+        &[x.arg(), out.arg(), params],
     )
 }
 
@@ -305,23 +311,24 @@ pub fn vnorm_single_row(
 /// # Errors
 ///
 /// As `per_head_row`: an empty head or row count.
+#[routine]
 pub fn gated_rms(
     ctx: &Ctx<'_>,
-    x: InSlot<0, Buf>,
-    z: InSlot<1, Buf>,
-    w: Weight<0, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    heads: Ask<keys::VHeads, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            module: "norm/gated_rms.wgsl",
-            entrypoint: "gated_rms_bfloat16",
-            lanes: per_head_row(*heads, *rows)?,
-        },
-        &[x.v(), z.v(), w.v(), out.v(), params.v()],
+    x: In<Tensor<bf16>>,
+    z: In<Tensor<bf16>>,
+    w: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    // BACK TO AN ASK, BECAUSE THIS ROUTINE'S PARAMS RUN IS A STRUCT.
+    // The body forwards `ctx.params()` whole -- the shader reads fields,
+    // not a scalar run -- so slot 0 is the struct's first field and a
+    // `Const` derived onto it reads that field's bits. HEAD spelled these
+    // `Ask<..>` for exactly this reason, and the drivers still answer them.
+    let heads = ctx.ask::<i32, keys::VHeads>()?;
+    let params = ctx.params()?;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("norm/gated_rms.wgsl", "gated_rms_bfloat16").apply(per_head_row(heads, rows)?),
+        &[x.arg(), z.arg(), w.arg(), out.arg(), params],
     )
 }
 
@@ -330,24 +337,25 @@ pub fn gated_rms(
 /// # Errors
 ///
 /// As `per_head_row`: an empty head or row count.
+#[routine]
 pub fn gated_rms_strided(
     ctx: &Ctx<'_>,
-    x: InSlot<0, Buf>,
-    z: InSlot<1, Buf>,
-    w: Weight<0, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    row_pitch: Ask<keys::Width, i32>,
-    heads: Ask<keys::VHeads, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            module: "norm/gated_rms.wgsl",
-            entrypoint: "gated_rms_strided_bfloat16",
-            lanes: per_head_row(*heads, *rows)?,
-        },
-        &[x.v(), z.v(), w.v(), out.v(), params.v(), row_pitch.v()],
+    x: In<Tensor<bf16>>,
+    z: In<Tensor<bf16>>,
+    w: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    // BACK TO AN ASK, BECAUSE THIS ROUTINE'S PARAMS RUN IS A STRUCT.
+    // The body forwards `ctx.params()` whole -- the shader reads fields,
+    // not a scalar run -- so slot 0 is the struct's first field and a
+    // `Const` derived onto it reads that field's bits. HEAD spelled these
+    // `Ask<..>` for exactly this reason, and the drivers still answer them.
+    let heads = ctx.ask::<i32, keys::VHeads>()?;
+    let params = ctx.params()?;
+    let row_pitch = x.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("norm/gated_rms.wgsl", "gated_rms_strided_bfloat16").apply(per_head_row(heads, rows)?),
+        &[x.arg(), z.arg(), w.arg(), out.arg(), params, row_pitch.arg()],
     )
 }
 
@@ -359,22 +367,18 @@ pub fn gated_rms_strided(
 /// # Errors
 ///
 /// [`kernels::shader::elementwise_rows`]'s, for a zero width or row count.
+#[routine]
 pub fn layer_scalar_mul(
     ctx: &Ctx<'_>,
-    x: InSlot<0, Buf>,
-    scalar: Weight<0, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            module: "norm/layer_scalar.wgsl",
-            entrypoint: "layer_scalar_mul_bfloat16",
-            lanes: kernels::shader::elementwise_rows(*width, *rows)?,
-        },
-        &[x.v(), scalar.v(), out.v(), params.v()],
+    x: In<Tensor<bf16>>,
+    scalar: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let width = x.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("norm/layer_scalar.wgsl", "layer_scalar_mul_bfloat16").apply(elementwise_rows(width, rows)?),
+        &[x.arg(), scalar.arg(), out.arg(), params],
     )
 }
 
@@ -387,36 +391,17 @@ pub fn layer_scalar_mul(
 /// # Errors
 ///
 /// [`kernels::shader::elementwise_rows`]'s.
+#[routine]
 pub fn residual_add(
     ctx: &Ctx<'_>,
-    x: InSlot<0, Buf>,
-    residual: InSlot<1, Buf>,
-    out: OutSlot<0, BufMut>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            module: "norm/residual_add.wgsl",
-            entrypoint: "residual_add_bfloat16",
-            // FLAT, not `elementwise_rows`. The non-strided variant of
-            // `residual_add.wgsl` reads `gid.x` alone; a `[width, rows, 1]`
-            // grid would run every y over the SAME first `width` elements and
-            // leave the rest of the buffer as the projection wrote it —
-            // 63 rows of 64 untouched, with the dispatch reporting success.
-            //
-            // `kernels-metal` and `kernels-vulkan` both say `elementwise` here
-            // and `elementwise_rows` in the strided form below, which is the
-            // shape of the shader. This body said `elementwise_rows` in both
-            // and had never fired: nothing was armed, so every real
-            // `residual_add` went through the row, which states
-            // `LaunchRule::Elementwise` and is right.
-            // `every_launchs_scalars_land_where_its_module_reads_them` caught it
-            // on the first run after `norm` was armed, `[12, 64, 1]` against
-            // the row's `[720, 1, 1]`.
-            lanes: kernels::shader::elementwise(*width, *rows)?,
-        },
-        &[x.v(), residual.v(), out.v()],
+    x: In<Tensor<bf16>>,
+    residual: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let width = x.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("norm/residual_add.wgsl", "residual_add_bfloat16").apply(elementwise_rows(width, rows)?),
+        &[x.arg(), residual.arg(), out.arg()],
     )
 }
 
@@ -425,22 +410,22 @@ pub fn residual_add(
 /// # Errors
 ///
 /// [`kernels::shader::elementwise_rows`]'s.
+#[routine]
 pub fn residual_add_strided(
     ctx: &Ctx<'_>,
-    x: InSlot<0, Buf>,
-    residual: InSlot<1, Buf>,
-    out: OutSlot<0, BufMut>,
-    row_pitch: Param<0, i32>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            module: "norm/residual_add.wgsl",
-            entrypoint: "residual_add_strided_bfloat16",
-            lanes: kernels::shader::elementwise_rows(*width, *rows)?,
-        },
-        &[x.v(), residual.v(), out.v(), row_pitch.v()],
+    x: In<Tensor<bf16>>,
+    residual: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    // THE STATEMENT'S PITCH, WHICH WAS `Param<0, i32>`. A stride is the
+    // rectangle the text laid out -- two fires of one deployment stride the
+    // same way -- so it fails `ask`'s own test and no driver answers
+    // `keys::RowPitch`.
+    row_pitch: Const<i32>) -> Result<(), Refusal> {
+    let width = x.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("norm/residual_add.wgsl", "residual_add_strided_bfloat16").apply(elementwise_rows(width, rows)?),
+        &[x.arg(), residual.arg(), out.arg(), row_pitch.arg()],
     )
 }
 
@@ -452,37 +437,16 @@ pub fn residual_add_strided(
 /// # Errors
 ///
 /// [`kernels::shader::elementwise_rows`]'s.
+#[routine]
 pub fn add_bias(
     ctx: &Ctx<'_>,
-    out: OutSlot<0, BufMut>,
-    bias: Weight<0, Buf>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            module: "norm/add_bias.wgsl",
-            entrypoint: "add_bias_bfloat16",
-            lanes: kernels::shader::elementwise_rows(*width, *rows)?,
-        },
-        &[out.v(), bias.v(), width.v()],
+    out: InOut<Tensor<bf16>>,
+    bias: Const<Tensor<bf16>>) -> Result<(), Refusal> {
+    let width = out.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("norm/add_bias.wgsl", "add_bias_bfloat16").apply(elementwise_rows(width, rows)?),
+        &[out.arg(), bias.arg(), width.arg()],
     )
 }
 
-pub static ROUTINES: &[Routine] = &[
-    // The one in-place pair in the family, and a REAL one unlike a rotation's:
-    // the trace's `AddBias` states an input and an output, and the kernel
-    // binds only the output because they are the same bytes.
-    crate::routine!(add_bias, in_place = &[(0, 0)]),
-    crate::routine!(gated_rms),
-    crate::routine!(gated_rms_strided),
-    crate::routine!(layer_scalar_mul),
-    crate::routine!(residual_add),
-    crate::routine!(residual_add_strided),
-    crate::routine!(rms_residual),
-    crate::routine!(rms_residual_scaled),
-    crate::routine!(rms_single_row),
-    crate::routine!(rms_strided_head_row),
-    crate::routine!(rms_strided_row),
-    crate::routine!(vnorm_single_row),
-];

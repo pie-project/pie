@@ -1492,22 +1492,33 @@ impl Block {
 /// not build. Read off the row's `Ty` and not off the shader, which is the
 /// point: a row that says `Buf` where its shader says `read_write` is a
 /// disagreement between the table and the tree, and it should fail here.
+///
+/// Through [`kernels::Ty::binds`] and not a hand-kept list here: this used to
+/// be its own `matches!` naming every `*Mut` variant, and it drifted the same
+/// way `is_buffer`'s once did — `Ty::Bf16sMut` and `Ty::F16sMut` arrived after
+/// the list was last written and neither is in it, so every activation-typed
+/// output (`add_bias`, `residual_add`, `shared_expert_combine`, the tiled and
+/// quantised matvecs, `silu_mul`, ...) read here as read-only and this
+/// function failed them against a body that correctly writes them. A
+/// classification kept once in `kernels` cannot drift from itself twice.
 fn writable(ty: kernels::Ty) -> bool {
-    use kernels::Ty;
-    matches!(
-        ty,
-        Ty::BufMut
-            | Ty::F32sMut
-            | Ty::I32sMut
-            | Ty::U32sMut
-            | Ty::U8sMut
-            | Ty::U16sMut
-            | Ty::I8sMut
-            | Ty::BufArrayMut
-            | Ty::BufArrayOut
-            | Ty::BufArrayOutMut
-    )
+    ty.binds() == kernels::Binds::Writes
 }
+
+/// The paged-attention family's shared `@group(0)` writability shape.
+///
+/// `sdpa_paged_decode`, `..._sink`, `sdpa_paged_tiled`, `..._sink`, and
+/// `sdpa_paged_mma`, `..._sink` all ask the fire for the SAME nine tables —
+/// `k_pages`, `v_pages`, `position_ids`, `req_of_token`, `kv_page_indices`,
+/// `kv_page_indptr`, `attention_mask`, `attention_mask_enabled`, `sinks` —
+/// rather than declaring them, so each one's `run`-derived count (`queries`,
+/// `out` only) would undercount by nine. Read off every one of these
+/// routines' bodies and cross-checked against `naga`'s own per-binding write
+/// map: `queries` reads, the nine asked tables read, and `out` is the only
+/// write, at position three.
+const PAGED_ATTENTION_WRITES: [bool; 11] = [
+    false, false, false, true, false, false, false, false, false, false, false,
+];
 
 /// The row's writability flags, against what the shader BODY actually does.
 ///
@@ -1706,8 +1717,9 @@ fn run(gpu: &Gpu, entrypoint: &str, buffers: &[&wgpu::Buffer], uniform: &[u8], g
     let writes: Vec<bool> = stem
         .args
         .iter()
-        .filter(|(ty, _)| kernels_wgpu::is_buffer(*ty))
-        .map(|(ty, _)| writable(*ty))
+        .copied()
+        .filter(|ty| kernels_wgpu::is_buffer(*ty))
+        .map(writable)
         .collect();
     assert_eq!(
         writes.len(),
@@ -2226,7 +2238,18 @@ fn a_norm_is_its_closed_form_at_both_of_its_folds() {
             &rms_params(eps, WIDTH, w_stride as u32, plus_one, gain),
         );
         // `LaunchRule::Rms` is one workgroup per axis, and the axis is the row.
-        run(gpu, name, &[&x, &w, &out, &params], &[], [ROWS, 1, 1]);
+        //
+        // `rms_single_row` asks the fire for `params` rather than declaring
+        // it, so `run`'s signature-derived count (`x`, `w`, `out`)
+        // undercounts by one; only `out` is written.
+        dispatch(
+            gpu,
+            name,
+            &[&x, &w, &out, &params],
+            &[false, false, true, false],
+            &[],
+            [ROWS, 1, 1],
+        );
 
         let got = unpack(&read(gpu, &out), n);
         for row in 0..ROWS as usize {
@@ -2337,10 +2360,15 @@ fn a_packed_operand_bounds_the_gather_it_rides_in() {
     );
 
     // `ElementwiseRows`, in WORDS on x because one invocation moves one word.
-    run(
+    //
+    // `row_gather` asks the fire for `rows` (the index table) and `params`
+    // rather than declaring them, so `run`'s signature-derived count
+    // (`input`, `out`) undercounts by two; only `out` is written.
+    dispatch(
         gpu,
         name,
         &[&input, &out, &rows, &params],
+        &[false, true, false, false],
         &[],
         [over(pitch as u32, 16), over(count as u32, 16), 1],
     );
@@ -2497,10 +2525,14 @@ fn each_gated_activation_answers_to_its_own_closed_form() {
     // shell builds from the row is the same on all three backends.
     let geglu = sentinelled(gpu, n / 2);
     let geglu_params = storage(gpu, &0u32.to_le_bytes());
-    run(
+    // `geglu_tanh` asks the fire for `params` rather than declaring it, so
+    // `run`'s signature-derived count (`gate`, `up`, `geglu`) undercounts by
+    // one; only `geglu` is written.
+    dispatch(
         gpu,
         "geglu_tanh_bfloat16",
         &[&gate_buf, &up_buf, &geglu, &geglu_params],
+        &[false, false, true, false],
         &[],
         [words, 1, 1],
     );
@@ -2517,10 +2549,13 @@ fn each_gated_activation_answers_to_its_own_closed_form() {
         ]
         .concat(),
     );
-    run(
+    // Same shape as `geglu_tanh` above: `gptoss_swiglu` also asks for
+    // `params`, so `run` undercounts by one here too.
+    dispatch(
         gpu,
         "gptoss_swiglu_bfloat16",
         &[&gate_buf, &up_buf, &gptoss, &gptoss_params],
+        &[false, false, true, false],
         &[],
         [words, 1, 1],
     );
@@ -2709,10 +2744,15 @@ fn a_rope_rotates_against_the_tensor_it_is_overwriting() {
         .f32("base", base)
         .i32("head_dim", head_dim as i32)
         .done();
-    run(
+    // `neox_decode` asks the fire for `position` rather than declaring it, so
+    // `run`'s signature-derived count undercounts by one buffer; `dispatch`
+    // takes the writability the routine's body actually gives each slot.
+    // `x` is `InOut` (written), `position` is a read-only ask.
+    dispatch(
         gpu,
         "neox_decode_bfloat16",
         &[&x, &position],
+        &[true, false],
         &block,
         [pairs as u32, heads as u32, 1],
     );
@@ -2776,10 +2816,13 @@ fn a_proportional_rope_turns_only_its_own_slice() {
         .f32("base", base)
         .i32("head_dim", head_dim as i32)
         .done();
-    run(
+    // Same undercount as `neox_decode`: `position` is asked for, not
+    // declared. `x` (`InOut`) is written, `position` is read.
+    dispatch(
         gpu,
         "neox_prop_decode_bfloat16",
         &[&x, &position],
+        &[true, false],
         &block,
         [pairs as u32, heads as u32, 1],
     );
@@ -2961,10 +3004,15 @@ fn a_kv_append_scatters_to_the_slot_its_strides_name() {
         .wide("k_seq_stride", k_seq_stride)
         .done();
     assert_eq!(block.len(), 32, "24 bytes of fields, rounded to 16 by WGSL");
-    run(
+    // `kv_append` asks the fire for `k_cache`/`v_cache`/`pos`, so `run`'s
+    // signature-derived count (`k_new`, `v_new` only) undercounts by three.
+    // The two asked caches are WRITTEN (the append scatters into them); the
+    // asked position table is read-only.
+    dispatch(
         gpu,
         "kv_append_bfloat16",
         &[&k_new, &v_new, &k_cache, &v_cache, &pos],
+        &[false, false, true, true, false],
         &block,
         [over(head_dim as u32 / 2, 256), kv_heads as u32, 1],
     );
@@ -3064,12 +3112,22 @@ fn a_paged_kv_append_writes_through_its_page_table() {
         .i32("page_size", page_size as i32)
         .i32("n_kv_heads", n_kv_heads as i32)
         .done();
-    run(
+    // `kv_append_paged` asks the fire for `k_pages`/`v_pages`/`w_page`/`w_off`
+    // (and takes six more ring-ABI holes this module never declares), so
+    // `run`'s signature-derived count (`k_new`, `v_new` only) badly
+    // undercounts. Bindings 2 and 3 (`k_pages`, `v_pages`) are WRITTEN by the
+    // append; every other slot — the six ring holes and the write-page/offset
+    // tables — is read-only or untouched.
+    dispatch(
         gpu,
         "kv_append_paged_bfloat16",
         &[
             &k_new, &v_new, &k_pages, &v_pages, &rings[0], &rings[1], &rings[2], &rings[3],
             &rings[4], &rings[5], &page, &off, &rings[0],
+        ],
+        &[
+            false, false, true, true, false, false, false, false, false, false, false, false,
+            false,
         ],
         &block,
         [
@@ -3220,10 +3278,14 @@ fn a_dense_decode_attends_with_the_value_stride_and_not_the_key_stride() {
         .f32("scale", scale)
         .done();
     assert_eq!(block.len(), 48, "two i32s, four vec2<u32>s and a float");
-    run(
+    // `sdpa_vector_decode` asks the fire for `keys`/`values`, so `run`'s
+    // signature-derived count (`queries`, `out`) undercounts by two; only
+    // `out` is written.
+    dispatch(
         gpu,
         "sdpa_vector_decode_bfloat16_d_64",
         &[&queries, &keys, &values, &out],
+        &[false, false, false, true],
         &block,
         [q_heads as u32, rows as u32, 1],
     );
@@ -3337,7 +3399,9 @@ fn a_paged_decode_attends_through_its_page_table_and_its_mask() {
             .u32("attention_mask_stride", mask_stride)
             .i32("window", window)
             .done();
-        run(
+        // `sdpa_paged_decode` asks the fire for nine of these eleven buffers
+        // rather than declaring them; see `PAGED_ATTENTION_WRITES`.
+        dispatch(
             gpu,
             &entrypoint,
             &[
@@ -3353,6 +3417,7 @@ fn a_paged_decode_attends_through_its_page_table_and_its_mask() {
                 &attention_mask_enabled,
                 &sinks,
             ],
+            &PAGED_ATTENTION_WRITES,
             &block,
             [q_heads as u32, rows as u32, 1],
         );
@@ -3628,7 +3693,14 @@ fn a_router_chooses_exactly_and_weights_approximately() {
     // `LaunchRule::RouterLane`: one workgroup per ROW, on y. The row axis was
     // once missing next door, and at `grid.y = 1` a mixture prefill routed row
     // 0 and left every other row's ids whatever the previous layer wrote.
-    run(
+    //
+    // `router_topk` asks the fire for `params` (the staged block) rather
+    // than declaring it, and `per_expert_scale` is a deliberately absent
+    // buffer this unscaled arm never reads but which still occupies a real
+    // bind group slot; `run`'s signature-derived count (three declared
+    // buffers) would undercount by two. `expert_ids` and `expert_weights`
+    // are the only written buffers.
+    dispatch(
         gpu,
         "router_topk_bfloat16",
         &[
@@ -3638,6 +3710,7 @@ fn a_router_chooses_exactly_and_weights_approximately() {
             &params,
             &per_expert_scale,
         ],
+        &[false, true, true, false, false],
         &[],
         [1, rows as u32, 1],
     );
@@ -3754,10 +3827,17 @@ fn a_route_sort_gives_every_pair_one_slot_in_its_own_span() {
     // `LaunchRule::RouterSort`: ONE workgroup for the whole routing, whatever
     // the row count. N copies of this would each clear and rewrite the
     // permutation the others are reading.
-    run(
+    //
+    // `route_sort` asks the fire for `params` rather than declaring it, so
+    // `run`'s signature-derived count (`expert_ids`, `perm`, `row_expert`,
+    // `tile_expert`, `inv`) undercounts by one; `perm`, `row_expert`,
+    // `tile_expert` and `inv` are all written, and `expert_ids` and `params`
+    // are read.
+    dispatch(
         gpu,
         "route_sort",
         &[&expert_ids, &perm, &row_expert, &tile_expert, &params, &inv],
+        &[false, true, true, true, false, true],
         &[],
         [1, 1, 1],
     );
@@ -3906,10 +3986,14 @@ fn a_route_gather_compacts_by_its_permutation() {
         ),
     );
 
-    run(
+    // `route_gather` asks the fire for `params` rather than declaring it, so
+    // `run`'s signature-derived count (`x`, `out`, `perm`) undercounts by
+    // one; only `out` is written.
+    dispatch(
         gpu,
         "route_gather",
         &[&x, &out, &perm, &params],
+        &[false, true, false, false],
         &[],
         [over(width as u32, 16), over(padded as u32, 16), 1],
     );
@@ -4022,10 +4106,16 @@ fn a_combine_reads_back_through_the_inverse_permutation() {
             .collect::<Vec<u8>>(),
     );
 
-    run(
+    // `combine_sorted` asks the fire for `params` from a staged block rather
+    // than declaring it as an operand, and it lands BETWEEN `out` and `inv`
+    // in fire order — not appended at the end — so `run`'s signature-derived
+    // sequence would both undercount and misplace it. `out` is the only
+    // written buffer; `y`, `weights`, `params` and `inv` are all read.
+    dispatch(
         gpu,
         "combine_sorted",
         &[&y, &weights, &out, &params, &inv],
+        &[false, false, true, false, false],
         &[],
         [over(width as u32, 16), over(rows as u32, 16), 1],
     );
@@ -4902,10 +4992,18 @@ fn a_routed_matvec_indexes_weights_by_expert_and_input_by_two_strides() {
     ] {
         let y = sentinelled(gpu, shape.y_len().div_ceil(2));
         let block = shape.block(entrypoint);
-        run(
+        // Both `qmv_routed` and `qmv_routed_bias` ask the fire for
+        // `expert_ids` and derive `in_vec_size`/`out_vec_size` from the
+        // marks rather than declaring them as buffers, and `bias` is either
+        // a real `Const` (the `_bias` form) or the SAME binding left absent
+        // (the plain form) — either way it is a real, read-only slot in the
+        // bind group. `run`'s signature-derived count would miscount both
+        // arms; `y` is the only written buffer.
+        dispatch(
             gpu,
             entrypoint,
             &[&w, &scales, &biases, &x, &y, &bias, &ids],
+            &[false, false, false, false, true, false, false],
             &block,
             shape.grid(),
         );
@@ -5023,10 +5121,16 @@ fn an_mxfp4_routed_matvec_does_not_depend_on_the_bias_plane_slot() {
     for unread in [&unread_a, &unread_b] {
         let y = sentinelled(gpu, shape.y_len().div_ceil(2));
         let block = shape.block(entrypoint);
-        run(
+        // `mxfp4_qmv_routed_bias` asks the fire for `expert_ids` and derives
+        // its two vec sizes from the marks, so `run`'s signature-derived
+        // count would miscount. Binding 2 is the hole this `//#if` arm never
+        // declares — its value never reaches the shader either way — and
+        // `y` is the only written buffer.
+        dispatch(
             gpu,
             entrypoint,
             &[&w, &scales, unread, &x, &y, &bias, &ids],
+            &[false, false, false, false, true, false, false],
             &block,
             shape.grid(),
         );
@@ -5112,7 +5216,13 @@ fn a_scaled_router_weights_by_the_expert_and_not_by_the_slot() {
     for entrypoint in ["router_topk_bfloat16", "router_topk_scaled_bfloat16"] {
         let expert_ids = i32s(gpu, &vec![-7i32; rows * k]);
         let expert_weights = sentinelled(gpu, (rows * k).div_ceil(2));
-        run(
+        // Both `router_topk` and `router_topk_scaled` ask the fire for
+        // `params`; `per_expert_scale` is either a deliberately absent hole
+        // (the plain form) or a real `Const` (the scaled form) at the same
+        // binding either way. `run`'s signature-derived count would
+        // undercount both arms. `expert_ids` and `expert_weights` are the
+        // only written buffers.
+        dispatch(
             gpu,
             entrypoint,
             &[
@@ -5122,6 +5232,7 @@ fn a_scaled_router_weights_by_the_expert_and_not_by_the_slot() {
                 &params,
                 &per_expert_scale,
             ],
+            &[false, true, true, false, false],
             &[],
             [1, rows as u32, 1],
         );
@@ -5369,10 +5480,15 @@ fn a_qkv_split_gives_each_projection_its_own_width() {
     // `LaunchRule::SplitPacked` is `[in_width, rows, 1]` in ELEMENTS; this body
     // owns a pair, so half that many lanes do the work and the rest exit at the
     // guard. Dispatched at the minimum, where an undershoot is visible.
-    run(
+    //
+    // `split_qkv_bf16` asks the fire for `params` rather than declaring it,
+    // so `run`'s signature-derived count (`packed`, `q`, `k`, `v`)
+    // undercounts by one; `q`, `k` and `v` are all written.
+    dispatch(
         gpu,
         "split_qkv_bf16",
         &[&packed, &q, &k, &v, &params],
+        &[false, true, true, true, false],
         &[],
         [over(packed_width.div_ceil(2) as u32, 256), rows as u32, 1],
     );
@@ -5480,10 +5596,14 @@ fn a_logit_softcap_saturates_at_its_cap() {
         &[cap.to_bits().to_le_bytes(), 3u32.to_le_bytes()].concat(),
     );
 
-    run(
+    // `logit_softcap` asks the fire for `params` (the staged cap block)
+    // rather than declaring it, so `run`'s signature-derived count
+    // (`logits`, `out`) undercounts by one; only `out` is written.
+    dispatch(
         gpu,
         "logit_softcap_bfloat16",
         &[&logits, &out, &params],
+        &[false, true, false],
         &[],
         [over(n as u32 / 2, 256), 1, 1],
     );
@@ -5563,10 +5683,14 @@ fn a_ple_combine_rounds_once_and_at_the_end() {
         &[inv_sqrt2.to_bits().to_le_bytes(), 3u32.to_le_bytes()].concat(),
     );
 
-    run(
+    // `ple_combine` asks the fire for `params` rather than declaring it, so
+    // `run`'s signature-derived count (`proj`, `token`, `out`) undercounts
+    // by one; only `out` is written.
+    dispatch(
         gpu,
         "ple_combine_bfloat16",
         &[&proj, &token, &out, &params],
+        &[false, false, true, false],
         &[],
         [over(n as u32 / 2, 256), 1, 1],
     );
@@ -5639,10 +5763,14 @@ fn a_layer_scalar_multiply_reads_its_scale_from_the_buffer() {
     let out = sentinelled(gpu, n / 2);
     let params = storage(gpu, &7u32.to_le_bytes());
 
-    run(
+    // `layer_scalar_mul` asks the fire for `params` (the staged, unread
+    // `hidden` field), so `run`'s signature-derived count (`x`, `scalar`,
+    // `out`) undercounts by one; only `out` is written.
+    dispatch(
         gpu,
         "layer_scalar_mul_bfloat16",
         &[&x, &scalar, &out, &params],
+        &[false, false, true, false],
         &[],
         [over(n as u32 / 2, 256), 1, 1],
     );
@@ -5711,10 +5839,14 @@ fn a_vector_norm_reduces_over_its_axis_and_not_over_its_row() {
     // `LaunchRule::Rms` is one workgroup per AXIS, not per row: `width / axis`
     // axes to a row and `rows` rows.
     let axes = (width / axis) * rows;
-    run(
+    // `vnorm_single_row` asks the fire for `params` rather than declaring
+    // it, so `run`'s signature-derived count (`x`, `out`) undercounts by
+    // one; only `out` is written.
+    dispatch(
         gpu,
         "vnorm_single_row_bfloat16",
         &[&x, &out, &params],
+        &[false, true, false],
         &[],
         [axes as u32, 1, 1],
     );
@@ -5870,10 +6002,16 @@ fn an_embedding_gather_decodes_in_all_four_corners_at_two_packings() {
                 // `LaunchRule::Elementwise`, one row, in output WORDS.
                 [over(hidden as u32 / 2, 256), 1, 1]
             };
-            run(
+            // Every `embed_gather` variant asks the fire for `id` (the row
+            // index buffer) rather than declaring it, so `run`'s
+            // signature-derived count (`w`, `scales`, `biases`, `out`)
+            // undercounts by one across all four `scaled`/`mb` combinations;
+            // `out` is the only written buffer.
+            dispatch(
                 gpu,
                 &entrypoint,
                 &[&w, &scales, &biases, &id, &out],
+                &[false, false, false, false, true],
                 &block.done(),
                 grid,
             );
@@ -5980,10 +6118,15 @@ fn a_batched_rope_gives_every_row_its_own_position() {
     // `LaunchRule::Rope` is `[rotary / 2, heads, rows]`, and the module is
     // `@workgroup_size(1)` so the grid is EXACT — the body reads
     // `num_workgroups.x` as the pair count it strides each partner by.
-    run(
+    //
+    // `neox_mb` asks the fire for `position` rather than declaring it, so
+    // `run`'s signature-derived count undercounts by one buffer; `x` is
+    // written (`InOut`), `position` is a read-only ask.
+    dispatch(
         gpu,
         "neox_mb_bfloat16",
         &[&x, &position],
+        &[true, false],
         &block,
         [pairs as u32, heads as u32, rows as u32],
     );
@@ -6064,10 +6207,15 @@ fn a_frequency_table_rope_reads_a_reordered_block() {
             .i32("head_dim", head_dim as i32)
             .f32("mscale", mscale)
             .done();
-        run(
+        // Both entrypoints ask the fire for `position` and `inv_freq` rather
+        // than declaring them, so `run`'s signature-derived count
+        // undercounts by two buffers; `x` (`InOut`) is written, the asked
+        // `position` and `inv_freq` are both read-only.
+        dispatch(
             gpu,
             entrypoint,
             &[&x, &position, &inv_freq],
+            &[true, false, false],
             &block,
             [pairs as u32, heads as u32, rows as u32],
         );
@@ -6138,20 +6286,28 @@ fn a_norm_folds_its_residual_and_its_layer_gain() {
     let params = storage(gpu, &rms_params(eps, WIDTH, 1, 0, 1.0));
 
     let plain = sentinelled(gpu, n / 2);
-    run(
+    // `rms_residual` asks the fire for `params` rather than declaring it —
+    // it lands at position 3, between the declared `out` and `r` — so
+    // `run`'s signature-derived sequence would both undercount and misplace
+    // it. Only `out` (`plain`) is written.
+    dispatch(
         gpu,
         "rms_residual_bfloat16",
         &[&x, &w, &plain, &params, &r],
+        &[false, false, true, false, false],
         &[],
         [ROWS, 1, 1],
     );
     let got_plain = unpack(&read(gpu, &plain), n);
 
     let scaled = sentinelled(gpu, n / 2);
-    run(
+    // Same shape as `rms_residual`, with the scaled variant's extra `s`
+    // trailing after `r`. Only `out` (`scaled`) is written.
+    dispatch(
         gpu,
         "rms_residual_scaled_bfloat16",
         &[&x, &w, &scaled, &params, &r, &s],
+        &[false, false, true, false, false, false],
         &[],
         [ROWS, 1, 1],
     );
@@ -6305,10 +6461,14 @@ fn a_strided_geglu_reads_three_different_pitches() {
         // measured under a launch its table does not state is a kernel measured
         // under a launch nothing will give it, and this file said so about itself
         // for as long as the body disagreed with the row.
-        run(
+        // `geglu_tanh_strided` asks the fire for `params` rather than
+        // declaring it, so `run`'s signature-derived count (`gate`, `up`,
+        // `out`) undercounts by one; only `out` is written.
+        dispatch(
             gpu,
             "geglu_tanh_strided_bfloat16",
             &[&gate, &up, &out, &params],
+            &[false, false, true, false],
             &[],
             [over((width * rows) as u32, 256), 1, 1],
         );
@@ -6482,7 +6642,9 @@ fn every_paged_sink_arm_folds_its_sink_into_the_denominator() {
             block = block.i32("n_rows", rows as i32);
         }
         let block = block.done();
-        run(
+        // Every arm here — decode, tiled and mma, sunk or not — asks the
+        // fire for the same nine tables; see `PAGED_ATTENTION_WRITES`.
+        dispatch(
             gpu,
             entrypoint,
             &[
@@ -6498,6 +6660,7 @@ fn every_paged_sink_arm_folds_its_sink_into_the_denominator() {
                 &attention_mask_enabled,
                 &sinks,
             ],
+            &PAGED_ATTENTION_WRITES,
             &block,
             if tiled {
                 [q_heads as u32, over(rows as u32, 32), 1]
@@ -6686,10 +6849,14 @@ fn a_sliding_window_decode_ends_each_row_at_its_own_position() {
         64,
         "two i32s, four vec2<u32>s and four more words"
     );
-    run(
+    // `sdpa_vector_decode_swa` asks the fire for `keys`/`values`, so `run`'s
+    // signature-derived count (`queries`, `out`) undercounts by two; only
+    // `out` is written.
+    dispatch(
         gpu,
         entrypoint,
         &[&queries, &keys, &values, &out],
+        &[false, false, false, true],
         &block,
         [q_heads as u32, rows as u32, 1],
     );
@@ -7345,15 +7512,16 @@ fn a_paged_tiled_fire_attends_through_its_page_table_and_its_mask() {
         // `LaunchRule::SdpaTiled` derives, and `driver-wgpu`'s
         // `geometry::grid` is the thing that has to agree with it.
         //
-        // Through `run` and no longer through `dispatch`: this row was
-        // UNSTATED when this proof was written, and upstream has since stated
-        // its eighteen operands in `kernels-metal`. So the layout is derived
-        // from the row rather than transcribed here, which makes this a proof
-        // of the launch ABI as well as of the arithmetic -- and
-        // `every_stated_row_is_dispatched_or_named` is what forced the
-        // upgrade, by refusing to let a row that grew operands stay on the
-        // hand-written path.
-        run(
+        // Back on `dispatch`, and not because the row went unstated again --
+        // it is still `sdpa_paged_tiled`, and `every_stated_row_is_dispatched_or_named`
+        // still holds it claimed. What changed is the MARKS migration: nine
+        // of `queries`/`out`'s eleven neighbours moved from declared
+        // parameters into `ctx.ask` calls inside the body, so `run`'s
+        // signature-derived count sees two buffers where the fire binds
+        // eleven. `PAGED_ATTENTION_WRITES` is this family's shape, read off
+        // every paged-attention body and checked against `naga`'s own
+        // per-binding write map.
+        dispatch(
             gpu,
             &entrypoint,
             &[
@@ -7369,6 +7537,7 @@ fn a_paged_tiled_fire_attends_through_its_page_table_and_its_mask() {
                 &attention_mask_enabled,
                 &sinks,
             ],
+            &PAGED_ATTENTION_WRITES,
             &block,
             [q_heads as u32, over(rows as u32, 32), 1],
         );

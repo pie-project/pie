@@ -347,7 +347,17 @@ fn a_statement_that_states_scalars_carries_them_to_its_dispatch() {
         // `silu_mul` takes none and its row names none — a kernel with no
         // scalars is not a statement missing them.
         .filter(|s| {
-            !s.starts_with("kv_append") && !s.starts_with("sdpa_") && *s != "silu_mul_bfloat16"
+            // A PACKED BLOCK IS NOT AN EMPTY RUN. `rms_single_row` forwards
+            // `ctx.params()` whole -- the shader reads a `RmsParams` struct by
+            // field -- so its scalars ride as ONE staged block and `params` is
+            // empty by construction. It read as "carries no scalars" only
+            // while the block went unrecognised, which is what
+            // `ParamSlot::packed` says and `packed_params_cover_the_struct`
+            // measures.
+            !s.starts_with("kv_append")
+                && !s.starts_with("sdpa_")
+                && *s != "silu_mul_bfloat16"
+                && *s != "rms_single_row_bfloat16"
         })
         .collect();
     assert!(
@@ -1191,12 +1201,20 @@ fn the_strided_activation_reaches_every_row_it_is_given() {
         );
         // `GegluStridedParams` is `{width, unused, gate_pitch, up_pitch,
         // out_pitch}` and the body divides by the first word.
+        //
+        // READ OFF THE STATEMENT, NOT THE DISPATCH. This body forwards
+        // `ctx.params()` whole, so its words ride as ONE staged block and
+        // `Dispatch::params` is empty by construction -- `ParamSlot::packed`
+        // is what carries them. The statement's own run is the same words in
+        // the same order, and it is what the block points into.
+        let stated =
+            &low.params[launch.params.start as usize..launch.params.end as usize];
         assert_eq!(
-            d.params[0], dims.width,
+            stated[0], dims.width,
             "`{symbol}`: the body divides the thread id by params[0] to get \
              its row, so a stated {} against a real width of {} puts every \
              row but the first at the wrong offset",
-            d.params[0], dims.width
+            stated[0], dims.width
         );
         seen += 1;
     }

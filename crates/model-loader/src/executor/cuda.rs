@@ -22,7 +22,7 @@ use cudarc::runtime::sys as rt;
 //
 // `scale_rows` takes a fat `Out` rather than a slot, sized by
 // `extent_2d`'s `(rows, width)` pair rather than two separate `i32`s.
-use kernels_cuda::{In, Out};
+use kernels_cuda::{In, InOut, Out};
 use kernels_cuda::quant;
 
 use crate::error::Error;
@@ -402,12 +402,17 @@ impl CudaArena {
         // SAFETY: both spans are in bounds, the plan chose this row for an
         // f32 source and a bf16 destination, and the stream is live for the
         // launch.
+        let width = i32::try_from(n).map_err(|_| {
+            plan_disagrees("the cast covers more elements than one row can state")
+        })?;
         let ctx = unsafe { kernels_cuda::jit::Ctx::on(self.stream.cast()) };
         let fired = quant::cast_fp32_to::<kernels_cuda::jit::abi::bf16>(
             &ctx,
-            In { ptr: self.at(op.src.offset).cast(), rows: 0, width: 0 },
-            Out { ptr: self.at(op.dst.offset).cast(), rows: 0, width: 0 },
-            n,
+            // ONE ROW OF `n`: the cast is elementwise and the routine reads
+            // its extent off the destination, which is what a traced fire's
+            // binder mints for it too.
+            In { ptr: self.at(op.src.offset).cast(), rows: 1, width },
+            Out { ptr: self.at(op.dst.offset).cast(), rows: 1, width },
         );
         declined(CUDA_CAST_FP32_TO_BF16, fired)
     }
@@ -428,7 +433,9 @@ impl CudaArena {
         let ctx = unsafe { kernels_cuda::jit::Ctx::on(self.stream.cast()) };
         let fired = quant::scale_rows::<kernels_cuda::jit::abi::bf16>(
             &ctx,
-            Out { ptr: self.at(op.dst.offset).cast(), rows: as_int(rows)?, width: as_int(cols)? },
+            // `InOut`: the kernel scales `dst` IN PLACE, which the comment
+            // above already says and the mark now says too.
+            InOut { ptr: self.at(op.dst.offset).cast(), rows: as_int(rows)?, width: as_int(cols)? },
             In { ptr: self.at(factors.offset).cast_const().cast(), rows: 0, width: 0 },
         );
         declined(CUDA_SCALE_ROWS_BF16, fired)
@@ -445,14 +452,16 @@ impl CudaArena {
         // SAFETY: every span is bounds-checked by `encode_scales`; the row
         // takes a source, a payload, an E8M0 scale array and one extent.
         let ctx = unsafe { kernels_cuda::jit::Ctx::on(self.stream.cast()) };
-        let fired = quant::quantize_bf16_to_mxfp4_e2m1_per_block(
-            &ctx,
-            In { ptr: self.at(op.src.offset).cast_const().cast(), rows: 0, width: 0 },
-            Out { ptr: self.at(op.dst.offset).cast(), rows: 0, width: 0 },
-            Out { ptr: self.at(scales.offset).cast(), rows: 0, width: 0 },
-            as_int(rows)?,
-            as_int(cols)?,
-        );
+        let fired = unsafe {
+            quant::quantize_bf16_to_mxfp4_e2m1_per_block(
+                &ctx,
+                self.at(op.src.offset).cast_const().cast(),
+                self.at(op.dst.offset).cast(),
+                self.at(scales.offset).cast(),
+                as_int(rows)?,
+                as_int(cols)?,
+            )
+        };
         declined(CUDA_QUANTIZE_BF16_TO_MXFP4, fired)
     }
 
@@ -465,14 +474,16 @@ impl CudaArena {
         let scales = self.encode_scales(op)?;
         // SAFETY: as above; the scales are `f32` for this row.
         let ctx = unsafe { kernels_cuda::jit::Ctx::on(self.stream.cast()) };
-        let fired = quant::quantize_bf16_to_fp8_e4m3_per_channel(
-            &ctx,
-            In { ptr: self.at(op.src.offset).cast_const().cast(), rows: 0, width: 0 },
-            Out { ptr: self.at(op.dst.offset).cast(), rows: 0, width: 0 },
-            Out { ptr: self.at(scales.offset).cast(), rows: 0, width: 0 },
-            as_int(rows)?,
-            as_int(cols)?,
-        );
+        let fired = unsafe {
+            quant::quantize_bf16_to_fp8_e4m3_per_channel(
+                &ctx,
+                self.at(op.src.offset).cast_const().cast(),
+                self.at(op.dst.offset).cast(),
+                self.at(scales.offset).cast(),
+                as_int(rows)?,
+                as_int(cols)?,
+            )
+        };
         declined(CUDA_QUANTIZE_BF16_TO_FP8, fired)
     }
 
@@ -553,18 +564,32 @@ mod tests {
     /// Asks `routine()` rather than scanning a table: a symbol it
     /// answers for has a host program the dispatch will actually reach,
     /// which is what this file's four launches need to be true.
+    ///
+    /// TWO OF THE FOUR ARE NOT ROUTINES, and the split is the point. A
+    /// `Routine` is what a TRACE states, and no trace states a load-time
+    /// weight transform — so `kernels-cuda` holds the two quantisers as
+    /// plain `unsafe fn`s. Their names are checked by the COMPILER at
+    /// `encode_mxfp4`/`encode_fp8` instead, which is a stronger check than
+    /// this one and needs no list; what stays here is the pair whose string
+    /// still has to resolve against a registry.
     #[test]
     fn every_symbol_the_plan_may_name_is_a_row_this_build_can_fire() {
-        for symbol in [
-            CUDA_CAST_FP32_TO_BF16,
-            CUDA_SCALE_ROWS_BF16,
-            CUDA_QUANTIZE_BF16_TO_MXFP4,
-            CUDA_QUANTIZE_BF16_TO_FP8,
-        ] {
+        for symbol in [CUDA_CAST_FP32_TO_BF16, CUDA_SCALE_ROWS_BF16] {
             assert!(
                 kernels_cuda::routine(symbol).is_some(),
                 "the loader may compile a plan naming `{symbol}`, and \
                  `kernels-cuda` has no routine for it"
+            );
+        }
+
+        // The other half of the same claim: a plan may name these two, and
+        // nothing in `kernels-cuda`'s registry answers for either. If one
+        // ever gains a `#[routine]`, it belongs in the loop above.
+        for symbol in [CUDA_QUANTIZE_BF16_TO_MXFP4, CUDA_QUANTIZE_BF16_TO_FP8] {
+            assert!(
+                kernels_cuda::routine(symbol).is_none(),
+                "`{symbol}` is a registry row again; move it into the loop \
+                 above, which is the check its string then needs"
             );
         }
     }

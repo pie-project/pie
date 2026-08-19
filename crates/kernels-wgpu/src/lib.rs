@@ -193,12 +193,50 @@ pub mod rope;
 pub mod sample;
 pub mod ssm;
 
+/// This crate's backend, under the one name `#[routine]` knows it by.
+///
+/// The attribute is shared by all four planes and cannot name any of them, so
+/// each aliases its own here and the macro writes `crate::Plane`.
+pub type Plane = crate::routine::Wgpu;
+
+/// Every routine this crate declares.
+///
+/// A DISTRIBUTED SLICE, so nothing enumerates: `#[routine]` puts each row in a
+/// `linkme_ROUTINES` link section beside its own `fn`, and the linker hands
+/// back the bounds. There is no membership list to add a routine to, which is
+/// the last hand-written thing about one -- and the last that could be
+/// forgotten, leaving a routine compiled, correct and unreachable.
+///
+/// The order is LINK ORDER and no reader may depend on it. Nothing does:
+/// lookups match on the full symbol, which `kernels-cuda`'s
+/// `no_symbol_is_declared_twice` keeps unique -- one section, four crates, so
+/// that proof covers this plane's rows as much as its own.
+// THE SLICE'S NAME IS A LINK-SECTION NAME, AND IT IS GLOBAL.
+//
+// `linkme` keys a distributed slice on the STATIC's identifier, not on the
+// crate that declares it, so four crates each declaring `ROUTINES` are four
+// declarations of one slice -- and `linkme` 0.3.37 refuses that outright
+// ("duplicate #[distributed_slice] with name \"ROUTINES\"") the moment two of
+// them are linked into one binary, which `kernels`' cross-backend agreement
+// test is. Before that version it was worse than a refusal: the sections
+// merged, and a sweep over one plane's rows walked another's.
+//
+// So the declaration wears the plane's name and the ALIAS wears the one
+// `#[routine]` emits. `crate::ROUTINES` still resolves, at no cost to a
+// reader, and the link section is this crate's alone.
+#[::linkme::distributed_slice]
+pub static WGPU_ROUTINES: [::kernels::routine::Routine<Plane>];
+
+/// The slice under the name `#[routine]` registers into.
+pub use WGPU_ROUTINES as ROUTINES;
+
 /// The family tables, concatenated.
 ///
 /// A `const fn` fold rather than a `Vec`, so the whole table stays a `&'static`
 /// the compiler can read at load with no allocation — the same shape both
 /// siblings use for the same reason.
 pub static KERNELS: &[KernelSig] = &CONCAT;
+
 
 const FAMILIES: &[&[KernelSig]] = &[
     attn::KERNELS,
@@ -229,10 +267,10 @@ const EMPTY: KernelSig = KernelSig {
     name: "",
     symbol: "",
     whole: false,
-    in_place: &[],
     depth_prefix_plan: false,
     args: &[],
-    sides: &[],
+    sources: &[],
+    derived: &[],
     axes: &[],
 };
 
@@ -241,10 +279,10 @@ const fn copy_sig(k: &KernelSig) -> KernelSig {
         name: k.name,
         symbol: k.symbol,
         whole: k.whole,
-        in_place: k.in_place,
+        sources: k.sources,
+        derived: k.derived,
         depth_prefix_plan: k.depth_prefix_plan,
         args: k.args,
-        sides: k.sides,
         axes: k.axes,
     }
 }
@@ -435,21 +473,8 @@ pub fn retired() -> Vec<&'static str> {
 /// `CROSSED`, and the list is what [`KERNELS`] is being emptied into.
 #[must_use]
 pub fn routines() -> Vec<&'static routine::Routine> {
-    /// The families that have crossed. One line per family.
-    const CROSSED: &[&[routine::Routine]] = &[
-        attn::ROUTINES,
-        layout::ROUTINES,
-        mlp::ROUTINES,
-        moe::ROUTINES,
-        norm::ROUTINES,
-        rope::ROUTINES,
-        ssm::ROUTINES,
-        sample::ROUTINES,
-        ptir::ROUTINES,
-        quant::ROUTINES,
-    ];
-
-    CROSSED.iter().copied().flatten().collect()
+    
+    ROUTINES.iter().collect()
 }
 
 /// Every routine this backend has crossed, with the backend forgotten.
@@ -461,8 +486,8 @@ pub fn routines() -> Vec<&'static routine::Routine> {
 /// three backends' incompatible `Routine<B>` types can share.
 #[must_use]
 pub fn declared() -> Vec<kernels::routine::Declared> {
-    routines()
-        .into_iter()
+    ROUTINES
+        .iter()
         .map(kernels::routine::Routine::declared)
         .collect()
 }
@@ -550,31 +575,17 @@ pub const DOWNLEVEL_UNIFORM_BYTES: u32 = 16 * 1024;
 /// there is no stream and no cuBLAS handle in WebGPU — so they answer `false`,
 /// and a row that used one would put a plan cache in a uniform: a failure at
 /// the row, where it can be read, rather than a silent binding.
+///
+/// THROUGH [`kernels::Ty::binds`] AND NOT AN ENUMERATION HERE. The list this
+/// replaced had drifted twice over: `Ty::Buf`, `Ty::F32s`, `Ty::I32s`,
+/// `Ty::U32s` and `Ty::U8s` each appeared TWICE — the residue of the
+/// `Buf`/`BufMut` merge rewriting every `XMut` arm to `X` — and `Ty::Bf16s`
+/// was absent, which would have put an activation buffer in a uniform the
+/// moment a signature named its element. A classification stated once in
+/// `kernels` cannot drift from itself, and a `Ty` added later is classified
+/// there rather than in three backends.
 pub const fn is_buffer(ty: kernels::Ty) -> bool {
-    use kernels::Ty;
-    matches!(
-        ty,
-        Ty::BufMut
-            | Ty::Buf
-            | Ty::I32s
-            | Ty::I64s
-            | Ty::U32s
-            | Ty::U8s
-            | Ty::F32sMut
-            | Ty::F32s
-            | Ty::I32sMut
-            | Ty::U32sMut
-            | Ty::U8sMut
-            | Ty::U16s
-            | Ty::U16sMut
-            | Ty::I8s
-            | Ty::BufArray
-            | Ty::BufArrayMut
-            | Ty::BufArrayOut
-            | Ty::BufArrayOutMut
-            | Ty::U8Array
-            | Ty::I32Array
-    )
+    !matches!(ty.binds(), kernels::Binds::Nothing)
 }
 
 #[cfg(test)]
@@ -694,3 +705,13 @@ mod tests {
     // `every_entrypoint_in_the_tree_builds_a_pipeline_on_this_adapter` builds all 481
     // entrypoints, so a kernel the adapter cannot lay out fails there by name.
 }
+
+/// What a generic routine's element type must be on this plane.
+///
+/// `#[routine]` puts this on every type parameter that states no bound of its
+/// own, so a generic signature reads the same on all four planes and the
+/// plane's own requirement is said HERE, once. A shader plane binds a handle
+/// and asks nothing more of an element than that it be one.
+pub trait RoutineElem: kernels::Elem {}
+
+impl<T: kernels::Elem> RoutineElem for T {}

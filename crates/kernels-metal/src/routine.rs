@@ -22,7 +22,7 @@
 //!   what varies is the entrypoint, which a body spells.
 //!
 //! A buffer carries no writability, though it looks like it should: Metal's
-//! ordering comes from the encoder, so `Buf` versus `BufMut` stays a property
+//! ordering comes from the encoder, so `Buf` versus `Buf` stays a property
 //! of the signature's TYPE — which is what makes a body handed the wrong one
 //! fail to compile.
 
@@ -42,16 +42,23 @@ impl Backend for Metal {
     type Value = ArgValue;
     type Ctx<'a> = dyn Encode + 'a;
 
-    // NO SHAPE TO GIVE, and refusing is the whole of the correct answer.
-    //
-    // A region is `{address, rows, width}` and this backend's bound value is
-    // an address alone. It already carries the other two somewhere better:
-    // wgpu and metal carry the launch's two widths as `Facts` fields, a
-    // per-LAUNCH statement rather than a per-operand one. Until one of them is
-    // asked for a fat `In<N, _>` this refusal is unreachable, and the first
-    // table that spells one finds out at the first fire.
-    fn region(_value: &ArgValue, _at: usize) -> Result<Extent, Refusal> {
-        Err(Refusal::Absent { what: "a region's shape: the metal binder binds addresses only" })
+    // THIS PLANE MINTS REGION-SHAPED VALUES NOW, and that is §7 of
+    // `.wiki/migration.md` settled. It used to bind addresses alone and refuse
+    // here, so its marks answered zero for `rows` and `width` and every
+    // rectangle had to arrive as a separate parameter keyed to `keys::Width`,
+    // `keys::InWidth` or `keys::OutWidth0`. The widths were always there --
+    // `Holds::in_width` and `out_width` answered them for a `Kind::InWidth`
+    // slot -- they simply reached a parameter instead of the operand they
+    // describe.
+    fn region(value: &ArgValue) -> Result<Extent, Refusal> {
+        match *value {
+            ArgValue::Shaped { rows, width, .. } => Ok(Extent { rows, width }),
+            // `Absent`, not `Kind`: a plain handle carries no `Ty` mismatch,
+            // just no shape to report.
+            _ => Err(Refusal::Absent {
+                what: "a region's shape: the bound value carries only a handle",
+            }),
+        }
     }
 }
 
@@ -69,7 +76,7 @@ pub enum ArgValue {
     /// `MTLBuffer` or a GPU address and does not need to — the driver resolves
     /// handles to its own `Slice`s before it calls.
     Buffer(u32),
-    /// The same, bound at a [`Ty::BufMut`] or [`Ty::F32sMut`] argument.
+    /// The same, bound at a [`Ty::Buf`] or [`Ty::F32s`] argument.
     ///
     /// # The direction has to ride on the VALUE
     ///
@@ -97,7 +104,39 @@ pub enum ArgValue {
     F32(f32),
     /// A 64-bit stride or extent, which is what [`Ty::Usize`] means here.
     Usize(u64),
+    /// A DEVICE ALLOCATION AND THE RECTANGLE THE STATEMENT GAVE IT.
+    ///
+    /// Minted by [`kernels::bind`] for an operand slot, and consumed by the
+    /// mark that unpacks it: `In<Tensor<bf16>>` keeps the shape, so `x.width`
+    /// is where a body reads its own operand's pitch. That is what took
+    /// `Width`, `InWidth` and `OutWidth0` off 337 parameter lists -- they were
+    /// a fact the operand beside them already implied, and the only reason
+    /// they could not come off the mark was that this plane bound addresses
+    /// alone.
+    ///
+    /// # It never reaches `Encode::fire`
+    ///
+    /// A body re-emits its operands through [`kernels::Bind::arg`], which
+    /// mints a plain [`Self::Buffer`]. So the shape exists between `bind` and
+    /// `unpack` and nowhere else, and no encoder has to know about it.
+    Shaped {
+        /// The caller's index for the allocation.
+        handle: u32,
+        /// Rows in this launch's rectangle.
+        rows: i32,
+        /// Elements per row. Zero where the statement gave none.
+        width: i32,
+    },
 }
+
+/// NO ABSENT VALUE TO MINT, and the default is the whole of the answer.
+///
+/// This plane binds HANDLES: every operand a statement places resolves to one,
+/// and a statement that placed none produces no value at all rather than an
+/// empty one. So `Option<M>` here always unpacks as `Some`, which is what
+/// [`kernels::routine::Absent`]'s default says. A plane that later grows a
+/// sentinel handle overrides both halves together.
+impl kernels::routine::Absent for ArgValue {}
 
 impl ArgValue {
     /// What this value is, for a refusal to name.
@@ -105,6 +144,7 @@ impl ArgValue {
     pub const fn kind(self) -> &'static str {
         match self {
             Self::Buffer(_) => "a buffer",
+            Self::Shaped { .. } => "a buffer",
             Self::BufferMut(_) => "a writable buffer",
             Self::I32(_) => "an i32",
             Self::U32(_) => "a u32",
@@ -114,47 +154,11 @@ impl ArgValue {
     }
 }
 
-/// One dispatch, as a routine body states it.
-///
-/// Not generic over a lifetime, unlike vulkan's. Both of its strings are
-/// `&'static`: a Metal `Dispatch` is **planned now and encoded later**, so a
-/// borrowed entrypoint would tie the plan's lifetime to the stack frame of the
-/// body that named it. It costs nothing — an entrypoint that is not a
-/// compile-time literal is the defect this plane exists to forbid.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Fire {
-    /// The entrypoint, whole, as the shader's `[[host_name(...)]]` spells it.
-    ///
-    /// A body that varies over an instantiation axis picks the spelling
-    /// itself; nothing pastes a suffix on afterwards. That mattered: an
-    /// entrypoint assembled by pasting an axis suffix onto a row name is how
-    /// `neox_freqs_mb` came to name the DECODE symbol — a single-row kernel
-    /// over a multi-row grid, which rotated row zero and left the rest alone.
-    pub entrypoint: &'static str,
-    /// The shader this entrypoint is compiled from, relative to the kernels
-    /// directory — `"quant/qmm_t.metal"`.
-    ///
-    /// Metal's alone. See the module docs: there is no ahead-of-time build to
-    /// key on, and the path is not derivable from the entrypoint.
-    pub file: &'static str,
-    /// Total THREADS in each dimension, not threadgroups.
-    ///
-    /// `dispatchThreads:` takes a thread count where `cuLaunchKernel` takes a
-    /// block count. Writing it the other way launches `n_heads` threads in
-    /// total, which the hardware does not report: the kernel's simd reductions
-    /// just read lanes that were never dispatched.
-    ///
-    /// A body must not state a zero here. A dispatch of no threads runs
-    /// nothing and reports success; a body with nothing to do returns
-    /// [`Refusal::Empty`].
-    pub lanes: [u32; 3],
-    /// Threads per threadgroup.
-    ///
-    /// Stated, not reflected. The kernel's own reductions depend on it:
-    /// `rms.metal` gives threadgroup `gid` the span `gid * axis_size`, and
-    /// `qmm_t.metal`'s steel MMA is written for `WM * WN * SIMD_SIZE` threads.
-    pub group: [u32; 3],
-}
+// THE PLANE'S OWN `Fire` STOOD HERE. It is `kernels::routine::Fire` now,
+// which CUDA states too -- the four facts were always the same four, and the
+// only difference was that CUDA passed them positionally. See that type for
+// what the shared `lanes`/`group` pair means.
+
 
 /// What a routine body dispatches through.
 ///
@@ -180,7 +184,26 @@ pub trait Encode {
     /// # Errors
     ///
     /// Whatever the binding refused, as a [`Refusal`].
-    fn dispatch(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal>;
+    fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal>;
+
+    /// ONE VALUE, RESOLVED FROM THE COLUMN'S OWN VOCABULARY.
+    ///
+    /// What a body reaches through `ctx.ask::<C, keys::X>()` and
+    /// `ctx.params()`. The ANSWERING side is unchanged by this: the driver
+    /// already resolves a `(Ty, Source)` pair for every argument it binds --
+    /// `kernels::bind::one`, over its own `Holds` -- and this is that call,
+    /// made for a body instead of for a column.
+    ///
+    /// It exists because most of what used to be an `Env` parameter was
+    /// checkpoint configuration the statement now carries as a `Const`, and
+    /// what is left -- the batch, the plan, the allocator -- needed an ANSWER
+    /// rather than a parameter.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Unstated`] when this backend answers no such fact, and
+    /// whatever the fact's own absence means otherwise.
+    fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal>;
 }
 
 /// This backend's value, as the shared operand types read it.
@@ -192,6 +215,7 @@ pub trait Encode {
 impl ShaderValue for ArgValue {
     fn as_buffer(self) -> Option<u32> {
         match self {
+            Self::Shaped { handle, .. } => Some(handle),
             Self::Buffer(handle) | Self::BufferMut(handle) => Some(handle),
             _ => None,
         }
@@ -222,6 +246,18 @@ impl ShaderValue for ArgValue {
             Self::Usize(v) => Some(v),
             _ => None,
         }
+    }
+    fn as_extent(self) -> Option<(i32, i32)> {
+        match self {
+            Self::Shaped { rows, width, .. } => Some((rows, width)),
+            _ => None,
+        }
+    }
+    fn buffer_at(handle: u32, rows: i32, width: i32) -> Self {
+        Self::Shaped { handle, rows, width }
+    }
+    fn buffer_mut_at(handle: u32, rows: i32, width: i32) -> Self {
+        Self::Shaped { handle, rows, width }
     }
     fn buffer(handle: u32) -> Self {
         Self::Buffer(handle)
@@ -261,6 +297,14 @@ impl kernels::shader::Lang for Metal {
     const U8S: &'static str = "const device uint8_t*";
     const F32S: &'static str = "const device float*";
     const F32S_MUT: &'static str = "device float*";
+    // THE ONE LANGUAGE OF THE THREE THAT HAS THE TYPE. MSL declares `bfloat`
+    // and this tree writes it 129 times; `device T*` is the TEMPLATE
+    // parameter, written 346 times, and a signature that named the element
+    // was spelling the second where the kernel meant the first.
+    const BF16S: &'static str = "const device bfloat*";
+    const BF16S_MUT: &'static str = "device bfloat*";
+    const F16S: &'static str = "const device half*";
+    const F16S_MUT: &'static str = "device half*";
     const I32: &'static str = "const constant int&";
     const U32: &'static str = "constant uint&";
     const F32: &'static str = "const constant float&";
@@ -273,7 +317,7 @@ impl kernels::shader::Lang for Metal {
 /// Re-exported rather than named through `kernels::shader` at every use, so a
 /// body's signature reads as this backend's own and a family file imports one
 /// module.
-pub use kernels::shader::{Bind, Buf, BufMut, F32s, F32sMut, I32s, InPacked, U8s, U32s, Usize};
+pub use kernels::shader::{Bind, InPacked, Tensor, Usize, bf16, f16};
 
 /// What a routine body dispatches through, spelled as a body writes it.
 ///
@@ -283,97 +327,46 @@ pub use kernels::shader::{Bind, Buf, BufMut, F32s, F32sMut, I32s, InPacked, U8s,
 /// an implementor is never `'static`. Bodies take `&Ctx<'_>`.
 pub type Ctx<'a> = dyn Encode + 'a;
 
+// THE ASKING SIDE, over the one method the driver implements.
+//
+// `Asks` is blanket-implemented for every `Answers`, so this is the whole of
+// what a plane states to give its bodies `ctx.ask::<C, keys::X>()`,
+// `ctx.params()` and `ctx.absent()`.
+impl kernels::routine::Answers<Metal> for Ctx<'_> {
+    fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
+        Encode::resolve(self, ty, source)
+    }
+}
+
 /// One routine, in this backend's instantiation of the machinery.
 pub type Routine = kernels::routine::Routine<Metal>;
 
-/// The backend's wrapper over [`kernels::routine!`], with [`Metal`] filled in
-/// so a declaration names only the `fn`:
-///
-/// ```ignore
-/// pub static ROUTINES: &[Routine] = &[
-///     routine!(rms_single_row),
-///     routine!(neox_decode, in_place = &[(0, 0)]),
-/// ];
-/// ```
-#[macro_export]
-macro_rules! routine {
-    ($body:ident $(, $($fact:tt)*)?) => {
-        ::kernels::routine!($crate::routine::Metal, $body $(, $($fact)*)?)
-    };
-}
 
-/// `LaunchRule::Elementwise`: one lane per element of the whole rectangle, on
-/// one axis.
-///
-/// The two launch rules this crate's elementwise kernels use are written here
-/// once rather than in each family: they are the two shapes `driver-metal`'s
-/// `geometry::lanes` has always computed, and a body stating its own grid is
-/// meant to make the same statement, not a new one.
-///
-/// A lane count is in THREADS, which on Metal is also what the encoder takes,
-/// so unlike vulkan's there is no `div_ceil` waiting in the driver and unlike
-/// CUDA's no rounding up to a whole group. A body that asks for `width * rows`
-/// threads gets exactly that, which is why the elementwise bodies in this
-/// crate carry no bounds guard: the grid IS the extent.
-///
-/// # Errors
-///
-/// [`Refusal::Empty`] when either extent is zero or negative, and
-/// [`Refusal::Grid`] when the product does not fit a `u32`. Both are refusals
-/// rather than clamps because both fail SILENTLY otherwise: a dispatch of zero
-/// threads returns success over a buffer that keeps whatever it held, and a
-/// wrapped product covers a fraction of the rectangle and also returns
-/// success. An extent of zero arrives here honestly — a routed expert that won
-/// no tokens has zero rows — so this is a value the caller reads, not a panic.
-pub fn elementwise(width: i32, rows: i32) -> Result<[u32; 3], kernels::routine::Refusal> {
-    let [w, r] = rectangle(width, rows)?;
-    let n = u64::from(w) * u64::from(r);
-    let n = u32::try_from(n).map_err(|_| kernels::routine::Refusal::Grid {
-        what: "width * rows",
-        at: i64::try_from(n).unwrap_or(i64::MAX),
-    })?;
-    Ok([n, 1, 1])
-}
 
-/// `LaunchRule::ElementwiseRows`: the rows on their own axis.
+/// The two launch rules a shader-plane body states its rectangle with.
 ///
-/// # Errors
+/// Re-exported and not re-written. Both of these, and the `rectangle` check
+/// under them, stood here character for character in `kernels-metal`,
+/// `kernels-vulkan` and `kernels/src/shader.rs` — one function in three
+/// copies, reached by three different paths, so a body could be told apart by
+/// which spelling it used. There is one now, and it is the shared one.
+pub use kernels::shader::{elementwise, elementwise_rows};
+
+/// The fact keys a BODY asks the runtime with — `ctx.ask::<i32, keys::Rows>()`.
 ///
-/// [`Refusal::Empty`], as [`elementwise`]. No `Grid` refusal is possible:
-/// neither extent is multiplied, and each already fits a `u32`.
-pub fn elementwise_rows(width: i32, rows: i32) -> Result<[u32; 3], kernels::routine::Refusal> {
-    let [w, r] = rectangle(width, rows)?;
-    Ok([w, r, 1])
-}
-
-/// The extents both rules share, checked once.
-fn rectangle(width: i32, rows: i32) -> Result<[u32; 2], kernels::routine::Refusal> {
-    if width <= 0 {
-        return Err(kernels::routine::Refusal::Empty { what: "width" });
-    }
-    if rows <= 0 {
-        return Err(kernels::routine::Refusal::Empty { what: "rows" });
-    }
-    Ok([width.unsigned_abs(), rows.unsigned_abs()])
-}
-
-/// The provenance of an argument, re-exported so a routine signature can say
-/// `Env<I32s>` without naming the machinery crate.
-pub use kernels::routine::Env;
-
-/// The slot marks, re-exported for the same reason: a routine signature states
-/// `OutSlot<0, BufMut>` or `Weight<2, F32s>` so the operand slot the arm binds
-/// this pointer from is a fact of the type, not of the hand-written arm alone.
+/// Not what a signature binds its scalars from any more: a scalar the
+/// checkpoint fixes is a `Const` the statement carries, and a key names only
+/// what a fire decides.
 pub use kernels::keys;
-pub use kernels::routine::{Ask, Block, Else, Held, InSlot, Nth, Null, OutSlot, Over, Param, ParamF32, ParamOr, ParamOrLit, Reckoned, Say, Times, Weight};
+pub use kernels::routine::{Const, Fire, In, InOut, Out};
 
-/// Re-exported for the same reason.
-pub use kernels::routine::Provenance as Supplier;
+/// What a body asks the runtime for, once `Env` is out of the parameter list.
+pub use kernels::routine::{Answers, Asks};
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kernels::routine::Provenance;
 
     /// Every argument kind refuses a value of another kind, by position.
     ///
@@ -398,22 +391,22 @@ mod tests {
             })
         );
         assert_eq!(
-            <Buf as Arg<Metal>>::unpack(&ArgValue::F32(1.0), 7),
+            <Tensor<bf16> as Arg<Metal>>::unpack(&ArgValue::F32(1.0), 7),
             Err(Refusal::Kind {
                 at: 7,
-                want: Ty::Buf
+                want: Ty::Bf16s
             })
         );
         // And a buffer handle is accepted by every buffer kind, because the
         // handle carries no element type -- the TYPE does, which is what makes
         // a body handed the wrong one fail to compile rather than at runtime.
         assert_eq!(
-            <Buf as Arg<Metal>>::unpack(&ArgValue::Buffer(9), 0),
-            Ok(Buf(9))
+            <Tensor<bf16> as Arg<Metal>>::unpack(&ArgValue::Buffer(9), 0),
+            Ok(Tensor::<bf16>::new(9))
         );
         assert_eq!(
-            <U32s as Arg<Metal>>::unpack(&ArgValue::Buffer(9), 0),
-            Ok(U32s(9))
+            <Tensor<u32> as Arg<Metal>>::unpack(&ArgValue::Buffer(9), 0),
+            Ok(Tensor::<u32>::new(9))
         );
     }
 
@@ -445,12 +438,15 @@ mod tests {
             <ArgValue as ShaderValue>::buffer_mut(4),
             ArgValue::BufferMut(4)
         );
-        assert_ne!(<Buf as Arg<Metal>>::TY, <BufMut as Arg<Metal>>::TY);
+        assert_ne!(
+            <In<Tensor<bf16>> as Arg<Metal>>::TY,
+            <Out<Tensor<bf16>> as Arg<Metal>>::TY
+        );
         // And a mutable value still unpacks as its handle, because a routine
         // that receives one reads a handle and not a direction.
         assert_eq!(
-            <BufMut as Arg<Metal>>::unpack(&ArgValue::BufferMut(9), 0),
-            Ok(BufMut(9))
+            <Tensor<bf16> as Arg<Metal>>::unpack(&ArgValue::BufferMut(9), 0),
+            Ok(Tensor::<bf16>::new(9))
         );
     }
 
@@ -471,12 +467,14 @@ mod tests {
         );
     }
 
-    /// `Env` marks the supplier and changes nothing else.
+    /// The ELEMENT decides the `Ty`, and nothing else does.
     #[test]
-    fn the_environment_wrapper_carries_the_type_and_states_the_supplier() {
-        assert_eq!(<Env<I32s> as Arg<Metal>>::TY, Ty::I32s);
-        assert_eq!(<Env<I32s> as Arg<Metal>>::PROV, Provenance::Env);
-        assert_eq!(<I32s as Arg<Metal>>::PROV, Provenance::Trace);
+    fn a_tensor_takes_its_argument_type_from_its_element() {
+        // `Tensor<i32>` IS THE CARRIER NOW, and it has no provenance to
+        // assert: `Env` and `Provenance` are both deleted, so what is left
+        // to check is that the element decides the `Ty`.
+        assert_eq!(<Tensor<i32> as Arg<Metal>>::TY, Ty::I32s);
+        assert_eq!(<Tensor<u8> as Arg<Metal>>::TY, Ty::U8s);
     }
 
     /// The declared spellings are the shader tree's, not invented. The point of
@@ -484,13 +482,42 @@ mod tests {
     /// worth nothing if the strings were guessed.
     #[test]
     fn the_spellings_are_the_ones_the_msl_tree_declares() {
-        assert_eq!(<Buf as Arg<Metal>>::SPELLING, "const device T*");
-        assert_eq!(<BufMut as Arg<Metal>>::SPELLING, "device T*");
-        assert_eq!(<I32s as Arg<Metal>>::SPELLING, "const device int*");
-        assert_eq!(<U32s as Arg<Metal>>::SPELLING, "const device uint32_t*");
-        assert_eq!(<U8s as Arg<Metal>>::SPELLING, "const device uint8_t*");
+        // ONE CONST, ONE VALUE. This used to assert the SAME const equalled
+        // BOTH `"const device T*"` (`Buf`'s spelling) AND `"device T*"`
+        // (`BufMut`'s) -- two contradictory claims about a single string,
+        // the residue of the `Buf`/`BufMut` merge: `Tensor<bf16>` is the
+        // ACTIVATION element, which `Lang::BF16S`/`BF16S_MUT` name, not the
+        // generic `Lang::BUF`/`BUF_MUT` a bare opaque buffer would have
+        // routed through. `Arg<Metal>::SPELLING` for `Tensor<E>` reads
+        // `E`'s own spell off `Lang`, and for `bf16` that spell is `BF16S`,
+        // never `BUF` -- `BUF`/`BUF_MUT` are what a `Tensor<E>` for some
+        // OTHER, unnamed element would have spelled, and nothing in this
+        // tree carries one. The direction now rides the MARK, so the
+        // writable spelling is `Lang::BF16S_MUT` and no type names it.
+        assert_eq!(
+            <Tensor<bf16> as Arg<Metal>>::SPELLING,
+            "const device bfloat*"
+        );
+        assert_eq!(<Metal as kernels::shader::Lang>::BF16S_MUT, "device bfloat*");
+        assert_eq!(<Tensor<i32> as Arg<Metal>>::SPELLING, "const device int*");
+        assert_eq!(<Tensor<u32> as Arg<Metal>>::SPELLING, "const device uint32_t*");
+        assert_eq!(<Tensor<u8> as Arg<Metal>>::SPELLING, "const device uint8_t*");
+        // The element the tree declares 129 times, which `Buf` withheld.
+        // `bf16`/`f16` are `Element` markers now, not `Arg<Metal>` carriers
+        // -- `Tensor<bf16>`/`Tensor<f16>` are -- so the concrete spelling is
+        // read off `Lang` directly, the same way `BF16S_MUT` is two lines up.
+        assert_eq!(<Metal as kernels::shader::Lang>::BF16S, "const device bfloat*");
+        assert_eq!(<Metal as kernels::shader::Lang>::F16S, "const device half*");
         // Empty, and deliberately: nothing in the tree declares a 64-bit
         // shader integer, so there is no spelling to record.
         assert_eq!(<Usize as Arg<Metal>>::SPELLING, "");
     }
 }
+
+// THE PLANE'S `routine!` WRAPPER STOOD HERE AND HAS NO CALLERS.
+//
+// It filled this backend in so a membership list could name only the
+// `fn`. There is no membership list: `#[routine]` builds the row beside
+// the `fn` and a distributed slice collects it, so the only caller of
+// `kernels::routine!` is the attribute, which names the backend through
+// `crate::Plane`.

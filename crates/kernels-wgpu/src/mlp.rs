@@ -4,6 +4,7 @@
 //! name: it bakes gpt-oss's asymmetric clamp, its `alpha` and its `(up + 1)`
 //! term, and its own first line says so.
 
+use kernels_macros::routine;
 use kernels::KernelSig;
 
 /// EMPTY: this family's rows have been RETIRED.
@@ -36,10 +37,8 @@ pub static ENTRYPOINTS: &[&str] = &[
     "silu_mul_strided_bfloat16",
 ];
 
-use crate::routine::{keys, Ask, Bind, Block, Buf, BufMut, Ctx, Fire, Routine};
-use crate::routine::{InSlot, OutSlot, Param};
+use crate::routine::{Asks, Bind, Ctx, Fire, In, Out, Tensor, bf16, elementwise, elementwise_rows, keys};
 use kernels::routine::Refusal;
-use kernels::shader::elementwise;
 
 /// `out = silu(gate) * up`, elementwise over the FFN intermediate.
 ///
@@ -50,21 +49,17 @@ use kernels::shader::elementwise;
 /// # Errors
 ///
 /// [`kernels::shader::elementwise`]'s, for a zero width or row count.
+#[routine]
 pub fn silu_mul(
     ctx: &Ctx<'_>,
-    gate: InSlot<0, Buf>,
-    up: InSlot<1, Buf>,
-    out: OutSlot<0, BufMut>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            module: "mlp/gated.wgsl",
-            entrypoint: "silu_mul_bfloat16",
-            lanes: elementwise(*width, *rows)?,
-        },
-        &[gate.v(), up.v(), out.v()],
+    gate: In<Tensor<bf16>>,
+    up: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let width = gate.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("mlp/gated.wgsl", "silu_mul_bfloat16").apply(elementwise(width, rows)?),
+        &[gate.arg(), up.arg(), out.arg()],
     )
 }
 
@@ -86,22 +81,18 @@ pub fn silu_mul(
 /// # Errors
 ///
 /// [`kernels::shader::elementwise`]'s.
+#[routine]
 pub fn geglu_tanh(
     ctx: &Ctx<'_>,
-    gate: InSlot<0, Buf>,
-    up: InSlot<1, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            module: "mlp/gated.wgsl",
-            entrypoint: "geglu_tanh_bfloat16",
-            lanes: elementwise(*width, *rows)?,
-        },
-        &[gate.v(), up.v(), out.v(), params.v()],
+    gate: In<Tensor<bf16>>,
+    up: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let width = gate.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("mlp/gated.wgsl", "geglu_tanh_bfloat16").apply(elementwise(width, rows)?),
+        &[gate.arg(), up.arg(), out.arg(), params],
     )
 }
 
@@ -114,22 +105,18 @@ pub fn geglu_tanh(
 /// # Errors
 ///
 /// [`kernels::shader::elementwise`]'s.
+#[routine]
 pub fn geglu_tanh_strided(
     ctx: &Ctx<'_>,
-    gate: InSlot<0, Buf>,
-    up: InSlot<1, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            module: "mlp/gated.wgsl",
-            entrypoint: "geglu_tanh_strided_bfloat16",
-            lanes: elementwise(*width, *rows)?,
-        },
-        &[gate.v(), up.v(), out.v(), params.v()],
+    gate: In<Tensor<bf16>>,
+    up: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let width = gate.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("mlp/gated.wgsl", "geglu_tanh_strided_bfloat16").apply(elementwise(width, rows)?),
+        &[gate.arg(), up.arg(), out.arg(), params],
     )
 }
 
@@ -142,22 +129,18 @@ pub fn geglu_tanh_strided(
 /// # Errors
 ///
 /// [`kernels::shader::elementwise`]'s.
+#[routine]
 pub fn gptoss_swiglu(
     ctx: &Ctx<'_>,
-    gate: InSlot<0, Buf>,
-    up: InSlot<1, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            module: "mlp/gated.wgsl",
-            entrypoint: "gptoss_swiglu_bfloat16",
-            lanes: elementwise(*width, *rows)?,
-        },
-        &[gate.v(), up.v(), out.v(), params.v()],
+    gate: In<Tensor<bf16>>,
+    up: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let width = gate.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("mlp/gated.wgsl", "gptoss_swiglu_bfloat16").apply(elementwise(width, rows)?),
+        &[gate.arg(), up.arg(), out.arg(), params],
     )
 }
 
@@ -180,29 +163,22 @@ pub fn gptoss_swiglu(
 /// # Errors
 ///
 /// [`kernels::shader::elementwise_rows`]'s.
+#[routine]
 pub fn silu_mul_strided(
     ctx: &Ctx<'_>,
-    gate: InSlot<0, Buf>,
-    up: InSlot<1, Buf>,
-    out: OutSlot<0, BufMut>,
-    row_pitch: Param<0, i32>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            module: "mlp/gated.wgsl",
-            entrypoint: "silu_mul_strided_bfloat16",
-            lanes: kernels::shader::elementwise_rows(*width, *rows)?,
-        },
-        &[gate.v(), up.v(), out.v(), row_pitch.v()],
+    gate: In<Tensor<bf16>>,
+    up: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<1>` named.
+    // This body forwards `ctx.params()` as a STRUCT, so the run is the
+    // shader's layout and no `Const` mark can name a word inside it; the
+    // migration made this `keys::RowPitch`, which no driver answers.
+    let row_pitch = ctx.param(1)?;
+    let width = gate.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("mlp/gated.wgsl", "silu_mul_strided_bfloat16").apply(elementwise_rows(width, rows)?),
+        &[gate.arg(), up.arg(), out.arg(), row_pitch.arg()],
     )
 }
 
-pub static ROUTINES: &[Routine] = &[
-    crate::routine!(geglu_tanh),
-    crate::routine!(geglu_tanh_strided),
-    crate::routine!(gptoss_swiglu),
-    crate::routine!(silu_mul),
-    crate::routine!(silu_mul_strided),
-];

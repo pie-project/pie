@@ -457,8 +457,8 @@ fn entrypoint_tables() -> BTreeMap<String, Vec<String>> {
     out
 }
 
-/// The entrypoints one `Fire`'s `entrypoint:` expression can name, or `None`
-/// if no static reading can tell.
+/// The entrypoints the second argument of one `Fire::at(file, entrypoint)`
+/// call can name, or `None` if no static reading can tell.
 ///
 /// Two shapes, and the plane forbids a third: a literal names itself, and
 /// `TABLE[point(..)]` names every string in `TABLE`, because the index picks a
@@ -472,6 +472,83 @@ fn fired_names(value: &str, tables: &BTreeMap<String, Vec<String>>) -> Option<Ve
     }
     let (name, _) = value.split_once('[')?;
     tables.get(name.trim()).cloned()
+}
+
+/// Every `Fire::at(file, entrypoint)` call read out of source, with the line
+/// each opens on and the RAW TEXT of its second argument.
+///
+/// A body now spells its point as `Fire::at(file, entrypoint).apply(geometry)`
+/// — a CALL, not the `Fire { file: .., entrypoint: .., .. }` struct literal
+/// (nor an `entrypoint: ..,` labelled line) this scan used to anchor on: `rg
+/// 'entrypoint:' crates/kernels-metal/src` is empty over the whole crate,
+/// every family having crossed to the call form. So the region tracked is the
+/// call's own parentheses, counted from `Fire::at(`'s own opening one, and
+/// the two arguments split on the first comma AT THAT DEPTH — so a comma
+/// inside `head_point(*head_dim, &PAGED_DIMS)`, itself an argument, does not
+/// end the first one early. `kernels-wgpu`'s sibling test solved the same
+/// problem first; this is that solution, trimmed to what this file needs (no
+/// `.apply(..)` geometry is read here, so there is nothing to swallow).
+fn fire_entrypoints(text: &str) -> Vec<(usize, String)> {
+    let code: String = text
+        .lines()
+        .map(|l| l.split_once("//").map_or(l, |(before, _)| before))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let bytes = code.as_bytes();
+
+    /// The index one past the delimiter matching `bytes[open]`, itself one of
+    /// `( [ {`. A quoted string's own brackets do not count, so a table name
+    /// or an entrypoint literal holding one — none do today, but the scan
+    /// should not break the day one needs a `[` in its name — is inert.
+    fn matching_close(bytes: &[u8], open: usize) -> usize {
+        let mut depth = 1i32;
+        let mut in_str = false;
+        let mut i = open + 1;
+        while depth > 0 {
+            match bytes[i] {
+                b'"' => in_str = !in_str,
+                b'(' | b'[' | b'{' if !in_str => depth += 1,
+                b')' | b']' | b'}' if !in_str => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        i
+    }
+
+    /// The first comma this argument list holds at ITS OWN depth, i.e. not
+    /// inside a nested call or index.
+    fn top_level_comma(bytes: &[u8]) -> Option<usize> {
+        let mut depth = 0i32;
+        let mut in_str = false;
+        for (i, &b) in bytes.iter().enumerate() {
+            match b {
+                b'"' => in_str = !in_str,
+                b'(' | b'[' | b'{' if !in_str => depth += 1,
+                b')' | b']' | b'}' if !in_str => depth -= 1,
+                b',' if !in_str && depth == 0 => return Some(i),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = code[from..].find("Fire::at(") {
+        let start = from + rel;
+        let open = start + "Fire::at".len();
+        let close = matching_close(bytes, open);
+        let args = &code[open + 1..close - 1];
+        let entrypoint = match top_level_comma(args.as_bytes()) {
+            Some(c) => args[c + 1..].trim(),
+            None => args.trim(),
+        };
+        let line = code[..start].matches('\n').count() + 1;
+        out.push((line, entrypoint.to_owned()));
+        from = close;
+    }
+    out
 }
 
 /// Census names that no body in this crate fires.
@@ -553,19 +630,13 @@ fn every_entrypoint_a_body_fires_is_one_the_census_carries() {
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
         let mut fired: BTreeSet<String> = BTreeSet::new();
-        for (n, line) in text.lines().enumerate() {
-            let code = line.split_once("//").map_or(line, |(before, _)| before);
-            let Some(value) = code.trim().strip_prefix("entrypoint:") else {
-                continue;
-            };
-            let value = value.trim().trim_end_matches(',').trim();
-            match fired_names(value, &tables) {
+        for (line, value) in fire_entrypoints(&text) {
+            match fired_names(&value, &tables) {
                 Some(names) => fired.extend(names),
                 None => panic!(
-                    "{module}:{}: `{value}` is neither a literal nor an index \
-                     into an axis of literals, so no static reading of this \
-                     crate can say which entrypoints it fires",
-                    n + 1,
+                    "{module}:{line}: `{value}` is neither a literal nor an \
+                     index into an axis of literals, so no static reading of \
+                     this crate can say which entrypoints it fires",
                 ),
             }
         }

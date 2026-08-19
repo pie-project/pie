@@ -985,13 +985,16 @@ fn mla_absorb(
     b: &BoundLaunch<'_>,
     spec: &LaunchSpec,
     ctx: &DispatchCtx,
-    rows: i32,
     call: fn(
         &kernels_cuda::jit::Ctx,
-        kernels::routine::In<0, c_void>,
-        kernels::routine::Bank<0, c_void>,
-        kernels::routine::Out<0, c_void>,
-        kernels::routine::Env<kernels::keys::Rows>,
+        kernels::routine::In<kernels_cuda::routine::Tensor<c_void>>,
+        kernels::routine::Const<kernels_cuda::routine::Tensor<c_void>>,
+        kernels::routine::Out<kernels_cuda::routine::Tensor<c_void>>,
+        // THE FOUR EXTENTS, AND NO ROW COUNT. `rows` was `Env<keys::Rows>` and
+        // the arm built one by hand; the routine asks its context for the
+        // fire's token count now. The four that remain are the absorb's own
+        // head geometry, which no operand's rectangle spells -- each absorb
+        // takes the WHOLE `kv_b_proj` bank and slices it itself.
         i32,
         i32,
         i32,
@@ -1037,10 +1040,10 @@ fn mla_absorb(
     let fired = call(
         &cx,
         kernels::routine::In { ptr: b.args[0].ptr.cast_const(), rows: 0, width: 0 },
-        kernels::routine::Bank { ptr: b.args[spec.n_in + spec.n_out].ptr.cast_const() },
+        kernels::routine::Const { v: b.args[spec.n_in + spec.n_out].ptr.cast_const() },
         kernels::routine::Out { ptr: b.args[spec.n_in].ptr, rows: 0, width: 0 },
-        // The only trailing scalar with a distinct type; the four i32s permute.
-        <kernels::keys::Rows as kernels::keys::Fact>::env(rows),
+        // THE FOUR EXTENTS THE STATEMENT CARRIES, and no row count: the
+        // routine asks its context for the fire's token count.
         p(0),
         p(1),
         p(2),
@@ -1187,7 +1190,6 @@ pub fn dispatch<R: Resolver>(
             bound,
             spec,
             ctx,
-            rows,
             kernels_cuda::gemm::mla_absorb_q_to_latent_bf16,
         )?,
         "gemm::mla_absorb_latent_to_v_bf16" => mla_absorb(
@@ -1195,7 +1197,6 @@ pub fn dispatch<R: Resolver>(
             bound,
             spec,
             ctx,
-            rows,
             kernels_cuda::gemm::mla_absorb_latent_to_v_bf16,
         )?,
 

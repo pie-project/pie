@@ -5,12 +5,12 @@
 //! binds five buffers, two scalars and two axis facts. Nine is what that
 //! kernel takes; collecting them into a struct would restate the binding order
 //! somewhere else, which is the thing this refactor removes.
-#![allow(clippy::too_many_arguments)]
 
+use kernels::Grid;
+use kernels_macros::routine;
 use kernels::routine::Refusal;
 
-use crate::routine::{elementwise, elementwise_rows, keys, Ask, Bind, Block, Buf, BufMut, Ctx, Fire, I32s, InPacked, Param, ParamF32, Routine, U32s};
-use crate::routine::{InSlot, OutSlot, Weight};
+use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, InPacked, Out, Tensor, bf16, elementwise, elementwise_rows, keys};
 
 /// Threads per threadgroup for every body in this file.
 ///
@@ -233,28 +233,20 @@ const EMBED_GATHER_FILE: &str = "layout/embed_gather.metal";
 ///
 /// [`Refusal::Empty`] for an empty rectangle, [`Refusal::Narrow`] for an
 /// affine point the shader tree does not carry.
+#[routine]
 pub fn embed_gather_4bit(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    // THE TOKEN IDS ARE THE FIRE'S. An embedding gather at the top of a
-    // graph has no traced operand -- the ids come off the fire's frame --
-    // which is why the statement places three weights and no input.
-    id: Ask<keys::TokenIds, I32s>,
-    out: OutSlot<0, BufMut>,
-    hidden: Param<0, i32>,
-    group: Ask<keys::QuantGroup, i32>,
-    bits: Ask<keys::QuantBits, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: EMBED_GATHER[affine_point(*group, *bits)?],
-            file: EMBED_GATHER_FILE,
-            lanes: elementwise(*hidden, 1)?,
-            group: [GROUP_X, 1, 1],
-        },
-        &[w.v(), scales.v(), biases.v(), id.v(), out.v(), hidden.v()],
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    group: Const<i32>,
+    bits: Const<i32>) -> Result<(), Refusal> {
+    let id = ctx.ask::<Tensor<i32>, keys::TokenIds>()?;
+    let hidden = out.width;
+    ctx.fire(
+        Fire::at(EMBED_GATHER_FILE, EMBED_GATHER[affine_point(*group, *bits)?]).apply(Grid::of(elementwise(hidden, 1)?, [GROUP_X, 1, 1])),
+        &[w.arg(), scales.arg(), biases.arg(), id.arg(), out.arg(), hidden.arg()],
     )
 }
 
@@ -269,29 +261,21 @@ pub fn embed_gather_4bit(
 /// # Errors
 ///
 /// As [`embed_gather_4bit`].
+#[routine]
 pub fn embed_gather_mb_4bit(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    // THE TOKEN IDS ARE THE FIRE'S. An embedding gather at the top of a
-    // graph has no traced operand -- the ids come off the fire's frame --
-    // which is why the statement places three weights and no input.
-    id: Ask<keys::TokenIds, I32s>,
-    out: OutSlot<0, BufMut>,
-    hidden: Param<0, i32>,
-    rows: Ask<keys::Rows, i32>,
-    group: Ask<keys::QuantGroup, i32>,
-    bits: Ask<keys::QuantBits, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: EMBED_GATHER_MB[affine_point(*group, *bits)?],
-            file: EMBED_GATHER_FILE,
-            lanes: elementwise_rows(*hidden, *rows)?,
-            group: [GROUP_X, 1, 1],
-        },
-        &[w.v(), scales.v(), biases.v(), id.v(), out.v(), hidden.v()],
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    group: Const<i32>,
+    bits: Const<i32>) -> Result<(), Refusal> {
+    let id = ctx.ask::<Tensor<i32>, keys::TokenIds>()?;
+    let hidden = out.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(EMBED_GATHER_FILE, EMBED_GATHER_MB[affine_point(*group, *bits)?]).apply(Grid::of(elementwise_rows(hidden, rows)?, [GROUP_X, 1, 1])),
+        &[w.arg(), scales.arg(), biases.arg(), id.arg(), out.arg(), hidden.arg()],
     )
 }
 
@@ -305,36 +289,28 @@ pub fn embed_gather_mb_4bit(
 /// # Errors
 ///
 /// As [`embed_gather_4bit`].
+#[routine]
 pub fn embed_gather_scaled_4bit(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    // THE TOKEN IDS ARE THE FIRE'S. An embedding gather at the top of a
-    // graph has no traced operand -- the ids come off the fire's frame --
-    // which is why the statement places three weights and no input.
-    id: Ask<keys::TokenIds, I32s>,
-    out: OutSlot<0, BufMut>,
-    hidden: Param<0, i32>,
-    embed_scale: ParamF32<1>,
-    group: Ask<keys::QuantGroup, i32>,
-    bits: Ask<keys::QuantBits, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: EMBED_GATHER_SCALED[affine_point(*group, *bits)?],
-            file: EMBED_GATHER_FILE,
-            lanes: elementwise(*hidden, 1)?,
-            group: [GROUP_X, 1, 1],
-        },
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    embed_scale: Const<f32>,
+    group: Const<i32>,
+    bits: Const<i32>) -> Result<(), Refusal> {
+    let id = ctx.ask::<Tensor<i32>, keys::TokenIds>()?;
+    let hidden = out.width;
+    ctx.fire(
+        Fire::at(EMBED_GATHER_FILE, EMBED_GATHER_SCALED[affine_point(*group, *bits)?]).apply(Grid::of(elementwise(hidden, 1)?, [GROUP_X, 1, 1])),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            id.v(),
-            out.v(),
-            hidden.v(),
-            embed_scale.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            id.arg(),
+            out.arg(),
+            hidden.arg(),
+            embed_scale.arg(),
         ],
     )
 }
@@ -345,37 +321,29 @@ pub fn embed_gather_scaled_4bit(
 /// # Errors
 ///
 /// As [`embed_gather_4bit`].
+#[routine]
 pub fn embed_gather_scaled_mb_4bit(
     ctx: &Ctx<'_>,
-    w: Weight<0, Buf>,
-    scales: Weight<1, Buf>,
-    biases: Weight<2, Buf>,
-    // THE TOKEN IDS ARE THE FIRE'S. An embedding gather at the top of a
-    // graph has no traced operand -- the ids come off the fire's frame --
-    // which is why the statement places three weights and no input.
-    id: Ask<keys::TokenIds, I32s>,
-    out: OutSlot<0, BufMut>,
-    hidden: Param<0, i32>,
-    embed_scale: ParamF32<1>,
-    rows: Ask<keys::Rows, i32>,
-    group: Ask<keys::QuantGroup, i32>,
-    bits: Ask<keys::QuantBits, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: EMBED_GATHER_SCALED_MB[affine_point(*group, *bits)?],
-            file: EMBED_GATHER_FILE,
-            lanes: elementwise_rows(*hidden, *rows)?,
-            group: [GROUP_X, 1, 1],
-        },
+    w: Const<Tensor<u32>>,
+    scales: Const<Tensor<bf16>>,
+    biases: Const<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    embed_scale: Const<f32>,
+    group: Const<i32>,
+    bits: Const<i32>) -> Result<(), Refusal> {
+    let id = ctx.ask::<Tensor<i32>, keys::TokenIds>()?;
+    let hidden = out.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(EMBED_GATHER_FILE, EMBED_GATHER_SCALED_MB[affine_point(*group, *bits)?]).apply(Grid::of(elementwise_rows(hidden, rows)?, [GROUP_X, 1, 1])),
         &[
-            w.v(),
-            scales.v(),
-            biases.v(),
-            id.v(),
-            out.v(),
-            hidden.v(),
-            embed_scale.v(),
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            id.arg(),
+            out.arg(),
+            hidden.arg(),
+            embed_scale.arg(),
         ],
     )
 }
@@ -395,23 +363,18 @@ pub fn embed_gather_scaled_mb_4bit(
 /// # Errors
 ///
 /// [`Refusal::Empty`] when the block is empty.
+#[routine]
 pub fn ple_combine(
     ctx: &Ctx<'_>,
-    proj: InSlot<0, Buf>,
-    token: InSlot<1, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "ple_combine_bfloat16",
-            file: "layout/ple_combine.metal",
-            lanes: elementwise(*width, *rows)?,
-            group: [GROUP_X, 1, 1],
-        },
-        &[proj.v(), token.v(), out.v(), params.v()],
+    proj: In<Tensor<bf16>>,
+    token: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let width = proj.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("layout/ple_combine.metal", "ple_combine_bfloat16").apply(Grid::of(elementwise(width, rows)?, [GROUP_X, 1, 1])),
+        &[proj.arg(), token.arg(), out.arg(), params],
     )
 }
 
@@ -434,53 +397,108 @@ pub fn ple_combine(
 /// # Errors
 ///
 /// [`Refusal::Empty`] for an empty rectangle.
+#[routine]
 pub fn row_gather(
     ctx: &Ctx<'_>,
-    input: InSlot<0, Buf>,
-    out: OutSlot<0, BufMut>,
-    rows: Ask<keys::SamplingIndices, U32s>,
-    params: Block<Buf>,
-    count: Ask<keys::RequestCount, InPacked>,
-    width: Ask<keys::Width, i32>,
-    row_count: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "row_gather_bfloat16",
-            file: "layout/row_gather.metal",
-            lanes: elementwise_rows(*width, *row_count)?,
-            group: [GROUP_X, 1, 1],
-        },
-        &[input.v(), out.v(), rows.v(), params.v(), count.v()],
+    input: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let rows = ctx.ask::<Tensor<u32>, keys::SamplingIndices>()?;
+    let params = ctx.params()?;
+    let count = ctx.ask::<InPacked, keys::RequestCount>()?;
+    let width = input.width;
+    let row_count = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("layout/row_gather.metal", "row_gather_bfloat16").apply(Grid::of(elementwise_rows(width, row_count)?, [GROUP_X, 1, 1])),
+        &[input.arg(), out.arg(), rows.arg(), params, count.arg()],
     )
 }
 
-/// This family's routines.
-pub static ROUTINES: &[Routine] = &[
-    crate::routine!(embed_gather_4bit),
-    crate::routine!(embed_gather_mb_4bit),
-    crate::routine!(embed_gather_scaled_4bit),
-    crate::routine!(embed_gather_scaled_mb_4bit),
-    crate::routine!(ple_combine),
-    crate::routine!(row_gather),
-];
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routine::{ArgValue, Encode};
-    use core::cell::RefCell;
+    use crate::routine::{ArgValue, Const, Encode, Tensor};
+    use core::cell::{Cell, RefCell};
 
     /// One recorded dispatch: the fire, and the argument list.
     type Call = (Fire, Vec<ArgValue>);
 
-    /// An `Encode` that remembers what it was asked to do.
-    #[derive(Default)]
-    struct Seen(RefCell<Vec<Call>>);
+    /// An `Encode` that remembers what it was asked to do, and answers the
+    /// facts this family's bodies ask for.
+    ///
+    /// `rows` backs every `ctx.ask::<i32, keys::Rows>()` in this file --
+    /// `embed_gather_mb_4bit`/`embed_gather_scaled_mb_4bit`'s row count and
+    /// `row_gather`'s request count are both this fact under different names,
+    /// so a test that fires more than one sets it again between calls.
+    /// `token_ids` and `sampling_indices` are the two buffers every gather
+    /// reads its indices through; `request_count` is `row_gather`'s
+    /// `InPacked` request count, answered as the `u32` an `InPacked` unpacks
+    /// from rather than as a buffer. `params_handle` answers `ctx.params()`.
+    struct Seen {
+        calls: RefCell<Vec<Call>>,
+        rows: Cell<i32>,
+        token_ids: Cell<u32>,
+        sampling_indices: Cell<u32>,
+        request_count: Cell<u32>,
+        params_handle: Cell<u32>,
+        /// THE STATEMENT\'S SCALAR RUN, for a body that reads a word by
+        /// index. Empty means "4096 at every slot", which is a plausible
+        /// stride for the rows these tests build; a case that means a
+        /// particular tiling or split count sets its own.
+        words: RefCell<Vec<i32>>,
+    }
+
+    impl Default for Seen {
+        fn default() -> Self {
+            Self {
+                calls: RefCell::default(),
+                rows: Cell::new(1),
+                token_ids: Cell::new(800),
+                sampling_indices: Cell::new(800),
+                request_count: Cell::new(1),
+                params_handle: Cell::new(900),
+                words: RefCell::default(),
+            }
+        }
+    }
 
     impl Encode for Seen {
-        fn dispatch(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
-            self.0.borrow_mut().push((fire, args.to_vec()));
+        // A PROBE HAS NO FIRE BEHIND IT, so it answers only the facts this
+        // file's bodies ask for and refuses everything else honestly --
+        // answering zero for an unasked fact would let a body under test pass
+        // while the fact it asked for went unanswered on a real driver.
+        fn resolve(&self, _ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
+            use kernels::keys::Fact;
+            if source == <keys::Rows as Fact>::SOURCE {
+                return Ok(ArgValue::I32(self.rows.get()));
+            }
+            if source == <keys::TokenIds as Fact>::SOURCE {
+                return Ok(ArgValue::Buffer(self.token_ids.get()));
+            }
+            if source == <keys::SamplingIndices as Fact>::SOURCE {
+                return Ok(ArgValue::Buffer(self.sampling_indices.get()));
+            }
+            if source == <keys::RequestCount as Fact>::SOURCE {
+                return Ok(ArgValue::U32(self.request_count.get()));
+            }
+            // THE STATEMENT'S OWN SCALARS, which a body reads by index when its
+            // params run is a struct and no `Const` mark can name a word inside
+            // it -- see `Asks::param`. The probe answers a number that is
+            // plausible for every reader: a stride wide enough for the rows
+            // these tests build, and a positive tiling.
+            if let kernels::Source::Slot(kernels::Kind::Param, n) = source {
+                return Ok(ArgValue::I32(
+                    self.words.borrow().get(usize::from(n)).copied().unwrap_or(4096),
+                ));
+            }
+            if source == kernels::Source::Slot(kernels::Kind::Params, 0) {
+                return Ok(ArgValue::Buffer(self.params_handle.get()));
+            }
+            Err(Refusal::Unstated { what: "a fact this probe does not answer" })
+        }
+
+        fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
+            self.calls.borrow_mut().push((fire, args.to_vec()));
             Ok(())
         }
     }
@@ -496,33 +514,27 @@ mod tests {
         let seen = Seen::default();
         embed_gather_4bit(
             &seen,
-            Weight::new(Buf(1)),
-            Weight::new(Buf(2)),
-            Weight::new(Buf(3)),
-            Ask::new(I32s(4)),
-            OutSlot::new(BufMut(5)),
-            Param::new(2048),
-            Ask::new(64),
-            Ask::new(4),
-        )
+            Const::new(Tensor::<u32>::new(1)),
+            Const::new(Tensor::<bf16>::new(2)),
+            Const::new(Tensor::<bf16>::new(3)),
+            Out { ptr: Tensor::<bf16>::new(5), rows: 0, width: 2048 },
+            Const::new(64),
+            Const::new(4))
         .expect("a 64/4 checkpoint is one of the six");
 
         assert_eq!(
-            seen.0.borrow()[0].0.entrypoint,
+            seen.calls.borrow()[0].0.entrypoint,
             "embed_gather_4bit_bfloat16_gs_64_b_4"
         );
 
         let narrow = embed_gather_4bit(
             &seen,
-            Weight::new(Buf(1)),
-            Weight::new(Buf(2)),
-            Weight::new(Buf(3)),
-            Ask::new(I32s(4)),
-            OutSlot::new(BufMut(5)),
-            Param::new(2048),
-            Ask::new(96),
-            Ask::new(4),
-        )
+            Const::new(Tensor::<u32>::new(1)),
+            Const::new(Tensor::<bf16>::new(2)),
+            Const::new(Tensor::<bf16>::new(3)),
+            Out { ptr: Tensor::<bf16>::new(5), rows: 0, width: 2048 },
+            Const::new(96),
+            Const::new(4))
         .expect_err("96 is not a group size this tree carries");
         assert!(
             matches!(
@@ -536,7 +548,7 @@ mod tests {
              can fall back rather than fault"
         );
         assert_eq!(
-            seen.0.borrow().len(),
+            seen.calls.borrow().len(),
             1,
             "and nothing was encoded on the way to refusing"
         );
@@ -555,31 +567,25 @@ mod tests {
         let seen = Seen::default();
         embed_gather_4bit(
             &seen,
-            Weight::new(Buf(1)),
-            Weight::new(Buf(2)),
-            Weight::new(Buf(3)),
-            Ask::new(I32s(4)),
-            OutSlot::new(BufMut(5)),
-            Param::new(2048),
-            Ask::new(32),
-            Ask::new(4),
-        )
+            Const::new(Tensor::<u32>::new(1)),
+            Const::new(Tensor::<bf16>::new(2)),
+            Const::new(Tensor::<bf16>::new(3)),
+            Out { ptr: Tensor::<bf16>::new(5), rows: 0, width: 2048 },
+            Const::new(32),
+            Const::new(4))
         .expect("a launch");
+        seen.rows.set(7);
         embed_gather_mb_4bit(
             &seen,
-            Weight::new(Buf(1)),
-            Weight::new(Buf(2)),
-            Weight::new(Buf(3)),
-            Ask::new(I32s(4)),
-            OutSlot::new(BufMut(5)),
-            Param::new(2048),
-            Ask::new(7),
-            Ask::new(32),
-            Ask::new(4),
-        )
+            Const::new(Tensor::<u32>::new(1)),
+            Const::new(Tensor::<bf16>::new(2)),
+            Const::new(Tensor::<bf16>::new(3)),
+            Out { ptr: Tensor::<bf16>::new(5), rows: 0, width: 2048 },
+            Const::new(32),
+            Const::new(4))
         .expect("a launch");
 
-        let calls = seen.0.borrow();
+        let calls = seen.calls.borrow();
         assert_eq!(
             calls[0].0.lanes,
             [2048, 1, 1],
@@ -607,20 +613,16 @@ mod tests {
         let seen = Seen::default();
         embed_gather_scaled_mb_4bit(
             &seen,
-            Weight::new(Buf(1)),
-            Weight::new(Buf(2)),
-            Weight::new(Buf(3)),
-            Ask::new(I32s(4)),
-            OutSlot::new(BufMut(5)),
-            Param::new(2048),
-            ParamF32::new(45.254_834),
-            Ask::new(7),
-            Ask::new(128),
-            Ask::new(8),
-        )
+            Const::new(Tensor::<u32>::new(1)),
+            Const::new(Tensor::<bf16>::new(2)),
+            Const::new(Tensor::<bf16>::new(3)),
+            Out { ptr: Tensor::<bf16>::new(5), rows: 0, width: 2048 },
+            Const::new(45.254_834),
+            Const::new(128),
+            Const::new(8))
         .expect("a launch");
 
-        let calls = seen.0.borrow();
+        let calls = seen.calls.borrow();
         let (fire, args) = &calls[0];
         assert_eq!(
             fire.entrypoint,
@@ -649,19 +651,15 @@ mod tests {
     #[test]
     fn the_row_gathers_count_is_the_last_argument_because_it_rides_the_pack() {
         let seen = Seen::default();
+        seen.rows.set(3);
+        seen.request_count.set(3);
         row_gather(
             &seen,
-            InSlot::new(Buf(1)),
-            OutSlot::new(BufMut(2)),
-            Ask::new(U32s(3)),
-            Block::new(Buf(4)),
-            Ask::new(InPacked(3)),
-            Ask::new(2048),
-            Ask::new(3),
-        )
+            In { ptr: Tensor::<bf16>::new(1), rows: 0, width: 2048 },
+            Out::new(Tensor::<bf16>::new(2)))
         .expect("three requests is a launch");
 
-        let calls = seen.0.borrow();
+        let calls = seen.calls.borrow();
         let (fire, args) = &calls[0];
         assert_eq!(fire.entrypoint, "row_gather_bfloat16");
         assert_eq!(fire.file, "layout/row_gather.metal");

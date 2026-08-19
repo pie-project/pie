@@ -710,6 +710,8 @@ mod tests {
             params,
             n_requests: 1,
             conds: Vec::new(),
+            // A fixture states no attention schedule to raise.
+            preps: Vec::new(),
             readout: None,
         }
     }

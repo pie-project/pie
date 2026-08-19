@@ -5,19 +5,13 @@
 //! `rows * 2 * width` region and halve it themselves. Extents come off the
 //! bound `In`/`Out` regions' `rows`/`width`, never a separate parameter.
 
-#![allow(clippy::too_many_arguments)]
-
-use crate::jit::{Ctx, Family, Launch, Routine};
-use crate::driver_internal::sigmoid_gate_inplace_bf16;
-use crate::{routine};
-use crate::jit::Abi;
-use crate::jit::abi::Inst;
+use kernels::{Bind, Fire};
+use kernels::routine::{Asks, Const, In, InOut, Out};
+use kernels_macros::routine;
+use crate::jit::{Ctx, Launch};
+use crate::jit::abi::Tensor;
 use crate::jit::abi::{bf16, f16};
-use kernels::Env;
-use kernels::In;
-use kernels::Out;
 use kernels::Refusal;
-use kernels::Weight;
 use kernels::keys;
 
 /// Threads per block, everywhere in this family.
@@ -61,29 +55,16 @@ pub const GPT_OSS_GLU_ALPHA: f32 = 1.702;
 ///
 /// `gate` and `up` must address `y.rows * y.width` live bf16 elements and
 /// `y` that many writable ones.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn swiglu<T>(
-    ctx: &Ctx,
-    gate: In<0, T>,
-    up: In<1, T>,
-    y: Out<0, T>,
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
-{
+    ctx: &Ctx<'_>,
+    gate: In<Tensor<T>>,
+    up: In<Tensor<T>>,
+    y: Out<Tensor<T>>) -> Result<(), Refusal> {
     let n = y.rows.saturating_mul(y.width);
     // SAFETY: `call()`'s contract — every pointer addresses live device
     // memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "mlp/swiglu.cuh",
-            &format!("::pie::mlp::swiglu<{}>", T::CPP),
-            elementwise(n),
-            &[gate.ptr.arg(), up.ptr.arg(), y.ptr.arg(), n.arg()],
-        )
-    }
+    ctx.fire(Fire::at("mlp/swiglu.cuh", crate::jit::symbol(&format!("::pie::mlp::swiglu<{}>", T::CPP))).apply(elementwise(n)), &[gate.arg(), up.arg(), y.arg(), n.arg()])
 }
 
 /// The same with the gate clamped to `±limit` — `mlp::swiglu_clamp_bf16`.
@@ -91,28 +72,20 @@ where
 /// # Safety
 ///
 /// [`swiglu`]'s.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn swiglu_clamp<T>(
-    ctx: &Ctx,
-    gate: In<0, T>,
-    up: In<1, T>,
-    y: Out<0, T>,
-    limit: Env<keys::GluLimit>,
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
-{
+    ctx: &Ctx<'_>,
+    gate: In<Tensor<T>>,
+    up: In<Tensor<T>>,
+    y: Out<Tensor<T>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
+    // builder ever began stating them. A `Const` mark PROMISES the statement
+    // carries the number at its slot in the params run; where nothing states
+    // one the promise breaks at the fire, not at the type. §11.20.
+    let limit = ctx.ask::<f32, keys::GluLimit>()?;
+
     let n = y.rows.saturating_mul(y.width);
-    unsafe {
-        ctx.launch(
-            "mlp/swiglu.cuh",
-            &format!("::pie::mlp::swiglu_clamp<{}>", T::CPP),
-            elementwise(n),
-            &[gate.ptr.arg(), up.ptr.arg(), y.ptr.arg(), n.arg(), limit.arg()],
-        )
-    }
+    ctx.fire(Fire::at("mlp/swiglu.cuh", crate::jit::symbol(&format!("::pie::mlp::swiglu_clamp<{}>", T::CPP))).apply(elementwise(n)), &[gate.arg(), up.arg(), y.arg(), n.arg(), limit.arg()])
 }
 
 /// SiTU — `mlp::situ_bf16`.
@@ -120,30 +93,24 @@ where
 /// # Safety
 ///
 /// [`swiglu`]'s.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn situ<T>(
-    ctx: &Ctx,
-    gate: In<0, T>,
-    up: In<1, T>,
-    y: Out<0, T>,
-    // Unbound: `Deployment` states neither field yet, so both are always 0.0.
+    ctx: &Ctx<'_>,
+    gate: In<Tensor<T>>,
+    up: In<Tensor<T>>,
+    y: Out<Tensor<T>>,
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<f32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
     beta: f32,
-    linear_beta: f32,
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
-{
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<f32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
+    linear_beta: f32) -> Result<(), Refusal> {
     let n = y.rows.saturating_mul(y.width);
-    unsafe {
-        ctx.launch(
-            "mlp/swiglu.cuh",
-            &format!("::pie::mlp::situ<{}>", T::CPP),
-            elementwise(n),
-            &[gate.ptr.arg(), up.ptr.arg(), y.ptr.arg(), n.arg(), beta.arg(), linear_beta.arg()],
-        )
-    }
+    ctx.fire(Fire::at("mlp/swiglu.cuh", crate::jit::symbol(&format!("::pie::mlp::situ<{}>", T::CPP))).apply(elementwise(n)), &[gate.arg(), up.arg(), y.arg(), n.arg(), beta.arg(), linear_beta.arg()])
 }
 
 /// GeGLU-tanh — `mlp::geglu_tanh_bf16`.
@@ -151,29 +118,24 @@ where
 /// # Safety
 ///
 /// [`swiglu`]'s. `y` may alias `gate`.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn geglu_tanh<T>(
-    ctx: &Ctx,
-    // Stated explicitly, not derived: `y` aliases `gate` (`in_place =
-    // &[(0, 0)]`), so counting operands would miscount which is which.
-    gate: In<0, T>,
-    up: In<1, T>,
-    y: Out<0, T>,
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
-{
+    ctx: &Ctx<'_>,
+    // TWO MARKS AND NOT ONE, and the row's old `in_place = &[(0, 0)]` is why
+    // that has to be said. The pair was a MAY-ALIAS: through a statement the
+    // allocator gave result 0 operand 0's offset, and the kernel takes the
+    // gate and the destination as two pointers because it does not require
+    // that -- `tower::gemma4_vision` calls this directly with three distinct
+    // buffers. `InOut` claims ONE ADDRESS, which would be false there.
+    //
+    // So the hint is dropped rather than mis-stated. The four marks have no
+    // word for *"the statement may place one buffer here"*; §11.5 records the
+    // three routines that had one.
+    gate: In<Tensor<T>>,
+    up: In<Tensor<T>>,
+    y: Out<Tensor<T>>) -> Result<(), Refusal> {
     let n = y.rows.saturating_mul(y.width);
-    unsafe {
-        ctx.launch(
-            "mlp/swiglu.cuh",
-            &format!("::pie::mlp::geglu_tanh<{}>", T::CPP),
-            elementwise(n),
-            &[gate.ptr.arg(), up.ptr.arg(), y.ptr.arg(), n.arg()],
-        )
-    }
+    ctx.fire(Fire::at("mlp/swiglu.cuh", crate::jit::symbol(&format!("::pie::mlp::geglu_tanh<{}>", T::CPP))).apply(elementwise(n)), &[gate.arg(), up.arg(), y.arg(), n.arg()])
 }
 
 /// `y = max(x, 0)^2` — `mlp::relu2_bf16`.
@@ -182,22 +144,10 @@ where
 ///
 /// `x` must address `y.rows * y.width` live bf16 elements and `y` that many
 /// writable ones.
-#[kernels_macros::routine]
-pub fn relu2<T>(ctx: &Ctx, x: In<0, T>, y: Out<0, T>) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
-{
+#[routine(bf16)]
+pub fn relu2<T>(ctx: &Ctx<'_>, x: In<Tensor<T>>, y: Out<Tensor<T>>) -> Result<(), Refusal> {
     let n = y.rows.saturating_mul(y.width);
-    unsafe {
-        ctx.launch(
-            "mlp/swiglu.cuh",
-            &format!("::pie::mlp::relu2<{}>", T::CPP),
-            elementwise(n),
-            &[x.ptr.arg(), y.ptr.arg(), n.arg()],
-        )
-    }
+    ctx.fire(Fire::at("mlp/swiglu.cuh", crate::jit::symbol(&format!("::pie::mlp::relu2<{}>", T::CPP))).apply(elementwise(n)), &[x.arg(), y.arg(), n.arg()])
 }
 
 /// gpt-oss's clamped GLU — `mlp::gpt_oss_glu_bf16`.
@@ -206,40 +156,31 @@ where
 ///
 /// [`swiglu`]'s, plus: when `y_fp16` is `Some`, it must address
 /// `y.rows * y.width` writable fp16 elements. `y` may alias `gate`.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn gpt_oss_glu<T>(
-    ctx: &Ctx,
-    gate: In<0, T>,
-    up: In<1, T>,
-    y: Out<0, T>,
-    limit: Env<keys::GluLimit>,
-    // `quant`'s fused MXFP4 gate/up computes the same activation from this
-    // fact independently; nothing keeps the two numerically in sync.
-    alpha: Env<keys::GluAlpha>,
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
-{
+    ctx: &Ctx<'_>,
+    // As [`geglu_tanh`]'s pair, and a may-alias for the same reason.
+    gate: In<Tensor<T>>,
+    up: In<Tensor<T>>,
+    y: Out<Tensor<T>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
+    // builder ever began stating them. A `Const` mark PROMISES the statement
+    // carries the number at its slot in the params run; where nothing states
+    // one the promise breaks at the fire, not at the type. §11.20.
+    let limit = ctx.ask::<f32, keys::GluLimit>()?;
+    let alpha = ctx.ask::<f32, keys::GluAlpha>()?;
+
     let n = y.rows.saturating_mul(y.width);
-    unsafe {
-        ctx.launch(
-            "mlp/swiglu.cuh",
-            &format!("::pie::mlp::gpt_oss_glu<{}>", T::CPP),
-            elementwise(n),
-            &[
-                gate.ptr.arg(),
-                up.ptr.arg(),
-                y.ptr.arg(),
+    ctx.fire(Fire::at("mlp/swiglu.cuh", crate::jit::symbol(&format!("::pie::mlp::gpt_oss_glu<{}>", T::CPP))).apply(elementwise(n)), &[
+                gate.arg(),
+                up.arg(),
+                y.arg(),
                 // Always null: this fp16 side-output slot is never filled.
                 ::core::ptr::null_mut::<f16>().arg(),
                 n.arg(),
                 limit.arg(),
                 alpha.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// SwiGLU over a packed gate‖up bank — `mlp::chunked_swiglu_bf16`.
@@ -247,30 +188,56 @@ where
 /// # Safety
 ///
 /// `packed` must address `y.rows * 2 * y.width` live bf16 elements and `y`
-/// `y.rows * y.width` writable ones. `y` may alias the second half of
-/// `packed`, which is what `in_place = &[(0, 1)]` declares.
-#[kernels_macros::routine]
+/// `y.rows * y.width` writable ones.
+#[routine(bf16)]
 pub fn chunked_swiglu<T>(
-    ctx: &Ctx,
-    packed: In<0, T>,
+    ctx: &Ctx<'_>,
+    packed: In<Tensor<T>>,
     // Extent comes off `y` (`rows * width`), not `packed` (`rows * 2 * width`).
-    y: Out<0, T>,
-    // The C++'s `chunked_swiglu_gate_second` twin has no `ROUTINES` row, so it
-    // never fires; the checkpoint-side `gate_second` flag shares the name only.
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
-{
-    unsafe {
-        ctx.launch(
-            "mlp/swiglu.cuh",
-            &format!("::pie::mlp::chunked_swiglu<{}>", T::CPP),
-            elementwise_rows(y.rows, y.width),
-            &[packed.ptr.arg(), y.ptr.arg(), y.width.arg()],
-        )
-    }
+    //
+    // `Out`, NOT `InOut`, and §11.6's rule is the one that decides it: *a
+    // routine that fires its mark TWICE requires the alias, one that fires
+    // two marks does not*. This fires `packed` and `y` separately, so the
+    // kernel takes a source and a destination and does not need them to be
+    // one address. HEAD said the same with `Out<0, T>`; its row's
+    // `in_place = &[(0, 1)]` was an ALLOCATOR instruction beside the mark,
+    // not a claim about the parameter, and `InOut` conflates the two.
+    //
+    // The dense MLP states one operand here, so an `InOut` — which derives
+    // `Source::Alias(1, 0)` and reads INPUT 1 — refused every llama, qwen3
+    // and gemma fire at its tenth launch with "the fire does not carry an
+    // input operand". The statement shape that really does place a
+    // destination is [`chunked_swiglu_into`] below.
+    y: Out<Tensor<T>>) -> Result<(), Refusal> {
+    ctx.fire(Fire::at("mlp/swiglu.cuh", crate::jit::symbol(&format!("::pie::mlp::chunked_swiglu<{}>", T::CPP))).apply(elementwise_rows(y.rows, y.width)), &[packed.arg(), y.arg(), y.width.arg()])
+}
+
+/// [`chunked_swiglu`] over a destination the STATEMENT places —
+/// `mlp::chunked_swiglu_into_bf16`.
+///
+/// One kernel, two statement shapes, so two rows — the split
+/// `attn::write_kv_to_pages_bf16`/`_quantised` already makes for the same
+/// reason. The dense MLP hands this activation a fresh result and lets the
+/// arena place it; qwen3.5's ALIGNED MoE leg cannot, because
+/// `build_moe_ptrs_aligned` has already baked that buffer's base address into
+/// the device pointer arrays the batched-cuBLAS fallback dereferences. There
+/// the destination is an operand and the result must BE it, which is what
+/// `InOut` says and what HEAD's `in_place = &[(0, 1)]` asked the allocator
+/// for.
+///
+/// One mark could not serve both: `Out` alone leaves the aligned leg writing
+/// a buffer the pointer arrays do not name, and `InOut` alone reaches for an
+/// input the dense MLP does not place.
+///
+/// # Safety
+///
+/// [`chunked_swiglu`]'s, and `y` must be the buffer the statement placed.
+#[routine(bf16)]
+pub fn chunked_swiglu_into<T>(
+    ctx: &Ctx<'_>,
+    packed: In<Tensor<T>>,
+    y: InOut<Tensor<T>>) -> Result<(), Refusal> {
+    ctx.fire(Fire::at("mlp/swiglu.cuh", crate::jit::symbol(&format!("::pie::mlp::chunked_swiglu<{}>", T::CPP))).apply(elementwise_rows(y.rows, y.width)), &[packed.arg(), y.arg(), y.width.arg()])
 }
 
 /// The packed form with the gate clamped —
@@ -278,26 +245,18 @@ where
 /// # Safety
 ///
 /// [`chunked_swiglu`]'s.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn chunked_swiglu_clamp<T>(
-    ctx: &Ctx,
-    packed: In<0, T>,
-    y: Out<0, T>,
-    limit: Env<keys::GluLimit>,
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
-{
-    unsafe {
-        ctx.launch(
-            "mlp/swiglu.cuh",
-            &format!("::pie::mlp::chunked_swiglu_clamp<{}>", T::CPP),
-            elementwise_rows(y.rows, y.width),
-            &[packed.ptr.arg(), y.ptr.arg(), y.width.arg(), limit.arg()],
-        )
-    }
+    ctx: &Ctx<'_>,
+    packed: In<Tensor<T>>,
+    y: Out<Tensor<T>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
+    // builder ever began stating them. A `Const` mark PROMISES the statement
+    // carries the number at its slot in the params run; where nothing states
+    // one the promise breaks at the fire, not at the type. §11.20.
+    let limit = ctx.ask::<f32, keys::GluLimit>()?;
+
+    ctx.fire(Fire::at("mlp/swiglu.cuh", crate::jit::symbol(&format!("::pie::mlp::chunked_swiglu_clamp<{}>", T::CPP))).apply(elementwise_rows(y.rows, y.width)), &[packed.arg(), y.arg(), y.width.arg(), limit.arg()])
 }
 
 /// SiTU over a packed bank — `mlp::chunked_situ_bf16`.
@@ -305,28 +264,22 @@ where
 /// # Safety
 ///
 /// [`chunked_swiglu`]'s.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn chunked_situ<T>(
-    ctx: &Ctx,
-    packed: In<0, T>,
-    y: Out<0, T>,
-    // [`situ`]'s `beta`/`linear_beta`, for the same reason (unbound).
+    ctx: &Ctx<'_>,
+    packed: In<Tensor<T>>,
+    y: Out<Tensor<T>>,
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<f32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
     beta: f32,
-    linear_beta: f32,
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
-{
-    unsafe {
-        ctx.launch(
-            "mlp/swiglu.cuh",
-            &format!("::pie::mlp::chunked_situ<{}>", T::CPP),
-            elementwise_rows(y.rows, y.width),
-            &[packed.ptr.arg(), y.ptr.arg(), y.width.arg(), beta.arg(), linear_beta.arg()],
-        )
-    }
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<f32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
+    linear_beta: f32) -> Result<(), Refusal> {
+    ctx.fire(Fire::at("mlp/swiglu.cuh", crate::jit::symbol(&format!("::pie::mlp::chunked_situ<{}>", T::CPP))).apply(elementwise_rows(y.rows, y.width)), &[packed.arg(), y.arg(), y.width.arg(), beta.arg(), linear_beta.arg()])
 }
 
 /// GeGLU-tanh over a packed bank — `mlp::chunked_geglu_tanh_bf16`.
@@ -334,25 +287,12 @@ where
 /// # Safety
 ///
 /// [`chunked_swiglu`]'s.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn chunked_geglu_tanh<T>(
-    ctx: &Ctx,
-    packed: In<0, T>,
-    y: Out<0, T>,
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
-{
-    unsafe {
-        ctx.launch(
-            "mlp/swiglu.cuh",
-            &format!("::pie::mlp::chunked_geglu_tanh<{}>", T::CPP),
-            elementwise_rows(y.rows, y.width),
-            &[packed.ptr.arg(), y.ptr.arg(), y.width.arg()],
-        )
-    }
+    ctx: &Ctx<'_>,
+    packed: In<Tensor<T>>,
+    y: Out<Tensor<T>>) -> Result<(), Refusal> {
+    ctx.fire(Fire::at("mlp/swiglu.cuh", crate::jit::symbol(&format!("::pie::mlp::chunked_geglu_tanh<{}>", T::CPP))).apply(elementwise_rows(y.rows, y.width)), &[packed.arg(), y.arg(), y.width.arg()])
 }
 
 /// `out += y * sigmoid(x · gate_w)` — `mlp::sigmoid_dot_scalar_gate_add_bf16`.
@@ -363,35 +303,22 @@ where
 /// elements — `out` writable, and it is the residual stream the statement
 /// takes as its second operand, which is what `in_place = &[(0, 1)]`
 /// declares. `gate_w` must address `out.width` live bf16 elements.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn sigmoid_dot_scalar_gate_add<T>(
-    ctx: &Ctx,
-    x: In<0, T>,
+    ctx: &Ctx<'_>,
+    x: In<Tensor<T>>,
     // The statement's only weight, so `Weight<0, *const T>` and a name lookup agree.
-    gate_w: Weight<0, *const T>,
-    out: Out<0, T>,
-    // Stated as `In<2, _>`, not derived: `in_place = &[(0, 1)]` claims operand
+    gate_w: Const<Tensor<T>>,
+    out: InOut<Tensor<T>>,
+    // Stated as `In<2, *const _>`, not derived: `in_place = &[(0, 1)]` claims operand
     // 1 for the aliased `out`, so the true next statement operand is 2.
-    y: In<2, T>,
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
-{
+    y: In<Tensor<T>>) -> Result<(), Refusal> {
     // `h` is a pitch, not an extent: `swiglu.cuh` strides `x`, `out` and `y`
     // by the same number. `layout::stated` turns `all()`'s `Absent` into this
     // family's own `Empty { what: "the row width" }`.
     let row = crate::layout::stated(out.all("the row width"))?;
     let h = row.stride;
-    unsafe {
-        ctx.launch(
-            "mlp/swiglu.cuh",
-            &format!("::pie::mlp::sigmoid_dot_scalar_gate_add<{}>", T::CPP),
-            rms(row.rows),
-            &[x.ptr.arg(), gate_w.ptr.arg(), out.ptr.arg(), y.ptr.arg(), h.arg()],
-        )
-    }
+    ctx.fire(Fire::at("mlp/swiglu.cuh", crate::jit::symbol(&format!("::pie::mlp::sigmoid_dot_scalar_gate_add<{}>", T::CPP))).apply(rms(row.rows)), &[x.arg(), gate_w.arg(), out.arg(), y.arg(), h.arg()])
 }
 
 /// AltUp's activation sparsity, in place — `mlp::gaussian_topk_bf16`.
@@ -399,114 +326,78 @@ where
 /// # Safety
 ///
 /// `x` must address `x.rows * x.width` live and writable bf16 elements.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn gaussian_topk<T>(
-    ctx: &Ctx,
-    // In place (`in_place = &[(0, 0)]`): also `In(0)`, but `Out<0, T>` matches
+    ctx: &Ctx<'_>,
+    // In place (`in_place = &[(0, 0)]`): also `In(0)`, but `Out<0, *mut T>` matches
     // the launcher's own `*mut`.
-    x: Out<0, T>,
-    // Off the statement's `params`, not a driver table (`ParamF32(0)`, as
-    // `swiglu_clamp`'s `limit` does). Hand-armed: `Facts` is `Copy` and can't
-    // derive a variable-length `ParamF32` run.
-    #[source(ParamF32(0))]
-    std_multiplier: f32,
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *mut T: Abi,
-{
+    x: InOut<Tensor<T>>) -> Result<(), Refusal> {
+    let std_multiplier = ctx.ask::<f32, keys::ParamF32_0>()?;
     // Same reason as `sigmoid_dot_scalar_gate_add`'s `h`: `dim` is both the
     // loop bound and the row stride in `gaussian_topk.cuh`, so one number
     // serves as both extent and pitch.
     let row = crate::layout::stated(x.all("the row width"))?;
     let dim = row.stride;
-    unsafe {
-        ctx.launch(
-            "mlp/gaussian_topk.cuh",
-            &format!("::pie::mlp::gaussian_topk<{}>", T::CPP),
-            rms(row.rows),
-            &[x.ptr.arg(), dim.arg(), std_multiplier.arg()],
-        )
-    }
+    ctx.fire(Fire::at("mlp/gaussian_topk.cuh", crate::jit::symbol(&format!("::pie::mlp::gaussian_topk<{}>", T::CPP))).apply(rms(row.rows)), &[x.arg(), dim.arg(), std_multiplier.arg()])
 }
 
 // Pins each launcher's derived operand-binding metadata, so a change to
 // `#[source(...)]` that alters a slot's binding is caught here, not at first use.
 const _: () = {
     assert!(<sigmoid_dot_scalar_gate_add as ::kernels::Derivation>::DERIVED.len() == 4);
-    assert!(matches!(<sigmoid_dot_scalar_gate_add as ::kernels::Derivation>::DERIVED[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(kernels::source_is_named(&<sigmoid_dot_scalar_gate_add as ::kernels::Derivation>::DERIVED[1].source, <kernels::keys::NamedWeight as kernels::keys::Fact>::KEY));
-    assert!(matches!(<sigmoid_dot_scalar_gate_add as ::kernels::Derivation>::DERIVED[2].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(matches!(<sigmoid_dot_scalar_gate_add as ::kernels::Derivation>::DERIVED[3].source, Some(kernels::Source::Slot(kernels::Kind::In, 2))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(sigmoid_dot_scalar_gate_add::<bf16>)[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(sigmoid_dot_scalar_gate_add::<bf16>)[1], Some(kernels::Source::Or(kernels::Source::Named(_), kernels::Source::Slot(kernels::Kind::Weight, 0)))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(sigmoid_dot_scalar_gate_add::<bf16>)[2], Some(kernels::Source::Alias(1, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(sigmoid_dot_scalar_gate_add::<bf16>)[3], Some(kernels::Source::Slot(kernels::Kind::In, 2))));
 
-    assert!(<gpt_oss_glu as ::kernels::Derivation>::DERIVED.len() == 5);
-    assert!(kernels::source_is_named(&<gpt_oss_glu as ::kernels::Derivation>::DERIVED[3].source, <kernels::keys::GluLimit as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&<gpt_oss_glu as ::kernels::Derivation>::DERIVED[4].source, <kernels::keys::GluAlpha as kernels::keys::Fact>::KEY));
+    assert!(<gpt_oss_glu as ::kernels::Derivation>::DERIVED.len() == 3);
 
     assert!(<chunked_swiglu as ::kernels::Derivation>::DERIVED.len() == 2);
-    assert!(matches!(<chunked_swiglu as ::kernels::Derivation>::DERIVED[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(<chunked_swiglu as ::kernels::Derivation>::DERIVED[1].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(chunked_swiglu::<bf16>)[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    // `Out(0)`, matching `chunked_geglu_tanh` directly below — the twin that
+    // kept it. An `Alias(1, 0)` here claims a second input the statement does
+    // not place, and a result half the operand's width cannot be that buffer.
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(chunked_swiglu::<bf16>)[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
 
     assert!(<chunked_geglu_tanh as ::kernels::Derivation>::DERIVED.len() == 2);
-    assert!(matches!(<chunked_geglu_tanh as ::kernels::Derivation>::DERIVED[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(<chunked_geglu_tanh as ::kernels::Derivation>::DERIVED[1].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(chunked_geglu_tanh::<bf16>)[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(chunked_geglu_tanh::<bf16>)[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
 
     // Index 2 (the beta pair's first half) is deliberately `None`: this
     // row stays refused rather than bound to a guessed source.
-    assert!(<chunked_situ as ::kernels::Derivation>::DERIVED[2].source.is_none());
+    assert!(kernels::routine::sources::<crate::jit::Cuda, _, _>(chunked_situ::<bf16>)[2].is_none());
 
     // The counterpart: this one is bound, and off the statement rather
     // than off a fact, which is why it needs a hand arm.
-    assert!(<gaussian_topk as ::kernels::Derivation>::DERIVED.len() == 2);
-    assert!(matches!(<gaussian_topk as ::kernels::Derivation>::DERIVED[0].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(matches!(<gaussian_topk as ::kernels::Derivation>::DERIVED[1].source, Some(kernels::Source::Slot(kernels::Kind::ParamF32, 0))));
+    assert!(<gaussian_topk as ::kernels::Derivation>::DERIVED.len() == 1);
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(gaussian_topk::<bf16>)[0], Some(kernels::Source::Alias(0, 0))));
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
 
     assert!(<swiglu as ::kernels::Derivation>::DERIVED.len() == 3);
-    assert!(matches!(<swiglu as ::kernels::Derivation>::DERIVED[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(<swiglu as ::kernels::Derivation>::DERIVED[1].source, Some(kernels::Source::Slot(kernels::Kind::In, 1))));
-    assert!(matches!(<swiglu as ::kernels::Derivation>::DERIVED[2].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(swiglu::<bf16>)[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(swiglu::<bf16>)[1], Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(swiglu::<bf16>)[2], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
 
     assert!(<relu2 as ::kernels::Derivation>::DERIVED.len() == 2);
-    assert!(matches!(<relu2 as ::kernels::Derivation>::DERIVED[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(<relu2 as ::kernels::Derivation>::DERIVED[1].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(relu2::<bf16>)[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(relu2::<bf16>)[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
 
     assert!(<geglu_tanh as ::kernels::Derivation>::DERIVED.len() == 3);
-    assert!(matches!(<geglu_tanh as ::kernels::Derivation>::DERIVED[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(<geglu_tanh as ::kernels::Derivation>::DERIVED[1].source, Some(kernels::Source::Slot(kernels::Kind::In, 1))));
-    assert!(matches!(<geglu_tanh as ::kernels::Derivation>::DERIVED[2].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(<geglu_tanh as ::kernels::Derivation>::DERIVED[0].stated);
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(geglu_tanh::<bf16>)[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(geglu_tanh::<bf16>)[1], Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(geglu_tanh::<bf16>)[2], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
 };
 
-/// This family's routines, and what a trace may say about each.
-///
-/// `in_place = &[..]` states which operands share an address — the one
-/// thing no signature captures.
-pub static ROUTINES: &[Routine] = &[
-    routine!(swiglu_bf16 = swiglu::<bf16>, ),
-    routine!(swiglu_clamp_bf16 = swiglu_clamp::<bf16>, ),
-    routine!(situ_bf16 = situ::<bf16>, ),
-    routine!(geglu_tanh_bf16 = geglu_tanh::<bf16>, in_place = &[(0, 0)], ),
-    routine!(relu2_bf16 = relu2::<bf16>, ),
-    routine!(gpt_oss_glu_bf16 = gpt_oss_glu::<bf16>, in_place = &[(0, 0)], ),
-    routine!(chunked_swiglu_bf16 = chunked_swiglu::<bf16>, in_place = &[(0, 1)], ),
-    routine!(chunked_swiglu_clamp_bf16 = chunked_swiglu_clamp::<bf16>, ),
-    routine!(chunked_situ_bf16 = chunked_situ::<bf16>, ),
-    routine!(chunked_geglu_tanh_bf16 = chunked_geglu_tanh::<bf16>, ),
-    routine!(sigmoid_dot_scalar_gate_add_bf16 = sigmoid_dot_scalar_gate_add::<bf16>, in_place = &[(0, 1)], ),
-    routine!(gaussian_topk_bf16 = gaussian_topk::<bf16>, in_place = &[(0, 0)], ),
-    // Bare identifier, imported above: the row lives here (not in
-    // `driver_internal`) because `Family::symbol` needs the `mlp::` prefix.
-    routine!(sigmoid_gate_inplace_bf16, in_place = &[(0, 0)]),
-];
-
-/// `mlp`, as a trace names it.
-pub static FAMILY: Family = crate::family!(ROUTINES);
 
 // Pins `std_multiplier`'s `#[source(ParamF32(0))]` binding, so "simplifying"
 // the attribute away and silently returning the row to unbound is caught here.
 const _: () = {
-    let d = <gaussian_topk as kernels::Derivation>::DERIVED;
-    assert!(d.len() == 2);
-    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::ParamF32, 0))));
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(gaussian_topk::<bf16>);
+    assert!(d.len() == 1);
+    assert!(matches!(d[0], Some(kernels::Source::Alias(0, 0))));
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
 };

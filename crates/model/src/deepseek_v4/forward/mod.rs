@@ -149,7 +149,14 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
             // The compressed pass: gather this layer's block entries,
             // rope them the same way, store them, then attend.
             let entries = dsl::cuda::dsv4_compress_gather_paged(&boundary_pos, &boundary_req, l, a.head_dim);
-            let entries = dsl::cuda::rope_partial_last(&entries, a.heads, a.qk_rope_head_dim);
+            // THE ENTRIES' OWN RECTANGLE, not the query's. `rope_partial_last`
+            // rotates IN PLACE -- its row aliases result 0 with operand 0 --
+            // so the result it declares has to be the buffer it was handed,
+            // and the gather declares one entry of `head_dim` per boundary
+            // token (`[Dim::Tokens, Dim::Const(head_dim)]`). Passing the
+            // query's `heads * qk_rope_head_dim` here declared one buffer at
+            // two sizes: the arena placed the alias outside its owner.
+            let entries = dsl::cuda::rope_partial_last(&entries, 1, a.head_dim);
             dsl::cuda::dsv4_store_comp_entries(&entries, &boundary_pos, &boundary_req, l);
             let (o_comp, lse_comp) =
                 dsl::cuda::attention_compressed_paged(&q, l, a.heads, a.head_dim);

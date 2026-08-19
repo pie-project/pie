@@ -27,11 +27,12 @@
 
 use std::cell::RefCell;
 
-use kernels::routine::{Provenance, Refusal, Routine};
+use kernels::routine::{Refusal, Routine};
 use kernels_wgpu::routine::{ArgValue, Encode, Fire, Wgpu};
 use model_compiler::lower::Launch;
 
 use crate::binding::{Bound, ParamSlot, Params};
+use crate::lowering::hold::Facts;
 use crate::dispatch::Dispatch;
 use crate::reflect::Declared;
 
@@ -190,16 +191,38 @@ pub struct Stated {
 }
 
 /// An [`Encode`] that records what a body asks for.
-#[derive(Default)]
-pub struct Planner {
+pub struct Planner<'a, 'h> {
     out: RefCell<Vec<Stated>>,
+    /// WHAT THIS FIRE ANSWERS, for a body that asks.
+    ///
+    /// `None` on a planner built for a probe, which has no fire behind it: a
+    /// body that asks on one gets [`Refusal::Unstated`], which is the honest
+    /// answer rather than an invented zero.
+    answers: Option<(&'h RefCell<super::hold::Handles<'a>>, Facts)>,
 }
 
-impl Planner {
-    /// A planner with nothing recorded.
+impl Default for Planner<'_, '_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'a, 'h> Planner<'a, 'h> {
+    /// A planner with nothing recorded, and nothing to answer with.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self { out: RefCell::new(Vec::new()), answers: None }
+    }
+
+    /// The same planner, able to ANSWER a body that asks.
+    #[must_use]
+    pub fn answering(
+        mut self,
+        handles: &'h RefCell<super::hold::Handles<'a>>,
+        facts: Facts,
+    ) -> Self {
+        self.answers = Some((handles, facts));
+        self
     }
 
     /// What the body asked for, in the order it asked.
@@ -209,8 +232,26 @@ impl Planner {
     }
 }
 
-impl Encode for Planner {
-    fn dispatch(&self, fire: Fire<'_>, args: &[ArgValue]) -> Result<(), Refusal> {
+impl Encode for Planner<'_, '_> {
+    // A PLANNER ANSWERS THROUGH THE SAME BINDER THE COLUMN WENT THROUGH.
+    // `Env` left the parameter list, so a fact only the fire can answer is no
+    // longer bound into `args` before the body runs; the body asks, and this
+    // is `kernels::bind::one` entered at one argument instead of a list.
+    //
+    // `RefCell` because answering MINTS -- a staged fact takes a handle, which
+    // is a mutation of the handle vector -- and the body holds only a `&self`.
+    fn resolve(
+        &self,
+        ty: kernels::Ty,
+        source: kernels::Source,
+    ) -> Result<ArgValue, Refusal> {
+        let (handles, facts) = self.answers.ok_or(Refusal::Unstated {
+            what: "a fact, on a planner with no fire behind it",
+        })?;
+        super::bind::one(ty, source, &mut handles.borrow_mut(), facts)
+    }
+
+    fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
         // A body with nothing to do should have refused. Zero lanes become
         // `dispatch_workgroups(0, 1, 1)`, which is legal WebGPU that runs
         // nothing and reports success, so the output keeps whatever it held
@@ -226,12 +267,20 @@ impl Encode for Planner {
         let mut scalars = Vec::new();
         for arg in args {
             match arg {
+                // A `Shaped` HANDLE IS STILL A HANDLE. It carries the
+                // rectangle the statement gave the operand, which the marks
+                // read and a dispatch does not, so it is recorded here as the
+                // buffer it is.
                 ArgValue::Buffer(h) => handles.push(*h),
+                ArgValue::Shaped { handle, .. } => handles.push(*handle),
                 other => scalars.push(*other),
             }
         }
         self.out.borrow_mut().push(Stated {
-            module: fire.module.to_owned(),
+            // `Fire` NAMES A FILE, not a module: the shared statement carries
+            // `file` where this plane's own `Fire` carried `module`, and a
+            // WGSL file holds many entrypoints, so the file IS the module key.
+            module: fire.file.to_owned(),
             entrypoint: fire.entrypoint.to_owned(),
             lanes: fire.lanes,
             handles,
@@ -248,7 +297,40 @@ impl Encode for Planner {
 /// [`Unplanned::Refused`] when the body refuses, [`Unplanned::Silent`] when
 /// it returns `Ok` without dispatching.
 pub fn state(routine: &'static Routine<Wgpu>, args: &[ArgValue]) -> Result<Vec<Stated>, Unplanned> {
-    let planner = Planner::new();
+    run(routine, args, Planner::new())
+}
+
+/// [`state`], on a planner that can ANSWER what the body asks.
+///
+/// THE CHANNEL A CROSSED BODY NEEDS, and `plan` is why it has to exist.
+/// With `Env` out of the parameter list a fact only the fire can answer —
+/// the positions table, the KV pages, the row count — is no longer bound
+/// into `args` before the body runs. The body asks for it, and a planner
+/// with no fire behind it answers `Refusal::Unstated`, so a production plan
+/// built on [`state`] refused every routine that reached for one.
+///
+/// `handles` is a cell because ANSWERING MINTS: a staged fact takes a handle,
+/// and `plan` reads the same list back afterwards to resolve what the body
+/// asked for.
+///
+/// # Errors
+///
+/// As [`state`].
+pub fn stating<'a>(
+    routine: &'static Routine<Wgpu>,
+    args: &[ArgValue],
+    handles: &RefCell<super::hold::Handles<'a>>,
+    facts: Facts,
+) -> Result<Vec<Stated>, Unplanned> {
+    run(routine, args, Planner::new().answering(handles, facts))
+}
+
+/// One body, one planner, one list of dispatches.
+fn run(
+    routine: &'static Routine<Wgpu>,
+    args: &[ArgValue],
+    planner: Planner<'_, '_>,
+) -> Result<Vec<Stated>, Unplanned> {
     (routine.body)(&planner, args).map_err(Unplanned::Refused)?;
     let out = planner.stated();
     if out.is_empty() {
@@ -325,6 +407,9 @@ pub fn bind<'a, B>(
     let mut bytes: Vec<u8> = Vec::new();
     for value in &stated.scalars {
         let (width, run): (usize, [u8; 8]) = match value {
+            // A BUFFER IS NOT A SCALAR and never reaches this run: the split
+            // above puts every handle, shaped or plain, on the other side.
+            ArgValue::Buffer(_) | ArgValue::Shaped { .. } => continue,
             ArgValue::I32(v) => (4, {
                 let mut b = [0u8; 8];
                 b[..4].copy_from_slice(&v.to_le_bytes());
@@ -358,11 +443,11 @@ pub fn bind<'a, B>(
     // it takes a place in the numbering. `mlp`'s three gated activations are
     // the second kind — `gated.wgsl` declares `@group(0) @binding(3)
     // var<storage> params` — and the table path resolves them the same way,
-    // through a row that states `Param(0): Buf`.
+    // through a row that states `Const { v: 0 }: Buf`.
     if let Some(at) = storage_block {
         // The statement's run FIRST, then whatever the body passed beside the
         // block. That order is the table path's: `scalars` builds one run by
-        // walking the row, taking the whole tail at a `Param(_): Buf` and
+        // walking the row, taking the whole tail at a `Const { v: _ }: Buf` and
         // appending each derived number after it — `row_gather`'s request
         // count is exactly such a number, and its shader reads it as the last
         // field of the struct.
@@ -527,7 +612,12 @@ pub fn plan<'a, R: crate::binding::Resolve>(
     let mut handles = super::hold::Handles::with_numbers(args, asked, scalars, &numbers);
     let taken_args = super::bind::bind(routine.args, routine.sources, &mut handles, facts)
         .map_err(Unplanned::Refused)?;
-    let stated = state(routine, &taken_args)?;
+    // THE BODY ANSWERS THROUGH THE SAME HANDLES IT BOUND FROM. Answering
+    // mints, and the walk below reads the minted list back, so the cell hands
+    // the planner a borrow and gives the `Handles` back after.
+    let handles = RefCell::new(handles);
+    let stated = stating(routine, &taken_args, &handles, facts)?;
+    let mut handles = handles.into_inner();
 
     // The operands the BODY asked for, resolved in the order it asked. Not
     // the statement's order: `Handles` minted a handle per ask, and this
@@ -607,46 +697,44 @@ pub fn armed(symbol: &str) -> Option<&'static Routine<Wgpu>> {
 /// number stated in a place the compiler cannot check against the kernel,
 /// which is the whole reason this plane exists.
 ///
-/// `driver-metal` counts only `BufMut`. This counts every writable type in
-/// `kernels::Ty`, because `ssm`'s bodies take `F32sMut` for their recurrent
-/// state and a count that missed those would split a statement in the wrong
-/// place — silently, since `split` just takes the last `n`.
+/// `driver-metal` counts only `BufMut`. This counts every writable type,
+/// because `ssm`'s bodies take `F32sMut` for their recurrent state and a count
+/// that missed those would split a statement in the wrong place — silently,
+/// since `split` just takes the last `n`.
+///
+/// Through [`kernels::Ty::binds`] rather than an enumeration: the list this
+/// replaced named nine types and would have missed `Ty::Bf16sMut` the moment a
+/// signature named the activation element it binds, which is the same failure
+/// one crate over rather than a new one.
 #[must_use]
 pub fn results(routine: &Routine<Wgpu>) -> usize {
-    use kernels::Ty;
     routine
         .args
         .iter()
-        .filter(|(ty, _)| {
-            matches!(
-                ty,
-                Ty::BufMut
-                    | Ty::F32sMut
-                    | Ty::I32sMut
-                    | Ty::U32sMut
-                    | Ty::U8sMut
-                    | Ty::U16sMut
-                    | Ty::I8sMut
-                    | Ty::BufArrayMut
-                    | Ty::BufArrayOut
-                    | Ty::BufArrayOutMut
-            )
-        })
+        .filter(|ty| ty.binds() == kernels::Binds::Writes)
         .count()
 }
 
 /// What a body takes that is NOT an operand.
 ///
-/// `Provenance::Env` marks the arguments that size the grid and that the
-/// kernel never reads. They are why an arm can produce a shorter list than
-/// the body's arity: the arm supplies operands, the `Facts` supply these.
+/// # It is zero now, and the reason is the whole refactor
+///
+/// `Provenance::Env` used to mark the arguments that size the grid and that
+/// the kernel never reads — the arm supplied operands and the `Facts` supplied
+/// these, so an arm could produce a shorter list than the body's arity.
+///
+/// `Env` is gone from the parameter list. A fact only the fire can answer is
+/// asked for in the BODY (`ctx.ask::<C, keys::X>()`), so it occupies no
+/// argument position at all, and a fact the checkpoint fixes is a `Const` the
+/// statement carries, which is an argument like any other. Every parameter is
+/// positional and the arm supplies all of them.
+///
+/// Kept as a function rather than deleted because its callers read as *"the
+/// arm's list is short by this much"*, and the honest answer to that question
+/// is now zero rather than a number nobody computes.
 #[must_use]
-pub fn env_count(routine: &Routine<Wgpu>) -> usize {
-    routine
-        .args
-        .iter()
-        .filter(|(_, prov)| *prov == Provenance::Env)
-        .count()
+pub const fn env_count(_routine: &Routine<Wgpu>) -> usize {
+    0
 }
 
 #[cfg(test)]
@@ -670,12 +758,8 @@ mod tests {
         }
     }
 
-    fn fire<'a>(module: &'a str, entrypoint: &'a str, lanes: [u32; 3]) -> Fire<'a> {
-        Fire {
-            module,
-            entrypoint,
-            lanes,
-        }
+    fn fire(module: &'static str, entrypoint: &'static str, lanes: [u32; 3]) -> Fire {
+        Fire::at(module, entrypoint).apply(lanes)
     }
 
     /// A planner records what the body said, splitting buffers from scalars
@@ -687,7 +771,7 @@ mod tests {
     #[test]
     fn a_planner_splits_buffers_from_scalars_by_variant() {
         let p = Planner::new();
-        p.dispatch(
+        p.fire(
             fire("sample/argmax.wgsl", "argmax_logits_bfloat16", [256, 1, 1]),
             &[
                 ArgValue::Buffer(0),
@@ -716,7 +800,7 @@ mod tests {
         let p = Planner::new();
         for lanes in [[0, 1, 1], [1, 0, 1], [1, 1, 0]] {
             assert!(matches!(
-                p.dispatch(fire("m.wgsl", "e", lanes), &[]),
+                p.fire(fire("m.wgsl", "e", lanes), &[]),
                 Err(Refusal::Grid { .. })
             ));
         }
@@ -966,18 +1050,33 @@ mod tests {
             );
             // The arm may refuse for its own reasons; what matters is that
             // when it SUCCEEDS it recorded a slab ask, so `plan` will refuse.
-            if crate::lowering::bind::bind(routine.args, routine.sources, &mut o, facts).is_ok() {
+            if let Ok(bound) =
+                crate::lowering::bind::bind(routine.args, routine.sources, &mut o, facts)
+            {
                 let asked = o.asked();
                 let slab = asked
                     .iter()
                     .position(|a| matches!(a, super::super::hold::Asked::Slab(_)));
-                let at = slab.unwrap_or_else(|| {
-                    panic!(
-                        "`{point}`'s arm filled every operand without asking \
-                         for a recurrent slab, which means it took the carry \
-                         from somewhere that is not one"
-                    )
-                });
+                // THE CARRY MOVED INTO THE BODY, so binding the COLUMN can no
+                // longer see it: `gdn_core_recurrent_prefill` reaches for its
+                // recurrent slab with `ctx.ask::<_, keys::RecurrentState>()`,
+                // which is a call and not a declaration. Running the body is
+                // what asks, and a driver that holds no slab refuses there --
+                // the same refusal, one step later. `plan` runs the body too,
+                // so this is the path the fire actually takes.
+                let at = match slab {
+                    Some(at) => at,
+                    None => {
+                        let planner = Planner::new();
+                        (routine.body)(&planner, &bound).expect_err(
+                            "a driver that allocates no recurrent slab cannot \
+                             answer `keys::RecurrentState`, so the body must \
+                             refuse rather than carry from somewhere else",
+                        );
+                        declined.push(point.clone());
+                        continue;
+                    }
+                };
                 // The refusal `plan` will raise for that ask, constructed here
                 // so this test NAMES it: `Resolve::slab` answers `None` on
                 // this driver, so the ask cannot become a binding.
@@ -1082,17 +1181,16 @@ mod tests {
         }
         static QUIET: Routine<Wgpu> = Routine {
             name: "says_nothing",
+            namespace: "",
             args: &[],
             // Empty beside an empty `args`, which is the pair's own rule: all
             // three are DERIVED from the body's arguments, and this body has
             // none.
-            sides: &[],
             sources: &[],
             spelling: &[],
             body: says_nothing,
             whole: false,
             depth_prefix_plan: false,
-            in_place: &[],
             derived: &[],
         };
         assert_eq!(state(&QUIET, &[]), Err(Unplanned::Silent));
@@ -1126,16 +1224,20 @@ mod tests {
 
     /// A routine states its own result count, and `argmax` states two.
     ///
-    /// Falsified by counting only `Ty::BufMut` as metal does: `ssm`'s bodies
-    /// take `F32sMut` for their recurrent state, and a count that missed
-    /// those would split a statement in the wrong place — silently, because
-    /// `Handles::over` just takes the last `n` as outputs.
+    /// Falsified by counting only `Ty::BufMut`: `ssm`'s bodies take `F32sMut`
+    /// for their recurrent state, and a count that missed those would split a
+    /// statement in the wrong place — silently, because `Handles::over` just
+    /// takes the last `n` as outputs. `results` asks
+    /// [`kernels::Ty::binds`] instead, so the narrow reading below is what it
+    /// must beat rather than what it does.
     #[test]
     fn a_routine_states_how_many_of_its_operands_are_results() {
         let argmax = armed("argmax_logits").expect("the one armed symbol");
         assert_eq!(results(argmax), 2, "next_token and eos_flag");
 
-        // The case metal's narrower count would miss.
+        // The narrow count, spelled out here BECAUSE it is wrong: this is the
+        // one place the tree may name `Ty::BufMut` alone, and it exists to
+        // fail if `results` is ever narrowed back to it.
         let gdn = kernels_wgpu::routines()
             .into_iter()
             .find(|r| r.name == "gdn_core")
@@ -1143,7 +1245,7 @@ mod tests {
         let mut_bufs = gdn
             .args
             .iter()
-            .filter(|(ty, _)| *ty == kernels::Ty::BufMut)
+            .filter(|ty| **ty == kernels::Ty::BufMut)
             .count();
         assert!(
             results(gdn) > mut_bufs,
@@ -1222,6 +1324,8 @@ mod tests {
             params: Vec::new(),
             n_requests: 1,
             conds: Vec::new(),
+            // A fixture states no attention schedule to raise.
+            preps: Vec::new(),
             readout: None,
         };
         let launch = Launch {

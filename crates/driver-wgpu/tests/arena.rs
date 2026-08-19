@@ -515,7 +515,13 @@ fn stated_by(
     );
     let taken =
         driver_wgpu::lowering::bind::bind(body.args, body.sources, &mut handles, facts).ok()?;
-    driver_wgpu::lowering::routine::state(body, &taken).ok()
+    // ON A PLANNER THAT CAN ANSWER. `state`'s has no fire behind it, so every
+    // body that reaches for a fact -- which after the marks migration is most
+    // of them -- refuses `Unstated` and this helper returns `None`. A walk
+    // built on it measured nothing, and the assertions below could not tell
+    // "no rectangle does this" from "no rectangle was read".
+    let handles = core::cell::RefCell::new(handles);
+    driver_wgpu::lowering::routine::stating(body, &taken, &handles, facts).ok()
 }
 
 /// The offsets a body's scalars pack to, from WGSL's alignment rule.
@@ -535,7 +541,14 @@ fn packed_offsets(scalars: &[ArgValue]) -> Vec<u32> {
             // A body cannot pass a buffer as a scalar: `routine::state`
             // separates the handles out. Counted as a word so that a change
             // there shows up as a misplacement rather than as a silent skip.
-            ArgValue::I32(_) | ArgValue::U32(_) | ArgValue::F32(_) | ArgValue::Buffer(_) => 4,
+            // `Shaped` IS A BUFFER WITH ITS RECTANGLE. It reaches a scalar
+            // run for the same reason `Buffer` does -- it does not -- and is
+            // counted the same way so a change there shows as a misplacement.
+            ArgValue::I32(_)
+            | ArgValue::U32(_)
+            | ArgValue::F32(_)
+            | ArgValue::Buffer(_)
+            | ArgValue::Shaped { .. } => 4,
         };
         at = at.next_multiple_of(width);
         out.push(u32::try_from(at).expect("a block of a few words"));
@@ -1001,8 +1014,11 @@ const REACHES: &[(&str, Reaches)] = &[
     // the direction a reader wants from this diff -- a tile change, not new
     // coverage.
     (
+        // `RunGrows(0)` since the tile axes became `Const<i32>`: `bm`/`bn`
+        // were facts the driver recovered from the SYMBOL and are the
+        // statement's now, so the run runs one word past the plan's block.
         "affine_qmm_t_bfloat16_gs_64_b_8_bm_32_bn_32",
-        Reaches::Uniform,
+        Reaches::RunGrows(0),
     ),
     ("affine_qmv_fast_bfloat16_gs_64_b_8", Reaches::Uniform),
     // THE DENSE PROJECTIONS MOVED TO THE PRECAST PATH. Upstream's "metal: run
@@ -1033,8 +1049,11 @@ const REACHES: &[(&str, Reaches)] = &[
     // the grid. Both are marked `Env` on the routine so the block is packed
     // from what the shader actually reads.
     (
+        // `RunGrows(0)` until the row stride became a `Const<i32>` -- the
+        // rectangle the text laid out, not the fire's -- which is one more
+        // word than the plan fills.
         "cast_qmm_input_strided_bfloat16_to_float16",
-        Reaches::RunGrows(0),
+        Reaches::RunGrows(1),
     ),
     ("affine_qmv_fast_bfloat16_gs_64_b_4", Reaches::Uniform),
     (
@@ -1045,12 +1064,17 @@ const REACHES: &[(&str, Reaches)] = &[
     // unbiased routed QMV keeps the bias slot its biased twin reads, and the
     // module declares it and never touches it. `DriverSupplies(1)` until the
     // gap was counted, which is the whole argument for counting gaps.
-    ("affine_qmv_routed_bfloat16_gs_64_b_4", Reaches::Uniform),
+    // RunGrows RATHER THAN Uniform SINCE THE MARKS MIGRATION: the routed
+    // matvecs read their slot strides and their group/bit counts as
+    // `Const<i32>` now -- the statement carries what the driver used to
+    // recover from the symbol -- so the run these modules read grows past
+    // the uniform block the plan alone filled.
+    ("affine_qmv_routed_bfloat16_gs_64_b_4", Reaches::RunGrows(2)),
     // The MXFP4 twin, and the newest row here: it stated NO operands until
     // recently, which made it the one operand-less row a real plan could name.
     // Now it says where its buffers go, and its unread `biases` slot is the
     // same kind of gap -- the codec has no bias plane, so nothing fills it.
-    ("mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4", Reaches::Uniform),
+    ("mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4", Reaches::RunGrows(2)),
     // The BATCHED routed pair, which the texts started launching when upstream
     // added `Qwen35MetalFacts::moe_tile` -- the opt-in that turns a MoE
     // prefill's expert banks from one matvec per row into a tiled GEMM.
@@ -1197,7 +1221,7 @@ const REACHES: &[(&str, Reaches)] = &[
 ///
 /// The five shapes above were read off a ROW: `struct_slot` found the block's
 /// slot in `kernels_wgpu::bindings`, `gaps` counted the row's `Source::Unbound`
-/// operands, and `sig.in_place` named the aliases. `kernels_wgpu::KERNELS` is
+/// operands, and `sig.in_place()` named the aliases. `kernels_wgpu::KERNELS` is
 /// empty and every one of those readings is gone. Each is taken from what a
 /// real plan PRODUCES instead -- the block's slot from `Dispatch::block_at`,
 /// the aliases from `Routine::in_place`, and the balance from the buffer list
@@ -1253,7 +1277,7 @@ fn what_the_plan_states_and_what_the_module_binds_account_for_each_other() {
             // plan states -- which is true and is not what is interesting
             // about it.
             let args = (launch.args.end - launch.args.start)
-                - u32::try_from(routine.in_place.len()).expect("a routine states few aliases");
+                - u32::try_from(routine.in_place().len()).expect("a routine states few aliases");
             let block = match d.params {
                 Params::Block {
                     at: ParamSlot::Storage(at),
@@ -2031,6 +2055,37 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
                         refused_hollow += 1;
                     }
 
+                    // AND THE SEAM MOVED, so the hollow case has to move with
+                    // it. A head width used to reach a body through
+                    // `Facts::head_dim`, and a geometry of zeros was therefore
+                    // the way to hand one nothing. It is a `Const<i32>` now --
+                    // the checkpoint's, which the STATEMENT carries -- so the
+                    // fire's zeros no longer reach it and the block above stops
+                    // witnessing anything for that family.
+                    //
+                    // What a caller can still hand it nothing THROUGH is the
+                    // params run, so that is zeroed here. A body that divides
+                    // by its stated width, or sizes a group by it, must refuse
+                    // rather than dispatch an empty grid.
+                    let mut hollowed = low.clone();
+                    hollowed.params = vec![0; low.params.len()];
+                    if let Ok(hollow) = driver_wgpu::dispatch::plan_one(
+                        &hollowed,
+                        launch,
+                        Built { module, declared },
+                        sources,
+                        Geometry::default(),
+                    ) {
+                        assert!(
+                            !hollow.groups.contains(&0),
+                            "{text}: `{symbol}` planned {:?} from a statement \
+                             of zeros",
+                            hollow.groups
+                        );
+                    } else {
+                        refused_hollow += 1;
+                    }
+
                     // THE POOL'S NUMBERS REACH THE SHADER. A body may pass
                     // a number that belongs to the POOL rather than to the
                     // statement -- the KV page size, the cache's two strides,
@@ -2397,8 +2452,23 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
         // 436.7 at 64 -- and the two routed rows in `REACHES` above are the
         // SAME two symbols at the new tile, which is why the count there
         // did not move either.
+        // UP BY 1,395,064 WITH THE MARKS MIGRATION, and up is the direction to
+        // read carefully. It is the strided norms: `rms_strided_row` and
+        // `rms_strided_head_row` sized their threadgroup from `x.width`, which
+        // is the PITCH across several norms and not one norm's axis. Their
+        // axis is `params[1]` and a `Const<i32>` now, so the group is sized by
+        // the norm rather than by the whole strided row -- more groups, each
+        // covering what it should, where before one oversized group covered a
+        // row and masked the surplus. Wasteful became right, and right costs
+        // more workgroups.
+        //
+        // And by 177,320 more when `rms_single_row` joined its strided twin:
+        // its axis is `params[1]` too, and it had been reading `x.width`. A
+        // row that holds one norm makes the two the same number, and one that
+        // holds several does not -- which is exactly the case the old reading
+        // sized wrong.
         workgroups,
-        36_474_730,
+        38_047_114,
         "the plans dispatch a different amount of work"
     );
     // The third dimension is a prefill's rows, and only the paged decodes put
@@ -2473,7 +2543,13 @@ fn every_arm_naming_a_pool_number_is_handed_that_number_and_not_another() {
         })
         .chain((0..8).map(|i| Arg::Weight(format!("layer.0.w{i}"))))
         .collect();
-    let scalars: Vec<u32> = (0..24).map(|i| 1000 + i).collect();
+    // A RUN EVERY ARMED BODY CAN READ. It was `1000 + i` -- distinct
+    // sentinels, which was right while the widths came from the FIRE, and
+    // wrong the moment a head width became a `Const<i32>` the statement
+    // carries: no point is compiled at a 1003-wide head, so every attention
+    // body refused and this sweep ran nothing. 64 is a width all four decode
+    // families instantiate, and a positive window admits the sliding pair.
+    let scalars: Vec<u32> = vec![64; 24];
     // A plausible fire, and every field non-zero: an arm dividing by a head
     // count would be measuring this file's laziness rather than the driver.
     let geometry = Geometry {
@@ -2511,19 +2587,79 @@ fn every_arm_naming_a_pool_number_is_handed_that_number_and_not_another() {
         };
         let results = driver_wgpu::lowering::routine::results(routine);
         let facts = driver_wgpu::lowering::hold::facts(&symbol, 1, geometry, 1, 512, 512);
+        // THE WIDTH THIS SYMBOL IS COMPILED FOR, read off its own name. One
+        // flat run cannot serve the decode families: `sdpa_vector_decode_sink`
+        // exists at `_d_64` alone and `sdpa_vector_decode_swa` at `_d_256` and
+        // `_d_512`, so any single number refuses one of them -- and a refusal
+        // here is a body this sweep never ran.
+        let scalars: Vec<u32> = match symbol.rsplit_once("_d_").and_then(|(_, d)| {
+            d.split('_').next().and_then(|d| d.parse::<u32>().ok())
+        }) {
+            // AT THE SLOT EACH FAMILY READS IT FROM, which is not the same
+            // slot. `sdpa_vector_decode` takes `[scale, head_dim, q_heads]`;
+            // the `swa` and `sink` forms put a WINDOW between the scale and
+            // the width, so theirs is at 2. A run of one number everywhere
+            // would state a window of 256 and a q-head count to match.
+            Some(d) => {
+                let at = usize::from(
+                    symbol.contains("_swa") || symbol.contains("_sink"),
+                ) + 1;
+                let mut run = scalars.clone();
+                run[at] = d;
+                // AND THE HEAD COUNT THAT GOES WITH IT. The query row this
+                // file synthesizes is 512 wide and a row is heads laid end to
+                // end, so a width of `d` means `512 / d` of them -- state one
+                // and not the other and the body refuses a row that does not
+                // divide.
+                run[at + 1] = (512 / d).max(1);
+                run
+            }
+            None => scalars.clone(),
+        };
         let mut open = driver_wgpu::lowering::hold::Handles::with_numbers(
             &args,
             results,
             &scalars,
             &contiguous,
         );
-        let free =
-            driver_wgpu::lowering::bind::bind(routine.args, routine.sources, &mut open, facts).ok();
+        // THROUGH THE BODY, NOT THE COLUMN. The cache's strides are
+        // `ctx.ask::<_, keys::KvHeadStride>()` calls now -- a fact only the
+        // fire can answer left the parameter list, which is the whole of the
+        // marks migration -- so binding the column alone never sees them and
+        // this sweep witnessed nothing at all. `Stated::scalars` is what the
+        // body PASSED, in its own order, which is the order a swap moves.
+        let fired_scalars = |taken: Vec<ArgValue>,
+                             open: driver_wgpu::lowering::hold::Handles<'_>|
+         -> Vec<ArgValue> {
+            let cell = core::cell::RefCell::new(open);
+            driver_wgpu::lowering::routine::stating(routine, &taken, &cell, facts)
+                .ok()
+                .map(|stated| {
+                    stated
+                        .iter()
+                        .flat_map(|one| one.scalars.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or(taken)
+        };
+        let free = driver_wgpu::lowering::bind::bind(
+            routine.args,
+            routine.sources,
+            &mut open,
+            facts,
+        )
+        .ok()
+        .map(|taken| fired_scalars(taken, open));
         let mut walled =
             driver_wgpu::lowering::hold::Handles::with_numbers(&args, results, &scalars, &paged);
-        let held =
-            driver_wgpu::lowering::bind::bind(routine.args, routine.sources, &mut walled, facts)
-                .ok();
+        let held = driver_wgpu::lowering::bind::bind(
+            routine.args,
+            routine.sources,
+            &mut walled,
+            facts,
+        )
+        .ok()
+        .map(|taken| fired_scalars(taken, walled));
         if free.is_none() && held.is_none() {
             continue;
         }
@@ -2645,7 +2781,9 @@ fn position(args: &[ArgValue], word: u32) -> Option<usize> {
         ArgValue::U32(n) => *n == word,
         ArgValue::I32(n) => n.cast_unsigned() == word,
         ArgValue::Usize(n) => *n == u64::from(word),
-        ArgValue::Buffer(_) | ArgValue::F32(_) => false,
+        // A HANDLE IS NOT ONE OF THESE NUMBERS, whether or not it arrived
+        // with its rectangle beside it.
+        ArgValue::Buffer(_) | ArgValue::Shaped { .. } | ArgValue::F32(_) => false,
     })
 }
 

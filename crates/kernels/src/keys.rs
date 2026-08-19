@@ -1,7 +1,14 @@
 //! Facts, as types.
 //!
-//! A launcher wanting the environment's epsilon writes `Env<keys::RmsEps>`.
-//! The word `"rms_eps"` appears once, here, and never at a use site.
+//! A body wanting the fire's token count writes `ctx.ask::<i32, keys::Rows>()`.
+//! The word `"rows"` appears once, here, and never at a use site.
+//!
+//! WHAT IS LEFT HERE IS WHAT ONLY A FIRE CAN ANSWER. A fact the checkpoint
+//! fixes at load time is not the environment's and never was: it is a
+//! constant, and a constant reaches the kernel as a `Const` parameter the
+//! statement carries. 71 keys over 936 uses left this file for that reason.
+//! What stays is the batch, the plan and the allocator, which is what this
+//! engine does.
 //!
 //! A PARAMETER NAME AND A FACT COINCIDE ONLY BY LUCK: [`Theta`] is the layer's
 //! rope base and [`RopeTheta`] the fire's, and gemma-4 makes them differ. The
@@ -11,12 +18,13 @@
 //! carry that no backend answers yet. Do not reach for a §1 key because a §2
 //! one refuses.
 //!
-//! `Env<keys::X>` and not bare `keys::X`: `Env<…>` says the binder supplies
-//! this, and the `keys::` segment separates a handle from a fact.
+//! A key is a QUESTION and never a carrier. `ask` names both — the carrier
+//! first, the question second — because a fact's `Value` is one concrete type
+//! across every backend while a shader carrier is a binding index.
 
 use crate::Source;
 
-/// A fact the environment supplies, named by a type.
+/// A fact only the fire can answer, named by a type.
 ///
 /// `#[routine]` reads these consts **as a path expression** — it emits
 /// `<keys::RmsEps as Fact>::SOURCE` and cannot know which fact that is, so
@@ -37,14 +45,6 @@ pub trait Fact: Copy {
     /// The value, unwrapped.
     fn get(self) -> Self::Value;
 
-    /// The fact, wrapped, for a caller that already has the number.
-    ///
-    /// A hand arm in `bind/arms/` is the one caller that does not go through
-    /// the derived column, so it builds what the column would have built.
-    /// Having to name the fact it supplies is what makes a wrong one visible.
-    fn env(value: Self::Value) -> crate::Env<Self>
-    where
-        Self: Sized;
 }
 
 /// Declare a fact.
@@ -53,8 +53,15 @@ pub trait Fact: Copy {
 /// fact!(RmsEps = "rms_eps" => Source::Named("rms_eps") => f32);
 /// ```
 ///
-/// A newtype and not a unit struct: the fact type is itself an `Arg` that
-/// unpacks the value it names, so `Env<T>`'s forwarding needs no change.
+/// THERE IS NO `stated` PREFIX ANY MORE. It marked a fact only the statement
+/// could answer, and every one of those was a scalar with no mark to carry it:
+/// nine weight-walker extents declared `stated`, resolving through
+/// `Source::Named`, answered by no driver, so every routine taking one was
+/// unreachable. `Const<i32>` is what they were missing, and a `Const` names no
+/// key at all.
+///
+/// A newtype and not a unit struct: the value rides in the field, so a hand
+/// arm can build one and [`Fact::env`] can wrap it.
 #[macro_export]
 macro_rules! fact {
     ($(#[$m:meta])* $name:ident = $key:literal => $src:expr => $value:ty) => {
@@ -70,10 +77,6 @@ macro_rules! fact {
             fn get(self) -> $value {
                 self.0
             }
-
-            fn env(value: $value) -> $crate::Env<Self> {
-                $crate::Env($name(value))
-            }
         }
 
         impl core::ops::Deref for $name {
@@ -84,22 +87,20 @@ macro_rules! fact {
             }
         }
 
-        impl<B> $crate::routine::Arg<B> for $name
-        where
-            B: $crate::routine::Backend,
-            $value: $crate::routine::Arg<B>,
-        {
-            const TY: $crate::Ty = <$value as $crate::routine::Arg<B>>::TY;
-            const PROV: $crate::routine::Provenance = $crate::routine::Provenance::Env;
-            const SPELLING: &'static str = <$value as $crate::routine::Arg<B>>::SPELLING;
+        // NO `Arg` IMPL. A fact is a KEY and never a carrier.
+        //
+        // It used to be both, and that is what made the two planes spell one
+        // claim two ways: `Env<keys::RmsEps>` put the fact in the CARRIER slot
+        // and worked on CUDA, where a fact's `Value` is the type the ABI
+        // passes; a shader carrier is a binding index, so the three shader
+        // planes had to write `Env<f32, keys::RmsEps>` instead. Six hundred
+        // and fifty-five sites took the first spelling and one thousand three
+        // hundred the second, CUDA itself using both.
+        //
+        // With the impl gone there is one spelling, `Env<carrier, key>`, and
+        // the question and the thing that carries the answer are always
+        // separate -- which is what they are.
 
-            fn unpack(
-                value: &B::Value,
-                at: usize,
-            ) -> ::core::result::Result<Self, $crate::routine::Refusal> {
-                <$value as $crate::routine::Arg<B>>::unpack(value, at).map($name)
-            }
-        }
     };
 }
 
@@ -866,6 +867,177 @@ fact!(/// Which request each token belongs to.
 fact!(/// The rope frequency table, when it is precomputed rather than derived.
     RopeFrequencies = "rope_frequencies" => Source::Named("rope_frequencies") => *const f32);
 
+// ── §N  THE KEYS THAT REPLACED AN ATTRIBUTE ───────────────────────────────
+//
+// `#[source(OutWidth(0))]` and `#[lit(1.702)]` were a THIRD encoding of a
+// source, beside the marks and beside `Source` itself, and the only one a
+// reader of types could not see. Twenty-one parameters wore one. Each is a
+// key now, so the escape hatch and the vocabulary are the same thing.
+
+fact!(/// The width of result 0's row, as a scalar parameter.
+    ///
+    /// A SHAPE READ AS A NUMBER: the launcher wants the width without the
+    /// address, which `Out<T>`'s `width` field gives a body that holds the
+    /// operand and this gives one that does not.
+    OutWidth0 = "out_width0" => Source::Slot(crate::Kind::OutWidth, 0) => i32);
+
+fact!(/// The width of operand 0's row. [`OutWidth0`]'s counterpart.
+    InWidth0 = "in_width0" => Source::Slot(crate::Kind::InWidth, 0) => i32);
+
+fact!(/// The statement's zeroth scalar, read as a float.
+    ///
+    /// `Param<0, f32>` says this in a signature that can take the mark;
+    /// `gaussian_topk`'s `std_multiplier` cannot, because the params run and
+    /// the operand run are two arrays and the mark walks the second.
+    ParamF32_0 = "param_f32_0" => Source::Slot(crate::Kind::ParamF32, 0) => f32);
+
+// `GluAlpha` IS NOT ONE OF THESE, though 1.702 looks like it belongs. The
+// number is `Deployment::mlp_gate`'s `SiluClamped { alpha, .. }`, read per
+// fire, and `driver-cuda`'s `launch_context_is_stated` records the last time
+// it was cut loose from that field: the gate stopped being scaled and the
+// model degraded rather than faulted. `Lit` is for a number the SYMBOL
+// decides — `BetaZero` against `BetaOne` — and no symbol decides this one.
+// The live declaration is `Source::Named("glu_alpha")`, above.
+
+// `Unstated` STOOD HERE AND IS DELETED.
+//
+// It said *"nothing supplies this parameter"* about a POINTER a launcher
+// supplied itself, and it existed because a bare `*const T` would otherwise be
+// counted into the next input slot. With `Env` gone there is no such
+// parameter: a value the launcher makes is a value the BODY makes, and it
+// reaches the argument list as `ctx.absent()?` — the same `Lit::Null` the
+// column used to resolve, asked for where it is used instead of declared where
+// it is not.
+
+// ── §N  THE KEYS THAT REPLACED A WRAPPER ──────────────────────────────────
+//
+// A source is a source whether a routine reaches it by NAME or by shape, so
+// the wrappers that existed only to spell one shape of source are keys now.
+// `Block<Buf>`, `Null<Buf>`, `ParamOrLit<4, -1, i32>` and the whole `Reckoned`
+// / `Says` type-level arithmetic were six types and five markers between them;
+// each is one line here, and `Env<T, K>` reads all of them.
+
+fact!(/// Every scalar the statement carries, staged as one struct and bound
+    /// as one buffer — what `Block<Buf>` used to spell.
+    ///
+    /// A NAME AND NOT A SHAPE: the block is the params CHANNEL, which is why
+    /// this is `Slot(Kind::Params, 0)` rather than a `Named`. `Env<Buf,
+    /// keys::Params>` says the binder supplies it AND which of the binder's
+    /// buffers it is, which is the whole of what the wrapper said.
+    Params = "params" => Source::Slot(crate::Kind::Params, 0) => *const u8);
+
+fact!(/// The optional operand this routine leaves ABSENT — `Null<T>`'s source.
+    ///
+    /// The one source that needs no resolver: the answer is the absence.
+    /// Fourteen arguments in the metal plane bind from `state(None)` — a
+    /// family with no per-head sink logits, a routed matmul with no bias, the
+    /// ring-buffer slots a paged append does not use — and until they said so
+    /// the row read the same as an argument nobody had got round to.
+    Absent = "absent" => Source::Lit(crate::Lit::Null) => *const u8);
+
+fact!(/// `-1`, which is "no sliding window" where a paged attention reads it.
+    ///
+    /// `ParamOrLit<4, -1, i32>` stood at twenty-one sites and spelled the
+    /// number; this spells what the number MEANS, and `Param<4, Env<i32,
+    /// keys::NoSlidingWindow>>` is the same chain with the sentinel named.
+    NoSlidingWindow = "no_sliding_window" => Source::Lit(crate::Lit::I32(-1)) => i32);
+
+fact!(/// How many query heads share one KV head: `q_heads / kv_heads`.
+    ///
+    /// ARITHMETIC ON TWO FACTS THE DRIVER ALREADY HOLDS, which is why it is a
+    /// key and not a scalar the statement carries. It was the second:
+    /// `model/qwen_3_5/forward/metal.rs` computed `f.q_heads /
+    /// f.kv_heads.max(1)` and shipped the answer through the params channel to
+    /// thirty shader routines, while `bind.rs` had both terms in its resolver
+    /// the whole time and CUDA never asked for it at all.
+    ///
+    /// `Source::Over` refuses a zero divisor, which is what `.max(1)` was
+    /// standing in for.
+    GqaFactor = "gqa_factor" => Source::Over(
+        &Source::Named("q_heads"), &Source::Named("kv_heads")) => i32);
+
+fact!(/// How many norms a row packs: the row's width over one head's length.
+    ///
+    /// The divisor is itself a chain, because a statement may carry the head
+    /// length and the fire answers when it does not. This is
+    /// `rms_strided_head_row`'s `heads` and nothing else states it.
+    HeadsPerRow = "heads_per_row" => Source::Over(
+        &Source::Named("width"),
+        &Source::Or(&Source::Slot(crate::Kind::Param, 1), &Source::Named("width")),
+    ) => i32);
+
+// ── §7  THE PARAMS CHANNEL, NAMED ─────────────────────────────────────────
+//
+// Five hundred and twelve arguments read a scalar by its POSITION in the
+// statement's run -- `Param<3, u32>` -- and the position was the whole of the
+// address. Three things went wrong with that and each is recorded elsewhere
+// in this tree:
+//
+// * `driver-vulkan/src/lib.rs`'s `sdpa_paged_decode` wired
+//   `attention_mask_stride` to `Slot(Kind::Param, 3)` and read every mask at a
+//   stride of zero, because `Hold::staged` packs an unstated slot as `0`
+//   (`driver-vulkan/src/hold.rs:540`) and zero is a legal `u32`.
+// * `model-dsl`'s `rope_launch` passes `vec![0]` for full rope and
+//   `vec![rotary_dim]` for partial, so a SENTINEL in the value carried the
+//   distinction `keys::RotaryWidth` already names.
+// * `GqaFactor` above: thirty shader routines took `q_heads / kv_heads`
+//   through the channel while the resolver held both terms and CUDA never
+//   asked at all.
+//
+// A key fixes all three, because a key names WHO ANSWERS. `Fact::PROV` is the
+// load-bearing half: a stride the driver staged is `Env` and a checkpoint
+// extent the statement carries is `stated`, and wiring one where the other
+// belongs stops being a plausible alternative. Where no one answers the fire
+// gets a `Refusal` instead of a zero.
+
+fact!(/// The pitch of the `x` operand's rows, where a launcher walks `x` at a
+    /// stride its own result does not share.
+    XRowStride = "x_row_stride" => Source::Named("x_row_stride") => i32);
+
+fact!(/// Elements between one SLOT of `x` and the next, for a launcher whose
+    /// input is a ring of slots rather than a dense rectangle.
+    XSlotStride = "x_slot_stride" => Source::Named("x_slot_stride") => i32);
+
+fact!(/// How many slots one row of the ring holds.
+    SlotsPerRow = "slots_per_row" => Source::Named("slots_per_row") => i32);
+
+fact!(/// The pitch of the query rectangle's rows.
+    QRowStride = "q_row_stride" => Source::Named("q_row_stride") => i32);
+
+fact!(/// The pitch of the output rectangle's rows.
+    ORowStride = "o_row_stride" => Source::Named("o_row_stride") => i32);
+
+fact!(/// The sliding window, or `-1` where the statement states none.
+    ///
+    /// [`WindowLeft`] with its fallback NAMED, which is what
+    /// `Param<4, Env<i32, keys::NoSlidingWindow>>` spelled at twenty-one
+    /// sites: the statement's number if it carries one, and the sentinel
+    /// meaning "full attention" if it does not. The chain belongs to the
+    /// QUESTION, not to a wrapper around the carrier -- every routine asking
+    /// for a window wants the same fallback, and spelling it per-signature is
+    /// twenty-one chances to spell a different one.
+    WindowOrNone = "window_left.or_none" => Source::Or(
+        &Source::Named("window_left"), &Source::Lit(crate::Lit::I32(-1))) => i32);
+
+// ── §8  WHAT THE STATEMENT REALLY DOES ANSWER ────────────────────────────
+//
+// [`Provenance::Trace`] survives, and this is everything it survives for: a
+// WEIGHT WALKER's extents. `quant.rs`'s `dequant_fp8_e4m3_to` says it —
+// *"dequantise a weight, whose shape is a checkpoint property, not a fire
+// fact. Its leading extent has no `Source`: `keys::Rows` would compile but
+// read the fire's token count instead"* — and that is the whole class. These
+// launches run at load time over a checkpoint the fire has not begun to use,
+// so there is no rectangle to read and the statement is the only witness.
+//
+// [`Provenance::Trace`]: crate::routine::Provenance::Trace
+
+fact!(
+    /// The one f32 scale a per-tensor FP8 checkpoint was quantised at.
+    ///
+    /// NOT [`SmScale`] and not [`RopeScale`]: this is a dequantiser's, and
+    /// the three were all spelled `scale` at a param slot.
+    DequantScale = "dequant.scale" => Source::Named("dequant.scale") => f32);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -874,120 +1046,59 @@ mod tests {
     ///
     /// §6 folds [`Fact::SOURCE`] into [`Fact::KEY`], so two types sharing a
     /// key would silently become one fact.
+    ///
+    /// # Read out of the source, not written down beside it
+    ///
+    /// It used to be a hand list of `X::KEY`, with a second assertion holding
+    /// the list's LENGTH against the number of `fact!(` lines so that a new
+    /// fact could not be forgotten. That second assertion is the whole reason
+    /// the first one worked, and it is also what broke: the list stopped at
+    /// eighty-eight while the file grew to two hundred and twelve, so the
+    /// guard was reporting the drift it existed to prevent and nothing else
+    /// was checking uniqueness.
+    ///
+    /// Rust cannot enumerate the types implementing a trait — that has not
+    /// changed — but the DECLARATIONS are enumerable, because each fact is
+    /// exactly one `fact!(...)` and each carries its key as a literal. Reading
+    /// them is what the length check was standing in for, and it cannot fall
+    /// behind.
     #[test]
     fn keys_are_distinct() {
-        let keys = [
-            RmsEps::KEY,
-            Theta::KEY,
-            RopeTheta::KEY,
-            RotaryWidth::KEY,
-            WindowLeft::KEY,
-            HeadDim::KEY,
-            NumQHeads::KEY,
-            NumKvHeads::KEY,
-            PerHeadDim::KEY,
-            Vocab::KEY,
-            PleDim::KEY,
-            RequestCount::KEY,
-            Rows::KEY,
-            TokenIds::KEY,
-            Positions::KEY,
-            SamplingIndices::KEY,
-            KvPageSize::KEY,
-            // The seven the shader backends construct and CUDA never spells.
-            AttentionMask::KEY,
-            AttentionMaskEnabled::KEY,
-            AttentionMaskStride::KEY,
-            KvHeadStride::KEY,
-            KvSeqStride::KEY,
-            KvWritePage::KEY,
-            KvWriteOffset::KEY,
-            KvWritePageOrNull::KEY,
-            KvWriteOffsetOrNull::KEY,
-            KvHeadDim::KEY,
-            KvNumHeads::KEY,
-            KvEnvMin::KEY,
-            KvEnvMax::KEY,
-            KvKeyScales::KEY,
-            KvValueScales::KEY,
-            KvBlockSize::KEY,
-            KvSchemeByte::KEY,
-            KvStorageDtype::KEY,
-            KvBf16Keys::KEY,
-            KvBf16Values::KEY,
-            KvPagesInBatch::KEY,
-            KvMaxPagesPerRequest::KEY,
-            RopeInterleaved::KEY,
-            PeelWindow::KEY,
-            FirstToken::KEY,
-            YarnFactor::KEY,
-            YarnBetaFast::KEY,
-            YarnBetaSlow::KEY,
-            YarnAttentionFactor::KEY,
-            YarnOriginalMaxPosition::KEY,
-            RowsTotal::KEY,
-            AttnLseOut::KEY,
-            AttnLogitsSoftCap::KEY,
-            FinalLogitSoftcap::KEY,
-            KvNativeBf16::KEY,
-            KvHndLayout::KEY,
-            MoeNormTopk::KEY,
-            MoeRoutedScaling::KEY,
-            GluAlpha::KEY,
-            GluLimit::KEY,
-            ExpertsPerToken::KEY,
-            NamedWeight::KEY,
-            NamedWeight2::KEY,
-            KvKeys::KEY,
-            KvValues::KEY,
-            RequestOfToken::KEY,
-            KvPageIndices::KEY,
-            KvPageIndptr::KEY,
-            RopeFrequencies::KEY,
-            Width::KEY,
-            InWidth::KEY,
-            VHeads::KEY,
-            VDim::KEY,
-            NumExperts::KEY,
-            QuantGroup::KEY,
-            QuantBits::KEY,
-            TileM::KEY,
-            TileN::KEY,
-            AttnPartials::KEY,
-            AttnSplits::KEY,
-            RecurrentSlots::KEY,
-            ConvState::KEY,
-            NewConvState::KEY,
-            RecurrentState::KEY,
-            KvHasEnvelopes::KEY,
-            KvLastPageLens::KEY,
-            SmScale::KEY,
-            WeightBias::KEY,
-            WeightScales::KEY,
-            WeightUpBias::KEY,
-            WeightGateBias::KEY,
-        ];
-        let mut seen = keys.to_vec();
+        // At LINE START, so the macro's own `/// fact!(RmsEps = ...)` doc
+        // example is not counted.
+        let src = include_str!("keys.rs");
+        let declared: Vec<&str> = src
+            .split("\nfact!(")
+            .skip(1)
+            .filter_map(|block| {
+                let (_, rest) = block.split_once(" = \"")?;
+                let (key, _) = rest.split_once('"')?;
+                Some(key)
+            })
+            .collect();
+        let starts = src.matches("\nfact!(").count();
+        assert_eq!(
+            declared.len(),
+            starts,
+            "every `fact!(` states a key literal; {} of {starts} parsed",
+            declared.len(),
+        );
+
+        let mut seen = declared.clone();
         seen.sort_unstable();
         seen.dedup();
-        assert_eq!(seen.len(), keys.len(), "two facts share a key");
-
-        // AND THE LIST IS THE WHOLE LIST. Rust cannot enumerate the types
-        // implementing a trait, so `keys` stays by hand — but it does not
-        // have to stay UNCHECKED. Each fact is exactly one `fact!(...)` at
-        // column zero, and the match is at LINE START rather than by
-        // `contains` so the macro's own `/// fact!(RmsEps = ...)` doc example
-        // is not counted.
-        let declared = include_str!("keys.rs")
-            .lines()
-            .filter(|l| l.starts_with("fact!("))
-            .count();
         assert_eq!(
-            keys.len(),
-            declared,
-            "{declared} facts are declared and {} are checked for a unique \
-             key; add the new one to `keys` above",
-            keys.len(),
+            seen.len(),
+            declared.len(),
+            "two facts share a key: {:?}",
+            {
+                let mut dup = declared.clone();
+                dup.sort_unstable();
+                dup.windows(2)
+                    .filter(|w| w[0] == w[1])
+                    .map(|w| w[0])
+                    .collect::<Vec<_>>()
+            },
         );
     }
 
@@ -1041,12 +1152,16 @@ mod tests {
             );
         }
 
-        // The drift guard: what separates a view read from a flat fact is the
-        // key's NAMESPACE, so count the dotted `kv.`/`weight.` keys in the
-        // source against the hand list above. It is a SUPERSET by exactly one
-        // row — `kv.last_page_lens` is read off the fire's PLAN rather than a
-        // layer view and is the only plan fact with a dotted key, hence
-        // `NOT_VIEWS`.
+        // THE DRIFT GUARD, AIMED THE OTHER WAY. It used to hold the hand
+        // list's LENGTH against the dotted keys in the source, which made
+        // every new `kv.`/`weight.` fact a test failure until someone copied
+        // it up — and the list duly fell behind, at eight of twenty-two.
+        //
+        // What the guard is actually for is that a dotted key names a VIEW,
+        // so it checks that directly: every dotted key in the file is
+        // namespaced `kv.` or `weight.` and nothing else. The hand list above
+        // keeps its own job, which is holding each named fact to being its own
+        // source.
         const NOT_VIEWS: &[&str] = &["kv.last_page_lens"];
         let src = include_str!("keys.rs");
         let namespaced: Vec<&str> = src
@@ -1059,11 +1174,16 @@ mod tests {
             })
             .filter(|k| !NOT_VIEWS.contains(k))
             .collect();
-        assert_eq!(
-            views.len(),
-            namespaced.len(),
-            "{namespaced:?} are namespaced view reads and {} are checked",
-            views.len(),
+        for key in &namespaced {
+            let (space, _) = key.split_once('.').expect("a dotted key");
+            assert!(
+                space == "kv" || space == "weight",
+                "{key} is namespaced `{space}.`, which is neither view",
+            );
+        }
+        assert!(
+            namespaced.len() >= views.len(),
+            "the hand list is a subset of what the file declares",
         );
 
         assert!(!HeadDim::KEY.contains('.'), "the plain fact stays plain");

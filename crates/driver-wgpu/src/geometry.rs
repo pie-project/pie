@@ -889,10 +889,21 @@ mod tests {
     /// refusal here is "this body is not compiled for that head width" or
     /// "that scalar was not stated", never "the fixture was too short".
     fn statement() -> Vec<model_compiler::lower::Arg> {
+        statement_wide(128)
+    }
+
+    /// [`statement`] whose operands are `width` wide.
+    ///
+    /// THE RESULT'S WIDTH IS THE STATEMENT'S NOW. A routed matvec reads its
+    /// output width off `y.width` -- the rectangle the text gave the operand
+    /// -- where the driver used to hand it `out_vec_size` as a fire number. A
+    /// sweep over output widths therefore has to vary the RECTANGLE, not just
+    /// the scalar run, or the body answers 128 whatever the case says.
+    fn statement_wide(width: u32) -> Vec<model_compiler::lower::Arg> {
         let mut args: Vec<model_compiler::lower::Arg> = (0..12usize)
             .map(|n| model_compiler::lower::Arg::Arena {
                 at: n * 256,
-                width: 128,
+                width,
                 bytes: 2,
             })
             .collect();
@@ -916,9 +927,19 @@ mod tests {
     ///
     /// A body may state MORE than one dispatch, so this answers all of them.
     fn fired(symbol: &str, facts: Facts, scalars: &[u32]) -> Result<Vec<Stated>, String> {
+        fired_wide(symbol, facts, scalars, 128)
+    }
+
+    /// [`fired`], over a statement whose operands are `width` wide.
+    fn fired_wide(
+        symbol: &str,
+        facts: Facts,
+        scalars: &[u32],
+        width: u32,
+    ) -> Result<Vec<Stated>, String> {
         let routine = crate::lowering::routine::armed(symbol)
             .ok_or_else(|| format!("`{symbol}` is claimed by no armed stem"))?;
-        let args = statement();
+        let args = statement_wide(width);
         let mut handles = crate::lowering::hold::Handles::with_scalars(
             &args,
             crate::lowering::routine::results(routine),
@@ -927,7 +948,14 @@ mod tests {
         let taken =
             crate::lowering::bind::bind(routine.args, routine.sources, &mut handles, facts)
                 .map_err(|why| format!("the binder refused: {why:?}"))?;
-        crate::lowering::routine::state(routine, &taken).map_err(|why| why.to_string())
+        // ON A PLANNER THAT CAN ANSWER, because these bodies ask. A fact only
+        // the fire can answer is no longer bound into `args` before the body
+        // runs -- that is the whole of the marks migration -- so `state`'s
+        // fire-less planner refuses every routine that reaches for one, and a
+        // geometry sweep built on it measured nothing at all.
+        let handles = core::cell::RefCell::new(handles);
+        crate::lowering::routine::stating(routine, &taken, &handles, facts)
+            .map_err(|why| why.to_string())
     }
 
     /// The widest extent any fire asks of each module, and how many census
@@ -1539,7 +1567,37 @@ mod tests {
                 // A width this body is not compiled for is a refusal and not a
                 // gap: the pinned list below is what says which pairs were
                 // supposed to answer.
-                let Ok(stated) = fired(&symbol, firing(&symbol, rows, 128, fire), &[128; 8]) else {
+                // THE WIDTH THIS CASE IS ABOUT, at the slot the routines read
+                // it from. `head_dim` is `Const<i32>` at params[3] now -- it
+                // was a fact the driver recovered from the SYMBOL -- so a run
+                // of eights of 128 named the 128-wide module whatever width
+                // the case swept.
+                // `[n_kv_heads, scale, window, head_dim, q_heads]`, which is
+                // the run these routines' `Const` marks claim, in order. It
+                // was a flat run of 128s -- a head width of 128 whatever the
+                // case swept, and a q-head count of 128 against the fire's
+                // four.
+                // THE TWO FAMILIES DECLARE DIFFERENT RUNS. `sdpa_paged_*`
+                // takes `[n_kv_heads, scale, window, head_dim, q_heads]`;
+                // `sdpa_vector_*` has no paging and takes `[scale, head_dim,
+                // q_heads]`, so its width is at slot 1 and not 3. A flat run
+                // of 128s named the 128-wide module whatever the case swept.
+                let mut scalars = [128u32; 8];
+                if stem.starts_with("sdpa_paged") {
+                    scalars[0] = 2;
+                    scalars[3] = head_dim;
+                    scalars[4] = q_heads;
+                } else if stem.contains("swa") || stem.contains("sink") {
+                    // `[scale, window, head_dim, q_heads]`: the window stands
+                    // between the scale and the width. `sinks` is a WEIGHT and
+                    // takes no slot in the scalar run.
+                    scalars[2] = head_dim;
+                    scalars[3] = q_heads;
+                } else {
+                    scalars[1] = head_dim;
+                    scalars[2] = q_heads;
+                }
+                let Ok(stated) = fired(&symbol, firing(&symbol, rows, 128, fire), &scalars) else {
                     continue;
                 };
                 assert_eq!(
@@ -2010,7 +2068,13 @@ mod tests {
                 // same run the shader's uniform block gets, read by the arm
                 // and handed to the body, which is the only path a y extent
                 // takes now.
-                let scalars = [128, out_vec, 128, 128, slots, 0, 0, 0];
+                // `[x_slot_stride, x_row_stride, slots_per_row]`, which is
+                // the run this routine's three `Const` marks claim, in order.
+                // It was `[128, out_vec, 128, 128, slots, ..]` -- the shader's
+                // uniform block as the ARM once packed it, with the slot count
+                // at word 4. The body reads slot 2 now, and `out_vec` is not a
+                // scalar at all: it is `y.width`, the rectangle above.
+                let scalars = [128, 128, slots, 0, 0, 0, 0, 0];
                 let fire = crate::dispatch::Geometry {
                     q_heads: 4,
                     kv_heads: 2,
@@ -2020,8 +2084,11 @@ mod tests {
                     experts_per_token: slots,
                     ..Default::default()
                 };
-                let stated = fired(symbol, firing(symbol, rows, 128, fire), &scalars)
-                    .unwrap_or_else(|e| panic!("`{symbol}` is a matvec this tree plans: {e}"));
+                let stated =
+                    fired_wide(symbol, firing(symbol, rows, out_vec, fire), &scalars, out_vec)
+                        .unwrap_or_else(|e| {
+                            panic!("`{symbol}` is a matvec this tree plans: {e}")
+                        });
                 assert_eq!(stated.len(), 1, "`{symbol}` is one dispatch");
                 let name = stated[0].entrypoint.clone();
                 let declared =

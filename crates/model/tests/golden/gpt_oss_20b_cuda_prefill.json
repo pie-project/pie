@@ -5490,7 +5490,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 0
@@ -5655,7 +5655,8 @@
         "Launch": {
           "kernel": "mlp::gpt_oss_glu_bf16",
           "params": [
-            1088421888
+            1088421888,
+            1071242019
           ]
         }
       },
@@ -5850,7 +5851,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 1
@@ -6015,7 +6016,8 @@
         "Launch": {
           "kernel": "mlp::gpt_oss_glu_bf16",
           "params": [
-            1088421888
+            1088421888,
+            1071242019
           ]
         }
       },
@@ -6210,7 +6212,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 2
@@ -6375,7 +6377,8 @@
         "Launch": {
           "kernel": "mlp::gpt_oss_glu_bf16",
           "params": [
-            1088421888
+            1088421888,
+            1071242019
           ]
         }
       },
@@ -6570,7 +6573,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 3
@@ -6735,7 +6738,8 @@
         "Launch": {
           "kernel": "mlp::gpt_oss_glu_bf16",
           "params": [
-            1088421888
+            1088421888,
+            1071242019
           ]
         }
       },
@@ -6930,7 +6934,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 4
@@ -7095,7 +7099,8 @@
         "Launch": {
           "kernel": "mlp::gpt_oss_glu_bf16",
           "params": [
-            1088421888
+            1088421888,
+            1071242019
           ]
         }
       },
@@ -7290,7 +7295,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 5
@@ -7455,7 +7460,8 @@
         "Launch": {
           "kernel": "mlp::gpt_oss_glu_bf16",
           "params": [
-            1088421888
+            1088421888,
+            1071242019
           ]
         }
       },
@@ -7650,7 +7656,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 6
@@ -7815,7 +7821,8 @@
         "Launch": {
           "kernel": "mlp::gpt_oss_glu_bf16",
           "params": [
-            1088421888
+            1088421888,
+            1071242019
           ]
         }
       },
@@ -8010,7 +8017,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 7
@@ -8175,7 +8182,8 @@
         "Launch": {
           "kernel": "mlp::gpt_oss_glu_bf16",
           "params": [
-            1088421888
+            1088421888,
+            1071242019
           ]
         }
       },
@@ -8370,7 +8378,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 8
@@ -8535,7 +8543,8 @@
         "Launch": {
           "kernel": "mlp::gpt_oss_glu_bf16",
           "params": [
-            1088421888
+            1088421888,
+            1071242019
           ]
         }
       },
@@ -8730,7 +8739,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 9
@@ -8895,7 +8904,8 @@
         "Launch": {
           "kernel": "mlp::gpt_oss_glu_bf16",
           "params": [
-            1088421888
+            1088421888,
+            1071242019
           ]
         }
       },
@@ -9090,7 +9100,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 10
@@ -9255,7 +9265,8 @@
         "Launch": {
           "kernel": "mlp::gpt_oss_glu_bf16",
           "params": [
-            1088421888
+            1088421888,
+            1071242019
           ]
         }
       },
@@ -9450,7 +9461,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 11
@@ -9615,7 +9626,8 @@
         "Launch": {
           "kernel": "mlp::gpt_oss_glu_bf16",
           "params": [
-            1088421888
+            1088421888,
+            1071242019
           ]
         }
       },
@@ -9810,7 +9822,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 12
@@ -9975,7 +9987,8 @@
         "Launch": {
           "kernel": "mlp::gpt_oss_glu_bf16",
           "params": [
-            1088421888
+            1088421888,
+            1071242019
           ]
         }
       },
@@ -10170,7 +10183,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 13
@@ -10335,7 +10348,8 @@
         "Launch": {
           "kernel": "mlp::gpt_oss_glu_bf16",
           "params": [
-            1088421888
+            1088421888,
+            1071242019
           ]
         }
       },
@@ -10530,7 +10544,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 14
@@ -10695,7 +10709,8 @@
         "Launch": {
           "kernel": "mlp::gpt_oss_glu_bf16",
           "params": [
-            1088421888
+            1088421888,
+            1071242019
           ]
         }
       },
@@ -10890,7 +10905,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 15
@@ -11055,7 +11070,8 @@
         "Launch": {
           "kernel": "mlp::gpt_oss_glu_bf16",
           "params": [
-            1088421888
+            1088421888,
+            1071242019
           ]
         }
       },
@@ -11250,7 +11266,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 16
@@ -11415,7 +11431,8 @@
         "Launch": {
           "kernel": "mlp::gpt_oss_glu_bf16",
           "params": [
-            1088421888
+            1088421888,
+            1071242019
           ]
         }
       },
@@ -11610,7 +11627,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 17
@@ -11775,7 +11792,8 @@
         "Launch": {
           "kernel": "mlp::gpt_oss_glu_bf16",
           "params": [
-            1088421888
+            1088421888,
+            1071242019
           ]
         }
       },
@@ -11970,7 +11988,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 18
@@ -12135,7 +12153,8 @@
         "Launch": {
           "kernel": "mlp::gpt_oss_glu_bf16",
           "params": [
-            1088421888
+            1088421888,
+            1071242019
           ]
         }
       },
@@ -12330,7 +12349,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 19
@@ -12495,7 +12514,8 @@
         "Launch": {
           "kernel": "mlp::gpt_oss_glu_bf16",
           "params": [
-            1088421888
+            1088421888,
+            1071242019
           ]
         }
       },
@@ -12690,7 +12710,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 20
@@ -12855,7 +12875,8 @@
         "Launch": {
           "kernel": "mlp::gpt_oss_glu_bf16",
           "params": [
-            1088421888
+            1088421888,
+            1071242019
           ]
         }
       },
@@ -13050,7 +13071,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 21
@@ -13215,7 +13236,8 @@
         "Launch": {
           "kernel": "mlp::gpt_oss_glu_bf16",
           "params": [
-            1088421888
+            1088421888,
+            1071242019
           ]
         }
       },
@@ -13410,7 +13432,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 22
@@ -13575,7 +13597,8 @@
         "Launch": {
           "kernel": "mlp::gpt_oss_glu_bf16",
           "params": [
-            1088421888
+            1088421888,
+            1071242019
           ]
         }
       },
@@ -13770,7 +13793,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::attention_flashinfer_prefill",
+          "kernel": "attn::attention_flashinfer_prefill_lse",
           "state": {
             "store": "KvCache",
             "layer": 23
@@ -13935,7 +13958,8 @@
         "Launch": {
           "kernel": "mlp::gpt_oss_glu_bf16",
           "params": [
-            1088421888
+            1088421888,
+            1071242019
           ]
         }
       },

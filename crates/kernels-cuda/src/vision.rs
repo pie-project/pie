@@ -27,6 +27,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
+use kernels::{Bind, Fire};
 use core::ffi::c_void;
 
 use crate::jit::{Ctx, Launch};
@@ -118,34 +119,25 @@ fn flat(what: &'static str, t: usize) -> Result<Launch, Refusal> {
 /// ones; `weight` is `width` live bf16 elements or null, which the kernel
 /// reads as unit gain. All live on `ctx`'s stream.
 pub fn k_rms_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     x: *const c_void,
     weight: *const c_void,
     o: *mut c_void,
     rows: i32,
     width: i32,
-    eps: f32,
-) -> Result<(), Refusal> {
+    eps: f32) -> Result<(), Refusal> {
     let blocks = extent("rows", rows)?;
     // The width is not a grid axis — one block walks the whole row — but a
     // non-positive one is a row the kernel reads past the end of.
     extent("width", width)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/tower_naive_kernels.cuh",
-            "::pie::vision::k_rms<::pie::bf16>",
-            Launch::per_row(blocks, BLOCK),
-            &[
+    ctx.fire(Fire::at("vision/tower_naive_kernels.cuh", "::pie::vision::k_rms<::pie::bf16>").apply(Launch::per_row(blocks, BLOCK)), &[
                 x.cast::<bf16>().arg(),
                 MaybeConst::new(weight.cast::<bf16>()).arg(),
                 o.cast::<bf16>().arg(),
                 rows.arg(),
                 width.arg(),
                 eps.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `a += b` — `vision::k_add_bf16`.
@@ -157,17 +149,9 @@ pub fn k_rms_bf16(
 ///
 /// `a` and `b` each address `n` live bf16 elements, `a` writable, both on
 /// `ctx`'s stream.
-pub fn k_add_bf16(ctx: &Ctx, a: *mut c_void, b: *const c_void, n: usize) -> Result<(), Refusal> {
+pub fn k_add_bf16(ctx: &Ctx<'_>, a: *mut c_void, b: *const c_void, n: usize) -> Result<(), Refusal> {
     let launch = flat("n", n)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/tower_naive_kernels.cuh",
-            "::pie::vision::k_add<::pie::bf16>",
-            launch,
-            &[a.cast::<bf16>().arg(), b.cast::<bf16>().arg(), n.arg()],
-        )
-    }
+    ctx.fire(Fire::at("vision/tower_naive_kernels.cuh", "::pie::vision::k_add<::pie::bf16>").apply(launch), &[a.cast::<bf16>().arg(), b.cast::<bf16>().arg(), n.arg()])
 }
 
 /// The f32 input plane narrowed to bf16 — `vision::k_f32_to_bf16_bf16`.
@@ -181,21 +165,12 @@ pub fn k_add_bf16(ctx: &Ctx, a: *mut c_void, b: *const c_void, n: usize) -> Resu
 /// `a` addresses `n` live floats and `o` `n` writable bf16 elements, both on
 /// `ctx`'s stream.
 pub fn k_f32_to_bf16_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     a: *const c_void,
     o: *mut c_void,
-    n: usize,
-) -> Result<(), Refusal> {
+    n: usize) -> Result<(), Refusal> {
     let launch = flat("n", n)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/tower_naive_kernels.cuh",
-            "::pie::vision::k_f32_to_bf16<::pie::bf16>",
-            launch,
-            &[a.cast::<f32>().arg(), o.cast::<bf16>().arg(), n.arg()],
-        )
-    }
+    ctx.fire(Fire::at("vision/tower_naive_kernels.cuh", "::pie::vision::k_f32_to_bf16<::pie::bf16>").apply(launch), &[a.cast::<f32>().arg(), o.cast::<bf16>().arg(), n.arg()])
 }
 
 /// The exact erf GELU — `vision::k_gelu_erf_bf16`.
@@ -209,21 +184,12 @@ pub fn k_f32_to_bf16_bf16(
 /// `x` addresses `t` live bf16 elements and `o` `t` writable ones; they may
 /// be the same address. Both live on `ctx`'s stream.
 pub fn k_gelu_erf_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     x: *const c_void,
     o: *mut c_void,
-    t: usize,
-) -> Result<(), Refusal> {
+    t: usize) -> Result<(), Refusal> {
     let launch = flat("t", t)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/tower_naive_kernels.cuh",
-            "::pie::vision::k_gelu_erf<::pie::bf16>",
-            launch,
-            &[x.cast::<bf16>().arg(), o.cast::<bf16>().arg(), t.arg()],
-        )
-    }
+    ctx.fire(Fire::at("vision/tower_naive_kernels.cuh", "::pie::vision::k_gelu_erf<::pie::bf16>").apply(launch), &[x.cast::<bf16>().arg(), o.cast::<bf16>().arg(), t.arg()])
 }
 
 /// LayerNorm with an optional scale and bias — `vision::k_layernorm_bf16`.
@@ -238,26 +204,19 @@ pub fn k_gelu_erf_bf16(
 /// and `beta` are `width` live bf16 elements each or null. All live on `ctx`'s
 /// stream.
 pub fn k_layernorm_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     x: *const c_void,
     g: *const c_void,
     beta: *const c_void,
     o: *mut c_void,
     rows: i32,
     width: i32,
-    eps: f32,
-) -> Result<(), Refusal> {
+    eps: f32) -> Result<(), Refusal> {
     let blocks = extent("rows", rows)?;
     // As [`k_rms_bf16`]: one block walks the whole row, and a non-positive
     // width is a read past the end of it.
     extent("width", width)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/tower_naive_kernels.cuh",
-            "::pie::vision::k_layernorm<::pie::bf16>",
-            Launch::per_row(blocks, BLOCK),
-            &[
+    ctx.fire(Fire::at("vision/tower_naive_kernels.cuh", "::pie::vision::k_layernorm<::pie::bf16>").apply(Launch::per_row(blocks, BLOCK)), &[
                 x.cast::<bf16>().arg(),
                 MaybeConst::new(g.cast::<bf16>()).arg(),
                 MaybeConst::new(beta.cast::<bf16>()).arg(),
@@ -265,9 +224,7 @@ pub fn k_layernorm_bf16(
                 rows.arg(),
                 width.arg(),
                 eps.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// The naive `[n, k] x [o, k]^T` matmul — `vision::k_matmul_bf16`.
@@ -280,32 +237,23 @@ pub fn k_layernorm_bf16(
 /// `x` is `[n, k]` bf16, `w` is `[o, k]` bf16, `y` is `[n, o]` bf16 and
 /// writable. All live on `ctx`'s stream.
 pub fn k_matmul_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     x: *const c_void,
     w: *const c_void,
     y: *mut c_void,
     n: i32,
     k: i32,
-    o: i32,
-) -> Result<(), Refusal> {
+    o: i32) -> Result<(), Refusal> {
     let rows = extent("n", n)?;
     let width = extent("o", o)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/tower_naive_kernels.cuh",
-            "::pie::vision::k_matmul<::pie::bf16>",
-            tile16(rows, width),
-            &[
+    ctx.fire(Fire::at("vision/tower_naive_kernels.cuh", "::pie::vision::k_matmul<::pie::bf16>").apply(tile16(rows, width)), &[
                 x.cast::<bf16>().arg(),
                 w.cast::<bf16>().arg(),
                 y.cast::<bf16>().arg(),
                 n.arg(),
                 k.arg(),
                 o.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 // ── vision/gemma4_naive_kernels.cuh ─────────────────────────────────────────
@@ -323,29 +271,20 @@ pub fn k_matmul_bf16(
 /// same address; `lo` and `hi` address one live bf16 element each, or are
 /// null. All live on `ctx`'s stream.
 pub fn k_clamp_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     x: *const c_void,
     o: *mut c_void,
     lo: *const c_void,
     hi: *const c_void,
-    t: usize,
-) -> Result<(), Refusal> {
+    t: usize) -> Result<(), Refusal> {
     let launch = flat("t", t)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/gemma4_naive_kernels.cuh",
-            "::pie::vision::k_clamp<::pie::bf16>",
-            launch,
-            &[
+    ctx.fire(Fire::at("vision/gemma4_naive_kernels.cuh", "::pie::vision::k_clamp<::pie::bf16>").apply(launch), &[
                 x.cast::<bf16>().arg(),
                 o.cast::<bf16>().arg(),
                 MaybeConst::new(lo.cast::<bf16>()).arg(),
                 MaybeConst::new(hi.cast::<bf16>()).arg(),
                 t.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 // ── vision/gemma4_vision.cuh ────────────────────────────────────────────────
@@ -358,17 +297,9 @@ pub fn k_clamp_bf16(
 ///
 /// `p` addresses `t` live bf16 elements and `o` `t` writable ones, both on
 /// `ctx`'s stream.
-pub fn k_scale_bf16(ctx: &Ctx, p: *const c_void, o: *mut c_void, t: usize) -> Result<(), Refusal> {
+pub fn k_scale_bf16(ctx: &Ctx<'_>, p: *const c_void, o: *mut c_void, t: usize) -> Result<(), Refusal> {
     let launch = flat("t", t)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/gemma4_vision.cuh",
-            "::pie::vision::k_scale<::pie::bf16>",
-            launch,
-            &[p.cast::<bf16>().arg(), o.cast::<bf16>().arg(), t.arg()],
-        )
-    }
+    ctx.fire(Fire::at("vision/gemma4_vision.cuh", "::pie::vision::k_scale<::pie::bf16>").apply(launch), &[p.cast::<bf16>().arg(), o.cast::<bf16>().arg(), t.arg()])
 }
 
 /// The per-row score softmax — `vision::k_softmax_bf16`.
@@ -380,17 +311,9 @@ pub fn k_scale_bf16(ctx: &Ctx, p: *const c_void, o: *mut c_void, t: usize) -> Re
 /// # Safety
 ///
 /// `s` addresses `n * n` live floats and is writable, on `ctx`'s stream.
-pub fn k_softmax_bf16(ctx: &Ctx, s: *mut c_void, n: i32) -> Result<(), Refusal> {
+pub fn k_softmax_bf16(ctx: &Ctx<'_>, s: *mut c_void, n: i32) -> Result<(), Refusal> {
     let rows = extent("n", n)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/gemma4_vision.cuh",
-            "::pie::vision::k_softmax<::pie::bf16>",
-            Launch::per_row(rows, BLOCK),
-            &[s.cast::<f32>().arg(), n.arg()],
-        )
-    }
+    ctx.fire(Fire::at("vision/gemma4_vision.cuh", "::pie::vision::k_softmax<::pie::bf16>").apply(Launch::per_row(rows, BLOCK)), &[s.cast::<f32>().arg(), n.arg()])
 }
 
 /// The pooling accumulator, scaled and narrowed —
@@ -405,22 +328,13 @@ pub fn k_softmax_bf16(ctx: &Ctx, s: *mut c_void, n: i32) -> Result<(), Refusal> 
 /// `input` addresses `t` live floats and `o` `t` writable bf16 elements, both
 /// on `ctx`'s stream.
 pub fn k_pool_finish_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     input: *const c_void,
     o: *mut c_void,
     s: f32,
-    t: usize,
-) -> Result<(), Refusal> {
+    t: usize) -> Result<(), Refusal> {
     let launch = flat("t", t)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/gemma4_vision.cuh",
-            "::pie::vision::k_pool_finish<::pie::bf16>",
-            launch,
-            &[input.cast::<f32>().arg(), o.cast::<bf16>().arg(), s.arg(), t.arg()],
-        )
-    }
+    ctx.fire(Fire::at("vision/gemma4_vision.cuh", "::pie::vision::k_pool_finish<::pie::bf16>").apply(launch), &[input.cast::<f32>().arg(), o.cast::<bf16>().arg(), s.arg(), t.arg()])
 }
 
 /// The two axial position-table rows, added — `vision::k_addpos_grid2d_bf16`.
@@ -437,32 +351,23 @@ pub fn k_pool_finish_bf16(
 /// `y` is `[n, o]` bf16 and writable, `tb` is `[2, p, o]` bf16, `pos` is
 /// `[n, 2]` floats. All live on `ctx`'s stream.
 pub fn k_addpos_grid2d_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     y: *mut c_void,
     tb: *const c_void,
     pos: *const c_void,
     n: i32,
     o: i32,
-    p: i32,
-) -> Result<(), Refusal> {
+    p: i32) -> Result<(), Refusal> {
     let rows = extent("n", n)?;
     let width = extent("o", o)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/gemma4_vision.cuh",
-            "::pie::vision::k_addpos_grid2d<::pie::bf16>",
-            tile16(rows, width),
-            &[
+    ctx.fire(Fire::at("vision/gemma4_vision.cuh", "::pie::vision::k_addpos_grid2d<::pie::bf16>").apply(tile16(rows, width)), &[
                 y.cast::<bf16>().arg(),
                 tb.cast::<bf16>().arg(),
                 pos.cast::<f32>().arg(),
                 n.arg(),
                 o.arg(),
                 p.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// 2-D axial RoPE over a 64-wide head — `vision::k_rope_axial2d_bf16`.
@@ -477,24 +382,15 @@ pub fn k_addpos_grid2d_bf16(
 /// `q` is `[n, h, 64]` bf16 and writable and `pos` is `[n, 2]` floats, both on
 /// `ctx`'s stream.
 pub fn k_rope_axial2d_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     q: *mut c_void,
     pos: *const c_void,
     n: i32,
     h: i32,
-    theta: f32,
-) -> Result<(), Refusal> {
+    theta: f32) -> Result<(), Refusal> {
     let rows = extent("n", n)?;
     let heads = extent("h", h)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/gemma4_vision.cuh",
-            "::pie::vision::k_rope_axial2d<::pie::bf16>",
-            Launch::grid([1, heads, rows], [WARP, 1, 1]),
-            &[q.cast::<bf16>().arg(), pos.cast::<f32>().arg(), n.arg(), h.arg(), theta.arg()],
-        )
-    }
+    ctx.fire(Fire::at("vision/gemma4_vision.cuh", "::pie::vision::k_rope_axial2d<::pie::bf16>").apply(Launch::grid([1, heads, rows], [WARP, 1, 1])), &[q.cast::<bf16>().arg(), pos.cast::<f32>().arg(), n.arg(), h.arg(), theta.arg()])
 }
 
 /// One head's `QK^T` — `vision::k_qk_bf16`.
@@ -508,23 +404,16 @@ pub fn k_rope_axial2d_bf16(
 /// `q` and `k` are `[n, h, 64]` bf16, `s` is `[n, n]` floats and writable. All
 /// live on `ctx`'s stream.
 pub fn k_qk_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     q: *const c_void,
     k: *const c_void,
     s: *mut c_void,
     n: i32,
     h: i32,
     head: i32,
-    scale: f32,
-) -> Result<(), Refusal> {
+    scale: f32) -> Result<(), Refusal> {
     let rows = extent("n", n)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/gemma4_vision.cuh",
-            "::pie::vision::k_qk<::pie::bf16>",
-            tile16(rows, rows),
-            &[
+    ctx.fire(Fire::at("vision/gemma4_vision.cuh", "::pie::vision::k_qk<::pie::bf16>").apply(tile16(rows, rows)), &[
                 q.cast::<bf16>().arg(),
                 k.cast::<bf16>().arg(),
                 s.cast::<f32>().arg(),
@@ -532,9 +421,7 @@ pub fn k_qk_bf16(
                 h.arg(),
                 head.arg(),
                 scale.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// One head's `softmax(QK^T) V` — `vision::k_av_bf16`.
@@ -548,31 +435,22 @@ pub fn k_qk_bf16(
 /// `s` is `[n, n]` floats, `v` is `[n, h, 64]` bf16, `o` is `[n, h, 64]` bf16
 /// and writable. All live on `ctx`'s stream.
 pub fn k_av_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     s: *const c_void,
     v: *const c_void,
     o: *mut c_void,
     n: i32,
     h: i32,
-    head: i32,
-) -> Result<(), Refusal> {
+    head: i32) -> Result<(), Refusal> {
     let rows = extent("n", n)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/gemma4_vision.cuh",
-            "::pie::vision::k_av<::pie::bf16>",
-            tile16(rows, AXIAL_HEAD_DIM),
-            &[
+    ctx.fire(Fire::at("vision/gemma4_vision.cuh", "::pie::vision::k_av<::pie::bf16>").apply(tile16(rows, AXIAL_HEAD_DIM)), &[
                 s.cast::<f32>().arg(),
                 v.cast::<bf16>().arg(),
                 o.cast::<bf16>().arg(),
                 n.arg(),
                 h.arg(),
                 head.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// The pooling scatter-accumulate — `vision::k_pool_bf16`.
@@ -588,32 +466,23 @@ pub fn k_av_bf16(
 /// `h` is `[n, d]` bf16, `grp` is `[n]` `int`s each addressing a live row of
 /// `o`, and `o` is that accumulator, writable. All live on `ctx`'s stream.
 pub fn k_pool_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     h: *const c_void,
     grp: *const c_void,
     o: *mut c_void,
     n: i32,
     d: i32,
-    k2: f32,
-) -> Result<(), Refusal> {
+    k2: f32) -> Result<(), Refusal> {
     let rows = extent("n", n)?;
     let width = extent("d", d)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/gemma4_vision.cuh",
-            "::pie::vision::k_pool<::pie::bf16>",
-            tile16(rows, width),
-            &[
+    ctx.fire(Fire::at("vision/gemma4_vision.cuh", "::pie::vision::k_pool<::pie::bf16>").apply(tile16(rows, width)), &[
                 h.cast::<bf16>().arg(),
                 grp.cast::<i32>().arg(),
                 o.cast::<f32>().arg(),
                 n.arg(),
                 d.arg(),
                 k2.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 // ── vision/gemma4_audio.cuh ─────────────────────────────────────────────────
@@ -626,17 +495,9 @@ pub fn k_pool_bf16(
 ///
 /// `x` addresses `t` live bf16 elements and `o` `t` writable ones, possibly
 /// the same address. Both live on `ctx`'s stream.
-pub fn k_silu_bf16(ctx: &Ctx, x: *const c_void, o: *mut c_void, t: usize) -> Result<(), Refusal> {
+pub fn k_silu_bf16(ctx: &Ctx<'_>, x: *const c_void, o: *mut c_void, t: usize) -> Result<(), Refusal> {
     let launch = flat("t", t)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/gemma4_audio.cuh",
-            "::pie::vision::k_silu<::pie::bf16>",
-            launch,
-            &[x.cast::<bf16>().arg(), o.cast::<bf16>().arg(), t.arg()],
-        )
-    }
+    ctx.fire(Fire::at("vision/gemma4_audio.cuh", "::pie::vision::k_silu<::pie::bf16>").apply(launch), &[x.cast::<bf16>().arg(), o.cast::<bf16>().arg(), t.arg()])
 }
 
 /// `a += scale * b` — `vision::k_axpy_bf16`.
@@ -649,22 +510,13 @@ pub fn k_silu_bf16(ctx: &Ctx, x: *const c_void, o: *mut c_void, t: usize) -> Res
 /// `a` and `b` each address `t` live bf16 elements, `a` writable. Both live on
 /// `ctx`'s stream.
 pub fn k_axpy_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     a: *mut c_void,
     b: *const c_void,
     scale: f32,
-    t: usize,
-) -> Result<(), Refusal> {
+    t: usize) -> Result<(), Refusal> {
     let launch = flat("t", t)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/gemma4_audio.cuh",
-            "::pie::vision::k_axpy<::pie::bf16>",
-            launch,
-            &[a.cast::<bf16>().arg(), b.cast::<bf16>().arg(), scale.arg(), t.arg()],
-        )
-    }
+    ctx.fire(Fire::at("vision/gemma4_audio.cuh", "::pie::vision::k_axpy<::pie::bf16>").apply(launch), &[a.cast::<bf16>().arg(), b.cast::<bf16>().arg(), scale.arg(), t.arg()])
 }
 
 /// The naive matmul with an optional bias — `vision::k_matmul_bias_bf16`.
@@ -676,24 +528,17 @@ pub fn k_axpy_bf16(
 /// `x` is `[n, k]` bf16, `w` is `[o, k]` bf16, `b` is `[o]` bf16 or null, `y`
 /// is `[n, o]` bf16 and writable. All live on `ctx`'s stream.
 pub fn k_matmul_bias_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     x: *const c_void,
     w: *const c_void,
     b: *const c_void,
     y: *mut c_void,
     n: i32,
     k: i32,
-    o: i32,
-) -> Result<(), Refusal> {
+    o: i32) -> Result<(), Refusal> {
     let rows = extent("n", n)?;
     let width = extent("o", o)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/gemma4_audio.cuh",
-            "::pie::vision::k_matmul_bias<::pie::bf16>",
-            tile16(rows, width),
-            &[
+    ctx.fire(Fire::at("vision/gemma4_audio.cuh", "::pie::vision::k_matmul_bias<::pie::bf16>").apply(tile16(rows, width)), &[
                 x.cast::<bf16>().arg(),
                 w.cast::<bf16>().arg(),
                 MaybeConst::new(b.cast::<bf16>()).arg(),
@@ -701,9 +546,7 @@ pub fn k_matmul_bias_bf16(
                 n.arg(),
                 k.arg(),
                 o.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// The conv module's gated linear unit — `vision::k_glu_bf16`.
@@ -716,23 +559,14 @@ pub fn k_matmul_bias_bf16(
 /// `x` is `[n, 2*d]` bf16 and `o` is `[n, d]` bf16 and writable, both on
 /// `ctx`'s stream.
 pub fn k_glu_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     x: *const c_void,
     o: *mut c_void,
     n: i32,
-    d: i32,
-) -> Result<(), Refusal> {
+    d: i32) -> Result<(), Refusal> {
     let rows = extent("n", n)?;
     let width = extent("d", d)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/gemma4_audio.cuh",
-            "::pie::vision::k_glu<::pie::bf16>",
-            tile16(rows, width),
-            &[x.cast::<bf16>().arg(), o.cast::<bf16>().arg(), n.arg(), d.arg()],
-        )
-    }
+    ctx.fire(Fire::at("vision/gemma4_audio.cuh", "::pie::vision::k_glu<::pie::bf16>").apply(tile16(rows, width)), &[x.cast::<bf16>().arg(), o.cast::<bf16>().arg(), n.arg(), d.arg()])
 }
 
 /// LayerNorm over the channel axis, then ReLU —
@@ -747,34 +581,25 @@ pub fn k_glu_bf16(
 /// `x` and `o` address `r * c` live bf16 elements, `o` writable and possibly
 /// the same address; `w` is `[c]` bf16 or null. All live on `ctx`'s stream.
 pub fn k_layernorm_relu_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     x: *const c_void,
     w: *const c_void,
     o: *mut c_void,
     r: i32,
     c: i32,
-    eps: f32,
-) -> Result<(), Refusal> {
+    eps: f32) -> Result<(), Refusal> {
     let rows = extent("r", r)?;
     // As [`k_rms_bf16`]: the channel count is the row this block walks, not a
     // grid axis, and a non-positive one is a read past the end of it.
     extent("c", c)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/gemma4_audio.cuh",
-            "::pie::vision::k_layernorm_relu<::pie::bf16>",
-            Launch::per_row(rows, LAYERNORM_BLOCK),
-            &[
+    ctx.fire(Fire::at("vision/gemma4_audio.cuh", "::pie::vision::k_layernorm_relu<::pie::bf16>").apply(Launch::per_row(rows, LAYERNORM_BLOCK)), &[
                 x.cast::<bf16>().arg(),
                 MaybeConst::new(w.cast::<bf16>()).arg(),
                 o.cast::<bf16>().arg(),
                 r.arg(),
                 c.arg(),
                 eps.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `[oc, t_out, f_out]` flattened to `[t_out, f_out*oc]` —
@@ -788,30 +613,21 @@ pub fn k_layernorm_relu_bf16(
 /// `input` is `[oc, t_out, f_out]` bf16 and `out` is `[t_out, f_out*oc]` bf16
 /// and writable, both on `ctx`'s stream.
 pub fn k_sscp_flatten_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     input: *const c_void,
     out: *mut c_void,
     oc: i32,
     t_out: i32,
-    f_out: i32,
-) -> Result<(), Refusal> {
+    f_out: i32) -> Result<(), Refusal> {
     let rows = extent("t_out", t_out)?;
     let width = axes("f_out * oc", extent("f_out", f_out)?, extent("oc", oc)?)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/gemma4_audio.cuh",
-            "::pie::vision::k_sscp_flatten<::pie::bf16>",
-            tile16(rows, width),
-            &[
+    ctx.fire(Fire::at("vision/gemma4_audio.cuh", "::pie::vision::k_sscp_flatten<::pie::bf16>").apply(tile16(rows, width)), &[
                 input.cast::<bf16>().arg(),
                 out.cast::<bf16>().arg(),
                 oc.arg(),
                 t_out.arg(),
                 f_out.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// The in-place q/k pre-scale — `vision::k_qkv_scale_bf16`.
@@ -826,7 +642,7 @@ pub fn k_sscp_flatten_bf16(
 /// `q` and `k` are `[n, h*hd]` bf16 and writable, `pds` is `[hd]` bf16. All
 /// live on `ctx`'s stream.
 pub fn k_qkv_scale_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     q: *mut c_void,
     k: *mut c_void,
     pds: *const c_void,
@@ -834,17 +650,10 @@ pub fn k_qkv_scale_bf16(
     h: i32,
     hd: i32,
     q_scale: f32,
-    k_scale: f32,
-) -> Result<(), Refusal> {
+    k_scale: f32) -> Result<(), Refusal> {
     let rows = extent("n", n)?;
     let width = axes("h * hd", extent("h", h)?, extent("hd", hd)?)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/gemma4_audio.cuh",
-            "::pie::vision::k_qkv_scale<::pie::bf16>",
-            tile16(rows, width),
-            &[
+    ctx.fire(Fire::at("vision/gemma4_audio.cuh", "::pie::vision::k_qkv_scale<::pie::bf16>").apply(tile16(rows, width)), &[
                 q.cast::<bf16>().arg(),
                 k.cast::<bf16>().arg(),
                 pds.cast::<bf16>().arg(),
@@ -853,9 +662,7 @@ pub fn k_qkv_scale_bf16(
                 hd.arg(),
                 q_scale.arg(),
                 k_scale.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// The sinusoidal relative-position encoding — `vision::k_rel_pos_enc_bf16`.
@@ -867,18 +674,10 @@ pub fn k_qkv_scale_bf16(
 /// # Safety
 ///
 /// `pe` is `[p, hidden]` bf16 and writable, on `ctx`'s stream.
-pub fn k_rel_pos_enc_bf16(ctx: &Ctx, pe: *mut c_void, p: i32, hidden: i32) -> Result<(), Refusal> {
+pub fn k_rel_pos_enc_bf16(ctx: &Ctx<'_>, pe: *mut c_void, p: i32, hidden: i32) -> Result<(), Refusal> {
     let rows = extent("p", p)?;
     let width = extent("hidden", hidden)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/gemma4_audio.cuh",
-            "::pie::vision::k_rel_pos_enc<::pie::bf16>",
-            tile16(rows, width),
-            &[pe.cast::<bf16>().arg(), p.arg(), hidden.arg()],
-        )
-    }
+    ctx.fire(Fire::at("vision/gemma4_audio.cuh", "::pie::vision::k_rel_pos_enc<::pie::bf16>").apply(tile16(rows, width)), &[pe.cast::<bf16>().arg(), p.arg(), hidden.arg()])
 }
 
 /// `Conv2d(k3, s2, p1)` over (time, frequency) — `vision::k_conv2d_s2_bf16`.
@@ -892,7 +691,7 @@ pub fn k_rel_pos_enc_bf16(ctx: &Ctx, pe: *mut c_void, p: i32, hidden: i32) -> Re
 /// `input` is `[ic, t_in, f_in]` bf16, `w` is `[oc, ic, 3, 3]` bf16, `out` is
 /// `[oc, t_out, f_out]` bf16 and writable. All live on `ctx`'s stream.
 pub fn k_conv2d_s2_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     input: *const c_void,
     w: *const c_void,
     out: *mut c_void,
@@ -901,16 +700,9 @@ pub fn k_conv2d_s2_bf16(
     f_in: i32,
     oc: i32,
     t_out: i32,
-    f_out: i32,
-) -> Result<(), Refusal> {
+    f_out: i32) -> Result<(), Refusal> {
     let launch = channelled(oc, t_out, f_out)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/gemma4_audio.cuh",
-            "::pie::vision::k_conv2d_s2<::pie::bf16>",
-            launch,
-            &[
+    ctx.fire(Fire::at("vision/gemma4_audio.cuh", "::pie::vision::k_conv2d_s2<::pie::bf16>").apply(launch), &[
                 input.cast::<bf16>().arg(),
                 w.cast::<bf16>().arg(),
                 out.cast::<bf16>().arg(),
@@ -920,9 +712,7 @@ pub fn k_conv2d_s2_bf16(
                 oc.arg(),
                 t_out.arg(),
                 f_out.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `[oc, t_out, f_out]` to `[t_out*f_out, oc]` — `vision::k_chlast_bf16`.
@@ -936,29 +726,20 @@ pub fn k_conv2d_s2_bf16(
 /// `input` is `[oc, t_out, f_out]` bf16 and `out` is `[t_out*f_out, oc]` bf16
 /// and writable, both on `ctx`'s stream.
 pub fn k_chlast_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     input: *const c_void,
     out: *mut c_void,
     oc: i32,
     t_out: i32,
-    f_out: i32,
-) -> Result<(), Refusal> {
+    f_out: i32) -> Result<(), Refusal> {
     let launch = channelled(oc, t_out, f_out)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/gemma4_audio.cuh",
-            "::pie::vision::k_chlast<::pie::bf16>",
-            launch,
-            &[
+    ctx.fire(Fire::at("vision/gemma4_audio.cuh", "::pie::vision::k_chlast<::pie::bf16>").apply(launch), &[
                 input.cast::<bf16>().arg(),
                 out.cast::<bf16>().arg(),
                 oc.arg(),
                 t_out.arg(),
                 f_out.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// [`k_chlast_bf16`]'s inverse — `vision::k_chfirst_bf16`.
@@ -967,29 +748,20 @@ pub fn k_chlast_bf16(
 ///
 /// [`k_chlast_bf16`]'s, with the two tensors' roles swapped.
 pub fn k_chfirst_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     input: *const c_void,
     out: *mut c_void,
     oc: i32,
     t_out: i32,
-    f_out: i32,
-) -> Result<(), Refusal> {
+    f_out: i32) -> Result<(), Refusal> {
     let launch = channelled(oc, t_out, f_out)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/gemma4_audio.cuh",
-            "::pie::vision::k_chfirst<::pie::bf16>",
-            launch,
-            &[
+    ctx.fire(Fire::at("vision/gemma4_audio.cuh", "::pie::vision::k_chfirst<::pie::bf16>").apply(launch), &[
                 input.cast::<bf16>().arg(),
                 out.cast::<bf16>().arg(),
                 oc.arg(),
                 t_out.arg(),
                 f_out.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `dim3((f_out+15)/16, (t_out+15)/16, oc)` over `B2` — the SSCP stage's grid,
@@ -1018,7 +790,7 @@ fn channelled(oc: i32, t_out: i32, f_out: i32) -> Result<Launch, Refusal> {
 /// `q`, `k` and `v` are `[n, h, hd]` bf16, `relk` is `[p, h, hd]` bf16, `out`
 /// is `[n, h, hd]` bf16 and writable. All live on `ctx`'s stream.
 pub fn k_local_attn_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     q: *const c_void,
     k: *const c_void,
     v: *const c_void,
@@ -1028,21 +800,14 @@ pub fn k_local_attn_bf16(
     h: i32,
     hd: i32,
     p: i32,
-    cap: f32,
-) -> Result<(), Refusal> {
+    cap: f32) -> Result<(), Refusal> {
     /// `k_local_attn`'s block — `dim3 g((N+127)/128, NH); <<<g, 128, 0, S>>>`.
     /// A TILE count on `grid.x`, which is why the walk never had a rule for it.
     const LOCAL_ATTN_BLOCK: u32 = 128;
 
     let tiles = extent("n", n)?.div_ceil(LOCAL_ATTN_BLOCK);
     let heads = extent("h", h)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/gemma4_audio.cuh",
-            "::pie::vision::k_local_attn<::pie::bf16>",
-            Launch::grid([tiles, heads, 1], [LOCAL_ATTN_BLOCK, 1, 1]),
-            &[
+    ctx.fire(Fire::at("vision/gemma4_audio.cuh", "::pie::vision::k_local_attn<::pie::bf16>").apply(Launch::grid([tiles, heads, 1], [LOCAL_ATTN_BLOCK, 1, 1])), &[
                 q.cast::<bf16>().arg(),
                 k.cast::<bf16>().arg(),
                 v.cast::<bf16>().arg(),
@@ -1053,9 +818,7 @@ pub fn k_local_attn_bf16(
                 hd.arg(),
                 p.arg(),
                 cap.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 // ── vision/qwen3_vl_tower.cuh ───────────────────────────────────────────────
@@ -1071,25 +834,16 @@ pub fn k_local_attn_bf16(
 /// `y` is `[m, n]` bf16 and writable and `b` is `[n]` bf16, both on `ctx`'s
 /// stream.
 pub fn k_bias_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     y: *mut c_void,
     b: *const c_void,
     m: usize,
-    n: i32,
-) -> Result<(), Refusal> {
+    n: i32) -> Result<(), Refusal> {
     let width = usize::try_from(extent("n", n)?).unwrap_or(usize::MAX);
     let count =
         m.checked_mul(width).ok_or(Refusal::Wide { what: "m * n", at: i64::MAX, max: i64::MAX })?;
     let launch = flat("m * n", count)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/qwen3_vl_tower.cuh",
-            "::pie::vision::k_bias<::pie::bf16>",
-            launch,
-            &[y.cast::<bf16>().arg(), b.cast::<bf16>().arg(), m.arg(), n.arg()],
-        )
-    }
+    ctx.fire(Fire::at("vision/qwen3_vl_tower.cuh", "::pie::vision::k_bias<::pie::bf16>").apply(launch), &[y.cast::<bf16>().arg(), b.cast::<bf16>().arg(), m.arg(), n.arg()])
 }
 
 /// The interpolated position embedding, added — `vision::k_add_pe_bf16`.
@@ -1102,21 +856,12 @@ pub fn k_bias_bf16(
 /// `h` addresses `t` live bf16 elements and is writable, `pe` `t` live ones.
 /// Both live on `ctx`'s stream.
 pub fn k_add_pe_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     h: *mut c_void,
     pe: *const c_void,
-    t: usize,
-) -> Result<(), Refusal> {
+    t: usize) -> Result<(), Refusal> {
     let launch = flat("t", t)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/qwen3_vl_tower.cuh",
-            "::pie::vision::k_add_pe<::pie::bf16>",
-            launch,
-            &[h.cast::<bf16>().arg(), pe.cast::<bf16>().arg(), t.arg()],
-        )
-    }
+    ctx.fire(Fire::at("vision/qwen3_vl_tower.cuh", "::pie::vision::k_add_pe<::pie::bf16>").apply(launch), &[h.cast::<bf16>().arg(), pe.cast::<bf16>().arg(), t.arg()])
 }
 
 /// `gelu_pytorch_tanh` — `vision::k_gelu_tanh_bf16`.
@@ -1128,21 +873,12 @@ pub fn k_add_pe_bf16(
 ///
 /// [`k_gelu_erf_bf16`]'s.
 pub fn k_gelu_tanh_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     x: *const c_void,
     o: *mut c_void,
-    t: usize,
-) -> Result<(), Refusal> {
+    t: usize) -> Result<(), Refusal> {
     let launch = flat("t", t)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/qwen3_vl_tower.cuh",
-            "::pie::vision::k_gelu_tanh<::pie::bf16>",
-            launch,
-            &[x.cast::<bf16>().arg(), o.cast::<bf16>().arg(), t.arg()],
-        )
-    }
+    ctx.fire(Fire::at("vision/qwen3_vl_tower.cuh", "::pie::vision::k_gelu_tanh<::pie::bf16>").apply(launch), &[x.cast::<bf16>().arg(), o.cast::<bf16>().arg(), t.arg()])
 }
 
 /// The same, with fc1's optional bias folded in —
@@ -1157,12 +893,11 @@ pub fn k_gelu_tanh_bf16(
 /// `x` is `[n, d]` bf16 and writable and `b` is `[d]` bf16 or null, both on
 /// `ctx`'s stream.
 pub fn k_gelu_bias_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     x: *mut c_void,
     b: *const c_void,
     n: i32,
-    d: i32,
-) -> Result<(), Refusal> {
+    d: i32) -> Result<(), Refusal> {
     /// A `rows * width` element count, as the `usize` the kernel takes.
     fn elements(what: &'static str, rows: i32, width: i32) -> Result<usize, Refusal> {
     let rows = usize::try_from(extent(what, rows)?).unwrap_or(usize::MAX);
@@ -1171,15 +906,7 @@ pub fn k_gelu_bias_bf16(
     }
 
     let launch = flat("n * d", elements("n * d", n, d)?)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/qwen3_vl_tower.cuh",
-            "::pie::vision::k_gelu_bias<::pie::bf16>",
-            launch,
-            &[x.cast::<bf16>().arg(), MaybeConst::new(b.cast::<bf16>()).arg(), n.arg(), d.arg()],
-        )
-    }
+    ctx.fire(Fire::at("vision/qwen3_vl_tower.cuh", "::pie::vision::k_gelu_bias<::pie::bf16>").apply(launch), &[x.cast::<bf16>().arg(), MaybeConst::new(b.cast::<bf16>()).arg(), n.arg(), d.arg()])
 }
 
 /// The patch merger's 2x2 gather — `vision::k_merge_gather_bf16`.
@@ -1192,24 +919,15 @@ pub fn k_gelu_bias_bf16(
 /// `h` is `[n_token * u, c]` bf16 and `g` is `[n_token, u*c]` bf16 and
 /// writable, both on `ctx`'s stream.
 pub fn k_merge_gather_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     h: *const c_void,
     g: *mut c_void,
     n_token: i32,
     u: i32,
-    c: i32,
-) -> Result<(), Refusal> {
+    c: i32) -> Result<(), Refusal> {
     let rows = extent("n_token", n_token)?;
     let width = axes("u * c", extent("u", u)?, extent("c", c)?)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/qwen3_vl_tower.cuh",
-            "::pie::vision::k_merge_gather<::pie::bf16>",
-            tile16(rows, width),
-            &[h.cast::<bf16>().arg(), g.cast::<bf16>().arg(), n_token.arg(), u.arg(), c.arg()],
-        )
-    }
+    ctx.fire(Fire::at("vision/qwen3_vl_tower.cuh", "::pie::vision::k_merge_gather<::pie::bf16>").apply(tile16(rows, width)), &[h.cast::<bf16>().arg(), g.cast::<bf16>().arg(), n_token.arg(), u.arg(), c.arg()])
 }
 
 /// The qkv split, its bias and the ViT rope, fused —
@@ -1227,7 +945,7 @@ pub fn k_merge_gather_bf16(
 /// `k` and `v` are `[n, nh, head]` bf16 and writable, `pos` is the rope
 /// position table as floats. All live on `ctx`'s stream.
 pub fn k_split_rope_qkv_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     qkv: *const c_void,
     b: *const c_void,
     q: *mut c_void,
@@ -1237,18 +955,11 @@ pub fn k_split_rope_qkv_bf16(
     n: i32,
     nh: i32,
     head: i32,
-    theta: f32,
-) -> Result<(), Refusal> {
+    theta: f32) -> Result<(), Refusal> {
     let rows = extent("n", n)?;
     let heads = extent("nh", nh)?;
     let half = extent("head / 2", head / 2)?;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "vision/qwen3_vl_tower.cuh",
-            "::pie::vision::k_split_rope_qkv<::pie::bf16>",
-            Launch::grid([heads, rows, 1], [half, 1, 1]),
-            &[
+    ctx.fire(Fire::at("vision/qwen3_vl_tower.cuh", "::pie::vision::k_split_rope_qkv<::pie::bf16>").apply(Launch::grid([heads, rows, 1], [half, 1, 1])), &[
                 qkv.cast::<bf16>().arg(),
                 MaybeConst::new(b.cast::<bf16>()).arg(),
                 q.cast::<bf16>().arg(),
@@ -1259,9 +970,7 @@ pub fn k_split_rope_qkv_bf16(
                 nh.arg(),
                 head.arg(),
                 theta.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 #[cfg(test)]

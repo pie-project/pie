@@ -594,7 +594,7 @@ fn a_null_lse_is_honoured() {
 /// A `fn` rather than a `let` at each site because `Ctx::on` is `unsafe` and
 /// the reason it is sound — the null stream is always live — is the same one
 /// every time and is better written once.
-fn ctx_null() -> Ctx {
+fn ctx_null() -> Ctx<'static> {
     // SAFETY: the null stream is always live.
     unsafe { Ctx::on(std::ptr::null_mut()) }
 }

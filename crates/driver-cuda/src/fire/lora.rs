@@ -142,14 +142,22 @@ impl crate::fire::sideband_arena::DeviceMemory for LiveLoraOps {
 impl LoraOps for LiveLoraOps {
     #[allow(clippy::not_unsafe_ptr_arg_deref)] // seam method; recorders share it
     fn cast_fp32_to_bf16(&mut self, src: *const c_void, dst: *mut c_void, elems: usize) {
+        let Ok(width) = i32::try_from(elems) else {
+            panic!("quant::cast_fp32_to_bf16: {elems} elements exceed one row");
+        };
         // SAFETY: the caller holds `self.stream` live across the launch.
         let fired = unsafe {
             let ctx = kernels_cuda::jit::Ctx::on(self.stream);
             kernels_cuda::quant::cast_fp32_to::<bf16>(
                 &ctx,
-                kernels::routine::In { ptr: src.cast::<f32>(), rows: 0, width: 0 },
-                kernels::routine::Out { ptr: dst.cast::<kernels_cuda::jit::abi::bf16>(), rows: 0, width: 0 },
-                elems,
+                // ONE ROW OF `elems`: the cast is elementwise and the routine
+                // reads its extent off the destination now.
+                kernels::routine::In { ptr: src.cast::<f32>(), rows: 1, width },
+                kernels::routine::Out {
+                    ptr: dst.cast::<kernels_cuda::jit::abi::bf16>(),
+                    rows: 1,
+                    width,
+                },
             )
         };
         empty_or_panic("quant::cast_fp32_to_bf16", fired);

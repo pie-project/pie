@@ -295,7 +295,7 @@ pub fn encode_one(
     // `base + i * 4`, which serves both spellings in the tree: a packed
     // `constant RouterParams&` is the address of its first field, and a
     // separate `const constant int&` is the address of that scalar. A row
-    // stating one `Param(0)` describes both at once.
+    // stating one `Const { v: 0 }` describes both at once.
     //
     // One slot and not one each, because that is what the shader tree already
     // does: `moe/route.metal` takes `constant RouterParams&`, `norm/rms.metal`

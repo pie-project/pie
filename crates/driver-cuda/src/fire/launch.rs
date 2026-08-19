@@ -456,6 +456,15 @@ fn run_program(
 ) -> Result<bool, i32> {
     use crate::program::session::Fired;
 
+    // A DOOR THE BRING-UP NEEDS. A sampling program runs on device and
+    // publishes through a ring, so when its answer is wrong there is nothing
+    // to read: the same fire either samples on device or hands the host raw
+    // logits, and only the second can be checked against the buffer this
+    // driver just wrote. `PIE_NO_PTIR_SAMPLER=1` takes the second.
+    if std::env::var_os("PIE_NO_PTIR_SAMPLER").is_some() {
+        return Ok(false);
+    }
+
     let Some(instance) = instances.get(&instance_id) else {
         return Ok(false);
     };
@@ -1292,11 +1301,25 @@ fn raise_attn_plans(
         // One schedule, whichever arm stated it. A text that states none is a
         // pure-prefill trace: `head_dim` keeps the geometry's answer so the
         // plan still stands for a capture whose other arm is a decode.
+        //
+        // THE STATED VARIANT RIDES ALONG, and dropping it was a silent
+        // numerics bug: this arm called `plan_decode`, which hardcodes
+        // `full_attention_variant = false`, so a stack with NO sliding window
+        // -- every llama, qwen3 and mistral -- planned the windowed schedule,
+        // answered `keys::Fa2DecodeFullAttention` with `false`, and
+        // `decode_arm` fell through to `DecodeArm::Window`. The text says
+        // which variant it wants (`PrepKind::DecodeAttention::full_attention`)
+        // and the two-schedule arm above already honours it; this one threw
+        // the answer away and every decode ran the wrong kernel.
+        //
+        // `windowed.or(full)`: where a text states BOTH at one width, one
+        // schedule serves both and the windowed variant is the general case.
         _ => {
-            let d = windowed.or(full).map_or(head_dim, |(d, _)| d as i32);
-            decode_plan.plan_decode(
+            let stated = windowed.or(full);
+            let d = stated.map_or(head_dim, |(d, _)| d as i32);
+            decode_plan.plan_decode_variant(
                 kv_indptr, q_heads_i, kv_heads, d, page_size,
-                ws.view(), raw_stream, true, -1,
+                ws.view(), raw_stream, true, stated.is_some_and(|(_, f)| f), -1,
             );
             core::ptr::null_mut()
         }
@@ -1597,6 +1620,12 @@ fn run_sampling_programs(
         })
     });
     let logits_base = readout.and_then(|v| named_bufs.get(&v)).map_or(0, |b| b.as_ptr() as u64);
+    // A ZERO BASE IS A SAMPLER READING ADDRESS ZERO, and it fails silently:
+    // every request draws from whatever is there, which is why a forward pass
+    // whose logits are provably right can still emit token 0 forever.
+    if std::env::var_os("PIE_TRACE_VALUES").is_some() {
+        eprintln!("[readout] value={readout:?} logits_base={logits_base:#x} vocab={vocab}");
+    }
     // Every request over its own row: request `r`'s logits row is the last of
     // its token span, `qo_indptr[r + 1] - 1` (`r` only on a decode). Still one
     // lane per fire, so this is N single-lane fires, not one N-lane fire.

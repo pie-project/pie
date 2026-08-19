@@ -54,10 +54,13 @@ pub use kernels::{Cap, KernelSig, LaunchRule, Lit, Refusal, Source, Ty};
 // The four position wrappers, re-exported for callers that hold no `Fire`.
 // `model-loader`'s CUDA executor calls these launchers directly and should not
 // have to depend on `kernels` to spell their signatures.
-pub use kernels::{In, Out};
+pub use kernels::routine::{In, InOut, Out};
 
 /// The per-symbol JIT, and the machinery a routine is written against.
 pub mod jit;
+/// The vocabulary a routine is written against, named once — the same module
+/// the three shader planes carry.
+pub mod routine;
 /// The rows nothing can derive, because their host programs are `driver-cuda`'s.
 pub mod source;
 
@@ -110,6 +113,42 @@ pub mod ssm;
 pub mod tower;
 pub mod vision;
 
+/// This crate's backend, under the one name `#[routine]` knows it by.
+///
+/// The attribute is shared by all four planes and cannot name any of them, so
+/// each aliases its own here and the macro writes `crate::Plane`.
+pub type Plane = crate::jit::Cuda;
+
+/// Every routine this crate declares.
+///
+/// A DISTRIBUTED SLICE, so nothing enumerates: `#[routine]` puts each row in a
+/// `linkme_ROUTINES` link section beside its own `fn`, and the linker hands
+/// back the bounds. There is no membership list to add a routine to, which is
+/// the last hand-written thing about one -- and the last that could be
+/// forgotten, leaving a routine compiled, correct and unreachable.
+///
+/// The order is LINK ORDER and no reader may depend on it. Nothing does:
+/// lookups match on the full symbol, which `no_symbol_is_declared_twice`
+/// keeps unique.
+// THE SLICE'S NAME IS A LINK-SECTION NAME, AND IT IS GLOBAL.
+//
+// `linkme` keys a distributed slice on the STATIC's identifier, not on the
+// crate that declares it, so four crates each declaring `ROUTINES` are four
+// declarations of one slice -- and `linkme` 0.3.37 refuses that outright
+// ("duplicate #[distributed_slice] with name \"ROUTINES\"") the moment two of
+// them are linked into one binary, which `kernels`' cross-backend agreement
+// test is. Before that version it was worse than a refusal: the sections
+// merged, and a sweep over one plane's rows walked another's.
+//
+// So the declaration wears the plane's name and the ALIAS wears the one
+// `#[routine]` emits. `crate::ROUTINES` still resolves, at no cost to a
+// reader, and the link section is this crate's alone.
+#[::linkme::distributed_slice]
+pub static CUDA_ROUTINES: [::kernels::routine::Routine<Plane>];
+
+/// The slice under the name `#[routine]` registers into.
+pub use CUDA_ROUTINES as ROUTINES;
+
 /// Why a compile or a launch did not happen, at the top level because it is
 /// what every launch path returns.
 #[cfg(feature = "_cuda")]
@@ -117,39 +156,6 @@ pub mod vision;
 pub use jit::Error;
 
 pub use jit::ArgValue;
-
-/// The families that have crossed to the routine shape.
-///
-/// The WHOLE declared surface: a symbol not reachable from this list is one
-/// [`call`] answers [`kernels::Refusal::Undeclared`] for, and there is no
-/// second table to look in.
-pub static FAMILIES: &[&jit::Family] = &[
-    &rope::FAMILY,
-    &sample::FAMILY,
-    &mlp::FAMILY,
-    &layout::FAMILY,
-    &quant::FAMILY,
-    &moe::FAMILY,
-    &ssm::FAMILY,
-    &norm::FAMILY,
-    &attn::FAMILY,
-    // XQA's one symbol is `attn`'s too. `Family::routine` strips the namespace
-    // and then matches on the routine's own name, so two families may share one
-    // namespace as long as no name repeats -- which `no_symbol_is_declared_twice`
-    // below is what checks.
-    &attn::xqa::FAMILY,
-    // As XQA's: the six FlashInfer FA2 dispatches are `attn::` symbols whose
-    // bodies belong beside the lattice and the params filling they fire.
-    &attn::fa2::FAMILY,
-    &gemm::FAMILY,
-    // Three symbols and no implementation — see `dist`'s header for why that
-    // is a declaration rather than an omission.
-    &dist::FAMILY,
-    // Two symbols with a host program and no device text, which is a third
-    // state and not a shade of the second: every refusal `comm` returns names
-    // the resolved template point and the header that would supply it.
-    &comm::FAMILY,
-];
 
 /// The rows `model-compiler` reads, every one of them derived.
 ///
@@ -160,7 +166,7 @@ pub static FAMILIES: &[&jit::Family] = &[
 /// fills it. `args` comes off the `fn`'s parameter list, so it costs nothing to
 /// carry and cannot drift.
 ///
-/// [`kernels::driver_bound!`] emptied the hand-written half: it derives the row
+/// [`kernels::untraced!`] emptied the hand-written half: it derives the row
 /// from the `fn` exactly as `routine!` does and leaves `args` empty, with a body
 /// that refuses a dispatch by STRING, because the driver calls those symbols by
 /// path where the compiler checks the call. Which symbols a statement can bind
@@ -174,17 +180,17 @@ pub fn sigs() -> &'static [KernelSig] {
     static ROWS: std::sync::OnceLock<&'static [KernelSig]> = std::sync::OnceLock::new();
     ROWS.get_or_init(|| {
         let mut rows: Vec<KernelSig> = Vec::new();
-        for family in FAMILIES {
-            for r in family.routines {
-                let symbol: &'static str = String::leak(family.symbol(r));
+        for r in ROUTINES {
+            {
+                let symbol: &'static str = String::leak(r.symbol());
                 rows.push(KernelSig {
                     name: symbol,
                     symbol,
                     args: r.args,
-                    sides: r.sides,
                     whole: r.whole,
                     depth_prefix_plan: r.depth_prefix_plan,
-                    in_place: r.in_place,
+                    sources: r.sources,
+                    derived: r.derived,
                     ..SIG_BASE
                 });
             }
@@ -198,10 +204,10 @@ const SIG_BASE: KernelSig = KernelSig {
     name: "",
     symbol: "",
     whole: false,
-    in_place: &[],
     depth_prefix_plan: false,
     args: &[],
-    sides: &[],
+    sources: &[],
+    derived: &[],
     axes: &[],
 };
 
@@ -212,11 +218,11 @@ const SIG_BASE: KernelSig = KernelSig {
 /// consumes its whole operand, and which of its operands alias.
 ///
 /// It answers for every row of [`sigs`], so `None` means UNDECLARED rather than
-/// "declared elsewhere" -- and a `driver_bound!` symbol answers `Some` with a
+/// "declared elsewhere" -- and a `untraced!` symbol answers `Some` with a
 /// body that refuses a string dispatch by name.
 #[must_use]
 pub fn routine(symbol: &str) -> Option<&'static jit::Routine> {
-    FAMILIES.iter().find_map(|family| family.routine(symbol))
+    ROUTINES.iter().find(|r| r.answers(symbol))
 }
 
 /// Fire the routine `symbol` names.
@@ -273,18 +279,53 @@ pub unsafe fn call_with_cublas(
     stream: *mut core::ffi::c_void,
     cublas: *mut core::ffi::c_void,
 ) -> Result<(), kernels::Refusal> {
+    // SAFETY: the caller's obligation on both pointers, forwarded.
+    unsafe { call_answering(symbol, args, stream, cublas, None) }
+}
+
+/// [`call_with_cublas`], lending the body this fire's ANSWERS.
+///
+/// `Env` left the parameter list, so a fact only the fire can answer — a page
+/// table, the KV pool, this batch's row count — is no longer bound into `args`
+/// before the body runs. The body asks for it with `ctx.ask::<C, keys::X>()`,
+/// and `env` is what answers.
+///
+/// `None` is the honest state for a hand-written call: those pass their
+/// arguments directly and ask nothing, and a body that asks on one gets
+/// [`kernels::Refusal::Unstated`] rather than an invented zero.
+///
+/// # Errors
+///
+/// [`kernels::Refusal::Undeclared`] if no family declares `symbol`; otherwise
+/// whatever the routine refuses.
+///
+/// # Safety
+///
+/// [`call_with_cublas`]'s obligations.
+pub unsafe fn call_answering(
+    symbol: &str,
+    args: &[ArgValue],
+    stream: *mut core::ffi::c_void,
+    cublas: *mut core::ffi::c_void,
+    env: Option<&dyn kernels::routine::Answers<jit::Cuda>>,
+) -> Result<(), kernels::Refusal> {
     let Some(routine) = routine(symbol) else {
         return Err(kernels::Refusal::Undeclared);
     };
     // SAFETY: the caller's obligation on both pointers, forwarded.
     let ctx = unsafe { jit::Ctx::on(stream).with_cublas(cublas) };
+    let ctx = match env {
+        Some(env) => ctx.with_env(env),
+        None => ctx,
+    };
     (routine.body)(&ctx, args)
 }
 
 #[cfg(test)]
 mod surface {
-    use super::{FAMILIES, call, routine, sigs};
+    use super::{call, routine, sigs};
     use kernels::{Refusal, Ty};
+    use super::ROUTINES;
 
     /// A row carries the signature it was derived from.
     ///
@@ -308,9 +349,13 @@ mod surface {
     fn a_symbol_resolves_to_its_routine() {
         let rope = routine("rope::rope_bf16").expect("rope has crossed");
         assert_eq!(rope.name, "rope_bf16");
-        assert_eq!(rope.args[0].0, Ty::Bf16sMut);
-        // One per crossed family, so a family dropped out of `FAMILIES` is a
-        // failure here rather than a symbol that silently stops resolving.
+        assert_eq!(rope.args[0], Ty::Bf16sMut);
+        // One per crossed namespace, so a routine's module dropping out of
+        // `ROUTINES` is a failure here rather than a symbol that silently
+        // stops resolving. `FAMILIES` held this list once; `Routine::namespace`
+        // is derived per-routine from `module_path!()` now, so there is no
+        // group left to drop out of, only the flat table `no_symbol_is_declared_twice`
+        // below walks.
         for symbol in [
             "sample::argmax_bf16",
             "mlp::swiglu_bf16",
@@ -345,15 +390,10 @@ mod surface {
     #[test]
     fn no_symbol_is_declared_twice() {
         let mut seen: Vec<String> = Vec::new();
-        for family in FAMILIES {
-            for r in family.routines {
-                let symbol = family.symbol(r);
-                assert!(
-                    !seen.contains(&symbol),
-                    "{symbol} is declared by two families"
-                );
-                seen.push(symbol);
-            }
+        for r in ROUTINES {
+            let symbol = r.symbol();
+            assert!(!seen.contains(&symbol), "{symbol} is declared twice");
+            seen.push(symbol);
         }
         assert!(
             seen.len() > 10,
@@ -364,143 +404,25 @@ mod surface {
 
 }
 
-/// Slots a signature WROTE DOWN, and slots a counter reached, over every
-/// declared routine.
-///
-/// The `#[cfg(test)]` census in `driver-cuda`'s `bind/table.rs` asks the same
-/// question of `sigs()` and has been stale since Kilimanjaro III, because a
-/// `#[test]` does not run under a `cargo check`-only regime. This walks
-/// `FAMILIES` instead — every hop is `&'static` — so the compiler recomputes
-/// it on each build and it cannot go stale.
-///
-/// `driver_bound!` rows carry `derived: &[]` and are invisible here, which is
-/// not a hole: `operands` refuses such a row before it reads an index.
-#[must_use]
-pub const fn slot_census() -> (usize, usize) {
-    let (mut stated, mut counted) = (0usize, 0usize);
-    let mut f = 0;
-    while f < FAMILIES.len() {
-        let routines = FAMILIES[f].routines;
-        let mut r = 0;
-        while r < routines.len() {
-            let d = routines[r].derived;
-            let mut i = 0;
-            while i < d.len() {
-                if matches!(
-                    d[i].source,
-                    Some(kernels::Source::Slot(kernels::Kind::In | kernels::Kind::Out, _))
-                ) {
-                    if d[i].stated {
-                        stated += 1;
-                    } else {
-                        counted += 1;
-                    }
-                }
-                i += 1;
-            }
-            r += 1;
-        }
-        f += 1;
-    }
-    (stated, counted)
-}
+// `slot_census()` AND `name_table_hits()` STOOD HERE, and the thing they
+// measured stopped existing.
+//
+// Both counted the ways an operand could reach a source WITHOUT the signature
+// saying: `slot_census` split slots into STATED and COUNTED so that a family
+// converting its launchers could not look like progress while the macro was
+// still guessing, and `name_table_hits` was pinned at zero to catch anyone
+// reintroducing the parameter-NAME table that once read `"eps"` as
+// `keys::RmsEps`.
+//
+// `resolve` ended the split. Every slot is derived from a mark's position
+// among the marks, so COUNTED is not a state a routine can be in and STATED is
+// every one of them. A census with one possible reading measures nothing.
 
-// COUNTED reached zero and `alias()` was deleted on the strength of it; a
-// non-zero reading means a column can be mis-bound with nothing left to
-// correct it. STATED rides beside it so a family DELETING launchers instead
-// of converting them cannot look like progress.
-/// Unstated rows whose source is neither a slot nor `None`.
+/// What a generic routine's element type must be on this plane.
 ///
-/// Zero, and it is a ONE-WAY DOOR: `kernels-macros` sends `Shape::Env` to
-/// `None`, so the parameter-name table that used to read `"eps"` as
-/// [`kernels::keys::RmsEps`] cannot produce a hit. A non-zero reading means
-/// somebody reintroduced a coupling between a parameter's SPELLING and a
-/// launch's behaviour, with nothing written down at either end.
-#[must_use]
-pub const fn name_table_hits() -> usize {
-    let mut hits = 0usize;
-    let mut f = 0;
-    while f < FAMILIES.len() {
-        let routines = FAMILIES[f].routines;
-        let mut r = 0;
-        while r < routines.len() {
-            let d = routines[r].derived;
-            let mut i = 0;
-            while i < d.len() {
-                if !d[i].stated
-                    && d[i].source.is_some()
-                    && !matches!(
-                        d[i].source,
-                        Some(kernels::Source::Slot(kernels::Kind::In | kernels::Kind::Out, _))
-                    )
-                {
-                    hits += 1;
-                }
-                i += 1;
-            }
-            r += 1;
-        }
-        f += 1;
-    }
-    hits
-}
-
-/// Rows whose `Named` source no launcher on this backend answers.
-///
-/// The CUDA binder answers every `keys::` fact a CUDA routine names, with
-/// five exceptions the shader planes construct and this one does not:
-/// `AttentionMask`, `AttentionMaskEnabled`, `AttentionMaskStride`,
-/// `KvHeadStride` and `KvSeqStride`. Zero rows here NAME one, which is what
-/// makes the exception list a statement about the other backends rather than
-/// a gap in this one.
-///
-/// The hazard this catches: declaring a key and forgetting to answer it in
-/// `operand()` is a SILENT demotion to `keys.rs` §2 — the row compiles, and
-/// refuses at bind on a machine nobody is watching.
-#[must_use]
-pub const fn unanswerable_named_rows() -> usize {
-    const UNANSWERED: [&str; 5] = [
-        <kernels::keys::AttentionMask as kernels::keys::Fact>::KEY,
-        <kernels::keys::AttentionMaskEnabled as kernels::keys::Fact>::KEY,
-        <kernels::keys::AttentionMaskStride as kernels::keys::Fact>::KEY,
-        <kernels::keys::KvHeadStride as kernels::keys::Fact>::KEY,
-        <kernels::keys::KvSeqStride as kernels::keys::Fact>::KEY,
-    ];
-    let mut hits = 0usize;
-    let mut f = 0;
-    while f < FAMILIES.len() {
-        let routines = FAMILIES[f].routines;
-        let mut r = 0;
-        while r < routines.len() {
-            let d = routines[r].derived;
-            let mut i = 0;
-            while i < d.len() {
-                if let Some(kernels::Source::Named(k)) = d[i].source {
-                    let mut u = 0;
-                    while u < UNANSWERED.len() {
-                        if kernels::source_is_named(&d[i].source, UNANSWERED[u]) {
-                            hits += 1;
-                        }
-                        u += 1;
-                    }
-                    let _ = k;
-                }
-                i += 1;
-            }
-            r += 1;
-        }
-        f += 1;
-    }
-    hits
-}
-
-const _: () = {
-    assert!(
-        unanswerable_named_rows() == 0,
-        "a CUDA routine names a fact only the shader planes answer"
-    );
-    let (stated, counted) = slot_census();
-    assert!(name_table_hits() == 0, "a parameter reached a fact through its NAME");
-    assert!(counted == 0, "a signature still reaches a slot by counting");
-    assert!(stated == 523, "the stated-slot count moved");
-};
+/// `#[routine]` puts this on every type parameter that states no bound of its
+/// own. CUDA needs two things of an element that a shader plane does not --
+/// that device text can be instantiated over it, and that both of its pointer
+/// ABIs bind -- and [`jit::abi::Pointee`] is those two. Saying it here is what
+/// keeps a generic signature free of a `where` line no other plane has.
+pub use crate::jit::abi::Pointee as RoutineElem;

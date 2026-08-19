@@ -579,7 +579,7 @@ fn run_dense_tactic(
             // one.
             gemv_bf16(
                 &ctx,
-                kernels::Weight { ptr: w },
+                kernels::Const { v: w },
                 kernels::In { ptr: act, rows: 0, width: k },
                 kernels::Out { ptr: y, rows: 0, width: n },
                 beta,
@@ -1163,7 +1163,7 @@ pub unsafe fn act_x_wt_bf16(
         if let Some(stream) = cublas_stream(handle)
             && gemv_bf16(
                 &unsafe { crate::jit::Ctx::on(stream) },
-                kernels::Weight { ptr: w },
+                kernels::Const { v: w },
                 kernels::In { ptr: act, rows: 0, width: k },
                 kernels::Out { ptr: y, rows: 0, width: n },
                 0.0,

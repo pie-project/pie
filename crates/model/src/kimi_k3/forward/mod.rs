@@ -265,6 +265,7 @@ pub fn kimi_k3_cuda(facts: &KimiK3Facts, class: FireClass) -> ForwardPlan {
                     kd.width(),
                     kd.value_heads,
                     kd.value_head_dim,
+                    kd.norm_eps(),
                 );
                 dsl::seam(o.trace(), &dsl::seam::ATTN_OUT, &[&o], Some(l));
                 y += matmul(&o, &w.kda_o);

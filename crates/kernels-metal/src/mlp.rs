@@ -4,10 +4,11 @@
 //! name: it bakes gpt-oss's asymmetric clamp, its `alpha` and its `(up + 1)`
 //! term, and its own first line says so.
 
+use kernels::Grid;
+use kernels_macros::routine;
 use kernels::routine::Refusal;
 
-use crate::routine::{elementwise, keys, Ask, Bind, Block, Buf, BufMut, Ctx, Fire, Routine};
-use crate::routine::{InSlot, OutSlot};
+use crate::routine::{Asks, Bind, Ctx, Fire, In, Out, Tensor, bf16, elementwise, keys};
 
 /// Threads per threadgroup for every elementwise body in this file.
 ///
@@ -33,23 +34,18 @@ const GROUP_X: u32 = 256;
 /// # Errors
 ///
 /// See [`crate::routine::elementwise`].
+#[routine]
 pub fn geglu_tanh(
     ctx: &Ctx<'_>,
-    gate: InSlot<0, Buf>,
-    up: InSlot<1, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "geglu_tanh_bfloat16",
-            file: "mlp/gated.metal",
-            lanes: elementwise(*width, *rows)?,
-            group: [GROUP_X, 1, 1],
-        },
-        &[gate.v(), up.v(), out.v(), params.v()],
+    gate: In<Tensor<bf16>>,
+    up: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let width = gate.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("mlp/gated.metal", "geglu_tanh_bfloat16").apply(Grid::of(elementwise(width, rows)?, [GROUP_X, 1, 1])),
+        &[gate.arg(), up.arg(), out.arg(), params],
     )
 }
 
@@ -70,23 +66,18 @@ pub fn geglu_tanh(
 /// # Errors
 ///
 /// See [`crate::routine::elementwise`].
+#[routine]
 pub fn geglu_tanh_strided(
     ctx: &Ctx<'_>,
-    gate: InSlot<0, Buf>,
-    up: InSlot<1, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "geglu_tanh_strided_bfloat16",
-            file: "mlp/gated.metal",
-            lanes: elementwise(*width, *rows)?,
-            group: [GROUP_X, 1, 1],
-        },
-        &[gate.v(), up.v(), out.v(), params.v()],
+    gate: In<Tensor<bf16>>,
+    up: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let width = gate.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("mlp/gated.metal", "geglu_tanh_strided_bfloat16").apply(Grid::of(elementwise(width, rows)?, [GROUP_X, 1, 1])),
+        &[gate.arg(), up.arg(), out.arg(), params],
     )
 }
 
@@ -103,23 +94,18 @@ pub fn geglu_tanh_strided(
 /// # Errors
 ///
 /// See [`crate::routine::elementwise`].
+#[routine]
 pub fn gptoss_swiglu(
     ctx: &Ctx<'_>,
-    gate: InSlot<0, Buf>,
-    up: InSlot<1, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "gptoss_swiglu_bfloat16",
-            file: "mlp/gated.metal",
-            lanes: elementwise(*width, *rows)?,
-            group: [GROUP_X, 1, 1],
-        },
-        &[gate.v(), up.v(), out.v(), params.v()],
+    gate: In<Tensor<bf16>>,
+    up: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let width = gate.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("mlp/gated.metal", "gptoss_swiglu_bfloat16").apply(Grid::of(elementwise(width, rows)?, [GROUP_X, 1, 1])),
+        &[gate.arg(), up.arg(), out.arg(), params],
     )
 }
 
@@ -138,42 +124,20 @@ pub fn gptoss_swiglu(
 /// # Errors
 ///
 /// See [`crate::routine::elementwise`].
+#[routine]
 pub fn silu_mul(
     ctx: &Ctx<'_>,
-    gate: InSlot<0, Buf>,
-    up: InSlot<1, Buf>,
-    out: OutSlot<0, BufMut>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "silu_mul_bfloat16",
-            file: "mlp/gated.metal",
-            lanes: elementwise(*width, *rows)?,
-            group: [GROUP_X, 1, 1],
-        },
-        &[gate.v(), up.v(), out.v()],
+    gate: In<Tensor<bf16>>,
+    up: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let width = gate.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at("mlp/gated.metal", "silu_mul_bfloat16").apply(Grid::of(elementwise(width, rows)?, [GROUP_X, 1, 1])),
+        &[gate.arg(), up.arg(), out.arg()],
     )
 }
 
-/// This family's routines.
-///
-/// Four of the five. `silu_mul_strided` does NOT cross, and the reason is a
-/// property of Metal's argument table rather than a judgment: its entrypoint
-/// declares `row_pitch` at **buffer(4)** with buffer(3) left empty, and a
-/// routine's argument list is positional -- the index in the list IS the slot.
-/// Neither this plane nor the table plane it replaces can express a hole, so
-/// crossing it would mean either binding a null at 3 or renumbering the
-/// entrypoint. It is DARK -- no text names it, and no statement produces the
-/// row pitch it wants -- so neither is worth doing to a symbol nothing calls.
-/// `kernels-vulkan` left it uncrossed too.
-pub static ROUTINES: &[Routine] = &[
-    crate::routine!(geglu_tanh),
-    crate::routine!(geglu_tanh_strided),
-    crate::routine!(gptoss_swiglu),
-    crate::routine!(silu_mul),
-];
 
 /// The shaders this family's routines reach: `(file, entrypoint)`, one pair
 /// per instantiated name.
@@ -196,19 +160,70 @@ pub static ENTRYPOINTS: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routine::{ArgValue, Encode};
-    use core::cell::RefCell;
+    use crate::routine::{ArgValue, Encode, Tensor};
+    use core::cell::{Cell, RefCell};
 
     /// One recorded dispatch: the fire, and the argument list.
     type Call = (Fire, Vec<ArgValue>);
 
-    /// An `Encode` that remembers what it was asked to do.
-    #[derive(Default)]
-    struct Seen(RefCell<Vec<Call>>);
+    /// An `Encode` that remembers what it was asked to do, and answers the
+    /// facts this family's bodies ask for.
+    ///
+    /// `rows` backs every `ctx.ask::<i32, keys::Rows>()` in this file --
+    /// under `kernel!` it rode its own `Ask::new(_)` argument, and now the
+    /// body asks the fire for it. `params_handle` answers `ctx.params()`,
+    /// standing in for the `Block::new(Buf(4))` every body but `silu_mul`
+    /// used to take.
+    struct Seen {
+        calls: RefCell<Vec<Call>>,
+        rows: Cell<i32>,
+        params_handle: Cell<u32>,
+        /// THE STATEMENT\'S SCALAR RUN, for a body that reads a word by
+        /// index. Empty means "4096 at every slot", which is a plausible
+        /// stride for the rows these tests build; a case that means a
+        /// particular tiling or split count sets its own.
+        words: RefCell<Vec<i32>>,
+    }
+
+    impl Default for Seen {
+        fn default() -> Self {
+            Self {
+                calls: RefCell::default(),
+                rows: Cell::new(2),
+                params_handle: Cell::new(4),
+                words: RefCell::default(),
+            }
+        }
+    }
 
     impl Encode for Seen {
-        fn dispatch(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
-            self.0.borrow_mut().push((fire, args.to_vec()));
+        // A PROBE HAS NO FIRE BEHIND IT, so it answers only the facts this
+        // file's bodies ask for and refuses everything else honestly --
+        // answering zero for an unasked fact would let a body under test pass
+        // while the fact it asked for went unanswered on a real driver.
+        fn resolve(&self, _ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
+            use kernels::keys::Fact;
+            if source == <keys::Rows as Fact>::SOURCE {
+                return Ok(ArgValue::I32(self.rows.get()));
+            }
+            // THE STATEMENT'S OWN SCALARS, which a body reads by index when its
+            // params run is a struct and no `Const` mark can name a word inside
+            // it -- see `Asks::param`. The probe answers a number that is
+            // plausible for every reader: a stride wide enough for the rows
+            // these tests build, and a positive tiling.
+            if let kernels::Source::Slot(kernels::Kind::Param, n) = source {
+                return Ok(ArgValue::I32(
+                    self.words.borrow().get(usize::from(n)).copied().unwrap_or(4096),
+                ));
+            }
+            if source == kernels::Source::Slot(kernels::Kind::Params, 0) {
+                return Ok(ArgValue::Buffer(self.params_handle.get()));
+            }
+            Err(Refusal::Unstated { what: "a fact this probe does not answer" })
+        }
+
+        fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
+            self.calls.borrow_mut().push((fire, args.to_vec()));
             Ok(())
         }
     }
@@ -219,16 +234,58 @@ mod tests {
     /// A positional bind in the TRACE's order rather than the kernel's is how
     /// `rms_single_row` came to read its own output as the weight, so the
     /// order is worth a test even where it looks obvious.
+    ///
+    /// KNOWN FAILING, upstream of this crate: `out` is an `Out<Tensor<bf16>>`
+    /// and `ArgValue::BufferMut(3)` below is the correct claim for what its
+    /// `.arg()` SHOULD produce. `kernels::shader::Tensor<E>` has one field,
+    /// `handle: u32`, with nowhere to keep a direction, and its `Bind` impl
+    /// (`crates/kernels/src/shader.rs`, outside this crate) reads `V::buffer
+    /// (self.handle)` unconditionally -- `Out`/`InOut` delegate to it exactly
+    /// as `In` does, so no positional argument a routine body binds itself
+    /// can presently come out `BufferMut` on any plane. `kernels::routine::
+    /// Elem for Tensor<E>` sets `Read = Write = Self` and its own comment
+    /// says why: "a binding index has one [value]... so `Read` and `Write`
+    /// are both `Self`, and the `Ty` still splits, because the TABLE must say
+    /// which way the launch drives the operand even where the value cannot."
+    /// That table -- the declared `Ty` a `KernelSig` carries -- is read-only
+    /// from here too, and nothing between a routine body's `ctx.fire()` and
+    /// `Encode::fire` re-derives a value from it: `Ctx<'_>` is `dyn Encode`
+    /// with no wrapping. The assertion states the correct claim rather than
+    /// one weakened to match the gap.
     #[test]
     fn all_four_bodies_bind_gate_up_and_out_at_zero_one_and_two() {
         let seen = Seen::default();
-        geglu_tanh(&seen, InSlot::new(Buf(1)), InSlot::new(Buf(2)), OutSlot::new(BufMut(3)), Block::new(Buf(4)), Ask::new(8), Ask::new(2)).expect("a launch");
-        geglu_tanh_strided(&seen, InSlot::new(Buf(1)), InSlot::new(Buf(2)), OutSlot::new(BufMut(3)), Block::new(Buf(4)), Ask::new(8), Ask::new(2))
-            .expect("a launch");
-        gptoss_swiglu(&seen, InSlot::new(Buf(1)), InSlot::new(Buf(2)), OutSlot::new(BufMut(3)), Block::new(Buf(4)), Ask::new(8), Ask::new(2)).expect("a launch");
-        silu_mul(&seen, InSlot::new(Buf(1)), InSlot::new(Buf(2)), OutSlot::new(BufMut(3)), Ask::new(8), Ask::new(2)).expect("a launch");
+        seen.rows.set(2);
+        geglu_tanh(
+            &seen,
+            In { ptr: Tensor::<bf16>::new(1), rows: 0, width: 8 },
+            In { ptr: Tensor::<bf16>::new(2), rows: 0, width: 8 },
+            Out::new(Tensor::<bf16>::new(3)),
+        )
+        .expect("a launch");
+        geglu_tanh_strided(
+            &seen,
+            In { ptr: Tensor::<bf16>::new(1), rows: 0, width: 8 },
+            In { ptr: Tensor::<bf16>::new(2), rows: 0, width: 8 },
+            Out::new(Tensor::<bf16>::new(3)),
+        )
+        .expect("a launch");
+        gptoss_swiglu(
+            &seen,
+            In { ptr: Tensor::<bf16>::new(1), rows: 0, width: 8 },
+            In { ptr: Tensor::<bf16>::new(2), rows: 0, width: 8 },
+            Out::new(Tensor::<bf16>::new(3)),
+        )
+        .expect("a launch");
+        silu_mul(
+            &seen,
+            In { ptr: Tensor::<bf16>::new(1), rows: 0, width: 8 },
+            In { ptr: Tensor::<bf16>::new(2), rows: 0, width: 8 },
+            Out::new(Tensor::<bf16>::new(3)),
+        )
+        .expect("a launch");
 
-        let calls = seen.0.borrow();
+        let calls = seen.calls.borrow();
         assert_eq!(calls.len(), 4, "one activation is one dispatch");
         for (fire, args) in calls.iter() {
             assert_eq!(
@@ -279,10 +336,16 @@ mod tests {
     #[test]
     fn the_grid_is_every_element_of_the_rectangle_and_not_one_row_of_it() {
         let seen = Seen::default();
-        geglu_tanh_strided(&seen, InSlot::new(Buf(1)), InSlot::new(Buf(2)), OutSlot::new(BufMut(3)), Block::new(Buf(4)), Ask::new(256), Ask::new(8))
-            .expect("eight rows is a launch");
+        seen.rows.set(8);
+        geglu_tanh_strided(
+            &seen,
+            In { ptr: Tensor::<bf16>::new(1), rows: 0, width: 256 },
+            In { ptr: Tensor::<bf16>::new(2), rows: 0, width: 256 },
+            Out::new(Tensor::<bf16>::new(3)),
+        )
+        .expect("eight rows is a launch");
 
-        let calls = seen.0.borrow();
+        let calls = seen.calls.borrow();
         let (fire, _) = &calls[0];
         assert_eq!(
             fire.lanes,
@@ -302,14 +365,20 @@ mod tests {
     #[test]
     fn a_rectangle_with_no_elements_is_a_refusal_and_not_a_launch() {
         let seen = Seen::default();
-        let refused = silu_mul(&seen, InSlot::new(Buf(1)), InSlot::new(Buf(2)), OutSlot::new(BufMut(3)), Ask::new(8), Ask::new(0))
-            .expect_err("zero rows is not a launch");
+        seen.rows.set(0);
+        let refused = silu_mul(
+            &seen,
+            In { ptr: Tensor::<bf16>::new(1), rows: 0, width: 8 },
+            In { ptr: Tensor::<bf16>::new(2), rows: 0, width: 8 },
+            Out::new(Tensor::<bf16>::new(3)),
+        )
+        .expect_err("zero rows is not a launch");
         assert!(
             matches!(refused, Refusal::Empty { what: "rows" }),
             "got {refused:?}"
         );
         assert!(
-            seen.0.borrow().is_empty(),
+            seen.calls.borrow().is_empty(),
             "and nothing was encoded on the way to refusing"
         );
     }

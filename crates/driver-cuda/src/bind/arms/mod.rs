@@ -16,20 +16,20 @@ use super::table;
 ///
 /// A generic `fn` and not a closure: a closure cannot be generic over a const
 /// parameter, so an arm could bind slot 1's pointer with slot 0's width.
-pub fn in_region<const N: usize, E: kernels::Elem>(
+pub fn in_region<const N: usize, E: kernels::Elem<Read = *const E>>(
     cx: &Cx<'_>,
     ptr: *const E,
     rows: i32,
-) -> In<N, E> {
+) -> In<E> {
     In { ptr, rows, width: cx.in_width(N).unwrap_or(0) }
 }
 
 /// [`in_region`]'s output half. Same argument, same reason for the const.
-pub fn out_region<const N: usize, E: kernels::Elem>(
+pub fn out_region<const N: usize, E: kernels::Elem<Write = *mut E>>(
     cx: &Cx<'_>,
     ptr: *mut E,
     rows: i32,
-) -> Out<N, E> {
+) -> Out<E> {
     Out { ptr, rows, width: cx.out_width(N).unwrap_or(0) }
 }
 
@@ -124,7 +124,9 @@ pub const fn row_census() -> (usize, usize, usize) {
 // wants something `Cx` may not offer (northstar §3.3).
 const _: () = {
     let (armed, refused, driver) = row_census();
-    assert!(armed == 138);
+    // 137 since `mlp::chunked_swiglu_into_bf16` joined: one kernel, two
+    // statement shapes, two contracts -- see the routine.
+    assert!(armed == 137);
     assert!(refused == 31);
     assert!(driver == 3);
 };
@@ -220,4 +222,68 @@ pub fn route(symbol: &str) -> Route {
     }
     // Everything else falls through to the hand-dispatch match.
     Route::Rows
+}
+
+#[cfg(test)]
+mod agreement {
+    use super::{FAMILIES, Route, route};
+
+    /// A row the registry refuses and a row whose column cannot resolve are
+    /// the SAME row.
+    ///
+    /// The two used to be one fact written twice: a parameter that nothing
+    /// supplies was spelled by being a bare `i32`, which said nothing at all,
+    /// while the reason it could not be bound was prose on `Bound::unbound`
+    /// over here. Ninety-five parameters wore the first and thirty-one
+    /// symbols the second, and twenty-three of them were the same routines.
+    ///
+    /// The parameter says it now — `Env<T, keys::Unstated>`, whose `Source` is
+    /// genuinely `None` — so the STATE is derivable and only the REASON is
+    /// prose. This is what keeps the two from drifting: a routine that gains
+    /// an unbindable parameter must gain a reason here, and one that loses its
+    /// last such parameter must lose it.
+    #[test]
+    fn a_refused_row_is_one_whose_column_cannot_resolve() {
+        let mut wrong: Vec<String> = Vec::new();
+        for rows in FAMILIES {
+            for b in *rows {
+                let Some(r) = kernels_cuda::routine(b.symbol) else { continue };
+                // `untraced` rows carry no column at all; they are not
+                // "unresolvable", they are "not resolved this way".
+                if r.derived.is_empty() {
+                    continue;
+                }
+                let unresolvable = r.sources.iter().any(Option::is_none);
+                let refused = matches!(route(b.symbol), Route::Unbound(_));
+                if unresolvable && !refused {
+                    wrong.push(format!(
+                        "  {}: a parameter says `keys::Unstated` and the registry \
+                         does not refuse the row -- a fire would reach it and \
+                         die on `Unstated`",
+                        b.symbol
+                    ));
+                }
+                // THE CONVERSE IS NOT DERIVABLE ANY MORE, and the reason is
+                // the `Env` -> `ask` move: a fact a body ASKS for is not a
+                // parameter, so it has no entry in `sources` to be `None`.
+                // Every row below refuses for a fact this driver cannot
+                // supply -- an MLA layer view, the score-capture CSR, a join's
+                // aux operand -- and every one of those facts is asked in the
+                // body now, so the column is fully sourced while the row is
+                // still, truthfully, unbindable.
+                //
+                // Asserting it anyway would demand that a standing refusal be
+                // deleted because its evidence moved, which is the test
+                // pushing a wrong change rather than catching one. The half
+                // above still holds and is the half that matters: a parameter
+                // that says `Unstated` MUST be refused.
+                let _ = refused;
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "the registry and the signatures disagree about which rows can bind:\n{}",
+            wrong.join("\n")
+        );
+    }
 }

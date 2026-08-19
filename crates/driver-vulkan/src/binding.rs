@@ -959,7 +959,7 @@ pub enum Unlayoutable {
     /// The scalar block's slot is not where the row puts its parameters.
     ///
     /// The module says which binding is the block; the row says which operand
-    /// is `Param(0)`. Both are read off separately, so their disagreement is
+    /// is `Const { v: 0 }`. Both are read off separately, so their disagreement is
     /// a finding rather than a fact -- and it means the shader would read its
     /// scalars out of an operand.
     BlockElsewhere {

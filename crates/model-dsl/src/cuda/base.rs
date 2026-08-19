@@ -69,10 +69,16 @@ builder! {
     }
 
 
-    /// `kernels::mlp::chunked_swiglu_bf16` over the ALIGNED leg's block-major staging:
-    /// [`swiglu`](crate::cuda::swiglu)'s shape, plus the destination the pointer build named.
+    /// `kernels::mlp::chunked_swiglu_into_bf16` over the ALIGNED leg's block-major
+    /// staging: [`swiglu`](crate::cuda::swiglu)'s shape, plus the destination the
+    /// pointer build named.
+    ///
+    /// A DIFFERENT SYMBOL from [`swiglu`](crate::cuda::swiglu), and the second
+    /// operand is why: this states its destination, so the routine's result
+    /// must BE it (`InOut`), while the dense form places no destination at all
+    /// and its result is the arena's to put anywhere.
     pub fn swiglu_aligned(x: &Val, stage: &Val, aligned: Dim, intermediate: u32) -> Val {
-        symbol: "mlp::chunked_swiglu_bf16",
+        symbol: "mlp::chunked_swiglu_into_bf16",
         on: x,
         inputs: [x, stage],
         out: [aligned, Dim::Const(intermediate)] as BF16,
@@ -115,11 +121,26 @@ pub fn qk_rmsnorm_rope(q: &Val, k: &Val, q_norm: &NormW, k_norm: &NormW) -> (Val
 /// `kernels::attn::attention_xqa_decode_bf16_prepared` (whose contract includes the fire-wide
 /// XQA prepare — and which is therefore declared `whole`; see [`model_ir::kernels`]).
 pub fn attention_xqa_decode(q: &Val, kv: &Kv, window_left: i32) -> Option<Val> {
+    // THE WINDOW IS A FACT NOW, NOT A SCALAR. Every routine below asks
+    // for it through `keys::WindowLeft`; the statement used to carry it
+    // and carried it into the slot a soft cap is read from. It stays on
+    // the signature because a caller states the deployment's window here
+    // and the guard predicates above still read the same number.
+    let _ = window_left;
     attn_at(
         q,
         kv,
         "attn::attention_xqa_decode_bf16_prepared",
-        window_left,
+        // NOTHING, AND THAT IS THE HONEST STATE. This routine declares the
+        // KV POOL's geometry -- page size, scheme byte, storage dtype,
+        // block size -- and a trace text holds none of it: the pool is the
+        // allocator's and the text never sees a deployment. It stated
+        // `[window_left]` before, which put one number at the page-size slot
+        // and left the rest zero; an empty run at least does not claim a
+        // page size of -1 -- and the routine asks the fire for the pool's
+        // numbers again, which is where they were before the marks and where
+        // `driver-cuda` has always answered them.
+        vec![],
     )
 }
 
@@ -172,7 +193,9 @@ pub fn attention_flashinfer_decode(
         q,
         kv,
         "attn::dispatch_attention_flashinfer_decode",
-        window_left,
+        // The plain decode declares no `Const` at all -- every number it uses
+        // is a fact it asks for -- so its statement carries none.
+        vec![],
     )
 }
 
@@ -182,19 +205,42 @@ pub fn attention_flashinfer_prefill(
     kv: &Kv,
     window_left: i32,
     head_dim: u32,
+    soft_cap: f32,
+    sm_scale: f32,
 ) -> Option<Val> {
+    // THE WINDOW IS A FACT NOW, NOT A SCALAR. Every routine below asks
+    // for it through `keys::WindowLeft`; the statement used to carry it
+    // and carried it into the slot a soft cap is read from. It stays on
+    // the signature because a caller states the deployment's window here
+    // and the guard predicates above still read the same number.
+    let _ = window_left;
     prefill_plan(&q.t, head_dim);
     attn_at(
         q,
         kv,
         "attn::dispatch_attention_flashinfer_prefill_bf16",
-        window_left,
+        cap_and_scale(soft_cap, sm_scale, head_dim),
     )
 }
 
 /// `kernels::attn::attention_flashinfer_prefill` — plan-free prefill wrapper.
-pub fn attention_flashinfer_prefill_planless(q: &Val, kv: &Kv, window_left: i32) -> Option<Val> {
-    attn_at(q, kv, "attn::attention_flashinfer_prefill", window_left)
+pub fn attention_flashinfer_prefill_planless(
+    q: &Val,
+    kv: &Kv,
+    window_left: i32,
+    head_dim: u32,
+    soft_cap: f32,
+    sm_scale: f32,
+) -> Option<Val> {
+    // THE WINDOW IS A FACT NOW, NOT A SCALAR. Every routine below asks
+    // for it through `keys::WindowLeft`; the statement used to carry it
+    // and carried it into the slot a soft cap is read from. It stays on
+    // the signature because a caller states the deployment's window here
+    // and the guard predicates above still read the same number.
+    let _ = window_left;
+    attn_at(q, kv, "attn::attention_flashinfer_prefill",
+        cap_and_scale(soft_cap, sm_scale, head_dim),
+    )
 }
 
 /// Class-dependent attention helper; arm order is the contract.
@@ -204,14 +250,25 @@ pub fn attention_for(
     kv: &Kv,
     window_left: i32,
     head_dim: u32,
+    soft_cap: f32,
+    sm_scale: f32,
 ) -> Option<Val> {
     match class {
         model_ir::trace::FireClass::Decode => {
             attention_flashinfer_decode(q, kv, window_left, head_dim)
         }
-        // The planless arm states no prep, so `head_dim` is unread on this
-        // side -- it plans from the host CSR when the statement runs.
-        _ => attention_flashinfer_prefill_planless(q, kv, window_left),
+        // The planless arm states no prep -- it plans from the host CSR when
+        // the statement runs -- but `head_dim` is read here even so: the
+        // routine takes an `sm_scale`, and a caller that states none gets
+        // `1/sqrt(head_dim)`.
+        _ => attention_flashinfer_prefill_planless(
+            q,
+            kv,
+            window_left,
+            head_dim,
+            soft_cap,
+            sm_scale,
+        ),
     }
 }
 
@@ -290,8 +347,13 @@ pub fn rope_yarn_original(q: &Val, k: &Val) -> (Val, Val) {
 /// `kernels::rope::rope_bf16`: the full rotation, named.
 /// The semantic [`super::rope`] carries a `RopeKind` and a rotary width, and the driver's arm
 /// asked whether the width was zero to decide between two launchers.
-pub fn rope(q: &Val, k: &Val) -> (Val, Val) {
-    rope_launch(q, k, "rope::rope_bf16", vec![0])
+pub fn rope(q: &Val, k: &Val, q_heads: u32, kv_heads: u32, head_dim: u32) -> (Val, Val) {
+    // `[num_q_heads, num_kv_heads, head_dim]`, which is the run the routine's
+    // three `Const` marks claim, in order. It was `vec![0]` -- one placeholder
+    // where three extents are read -- so every rotation counted zero heads.
+    // The theta and the interleave flag are NOT here: nothing on `Deployment`
+    // states the flag, so the body asks for both.
+    rope_launch(q, k, "rope::rope_bf16", vec![q_heads, kv_heads, head_dim])
 }
 
 /// Partial rope: `rotary_dim` rides `params`; q/k are full-width operands.
@@ -452,11 +514,25 @@ builder! {
     }
 
 
-    /// GPT-OSS GLU over routed `[Tokens, k, intermediate]`; `limit` rides params.
-    pub fn gpt_oss_glu(gate: &Val, up: &Val, top_k: u32, intermediate: u32, limit: f32) -> Val {
+    /// GPT-OSS GLU over routed `[Tokens, k, intermediate]`; `limit` and the
+    /// gate's `alpha` ride params, in the order the routine's two `Const<f32>`
+    /// marks claim them.
+    ///
+    /// `alpha` was stated nowhere and the routine takes it, so the fire read a
+    /// zero at that slot -- `x * sigmoid(0)` is `x/2`, an activation that is
+    /// finite, varied and wrong, which is the failure mode this whole check
+    /// exists to catch.
+    pub fn gpt_oss_glu(
+        gate: &Val,
+        up: &Val,
+        top_k: u32,
+        intermediate: u32,
+        limit: f32,
+        alpha: f32,
+    ) -> Val {
         symbol: "mlp::gpt_oss_glu_bf16",
         on: gate,
-        params: [limit.to_bits()],
+        params: [limit.to_bits(), alpha.to_bits()],
         inputs: [gate, up],
         out: [Dim::Tokens, Dim::Const(top_k), Dim::Const(intermediate)] as BF16,
         made: "the clamped GLU produces its value",
@@ -466,7 +542,22 @@ builder! {
 /// `kernels::attn::attention_naive_paged` — the fallback prefill for a head dim flashinfer's TC
 /// prefill template rejects.
 pub fn attention_naive_paged(q: &Val, kv: &Kv, window_left: i32) -> Option<Val> {
-    attn_at(q, kv, "attn::attention_naive_paged", window_left)
+    let _ = window_left;
+    attn_at(
+        q,
+        kv,
+        "attn::attention_naive_paged",
+        // NOTHING, AND THAT IS THE HONEST STATE. This routine declares the
+        // KV POOL's geometry -- page size, scheme byte, storage dtype,
+        // block size -- and a trace text holds none of it: the pool is the
+        // allocator's and the text never sees a deployment. It stated
+        // `[window_left]` before, which put one number at the page-size slot
+        // and left the rest zero; an empty run at least does not claim a
+        // page size of -1 -- and the routine asks the fire for the pool's
+        // numbers again, which is where they were before the marks and where
+        // `driver-cuda` has always answered them.
+        vec![],
+    )
 }
 
 /// `kernels::attn::write_kv_explicit_bf16`: the explicit-descriptor KV write (graph-replay
@@ -692,13 +783,21 @@ pub fn attention_flashinfer_decode_capture(
     kv: &Kv,
     window_left: i32,
     head_dim: u32,
+    soft_cap: f32,
+    sm_scale: f32,
 ) -> Option<Val> {
     decode_plan(&q.t, head_dim, window_left == -1);
     attn_at(
         q,
         kv,
         "attn::dispatch_attention_flashinfer_decode_capture",
-        window_left,
+        // THIS one declares the window as a `Const` and the other decode does
+        // not, which is the whole reason the run is spelled per routine.
+        {
+            let mut p = vec![window_left as u32];
+            p.extend(cap_and_scale(soft_cap, sm_scale, head_dim));
+            p
+        },
     )
 }
 
@@ -709,13 +808,21 @@ pub fn attention_flashinfer_prefill_capture(
     kv: &Kv,
     window_left: i32,
     head_dim: u32,
+    soft_cap: f32,
+    sm_scale: f32,
 ) -> Option<Val> {
+    // THE WINDOW IS A FACT NOW, NOT A SCALAR. Every routine below asks
+    // for it through `keys::WindowLeft`; the statement used to carry it
+    // and carried it into the slot a soft cap is read from. It stays on
+    // the signature because a caller states the deployment's window here
+    // and the guard predicates above still read the same number.
+    let _ = window_left;
     prefill_plan(&q.t, head_dim);
     attn_at(
         q,
         kv,
         "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
-        window_left,
+        cap_and_scale(soft_cap, sm_scale, head_dim),
     )
 }
 
@@ -748,13 +855,21 @@ pub fn attention_flashinfer_prefill_custom(
     kv: &Kv,
     window_left: i32,
     head_dim: u32,
+    soft_cap: f32,
+    sm_scale: f32,
 ) -> Option<Val> {
+    // THE WINDOW IS A FACT NOW, NOT A SCALAR. Every routine below asks
+    // for it through `keys::WindowLeft`; the statement used to carry it
+    // and carried it into the slot a soft cap is read from. It stays on
+    // the signature because a caller states the deployment's window here
+    // and the guard predicates above still read the same number.
+    let _ = window_left;
     prefill_plan(&q.t, head_dim);
     attn_at(
         q,
         kv,
         "attn::dispatch_attention_flashinfer_prefill_custom",
-        window_left,
+        cap_and_scale(soft_cap, sm_scale, head_dim),
     )
 }
 
@@ -784,9 +899,21 @@ pub fn dequant_only(kv: &Kv) {
     );
 }
 
-/// Attention dispatch shape: q input, cache state, output unless a guard/peel owns it.
-/// `window_left` rides params; runtime overrides still need a guard predicate.
-fn attn_at(q: &Val, kv: &Kv, kernel: &str, window_left: i32) -> Option<Val> {
+/// Attention dispatch shape: q input, cache state, output unless a guard/peel
+/// owns it. `params` is the run the named routine's `Const` marks declare, in
+/// their order.
+///
+/// IT USED TO BE `vec![window_left as u32]`, AND THAT IS NOT WHAT ANY OF THESE
+/// ROUTINES READ THERE. Every flashinfer dispatch declares `logits_soft_cap:
+/// Const<f32>` at slot 0 and asks for the window through `keys::WindowLeft`
+/// instead -- so the statement put `-1` where a float's BITS are read, which
+/// is `NaN`, and a soft cap of NaN takes every logit with it. The window
+/// itself was stated at a slot nothing reads.
+///
+/// It could not fault and it could not be seen: one `u32` is as wide as
+/// another, the count matched for the routines that take exactly one scalar,
+/// and `check_plan`'s params rule only ever counted them.
+fn attn_at(q: &Val, kv: &Kv, kernel: &str, params: Vec<u32>) -> Option<Val> {
     let out = q.t.inner.borrow().inside_value_region();
     let shape = (!out).then(|| q.t.inner.borrow().value_shape(q.id));
     record_with_params(
@@ -795,8 +922,26 @@ fn attn_at(q: &Val, kv: &Kv, kernel: &str, window_left: i32) -> Option<Val> {
         kernel,
         vec![],
         kv_state(kv),
-        vec![window_left as u32],
+        params,
         vec![q.id],
         shape.map(|s| (s, DType::BF16)),
     )
+}
+
+/// `[logits_soft_cap, sm_scale]`, the run five of the flashinfer dispatches
+/// declare and nothing else.
+///
+/// `sm_scale` is derived from the head dim when the caller states none, which
+/// is llama's `1/sqrt(d)` rule and NOT attention's -- gemma-3 publishes
+/// `query_pre_attn_scalar` and gemma-4 publishes 1.0, because its per-head
+/// q/k norms have already divided by what this would divide by again. A
+/// statement that derives it cannot serve a family that states it, so a
+/// positive `sm_scale` always wins.
+fn cap_and_scale(soft_cap: f32, sm_scale: f32, head_dim: u32) -> Vec<u32> {
+    let scale = if sm_scale > 0.0 {
+        sm_scale
+    } else {
+        1.0f32 / (head_dim as f32).sqrt()
+    };
+    vec![soft_cap.to_bits(), scale.to_bits()]
 }

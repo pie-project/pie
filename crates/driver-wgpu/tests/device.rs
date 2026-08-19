@@ -2381,21 +2381,21 @@ fn the_first_ported_routine_runs_on_this_adapter_and_averages_two_streams() {
         // statement places it as an operand. That marking is the read-side
         // repair the arity checker was red for: `Provenance::Env` is what
         // `arity_problem` skips.
-        kernels_wgpu::routine::InSlot {
+        kernels_wgpu::routine::In {
             ptr: kernels_wgpu::routine::Buf(0),
         },
-        kernels_wgpu::routine::InSlot {
+        kernels_wgpu::routine::In {
             ptr: kernels_wgpu::routine::Buf(1),
         },
-        kernels_wgpu::routine::OutSlot {
+        kernels_wgpu::routine::Out {
             ptr: kernels_wgpu::routine::BufMut(2),
         },
         // The per-layer table is a `Block` and the two extents are `Ask`ed
         // facts by name -- upstream retyped all three. The numbers are the
         // same; the types say who SUPPLIES them.
-        kernels_wgpu::routine::Block::new(kernels_wgpu::routine::Buf(3)),
-        kernels_wgpu::routine::Ask::new(i32::try_from(WORDS).expect("fits")),
-        kernels_wgpu::routine::Ask::new(1),
+        kernels_wgpu::routine::Env::new(kernels_wgpu::routine::Buf(3)),
+        kernels_wgpu::routine::Env::new(i32::try_from(WORDS).expect("fits")),
+        kernels_wgpu::routine::Env::new(1),
     )
     .expect("the routine dispatches on this adapter");
 

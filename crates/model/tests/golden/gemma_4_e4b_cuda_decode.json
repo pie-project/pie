@@ -6682,15 +6682,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 0
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -6942,15 +6954,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 1
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -7202,15 +7226,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 2
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -7462,15 +7498,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 3
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -7722,15 +7770,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 4
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -8084,15 +8144,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 512,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 5
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -8344,15 +8416,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 6
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -8604,15 +8688,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 7
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -8864,15 +8960,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 8
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -9124,15 +9232,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 9
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -9384,15 +9504,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 10
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -9746,15 +9878,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 512,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 11
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -10006,15 +10150,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 12
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -10266,15 +10422,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 13
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -10526,15 +10694,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 14
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -10786,15 +10966,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 15
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -11046,15 +11238,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 16
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -11408,15 +11612,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 512,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 17
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -11668,15 +11884,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 18
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -11928,15 +12156,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 19
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -12188,15 +12428,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 20
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -12448,15 +12700,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 21
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -12708,15 +12972,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 22
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -13070,15 +13346,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 512,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 23
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -13296,7 +13584,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.24.q_norm"
           ]
@@ -13325,15 +13613,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 22
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -13551,7 +13851,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.25.q_norm"
           ]
@@ -13580,15 +13880,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 22
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -13806,7 +14118,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.26.q_norm"
           ]
@@ -13835,15 +14147,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 22
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -14061,7 +14385,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.27.q_norm"
           ]
@@ -14090,15 +14414,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 22
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -14316,7 +14652,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.28.q_norm"
           ]
@@ -14345,15 +14681,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 22
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -14586,7 +14934,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::rope_partial_bf16",
+          "kernel": "rope::rope_partial_q_bf16",
           "params": [
             128
           ]
@@ -14615,15 +14963,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 512,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 23
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -14841,7 +15201,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.30.q_norm"
           ]
@@ -14870,15 +15230,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 22
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -15096,7 +15468,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.31.q_norm"
           ]
@@ -15125,15 +15497,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 22
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -15351,7 +15735,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.32.q_norm"
           ]
@@ -15380,15 +15764,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 22
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -15606,7 +16002,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.33.q_norm"
           ]
@@ -15635,15 +16031,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 22
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -15861,7 +16269,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.34.q_norm"
           ]
@@ -15890,15 +16298,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 22
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -16131,7 +16551,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::rope_partial_bf16",
+          "kernel": "rope::rope_partial_q_bf16",
           "params": [
             128
           ]
@@ -16160,15 +16580,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 512,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 23
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -16386,7 +16818,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.36.q_norm"
           ]
@@ -16415,15 +16847,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 22
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -16641,7 +17085,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.37.q_norm"
           ]
@@ -16670,15 +17114,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 22
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -16896,7 +17352,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.38.q_norm"
           ]
@@ -16925,15 +17381,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 22
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -17151,7 +17619,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.39.q_norm"
           ]
@@ -17180,15 +17648,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 22
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -17406,7 +17886,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.40.q_norm"
           ]
@@ -17435,15 +17915,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 22
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -17676,7 +18168,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::rope_partial_bf16",
+          "kernel": "rope::rope_partial_q_bf16",
           "params": [
             128
           ]
@@ -17705,15 +18197,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 512,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 23
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -17972,7 +18476,7 @@
     {
       "seam": "attn.out",
       "layer": 0,
-      "op": 15,
+      "op": 16,
       "values": [
         13
       ]
@@ -17980,7 +18484,7 @@
     {
       "seam": "attn.q",
       "layer": 1,
-      "op": 29,
+      "op": 30,
       "values": [
         28
       ]
@@ -17988,7 +18492,7 @@
     {
       "seam": "attn.out",
       "layer": 1,
-      "op": 31,
+      "op": 33,
       "values": [
         29
       ]
@@ -17996,7 +18500,7 @@
     {
       "seam": "attn.q",
       "layer": 2,
-      "op": 45,
+      "op": 47,
       "values": [
         44
       ]
@@ -18004,7 +18508,7 @@
     {
       "seam": "attn.out",
       "layer": 2,
-      "op": 47,
+      "op": 50,
       "values": [
         45
       ]
@@ -18012,7 +18516,7 @@
     {
       "seam": "attn.q",
       "layer": 3,
-      "op": 61,
+      "op": 64,
       "values": [
         60
       ]
@@ -18020,7 +18524,7 @@
     {
       "seam": "attn.out",
       "layer": 3,
-      "op": 63,
+      "op": 67,
       "values": [
         61
       ]
@@ -18028,7 +18532,7 @@
     {
       "seam": "attn.q",
       "layer": 4,
-      "op": 77,
+      "op": 81,
       "values": [
         76
       ]
@@ -18036,7 +18540,7 @@
     {
       "seam": "attn.out",
       "layer": 4,
-      "op": 79,
+      "op": 84,
       "values": [
         77
       ]
@@ -18044,7 +18548,7 @@
     {
       "seam": "attn.qv",
       "layer": 5,
-      "op": 93,
+      "op": 98,
       "values": [
         92,
         94
@@ -18053,7 +18557,7 @@
     {
       "seam": "attn.q",
       "layer": 5,
-      "op": 100,
+      "op": 105,
       "values": [
         98
       ]
@@ -18061,7 +18565,7 @@
     {
       "seam": "attn.out",
       "layer": 5,
-      "op": 102,
+      "op": 108,
       "values": [
         100
       ]
@@ -18069,7 +18573,7 @@
     {
       "seam": "attn.q",
       "layer": 6,
-      "op": 116,
+      "op": 122,
       "values": [
         115
       ]
@@ -18077,7 +18581,7 @@
     {
       "seam": "attn.out",
       "layer": 6,
-      "op": 118,
+      "op": 125,
       "values": [
         116
       ]
@@ -18085,7 +18589,7 @@
     {
       "seam": "attn.q",
       "layer": 7,
-      "op": 132,
+      "op": 139,
       "values": [
         131
       ]
@@ -18093,7 +18597,7 @@
     {
       "seam": "attn.out",
       "layer": 7,
-      "op": 134,
+      "op": 142,
       "values": [
         132
       ]
@@ -18101,7 +18605,7 @@
     {
       "seam": "attn.q",
       "layer": 8,
-      "op": 148,
+      "op": 156,
       "values": [
         147
       ]
@@ -18109,7 +18613,7 @@
     {
       "seam": "attn.out",
       "layer": 8,
-      "op": 150,
+      "op": 159,
       "values": [
         148
       ]
@@ -18117,7 +18621,7 @@
     {
       "seam": "attn.q",
       "layer": 9,
-      "op": 164,
+      "op": 173,
       "values": [
         163
       ]
@@ -18125,7 +18629,7 @@
     {
       "seam": "attn.out",
       "layer": 9,
-      "op": 166,
+      "op": 176,
       "values": [
         164
       ]
@@ -18133,7 +18637,7 @@
     {
       "seam": "attn.q",
       "layer": 10,
-      "op": 180,
+      "op": 190,
       "values": [
         179
       ]
@@ -18141,7 +18645,7 @@
     {
       "seam": "attn.out",
       "layer": 10,
-      "op": 182,
+      "op": 193,
       "values": [
         180
       ]
@@ -18149,7 +18653,7 @@
     {
       "seam": "attn.qv",
       "layer": 11,
-      "op": 196,
+      "op": 207,
       "values": [
         195,
         197
@@ -18158,7 +18662,7 @@
     {
       "seam": "attn.q",
       "layer": 11,
-      "op": 203,
+      "op": 214,
       "values": [
         201
       ]
@@ -18166,7 +18670,7 @@
     {
       "seam": "attn.out",
       "layer": 11,
-      "op": 205,
+      "op": 217,
       "values": [
         203
       ]
@@ -18174,7 +18678,7 @@
     {
       "seam": "attn.q",
       "layer": 12,
-      "op": 219,
+      "op": 231,
       "values": [
         218
       ]
@@ -18182,7 +18686,7 @@
     {
       "seam": "attn.out",
       "layer": 12,
-      "op": 221,
+      "op": 234,
       "values": [
         219
       ]
@@ -18190,7 +18694,7 @@
     {
       "seam": "attn.q",
       "layer": 13,
-      "op": 235,
+      "op": 248,
       "values": [
         234
       ]
@@ -18198,7 +18702,7 @@
     {
       "seam": "attn.out",
       "layer": 13,
-      "op": 237,
+      "op": 251,
       "values": [
         235
       ]
@@ -18206,7 +18710,7 @@
     {
       "seam": "attn.q",
       "layer": 14,
-      "op": 251,
+      "op": 265,
       "values": [
         250
       ]
@@ -18214,7 +18718,7 @@
     {
       "seam": "attn.out",
       "layer": 14,
-      "op": 253,
+      "op": 268,
       "values": [
         251
       ]
@@ -18222,7 +18726,7 @@
     {
       "seam": "attn.q",
       "layer": 15,
-      "op": 267,
+      "op": 282,
       "values": [
         266
       ]
@@ -18230,7 +18734,7 @@
     {
       "seam": "attn.out",
       "layer": 15,
-      "op": 269,
+      "op": 285,
       "values": [
         267
       ]
@@ -18238,7 +18742,7 @@
     {
       "seam": "attn.q",
       "layer": 16,
-      "op": 283,
+      "op": 299,
       "values": [
         282
       ]
@@ -18246,7 +18750,7 @@
     {
       "seam": "attn.out",
       "layer": 16,
-      "op": 285,
+      "op": 302,
       "values": [
         283
       ]
@@ -18254,7 +18758,7 @@
     {
       "seam": "attn.qv",
       "layer": 17,
-      "op": 299,
+      "op": 316,
       "values": [
         298,
         300
@@ -18263,7 +18767,7 @@
     {
       "seam": "attn.q",
       "layer": 17,
-      "op": 306,
+      "op": 323,
       "values": [
         304
       ]
@@ -18271,7 +18775,7 @@
     {
       "seam": "attn.out",
       "layer": 17,
-      "op": 308,
+      "op": 326,
       "values": [
         306
       ]
@@ -18279,7 +18783,7 @@
     {
       "seam": "attn.q",
       "layer": 18,
-      "op": 322,
+      "op": 340,
       "values": [
         321
       ]
@@ -18287,7 +18791,7 @@
     {
       "seam": "attn.out",
       "layer": 18,
-      "op": 324,
+      "op": 343,
       "values": [
         322
       ]
@@ -18295,7 +18799,7 @@
     {
       "seam": "attn.q",
       "layer": 19,
-      "op": 338,
+      "op": 357,
       "values": [
         337
       ]
@@ -18303,7 +18807,7 @@
     {
       "seam": "attn.out",
       "layer": 19,
-      "op": 340,
+      "op": 360,
       "values": [
         338
       ]
@@ -18311,7 +18815,7 @@
     {
       "seam": "attn.q",
       "layer": 20,
-      "op": 354,
+      "op": 374,
       "values": [
         353
       ]
@@ -18319,7 +18823,7 @@
     {
       "seam": "attn.out",
       "layer": 20,
-      "op": 356,
+      "op": 377,
       "values": [
         354
       ]
@@ -18327,7 +18831,7 @@
     {
       "seam": "attn.q",
       "layer": 21,
-      "op": 370,
+      "op": 391,
       "values": [
         369
       ]
@@ -18335,7 +18839,7 @@
     {
       "seam": "attn.out",
       "layer": 21,
-      "op": 372,
+      "op": 394,
       "values": [
         370
       ]
@@ -18343,7 +18847,7 @@
     {
       "seam": "attn.q",
       "layer": 22,
-      "op": 386,
+      "op": 408,
       "values": [
         385
       ]
@@ -18351,7 +18855,7 @@
     {
       "seam": "attn.out",
       "layer": 22,
-      "op": 388,
+      "op": 411,
       "values": [
         386
       ]
@@ -18359,7 +18863,7 @@
     {
       "seam": "attn.qv",
       "layer": 23,
-      "op": 402,
+      "op": 425,
       "values": [
         401,
         403
@@ -18368,7 +18872,7 @@
     {
       "seam": "attn.q",
       "layer": 23,
-      "op": 409,
+      "op": 432,
       "values": [
         407
       ]
@@ -18376,7 +18880,7 @@
     {
       "seam": "attn.out",
       "layer": 23,
-      "op": 411,
+      "op": 435,
       "values": [
         409
       ]
@@ -18384,7 +18888,7 @@
     {
       "seam": "attn.q",
       "layer": 24,
-      "op": 425,
+      "op": 449,
       "values": [
         424
       ]
@@ -18392,7 +18896,7 @@
     {
       "seam": "attn.out",
       "layer": 24,
-      "op": 427,
+      "op": 452,
       "values": [
         425
       ]
@@ -18400,7 +18904,7 @@
     {
       "seam": "attn.q",
       "layer": 25,
-      "op": 441,
+      "op": 466,
       "values": [
         440
       ]
@@ -18408,7 +18912,7 @@
     {
       "seam": "attn.out",
       "layer": 25,
-      "op": 443,
+      "op": 469,
       "values": [
         441
       ]
@@ -18416,7 +18920,7 @@
     {
       "seam": "attn.q",
       "layer": 26,
-      "op": 457,
+      "op": 483,
       "values": [
         456
       ]
@@ -18424,7 +18928,7 @@
     {
       "seam": "attn.out",
       "layer": 26,
-      "op": 459,
+      "op": 486,
       "values": [
         457
       ]
@@ -18432,7 +18936,7 @@
     {
       "seam": "attn.q",
       "layer": 27,
-      "op": 473,
+      "op": 500,
       "values": [
         472
       ]
@@ -18440,7 +18944,7 @@
     {
       "seam": "attn.out",
       "layer": 27,
-      "op": 475,
+      "op": 503,
       "values": [
         473
       ]
@@ -18448,7 +18952,7 @@
     {
       "seam": "attn.q",
       "layer": 28,
-      "op": 489,
+      "op": 517,
       "values": [
         488
       ]
@@ -18456,7 +18960,7 @@
     {
       "seam": "attn.out",
       "layer": 28,
-      "op": 491,
+      "op": 520,
       "values": [
         489
       ]
@@ -18464,7 +18968,7 @@
     {
       "seam": "attn.q",
       "layer": 29,
-      "op": 506,
+      "op": 535,
       "values": [
         505
       ]
@@ -18472,7 +18976,7 @@
     {
       "seam": "attn.out",
       "layer": 29,
-      "op": 508,
+      "op": 538,
       "values": [
         506
       ]
@@ -18480,7 +18984,7 @@
     {
       "seam": "attn.q",
       "layer": 30,
-      "op": 522,
+      "op": 552,
       "values": [
         521
       ]
@@ -18488,7 +18992,7 @@
     {
       "seam": "attn.out",
       "layer": 30,
-      "op": 524,
+      "op": 555,
       "values": [
         522
       ]
@@ -18496,7 +19000,7 @@
     {
       "seam": "attn.q",
       "layer": 31,
-      "op": 538,
+      "op": 569,
       "values": [
         537
       ]
@@ -18504,7 +19008,7 @@
     {
       "seam": "attn.out",
       "layer": 31,
-      "op": 540,
+      "op": 572,
       "values": [
         538
       ]
@@ -18512,7 +19016,7 @@
     {
       "seam": "attn.q",
       "layer": 32,
-      "op": 554,
+      "op": 586,
       "values": [
         553
       ]
@@ -18520,7 +19024,7 @@
     {
       "seam": "attn.out",
       "layer": 32,
-      "op": 556,
+      "op": 589,
       "values": [
         554
       ]
@@ -18528,7 +19032,7 @@
     {
       "seam": "attn.q",
       "layer": 33,
-      "op": 570,
+      "op": 603,
       "values": [
         569
       ]
@@ -18536,7 +19040,7 @@
     {
       "seam": "attn.out",
       "layer": 33,
-      "op": 572,
+      "op": 606,
       "values": [
         570
       ]
@@ -18544,7 +19048,7 @@
     {
       "seam": "attn.q",
       "layer": 34,
-      "op": 586,
+      "op": 620,
       "values": [
         585
       ]
@@ -18552,7 +19056,7 @@
     {
       "seam": "attn.out",
       "layer": 34,
-      "op": 588,
+      "op": 623,
       "values": [
         586
       ]
@@ -18560,7 +19064,7 @@
     {
       "seam": "attn.q",
       "layer": 35,
-      "op": 603,
+      "op": 638,
       "values": [
         602
       ]
@@ -18568,7 +19072,7 @@
     {
       "seam": "attn.out",
       "layer": 35,
-      "op": 605,
+      "op": 641,
       "values": [
         603
       ]
@@ -18576,7 +19080,7 @@
     {
       "seam": "attn.q",
       "layer": 36,
-      "op": 619,
+      "op": 655,
       "values": [
         618
       ]
@@ -18584,7 +19088,7 @@
     {
       "seam": "attn.out",
       "layer": 36,
-      "op": 621,
+      "op": 658,
       "values": [
         619
       ]
@@ -18592,7 +19096,7 @@
     {
       "seam": "attn.q",
       "layer": 37,
-      "op": 635,
+      "op": 672,
       "values": [
         634
       ]
@@ -18600,7 +19104,7 @@
     {
       "seam": "attn.out",
       "layer": 37,
-      "op": 637,
+      "op": 675,
       "values": [
         635
       ]
@@ -18608,7 +19112,7 @@
     {
       "seam": "attn.q",
       "layer": 38,
-      "op": 651,
+      "op": 689,
       "values": [
         650
       ]
@@ -18616,7 +19120,7 @@
     {
       "seam": "attn.out",
       "layer": 38,
-      "op": 653,
+      "op": 692,
       "values": [
         651
       ]
@@ -18624,7 +19128,7 @@
     {
       "seam": "attn.q",
       "layer": 39,
-      "op": 667,
+      "op": 706,
       "values": [
         666
       ]
@@ -18632,7 +19136,7 @@
     {
       "seam": "attn.out",
       "layer": 39,
-      "op": 669,
+      "op": 709,
       "values": [
         667
       ]
@@ -18640,7 +19144,7 @@
     {
       "seam": "attn.q",
       "layer": 40,
-      "op": 683,
+      "op": 723,
       "values": [
         682
       ]
@@ -18648,7 +19152,7 @@
     {
       "seam": "attn.out",
       "layer": 40,
-      "op": 685,
+      "op": 726,
       "values": [
         683
       ]
@@ -18656,7 +19160,7 @@
     {
       "seam": "attn.q",
       "layer": 41,
-      "op": 700,
+      "op": 741,
       "values": [
         699
       ]
@@ -18664,7 +19168,7 @@
     {
       "seam": "attn.out",
       "layer": 41,
-      "op": 702,
+      "op": 744,
       "values": [
         700
       ]

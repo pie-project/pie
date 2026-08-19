@@ -3,11 +3,11 @@
 //! The family table is empty — `driver-wgpu` arms this symbol directly — so
 //! the buffer order lives only in the shader's `@binding` numbering.
 
+use kernels_macros::routine;
 use kernels::KernelSig;
 use kernels::routine::{Refusal};
 
-use crate::routine::{keys, Ask, Bind, Buf, BufMut, Ctx, Fire, Routine};
-use crate::routine::{InSlot, OutSlot};
+use crate::routine::{Asks, Bind, Ctx, Fire, In, Out, Tensor, bf16, keys};
 
 /// EMPTY: this family's rows have been RETIRED — `driver-wgpu`'s
 /// `lowering::arm::argmax_logits` is this kernel's arm. The static stays
@@ -36,27 +36,20 @@ const GROUP_X: u32 = 256;
 /// # Errors
 ///
 /// [`Refusal::Empty`] when there are no rows to reduce.
+#[routine]
 pub fn argmax_logits(
-    ctx: &Ctx,
-    logits: InSlot<0, Buf>,
-    next_token: OutSlot<0, BufMut>,
-    params: InSlot<1, Buf>,
-    eos_flag: OutSlot<1, BufMut>,
-    rows: Ask<keys::Rows, u32>,
-) -> Result<(), Refusal> {
-    if *rows == 0 {
+    ctx: &Ctx<'_>,
+    logits: In<Tensor<bf16>>,
+    next_token: Out<Tensor<u32>>,
+    params: In<Tensor<bf16>>,
+    eos_flag: Out<Tensor<u32>>) -> Result<(), Refusal> {
+    let rows = ctx.ask::<u32, keys::Rows>()?;
+    if rows == 0 {
         return Err(Refusal::Empty { what: "rows" });
     }
     // `wg.y` is the row, and x carries the one workgroup that reduces it.
-    ctx.dispatch(
-        Fire {
-            module: "sample/argmax.wgsl",
-            entrypoint: "argmax_logits_bfloat16",
-            lanes: [GROUP_X, *rows, 1],
-        },
-        &[logits.v(), next_token.v(), params.v(), eos_flag.v()],
+    ctx.fire(
+        Fire::at("sample/argmax.wgsl", "argmax_logits_bfloat16").apply([GROUP_X, rows, 1]),
+        &[logits.arg(), next_token.arg(), params.arg(), eos_flag.arg()],
     )
 }
-
-/// This family's routines.
-pub static ROUTINES: &[Routine] = &[crate::routine!(argmax_logits)];

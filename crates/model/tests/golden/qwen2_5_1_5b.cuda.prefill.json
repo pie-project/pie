@@ -4199,7 +4199,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -4269,10 +4271,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -4292,19 +4294,25 @@
         9
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "dest": [
+        11
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "dest": [
+        11
+      ]
     },
     {
       "kind": {
@@ -4318,7 +4326,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "dest": [
+        11
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        11
+      ]
     },
     {
       "kind": {
@@ -4329,7 +4357,8 @@
             "layer": 0
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -4337,7 +4366,27 @@
         9
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "dest": [
+        11
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        11
+      ]
     },
     {
       "kind": {
@@ -4348,7 +4397,8 @@
             "layer": 0
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -4356,7 +4406,10 @@
         9
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "dest": [
+        11
+      ]
     },
     {
       "kind": {
@@ -4369,7 +4422,10 @@
         9
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "dest": [
+        11
+      ]
     },
     {
       "kind": {
@@ -4382,7 +4438,10 @@
         9
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "dest": [
+        11
+      ]
     },
     {
       "kind": {
@@ -4396,7 +4455,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "dest": [
+        11
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        11
+      ]
     },
     {
       "kind": {
@@ -4407,7 +4486,8 @@
             "layer": 0
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -4415,7 +4495,10 @@
         9
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "dest": [
+        11
+      ]
     },
     {
       "kind": {
@@ -4428,7 +4511,10 @@
         9
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "dest": [
+        11
+      ]
     },
     {
       "kind": {
@@ -4633,7 +4719,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -4703,10 +4791,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -4726,19 +4814,25 @@
         25
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "dest": [
+        27
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "dest": [
+        27
+      ]
     },
     {
       "kind": {
@@ -4752,7 +4846,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "dest": [
+        27
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        27
+      ]
     },
     {
       "kind": {
@@ -4763,7 +4877,8 @@
             "layer": 1
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -4771,7 +4886,27 @@
         25
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "dest": [
+        27
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        27
+      ]
     },
     {
       "kind": {
@@ -4782,7 +4917,8 @@
             "layer": 1
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -4790,7 +4926,10 @@
         25
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "dest": [
+        27
+      ]
     },
     {
       "kind": {
@@ -4803,7 +4942,10 @@
         25
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "dest": [
+        27
+      ]
     },
     {
       "kind": {
@@ -4816,7 +4958,10 @@
         25
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "dest": [
+        27
+      ]
     },
     {
       "kind": {
@@ -4830,7 +4975,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "dest": [
+        27
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        27
+      ]
     },
     {
       "kind": {
@@ -4841,7 +5006,8 @@
             "layer": 1
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -4849,7 +5015,10 @@
         25
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "dest": [
+        27
+      ]
     },
     {
       "kind": {
@@ -4862,7 +5031,10 @@
         25
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "dest": [
+        27
+      ]
     },
     {
       "kind": {
@@ -5067,7 +5239,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -5137,10 +5311,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -5160,19 +5334,25 @@
         41
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "dest": [
+        43
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "dest": [
+        43
+      ]
     },
     {
       "kind": {
@@ -5186,7 +5366,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "dest": [
+        43
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        43
+      ]
     },
     {
       "kind": {
@@ -5197,7 +5397,8 @@
             "layer": 2
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -5205,7 +5406,27 @@
         41
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "dest": [
+        43
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        43
+      ]
     },
     {
       "kind": {
@@ -5216,7 +5437,8 @@
             "layer": 2
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -5224,7 +5446,10 @@
         41
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "dest": [
+        43
+      ]
     },
     {
       "kind": {
@@ -5237,7 +5462,10 @@
         41
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "dest": [
+        43
+      ]
     },
     {
       "kind": {
@@ -5250,7 +5478,10 @@
         41
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "dest": [
+        43
+      ]
     },
     {
       "kind": {
@@ -5264,7 +5495,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "dest": [
+        43
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        43
+      ]
     },
     {
       "kind": {
@@ -5275,7 +5526,8 @@
             "layer": 2
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -5283,7 +5535,10 @@
         41
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "dest": [
+        43
+      ]
     },
     {
       "kind": {
@@ -5296,7 +5551,10 @@
         41
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "dest": [
+        43
+      ]
     },
     {
       "kind": {
@@ -5501,7 +5759,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -5571,10 +5831,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -5594,19 +5854,25 @@
         57
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "dest": [
+        59
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "dest": [
+        59
+      ]
     },
     {
       "kind": {
@@ -5620,7 +5886,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "dest": [
+        59
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        59
+      ]
     },
     {
       "kind": {
@@ -5631,7 +5917,8 @@
             "layer": 3
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -5639,7 +5926,27 @@
         57
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "dest": [
+        59
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        59
+      ]
     },
     {
       "kind": {
@@ -5650,7 +5957,8 @@
             "layer": 3
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -5658,7 +5966,10 @@
         57
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "dest": [
+        59
+      ]
     },
     {
       "kind": {
@@ -5671,7 +5982,10 @@
         57
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "dest": [
+        59
+      ]
     },
     {
       "kind": {
@@ -5684,7 +5998,10 @@
         57
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "dest": [
+        59
+      ]
     },
     {
       "kind": {
@@ -5698,7 +6015,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "dest": [
+        59
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        59
+      ]
     },
     {
       "kind": {
@@ -5709,7 +6046,8 @@
             "layer": 3
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -5717,7 +6055,10 @@
         57
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "dest": [
+        59
+      ]
     },
     {
       "kind": {
@@ -5730,7 +6071,10 @@
         57
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "dest": [
+        59
+      ]
     },
     {
       "kind": {
@@ -5935,7 +6279,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -6005,10 +6351,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -6028,19 +6374,25 @@
         73
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "dest": [
+        75
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "dest": [
+        75
+      ]
     },
     {
       "kind": {
@@ -6054,7 +6406,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "dest": [
+        75
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        75
+      ]
     },
     {
       "kind": {
@@ -6065,7 +6437,8 @@
             "layer": 4
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -6073,7 +6446,27 @@
         73
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "dest": [
+        75
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        75
+      ]
     },
     {
       "kind": {
@@ -6084,7 +6477,8 @@
             "layer": 4
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -6092,7 +6486,10 @@
         73
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "dest": [
+        75
+      ]
     },
     {
       "kind": {
@@ -6105,7 +6502,10 @@
         73
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "dest": [
+        75
+      ]
     },
     {
       "kind": {
@@ -6118,7 +6518,10 @@
         73
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "dest": [
+        75
+      ]
     },
     {
       "kind": {
@@ -6132,7 +6535,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "dest": [
+        75
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        75
+      ]
     },
     {
       "kind": {
@@ -6143,7 +6566,8 @@
             "layer": 4
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -6151,7 +6575,10 @@
         73
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "dest": [
+        75
+      ]
     },
     {
       "kind": {
@@ -6164,7 +6591,10 @@
         73
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "dest": [
+        75
+      ]
     },
     {
       "kind": {
@@ -6369,7 +6799,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -6439,10 +6871,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -6462,19 +6894,25 @@
         89
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "dest": [
+        91
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "dest": [
+        91
+      ]
     },
     {
       "kind": {
@@ -6488,7 +6926,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "dest": [
+        91
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        91
+      ]
     },
     {
       "kind": {
@@ -6499,7 +6957,8 @@
             "layer": 5
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -6507,7 +6966,27 @@
         89
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "dest": [
+        91
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        91
+      ]
     },
     {
       "kind": {
@@ -6518,7 +6997,8 @@
             "layer": 5
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -6526,7 +7006,10 @@
         89
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "dest": [
+        91
+      ]
     },
     {
       "kind": {
@@ -6539,7 +7022,10 @@
         89
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "dest": [
+        91
+      ]
     },
     {
       "kind": {
@@ -6552,7 +7038,10 @@
         89
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "dest": [
+        91
+      ]
     },
     {
       "kind": {
@@ -6566,7 +7055,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "dest": [
+        91
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        91
+      ]
     },
     {
       "kind": {
@@ -6577,7 +7086,8 @@
             "layer": 5
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -6585,7 +7095,10 @@
         89
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "dest": [
+        91
+      ]
     },
     {
       "kind": {
@@ -6598,7 +7111,10 @@
         89
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "dest": [
+        91
+      ]
     },
     {
       "kind": {
@@ -6803,7 +7319,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -6873,10 +7391,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -6896,19 +7414,25 @@
         105
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "dest": [
+        107
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "dest": [
+        107
+      ]
     },
     {
       "kind": {
@@ -6922,7 +7446,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "dest": [
+        107
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        107
+      ]
     },
     {
       "kind": {
@@ -6933,7 +7477,8 @@
             "layer": 6
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -6941,7 +7486,27 @@
         105
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "dest": [
+        107
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        107
+      ]
     },
     {
       "kind": {
@@ -6952,7 +7517,8 @@
             "layer": 6
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -6960,7 +7526,10 @@
         105
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "dest": [
+        107
+      ]
     },
     {
       "kind": {
@@ -6973,7 +7542,10 @@
         105
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "dest": [
+        107
+      ]
     },
     {
       "kind": {
@@ -6986,7 +7558,10 @@
         105
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "dest": [
+        107
+      ]
     },
     {
       "kind": {
@@ -7000,7 +7575,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "dest": [
+        107
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        107
+      ]
     },
     {
       "kind": {
@@ -7011,7 +7606,8 @@
             "layer": 6
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -7019,7 +7615,10 @@
         105
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "dest": [
+        107
+      ]
     },
     {
       "kind": {
@@ -7032,7 +7631,10 @@
         105
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "dest": [
+        107
+      ]
     },
     {
       "kind": {
@@ -7237,7 +7839,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -7307,10 +7911,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -7330,19 +7934,25 @@
         121
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "dest": [
+        123
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "dest": [
+        123
+      ]
     },
     {
       "kind": {
@@ -7356,7 +7966,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "dest": [
+        123
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        123
+      ]
     },
     {
       "kind": {
@@ -7367,7 +7997,8 @@
             "layer": 7
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -7375,7 +8006,27 @@
         121
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "dest": [
+        123
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        123
+      ]
     },
     {
       "kind": {
@@ -7386,7 +8037,8 @@
             "layer": 7
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -7394,7 +8046,10 @@
         121
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "dest": [
+        123
+      ]
     },
     {
       "kind": {
@@ -7407,7 +8062,10 @@
         121
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "dest": [
+        123
+      ]
     },
     {
       "kind": {
@@ -7420,7 +8078,10 @@
         121
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "dest": [
+        123
+      ]
     },
     {
       "kind": {
@@ -7434,7 +8095,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "dest": [
+        123
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        123
+      ]
     },
     {
       "kind": {
@@ -7445,7 +8126,8 @@
             "layer": 7
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -7453,7 +8135,10 @@
         121
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "dest": [
+        123
+      ]
     },
     {
       "kind": {
@@ -7466,7 +8151,10 @@
         121
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "dest": [
+        123
+      ]
     },
     {
       "kind": {
@@ -7671,7 +8359,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -7741,10 +8431,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -7764,19 +8454,25 @@
         137
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "dest": [
+        139
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "dest": [
+        139
+      ]
     },
     {
       "kind": {
@@ -7790,7 +8486,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "dest": [
+        139
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        139
+      ]
     },
     {
       "kind": {
@@ -7801,7 +8517,8 @@
             "layer": 8
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -7809,7 +8526,27 @@
         137
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "dest": [
+        139
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        139
+      ]
     },
     {
       "kind": {
@@ -7820,7 +8557,8 @@
             "layer": 8
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -7828,7 +8566,10 @@
         137
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "dest": [
+        139
+      ]
     },
     {
       "kind": {
@@ -7841,7 +8582,10 @@
         137
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "dest": [
+        139
+      ]
     },
     {
       "kind": {
@@ -7854,7 +8598,10 @@
         137
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "dest": [
+        139
+      ]
     },
     {
       "kind": {
@@ -7868,7 +8615,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "dest": [
+        139
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        139
+      ]
     },
     {
       "kind": {
@@ -7879,7 +8646,8 @@
             "layer": 8
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -7887,7 +8655,10 @@
         137
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "dest": [
+        139
+      ]
     },
     {
       "kind": {
@@ -7900,7 +8671,10 @@
         137
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "dest": [
+        139
+      ]
     },
     {
       "kind": {
@@ -8105,7 +8879,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -8175,10 +8951,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -8198,19 +8974,25 @@
         153
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "dest": [
+        155
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "dest": [
+        155
+      ]
     },
     {
       "kind": {
@@ -8224,7 +9006,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "dest": [
+        155
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        155
+      ]
     },
     {
       "kind": {
@@ -8235,7 +9037,8 @@
             "layer": 9
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -8243,7 +9046,27 @@
         153
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "dest": [
+        155
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        155
+      ]
     },
     {
       "kind": {
@@ -8254,7 +9077,8 @@
             "layer": 9
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -8262,7 +9086,10 @@
         153
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "dest": [
+        155
+      ]
     },
     {
       "kind": {
@@ -8275,7 +9102,10 @@
         153
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "dest": [
+        155
+      ]
     },
     {
       "kind": {
@@ -8288,7 +9118,10 @@
         153
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "dest": [
+        155
+      ]
     },
     {
       "kind": {
@@ -8302,7 +9135,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "dest": [
+        155
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        155
+      ]
     },
     {
       "kind": {
@@ -8313,7 +9166,8 @@
             "layer": 9
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -8321,7 +9175,10 @@
         153
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "dest": [
+        155
+      ]
     },
     {
       "kind": {
@@ -8334,7 +9191,10 @@
         153
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "dest": [
+        155
+      ]
     },
     {
       "kind": {
@@ -8539,7 +9399,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -8609,10 +9471,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -8632,19 +9494,25 @@
         169
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "dest": [
+        171
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "dest": [
+        171
+      ]
     },
     {
       "kind": {
@@ -8658,7 +9526,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "dest": [
+        171
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        171
+      ]
     },
     {
       "kind": {
@@ -8669,7 +9557,8 @@
             "layer": 10
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -8677,7 +9566,27 @@
         169
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "dest": [
+        171
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        171
+      ]
     },
     {
       "kind": {
@@ -8688,7 +9597,8 @@
             "layer": 10
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -8696,7 +9606,10 @@
         169
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "dest": [
+        171
+      ]
     },
     {
       "kind": {
@@ -8709,7 +9622,10 @@
         169
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "dest": [
+        171
+      ]
     },
     {
       "kind": {
@@ -8722,7 +9638,10 @@
         169
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "dest": [
+        171
+      ]
     },
     {
       "kind": {
@@ -8736,7 +9655,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "dest": [
+        171
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        171
+      ]
     },
     {
       "kind": {
@@ -8747,7 +9686,8 @@
             "layer": 10
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -8755,7 +9695,10 @@
         169
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "dest": [
+        171
+      ]
     },
     {
       "kind": {
@@ -8768,7 +9711,10 @@
         169
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "dest": [
+        171
+      ]
     },
     {
       "kind": {
@@ -8973,7 +9919,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -9043,10 +9991,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -9066,19 +10014,25 @@
         185
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "dest": [
+        187
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "dest": [
+        187
+      ]
     },
     {
       "kind": {
@@ -9092,7 +10046,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "dest": [
+        187
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        187
+      ]
     },
     {
       "kind": {
@@ -9103,7 +10077,8 @@
             "layer": 11
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -9111,7 +10086,27 @@
         185
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "dest": [
+        187
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        187
+      ]
     },
     {
       "kind": {
@@ -9122,7 +10117,8 @@
             "layer": 11
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -9130,7 +10126,10 @@
         185
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "dest": [
+        187
+      ]
     },
     {
       "kind": {
@@ -9143,7 +10142,10 @@
         185
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "dest": [
+        187
+      ]
     },
     {
       "kind": {
@@ -9156,7 +10158,10 @@
         185
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "dest": [
+        187
+      ]
     },
     {
       "kind": {
@@ -9170,7 +10175,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "dest": [
+        187
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        187
+      ]
     },
     {
       "kind": {
@@ -9181,7 +10206,8 @@
             "layer": 11
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -9189,7 +10215,10 @@
         185
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "dest": [
+        187
+      ]
     },
     {
       "kind": {
@@ -9202,7 +10231,10 @@
         185
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "dest": [
+        187
+      ]
     },
     {
       "kind": {
@@ -9407,7 +10439,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -9477,10 +10511,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -9500,19 +10534,25 @@
         201
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "dest": [
+        203
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "dest": [
+        203
+      ]
     },
     {
       "kind": {
@@ -9526,7 +10566,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "dest": [
+        203
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        203
+      ]
     },
     {
       "kind": {
@@ -9537,7 +10597,8 @@
             "layer": 12
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -9545,7 +10606,27 @@
         201
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "dest": [
+        203
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        203
+      ]
     },
     {
       "kind": {
@@ -9556,7 +10637,8 @@
             "layer": 12
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -9564,7 +10646,10 @@
         201
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "dest": [
+        203
+      ]
     },
     {
       "kind": {
@@ -9577,7 +10662,10 @@
         201
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "dest": [
+        203
+      ]
     },
     {
       "kind": {
@@ -9590,7 +10678,10 @@
         201
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "dest": [
+        203
+      ]
     },
     {
       "kind": {
@@ -9604,7 +10695,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "dest": [
+        203
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        203
+      ]
     },
     {
       "kind": {
@@ -9615,7 +10726,8 @@
             "layer": 12
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -9623,7 +10735,10 @@
         201
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "dest": [
+        203
+      ]
     },
     {
       "kind": {
@@ -9636,7 +10751,10 @@
         201
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "dest": [
+        203
+      ]
     },
     {
       "kind": {
@@ -9841,7 +10959,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -9911,10 +11031,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -9934,19 +11054,25 @@
         217
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "dest": [
+        219
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "dest": [
+        219
+      ]
     },
     {
       "kind": {
@@ -9960,7 +11086,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "dest": [
+        219
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        219
+      ]
     },
     {
       "kind": {
@@ -9971,7 +11117,8 @@
             "layer": 13
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -9979,7 +11126,27 @@
         217
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "dest": [
+        219
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        219
+      ]
     },
     {
       "kind": {
@@ -9990,7 +11157,8 @@
             "layer": 13
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -9998,7 +11166,10 @@
         217
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "dest": [
+        219
+      ]
     },
     {
       "kind": {
@@ -10011,7 +11182,10 @@
         217
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "dest": [
+        219
+      ]
     },
     {
       "kind": {
@@ -10024,7 +11198,10 @@
         217
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "dest": [
+        219
+      ]
     },
     {
       "kind": {
@@ -10038,7 +11215,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "dest": [
+        219
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        219
+      ]
     },
     {
       "kind": {
@@ -10049,7 +11246,8 @@
             "layer": 13
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -10057,7 +11255,10 @@
         217
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "dest": [
+        219
+      ]
     },
     {
       "kind": {
@@ -10070,7 +11271,10 @@
         217
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "dest": [
+        219
+      ]
     },
     {
       "kind": {
@@ -10275,7 +11479,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -10345,10 +11551,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -10368,19 +11574,25 @@
         233
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "dest": [
+        235
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "dest": [
+        235
+      ]
     },
     {
       "kind": {
@@ -10394,7 +11606,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "dest": [
+        235
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        235
+      ]
     },
     {
       "kind": {
@@ -10405,7 +11637,8 @@
             "layer": 14
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -10413,7 +11646,27 @@
         233
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "dest": [
+        235
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        235
+      ]
     },
     {
       "kind": {
@@ -10424,7 +11677,8 @@
             "layer": 14
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -10432,7 +11686,10 @@
         233
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "dest": [
+        235
+      ]
     },
     {
       "kind": {
@@ -10445,7 +11702,10 @@
         233
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "dest": [
+        235
+      ]
     },
     {
       "kind": {
@@ -10458,7 +11718,10 @@
         233
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "dest": [
+        235
+      ]
     },
     {
       "kind": {
@@ -10472,7 +11735,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "dest": [
+        235
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        235
+      ]
     },
     {
       "kind": {
@@ -10483,7 +11766,8 @@
             "layer": 14
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -10491,7 +11775,10 @@
         233
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "dest": [
+        235
+      ]
     },
     {
       "kind": {
@@ -10504,7 +11791,10 @@
         233
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "dest": [
+        235
+      ]
     },
     {
       "kind": {
@@ -10709,7 +11999,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -10779,10 +12071,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -10802,19 +12094,25 @@
         249
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "dest": [
+        251
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "dest": [
+        251
+      ]
     },
     {
       "kind": {
@@ -10828,7 +12126,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "dest": [
+        251
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        251
+      ]
     },
     {
       "kind": {
@@ -10839,7 +12157,8 @@
             "layer": 15
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -10847,7 +12166,27 @@
         249
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "dest": [
+        251
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        251
+      ]
     },
     {
       "kind": {
@@ -10858,7 +12197,8 @@
             "layer": 15
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -10866,7 +12206,10 @@
         249
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "dest": [
+        251
+      ]
     },
     {
       "kind": {
@@ -10879,7 +12222,10 @@
         249
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "dest": [
+        251
+      ]
     },
     {
       "kind": {
@@ -10892,7 +12238,10 @@
         249
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "dest": [
+        251
+      ]
     },
     {
       "kind": {
@@ -10906,7 +12255,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "dest": [
+        251
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        251
+      ]
     },
     {
       "kind": {
@@ -10917,7 +12286,8 @@
             "layer": 15
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -10925,7 +12295,10 @@
         249
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "dest": [
+        251
+      ]
     },
     {
       "kind": {
@@ -10938,7 +12311,10 @@
         249
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "dest": [
+        251
+      ]
     },
     {
       "kind": {
@@ -11143,7 +12519,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -11213,10 +12591,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -11236,19 +12614,25 @@
         265
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "dest": [
+        267
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "dest": [
+        267
+      ]
     },
     {
       "kind": {
@@ -11262,7 +12646,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "dest": [
+        267
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        267
+      ]
     },
     {
       "kind": {
@@ -11273,7 +12677,8 @@
             "layer": 16
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -11281,7 +12686,27 @@
         265
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "dest": [
+        267
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        267
+      ]
     },
     {
       "kind": {
@@ -11292,7 +12717,8 @@
             "layer": 16
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -11300,7 +12726,10 @@
         265
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "dest": [
+        267
+      ]
     },
     {
       "kind": {
@@ -11313,7 +12742,10 @@
         265
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "dest": [
+        267
+      ]
     },
     {
       "kind": {
@@ -11326,7 +12758,10 @@
         265
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "dest": [
+        267
+      ]
     },
     {
       "kind": {
@@ -11340,7 +12775,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "dest": [
+        267
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        267
+      ]
     },
     {
       "kind": {
@@ -11351,7 +12806,8 @@
             "layer": 16
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -11359,7 +12815,10 @@
         265
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "dest": [
+        267
+      ]
     },
     {
       "kind": {
@@ -11372,7 +12831,10 @@
         265
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "dest": [
+        267
+      ]
     },
     {
       "kind": {
@@ -11577,7 +13039,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -11647,10 +13111,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -11670,19 +13134,25 @@
         281
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "dest": [
+        283
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "dest": [
+        283
+      ]
     },
     {
       "kind": {
@@ -11696,7 +13166,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "dest": [
+        283
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        283
+      ]
     },
     {
       "kind": {
@@ -11707,7 +13197,8 @@
             "layer": 17
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -11715,7 +13206,27 @@
         281
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "dest": [
+        283
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        283
+      ]
     },
     {
       "kind": {
@@ -11726,7 +13237,8 @@
             "layer": 17
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -11734,7 +13246,10 @@
         281
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "dest": [
+        283
+      ]
     },
     {
       "kind": {
@@ -11747,7 +13262,10 @@
         281
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "dest": [
+        283
+      ]
     },
     {
       "kind": {
@@ -11760,7 +13278,10 @@
         281
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "dest": [
+        283
+      ]
     },
     {
       "kind": {
@@ -11774,7 +13295,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "dest": [
+        283
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        283
+      ]
     },
     {
       "kind": {
@@ -11785,7 +13326,8 @@
             "layer": 17
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -11793,7 +13335,10 @@
         281
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "dest": [
+        283
+      ]
     },
     {
       "kind": {
@@ -11806,7 +13351,10 @@
         281
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "dest": [
+        283
+      ]
     },
     {
       "kind": {
@@ -12011,7 +13559,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -12081,10 +13631,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -12104,19 +13654,25 @@
         297
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "dest": [
+        299
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "dest": [
+        299
+      ]
     },
     {
       "kind": {
@@ -12130,7 +13686,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "dest": [
+        299
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        299
+      ]
     },
     {
       "kind": {
@@ -12141,7 +13717,8 @@
             "layer": 18
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -12149,7 +13726,27 @@
         297
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "dest": [
+        299
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        299
+      ]
     },
     {
       "kind": {
@@ -12160,7 +13757,8 @@
             "layer": 18
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -12168,7 +13766,10 @@
         297
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "dest": [
+        299
+      ]
     },
     {
       "kind": {
@@ -12181,7 +13782,10 @@
         297
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "dest": [
+        299
+      ]
     },
     {
       "kind": {
@@ -12194,7 +13798,10 @@
         297
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "dest": [
+        299
+      ]
     },
     {
       "kind": {
@@ -12208,7 +13815,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "dest": [
+        299
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        299
+      ]
     },
     {
       "kind": {
@@ -12219,7 +13846,8 @@
             "layer": 18
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -12227,7 +13855,10 @@
         297
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "dest": [
+        299
+      ]
     },
     {
       "kind": {
@@ -12240,7 +13871,10 @@
         297
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "dest": [
+        299
+      ]
     },
     {
       "kind": {
@@ -12445,7 +14079,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -12515,10 +14151,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -12538,19 +14174,25 @@
         313
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "dest": [
+        315
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "dest": [
+        315
+      ]
     },
     {
       "kind": {
@@ -12564,7 +14206,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "dest": [
+        315
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        315
+      ]
     },
     {
       "kind": {
@@ -12575,7 +14237,8 @@
             "layer": 19
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -12583,7 +14246,27 @@
         313
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "dest": [
+        315
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        315
+      ]
     },
     {
       "kind": {
@@ -12594,7 +14277,8 @@
             "layer": 19
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -12602,7 +14286,10 @@
         313
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "dest": [
+        315
+      ]
     },
     {
       "kind": {
@@ -12615,7 +14302,10 @@
         313
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "dest": [
+        315
+      ]
     },
     {
       "kind": {
@@ -12628,7 +14318,10 @@
         313
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "dest": [
+        315
+      ]
     },
     {
       "kind": {
@@ -12642,7 +14335,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "dest": [
+        315
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        315
+      ]
     },
     {
       "kind": {
@@ -12653,7 +14366,8 @@
             "layer": 19
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -12661,7 +14375,10 @@
         313
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "dest": [
+        315
+      ]
     },
     {
       "kind": {
@@ -12674,7 +14391,10 @@
         313
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "dest": [
+        315
+      ]
     },
     {
       "kind": {
@@ -12879,7 +14599,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -12949,10 +14671,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -12972,19 +14694,25 @@
         329
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "dest": [
+        331
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "dest": [
+        331
+      ]
     },
     {
       "kind": {
@@ -12998,7 +14726,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "dest": [
+        331
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        331
+      ]
     },
     {
       "kind": {
@@ -13009,7 +14757,8 @@
             "layer": 20
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -13017,7 +14766,27 @@
         329
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "dest": [
+        331
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        331
+      ]
     },
     {
       "kind": {
@@ -13028,7 +14797,8 @@
             "layer": 20
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -13036,7 +14806,10 @@
         329
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "dest": [
+        331
+      ]
     },
     {
       "kind": {
@@ -13049,7 +14822,10 @@
         329
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "dest": [
+        331
+      ]
     },
     {
       "kind": {
@@ -13062,7 +14838,10 @@
         329
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "dest": [
+        331
+      ]
     },
     {
       "kind": {
@@ -13076,7 +14855,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "dest": [
+        331
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        331
+      ]
     },
     {
       "kind": {
@@ -13087,7 +14886,8 @@
             "layer": 20
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -13095,7 +14895,10 @@
         329
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "dest": [
+        331
+      ]
     },
     {
       "kind": {
@@ -13108,7 +14911,10 @@
         329
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "dest": [
+        331
+      ]
     },
     {
       "kind": {
@@ -13313,7 +15119,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -13383,10 +15191,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -13406,19 +15214,25 @@
         345
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "dest": [
+        347
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "dest": [
+        347
+      ]
     },
     {
       "kind": {
@@ -13432,7 +15246,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "dest": [
+        347
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        347
+      ]
     },
     {
       "kind": {
@@ -13443,7 +15277,8 @@
             "layer": 21
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -13451,7 +15286,27 @@
         345
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "dest": [
+        347
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        347
+      ]
     },
     {
       "kind": {
@@ -13462,7 +15317,8 @@
             "layer": 21
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -13470,7 +15326,10 @@
         345
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "dest": [
+        347
+      ]
     },
     {
       "kind": {
@@ -13483,7 +15342,10 @@
         345
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "dest": [
+        347
+      ]
     },
     {
       "kind": {
@@ -13496,7 +15358,10 @@
         345
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "dest": [
+        347
+      ]
     },
     {
       "kind": {
@@ -13510,7 +15375,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "dest": [
+        347
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        347
+      ]
     },
     {
       "kind": {
@@ -13521,7 +15406,8 @@
             "layer": 21
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -13529,7 +15415,10 @@
         345
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "dest": [
+        347
+      ]
     },
     {
       "kind": {
@@ -13542,7 +15431,10 @@
         345
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "dest": [
+        347
+      ]
     },
     {
       "kind": {
@@ -13747,7 +15639,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -13817,10 +15711,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -13840,19 +15734,25 @@
         361
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "dest": [
+        363
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "dest": [
+        363
+      ]
     },
     {
       "kind": {
@@ -13866,7 +15766,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "dest": [
+        363
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        363
+      ]
     },
     {
       "kind": {
@@ -13877,7 +15797,8 @@
             "layer": 22
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -13885,7 +15806,27 @@
         361
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "dest": [
+        363
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        363
+      ]
     },
     {
       "kind": {
@@ -13896,7 +15837,8 @@
             "layer": 22
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -13904,7 +15846,10 @@
         361
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "dest": [
+        363
+      ]
     },
     {
       "kind": {
@@ -13917,7 +15862,10 @@
         361
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "dest": [
+        363
+      ]
     },
     {
       "kind": {
@@ -13930,7 +15878,10 @@
         361
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "dest": [
+        363
+      ]
     },
     {
       "kind": {
@@ -13944,7 +15895,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "dest": [
+        363
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        363
+      ]
     },
     {
       "kind": {
@@ -13955,7 +15926,8 @@
             "layer": 22
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -13963,7 +15935,10 @@
         361
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "dest": [
+        363
+      ]
     },
     {
       "kind": {
@@ -13976,7 +15951,10 @@
         361
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "dest": [
+        363
+      ]
     },
     {
       "kind": {
@@ -14181,7 +16159,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -14251,10 +16231,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -14274,19 +16254,25 @@
         377
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "dest": [
+        379
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "dest": [
+        379
+      ]
     },
     {
       "kind": {
@@ -14300,7 +16286,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "dest": [
+        379
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        379
+      ]
     },
     {
       "kind": {
@@ -14311,7 +16317,8 @@
             "layer": 23
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -14319,7 +16326,27 @@
         377
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "dest": [
+        379
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        379
+      ]
     },
     {
       "kind": {
@@ -14330,7 +16357,8 @@
             "layer": 23
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -14338,7 +16366,10 @@
         377
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "dest": [
+        379
+      ]
     },
     {
       "kind": {
@@ -14351,7 +16382,10 @@
         377
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "dest": [
+        379
+      ]
     },
     {
       "kind": {
@@ -14364,7 +16398,10 @@
         377
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "dest": [
+        379
+      ]
     },
     {
       "kind": {
@@ -14378,7 +16415,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "dest": [
+        379
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        379
+      ]
     },
     {
       "kind": {
@@ -14389,7 +16446,8 @@
             "layer": 23
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -14397,7 +16455,10 @@
         377
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "dest": [
+        379
+      ]
     },
     {
       "kind": {
@@ -14410,7 +16471,10 @@
         377
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "dest": [
+        379
+      ]
     },
     {
       "kind": {
@@ -14615,7 +16679,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -14685,10 +16751,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -14708,19 +16774,25 @@
         393
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "dest": [
+        395
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "dest": [
+        395
+      ]
     },
     {
       "kind": {
@@ -14734,7 +16806,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "dest": [
+        395
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        395
+      ]
     },
     {
       "kind": {
@@ -14745,7 +16837,8 @@
             "layer": 24
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -14753,7 +16846,27 @@
         393
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "dest": [
+        395
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        395
+      ]
     },
     {
       "kind": {
@@ -14764,7 +16877,8 @@
             "layer": 24
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -14772,7 +16886,10 @@
         393
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "dest": [
+        395
+      ]
     },
     {
       "kind": {
@@ -14785,7 +16902,10 @@
         393
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "dest": [
+        395
+      ]
     },
     {
       "kind": {
@@ -14798,7 +16918,10 @@
         393
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "dest": [
+        395
+      ]
     },
     {
       "kind": {
@@ -14812,7 +16935,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "dest": [
+        395
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        395
+      ]
     },
     {
       "kind": {
@@ -14823,7 +16966,8 @@
             "layer": 24
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -14831,7 +16975,10 @@
         393
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "dest": [
+        395
+      ]
     },
     {
       "kind": {
@@ -14844,7 +16991,10 @@
         393
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "dest": [
+        395
+      ]
     },
     {
       "kind": {
@@ -15049,7 +17199,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -15119,10 +17271,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -15142,19 +17294,25 @@
         409
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "dest": [
+        411
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "dest": [
+        411
+      ]
     },
     {
       "kind": {
@@ -15168,7 +17326,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "dest": [
+        411
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        411
+      ]
     },
     {
       "kind": {
@@ -15179,7 +17357,8 @@
             "layer": 25
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -15187,7 +17366,27 @@
         409
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "dest": [
+        411
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        411
+      ]
     },
     {
       "kind": {
@@ -15198,7 +17397,8 @@
             "layer": 25
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -15206,7 +17406,10 @@
         409
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "dest": [
+        411
+      ]
     },
     {
       "kind": {
@@ -15219,7 +17422,10 @@
         409
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "dest": [
+        411
+      ]
     },
     {
       "kind": {
@@ -15232,7 +17438,10 @@
         409
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "dest": [
+        411
+      ]
     },
     {
       "kind": {
@@ -15246,7 +17455,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "dest": [
+        411
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        411
+      ]
     },
     {
       "kind": {
@@ -15257,7 +17486,8 @@
             "layer": 25
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -15265,7 +17495,10 @@
         409
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "dest": [
+        411
+      ]
     },
     {
       "kind": {
@@ -15278,7 +17511,10 @@
         409
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "dest": [
+        411
+      ]
     },
     {
       "kind": {
@@ -15483,7 +17719,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -15553,10 +17791,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -15576,19 +17814,25 @@
         425
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "dest": [
+        427
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "dest": [
+        427
+      ]
     },
     {
       "kind": {
@@ -15602,7 +17846,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "dest": [
+        427
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        427
+      ]
     },
     {
       "kind": {
@@ -15613,7 +17877,8 @@
             "layer": 26
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -15621,7 +17886,27 @@
         425
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "dest": [
+        427
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        427
+      ]
     },
     {
       "kind": {
@@ -15632,7 +17917,8 @@
             "layer": 26
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -15640,7 +17926,10 @@
         425
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "dest": [
+        427
+      ]
     },
     {
       "kind": {
@@ -15653,7 +17942,10 @@
         425
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "dest": [
+        427
+      ]
     },
     {
       "kind": {
@@ -15666,7 +17958,10 @@
         425
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "dest": [
+        427
+      ]
     },
     {
       "kind": {
@@ -15680,7 +17975,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "dest": [
+        427
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        427
+      ]
     },
     {
       "kind": {
@@ -15691,7 +18006,8 @@
             "layer": 26
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -15699,7 +18015,10 @@
         425
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "dest": [
+        427
+      ]
     },
     {
       "kind": {
@@ -15712,7 +18031,10 @@
         425
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "dest": [
+        427
+      ]
     },
     {
       "kind": {
@@ -15917,7 +18239,9 @@
         "Launch": {
           "kernel": "rope::rope_bf16",
           "params": [
-            0
+            12,
+            2,
+            128
           ]
         }
       },
@@ -15987,10 +18311,10 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 6
+              "ops": 8
             }
           ],
-          "else_ops": 4
+          "else_ops": 5
         }
       },
       "inputs": [],
@@ -16010,19 +18334,25 @@
         441
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "dest": [
+        443
+      ]
     },
     {
       "kind": {
         "Peel": {
-          "prefix_ops": 2,
-          "tail_ops": 1,
+          "prefix_ops": 3,
+          "tail_ops": 2,
           "window": "unmasked_prefix"
         }
       },
       "inputs": [],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "dest": [
+        443
+      ]
     },
     {
       "kind": {
@@ -16036,7 +18366,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "dest": [
+        443
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        443
+      ]
     },
     {
       "kind": {
@@ -16047,7 +18397,8 @@
             "layer": 27
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -16055,7 +18406,27 @@
         441
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "dest": [
+        443
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        443
+      ]
     },
     {
       "kind": {
@@ -16066,7 +18437,8 @@
             "layer": 27
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -16074,7 +18446,10 @@
         441
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "dest": [
+        443
+      ]
     },
     {
       "kind": {
@@ -16087,7 +18462,10 @@
         441
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "dest": [
+        443
+      ]
     },
     {
       "kind": {
@@ -16100,7 +18478,10 @@
         441
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "dest": [
+        443
+      ]
     },
     {
       "kind": {
@@ -16114,7 +18495,27 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "dest": [
+        443
+      ]
+    },
+    {
+      "kind": {
+        "Prep": {
+          "prep": {
+            "PrefillAttention": {
+              "head_dim": 128
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null,
+      "dest": [
+        443
+      ]
     },
     {
       "kind": {
@@ -16125,7 +18526,8 @@
             "layer": 27
           },
           "params": [
-            4294967295
+            0,
+            1035273459
           ]
         }
       },
@@ -16133,7 +18535,10 @@
         441
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "dest": [
+        443
+      ]
     },
     {
       "kind": {
@@ -16146,7 +18551,10 @@
         441
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "dest": [
+        443
+      ]
     },
     {
       "kind": {
@@ -16283,7 +18691,7 @@
     {
       "seam": "attn.out",
       "layer": 0,
-      "op": 19,
+      "op": 21,
       "values": [
         9
       ]
@@ -16291,7 +18699,7 @@
     {
       "seam": "attn.q",
       "layer": 0,
-      "op": 20,
+      "op": 22,
       "values": [
         9
       ]
@@ -16299,7 +18707,7 @@
     {
       "seam": "attn.out",
       "layer": 0,
-      "op": 23,
+      "op": 26,
       "values": [
         9
       ]
@@ -16307,7 +18715,7 @@
     {
       "seam": "attn.qv",
       "layer": 1,
-      "op": 32,
+      "op": 35,
       "values": [
         19,
         21
@@ -16316,7 +18724,7 @@
     {
       "seam": "attn.q",
       "layer": 1,
-      "op": 42,
+      "op": 45,
       "values": [
         25
       ]
@@ -16324,7 +18732,7 @@
     {
       "seam": "attn.out",
       "layer": 1,
-      "op": 47,
+      "op": 52,
       "values": [
         25
       ]
@@ -16332,7 +18740,7 @@
     {
       "seam": "attn.q",
       "layer": 1,
-      "op": 48,
+      "op": 53,
       "values": [
         25
       ]
@@ -16340,7 +18748,7 @@
     {
       "seam": "attn.out",
       "layer": 1,
-      "op": 51,
+      "op": 57,
       "values": [
         25
       ]
@@ -16348,26 +18756,10 @@
     {
       "seam": "attn.qv",
       "layer": 2,
-      "op": 60,
+      "op": 66,
       "values": [
         35,
         37
-      ]
-    },
-    {
-      "seam": "attn.q",
-      "layer": 2,
-      "op": 70,
-      "values": [
-        41
-      ]
-    },
-    {
-      "seam": "attn.out",
-      "layer": 2,
-      "op": 75,
-      "values": [
-        41
       ]
     },
     {
@@ -16381,7 +18773,23 @@
     {
       "seam": "attn.out",
       "layer": 2,
-      "op": 79,
+      "op": 83,
+      "values": [
+        41
+      ]
+    },
+    {
+      "seam": "attn.q",
+      "layer": 2,
+      "op": 84,
+      "values": [
+        41
+      ]
+    },
+    {
+      "seam": "attn.out",
+      "layer": 2,
+      "op": 88,
       "values": [
         41
       ]
@@ -16389,7 +18797,7 @@
     {
       "seam": "attn.qv",
       "layer": 3,
-      "op": 88,
+      "op": 97,
       "values": [
         51,
         53
@@ -16398,7 +18806,7 @@
     {
       "seam": "attn.q",
       "layer": 3,
-      "op": 98,
+      "op": 107,
       "values": [
         57
       ]
@@ -16406,7 +18814,7 @@
     {
       "seam": "attn.out",
       "layer": 3,
-      "op": 103,
+      "op": 114,
       "values": [
         57
       ]
@@ -16414,7 +18822,7 @@
     {
       "seam": "attn.q",
       "layer": 3,
-      "op": 104,
+      "op": 115,
       "values": [
         57
       ]
@@ -16422,7 +18830,7 @@
     {
       "seam": "attn.out",
       "layer": 3,
-      "op": 107,
+      "op": 119,
       "values": [
         57
       ]
@@ -16430,7 +18838,7 @@
     {
       "seam": "attn.qv",
       "layer": 4,
-      "op": 116,
+      "op": 128,
       "values": [
         67,
         69
@@ -16439,7 +18847,7 @@
     {
       "seam": "attn.q",
       "layer": 4,
-      "op": 126,
+      "op": 138,
       "values": [
         73
       ]
@@ -16447,7 +18855,7 @@
     {
       "seam": "attn.out",
       "layer": 4,
-      "op": 131,
+      "op": 145,
       "values": [
         73
       ]
@@ -16455,7 +18863,7 @@
     {
       "seam": "attn.q",
       "layer": 4,
-      "op": 132,
+      "op": 146,
       "values": [
         73
       ]
@@ -16463,7 +18871,7 @@
     {
       "seam": "attn.out",
       "layer": 4,
-      "op": 135,
+      "op": 150,
       "values": [
         73
       ]
@@ -16471,7 +18879,7 @@
     {
       "seam": "attn.qv",
       "layer": 5,
-      "op": 144,
+      "op": 159,
       "values": [
         83,
         85
@@ -16480,7 +18888,7 @@
     {
       "seam": "attn.q",
       "layer": 5,
-      "op": 154,
+      "op": 169,
       "values": [
         89
       ]
@@ -16488,7 +18896,7 @@
     {
       "seam": "attn.out",
       "layer": 5,
-      "op": 159,
+      "op": 176,
       "values": [
         89
       ]
@@ -16496,7 +18904,7 @@
     {
       "seam": "attn.q",
       "layer": 5,
-      "op": 160,
+      "op": 177,
       "values": [
         89
       ]
@@ -16504,7 +18912,7 @@
     {
       "seam": "attn.out",
       "layer": 5,
-      "op": 163,
+      "op": 181,
       "values": [
         89
       ]
@@ -16512,7 +18920,7 @@
     {
       "seam": "attn.qv",
       "layer": 6,
-      "op": 172,
+      "op": 190,
       "values": [
         99,
         101
@@ -16521,7 +18929,7 @@
     {
       "seam": "attn.q",
       "layer": 6,
-      "op": 182,
+      "op": 200,
       "values": [
         105
       ]
@@ -16529,7 +18937,7 @@
     {
       "seam": "attn.out",
       "layer": 6,
-      "op": 187,
+      "op": 207,
       "values": [
         105
       ]
@@ -16537,7 +18945,7 @@
     {
       "seam": "attn.q",
       "layer": 6,
-      "op": 188,
+      "op": 208,
       "values": [
         105
       ]
@@ -16545,7 +18953,7 @@
     {
       "seam": "attn.out",
       "layer": 6,
-      "op": 191,
+      "op": 212,
       "values": [
         105
       ]
@@ -16553,7 +18961,7 @@
     {
       "seam": "attn.qv",
       "layer": 7,
-      "op": 200,
+      "op": 221,
       "values": [
         115,
         117
@@ -16562,7 +18970,7 @@
     {
       "seam": "attn.q",
       "layer": 7,
-      "op": 210,
+      "op": 231,
       "values": [
         121
       ]
@@ -16570,7 +18978,7 @@
     {
       "seam": "attn.out",
       "layer": 7,
-      "op": 215,
+      "op": 238,
       "values": [
         121
       ]
@@ -16578,7 +18986,7 @@
     {
       "seam": "attn.q",
       "layer": 7,
-      "op": 216,
+      "op": 239,
       "values": [
         121
       ]
@@ -16586,7 +18994,7 @@
     {
       "seam": "attn.out",
       "layer": 7,
-      "op": 219,
+      "op": 243,
       "values": [
         121
       ]
@@ -16594,7 +19002,7 @@
     {
       "seam": "attn.qv",
       "layer": 8,
-      "op": 228,
+      "op": 252,
       "values": [
         131,
         133
@@ -16603,7 +19011,7 @@
     {
       "seam": "attn.q",
       "layer": 8,
-      "op": 238,
+      "op": 262,
       "values": [
         137
       ]
@@ -16611,7 +19019,7 @@
     {
       "seam": "attn.out",
       "layer": 8,
-      "op": 243,
+      "op": 269,
       "values": [
         137
       ]
@@ -16619,7 +19027,7 @@
     {
       "seam": "attn.q",
       "layer": 8,
-      "op": 244,
+      "op": 270,
       "values": [
         137
       ]
@@ -16627,7 +19035,7 @@
     {
       "seam": "attn.out",
       "layer": 8,
-      "op": 247,
+      "op": 274,
       "values": [
         137
       ]
@@ -16635,7 +19043,7 @@
     {
       "seam": "attn.qv",
       "layer": 9,
-      "op": 256,
+      "op": 283,
       "values": [
         147,
         149
@@ -16644,7 +19052,7 @@
     {
       "seam": "attn.q",
       "layer": 9,
-      "op": 266,
+      "op": 293,
       "values": [
         153
       ]
@@ -16652,7 +19060,7 @@
     {
       "seam": "attn.out",
       "layer": 9,
-      "op": 271,
+      "op": 300,
       "values": [
         153
       ]
@@ -16660,7 +19068,7 @@
     {
       "seam": "attn.q",
       "layer": 9,
-      "op": 272,
+      "op": 301,
       "values": [
         153
       ]
@@ -16668,7 +19076,7 @@
     {
       "seam": "attn.out",
       "layer": 9,
-      "op": 275,
+      "op": 305,
       "values": [
         153
       ]
@@ -16676,7 +19084,7 @@
     {
       "seam": "attn.qv",
       "layer": 10,
-      "op": 284,
+      "op": 314,
       "values": [
         163,
         165
@@ -16685,7 +19093,7 @@
     {
       "seam": "attn.q",
       "layer": 10,
-      "op": 294,
+      "op": 324,
       "values": [
         169
       ]
@@ -16693,7 +19101,7 @@
     {
       "seam": "attn.out",
       "layer": 10,
-      "op": 299,
+      "op": 331,
       "values": [
         169
       ]
@@ -16701,7 +19109,7 @@
     {
       "seam": "attn.q",
       "layer": 10,
-      "op": 300,
+      "op": 332,
       "values": [
         169
       ]
@@ -16709,7 +19117,7 @@
     {
       "seam": "attn.out",
       "layer": 10,
-      "op": 303,
+      "op": 336,
       "values": [
         169
       ]
@@ -16717,7 +19125,7 @@
     {
       "seam": "attn.qv",
       "layer": 11,
-      "op": 312,
+      "op": 345,
       "values": [
         179,
         181
@@ -16726,7 +19134,7 @@
     {
       "seam": "attn.q",
       "layer": 11,
-      "op": 322,
+      "op": 355,
       "values": [
         185
       ]
@@ -16734,7 +19142,7 @@
     {
       "seam": "attn.out",
       "layer": 11,
-      "op": 327,
+      "op": 362,
       "values": [
         185
       ]
@@ -16742,7 +19150,7 @@
     {
       "seam": "attn.q",
       "layer": 11,
-      "op": 328,
+      "op": 363,
       "values": [
         185
       ]
@@ -16750,7 +19158,7 @@
     {
       "seam": "attn.out",
       "layer": 11,
-      "op": 331,
+      "op": 367,
       "values": [
         185
       ]
@@ -16758,7 +19166,7 @@
     {
       "seam": "attn.qv",
       "layer": 12,
-      "op": 340,
+      "op": 376,
       "values": [
         195,
         197
@@ -16767,7 +19175,7 @@
     {
       "seam": "attn.q",
       "layer": 12,
-      "op": 350,
+      "op": 386,
       "values": [
         201
       ]
@@ -16775,7 +19183,7 @@
     {
       "seam": "attn.out",
       "layer": 12,
-      "op": 355,
+      "op": 393,
       "values": [
         201
       ]
@@ -16783,7 +19191,7 @@
     {
       "seam": "attn.q",
       "layer": 12,
-      "op": 356,
+      "op": 394,
       "values": [
         201
       ]
@@ -16791,7 +19199,7 @@
     {
       "seam": "attn.out",
       "layer": 12,
-      "op": 359,
+      "op": 398,
       "values": [
         201
       ]
@@ -16799,7 +19207,7 @@
     {
       "seam": "attn.qv",
       "layer": 13,
-      "op": 368,
+      "op": 407,
       "values": [
         211,
         213
@@ -16808,7 +19216,7 @@
     {
       "seam": "attn.q",
       "layer": 13,
-      "op": 378,
+      "op": 417,
       "values": [
         217
       ]
@@ -16816,7 +19224,7 @@
     {
       "seam": "attn.out",
       "layer": 13,
-      "op": 383,
+      "op": 424,
       "values": [
         217
       ]
@@ -16824,7 +19232,7 @@
     {
       "seam": "attn.q",
       "layer": 13,
-      "op": 384,
+      "op": 425,
       "values": [
         217
       ]
@@ -16832,7 +19240,7 @@
     {
       "seam": "attn.out",
       "layer": 13,
-      "op": 387,
+      "op": 429,
       "values": [
         217
       ]
@@ -16840,7 +19248,7 @@
     {
       "seam": "attn.qv",
       "layer": 14,
-      "op": 396,
+      "op": 438,
       "values": [
         227,
         229
@@ -16849,7 +19257,7 @@
     {
       "seam": "attn.q",
       "layer": 14,
-      "op": 406,
+      "op": 448,
       "values": [
         233
       ]
@@ -16857,7 +19265,7 @@
     {
       "seam": "attn.out",
       "layer": 14,
-      "op": 411,
+      "op": 455,
       "values": [
         233
       ]
@@ -16865,7 +19273,7 @@
     {
       "seam": "attn.q",
       "layer": 14,
-      "op": 412,
+      "op": 456,
       "values": [
         233
       ]
@@ -16873,7 +19281,7 @@
     {
       "seam": "attn.out",
       "layer": 14,
-      "op": 415,
+      "op": 460,
       "values": [
         233
       ]
@@ -16881,7 +19289,7 @@
     {
       "seam": "attn.qv",
       "layer": 15,
-      "op": 424,
+      "op": 469,
       "values": [
         243,
         245
@@ -16890,7 +19298,7 @@
     {
       "seam": "attn.q",
       "layer": 15,
-      "op": 434,
+      "op": 479,
       "values": [
         249
       ]
@@ -16898,7 +19306,7 @@
     {
       "seam": "attn.out",
       "layer": 15,
-      "op": 439,
+      "op": 486,
       "values": [
         249
       ]
@@ -16906,7 +19314,7 @@
     {
       "seam": "attn.q",
       "layer": 15,
-      "op": 440,
+      "op": 487,
       "values": [
         249
       ]
@@ -16914,7 +19322,7 @@
     {
       "seam": "attn.out",
       "layer": 15,
-      "op": 443,
+      "op": 491,
       "values": [
         249
       ]
@@ -16922,7 +19330,7 @@
     {
       "seam": "attn.qv",
       "layer": 16,
-      "op": 452,
+      "op": 500,
       "values": [
         259,
         261
@@ -16931,7 +19339,7 @@
     {
       "seam": "attn.q",
       "layer": 16,
-      "op": 462,
+      "op": 510,
       "values": [
         265
       ]
@@ -16939,7 +19347,7 @@
     {
       "seam": "attn.out",
       "layer": 16,
-      "op": 467,
+      "op": 517,
       "values": [
         265
       ]
@@ -16947,7 +19355,7 @@
     {
       "seam": "attn.q",
       "layer": 16,
-      "op": 468,
+      "op": 518,
       "values": [
         265
       ]
@@ -16955,7 +19363,7 @@
     {
       "seam": "attn.out",
       "layer": 16,
-      "op": 471,
+      "op": 522,
       "values": [
         265
       ]
@@ -16963,7 +19371,7 @@
     {
       "seam": "attn.qv",
       "layer": 17,
-      "op": 480,
+      "op": 531,
       "values": [
         275,
         277
@@ -16972,7 +19380,7 @@
     {
       "seam": "attn.q",
       "layer": 17,
-      "op": 490,
+      "op": 541,
       "values": [
         281
       ]
@@ -16980,7 +19388,7 @@
     {
       "seam": "attn.out",
       "layer": 17,
-      "op": 495,
+      "op": 548,
       "values": [
         281
       ]
@@ -16988,7 +19396,7 @@
     {
       "seam": "attn.q",
       "layer": 17,
-      "op": 496,
+      "op": 549,
       "values": [
         281
       ]
@@ -16996,7 +19404,7 @@
     {
       "seam": "attn.out",
       "layer": 17,
-      "op": 499,
+      "op": 553,
       "values": [
         281
       ]
@@ -17004,7 +19412,7 @@
     {
       "seam": "attn.qv",
       "layer": 18,
-      "op": 508,
+      "op": 562,
       "values": [
         291,
         293
@@ -17013,7 +19421,7 @@
     {
       "seam": "attn.q",
       "layer": 18,
-      "op": 518,
+      "op": 572,
       "values": [
         297
       ]
@@ -17021,7 +19429,7 @@
     {
       "seam": "attn.out",
       "layer": 18,
-      "op": 523,
+      "op": 579,
       "values": [
         297
       ]
@@ -17029,7 +19437,7 @@
     {
       "seam": "attn.q",
       "layer": 18,
-      "op": 524,
+      "op": 580,
       "values": [
         297
       ]
@@ -17037,7 +19445,7 @@
     {
       "seam": "attn.out",
       "layer": 18,
-      "op": 527,
+      "op": 584,
       "values": [
         297
       ]
@@ -17045,7 +19453,7 @@
     {
       "seam": "attn.qv",
       "layer": 19,
-      "op": 536,
+      "op": 593,
       "values": [
         307,
         309
@@ -17054,7 +19462,7 @@
     {
       "seam": "attn.q",
       "layer": 19,
-      "op": 546,
+      "op": 603,
       "values": [
         313
       ]
@@ -17062,7 +19470,7 @@
     {
       "seam": "attn.out",
       "layer": 19,
-      "op": 551,
+      "op": 610,
       "values": [
         313
       ]
@@ -17070,7 +19478,7 @@
     {
       "seam": "attn.q",
       "layer": 19,
-      "op": 552,
+      "op": 611,
       "values": [
         313
       ]
@@ -17078,7 +19486,7 @@
     {
       "seam": "attn.out",
       "layer": 19,
-      "op": 555,
+      "op": 615,
       "values": [
         313
       ]
@@ -17086,7 +19494,7 @@
     {
       "seam": "attn.qv",
       "layer": 20,
-      "op": 564,
+      "op": 624,
       "values": [
         323,
         325
@@ -17095,7 +19503,7 @@
     {
       "seam": "attn.q",
       "layer": 20,
-      "op": 574,
+      "op": 634,
       "values": [
         329
       ]
@@ -17103,7 +19511,7 @@
     {
       "seam": "attn.out",
       "layer": 20,
-      "op": 579,
+      "op": 641,
       "values": [
         329
       ]
@@ -17111,7 +19519,7 @@
     {
       "seam": "attn.q",
       "layer": 20,
-      "op": 580,
+      "op": 642,
       "values": [
         329
       ]
@@ -17119,7 +19527,7 @@
     {
       "seam": "attn.out",
       "layer": 20,
-      "op": 583,
+      "op": 646,
       "values": [
         329
       ]
@@ -17127,7 +19535,7 @@
     {
       "seam": "attn.qv",
       "layer": 21,
-      "op": 592,
+      "op": 655,
       "values": [
         339,
         341
@@ -17136,7 +19544,7 @@
     {
       "seam": "attn.q",
       "layer": 21,
-      "op": 602,
+      "op": 665,
       "values": [
         345
       ]
@@ -17144,7 +19552,7 @@
     {
       "seam": "attn.out",
       "layer": 21,
-      "op": 607,
+      "op": 672,
       "values": [
         345
       ]
@@ -17152,7 +19560,7 @@
     {
       "seam": "attn.q",
       "layer": 21,
-      "op": 608,
+      "op": 673,
       "values": [
         345
       ]
@@ -17160,7 +19568,7 @@
     {
       "seam": "attn.out",
       "layer": 21,
-      "op": 611,
+      "op": 677,
       "values": [
         345
       ]
@@ -17168,7 +19576,7 @@
     {
       "seam": "attn.qv",
       "layer": 22,
-      "op": 620,
+      "op": 686,
       "values": [
         355,
         357
@@ -17177,7 +19585,7 @@
     {
       "seam": "attn.q",
       "layer": 22,
-      "op": 630,
+      "op": 696,
       "values": [
         361
       ]
@@ -17185,7 +19593,7 @@
     {
       "seam": "attn.out",
       "layer": 22,
-      "op": 635,
+      "op": 703,
       "values": [
         361
       ]
@@ -17193,7 +19601,7 @@
     {
       "seam": "attn.q",
       "layer": 22,
-      "op": 636,
+      "op": 704,
       "values": [
         361
       ]
@@ -17201,7 +19609,7 @@
     {
       "seam": "attn.out",
       "layer": 22,
-      "op": 639,
+      "op": 708,
       "values": [
         361
       ]
@@ -17209,7 +19617,7 @@
     {
       "seam": "attn.qv",
       "layer": 23,
-      "op": 648,
+      "op": 717,
       "values": [
         371,
         373
@@ -17218,7 +19626,7 @@
     {
       "seam": "attn.q",
       "layer": 23,
-      "op": 658,
+      "op": 727,
       "values": [
         377
       ]
@@ -17226,7 +19634,7 @@
     {
       "seam": "attn.out",
       "layer": 23,
-      "op": 663,
+      "op": 734,
       "values": [
         377
       ]
@@ -17234,7 +19642,7 @@
     {
       "seam": "attn.q",
       "layer": 23,
-      "op": 664,
+      "op": 735,
       "values": [
         377
       ]
@@ -17242,7 +19650,7 @@
     {
       "seam": "attn.out",
       "layer": 23,
-      "op": 667,
+      "op": 739,
       "values": [
         377
       ]
@@ -17250,7 +19658,7 @@
     {
       "seam": "attn.qv",
       "layer": 24,
-      "op": 676,
+      "op": 748,
       "values": [
         387,
         389
@@ -17259,7 +19667,7 @@
     {
       "seam": "attn.q",
       "layer": 24,
-      "op": 686,
+      "op": 758,
       "values": [
         393
       ]
@@ -17267,7 +19675,7 @@
     {
       "seam": "attn.out",
       "layer": 24,
-      "op": 691,
+      "op": 765,
       "values": [
         393
       ]
@@ -17275,7 +19683,7 @@
     {
       "seam": "attn.q",
       "layer": 24,
-      "op": 692,
+      "op": 766,
       "values": [
         393
       ]
@@ -17283,7 +19691,7 @@
     {
       "seam": "attn.out",
       "layer": 24,
-      "op": 695,
+      "op": 770,
       "values": [
         393
       ]
@@ -17291,7 +19699,7 @@
     {
       "seam": "attn.qv",
       "layer": 25,
-      "op": 704,
+      "op": 779,
       "values": [
         403,
         405
@@ -17300,7 +19708,7 @@
     {
       "seam": "attn.q",
       "layer": 25,
-      "op": 714,
+      "op": 789,
       "values": [
         409
       ]
@@ -17308,7 +19716,7 @@
     {
       "seam": "attn.out",
       "layer": 25,
-      "op": 719,
+      "op": 796,
       "values": [
         409
       ]
@@ -17316,7 +19724,7 @@
     {
       "seam": "attn.q",
       "layer": 25,
-      "op": 720,
+      "op": 797,
       "values": [
         409
       ]
@@ -17324,7 +19732,7 @@
     {
       "seam": "attn.out",
       "layer": 25,
-      "op": 723,
+      "op": 801,
       "values": [
         409
       ]
@@ -17332,7 +19740,7 @@
     {
       "seam": "attn.qv",
       "layer": 26,
-      "op": 732,
+      "op": 810,
       "values": [
         419,
         421
@@ -17341,7 +19749,7 @@
     {
       "seam": "attn.q",
       "layer": 26,
-      "op": 742,
+      "op": 820,
       "values": [
         425
       ]
@@ -17349,7 +19757,7 @@
     {
       "seam": "attn.out",
       "layer": 26,
-      "op": 747,
+      "op": 827,
       "values": [
         425
       ]
@@ -17357,7 +19765,7 @@
     {
       "seam": "attn.q",
       "layer": 26,
-      "op": 748,
+      "op": 828,
       "values": [
         425
       ]
@@ -17365,7 +19773,7 @@
     {
       "seam": "attn.out",
       "layer": 26,
-      "op": 751,
+      "op": 832,
       "values": [
         425
       ]
@@ -17373,7 +19781,7 @@
     {
       "seam": "attn.qv",
       "layer": 27,
-      "op": 760,
+      "op": 841,
       "values": [
         435,
         437
@@ -17382,7 +19790,7 @@
     {
       "seam": "attn.q",
       "layer": 27,
-      "op": 770,
+      "op": 851,
       "values": [
         441
       ]
@@ -17390,7 +19798,7 @@
     {
       "seam": "attn.out",
       "layer": 27,
-      "op": 775,
+      "op": 858,
       "values": [
         441
       ]
@@ -17398,7 +19806,7 @@
     {
       "seam": "attn.q",
       "layer": 27,
-      "op": 776,
+      "op": 859,
       "values": [
         441
       ]
@@ -17406,7 +19814,7 @@
     {
       "seam": "attn.out",
       "layer": 27,
-      "op": 779,
+      "op": 863,
       "values": [
         441
       ]

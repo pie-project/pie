@@ -67,12 +67,30 @@ use crate::lowering::hold::{Facts, Handles};
 /// produce: [`Refusal::Absent`] for a slot or scalar the trace does not
 /// carry.
 pub fn bind(
-    args: &[(Ty, kernels::Provenance)],
+    args: &[Ty],
     sources: &[Option<Source>],
     o: &mut Handles<'_>,
     f: Facts,
 ) -> Result<Vec<ArgValue>, Refusal> {
     kernels::bind::bind::<ArgValue, _>(args, sources, &mut Held { o, f })
+}
+
+/// ONE value, for a body that ASKS rather than a column that declares.
+///
+/// The same resolver, entered at one argument instead of a list. Nothing new
+/// answers — what changed is only where the question is asked from.
+///
+/// # Errors
+///
+/// [`Refusal::Unstated`] for a fact this backend does not answer, and whatever
+/// the fact's own absence means otherwise.
+pub fn one(
+    ty: Ty,
+    source: Source,
+    o: &mut Handles<'_>,
+    f: Facts,
+) -> Result<ArgValue, Refusal> {
+    kernels::bind::one::<ArgValue, _>(ty, source, &mut Held { o, f })
 }
 
 /// This backend's answers, for the shared reader.
@@ -109,6 +127,17 @@ impl Holds for Held<'_, '_> {
 
     fn output(&mut self, n: usize) -> Result<u32, Refusal> {
         at(self.o.output(n)?)
+    }
+
+    // THE RECTANGLE, WHICH THE MARK NOW CARRIES. Without these two the
+    // shared binder's `shaped` reads a width of zero for every operand and
+    // every body that takes an `In<Tensor<_>>` refuses `Empty`.
+    fn in_width(&self, n: usize) -> Result<i32, Refusal> {
+        self.o.in_width(n)
+    }
+
+    fn out_width(&self, n: usize) -> Result<i32, Refusal> {
+        self.o.out_width(n)
     }
 
     fn weight(&mut self, n: usize) -> Result<u32, Refusal> {
@@ -474,7 +503,20 @@ mod tests {
         // that went unanswered would refuse there rather than merely be
         // counted here. It passes, and `driver-wgpu`'s serving suite passes 23
         // of 23 on real weights, which is the same claim made twice.
-        const UNHEARD: usize = 110;
+        // 110 -> 144 WITH THE MARKS MIGRATION, and every one of the thirty-four
+        // is a fact that moved the other way: `RmsEps`, `Theta`, `WindowLeft`,
+        // `KvHeadDim`, `KvNumHeads` and their neighbours are the checkpoint's
+        // constants, which §11.12 puts in the STATEMENT. A binder does not
+        // answer what the statement carries, so a fact leaving this binder's
+        // reach is the migration working rather than a port going backwards.
+        // 144 -> 125 WHEN THE INVENTED KEYS WENT. Nineteen of them named a
+        // number that was never a fact: `RowStride` was `Param<2>`,
+        // `SplitK` was `Param<5>`, `Elements` was `Width * Rows`. The
+        // migration minted a key so a body could ask for each, no driver ever
+        // answered one, and every routine that reached for one refused
+        // `Unstated`. `kernels/tests/every_plane_is_answered.rs` is what
+        // stops the next one being minted.
+        const UNHEARD: usize = 125;
         println!("facts minted but not heard by this binder: {}", unheard.len());
         for one in &unheard {
             println!("  {one}");
@@ -527,8 +569,13 @@ mod tests {
         for line in &unanswered {
             println!("{line}");
         }
+        // THE FLOOR MOVED BECAUSE THE COLUMN DID. It read `> 900` against a
+        // column of a thousand-odd, and the marks migration took it to 563:
+        // every fact a body now reaches for with `ctx.ask` has left the
+        // parameter run, and this walk enumerates the run. It is still a floor
+        // -- it catches the walk going quiet, which is what it is for.
         assert!(
-            asked > 900,
+            asked > 500,
             "only {asked} arguments were asked about, which means the walk \
              stopped finding them rather than that they were answered"
         );

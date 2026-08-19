@@ -75,6 +75,42 @@ pub mod rope;
 pub mod sample;
 pub mod ssm;
 
+/// This crate's backend, under the one name `#[routine]` knows it by.
+///
+/// The attribute is shared by all four planes and cannot name any of them, so
+/// each aliases its own here and the macro writes `crate::Plane`.
+pub type Plane = crate::routine::Metal;
+
+/// Every routine this crate declares.
+///
+/// A DISTRIBUTED SLICE, so nothing enumerates: `#[routine]` puts each row in a
+/// `linkme_ROUTINES` link section beside its own `fn`, and the linker hands
+/// back the bounds. There is no membership list to add a routine to, which is
+/// the last hand-written thing about one -- and the last that could be
+/// forgotten, leaving a routine compiled, correct and unreachable.
+///
+/// The order is LINK ORDER and no reader may depend on it. Nothing does:
+/// lookups match on the full symbol, which `no_symbol_is_declared_twice`
+/// keeps unique.
+// THE SLICE'S NAME IS A LINK-SECTION NAME, AND IT IS GLOBAL.
+//
+// `linkme` keys a distributed slice on the STATIC's identifier, not on the
+// crate that declares it, so four crates each declaring `ROUTINES` are four
+// declarations of one slice -- and `linkme` 0.3.37 refuses that outright
+// ("duplicate #[distributed_slice] with name \"ROUTINES\"") the moment two of
+// them are linked into one binary, which `kernels`' cross-backend agreement
+// test is. Before that version it was worse than a refusal: the sections
+// merged, and a sweep over one plane's rows walked another's.
+//
+// So the declaration wears the plane's name and the ALIAS wears the one
+// `#[routine]` emits. `crate::ROUTINES` still resolves, at no cost to a
+// reader, and the link section is this crate's alone.
+#[::linkme::distributed_slice]
+pub static METAL_ROUTINES: [::kernels::routine::Routine<Plane>];
+
+/// The slice under the name `#[routine]` registers into.
+pub use METAL_ROUTINES as ROUTINES;
+
 /// EMPTY. Every family has retired its rows.
 ///
 /// It is a `&[]` written here rather than ten empty slices folded together:
@@ -91,6 +127,30 @@ pub mod ssm;
 /// FINISHED. `refactor-bigplan.md` §7 Stage 5 deletes `KernelSig` itself,
 /// once the last backend can also write this line.
 pub static KERNELS: &[KernelSig] = &[];
+
+/// The entrypoints of the families whose `kernel!` rows have been RETIRED.
+///
+/// Stated at the SOURCE rather than at each consumer: one edit instead of N,
+/// every sweep keeps its coverage untouched, and the census stays whole so
+/// the comparison against a backend that has not retired the same rows keeps
+/// meaning what it meant.
+///
+/// This list grows as families cross and the table shrinks under it. When the
+/// last one crosses, `KERNELS` is empty and this is the whole census — which
+/// is `.wiki/kernel-x/refactor-bigplan.md` §7 Stage 4, and why it is a list
+/// of families rather than one flat slice.
+pub const RETIRED: &[&[(&str, &str)]] = &[
+    attn::ENTRYPOINTS,
+    layout::ENTRYPOINTS,
+    mlp::ENTRYPOINTS,
+    moe::ENTRYPOINTS,
+    norm::ENTRYPOINTS,
+    ptir::ENTRYPOINTS,
+    quant::ENTRYPOINTS,
+    rope::ENTRYPOINTS,
+    sample::ENTRYPOINTS,
+    ssm::ENTRYPOINTS,
+];
 
 /// Every routine this backend has crossed, with the backend forgotten.
 ///
@@ -116,24 +176,9 @@ pub static KERNELS: &[KernelSig] = &[];
 /// the mistakes on.
 #[must_use]
 pub fn declared() -> Vec<kernels::routine::Declared> {
-    /// The families that have crossed. One line per family, and the list is
-    /// what [`KERNELS`] is being emptied into.
-    const CROSSED: &[&[routine::Routine]] = &[
-        attn::ROUTINES,
-        layout::ROUTINES,
-        mlp::ROUTINES,
-        moe::ROUTINES,
-        norm::ROUTINES,
-        rope::ROUTINES,
-        sample::ROUTINES,
-        ptir::ROUTINES,
-        quant::ROUTINES,
-        ssm::ROUTINES,
-    ];
-
-    CROSSED
+    ROUTINES
         .iter()
-        .flat_map(|family| family.iter().map(kernels::routine::Routine::declared))
+        .map(kernels::routine::Routine::declared)
         .collect()
 }
 
@@ -214,41 +259,6 @@ pub fn kernel_of(symbol: &str) -> Option<&'static str> {
         .max_by_key(|name| name.len())
 }
 
-/// Whether `name` appears in `symbol` bounded by underscores on both sides.
-///
-/// NOT `starts_with`, and the difference is a whole family of kernels. A row's
-/// name is usually a prefix of its points — `rms_single_row_bfloat16` — but
-/// not always: `quant`'s are spelled `affine_qmv_fast_bfloat16_gs_64_b_4`,
-/// where the row is `qmv_fast` and `affine_` is a QUALIFIER the row name does
-/// not carry. A prefix rule finds nothing there.
-///
-/// It never had to. `KERNELS` held every row until Stage 4, and the caller
-/// above resolved these through the table's own axis expansion; the prefix
-/// rule was only ever the fallback for a retired family, and the first
-/// families to retire were the ones whose rows ARE prefixes. When the last
-/// row went, every `quant` and `moe` symbol stopped resolving and `model-ir`
-/// refused to build any metal text at all — the load-time check firing on the
-/// whole fleet.
-///
-/// The boundary is required on both sides for the reason the prefix rule
-/// required it on one: a point is appended with a separator, so `qmv_fast`
-/// must not claim `qmv_fastest_bfloat16`, and the qualifier is prepended with
-/// one, so it must not claim `xqmv_fast_bfloat16` either.
-fn at_word_boundary(symbol: &str, name: &str) -> bool {
-    let mut from = 0;
-    while let Some(at) = symbol[from..].find(name) {
-        let start = from + at;
-        let end = start + name.len();
-        let before = start == 0 || symbol.as_bytes()[start - 1] == b'_';
-        let after = end == symbol.len() || symbol.as_bytes()[end] == b'_';
-        if before && after {
-            return true;
-        }
-        from = start + 1;
-    }
-    false
-}
-
 /// Every `(shader file, entrypoint)` a retired family reaches.
 ///
 /// Metal compiles at RUN time from a path and a name, so the two are one fact
@@ -264,29 +274,6 @@ pub fn shaders() -> Vec<(&'static str, &'static str)> {
     out
 }
 
-/// The entrypoints of the families whose `kernel!` rows have been RETIRED.
-///
-/// Stated at the SOURCE rather than at each consumer: one edit instead of N,
-/// every sweep keeps its coverage untouched, and the census stays whole so
-/// the comparison against a backend that has not retired the same rows keeps
-/// meaning what it meant.
-///
-/// This list grows as families cross and the table shrinks under it. When the
-/// last one crosses, `KERNELS` is empty and this is the whole census — which
-/// is `.wiki/kernel-x/refactor-bigplan.md` §7 Stage 4, and why it is a list
-/// of families rather than one flat slice.
-pub const RETIRED: &[&[(&str, &str)]] = &[
-    attn::ENTRYPOINTS,
-    layout::ENTRYPOINTS,
-    mlp::ENTRYPOINTS,
-    moe::ENTRYPOINTS,
-    norm::ENTRYPOINTS,
-    ptir::ENTRYPOINTS,
-    quant::ENTRYPOINTS,
-    rope::ENTRYPOINTS,
-    sample::ENTRYPOINTS,
-    ssm::ENTRYPOINTS,
-];
 
 /// Points this backend NAMES but does not build, and the whole of that set.
 ///
@@ -453,3 +440,48 @@ pub fn retired() -> Vec<&'static str> {
         .flat_map(|f| f.iter().map(|(_, name)| *name))
         .collect()
 }
+
+/// Whether `name` appears in `symbol` bounded by underscores on both sides.
+///
+/// NOT `starts_with`, and the difference is a whole family of kernels. A row's
+/// name is usually a prefix of its points — `rms_single_row_bfloat16` — but
+/// not always: `quant`'s are spelled `affine_qmv_fast_bfloat16_gs_64_b_4`,
+/// where the row is `qmv_fast` and `affine_` is a QUALIFIER the row name does
+/// not carry. A prefix rule finds nothing there.
+///
+/// It never had to. `KERNELS` held every row until Stage 4, and the caller
+/// above resolved these through the table's own axis expansion; the prefix
+/// rule was only ever the fallback for a retired family, and the first
+/// families to retire were the ones whose rows ARE prefixes. When the last
+/// row went, every `quant` and `moe` symbol stopped resolving and `model-ir`
+/// refused to build any metal text at all — the load-time check firing on the
+/// whole fleet.
+///
+/// The boundary is required on both sides for the reason the prefix rule
+/// required it on one: a point is appended with a separator, so `qmv_fast`
+/// must not claim `qmv_fastest_bfloat16`, and the qualifier is prepended with
+/// one, so it must not claim `xqmv_fast_bfloat16` either.
+fn at_word_boundary(symbol: &str, name: &str) -> bool {
+    let mut from = 0;
+    while let Some(at) = symbol[from..].find(name) {
+        let start = from + at;
+        let end = start + name.len();
+        let before = start == 0 || symbol.as_bytes()[start - 1] == b'_';
+        let after = end == symbol.len() || symbol.as_bytes()[end] == b'_';
+        if before && after {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// What a generic routine's element type must be on this plane.
+///
+/// `#[routine]` puts this on every type parameter that states no bound of its
+/// own, so a generic signature reads the same on all four planes and the
+/// plane's own requirement is said HERE, once. A shader plane binds a handle
+/// and asks nothing more of an element than that it be one.
+pub trait RoutineElem: kernels::Elem {}
+
+impl<T: kernels::Elem> RoutineElem for T {}

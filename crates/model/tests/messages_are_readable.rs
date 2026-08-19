@@ -281,8 +281,42 @@ fn literal_bodies(line: &str) -> Vec<&str> {
     bodies
 }
 
+/// Does this literal read as a table ROW rather than a sentence?
+///
+/// A header labels columns and its own neighbours are code, so
+/// [`aligned_with_a_neighbour`] cannot see the table it belongs to. What it has
+/// instead is SEVERAL runs of padding, each between short labels: prose joined
+/// from a source line has exactly one such run, because there was one newline.
+/// Three or more is a layout.
+fn reads_as_a_table_row(body: &str) -> bool {
+    body.split("  ").filter(|part| !part.trim().is_empty()).count() >= 3
+        && !body.contains(". ")
+}
+
+/// Does a neighbouring line put a word at the same column?
+///
+/// A COLUMN IS NOT A SWALLOWED INDENT, and the two look identical on one line.
+/// A diagnostic table -- `driver-wgpu/tests/hybrid_probe.rs` prints several --
+/// pads each row so its numbers line up, and the padding lands mid-sentence
+/// exactly as a joined source line's indent does. What tells them apart is the
+/// LINE ABOVE OR BELOW: a table's neighbour has a word starting at the same
+/// column, and a joined line's does not.
+fn aligned_with_a_neighbour(lines: &[&str], idx: usize, col: usize) -> bool {
+    [idx.checked_sub(1), Some(idx + 1)]
+        .into_iter()
+        .flatten()
+        .filter_map(|n| lines.get(n))
+        .any(|other| {
+            other.len() > col
+                && other.as_bytes()[col] != b' '
+                && col > 0
+                && other.as_bytes()[col - 1] == b' '
+        })
+}
+
 fn collapsed_literals(src: &str) -> Vec<(usize, String)> {
     let mut found = Vec::new();
+    let lines: Vec<&str> = src.lines().collect();
     for (idx, line) in src.lines().enumerate() {
         for body in literal_bodies(line) {
             let mut at = 0;
@@ -293,7 +327,11 @@ fn collapsed_literals(src: &str) -> Vec<(usize, String)> {
                     + body[start..]
                         .find(|c: char| c != ' ')
                         .unwrap_or(body.len() - start);
-                if splits_prose(&body[..start], &body[end..]) {
+                let at_col = line.find(&body).map_or(end, |o| o + end);
+                if splits_prose(&body[..start], &body[end..])
+                    && !aligned_with_a_neighbour(&lines, idx, at_col)
+                    && !reads_as_a_table_row(&body)
+                {
                     let shown: String = body.chars().take(90).collect();
                     found.push((idx + 1, shown));
                     hit = true;

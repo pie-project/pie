@@ -804,7 +804,7 @@ impl<B: Allocation> PartialEq for Slot<'_, B> {
 // the plan's own order, which was the majority path while it existed.
 //
 // `scalars` resolved each `kernels::Source` into a NUMBER and decided where
-// the number went. The statement's own run answered `Param(i)` and
+// the number went. The statement's own run answered `Const { v: i }` and
 // `ParamF32(i)`; the resolver answered the pool's page size, the mask stride
 // and the fire's rows; the LAUNCH answered the derived family -- `OutWidth`,
 // `InWidth`, `OutElements`, `InElements` -- from its row span and its
@@ -1994,6 +1994,8 @@ mod tests {
             params: Vec::new(),
             n_requests: 0,
             conds: Vec::new(),
+            // A fixture states no attention schedule to raise.
+            preps: Vec::new(),
             readout: None,
         }
     }

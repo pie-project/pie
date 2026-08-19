@@ -395,18 +395,52 @@ fn the_sibling_gates_this_port_has_no_twin_for_are_named() {
 #[test]
 fn the_first_ported_routine_asks_for_the_grid_its_row_asked_for() {
     use driver_wgpu::geometry::{Dims, Module, Rule, groups};
-    use kernels_wgpu::routine::{ArgValue, Encode, Fire};
+    use kernels_wgpu::routine::{ArgValue, Encode, Fire, Tensor};
 
+    /// The lanes the body asked for, and the row count it will be told.
+    ///
+    /// IT ANSWERS AS WELL AS RECORDS. `ple_combine` reaches its row count
+    /// through `ctx.ask::<i32, keys::Rows>()` now rather than through an
+    /// `Env` parameter, so a probe that only recorded would refuse before it
+    /// dispatched. `resolve` is the one method that answering takes.
     #[derive(Default)]
-    struct Lanes(std::cell::RefCell<Option<[u32; 3]>>);
+    struct Lanes {
+        seen: std::cell::RefCell<Option<[u32; 3]>>,
+        rows: i32,
+    }
     impl Encode for Lanes {
-        fn dispatch(
+        fn fire(
             &self,
-            fire: Fire<'_>,
+            fire: Fire,
             _args: &[ArgValue],
         ) -> Result<(), kernels::routine::Refusal> {
-            *self.0.borrow_mut() = Some(fire.lanes);
+            *self.seen.borrow_mut() = Some(fire.lanes);
             Ok(())
+        }
+
+        fn resolve(
+            &self,
+            _ty: kernels::Ty,
+            source: kernels::Source,
+        ) -> Result<ArgValue, kernels::routine::Refusal> {
+            // One fact and the PARAMS BLOCK: this body asks for nothing
+            // else. `ctx.params()` resolves `Slot(Kind::Params, 0)` -- the
+            // packed scalar run, which reaches a shader as a buffer -- and a
+            // probe that refused it never reached the dispatch this test
+            // measures.
+            match source {
+                kernels::Source::Slot(kernels::Kind::Params, _) => {
+                    Ok(ArgValue::Buffer(0))
+                }
+                kernels::Source::Named(key)
+                    if key == <kernels::keys::Rows as kernels::keys::Fact>::KEY =>
+                {
+                    Ok(ArgValue::I32(self.rows))
+                }
+                _ => Err(kernels::routine::Refusal::Unstated {
+                    what: "a fact this probe does not answer",
+                }),
+            }
         }
     }
 
@@ -436,18 +470,22 @@ fn the_first_ported_routine_asks_for_the_grid_its_row_asked_for() {
         };
         let want = groups(rule, dims, module).expect("the rule answers");
 
-        let to = Lanes::default();
+        let to = Lanes {
+            rows: i32::try_from(rows).expect("fits"),
+            ..Lanes::default()
+        };
+        // THE WIDTH RIDES THE OPERAND. `In<Tensor<_>>` carries the
+        // rectangle the statement placed, so the body reads `proj.width`
+        // off its own argument where it used to take a separate `Env`.
+        let w = i32::try_from(width).expect("fits");
         kernels_wgpu::layout::ple_combine(
             &to,
-            kernels::routine::InSlot::new(kernels_wgpu::routine::Buf(0)),
-            kernels::routine::InSlot::new(kernels_wgpu::routine::Buf(1)),
-            kernels::routine::OutSlot::new(kernels_wgpu::routine::BufMut(2)),
-            kernels::routine::Block::new(kernels_wgpu::routine::Buf(3)),
-            kernels::routine::Ask::new(i32::try_from(width).expect("fits")),
-            kernels::routine::Ask::new(i32::try_from(rows).expect("fits")),
+            kernels::routine::In { ptr: Tensor::new(0), rows: 1, width: w },
+            kernels::routine::In { ptr: Tensor::new(1), rows: 1, width: w },
+            kernels::routine::Out { ptr: Tensor::new(2), rows: 1, width: w },
         )
         .expect("the body dispatches");
-        let lanes = to.0.borrow().expect("it dispatched once");
+        let lanes = to.seen.borrow().expect("it dispatched once");
 
         let got = [
             lanes[0].div_ceil(declared.local[0]),

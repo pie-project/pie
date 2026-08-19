@@ -38,12 +38,30 @@ use crate::lowering::hold::{Facts, Handles};
 /// produce: [`Refusal::Absent`] for a slot or scalar the trace does not
 /// carry.
 pub fn bind(
-    args: &[(Ty, kernels::Provenance)],
+    args: &[Ty],
     sources: &[Option<Source>],
     o: &mut Handles<'_>,
     f: Facts,
 ) -> Result<Vec<ArgValue>, Refusal> {
     kernels::bind::bind::<ArgValue, _>(args, sources, &mut Held { o, f })
+}
+
+/// ONE value, for a body that ASKS rather than a column that declares.
+///
+/// The same resolver, entered at one argument instead of a list. Nothing new
+/// answers — what changed is only where the question is asked from.
+///
+/// # Errors
+///
+/// [`Refusal::Unstated`] for a fact this backend does not answer, and whatever
+/// the fact's own absence means otherwise.
+pub fn one(
+    ty: Ty,
+    source: Source,
+    o: &mut Handles<'_>,
+    f: Facts,
+) -> Result<ArgValue, Refusal> {
+    kernels::bind::one::<ArgValue, _>(ty, source, &mut Held { o, f })
 }
 
 /// This backend's answers, for the shared reader.
@@ -58,23 +76,37 @@ struct Held<'a, 'h> {
 
 impl Holds for Held<'_, '_> {
     fn input(&mut self, n: usize) -> Result<u32, Refusal> {
-        Ok(self.o.input(n)?.0)
+        self.o.input(n)
     }
 
     fn output(&mut self, n: usize) -> Result<u32, Refusal> {
-        Ok(self.o.output(n)?.0)
+        self.o.output(n)
     }
 
     fn output_read(&mut self, n: usize) -> Result<u32, Refusal> {
-        Ok(self.o.output_read(n)?.0)
+        self.o.output_read(n)
     }
 
     fn weight(&mut self, n: usize) -> Result<u32, Refusal> {
-        Ok(self.o.weight(n)?.0)
+        self.o.weight(n)
+    }
+
+    // THE RECTANGLE, WHICH THE MARK NOW CARRIES. `shaped` asks for both
+    // halves of an operand -- the handle and its row width -- and the default
+    // here answers `Unstated`, which `bind` reads as a width of ZERO. Every
+    // body that takes an `In<Tensor<_>>` and reads `x.width` then refuses
+    // `Empty`, which is what left this backend unable to dispatch a rotation
+    // or a strided activation.
+    fn in_width(&self, n: usize) -> Result<i32, Refusal> {
+        self.o.in_width(n)
+    }
+
+    fn out_width(&self, n: usize) -> Result<i32, Refusal> {
+        self.o.out_width(n)
     }
 
     fn params_block(&mut self) -> u32 {
-        self.o.params_block().0
+        self.o.params_block()
     }
 
     fn param(&self, n: usize) -> Result<i32, Refusal> {
@@ -86,7 +118,7 @@ impl Holds for Held<'_, '_> {
     }
 
     fn null(&mut self) -> u32 {
-        self.o.state(None).0
+        self.o.state(None)
     }
 
     fn fact(&mut self, key: &'static str) -> Option<Result<Answer, Refusal>> {

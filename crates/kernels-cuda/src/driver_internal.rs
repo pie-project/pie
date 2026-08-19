@@ -1,26 +1,37 @@
 //! Launchers for a driver-side caller, not a family: no `FAMILY`, no
 //! `ROUTINES` here.
 //!
-//! Four host programs below are named by statements; each is declared with a
-//! `routine!` line in its own family module (`attn`, `layout`, `mlp`, `ssm`)
-//! naming this file's `fn` by bare identifier, since `Family::symbol` needs a
-//! module prefix this file doesn't have. [`add_bias_bf16`] and
-//! [`rmsnorm_gated_fp32_in_bf16`] are `void*` entry points forwarding into an
-//! already-declared `norm` routine.
+//! Four host programs below are named by statements, and each STATES the
+//! namespace that statement spells -- `#[routine(namespace = "attn")]` and so
+//! on for `layout`, `mlp` and `ssm`. This file collects launchers by CALLER
+//! rather than by family, so the module it is written in is not the prefix a
+//! trace uses: `lower::semantic` maps `OpKind::SplitQkv` onto
+//! `attn::split_qkv_bf16`, and a row filed under `driver_internal::` is a
+//! symbol nothing declares.
+//!
+//! Each used to be declared by a `routine!` line in its own family module
+//! naming this file's `fn` by bare identifier. A row registers where its `fn`
+//! is written now, so the namespace is said where the `fn` is.
+//!
+//! [`add_bias_bf16`] and [`rmsnorm_gated_fp32_in_bf16`] are `void*` entry
+//! points forwarding into an already-declared `norm` routine.
 //!
 //! Every `# Safety` below also requires that the memory it names live on
 //! `ctx`'s stream, which must outlive the launch.
 
+use kernels::routine::Asks;
+use kernels::{Bind, Fire, keys};
+use kernels_macros::routine;
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use crate::jit::{Ctx, Launch};
 use crate::jit::Abi;
 use crate::jit::abi::bf16;
+use crate::jit::abi::Tensor;
 use crate::{norm, quant};
 use kernels::Refusal;
-use kernels::keys::{self, Fact};
-use kernels::routine::{Bank, Env, In, Out, Weight};
+use kernels::routine::{Const, In, InOut, Out};
 
 /// The pointwise launch block, matching `runtime/launch.rs`'s `BLOCK`.
 const BLOCK: u32 = 256;
@@ -32,14 +43,13 @@ const BLOCK: u32 = 256;
 /// `packed` is `[n_tokens, q_dim + 2 * kv_dim]` bf16; `q_out` is
 /// `[n_tokens, q_dim]` and `k_out`/`v_out` are `[n_tokens, kv_dim]`, all
 /// bf16 and all writable.
-#[kernels_macros::routine]
+#[routine(namespace = "attn")]
 pub fn split_qkv_bf16(
-    ctx: &Ctx,
-    packed: In<0, bf16>,
-    q_out: Out<0, bf16>,
-    k_out: Out<1, bf16>,
-    v_out: Out<2, bf16>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    packed: In<Tensor<bf16>>,
+    q_out: Out<Tensor<bf16>>,
+    k_out: Out<Tensor<bf16>>,
+    v_out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
     let q = q_out.all("the q half")?;
     let k = k_out.all("the k half")?;
     let (q_dim, kv_dim) = (q.width, k.width);
@@ -48,22 +58,14 @@ pub fn split_qkv_bf16(
     }
     let n_tokens = q.rows;
     let width = q_dim.max(kv_dim).unsigned_abs();
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "attn/split_packed.cuh",
-            "::pie::attn::split_qkv<::pie::bf16>",
-            Launch::grid([width.div_ceil(BLOCK), n_tokens.unsigned_abs(), 1], [BLOCK, 1, 1]),
-            &[
-                packed.ptr.arg(),
-                q_out.ptr.arg(),
-                k_out.ptr.arg(),
-                v_out.ptr.arg(),
+    ctx.fire(Fire::at("attn/split_packed.cuh", "::pie::attn::split_qkv<::pie::bf16>").apply(Launch::grid([width.div_ceil(BLOCK), n_tokens.unsigned_abs(), 1], [BLOCK, 1, 1])), &[
+                packed.arg(),
+                q_out.arg(),
+                k_out.arg(),
+                v_out.arg(),
                 q_dim.arg(),
                 kv_dim.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// The bias add — `norm::add_bias_bf16`, `norm/add_bias.cuh`.
@@ -77,19 +79,18 @@ pub fn split_qkv_bf16(
 ///
 /// `out` is `[num_rows, dim]` bf16 and writable, `bias` is `[dim]` bf16.
 pub fn add_bias_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     out: *mut c_void,
     bias: *const c_void,
     num_rows: i32,
-    dim: i32,
-) -> Result<(), Refusal> {
+    dim: i32) -> Result<(), Refusal> {
     // `num_rows`/`dim` stay separate params here (a `*mut c_void` entry point
     // is what non-`Ctx` driver callers have) and become one `Out` region
     // only once they cross into the routine.
     norm::add_bias::<bf16>(
         ctx,
-        Out { ptr: out.cast::<bf16>(), rows: num_rows, width: dim },
-        Weight { ptr: bias.cast::<bf16>() },
+        InOut { ptr: out.cast::<bf16>(), rows: num_rows, width: dim },
+        Const { v: bias.cast::<bf16>() },
     )
 }
 
@@ -102,74 +103,64 @@ pub fn add_bias_bf16(
 /// `[N, V_h]`, `[N, V_h]` and `[V_h]`; `a_log` is `[V_h]` fp32; the five
 /// outputs are writable for `[N, K_h, K_d]`, `[N, K_h, K_d]`,
 /// `[N, V_h, V_d]`, `[N, V_h]` and `[N, V_h]`.
-#[allow(clippy::too_many_arguments)]
-#[kernels_macros::routine]
+#[routine(namespace = "ssm")]
 pub fn qwen_gdn_post_conv_prep_bf16(
-    ctx: &Ctx,
-    qkv_post: In<0, bf16>,
-    a: In<1, bf16>,
-    b: In<2, bf16>,
+    ctx: &Ctx<'_>,
+    qkv_post: In<Tensor<bf16>>,
+    a: In<Tensor<bf16>>,
+    b: In<Tensor<bf16>>,
     // `Bank<N>` reads the positional weight run; `Weight<N>` would compile
     // and bind the same two tensors through the named-weight table instead.
-    a_log: Bank<0, f32>,
-    dt_bias: Bank<1, bf16>,
-    q_norm_kh: Out<0, f32>,
-    k_norm_kh: Out<1, f32>,
-    v_fp32: Out<2, f32>,
-    g_log_out: Out<3, f32>,
-    beta_out: Out<4, f32>,
-    k_h: Env<keys::GdnKHeads>,
-    v_h: Env<keys::GdnVHeads>,
-    k_d: Env<keys::GdnKDim>,
-    v_d: Env<keys::GdnVDim>,
-    conv_dim: Env<keys::GdnConvDim>,
-) -> Result<(), Refusal> {
+    a_log: Const<Tensor<f32>>,
+    dt_bias: Const<Tensor<bf16>>,
+    q_norm_kh: Out<Tensor<f32>>,
+    k_norm_kh: Out<Tensor<f32>>,
+    v_fp32: Out<Tensor<f32>>,
+    g_log_out: Out<Tensor<f32>>,
+    beta_out: Out<Tensor<f32>>) -> Result<(), Refusal> {
+    // THE LINEAR-ATTENTION SHAPE, ASKED FOR. All five were `Const<i32>` and
+    // none of them could be: `OpKind::GdnPrep` carries two weight names and
+    // no numbers, and `lower::walk` builds a params run only for
+    // `OpKind::Launch` — so the statement had nowhere to put them and every
+    // qwen3.5 fire refused here. HEAD spelled all five `Env<keys::Gdn*>` and
+    // `driver-cuda` answers each off the same `Cx::gdn()` borrow.
+    let k_h = ctx.ask::<i32, keys::GdnKHeads>()?;
+    let v_h = ctx.ask::<i32, keys::GdnVHeads>()?;
+    let k_d = ctx.ask::<i32, keys::GdnKDim>()?;
+    let v_d = ctx.ask::<i32, keys::GdnVDim>()?;
+    let conv_dim = ctx.ask::<i32, keys::GdnConvDim>()?;
     /// `gated_delta_net.cu`'s `constexpr int BLOCK = 128;`.
     const PREP_BLOCK: u32 = 128;
     let n = qkv_post.all("the post-convolution qkv")?.rows;
     #[allow(clippy::cast_precision_loss)]
-    let q_scale = (**k_d as f32).sqrt().recip();
+    let q_scale = (k_d as f32).sqrt().recip();
     // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "ssm/gated_delta_net_prep.cuh",
-            "::pie::ssm::qwen_gdn_qk_norm<::pie::bf16, 128>",
-            Launch::grid([n.unsigned_abs(), (**k_h).unsigned_abs(), 1], [PREP_BLOCK, 1, 1]),
-            &[
-                qkv_post.ptr.arg(),
-                q_norm_kh.ptr.arg(),
-                k_norm_kh.ptr.arg(),
+    ctx.fire(Fire::at("ssm/gated_delta_net_prep.cuh", "::pie::ssm::qwen_gdn_qk_norm<::pie::bf16, 128>").apply(Launch::grid([n.unsigned_abs(), k_h.unsigned_abs(), 1], [PREP_BLOCK, 1, 1])), &[
+                qkv_post.arg(),
+                q_norm_kh.arg(),
+                k_norm_kh.arg(),
                 k_h.arg(),
                 k_d.arg(),
                 conv_dim.arg(),
                 q_scale.arg(),
-            ],
-        )?;
-    }
+            ])?;
     // SAFETY: the caller's assertion, forwarded. No barrier needed: the
     // second launch re-reads `qkv_post`, not anything the first wrote.
-    unsafe {
-        ctx.launch(
-            "ssm/gated_delta_net_prep.cuh",
-            "::pie::ssm::qwen_gdn_v_g_beta<::pie::bf16, 128>",
-            Launch::grid([n.unsigned_abs(), (**v_h).unsigned_abs(), 1], [PREP_BLOCK, 1, 1]),
-            &[
-                qkv_post.ptr.arg(),
-                a.ptr.arg(),
-                b.ptr.arg(),
-                a_log.ptr.arg(),
-                dt_bias.ptr.arg(),
-                v_fp32.ptr.arg(),
-                g_log_out.ptr.arg(),
-                beta_out.ptr.arg(),
+    ctx.fire(Fire::at("ssm/gated_delta_net_prep.cuh", "::pie::ssm::qwen_gdn_v_g_beta<::pie::bf16, 128>").apply(Launch::grid([n.unsigned_abs(), v_h.unsigned_abs(), 1], [PREP_BLOCK, 1, 1])), &[
+                qkv_post.arg(),
+                a.arg(),
+                b.arg(),
+                a_log.arg(),
+                dt_bias.arg(),
+                v_fp32.arg(),
+                g_log_out.arg(),
+                beta_out.arg(),
                 k_h.arg(),
                 v_h.arg(),
                 k_d.arg(),
                 v_d.arg(),
                 conv_dim.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// The per-head query/gate split — `layout::split_q_gate_bf16`,
@@ -180,19 +171,24 @@ pub fn qwen_gdn_post_conv_prep_bf16(
 /// `packed` is `[n, num_heads, 2 * head_dim]` bf16; `q_out` and `gate_out`
 /// are `[n, num_heads, head_dim]` bf16 and writable. All live on `ctx`'s
 /// stream.
-#[kernels_macros::routine]
+#[routine(namespace = "layout")]
 pub fn split_q_gate_bf16(
-    ctx: &Ctx,
-    packed: In<0, bf16>,
-    q_out: Out<0, bf16>,
-    gate_out: Out<1, bf16>,
+    ctx: &Ctx<'_>,
+    packed: In<Tensor<bf16>>,
+    q_out: Out<Tensor<bf16>>,
+    gate_out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
     // No operand carries this: both results are `heads * head_dim` wide and
     // `packed` is twice that, so the extents fix the product, never the
     // factors; `heads` is the division below.
-    head_dim: Env<keys::PerHeadDim>,
-) -> Result<(), Refusal> {
+    //
+    // ASKED, NOT `Const`: `OpKind::SplitQGate` is a semantic op, and only
+    // `OpKind::Launch` gets a params run out of `lower::walk` — so a `Const`
+    // here promises a number the statement has nowhere to put. HEAD spelled
+    // it `Env<keys::PerHeadDim>`, and it is `PerHeadDim` rather than
+    // `HeadDim` on purpose: this splits qwen3.5's LINEAR-attention q/gate,
+    // whose head width is the GDN key dim and not the attention head dim.
+    let head_dim = ctx.ask::<i32, keys::PerHeadDim>()?;
     let q = q_out.all("the query half")?;
-    let head_dim = **head_dim;
     if head_dim <= 0 {
         return Err(Refusal::Unstated { what: "the head pitch a q/gate split grids by" });
     }
@@ -201,22 +197,14 @@ pub fn split_q_gate_bf16(
     }
     let (n, num_heads) = (q.rows, q.width / head_dim);
     let block = if head_dim < 128 { 64 } else { 128 };
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "layout/deinterleave.cuh",
-            "::pie::layout::split_q_gate<::pie::bf16>",
-            Launch::grid([n.unsigned_abs(), num_heads.unsigned_abs(), 1], [block, 1, 1]),
-            &[
-                packed.ptr.arg(),
-                q_out.ptr.arg(),
-                gate_out.ptr.arg(),
+    ctx.fire(Fire::at("layout/deinterleave.cuh", "::pie::layout::split_q_gate<::pie::bf16>").apply(Launch::grid([n.unsigned_abs(), num_heads.unsigned_abs(), 1], [block, 1, 1])), &[
+                packed.arg(),
+                q_out.arg(),
+                gate_out.arg(),
                 n.arg(),
                 num_heads.arg(),
                 head_dim.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// That gate applied — `mlp::sigmoid_gate_inplace_bf16`, `mlp/swiglu.cuh`.
@@ -225,22 +213,13 @@ pub fn split_q_gate_bf16(
 ///
 /// `x` and `gate` are both `num_elements` bf16 elements; `x` is writable and
 /// is read and written by the same threads.
-#[kernels_macros::routine]
+#[routine(namespace = "mlp")]
 pub fn sigmoid_gate_inplace_bf16(
-    ctx: &Ctx,
-    x: Out<0, bf16>,
-    gate: In<1, bf16>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    x: InOut<Tensor<bf16>>,
+    gate: In<Tensor<bf16>>) -> Result<(), Refusal> {
     let num_elements = x.all("the gated rectangle")?.elements();
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "mlp/swiglu.cuh",
-            "::pie::mlp::sigmoid_gate_inplace<::pie::bf16>",
-            Launch::flat(num_elements.unsigned_abs(), BLOCK),
-            &[x.ptr.arg(), gate.ptr.arg(), num_elements.arg()],
-        )
-    }
+    ctx.fire(Fire::at("mlp/swiglu.cuh", "::pie::mlp::sigmoid_gate_inplace<::pie::bf16>").apply(Launch::flat(num_elements.unsigned_abs(), BLOCK)), &[x.arg(), gate.arg(), num_elements.arg()])
 }
 
 /// The gated norm with an FP32 `x` — `norm::rmsnorm_gated_fp32_in_bf16`,
@@ -257,27 +236,30 @@ pub fn sigmoid_gate_inplace_bf16(
 /// writable.
 #[allow(clippy::too_many_arguments)]
 pub fn rmsnorm_gated_fp32_in_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     x: *const c_void,
     gate: *const c_void,
     weight: *const c_void,
     y: *mut c_void,
     num_rows: i32,
-    hidden: i32,
-    eps: f32,
-) -> Result<(), Refusal> {
+    hidden: i32) -> Result<(), Refusal> {
     // `weight` is wrapped as the named bank: `OpKind::RmsnormGated` only ever
     // names it through `LaunchSpec::weight`, so there is no positional slot
     // for it to be `Bank<0>` of.
+    //
+    // `eps` LEFT THIS SIGNATURE with the `Const` it used to forward: the
+    // routine asks `keys::RmsEps` of the `Ctx` now, because the semantic op
+    // that fires it carries no params run for a `Const` to be read out of.
     let shape = |p: *mut bf16| Out { ptr: p, rows: num_rows, width: hidden };
     norm::rmsnorm_gated_fp32_in::<bf16>(
         ctx,
         In { ptr: x.cast::<f32>(), rows: num_rows, width: hidden },
         In { ptr: gate.cast::<bf16>(), rows: num_rows, width: hidden },
-        Weight { ptr: weight.cast::<f32>() },
+        Const { v: weight.cast::<f32>() },
         shape(y.cast::<bf16>()),
+        // `per_head_dim`, WHICH NOTHING SUPPLIES: zero is "the whole row",
+        // which is what the routine's own guard reads it as.
         0,
-        keys::RmsEps::env(eps),
     )
 }
 
@@ -311,28 +293,19 @@ fn addr<T>(p: *const T) -> crate::jit::abi::DevicePtr {
 /// `kv_last_page_lens` `num_requests` of them; `kv_len` is `num_requests`
 /// writable `u32`s.
 pub fn derive_kv_len(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     kv_page_indptr: *const u32,
     kv_last_page_lens: *const u32,
     page_size: u32,
     num_requests: u32,
-    kv_len: *mut u32,
-) -> Result<(), Refusal> {
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "layout/geometry.cuh",
-            "::pie::layout::derive_kv_len",
-            Launch::flat(num_requests, BLOCK),
-            &[
+    kv_len: *mut u32) -> Result<(), Refusal> {
+    ctx.fire(Fire::at("layout/geometry.cuh", "::pie::layout::derive_kv_len").apply(Launch::flat(num_requests, BLOCK)), &[
                 kv_page_indptr.arg(),
                 kv_last_page_lens.arg(),
                 page_size.arg(),
                 num_requests.arg(),
                 kv_len.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// A working-set slot id to its physical page-pool block —
@@ -348,28 +321,19 @@ pub fn derive_kv_len(
 /// live `u32`s, and `page_indices` `count` writable ones. All live on `ctx`'s
 /// stream, which must outlive the launch.
 pub fn resolve_slot_to_block(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     pages: *const u32,
     slot_to_block: *const u32,
     num_slots: u32,
     count: u32,
-    page_indices: *mut u32,
-) -> Result<(), Refusal> {
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "layout/geometry.cuh",
-            "::pie::layout::resolve_slot_to_block",
-            Launch::flat(count, BLOCK),
-            &[
+    page_indices: *mut u32) -> Result<(), Refusal> {
+    ctx.fire(Fire::at("layout/geometry.cuh", "::pie::layout::resolve_slot_to_block").apply(Launch::flat(count, BLOCK)), &[
                 pages.arg(),
                 slot_to_block.arg(),
                 num_slots.arg(),
                 count.arg(),
                 page_indices.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// A device-composed decode wave's page CSR — `layout/geometry.cuh`'s
@@ -394,7 +358,7 @@ pub fn resolve_slot_to_block(
 /// bytes. `kills` is null or one writable `u32`.
 #[allow(clippy::too_many_arguments)]
 pub fn compose_envelope_csr(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     members: *const c_void,
     traced_page_indptr: *const u32,
     traced_pages: *const u32,
@@ -408,8 +372,7 @@ pub fn compose_envelope_csr(
     kv_last_page_lens: *mut u32,
     w_slot_out: *mut u32,
     row_valid: *mut u8,
-    kills: Option<NonNull<u32>>,
-) -> Result<(), Refusal> {
+    kills: Option<NonNull<u32>>) -> Result<(), Refusal> {
     // Like `graph_pad_rows`' ceiling: `<<<1, member_count>>>` is a block
     // width, and past the device's maximum this fails inside
     // `cudaGetLastError`, launch already issued.
@@ -423,13 +386,7 @@ pub fn compose_envelope_csr(
     // One `u32` per member — page count, then (post-scan) its offset into
     // the composed list. `extern __shared__` sizes nothing itself.
     let smem = member_count * 4;
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "layout/geometry.cuh",
-            "::pie::layout::compose_envelope_csr",
-            Launch::grid([1, 1, 1], [member_count, 1, 1]).smem(smem),
-            &[
+    ctx.fire(Fire::at("layout/geometry.cuh", "::pie::layout::compose_envelope_csr").apply(Launch::grid([1, 1, 1], [member_count, 1, 1]).smem(smem)), &[
                 members.arg(),
                 traced_page_indptr.arg(),
                 traced_pages.arg(),
@@ -444,9 +401,7 @@ pub fn compose_envelope_csr(
                 w_slot_out.arg(),
                 row_valid.arg(),
                 kills.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// The KV compaction copy — `layout/gather_tokens.cuh`, choosing between its
@@ -467,7 +422,7 @@ pub fn compose_envelope_csr(
 /// have written.
 #[allow(clippy::too_many_arguments)]
 pub fn gather_tokens(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     k_pages: *mut u16,
     v_pages: *mut u16,
     ops: *const c_void,
@@ -476,8 +431,7 @@ pub fn gather_tokens(
     layer_stride_elems: i64,
     page_size: i32,
     num_kv_heads: i32,
-    head_dim: i32,
-) -> Result<(), Refusal> {
+    head_dim: i32) -> Result<(), Refusal> {
     let token_stride = i64::from(num_kv_heads) * i64::from(head_dim);
     let page_stride = token_stride * i64::from(page_size);
     let grid = Launch::grid([num_ops.unsigned_abs(), 1, num_layers.unsigned_abs()], [BLOCK, 1, 1]);
@@ -487,38 +441,23 @@ pub fn gather_tokens(
     // `token_stride * page_size`, so token alignment already implies it.
     if token_stride % 8 == 0 && layer_stride_elems % 8 == 0 {
         // SAFETY: the caller's assertion, forwarded.
-        return unsafe {
-            ctx.launch(
-                "layout/gather_tokens.cuh",
-                "::pie::layout::gather_i4",
-                grid,
-                &[
+        return ctx.fire(Fire::at("layout/gather_tokens.cuh", "::pie::layout::gather_i4").apply(grid), &[
                     k_pages.cast::<c_void>().arg(),
                     v_pages.cast::<c_void>().arg(),
                     ops.arg(),
                     (token_stride / 8).arg(),
                     (page_stride / 8).arg(),
                     (layer_stride_elems / 8).arg(),
-                ],
-            )
-        };
+                ]);
     }
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "layout/gather_tokens.cuh",
-            "::pie::layout::gather_u16",
-            grid,
-            &[
+    ctx.fire(Fire::at("layout/gather_tokens.cuh", "::pie::layout::gather_u16").apply(grid), &[
                 k_pages.arg(),
                 v_pages.arg(),
                 ops.arg(),
                 token_stride.arg(),
                 page_stride.arg(),
                 layer_stride_elems.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// The graph-lattice pad lanes' CSR — `layout/graph_pad.cuh`.
@@ -536,7 +475,7 @@ pub fn gather_tokens(
 /// both live.
 #[allow(clippy::too_many_arguments)]
 pub fn graph_pad_rows(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     qo_indptr: *mut u32,
     kv_page_indptr: *mut u32,
     kv_page_indices: *mut u32,
@@ -551,8 +490,7 @@ pub fn graph_pad_rows(
     real_tokens: i32,
     padding: i32,
     pad_tokens: i32,
-    pad_page: u32,
-) -> Result<(), Refusal> {
+    pad_page: u32) -> Result<(), Refusal> {
     // A real guard: at `pad_tokens < padding` the kernel's `base =
     // pad_tokens / padding` is zero, so lanes past `extra` get a zero-length
     // last page while still consuming one.
@@ -568,13 +506,7 @@ pub fn graph_pad_rows(
             max: i64::from(MAX_BLOCK),
         });
     }
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "layout/graph_pad.cuh",
-            "::pie::layout::graph_pad_rows",
-            Launch::grid([1, 1, 1], [padding.unsigned_abs(), 1, 1]),
-            &[
+    ctx.fire(Fire::at("layout/graph_pad.cuh", "::pie::layout::graph_pad_rows").apply(Launch::grid([1, 1, 1], [padding.unsigned_abs(), 1, 1])), &[
                 qo_indptr.arg(),
                 kv_page_indptr.arg(),
                 kv_page_indices.arg(),
@@ -590,9 +522,7 @@ pub fn graph_pad_rows(
                 padding.arg(),
                 pad_tokens.arg(),
                 pad_page.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// One block's max threads on every architecture this crate targets —
@@ -615,30 +545,21 @@ const MAX_BLOCK: i32 = 1024;
 /// and `up_out` `n_tokens * inter` writable ones each. All live on `ctx`'s
 /// stream, which must outlive the launch.
 pub fn split_gate_up_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     packed: *const c_void,
     gate_out: *mut c_void,
     up_out: *mut c_void,
     n_tokens: i32,
-    inter: i32,
-) -> Result<(), Refusal> {
-    // SAFETY: the caller's assertion, forwarded.
-    unsafe {
-        ctx.launch(
-            "layout/split_gate_up.cuh",
-            "::pie::layout::split_gate_up<::pie::bf16>",
-            Launch::grid(
+    inter: i32) -> Result<(), Refusal> {
+    ctx.fire(Fire::at("layout/split_gate_up.cuh", "::pie::layout::split_gate_up<::pie::bf16>").apply(Launch::grid(
                 [inter.unsigned_abs().div_ceil(BLOCK), n_tokens.unsigned_abs(), 1],
                 [BLOCK, 1, 1],
-            ),
-            &[
+            )), &[
                 packed.cast::<bf16>().arg(),
                 gate_out.cast::<bf16>().arg(),
                 up_out.cast::<bf16>().arg(),
                 inter.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// MXFP4's group width — `transcode.cuh`'s `kGroup = 32`.
@@ -660,13 +581,12 @@ const MXFP4_GROUP: i32 = 32;
 /// `src` addresses `rows * cols` live bf16, `packed` `rows * cols / 2`
 /// writable bytes and `scales` `rows * cols / 32` writable bytes.
 pub fn transcode_bf16_to_mxfp4(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     src: *const bf16,
     packed: *mut u8,
     scales: *mut u8,
     rows: i32,
-    cols: i32,
-) -> Result<(), Refusal> {
+    cols: i32) -> Result<(), Refusal> {
     if cols % MXFP4_GROUP != 0 {
         return Err(Refusal::Narrow {
             what: "cols, in whole 32-element blocks",
@@ -678,15 +598,8 @@ pub fn transcode_bf16_to_mxfp4(
         quant::transcode::EncodeMxfp4 { packed: addr(packed), scales: addr(scales), cols };
     // SAFETY: the caller's assertion, forwarded; both aggregates are bound to
     // local bindings that outlive the launch call, per `jit::abi`'s `Abi::arg`.
-    unsafe {
-        ctx.launch(
-            "quant/transcode.cuh",
-            "::pie::transcode::transcode_rowmajor_kernel<\
-                 ::pie::transcode::EncodeMxfp4::kGroup,::pie::transcode::DecodeBf16,::pie::transcode::EncodeMxfp4>",
-            Launch::per_row(rows.unsigned_abs(), BLOCK),
-            &[decode.arg(), encode.arg(), cols.arg()],
-        )
-    }
+    ctx.fire(Fire::at("quant/transcode.cuh", "::pie::transcode::transcode_rowmajor_kernel<\
+                 ::pie::transcode::EncodeMxfp4::kGroup,::pie::transcode::DecodeBf16,::pie::transcode::EncodeMxfp4>").apply(Launch::per_row(rows.unsigned_abs(), BLOCK)), &[decode.arg(), encode.arg(), cols.arg()])
 }
 
 /// A block-scaled FP8 E4M3 checkpoint transcoded to MXFP4 in one pass —
@@ -705,15 +618,14 @@ pub fn transcode_bf16_to_mxfp4(
 /// and `rows * cols / 32` writable bytes.
 #[allow(clippy::too_many_arguments)]
 pub fn transcode_fp8_e4m3_per_group_to_mxfp4(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     src: *const u8,
     src_scales: *const f32,
     packed: *mut u8,
     scales: *mut u8,
     rows: i32,
     cols: i32,
-    group_size: i32,
-) -> Result<(), Refusal> {
+    group_size: i32) -> Result<(), Refusal> {
     if cols % MXFP4_GROUP != 0 {
         return Err(Refusal::Narrow {
             what: "cols, in whole 32-element blocks",
@@ -729,16 +641,8 @@ pub fn transcode_fp8_e4m3_per_group_to_mxfp4(
     };
     let encode =
         quant::transcode::EncodeMxfp4 { packed: addr(packed), scales: addr(scales), cols };
-    // SAFETY: as `transcode_bf16_to_mxfp4`'s.
-    unsafe {
-        ctx.launch(
-            "quant/transcode.cuh",
-            "::pie::transcode::transcode_rowmajor_kernel<\
-                 ::pie::transcode::EncodeMxfp4::kGroup,::pie::transcode::DecodeFp8E4m3PerGroup,::pie::transcode::EncodeMxfp4>",
-            Launch::per_row(rows.unsigned_abs(), BLOCK),
-            &[decode.arg(), encode.arg(), cols.arg()],
-        )
-    }
+    ctx.fire(Fire::at("quant/transcode.cuh", "::pie::transcode::transcode_rowmajor_kernel<\
+                 ::pie::transcode::EncodeMxfp4::kGroup,::pie::transcode::DecodeFp8E4m3PerGroup,::pie::transcode::EncodeMxfp4>").apply(Launch::per_row(rows.unsigned_abs(), BLOCK)), &[decode.arg(), encode.arg(), cols.arg()])
 }
 
 // ===========================================================================
@@ -749,41 +653,38 @@ pub fn transcode_fp8_e4m3_per_group_to_mxfp4(
 const _: () = {
     // `attn::split_qkv_bf16` and `mlp::sigmoid_gate_inplace_bf16` are pinned
     // where their families' other rows are.
-    let d = <split_q_gate_bf16 as kernels::Derivation>::DERIVED;
-    assert!(d.len() == 4);
-    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(split_q_gate_bf16);
+    // THREE, NOT FOUR: the head pitch left the column when it stopped being a
+    // `Const`. `OpKind::SplitQGate` is semantic, so no params run reaches
+    // this launch and the pitch is asked as `keys::PerHeadDim`. A fourth
+    // entry would mean a scalar came back to a signature nothing states one
+    // for.
+    assert!(d.len() == 3);
+    assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
     // `Out(1)`, not `In(1)`: the gate half is a result of the split, though
     // both halves read as `const T*` in the C++.
-    assert!(matches!(d[2].source, Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
-    // The head pitch, carried by no operand; a fifth entry here would mean
-    // something started stating a number the geometry already implies.
-    assert!(kernels::source_is_named(&d[3].source, <kernels::keys::PerHeadDim as kernels::keys::Fact>::KEY));
+    assert!(matches!(d[2], Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
 
-    let d = <qwen_gdn_post_conv_prep_bf16 as kernels::Derivation>::DERIVED;
-    assert!(d.len() == 15);
-    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::In, 1))));
-    assert!(matches!(d[2].source, Some(kernels::Source::Slot(kernels::Kind::In, 2))));
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(qwen_gdn_post_conv_prep_bf16);
+    // TEN, NOT FIFTEEN: the five linear-attention dims left the column with
+    // their `Const` marks, for the reason above — `OpKind::GdnPrep` carries
+    // two weight names and no numbers.
+    assert!(d.len() == 10);
+    assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    assert!(matches!(d[2], Some(kernels::Source::Slot(kernels::Kind::In, 2))));
     // The positional bank, not `Weight<0>`/`Weight<1>`: `OpKind::GdnPrep`
     // also lands these two on `spec.weight`/`weight2`, so the named form
     // would compile and bind the same tensors from the other table.
-    assert!(matches!(d[3].source, Some(kernels::Source::Slot(kernels::Kind::Weight, 0))));
-    assert!(matches!(d[4].source, Some(kernels::Source::Slot(kernels::Kind::Weight, 1))));
+    assert!(matches!(d[3], Some(kernels::Source::Or(kernels::Source::Named(_), kernels::Source::Slot(kernels::Kind::Weight, 0)))));
+    assert!(matches!(d[4], Some(kernels::Source::Or(kernels::Source::Named(_), kernels::Source::Slot(kernels::Kind::Weight, 1)))));
     // Five results in the order `builder::gdn_prep` pushes them: the two
     // norms are `[N, K_h, K_d]`, the last three `[N, V_h, ..]` — swapping
     // within either group is a wrong shape, not a compile error.
-    assert!(matches!(d[5].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(matches!(d[6].source, Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
-    assert!(matches!(d[7].source, Some(kernels::Source::Slot(kernels::Kind::Out, 2))));
-    assert!(matches!(d[8].source, Some(kernels::Source::Slot(kernels::Kind::Out, 3))));
-    assert!(matches!(d[9].source, Some(kernels::Source::Slot(kernels::Kind::Out, 4))));
-    // `k_h`/`v_h` and `k_d`/`v_d` differ by one letter and grid different
-    // launches — swapping either pair compiles clean. `n` has no entry here:
-    // it comes from `qkv_post`'s own row count, not a fact.
-    assert!(kernels::source_is_named(&d[10].source, <kernels::keys::GdnKHeads as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[11].source, <kernels::keys::GdnVHeads as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[12].source, <kernels::keys::GdnKDim as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[13].source, <kernels::keys::GdnVDim as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&d[14].source, <kernels::keys::GdnConvDim as kernels::keys::Fact>::KEY));
+    assert!(matches!(d[5], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(d[6], Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
+    assert!(matches!(d[7], Some(kernels::Source::Slot(kernels::Kind::Out, 2))));
+    assert!(matches!(d[8], Some(kernels::Source::Slot(kernels::Kind::Out, 3))));
+    assert!(matches!(d[9], Some(kernels::Source::Slot(kernels::Kind::Out, 4))));
 };

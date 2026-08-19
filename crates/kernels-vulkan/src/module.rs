@@ -84,6 +84,83 @@ pub fn embedded() -> bool {
     !MODULES.is_empty()
 }
 
+/// The artifact a BODY names for `entrypoint`, at the best tier at or below
+/// `want` that this build actually compiled.
+///
+/// # WHY A BODY RESOLVES THIS AND A DRIVER NO LONGER DOES
+///
+/// The tier used to be chosen behind the body: a plan stated a bare
+/// entrypoint and `driver-vulkan`'s `Modules::code` walked
+/// [`Capability::PREFERENCE`] down from the device's tier. That walk is what
+/// made every tiered module unreachable for the life of the crate --
+/// `driver-vulkan/src/lib.rs` records 146 cooperative-matrix modules and 20
+/// fp16 ones dead on every device from the first commit, found by measuring
+/// prefill rather than by anything failing, because *"a tier that is off looks
+/// exactly like a tier that is on but does not help"*.
+///
+/// A body that names its artifact cannot have that bug. The name is in the
+/// source, the module either exists under it or the fire refuses, and a
+/// variant nothing names is a file nothing reads.
+///
+/// This is the same shape CUDA already had: there a body builds its
+/// entrypoint (`::pie::norm::add_bias<__nv_bfloat16>`) and interns it, here a
+/// body builds its file. Both planes decide what they run.
+///
+/// # The walk is still a walk, and belongs here
+///
+/// `want` is the DEVICE's ceiling, from [`crate::routine::Encode::best`]. A
+/// tier is additive -- most entrypoints have only a baseline -- so resolving
+/// means stepping down until the build has one. Doing that here rather than in
+/// the driver is what keeps it in front of the body: the answer is the string
+/// the body then passes to [`crate::routine::Fire::at`], and the driver binds
+/// exactly that.
+#[must_use]
+pub fn path(entrypoint: &str, want: Capability) -> &'static str {
+    let tier = Capability::PREFERENCE
+        .iter()
+        .skip_while(|&&c| c != want)
+        .find(|&&c| stem(&c.module(entrypoint).replace(".spv", "")).is_some())
+        .copied()
+        .unwrap_or(Capability::Baseline);
+    intern(&tier.module(entrypoint))
+}
+
+/// This artifact name, as a `&'static str`.
+///
+/// [`crate::routine::Fire`] takes `&'static str` because three of the four
+/// planes name a literal, and this one composes: an entrypoint chosen from a
+/// table, plus the tier's suffix. The set is bounded by the module table, and
+/// every name interned here is one the build already emitted, so the leak is
+/// the same finite one `kernels-cuda`'s `jit::symbol` takes for the same
+/// reason.
+fn intern(name: &str) -> &'static str {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static NAMES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+    let mut map = NAMES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(found) = map.get(name) {
+        return found;
+    }
+    let fresh: &'static str = Box::leak(name.to_owned().into_boxed_str());
+    map.insert(name.to_owned(), fresh);
+    fresh
+}
+
+/// The module a body named, by the artifact name it passed to `Fire::at`.
+///
+/// The whole of the driver's side now: no rule to spell a name with, no walk
+/// to take on the body's behalf. A name that names nothing is a refusal, which
+/// is what makes a mis-named artifact arrive as an error instead of as a
+/// silently slower kernel.
+#[must_use]
+pub fn at(file: &str) -> Option<&'static [u8]> {
+    stem(file.strip_suffix(".spv").unwrap_or(file))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

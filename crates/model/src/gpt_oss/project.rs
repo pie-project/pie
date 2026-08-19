@@ -146,7 +146,7 @@ pub fn manifest(f: &GptOssFacts) -> Manifest {
 /// activation's own. It had no home at all before — the driver carried
 /// a `swiglu_alpha` field nothing ever wrote, so every gpt-oss reaching
 /// a Metal text would have gated on alpha zero.
-const GATE_ALPHA: f32 = 1.702;
+pub(crate) const GATE_ALPHA: f32 = 1.702;
 
 /// This row's deployment.
 ///

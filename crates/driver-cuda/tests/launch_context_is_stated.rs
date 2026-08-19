@@ -115,6 +115,29 @@ use std::collections::{BTreeMap, BTreeSet};
 /// wrong is silent, so each carries the reason it is not a measurement.
 const CONSTANT_BY_ARGUMENT: &[(&str, &str)] = &[
     (
+        "altup_streams",
+        "gemma-3n's AltUp width, and this entry has been wrong in both \
+         directions. It first said the family has no CUDA text -- it has \
+         `gemma3n_cuda` -- and was then rewritten to say nothing could \
+         deliver the field, which held only while the AltUp `norm` arms \
+         were `unbound`. `Facts::altup_active` reads `ctx.altup_streams`, \
+         so the name IS deliverable and the honest claim is this one: NO \
+         CHECKPOINT VARIES IT. `Gemma3nAltUpFacts::num_streams` is 4 on \
+         the one gemma-3n row this tree carries, and 4 is what every \
+         published gemma-3n states -- the four-way hidden bundle is the \
+         architecture, not a size. A fifth stream would be a different \
+         model, and it would arrive as a new row here.",
+    ),
+    (
+        "altup_active",
+        "Which AltUp stream was run through the real layer, and it is 0 \
+         for the same reason `altup_streams` is 4: gemma-3n predicts from \
+         stream zero and corrects the rest against it, which is the \
+         block's definition rather than a tunable. `Facts::altup_active` \
+         can hand it over -- it is a live accessor -- so the claim is \
+         constancy and not unreachability.",
+    ),
+    (
         "write_state",
         "whether the fire advances recurrent state, and every class that \
          still exists does. `FireClass` says THE REPAIR CLASSES ARE GONE: \
@@ -244,23 +267,6 @@ const NOTHING_DELIVERS_IT: &[(&str, &str)] = &[
          unread, and a w4a16 checkpoint DOES state a group size. Wiring \
          the query to this field is one line, and this literal goes live \
          and quiet the moment it happens.",
-    ),
-    (
-        "altup_streams",
-        "gemma-3n's AltUp width. It has a CUDA text — `gemma3n_cuda`, the \
-         four-way hidden bundle — and it is METAL that refuses the row, \
-         which is what this entry used to have backwards. The three `norm` \
-         arms its AltUp block states are `unbound` and each names this \
-         field as the fact `Cx` has no query for: the streams arrive \
-         interleaved in one `[t, k*h]` row, so nothing but the fire knows \
-         how it divides.",
-    ),
-    (
-        "altup_active",
-        "as `altup_streams` — the active stream's index, and \
-         `norm::altup_correct_bf16`'s `unbound` row says it is the one \
-         extent on that statement which does not come off a value's own \
-         width.",
     ),
     (
         "altup_std_mult_by_layer",

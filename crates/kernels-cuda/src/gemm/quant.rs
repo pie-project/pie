@@ -101,9 +101,9 @@ use std::sync::{Mutex, OnceLock};
 use crate::jit::abi::bf16;
 // `In` and `Out` for the one cross-family call this file makes. Nothing here
 // is a `#[routine]` -- the three symbols these bodies serve are
-// `driver_bound!` rows in `gemm/mod.rs`, with no column and no binder -- so
+// `untraced!` rows in `gemm/mod.rs`, with no column and no binder -- so
 // the wrappers arrive as a CALLER's vocabulary rather than a launcher's.
-use kernels::routine::{In, Out};
+use kernels::routine::{In, InOut};
 
 use cudarc::cublas::sys::{
     cublasComputeType_t, cublasContext, cublasGemmAlgo_t, cublasGemmEx, cublasGetStream_v2,
@@ -851,13 +851,12 @@ unsafe fn dequant_then_bf16(
                 kernels::routine::In { ptr: w_fp8.cast(), rows: 0, width: 0 },
                 kernels::routine::Out { ptr: bf16_w.cast(), rows: 0, width: 0 },
                 kernels::routine::In { ptr: w_scale_fp32_dev.cast(), rows: 0, width: 0 },
-                // A LAUNCHER CALLING A LAUNCHER, so the wrappers are written
-                // out: this caller is the host program's, not a statement's,
-                // and `n`/`k`/`group_size` are its own numbers rather than
-                // anything a trace placed.
-                <kernels::keys::Rows as kernels::keys::Fact>::env(n),
-                k,
-                kernels::routine::Param(group_size),
+                // A LAUNCHER CALLING A LAUNCHER, so the marks are written out:
+                // this caller is the host program's, not a statement's, and
+                // `group_size` is its own number rather than anything a trace
+                // placed. `n` and `k` are gone from the list -- the routine
+                // reads them off the rectangle its operands carry.
+                kernels::routine::Const { v: group_size },
             )
         });
     } else if scale_kind == quant_kind::PER_CHANNEL {
@@ -869,8 +868,8 @@ unsafe fn dequant_then_bf16(
                 kernels::routine::In { ptr: w_fp8.cast(), rows: 0, width: 0 },
                 kernels::routine::Out { ptr: bf16_w.cast(), rows: 0, width: 0 },
                 kernels::routine::In { ptr: w_scale_fp32_dev.cast(), rows: 0, width: 0 },
-                kernels::routine::Param(n),
-                kernels::routine::Param(k),
+                kernels::routine::Const { v: n },
+                kernels::routine::Const { v: k },
             )
         });
     } else {
@@ -915,11 +914,11 @@ unsafe fn dequant_then_bf16(
                 kernels::routine::In { ptr: w_fp8.cast(), rows: 0, width: 0 },
                 kernels::routine::Out { ptr: bf16_w.cast(), rows: 0, width: 0 },
                 // The host program's own scale, not a statement's param slot;
-                // the wrapper is written out for the same reason the one
-                // above is.
-                kernels::routine::ParamF32(scale),
-                kernels::routine::Param(n),
-                kernels::routine::Param(k),
+                // the mark is written out for the same reason the one above
+                // is -- this caller is not a trace.
+                kernels::routine::Const { v: scale },
+                kernels::routine::Const { v: n },
+                kernels::routine::Const { v: k },
             )
         });
     }
@@ -956,9 +955,9 @@ unsafe fn int8_dequant_then_bf16(
         let ctx = crate::jit::Ctx::on(stream);
         crate::quant::dequant_int8_to_bf16_per_channel(
             &ctx,
-            kernels::routine::In { ptr: w_int8.cast(), rows: 0, width: 0 },
-            kernels::routine::Out { ptr: bf16_w.cast(), rows: 0, width: 0 },
-            kernels::routine::In { ptr: w_scale_inv.cast(), rows: 0, width: 0 },
+            w_int8.cast(),
+            bf16_w.cast(),
+            w_scale_inv.cast(),
             n,
             k,
         )
@@ -1043,9 +1042,9 @@ unsafe fn blockwise_w8a8(
         let ctx = crate::jit::Ctx::on(stream);
         crate::quant::quantize_bf16_to_fp8_e4m3_per_token_group(
             &ctx,
-            kernels::routine::In { ptr: act.cast(), rows: 0, width: 0 },
-            kernels::routine::Out { ptr: act_fp8.cast(), rows: 0, width: 0 },
-            kernels::routine::Out { ptr: act_scale.cast(), rows: 0, width: 0 },
+            act.cast(),
+            act_fp8.cast(),
+            act_scale.cast(),
             m,
             k,
             128,
@@ -1392,9 +1391,9 @@ unsafe fn int8_w_bf16_act(
         let ctx = crate::jit::Ctx::on(stream);
         crate::quant::quantize_bf16_to_int8_per_channel(
             &ctx,
-            kernels::routine::In { ptr: act_bf16.cast(), rows: 0, width: 0 },
-            kernels::routine::Out { ptr: act_int8.cast(), rows: 0, width: 0 },
-            kernels::routine::Out { ptr: act_scale.cast(), rows: 0, width: 0 },
+            act_bf16.cast(),
+            act_int8.cast(),
+            act_scale.cast(),
             m,
             k,
         )
@@ -1468,10 +1467,10 @@ unsafe fn int8_w_bf16_act(
             let ctx = crate::jit::Ctx::on(stream);
             crate::quant::dequant_int32_w8a8_to_bf16(
                 &ctx,
-                kernels::routine::In { ptr: acc_int32.cast::<i32>().cast_const(), rows: 0, width: 0 },
-                kernels::routine::In { ptr: act_scale.cast::<f32>().cast_const(), rows: 0, width: 0 },
-                kernels::routine::In { ptr: w_scale_inv.cast(), rows: 0, width: 0 },
-                kernels::routine::Out { ptr: y_bf16.cast(), rows: 0, width: 0 },
+                acc_int32.cast::<i32>().cast_const(),
+                act_scale.cast::<f32>().cast_const(),
+                w_scale_inv.cast(),
+                y_bf16.cast(),
                 m,
                 n,
             )
@@ -1483,10 +1482,10 @@ unsafe fn int8_w_bf16_act(
             let ctx = crate::jit::Ctx::on(stream);
             crate::quant::dequant_int32_w8a8_to_bf16(
                 &ctx,
-                kernels::routine::In { ptr: acc_int32.cast::<i32>().cast_const(), rows: 0, width: 0 },
-                kernels::routine::In { ptr: act_scale.cast::<f32>().cast_const(), rows: 0, width: 0 },
-                kernels::routine::In { ptr: w_scale_inv.cast(), rows: 0, width: 0 },
-                kernels::routine::Out { ptr: dq_dst.cast(), rows: 0, width: 0 },
+                acc_int32.cast::<i32>().cast_const(),
+                act_scale.cast::<f32>().cast_const(),
+                w_scale_inv.cast(),
+                dq_dst.cast(),
                 m,
                 n,
             )
@@ -1502,7 +1501,7 @@ unsafe fn int8_w_bf16_act(
         // mn)`, where `mn` was `m * n` folded flat by this tuner and then
         // unfolded by nobody: two loose extents travelling beside the
         // pointers they describe, which is §1.3 exactly. `norm::residual_add`
-        // takes `Out<0, _>` and `In<1, _>` now and multiplies them back out
+        // takes `Out<0, *mut _>` and `In<1, *const _>` now and multiplies them back out
         // itself (`norm.rs`'s `y.rows.saturating_mul(y.width)`), so the
         // flattening happens once, at the callee, on numbers that arrived
         // attached to the buffer.
@@ -1519,7 +1518,10 @@ unsafe fn int8_w_bf16_act(
             let ctx = crate::jit::Ctx::on(stream);
             crate::norm::residual_add::<bf16>(
                 &ctx,
-                Out { ptr: y_bf16.cast::<bf16>(), rows: m, width: n },
+                // ONE ADDRESS IN BOTH RUNS: the add is in place, which the
+                // signature says with `InOut` where the row used to say it
+                // with an `in_place` pair beside an `Out`.
+                InOut { ptr: y_bf16.cast::<bf16>(), rows: m, width: n },
                 In { ptr: dq_dst.cast::<bf16>().cast_const(), rows: m, width: n },
             )
         });
@@ -1720,8 +1722,8 @@ pub unsafe fn act_x_w(
                 kernels::routine::In { ptr: w.data.cast(), rows: 0, width: 0 },
                 kernels::routine::In { ptr: w.scale_data.cast(), rows: 0, width: 0 },
                 kernels::routine::Out { ptr: bf16_w.cast(), rows: 0, width: 0 },
-                kernels::routine::Param(n),
-                kernels::routine::Param(k),
+                kernels::routine::Const { v: n },
+                kernels::routine::Const { v: k },
             )
         });
         unsafe { gemm_bf16(handle, act, bf16_w, y, m, n, k, beta) };

@@ -6,12 +6,13 @@
 //! whose width is not a point of the axis has no pipeline, which used to be a
 //! runtime PSO failure naming a string and is now a fact the table states.
 
-#![allow(clippy::too_many_arguments)]
 
+use kernels::Grid;
+use kernels::BindMut;
+use kernels_macros::routine;
 use kernels::routine::Refusal;
 
-use crate::routine::{keys, Reckoned, Say, Times, Ask, Bind, Block, Buf, BufMut, Ctx, Env, Fire, Held, I32s, Null, Param, ParamF32, ParamOr, ParamOrLit, Routine, U32s, U8s, Usize};
-use crate::routine::{InSlot, OutSlot, Weight};
+use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, InOut, Out, Tensor, Usize, bf16, elementwise, elementwise_rows, keys};
 
 /// The shaders this family's routines reach: `(file, entrypoint)`, one pair
 /// per instantiated name.
@@ -255,24 +256,19 @@ const GATE_FILE: &str = "attn/gate.metal";
 /// # Errors
 ///
 /// [`Refusal::Empty`] for an empty width or row count.
+#[routine]
 pub fn split_qkv_bf16(
     ctx: &Ctx<'_>,
-    packed: InSlot<0, Buf>,
-    q: OutSlot<0, BufMut>,
-    k: OutSlot<1, BufMut>,
-    v: OutSlot<2, BufMut>,
-    params: Block<Buf>,
-    packed_width: Ask<keys::InWidth, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "split_qkv_bf16",
-            file: SPLIT_FILE,
-            lanes: crate::routine::elementwise_rows(*packed_width, *rows)?,
-            group: [GROUP_X, 1, 1],
-        },
-        &[packed.v(), q.v(), k.v(), v.v(), params.v()],
+    packed: In<Tensor<bf16>>,
+    q: Out<Tensor<bf16>>,
+    k: Out<Tensor<bf16>>,
+    v: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    let packed_width = packed.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(SPLIT_FILE, "split_qkv_bf16").apply(Grid::of(elementwise_rows(packed_width, rows)?, [GROUP_X, 1, 1])),
+        &[packed.arg(), q.arg(), k.arg(), v.arg(), params],
     )
 }
 
@@ -293,22 +289,20 @@ pub fn split_qkv_bf16(
 /// # Errors
 ///
 /// [`Refusal::Empty`] for an empty width or row count.
+#[routine]
 pub fn gate(
     ctx: &Ctx<'_>,
-    attn: OutSlot<0, BufMut>,
-    gate: InSlot<1, Buf>,
-    row_stride: Param<0, i32>,
-    width: Ask<keys::Width, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "gate_bfloat16",
-            file: GATE_FILE,
-            lanes: crate::routine::elementwise_rows(*width, *rows)?,
-            group: [GROUP_X, 1, 1],
-        },
-        &[attn.v(), gate.v(), row_stride.v()],
+    attn: InOut<Tensor<bf16>>,
+    gate: In<Tensor<bf16>>,
+    // THE STATEMENT'S STRIDE, WHICH WAS `Param<0, i32>`. A row stride is the
+    // rectangle the text laid out, not something this batch made, so it fails
+    // `ask`'s own test and no driver answers `keys::RowStride`.
+    row_stride: Const<i32>) -> Result<(), Refusal> {
+    let width = attn.width;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(GATE_FILE, "gate_bfloat16").apply(Grid::of(elementwise_rows(width, rows)?, [GROUP_X, 1, 1])),
+        &[attn.arg(), gate.arg(), row_stride.arg()],
     )
 }
 
@@ -322,32 +316,32 @@ pub fn gate(
 /// # Errors
 ///
 /// See [`head_grid`].
+#[routine]
 pub fn q_gate_split(
     ctx: &Ctx<'_>,
-    qg: InSlot<0, Buf>,
-    q_out: OutSlot<0, BufMut>,
-    gate_out: OutSlot<1, BufMut>,
-    head_dim: ParamOr<0, keys::HeadDim, i32>,
-    qg_row_stride: Param<1, i32>,
-    out_row_stride: Param<2, i32>,
-    q_heads: Ask<keys::NumQHeads, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    let lanes = head_grid(*head_dim, *q_heads, *rows)?;
-    ctx.dispatch(
-        Fire {
-            entrypoint: "q_gate_split_bfloat16",
-            file: GATE_FILE,
-            lanes,
-            group: head_group(lanes),
-        },
+    qg: In<Tensor<bf16>>,
+    q_out: Out<Tensor<bf16>>,
+    gate_out: Out<Tensor<bf16>>,
+    head_dim: Const<i32>,
+    // THE TWO STRIDES, WHICH WERE `Param<1>` AND `Param<2>`. A row stride is
+    // the rectangle the text laid out -- two fires of one deployment stride the
+    // same way -- so both fail `ask`'s own test and no driver answers
+    // `keys::QgRowStride` or `keys::OutRowStride`. The split refused
+    // `Unstated` on all three planes while they were asks.
+    qg_row_stride: Const<i32>,
+    out_row_stride: Const<i32>,
+    q_heads: Const<i32>) -> Result<(), Refusal> {
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    let lanes = head_grid(*head_dim, *q_heads, rows)?;
+    ctx.fire(
+        Fire::at(GATE_FILE, "q_gate_split_bfloat16").apply(Grid::of(lanes, head_group(lanes))),
         &[
-            qg.v(),
-            q_out.v(),
-            gate_out.v(),
-            head_dim.v(),
-            qg_row_stride.v(),
-            out_row_stride.v(),
+            qg.arg(),
+            q_out.arg(),
+            gate_out.arg(),
+            head_dim.arg(),
+            qg_row_stride.arg(),
+            out_row_stride.arg(),
         ],
     )
 }
@@ -360,35 +354,30 @@ pub fn q_gate_split(
 /// # Errors
 ///
 /// See [`head_grid`].
+#[routine]
 pub fn kv_append(
     ctx: &Ctx<'_>,
-    k_new: InSlot<0, Buf>,
-    v_new: InSlot<1, Buf>,
-    k_cache: Held<keys::KvKeys, BufMut>,
-    v_cache: Held<keys::KvValues, BufMut>,
-    pos: Held<keys::Positions, I32s>,
-    head_dim: ParamOr<0, keys::HeadDim, i32>,
-    k_head_stride: Held<keys::KvHeadStride, Usize>,
-    k_seq_stride: Held<keys::KvSeqStride, Usize>,
-    heads: Ask<keys::NumKvHeads, i32>,
-) -> Result<(), Refusal> {
+    k_new: In<Tensor<bf16>>,
+    v_new: In<Tensor<bf16>>,
+    head_dim: Const<i32>,
+    heads: Const<i32>) -> Result<(), Refusal> {
+    let k_cache = ctx.ask::<Tensor<bf16>, keys::KvKeys>()?;
+    let v_cache = ctx.ask::<Tensor<bf16>, keys::KvValues>()?;
+    let pos = ctx.ask::<Tensor<i32>, keys::Positions>()?;
+    let k_head_stride = ctx.ask::<Usize, keys::KvHeadStride>()?;
+    let k_seq_stride = ctx.ask::<Usize, keys::KvSeqStride>()?;
     let lanes = head_grid(*head_dim, *heads, 1)?;
-    ctx.dispatch(
-        Fire {
-            entrypoint: "kv_append_bfloat16",
-            file: KV_FILE,
-            lanes,
-            group: head_group(lanes),
-        },
+    ctx.fire(
+        Fire::at(KV_FILE, "kv_append_bfloat16").apply(Grid::of(lanes, head_group(lanes))),
         &[
-            k_new.v(),
-            v_new.v(),
-            k_cache.v(),
-            v_cache.v(),
-            pos.v(),
-            head_dim.v(),
-            k_head_stride.v(),
-            k_seq_stride.v(),
+            k_new.arg(),
+            v_new.arg(),
+            k_cache.arg_mut(),
+            v_cache.arg_mut(),
+            pos.arg(),
+            head_dim.arg(),
+            k_head_stride.arg(),
+            k_seq_stride.arg(),
         ],
     )
 }
@@ -415,51 +404,51 @@ pub fn kv_append(
 /// # Errors
 ///
 /// See [`head_grid`].
+#[routine]
 pub fn kv_append_paged(
     ctx: &Ctx<'_>,
-    k_new: InSlot<0, Buf>,
-    v_new: InSlot<1, Buf>,
-    k_pages: Ask<keys::KvKeys, BufMut>,
-    v_pages: Ask<keys::KvValues, BufMut>,
-    ring_4: Null<Env<Buf>>,
-    head_dim: ParamOr<0, keys::HeadDim, i32>,
-    ring_6: Null<Env<Buf>>,
-    ring_7: Null<Env<Buf>>,
-    ring_8: Null<Env<Buf>>,
-    ring_9: Null<Env<Buf>>,
-    page_size: Held<keys::KvPageSize, i32>,
-    ring_11: Null<Env<Buf>>,
-    n_kv_heads: ParamOr<1, keys::NumKvHeads, i32>,
-    w_page: Ask<keys::KvWritePage, U32s>,
-    w_off: Ask<keys::KvWriteOffset, U32s>,
-    ring_15: Null<Env<Buf>>,
-    tokens: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    let lanes = head_grid(*head_dim, *n_kv_heads, *tokens)?;
-    ctx.dispatch(
-        Fire {
-            entrypoint: "kv_append_paged_bfloat16",
-            file: KV_FILE,
-            lanes,
-            group: head_group(lanes),
-        },
+    k_new: In<Tensor<bf16>>,
+    v_new: In<Tensor<bf16>>,
+    head_dim: Const<i32>,
+    n_kv_heads: Const<i32>) -> Result<(), Refusal> {
+    // THE POOL'S NUMBER, ASKED FOR. `page_size` is a property of the
+    // allocation this driver made, not of the model the text describes,
+    // so no builder has it to state -- it was `Held<keys::KvPageSize>`
+    // before the marks and it is an ask now.
+    let page_size = ctx.ask::<i32, keys::KvPageSize>()?;
+
+    let k_pages = ctx.ask::<Tensor<bf16>, keys::KvKeys>()?;
+    let v_pages = ctx.ask::<Tensor<bf16>, keys::KvValues>()?;
+    let ring_4 = ctx.absent()?;
+    let ring_6 = ctx.absent()?;
+    let ring_7 = ctx.absent()?;
+    let ring_8 = ctx.absent()?;
+    let ring_9 = ctx.absent()?;
+    let ring_11 = ctx.absent()?;
+    let w_page = ctx.ask::<Tensor<u32>, keys::KvWritePage>()?;
+    let w_off = ctx.ask::<Tensor<u32>, keys::KvWriteOffset>()?;
+    let ring_15 = ctx.absent()?;
+    let tokens = ctx.ask::<i32, keys::Rows>()?;
+    let lanes = head_grid(*head_dim, *n_kv_heads, tokens)?;
+    ctx.fire(
+        Fire::at(KV_FILE, "kv_append_paged_bfloat16").apply(Grid::of(lanes, head_group(lanes))),
         &[
-            k_new.v(),
-            v_new.v(),
-            k_pages.v(),
-            v_pages.v(),
-            ring_4.v(),
-            head_dim.v(),
-            ring_6.v(),
-            ring_7.v(),
-            ring_8.v(),
-            ring_9.v(),
-            page_size.v(),
-            ring_11.v(),
-            n_kv_heads.v(),
-            w_page.v(),
-            w_off.v(),
-            ring_15.v(),
+            k_new.arg(),
+            v_new.arg(),
+            k_pages.arg_mut(),
+            v_pages.arg_mut(),
+            ring_4,
+            head_dim.arg(),
+            ring_6,
+            ring_7,
+            ring_8,
+            ring_9,
+            page_size.arg(),
+            ring_11,
+            n_kv_heads.arg(),
+            w_page.arg(),
+            w_off.arg(),
+            ring_15,
         ],
     )
 }
@@ -469,21 +458,21 @@ pub fn kv_append_paged(
 /// # Errors
 ///
 /// See [`elementwise`](crate::routine::elementwise).
+#[routine]
 pub fn logit_softcap(
     ctx: &Ctx<'_>,
-    logits: InSlot<0, Buf>,
-    out: OutSlot<0, BufMut>,
-    params: Block<Buf>,
-    n: Reckoned<Times<Say<keys::Width>, Say<keys::Rows>>, Env<i32>>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: "logit_softcap_bfloat16",
-            file: SOFTCAP_FILE,
-            lanes: crate::routine::elementwise(**n, 1)?,
-            group: [GROUP_X, 1, 1],
-        },
-        &[logits.v(), out.v(), params.v()],
+    logits: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let params = ctx.params()?;
+    // THE ELEMENT COUNT, DERIVED RATHER THAN ASKED. HEAD spelled it
+    // `Reckoned<Times<Say<Width>, Say<Rows>>>` -- a product of two facts,
+    // not a fact -- and the migration turned it into `keys::Elements`,
+    // which no driver answers. Both halves are on the operand's own
+    // rectangle, so the body multiplies them.
+    let n = out.rows.saturating_mul(out.width);
+    ctx.fire(
+        Fire::at(SOFTCAP_FILE, "logit_softcap_bfloat16").apply(Grid::of(elementwise(n, 1)?, [GROUP_X, 1, 1])),
+        &[logits.arg(), out.arg(), params],
     )
 }
 
@@ -519,54 +508,60 @@ const KV_FILE: &str = "attn/kv_write.metal";
 ///
 /// [`Refusal::Narrow`] from [`head_point`] for a width no shader carries, and
 /// see [`vector_grid`].
+#[routine]
 pub fn sdpa_paged_decode(
     ctx: &Ctx<'_>,
-    queries: InSlot<0, Buf>,
-    k_pages: Ask<keys::KvKeys, Buf>,
-    v_pages: Ask<keys::KvValues, Buf>,
-    out: OutSlot<0, BufMut>,
-    gqa_factor: Param<0, i32>,
-    position_ids: Ask<keys::Positions, I32s>,
-    req_of_token: Ask<keys::RequestOfToken, I32s>,
-    kv_page_indices: Ask<keys::KvPageIndices, U32s>,
-    kv_page_indptr: Ask<keys::KvPageIndptr, U32s>,
-    page_size: Held<keys::KvPageSize, i32>,
-    n_kv_heads: Param<1, i32>,
-    scale: ParamF32<2>,
-    attention_mask: Ask<keys::AttentionMask, U8s>,
-    attention_mask_stride: Ask<keys::AttentionMaskStride, u32>,
-    attention_mask_enabled: Ask<keys::AttentionMaskEnabled, U8s>,
-    window: ParamOrLit<4, -1, i32>,
-    sinks: Null<Env<Buf>>,
-    head_dim: Ask<keys::HeadDim, i32>,
-    q_heads: Ask<keys::NumQHeads, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: PAGED_DECODE[head_point(*head_dim, &PAGED_DIMS)?],
-            file: PAGED_FILE,
-            lanes: vector_grid(*q_heads, *rows)?,
-            group: BIG_GROUP,
-        },
+    queries: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    n_kv_heads: Const<i32>,
+    scale: Const<f32>,
+    window: Const<i32>,
+    head_dim: Const<i32>,
+    q_heads: Const<i32>) -> Result<(), Refusal> {
+    // THE POOL'S NUMBER, ASKED FOR. `page_size` is a property of the
+    // allocation this driver made, not of the model the text describes,
+    // so no builder has it to state -- it was `Held<keys::KvPageSize>`
+    // before the marks and it is an ask now.
+    let page_size = ctx.ask::<i32, keys::KvPageSize>()?;
+
+    let k_pages = ctx.ask::<Tensor<bf16>, keys::KvKeys>()?;
+    let v_pages = ctx.ask::<Tensor<bf16>, keys::KvValues>()?;
+    // GQA'S FACTOR, DERIVED FROM THE TWO COUNTS THE STATEMENT CARRIES.
+    // It was `Param<0, i32>` -- a scalar the DSL stated -- and the migration
+    // read it as a fire's fact and turned it into an ask no driver answers,
+    // so every paged attention refused `Unstated`. It is neither: it is
+    // `q_heads / n_kv_heads` and both are already `Const<i32>` here, so the
+    // one number is derived from the two rather than stated a third time.
+    let gqa_factor = if *n_kv_heads > 0 { *q_heads / *n_kv_heads } else { 0 };
+    let position_ids = ctx.ask::<Tensor<i32>, keys::Positions>()?;
+    let req_of_token = ctx.ask::<Tensor<i32>, keys::RequestOfToken>()?;
+    let kv_page_indices = ctx.ask::<Tensor<u32>, keys::KvPageIndices>()?;
+    let kv_page_indptr = ctx.ask::<Tensor<u32>, keys::KvPageIndptr>()?;
+    let attention_mask = ctx.ask::<Tensor<u8>, keys::AttentionMask>()?;
+    let attention_mask_stride = ctx.ask::<u32, keys::AttentionMaskStride>()?;
+    let attention_mask_enabled = ctx.ask::<Tensor<u8>, keys::AttentionMaskEnabled>()?;
+    let sinks = ctx.absent()?;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(PAGED_FILE, PAGED_DECODE[head_point(*head_dim, &PAGED_DIMS)?]).apply(Grid::of(vector_grid(*q_heads, rows)?, BIG_GROUP)),
         &[
-            queries.v(),
-            k_pages.v(),
-            v_pages.v(),
-            out.v(),
-            gqa_factor.v(),
-            position_ids.v(),
-            req_of_token.v(),
-            kv_page_indices.v(),
-            kv_page_indptr.v(),
-            page_size.v(),
-            n_kv_heads.v(),
-            scale.v(),
-            attention_mask.v(),
-            attention_mask_stride.v(),
-            attention_mask_enabled.v(),
-            window.v(),
-            sinks.v(),
+            queries.arg(),
+            k_pages.arg_mut(),
+            v_pages.arg_mut(),
+            out.arg(),
+            gqa_factor.arg(),
+            position_ids.arg(),
+            req_of_token.arg(),
+            kv_page_indices.arg(),
+            kv_page_indptr.arg(),
+            page_size.arg(),
+            n_kv_heads.arg(),
+            scale.arg(),
+            attention_mask.arg(),
+            attention_mask_stride.arg(),
+            attention_mask_enabled.arg(),
+            window.arg(),
+            sinks,
         ],
     )
 }
@@ -579,54 +574,60 @@ pub fn sdpa_paged_decode(
 /// # Errors
 ///
 /// See [`sdpa_paged_decode`].
+#[routine]
 pub fn sdpa_paged_decode_sink(
     ctx: &Ctx<'_>,
-    queries: InSlot<0, Buf>,
-    k_pages: Ask<keys::KvKeys, Buf>,
-    v_pages: Ask<keys::KvValues, Buf>,
-    out: OutSlot<0, BufMut>,
-    gqa_factor: Param<0, i32>,
-    position_ids: Ask<keys::Positions, I32s>,
-    req_of_token: Ask<keys::RequestOfToken, I32s>,
-    kv_page_indices: Ask<keys::KvPageIndices, U32s>,
-    kv_page_indptr: Ask<keys::KvPageIndptr, U32s>,
-    page_size: Held<keys::KvPageSize, i32>,
-    n_kv_heads: Param<1, i32>,
-    scale: ParamF32<2>,
-    attention_mask: Ask<keys::AttentionMask, U8s>,
-    attention_mask_stride: Ask<keys::AttentionMaskStride, u32>,
-    attention_mask_enabled: Ask<keys::AttentionMaskEnabled, U8s>,
-    window: ParamOrLit<4, -1, i32>,
-    sinks: Weight<0, Buf>,
-    head_dim: Ask<keys::HeadDim, i32>,
-    q_heads: Ask<keys::NumQHeads, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: PAGED_DECODE_SINK[head_point(*head_dim, &SINK_DIMS)?],
-            file: PAGED_FILE,
-            lanes: vector_grid(*q_heads, *rows)?,
-            group: BIG_GROUP,
-        },
+    queries: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    n_kv_heads: Const<i32>,
+    scale: Const<f32>,
+    window: Const<i32>,
+    sinks: Const<Tensor<bf16>>,
+    head_dim: Const<i32>,
+    q_heads: Const<i32>) -> Result<(), Refusal> {
+    // THE POOL'S NUMBER, ASKED FOR. `page_size` is a property of the
+    // allocation this driver made, not of the model the text describes,
+    // so no builder has it to state -- it was `Held<keys::KvPageSize>`
+    // before the marks and it is an ask now.
+    let page_size = ctx.ask::<i32, keys::KvPageSize>()?;
+
+    let k_pages = ctx.ask::<Tensor<bf16>, keys::KvKeys>()?;
+    let v_pages = ctx.ask::<Tensor<bf16>, keys::KvValues>()?;
+    // GQA'S FACTOR, DERIVED FROM THE TWO COUNTS THE STATEMENT CARRIES.
+    // It was `Param<0, i32>` -- a scalar the DSL stated -- and the migration
+    // read it as a fire's fact and turned it into an ask no driver answers,
+    // so every paged attention refused `Unstated`. It is neither: it is
+    // `q_heads / n_kv_heads` and both are already `Const<i32>` here, so the
+    // one number is derived from the two rather than stated a third time.
+    let gqa_factor = if *n_kv_heads > 0 { *q_heads / *n_kv_heads } else { 0 };
+    let position_ids = ctx.ask::<Tensor<i32>, keys::Positions>()?;
+    let req_of_token = ctx.ask::<Tensor<i32>, keys::RequestOfToken>()?;
+    let kv_page_indices = ctx.ask::<Tensor<u32>, keys::KvPageIndices>()?;
+    let kv_page_indptr = ctx.ask::<Tensor<u32>, keys::KvPageIndptr>()?;
+    let attention_mask = ctx.ask::<Tensor<u8>, keys::AttentionMask>()?;
+    let attention_mask_stride = ctx.ask::<u32, keys::AttentionMaskStride>()?;
+    let attention_mask_enabled = ctx.ask::<Tensor<u8>, keys::AttentionMaskEnabled>()?;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(PAGED_FILE, PAGED_DECODE_SINK[head_point(*head_dim, &SINK_DIMS)?]).apply(Grid::of(vector_grid(*q_heads, rows)?, BIG_GROUP)),
         &[
-            queries.v(),
-            k_pages.v(),
-            v_pages.v(),
-            out.v(),
-            gqa_factor.v(),
-            position_ids.v(),
-            req_of_token.v(),
-            kv_page_indices.v(),
-            kv_page_indptr.v(),
-            page_size.v(),
-            n_kv_heads.v(),
-            scale.v(),
-            attention_mask.v(),
-            attention_mask_stride.v(),
-            attention_mask_enabled.v(),
-            window.v(),
-            sinks.v(),
+            queries.arg(),
+            k_pages.arg_mut(),
+            v_pages.arg_mut(),
+            out.arg(),
+            gqa_factor.arg(),
+            position_ids.arg(),
+            req_of_token.arg(),
+            kv_page_indices.arg(),
+            kv_page_indptr.arg(),
+            page_size.arg(),
+            n_kv_heads.arg(),
+            scale.arg(),
+            attention_mask.arg(),
+            attention_mask_stride.arg(),
+            attention_mask_enabled.arg(),
+            window.arg(),
+            sinks.arg(),
         ],
     )
 }
@@ -641,55 +642,61 @@ pub fn sdpa_paged_decode_sink(
 /// # Errors
 ///
 /// See [`sdpa_paged_decode`] and [`tiled_grid`].
+#[routine]
 pub fn sdpa_paged_tiled(
     ctx: &Ctx<'_>,
-    queries: InSlot<0, Buf>,
-    k_pages: Ask<keys::KvKeys, Buf>,
-    v_pages: Ask<keys::KvValues, Buf>,
-    out: OutSlot<0, BufMut>,
-    gqa_factor: Param<0, i32>,
-    position_ids: Ask<keys::Positions, I32s>,
-    req_of_token: Ask<keys::RequestOfToken, I32s>,
-    kv_page_indices: Ask<keys::KvPageIndices, U32s>,
-    kv_page_indptr: Ask<keys::KvPageIndptr, U32s>,
-    page_size: Held<keys::KvPageSize, i32>,
-    n_kv_heads: Param<1, i32>,
-    scale: ParamF32<2>,
-    attention_mask: Ask<keys::AttentionMask, U8s>,
-    attention_mask_stride: Ask<keys::AttentionMaskStride, u32>,
-    attention_mask_enabled: Ask<keys::AttentionMaskEnabled, U8s>,
-    window: ParamOrLit<4, -1, i32>,
-    sinks: Null<Env<Buf>>,
-    n_rows: Ask<keys::Rows, i32>,
-    head_dim: Ask<keys::HeadDim, i32>,
-    q_heads: Ask<keys::NumQHeads, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: PAGED_TILED[head_point(*head_dim, &PAGED_DIMS)?],
-            file: PAGED_FILE,
-            lanes: tiled_grid(*q_heads, *n_rows, BIG_GROUP[0])?,
-            group: BIG_GROUP,
-        },
+    queries: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    n_kv_heads: Const<i32>,
+    scale: Const<f32>,
+    window: Const<i32>,
+    head_dim: Const<i32>,
+    q_heads: Const<i32>) -> Result<(), Refusal> {
+    // THE POOL'S NUMBER, ASKED FOR. `page_size` is a property of the
+    // allocation this driver made, not of the model the text describes,
+    // so no builder has it to state -- it was `Held<keys::KvPageSize>`
+    // before the marks and it is an ask now.
+    let page_size = ctx.ask::<i32, keys::KvPageSize>()?;
+
+    let k_pages = ctx.ask::<Tensor<bf16>, keys::KvKeys>()?;
+    let v_pages = ctx.ask::<Tensor<bf16>, keys::KvValues>()?;
+    // GQA'S FACTOR, DERIVED FROM THE TWO COUNTS THE STATEMENT CARRIES.
+    // It was `Param<0, i32>` -- a scalar the DSL stated -- and the migration
+    // read it as a fire's fact and turned it into an ask no driver answers,
+    // so every paged attention refused `Unstated`. It is neither: it is
+    // `q_heads / n_kv_heads` and both are already `Const<i32>` here, so the
+    // one number is derived from the two rather than stated a third time.
+    let gqa_factor = if *n_kv_heads > 0 { *q_heads / *n_kv_heads } else { 0 };
+    let position_ids = ctx.ask::<Tensor<i32>, keys::Positions>()?;
+    let req_of_token = ctx.ask::<Tensor<i32>, keys::RequestOfToken>()?;
+    let kv_page_indices = ctx.ask::<Tensor<u32>, keys::KvPageIndices>()?;
+    let kv_page_indptr = ctx.ask::<Tensor<u32>, keys::KvPageIndptr>()?;
+    let attention_mask = ctx.ask::<Tensor<u8>, keys::AttentionMask>()?;
+    let attention_mask_stride = ctx.ask::<u32, keys::AttentionMaskStride>()?;
+    let attention_mask_enabled = ctx.ask::<Tensor<u8>, keys::AttentionMaskEnabled>()?;
+    let sinks = ctx.absent()?;
+    let n_rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(PAGED_FILE, PAGED_TILED[head_point(*head_dim, &PAGED_DIMS)?]).apply(Grid::of(tiled_grid(*q_heads, n_rows, BIG_GROUP[0])?, BIG_GROUP)),
         &[
-            queries.v(),
-            k_pages.v(),
-            v_pages.v(),
-            out.v(),
-            gqa_factor.v(),
-            position_ids.v(),
-            req_of_token.v(),
-            kv_page_indices.v(),
-            kv_page_indptr.v(),
-            page_size.v(),
-            n_kv_heads.v(),
-            scale.v(),
-            attention_mask.v(),
-            attention_mask_stride.v(),
-            attention_mask_enabled.v(),
-            window.v(),
-            sinks.v(),
-            n_rows.v(),
+            queries.arg(),
+            k_pages.arg_mut(),
+            v_pages.arg_mut(),
+            out.arg(),
+            gqa_factor.arg(),
+            position_ids.arg(),
+            req_of_token.arg(),
+            kv_page_indices.arg(),
+            kv_page_indptr.arg(),
+            page_size.arg(),
+            n_kv_heads.arg(),
+            scale.arg(),
+            attention_mask.arg(),
+            attention_mask_stride.arg(),
+            attention_mask_enabled.arg(),
+            window.arg(),
+            sinks,
+            n_rows.arg(),
         ],
     )
 }
@@ -699,55 +706,61 @@ pub fn sdpa_paged_tiled(
 /// # Errors
 ///
 /// See [`sdpa_paged_tiled`].
+#[routine]
 pub fn sdpa_paged_tiled_sink(
     ctx: &Ctx<'_>,
-    queries: InSlot<0, Buf>,
-    k_pages: Ask<keys::KvKeys, Buf>,
-    v_pages: Ask<keys::KvValues, Buf>,
-    out: OutSlot<0, BufMut>,
-    gqa_factor: Param<0, i32>,
-    position_ids: Ask<keys::Positions, I32s>,
-    req_of_token: Ask<keys::RequestOfToken, I32s>,
-    kv_page_indices: Ask<keys::KvPageIndices, U32s>,
-    kv_page_indptr: Ask<keys::KvPageIndptr, U32s>,
-    page_size: Held<keys::KvPageSize, i32>,
-    n_kv_heads: Param<1, i32>,
-    scale: ParamF32<2>,
-    attention_mask: Ask<keys::AttentionMask, U8s>,
-    attention_mask_stride: Ask<keys::AttentionMaskStride, u32>,
-    attention_mask_enabled: Ask<keys::AttentionMaskEnabled, U8s>,
-    window: ParamOrLit<4, -1, i32>,
-    sinks: Weight<0, Buf>,
-    n_rows: Ask<keys::Rows, i32>,
-    head_dim: Ask<keys::HeadDim, i32>,
-    q_heads: Ask<keys::NumQHeads, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: PAGED_TILED_SINK[head_point(*head_dim, &SINK_DIMS)?],
-            file: PAGED_FILE,
-            lanes: tiled_grid(*q_heads, *n_rows, BIG_GROUP[0])?,
-            group: BIG_GROUP,
-        },
+    queries: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    n_kv_heads: Const<i32>,
+    scale: Const<f32>,
+    window: Const<i32>,
+    sinks: Const<Tensor<bf16>>,
+    head_dim: Const<i32>,
+    q_heads: Const<i32>) -> Result<(), Refusal> {
+    // THE POOL'S NUMBER, ASKED FOR. `page_size` is a property of the
+    // allocation this driver made, not of the model the text describes,
+    // so no builder has it to state -- it was `Held<keys::KvPageSize>`
+    // before the marks and it is an ask now.
+    let page_size = ctx.ask::<i32, keys::KvPageSize>()?;
+
+    let k_pages = ctx.ask::<Tensor<bf16>, keys::KvKeys>()?;
+    let v_pages = ctx.ask::<Tensor<bf16>, keys::KvValues>()?;
+    // GQA'S FACTOR, DERIVED FROM THE TWO COUNTS THE STATEMENT CARRIES.
+    // It was `Param<0, i32>` -- a scalar the DSL stated -- and the migration
+    // read it as a fire's fact and turned it into an ask no driver answers,
+    // so every paged attention refused `Unstated`. It is neither: it is
+    // `q_heads / n_kv_heads` and both are already `Const<i32>` here, so the
+    // one number is derived from the two rather than stated a third time.
+    let gqa_factor = if *n_kv_heads > 0 { *q_heads / *n_kv_heads } else { 0 };
+    let position_ids = ctx.ask::<Tensor<i32>, keys::Positions>()?;
+    let req_of_token = ctx.ask::<Tensor<i32>, keys::RequestOfToken>()?;
+    let kv_page_indices = ctx.ask::<Tensor<u32>, keys::KvPageIndices>()?;
+    let kv_page_indptr = ctx.ask::<Tensor<u32>, keys::KvPageIndptr>()?;
+    let attention_mask = ctx.ask::<Tensor<u8>, keys::AttentionMask>()?;
+    let attention_mask_stride = ctx.ask::<u32, keys::AttentionMaskStride>()?;
+    let attention_mask_enabled = ctx.ask::<Tensor<u8>, keys::AttentionMaskEnabled>()?;
+    let n_rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(PAGED_FILE, PAGED_TILED_SINK[head_point(*head_dim, &SINK_DIMS)?]).apply(Grid::of(tiled_grid(*q_heads, n_rows, BIG_GROUP[0])?, BIG_GROUP)),
         &[
-            queries.v(),
-            k_pages.v(),
-            v_pages.v(),
-            out.v(),
-            gqa_factor.v(),
-            position_ids.v(),
-            req_of_token.v(),
-            kv_page_indices.v(),
-            kv_page_indptr.v(),
-            page_size.v(),
-            n_kv_heads.v(),
-            scale.v(),
-            attention_mask.v(),
-            attention_mask_stride.v(),
-            attention_mask_enabled.v(),
-            window.v(),
-            sinks.v(),
-            n_rows.v(),
+            queries.arg(),
+            k_pages.arg_mut(),
+            v_pages.arg_mut(),
+            out.arg(),
+            gqa_factor.arg(),
+            position_ids.arg(),
+            req_of_token.arg(),
+            kv_page_indices.arg(),
+            kv_page_indptr.arg(),
+            page_size.arg(),
+            n_kv_heads.arg(),
+            scale.arg(),
+            attention_mask.arg(),
+            attention_mask_stride.arg(),
+            attention_mask_enabled.arg(),
+            window.arg(),
+            sinks.arg(),
+            n_rows.arg(),
         ],
     )
 }
@@ -760,59 +773,73 @@ pub fn sdpa_paged_tiled_sink(
 /// # Errors
 ///
 /// See [`sdpa_paged_tiled`].
+#[routine]
 pub fn sdpa_paged_tiled_strided(
     ctx: &Ctx<'_>,
-    queries: InSlot<0, Buf>,
-    k_pages: Ask<keys::KvKeys, Buf>,
-    v_pages: Ask<keys::KvValues, Buf>,
-    out: OutSlot<0, BufMut>,
-    gqa_factor: Param<0, i32>,
-    position_ids: Ask<keys::Positions, I32s>,
-    req_of_token: Ask<keys::RequestOfToken, I32s>,
-    kv_page_indices: Ask<keys::KvPageIndices, U32s>,
-    kv_page_indptr: Ask<keys::KvPageIndptr, U32s>,
-    page_size: Held<keys::KvPageSize, i32>,
-    n_kv_heads: Param<1, i32>,
-    scale: ParamF32<2>,
-    attention_mask: Ask<keys::AttentionMask, U8s>,
-    attention_mask_stride: Ask<keys::AttentionMaskStride, u32>,
-    attention_mask_enabled: Ask<keys::AttentionMaskEnabled, U8s>,
-    window: ParamOrLit<4, -1, i32>,
-    sinks: Null<Env<Buf>>,
-    n_rows: Ask<keys::Rows, i32>,
-    q_row_pitch: Param<5, i32>,
-    o_row_pitch: Param<6, i32>,
-    head_dim: Ask<keys::HeadDim, i32>,
-    q_heads: Ask<keys::NumQHeads, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: PAGED_TILED_STRIDED[head_point(*head_dim, &STRIDED_DIMS)?],
-            file: PAGED_FILE,
-            lanes: tiled_grid(*q_heads, *n_rows, BIG_GROUP[0])?,
-            group: BIG_GROUP,
-        },
+    queries: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    n_kv_heads: Const<i32>,
+    scale: Const<f32>,
+    window: Const<i32>,
+    head_dim: Const<i32>,
+    q_heads: Const<i32>) -> Result<(), Refusal> {
+    // THE POOL'S NUMBER, ASKED FOR. `page_size` is a property of the
+    // allocation this driver made, not of the model the text describes,
+    // so no builder has it to state -- it was `Held<keys::KvPageSize>`
+    // before the marks and it is an ask now.
+    let page_size = ctx.ask::<i32, keys::KvPageSize>()?;
+
+    let k_pages = ctx.ask::<Tensor<bf16>, keys::KvKeys>()?;
+    let v_pages = ctx.ask::<Tensor<bf16>, keys::KvValues>()?;
+    // GQA'S FACTOR, DERIVED FROM THE TWO COUNTS THE STATEMENT CARRIES.
+    // It was `Param<0, i32>` -- a scalar the DSL stated -- and the migration
+    // read it as a fire's fact and turned it into an ask no driver answers,
+    // so every paged attention refused `Unstated`. It is neither: it is
+    // `q_heads / n_kv_heads` and both are already `Const<i32>` here, so the
+    // one number is derived from the two rather than stated a third time.
+    let gqa_factor = if *n_kv_heads > 0 { *q_heads / *n_kv_heads } else { 0 };
+    let position_ids = ctx.ask::<Tensor<i32>, keys::Positions>()?;
+    let req_of_token = ctx.ask::<Tensor<i32>, keys::RequestOfToken>()?;
+    let kv_page_indices = ctx.ask::<Tensor<u32>, keys::KvPageIndices>()?;
+    let kv_page_indptr = ctx.ask::<Tensor<u32>, keys::KvPageIndptr>()?;
+    let attention_mask = ctx.ask::<Tensor<u8>, keys::AttentionMask>()?;
+    let attention_mask_stride = ctx.ask::<u32, keys::AttentionMaskStride>()?;
+    let attention_mask_enabled = ctx.ask::<Tensor<u8>, keys::AttentionMaskEnabled>()?;
+    let sinks = ctx.absent()?;
+    let n_rows = ctx.ask::<i32, keys::Rows>()?;
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<5>` named.
+    // This body forwards `ctx.params()` as a STRUCT, so the run is the
+    // shader's layout and no `Const` mark can name a word inside it; the
+    // migration made this `keys::QRowPitch`, which no driver answers.
+    let q_row_pitch = ctx.param(5)?;
+    // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<6>` named.
+    // This body forwards `ctx.params()` as a STRUCT, so the run is the
+    // shader's layout and no `Const` mark can name a word inside it; the
+    // migration made this `keys::ORowPitch`, which no driver answers.
+    let o_row_pitch = ctx.param(6)?;
+    ctx.fire(
+        Fire::at(PAGED_FILE, PAGED_TILED_STRIDED[head_point(*head_dim, &STRIDED_DIMS)?]).apply(Grid::of(tiled_grid(*q_heads, n_rows, BIG_GROUP[0])?, BIG_GROUP)),
         &[
-            queries.v(),
-            k_pages.v(),
-            v_pages.v(),
-            out.v(),
-            gqa_factor.v(),
-            position_ids.v(),
-            req_of_token.v(),
-            kv_page_indices.v(),
-            kv_page_indptr.v(),
-            page_size.v(),
-            n_kv_heads.v(),
-            scale.v(),
-            attention_mask.v(),
-            attention_mask_stride.v(),
-            attention_mask_enabled.v(),
-            window.v(),
-            sinks.v(),
-            n_rows.v(),
-            q_row_pitch.v(),
-            o_row_pitch.v(),
+            queries.arg(),
+            k_pages.arg_mut(),
+            v_pages.arg_mut(),
+            out.arg(),
+            gqa_factor.arg(),
+            position_ids.arg(),
+            req_of_token.arg(),
+            kv_page_indices.arg(),
+            kv_page_indptr.arg(),
+            page_size.arg(),
+            n_kv_heads.arg(),
+            scale.arg(),
+            attention_mask.arg(),
+            attention_mask_stride.arg(),
+            attention_mask_enabled.arg(),
+            window.arg(),
+            sinks,
+            n_rows.arg(),
+            q_row_pitch.arg(),
+            o_row_pitch.arg(),
         ],
     )
 }
@@ -828,55 +855,61 @@ pub fn sdpa_paged_tiled_strided(
 /// # Errors
 ///
 /// See [`sdpa_paged_tiled`].
+#[routine]
 pub fn sdpa_paged_mma(
     ctx: &Ctx<'_>,
-    queries: InSlot<0, Buf>,
-    k_pages: Ask<keys::KvKeys, Buf>,
-    v_pages: Ask<keys::KvValues, Buf>,
-    out: OutSlot<0, BufMut>,
-    gqa_factor: Param<0, i32>,
-    position_ids: Ask<keys::Positions, I32s>,
-    req_of_token: Ask<keys::RequestOfToken, I32s>,
-    kv_page_indices: Ask<keys::KvPageIndices, U32s>,
-    kv_page_indptr: Ask<keys::KvPageIndptr, U32s>,
-    page_size: Held<keys::KvPageSize, i32>,
-    n_kv_heads: Param<1, i32>,
-    scale: ParamF32<2>,
-    attention_mask: Ask<keys::AttentionMask, U8s>,
-    attention_mask_stride: Ask<keys::AttentionMaskStride, u32>,
-    attention_mask_enabled: Ask<keys::AttentionMaskEnabled, U8s>,
-    window: ParamOrLit<4, -1, i32>,
-    sinks: Null<Env<Buf>>,
-    n_rows: Ask<keys::Rows, i32>,
-    head_dim: Ask<keys::HeadDim, i32>,
-    q_heads: Ask<keys::NumQHeads, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: PAGED_MMA[head_point(*head_dim, &SINK_DIMS)?],
-            file: MMA_FILE,
-            lanes: tiled_grid(*q_heads, *n_rows, MMA_GROUP[0])?,
-            group: MMA_GROUP,
-        },
+    queries: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    n_kv_heads: Const<i32>,
+    scale: Const<f32>,
+    window: Const<i32>,
+    head_dim: Const<i32>,
+    q_heads: Const<i32>) -> Result<(), Refusal> {
+    // THE POOL'S NUMBER, ASKED FOR. `page_size` is a property of the
+    // allocation this driver made, not of the model the text describes,
+    // so no builder has it to state -- it was `Held<keys::KvPageSize>`
+    // before the marks and it is an ask now.
+    let page_size = ctx.ask::<i32, keys::KvPageSize>()?;
+
+    let k_pages = ctx.ask::<Tensor<bf16>, keys::KvKeys>()?;
+    let v_pages = ctx.ask::<Tensor<bf16>, keys::KvValues>()?;
+    // GQA'S FACTOR, DERIVED FROM THE TWO COUNTS THE STATEMENT CARRIES.
+    // It was `Param<0, i32>` -- a scalar the DSL stated -- and the migration
+    // read it as a fire's fact and turned it into an ask no driver answers,
+    // so every paged attention refused `Unstated`. It is neither: it is
+    // `q_heads / n_kv_heads` and both are already `Const<i32>` here, so the
+    // one number is derived from the two rather than stated a third time.
+    let gqa_factor = if *n_kv_heads > 0 { *q_heads / *n_kv_heads } else { 0 };
+    let position_ids = ctx.ask::<Tensor<i32>, keys::Positions>()?;
+    let req_of_token = ctx.ask::<Tensor<i32>, keys::RequestOfToken>()?;
+    let kv_page_indices = ctx.ask::<Tensor<u32>, keys::KvPageIndices>()?;
+    let kv_page_indptr = ctx.ask::<Tensor<u32>, keys::KvPageIndptr>()?;
+    let attention_mask = ctx.ask::<Tensor<u8>, keys::AttentionMask>()?;
+    let attention_mask_stride = ctx.ask::<u32, keys::AttentionMaskStride>()?;
+    let attention_mask_enabled = ctx.ask::<Tensor<u8>, keys::AttentionMaskEnabled>()?;
+    let sinks = ctx.absent()?;
+    let n_rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(MMA_FILE, PAGED_MMA[head_point(*head_dim, &SINK_DIMS)?]).apply(Grid::of(tiled_grid(*q_heads, n_rows, MMA_GROUP[0])?, MMA_GROUP)),
         &[
-            queries.v(),
-            k_pages.v(),
-            v_pages.v(),
-            out.v(),
-            gqa_factor.v(),
-            position_ids.v(),
-            req_of_token.v(),
-            kv_page_indices.v(),
-            kv_page_indptr.v(),
-            page_size.v(),
-            n_kv_heads.v(),
-            scale.v(),
-            attention_mask.v(),
-            attention_mask_stride.v(),
-            attention_mask_enabled.v(),
-            window.v(),
-            sinks.v(),
-            n_rows.v(),
+            queries.arg(),
+            k_pages.arg_mut(),
+            v_pages.arg_mut(),
+            out.arg(),
+            gqa_factor.arg(),
+            position_ids.arg(),
+            req_of_token.arg(),
+            kv_page_indices.arg(),
+            kv_page_indptr.arg(),
+            page_size.arg(),
+            n_kv_heads.arg(),
+            scale.arg(),
+            attention_mask.arg(),
+            attention_mask_stride.arg(),
+            attention_mask_enabled.arg(),
+            window.arg(),
+            sinks,
+            n_rows.arg(),
         ],
     )
 }
@@ -886,55 +919,61 @@ pub fn sdpa_paged_mma(
 /// # Errors
 ///
 /// See [`sdpa_paged_mma`].
+#[routine]
 pub fn sdpa_paged_mma_sink(
     ctx: &Ctx<'_>,
-    queries: InSlot<0, Buf>,
-    k_pages: Ask<keys::KvKeys, Buf>,
-    v_pages: Ask<keys::KvValues, Buf>,
-    out: OutSlot<0, BufMut>,
-    gqa_factor: Param<0, i32>,
-    position_ids: Ask<keys::Positions, I32s>,
-    req_of_token: Ask<keys::RequestOfToken, I32s>,
-    kv_page_indices: Ask<keys::KvPageIndices, U32s>,
-    kv_page_indptr: Ask<keys::KvPageIndptr, U32s>,
-    page_size: Held<keys::KvPageSize, i32>,
-    n_kv_heads: Param<1, i32>,
-    scale: ParamF32<2>,
-    attention_mask: Ask<keys::AttentionMask, U8s>,
-    attention_mask_stride: Ask<keys::AttentionMaskStride, u32>,
-    attention_mask_enabled: Ask<keys::AttentionMaskEnabled, U8s>,
-    window: ParamOrLit<4, -1, i32>,
-    sinks: Weight<0, Buf>,
-    n_rows: Ask<keys::Rows, i32>,
-    head_dim: Ask<keys::HeadDim, i32>,
-    q_heads: Ask<keys::NumQHeads, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: PAGED_MMA_SINK[head_point(*head_dim, &SINK_DIMS)?],
-            file: MMA_FILE,
-            lanes: tiled_grid(*q_heads, *n_rows, MMA_GROUP[0])?,
-            group: MMA_GROUP,
-        },
+    queries: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    n_kv_heads: Const<i32>,
+    scale: Const<f32>,
+    window: Const<i32>,
+    sinks: Const<Tensor<bf16>>,
+    head_dim: Const<i32>,
+    q_heads: Const<i32>) -> Result<(), Refusal> {
+    // THE POOL'S NUMBER, ASKED FOR. `page_size` is a property of the
+    // allocation this driver made, not of the model the text describes,
+    // so no builder has it to state -- it was `Held<keys::KvPageSize>`
+    // before the marks and it is an ask now.
+    let page_size = ctx.ask::<i32, keys::KvPageSize>()?;
+
+    let k_pages = ctx.ask::<Tensor<bf16>, keys::KvKeys>()?;
+    let v_pages = ctx.ask::<Tensor<bf16>, keys::KvValues>()?;
+    // GQA'S FACTOR, DERIVED FROM THE TWO COUNTS THE STATEMENT CARRIES.
+    // It was `Param<0, i32>` -- a scalar the DSL stated -- and the migration
+    // read it as a fire's fact and turned it into an ask no driver answers,
+    // so every paged attention refused `Unstated`. It is neither: it is
+    // `q_heads / n_kv_heads` and both are already `Const<i32>` here, so the
+    // one number is derived from the two rather than stated a third time.
+    let gqa_factor = if *n_kv_heads > 0 { *q_heads / *n_kv_heads } else { 0 };
+    let position_ids = ctx.ask::<Tensor<i32>, keys::Positions>()?;
+    let req_of_token = ctx.ask::<Tensor<i32>, keys::RequestOfToken>()?;
+    let kv_page_indices = ctx.ask::<Tensor<u32>, keys::KvPageIndices>()?;
+    let kv_page_indptr = ctx.ask::<Tensor<u32>, keys::KvPageIndptr>()?;
+    let attention_mask = ctx.ask::<Tensor<u8>, keys::AttentionMask>()?;
+    let attention_mask_stride = ctx.ask::<u32, keys::AttentionMaskStride>()?;
+    let attention_mask_enabled = ctx.ask::<Tensor<u8>, keys::AttentionMaskEnabled>()?;
+    let n_rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(MMA_FILE, PAGED_MMA_SINK[head_point(*head_dim, &SINK_DIMS)?]).apply(Grid::of(tiled_grid(*q_heads, n_rows, MMA_GROUP[0])?, MMA_GROUP)),
         &[
-            queries.v(),
-            k_pages.v(),
-            v_pages.v(),
-            out.v(),
-            gqa_factor.v(),
-            position_ids.v(),
-            req_of_token.v(),
-            kv_page_indices.v(),
-            kv_page_indptr.v(),
-            page_size.v(),
-            n_kv_heads.v(),
-            scale.v(),
-            attention_mask.v(),
-            attention_mask_stride.v(),
-            attention_mask_enabled.v(),
-            window.v(),
-            sinks.v(),
-            n_rows.v(),
+            queries.arg(),
+            k_pages.arg_mut(),
+            v_pages.arg_mut(),
+            out.arg(),
+            gqa_factor.arg(),
+            position_ids.arg(),
+            req_of_token.arg(),
+            kv_page_indices.arg(),
+            kv_page_indptr.arg(),
+            page_size.arg(),
+            n_kv_heads.arg(),
+            scale.arg(),
+            attention_mask.arg(),
+            attention_mask_stride.arg(),
+            attention_mask_enabled.arg(),
+            window.arg(),
+            sinks.arg(),
+            n_rows.arg(),
         ],
     )
 }
@@ -953,42 +992,44 @@ pub fn sdpa_paged_mma_sink(
 /// # Errors
 ///
 /// [`Refusal::Narrow`] from [`head_point`], and see [`vector_grid`].
+#[routine]
 pub fn sdpa_vector_decode(
     ctx: &Ctx<'_>,
-    queries: InSlot<0, Buf>,
-    keys: Held<keys::KvKeys, Buf>,
-    values: Held<keys::KvValues, Buf>,
-    out: OutSlot<0, BufMut>,
-    gqa_factor: Param<0, i32>,
-    n: Param<1, i32>,
-    k_head_stride: Held<keys::KvHeadStride, Usize>,
-    k_seq_stride: Held<keys::KvSeqStride, Usize>,
-    v_head_stride: Held<keys::KvHeadStride, Usize>,
-    v_seq_stride: Held<keys::KvSeqStride, Usize>,
-    scale: ParamF32<2>,
-    head_dim: Ask<keys::HeadDim, i32>,
-    q_heads: Ask<keys::NumQHeads, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: VECTOR_DECODE[head_point(*head_dim, &VECTOR_DIMS)?],
-            file: VECTOR_FILE,
-            lanes: vector_grid(*q_heads, *rows)?,
-            group: BIG_GROUP,
-        },
+    queries: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    scale: Const<f32>,
+    head_dim: Const<i32>,
+    q_heads: Const<i32>) -> Result<(), Refusal> {
+    let keys = ctx.ask::<Tensor<bf16>, keys::KvKeys>()?;
+    let values = ctx.ask::<Tensor<bf16>, keys::KvValues>()?;
+    // GQA'S FACTOR, DERIVED FROM THE TWO COUNTS THE STATEMENT CARRIES.
+    // It was `Param<0, i32>` -- a scalar the DSL stated -- and the migration
+    // read it as a fire's fact and turned it into an ask no driver answers,
+    // so every paged attention refused `Unstated`. It is neither: it is
+    // `q_heads / n_kv_heads` and both are already `Const<i32>` here, so the
+    // one number is derived from the two rather than stated a third time.
+    let n_kv_heads = ctx.ask::<i32, keys::NumKvHeads>()?;
+    let gqa_factor = if n_kv_heads > 0 { *q_heads / n_kv_heads } else { 0 };
+    let n = out.width;
+    let k_head_stride = ctx.ask::<Usize, keys::KvHeadStride>()?;
+    let k_seq_stride = ctx.ask::<Usize, keys::KvSeqStride>()?;
+    let v_head_stride = ctx.ask::<Usize, keys::KvHeadStride>()?;
+    let v_seq_stride = ctx.ask::<Usize, keys::KvSeqStride>()?;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(VECTOR_FILE, VECTOR_DECODE[head_point(*head_dim, &VECTOR_DIMS)?]).apply(Grid::of(vector_grid(*q_heads, rows)?, BIG_GROUP)),
         &[
-            queries.v(),
-            keys.v(),
-            values.v(),
-            out.v(),
-            gqa_factor.v(),
-            n.v(),
-            k_head_stride.v(),
-            k_seq_stride.v(),
-            v_head_stride.v(),
-            v_seq_stride.v(),
-            scale.v(),
+            queries.arg(),
+            keys.arg(),
+            values.arg(),
+            out.arg(),
+            gqa_factor.arg(),
+            n.arg(),
+            k_head_stride.arg(),
+            k_seq_stride.arg(),
+            v_head_stride.arg(),
+            v_seq_stride.arg(),
+            scale.arg(),
         ],
     )
 }
@@ -1005,48 +1046,55 @@ pub fn sdpa_vector_decode(
 /// # Errors
 ///
 /// See [`sdpa_vector_decode`].
+#[routine]
 pub fn sdpa_vector_decode_swa(
     ctx: &Ctx<'_>,
-    queries: InSlot<0, Buf>,
-    keys: Held<keys::KvKeys, Buf>,
-    values: Held<keys::KvValues, Buf>,
-    out: OutSlot<0, BufMut>,
-    gqa_factor: Param<0, i32>,
-    n: Param<1, i32>,
-    k_head_stride: Held<keys::KvHeadStride, Usize>,
-    k_seq_stride: Held<keys::KvSeqStride, Usize>,
-    v_head_stride: Held<keys::KvHeadStride, Usize>,
-    v_seq_stride: Held<keys::KvSeqStride, Usize>,
-    scale: ParamF32<2>,
-    window: Param<3, i32>,
-    q_row_stride: Param<4, i32>,
-    o_row_stride: Param<5, i32>,
-    head_dim: Ask<keys::HeadDim, i32>,
-    q_heads: Ask<keys::NumQHeads, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: VECTOR_SWA[head_point(*head_dim, &SWA_DIMS)?],
-            file: SLIDING_FILE,
-            lanes: vector_grid(*q_heads, *rows)?,
-            group: BIG_GROUP,
-        },
+    queries: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    scale: Const<f32>,
+    window: Const<i32>,
+    head_dim: Const<i32>,
+    q_heads: Const<i32>,
+    // THE TWO PITCHES, WHICH WERE `Param<4>` AND `Param<5>`. A row stride is
+    // the rectangle the text laid out -- two fires of one deployment stride
+    // the same way -- so it fails `ask`'s own test, and no driver answers
+    // `keys::QRowStride` or `keys::ORowStride`. Every sliding and sinked
+    // decode refused `Unstated` while they were asks.
+    q_row_stride: Const<i32>,
+    o_row_stride: Const<i32>) -> Result<(), Refusal> {
+    let keys = ctx.ask::<Tensor<bf16>, keys::KvKeys>()?;
+    let values = ctx.ask::<Tensor<bf16>, keys::KvValues>()?;
+    // GQA'S FACTOR, DERIVED FROM THE TWO COUNTS THE STATEMENT CARRIES.
+    // It was `Param<0, i32>` -- a scalar the DSL stated -- and the migration
+    // read it as a fire's fact and turned it into an ask no driver answers,
+    // so every paged attention refused `Unstated`. It is neither: it is
+    // `q_heads / n_kv_heads` and both are already `Const<i32>` here, so the
+    // one number is derived from the two rather than stated a third time.
+    let n_kv_heads = ctx.ask::<i32, keys::NumKvHeads>()?;
+    let gqa_factor = if n_kv_heads > 0 { *q_heads / n_kv_heads } else { 0 };
+    let n = out.width;
+    let k_head_stride = ctx.ask::<Usize, keys::KvHeadStride>()?;
+    let k_seq_stride = ctx.ask::<Usize, keys::KvSeqStride>()?;
+    let v_head_stride = ctx.ask::<Usize, keys::KvHeadStride>()?;
+    let v_seq_stride = ctx.ask::<Usize, keys::KvSeqStride>()?;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(SLIDING_FILE, VECTOR_SWA[head_point(*head_dim, &SWA_DIMS)?]).apply(Grid::of(vector_grid(*q_heads, rows)?, BIG_GROUP)),
         &[
-            queries.v(),
-            keys.v(),
-            values.v(),
-            out.v(),
-            gqa_factor.v(),
-            n.v(),
-            k_head_stride.v(),
-            k_seq_stride.v(),
-            v_head_stride.v(),
-            v_seq_stride.v(),
-            scale.v(),
-            window.v(),
-            q_row_stride.v(),
-            o_row_stride.v(),
+            queries.arg(),
+            keys.arg(),
+            values.arg(),
+            out.arg(),
+            gqa_factor.arg(),
+            n.arg(),
+            k_head_stride.arg(),
+            k_seq_stride.arg(),
+            v_head_stride.arg(),
+            v_seq_stride.arg(),
+            scale.arg(),
+            window.arg(),
+            q_row_stride.arg(),
+            o_row_stride.arg(),
         ],
     )
 }
@@ -1061,50 +1109,57 @@ pub fn sdpa_vector_decode_swa(
 /// # Errors
 ///
 /// See [`sdpa_vector_decode`].
+#[routine]
 pub fn sdpa_vector_decode_sink(
     ctx: &Ctx<'_>,
-    queries: InSlot<0, Buf>,
-    keys: Held<keys::KvKeys, Buf>,
-    values: Held<keys::KvValues, Buf>,
-    out: OutSlot<0, BufMut>,
-    gqa_factor: Param<0, i32>,
-    n: Param<1, i32>,
-    k_head_stride: Held<keys::KvHeadStride, Usize>,
-    k_seq_stride: Held<keys::KvSeqStride, Usize>,
-    v_head_stride: Held<keys::KvHeadStride, Usize>,
-    v_seq_stride: Held<keys::KvSeqStride, Usize>,
-    scale: ParamF32<2>,
-    window: Param<3, i32>,
-    q_row_stride: Param<4, i32>,
-    o_row_stride: Param<5, i32>,
-    sinks: Weight<0, Buf>,
-    head_dim: Ask<keys::HeadDim, i32>,
-    q_heads: Ask<keys::NumQHeads, i32>,
-    rows: Ask<keys::Rows, i32>,
-) -> Result<(), Refusal> {
-    ctx.dispatch(
-        Fire {
-            entrypoint: VECTOR_SINK[head_point(*head_dim, &SINK_DIMS)?],
-            file: SLIDING_FILE,
-            lanes: vector_grid(*q_heads, *rows)?,
-            group: BIG_GROUP,
-        },
+    queries: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>,
+    scale: Const<f32>,
+    window: Const<i32>,
+    sinks: Const<Tensor<bf16>>,
+    head_dim: Const<i32>,
+    q_heads: Const<i32>,
+    // THE TWO PITCHES, WHICH WERE `Param<4>` AND `Param<5>`. A row stride is
+    // the rectangle the text laid out -- two fires of one deployment stride
+    // the same way -- so it fails `ask`'s own test, and no driver answers
+    // `keys::QRowStride` or `keys::ORowStride`. Every sliding and sinked
+    // decode refused `Unstated` while they were asks.
+    q_row_stride: Const<i32>,
+    o_row_stride: Const<i32>) -> Result<(), Refusal> {
+    let keys = ctx.ask::<Tensor<bf16>, keys::KvKeys>()?;
+    let values = ctx.ask::<Tensor<bf16>, keys::KvValues>()?;
+    // GQA'S FACTOR, DERIVED FROM THE TWO COUNTS THE STATEMENT CARRIES.
+    // It was `Param<0, i32>` -- a scalar the DSL stated -- and the migration
+    // read it as a fire's fact and turned it into an ask no driver answers,
+    // so every paged attention refused `Unstated`. It is neither: it is
+    // `q_heads / n_kv_heads` and both are already `Const<i32>` here, so the
+    // one number is derived from the two rather than stated a third time.
+    let n_kv_heads = ctx.ask::<i32, keys::NumKvHeads>()?;
+    let gqa_factor = if n_kv_heads > 0 { *q_heads / n_kv_heads } else { 0 };
+    let n = out.width;
+    let k_head_stride = ctx.ask::<Usize, keys::KvHeadStride>()?;
+    let k_seq_stride = ctx.ask::<Usize, keys::KvSeqStride>()?;
+    let v_head_stride = ctx.ask::<Usize, keys::KvHeadStride>()?;
+    let v_seq_stride = ctx.ask::<Usize, keys::KvSeqStride>()?;
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    ctx.fire(
+        Fire::at(SLIDING_FILE, VECTOR_SINK[head_point(*head_dim, &SINK_DIMS)?]).apply(Grid::of(vector_grid(*q_heads, rows)?, BIG_GROUP)),
         &[
-            queries.v(),
-            keys.v(),
-            values.v(),
-            out.v(),
-            gqa_factor.v(),
-            n.v(),
-            k_head_stride.v(),
-            k_seq_stride.v(),
-            v_head_stride.v(),
-            v_seq_stride.v(),
-            scale.v(),
-            window.v(),
-            q_row_stride.v(),
-            o_row_stride.v(),
-            sinks.v(),
+            queries.arg(),
+            keys.arg(),
+            values.arg(),
+            out.arg(),
+            gqa_factor.arg(),
+            n.arg(),
+            k_head_stride.arg(),
+            k_seq_stride.arg(),
+            v_head_stride.arg(),
+            v_seq_stride.arg(),
+            scale.arg(),
+            window.arg(),
+            q_row_stride.arg(),
+            o_row_stride.arg(),
+            sinks.arg(),
         ],
     )
 }
@@ -1140,45 +1195,166 @@ pub const VECTOR_SINK: [&str; 1] = ["sdpa_vector_decode_sink_bfloat16_d_64"];
 
 const SLIDING_FILE: &str = "attn/sdpa_sliding.metal";
 
-/// The family, in the order the rows above state it.
-pub static ROUTINES: &[Routine] = &[
-    crate::routine!(split_qkv_bf16),
-    // In place on the attention output, and a real alias: the trace states the
-    // tensor it gates and the kernel binds it once because they are the same
-    // bytes.
-    crate::routine!(gate, in_place = &[(0, 0)]),
-    crate::routine!(kv_append),
-    crate::routine!(kv_append_paged),
-    crate::routine!(logit_softcap),
-    crate::routine!(q_gate_split),
-    crate::routine!(sdpa_paged_decode),
-    crate::routine!(sdpa_paged_decode_sink),
-    crate::routine!(sdpa_paged_mma),
-    crate::routine!(sdpa_paged_mma_sink),
-    crate::routine!(sdpa_paged_tiled),
-    crate::routine!(sdpa_paged_tiled_sink),
-    crate::routine!(sdpa_paged_tiled_strided),
-    crate::routine!(sdpa_vector_decode),
-    crate::routine!(sdpa_vector_decode_sink),
-    crate::routine!(sdpa_vector_decode_swa),
-];
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routine::{ArgValue, Encode};
-    use core::cell::RefCell;
+    use crate::routine::{ArgValue, Const, Encode, Tensor};
+    use core::cell::{Cell, RefCell};
 
     /// One recorded dispatch: the fire, and the argument list.
     type Call = (Fire, Vec<ArgValue>);
 
-    /// An `Encode` that remembers what it was asked to do.
-    #[derive(Default)]
-    struct Seen(RefCell<Vec<Call>>);
+    /// An `Encode` that remembers what it was asked to do, and answers the
+    /// facts this file's TESTED bodies ask for: the KV-cache pair and its
+    /// four strides, the paged pool's index/mask/page-size family, the write
+    /// pair a paged append binds, the two strided pitches
+    /// `sdpa_paged_tiled_strided` adds, and `Rows` -- which every one of them
+    /// asks under that one name whether the caller thinks of it as rows, a
+    /// token count, or a tile count. `gate`'s `row_stride` is separate from
+    /// all of that. None of `split_qkv_bf16`, `q_gate_split`,
+    /// `logit_softcap` or the three `_sink` forms is fired by a test in this
+    /// module, so their own facts (`params`, `QgRowStride`, `OutRowStride`,
+    /// `Elements`) have no Cell here -- adding one nothing exercises would be
+    /// a guess this probe cannot stand behind.
+    struct Seen {
+        calls: RefCell<Vec<Call>>,
+        page_size: Cell<i32>,
+        k_pages: Cell<u32>,
+        v_pages: Cell<u32>,
+        gqa_factor: Cell<i32>,
+        positions: Cell<u32>,
+        request_of_token: Cell<u32>,
+        kv_page_indices: Cell<u32>,
+        kv_page_indptr: Cell<u32>,
+        attention_mask: Cell<u32>,
+        attention_mask_stride: Cell<u32>,
+        attention_mask_enabled: Cell<u32>,
+        rows: Cell<i32>,
+        row_stride: Cell<i32>,
+        kv_head_stride: Cell<u32>,
+        kv_seq_stride: Cell<u32>,
+        kv_write_page: Cell<u32>,
+        kv_write_offset: Cell<u32>,
+        q_row_pitch: Cell<i32>,
+        o_row_pitch: Cell<i32>,
+        q_row_stride: Cell<i32>,
+        o_row_stride: Cell<i32>,
+        absent_handle: Cell<u32>,
+    }
+
+    impl Default for Seen {
+        fn default() -> Self {
+            Self {
+                calls: RefCell::default(),
+                page_size: Cell::new(16),
+                k_pages: Cell::new(700),
+                v_pages: Cell::new(701),
+                gqa_factor: Cell::new(2),
+                positions: Cell::new(702),
+                request_of_token: Cell::new(703),
+                kv_page_indices: Cell::new(704),
+                kv_page_indptr: Cell::new(705),
+                attention_mask: Cell::new(706),
+                attention_mask_stride: Cell::new(0),
+                attention_mask_enabled: Cell::new(707),
+                rows: Cell::new(4),
+                row_stride: Cell::new(4096),
+                kv_head_stride: Cell::new(128),
+                kv_seq_stride: Cell::new(64),
+                kv_write_page: Cell::new(11),
+                kv_write_offset: Cell::new(12),
+                q_row_pitch: Cell::new(512),
+                o_row_pitch: Cell::new(256),
+                q_row_stride: Cell::new(512),
+                o_row_stride: Cell::new(256),
+                absent_handle: Cell::new(99),
+            }
+        }
+    }
 
     impl Encode for Seen {
-        fn dispatch(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
-            self.0.borrow_mut().push((fire, args.to_vec()));
+        fn resolve(&self, _ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
+            use kernels::keys::Fact;
+            // THE STATEMENT'S OWN SCALARS, read by index where the params run
+            // is the shader's struct and no `Const` mark can name a word in it
+            // -- see `Asks::param`. A stride wide enough for the rows these
+            // cases build.
+            if let kernels::Source::Slot(kernels::Kind::Param, n) = source {
+                let _ = n;
+                return Ok(ArgValue::I32(4096));
+            }
+            if source == <keys::KvPageSize as Fact>::SOURCE {
+                return Ok(ArgValue::I32(self.page_size.get()));
+            }
+            if source == <keys::KvKeys as Fact>::SOURCE {
+                return Ok(ArgValue::Buffer(self.k_pages.get()));
+            }
+            if source == <keys::KvValues as Fact>::SOURCE {
+                return Ok(ArgValue::Buffer(self.v_pages.get()));
+            }
+            // THE CACHE'S HEAD COUNT, which the paged bodies derive
+            // `gqa_factor` from now rather than being told it. The probe's
+            // own `gqa_factor` cell stays: `sdpa_vector_*` still asks.
+            if source == <keys::NumKvHeads as Fact>::SOURCE {
+                return Ok(ArgValue::I32(8));
+            }
+            if source == <keys::GqaFactor as Fact>::SOURCE {
+                return Ok(ArgValue::I32(self.gqa_factor.get()));
+            }
+            if source == <keys::Positions as Fact>::SOURCE {
+                return Ok(ArgValue::Buffer(self.positions.get()));
+            }
+            if source == <keys::RequestOfToken as Fact>::SOURCE {
+                return Ok(ArgValue::Buffer(self.request_of_token.get()));
+            }
+            if source == <keys::KvPageIndices as Fact>::SOURCE {
+                return Ok(ArgValue::Buffer(self.kv_page_indices.get()));
+            }
+            if source == <keys::KvPageIndptr as Fact>::SOURCE {
+                return Ok(ArgValue::Buffer(self.kv_page_indptr.get()));
+            }
+            if source == <keys::AttentionMask as Fact>::SOURCE {
+                return Ok(ArgValue::Buffer(self.attention_mask.get()));
+            }
+            if source == <keys::AttentionMaskStride as Fact>::SOURCE {
+                return Ok(ArgValue::U32(self.attention_mask_stride.get()));
+            }
+            if source == <keys::AttentionMaskEnabled as Fact>::SOURCE {
+                return Ok(ArgValue::Buffer(self.attention_mask_enabled.get()));
+            }
+            if source == <keys::Rows as Fact>::SOURCE {
+                return Ok(ArgValue::I32(self.rows.get()));
+            }
+            if source == <keys::KvHeadStride as Fact>::SOURCE {
+                return Ok(ArgValue::Usize(u64::from(self.kv_head_stride.get())));
+            }
+            if source == <keys::KvSeqStride as Fact>::SOURCE {
+                return Ok(ArgValue::Usize(u64::from(self.kv_seq_stride.get())));
+            }
+            if source == <keys::KvWritePage as Fact>::SOURCE {
+                return Ok(ArgValue::Buffer(self.kv_write_page.get()));
+            }
+            if source == <keys::KvWriteOffset as Fact>::SOURCE {
+                return Ok(ArgValue::Buffer(self.kv_write_offset.get()));
+            }
+            if source == <keys::QRowStride as Fact>::SOURCE {
+                return Ok(ArgValue::I32(self.q_row_stride.get()));
+            }
+            if source == <keys::ORowStride as Fact>::SOURCE {
+                return Ok(ArgValue::I32(self.o_row_stride.get()));
+            }
+            if source == kernels::Source::Lit(kernels::Lit::Null) {
+                return Ok(ArgValue::Buffer(self.absent_handle.get()));
+            }
+            // Anything else is refused: a probe that invented an answer to a
+            // fact it does not know would let a body pass under test while
+            // the same fact went unanswered on a real driver.
+            Err(Refusal::Unstated { what: "a fact this probe does not answer" })
+        }
+
+        fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
+            self.calls.borrow_mut().push((fire, args.to_vec()));
             Ok(())
         }
     }
@@ -1198,8 +1374,15 @@ mod tests {
     #[test]
     fn a_gate_covers_every_row_of_a_prefill() {
         let seen = Seen::default();
-        gate(&seen, OutSlot::new(BufMut(1)), InSlot::new(Buf(2)), Param::new(4096), Ask::new(4096), Ask::new(512)).expect("a launch");
-        let calls = seen.0.borrow();
+        seen.rows.set(512);
+        gate(
+            &seen,
+            InOut { ptr: Tensor::<bf16>::new(1), rows: 0, width: 4096 },
+            In::new(Tensor::<bf16>::new(2)),
+            // The statement's stride, which the probe used to answer.
+            Const::new(4096))
+        .expect("a launch");
+        let calls = seen.calls.borrow();
         let (fire, _) = &calls[0];
         assert_eq!(
             fire.lanes[1], 512,
@@ -1218,35 +1401,21 @@ mod tests {
     #[test]
     fn a_paged_append_binds_the_rings_slots_it_does_not_read() {
         let seen = Seen::default();
-        let ring = Buf(99);
+        let ring = Tensor::<bf16>::new(99);
         kv_append_paged(
             &seen,
-            InSlot::new(Buf(1)),
-            InSlot::new(Buf(2)),
-            Ask::new(BufMut(3)),
-            Ask::new(BufMut(4)),
-            Null::new(Env(ring)),
-            ParamOr::new(256),
-            Null::new(Env(ring)),
-            Null::new(Env(ring)),
-            Null::new(Env(ring)),
-            Null::new(Env(ring)),
-            Held::new(16),
-            Null::new(Env(ring)),
-            ParamOr::new(8),
-            Ask::new(U32s(11)),
-            Ask::new(U32s(12)),
-            Null::new(Env(ring)),
-            Ask::new(1),
-        )
+            In::new(Tensor::<bf16>::new(1)),
+            In::new(Tensor::<bf16>::new(2)),
+            Const::new(256),
+            Const::new(8))
         .expect("a launch");
-        let calls = seen.0.borrow();
+        let calls = seen.calls.borrow();
         let (_, args) = &calls[0];
         assert_eq!(args.len(), 16, "the pool's whole argument table");
-        assert_eq!(args[13], U32s(11).v(), "the destination page at thirteen");
-        assert_eq!(args[14], U32s(12).v(), "and its offset at fourteen");
+        assert_eq!(args[13], Tensor::<u32>::new(11).arg(), "the destination page at thirteen");
+        assert_eq!(args[14], Tensor::<u32>::new(12).arg(), "and its offset at fourteen");
         for slot in [4, 6, 7, 8, 9, 11, 15] {
-            assert_eq!(args[slot], ring.v(), "slot {slot} still holds an address");
+            assert_eq!(args[slot], ring.arg(), "slot {slot} still holds an address");
         }
     }
 
@@ -1283,37 +1452,24 @@ mod tests {
     #[test]
     fn a_tiled_prefill_launches_a_group_per_tile_and_states_the_rows() {
         let seen = Seen::default();
+        seen.rows.set(100);
         sdpa_paged_tiled(
             &seen,
-            InSlot::new(Buf(1)),
-            Ask::new(Buf(2)),
-            Ask::new(Buf(3)),
-            OutSlot::new(BufMut(4)),
-            Param::new(4),
-            Ask::new(I32s(5)),
-            Ask::new(I32s(6)),
-            Ask::new(U32s(7)),
-            Ask::new(U32s(8)),
-            Held::new(16),
-            Param::new(8),
-            ParamF32::new(0.125),
-            Ask::new(U8s(9)),
-            Ask::new(0),
-            Ask::new(U8s(10)),
-            ParamOrLit::new(0),
-            Null::new(Env(Buf(11))),
-            Ask::new(100),
-            Ask::new(64),
-            Ask::new(32),
-        )
+            In::new(Tensor::<bf16>::new(1)),
+            Out::new(Tensor::<bf16>::new(4)),
+            Const::new(8),
+            Const::new(0.125),
+            Const::new(0),
+            Const::new(64),
+            Const::new(32))
         .expect("a launch");
-        let calls = seen.0.borrow();
+        let calls = seen.calls.borrow();
         let (fire, args) = &calls[0];
         assert_eq!(
             fire.lanes[1], 4,
             "a hundred rows is four tiles of thirty-two, the last one partial"
         );
-        assert_eq!(args[17], 100.v(), "and the kernel is told the hundred");
+        assert_eq!(args[17], 100.arg(), "and the kernel is told the hundred");
     }
 
     /// The matrix-unit tiling launches the 128 threads it was compiled for.
@@ -1324,31 +1480,18 @@ mod tests {
     #[test]
     fn the_matrix_unit_tiling_launches_its_declared_width() {
         let seen = Seen::default();
+        seen.rows.set(64);
         sdpa_paged_mma(
             &seen,
-            InSlot::new(Buf(1)),
-            Ask::new(Buf(2)),
-            Ask::new(Buf(3)),
-            OutSlot::new(BufMut(4)),
-            Param::new(4),
-            Ask::new(I32s(5)),
-            Ask::new(I32s(6)),
-            Ask::new(U32s(7)),
-            Ask::new(U32s(8)),
-            Held::new(16),
-            Param::new(8),
-            ParamF32::new(0.125),
-            Ask::new(U8s(9)),
-            Ask::new(0),
-            Ask::new(U8s(10)),
-            ParamOrLit::new(0),
-            Null::new(Env(Buf(11))),
-            Ask::new(64),
-            Ask::new(64),
-            Ask::new(32),
-        )
+            In::new(Tensor::<bf16>::new(1)),
+            Out::new(Tensor::<bf16>::new(4)),
+            Const::new(8),
+            Const::new(0.125),
+            Const::new(0),
+            Const::new(64),
+            Const::new(32))
         .expect("a launch");
-        let calls = seen.0.borrow();
+        let calls = seen.calls.borrow();
         let (fire, _) = &calls[0];
         assert_eq!(fire.group, MMA_GROUP, "the width the shader declares");
         assert_eq!(
@@ -1396,143 +1539,63 @@ mod tests {
     #[test]
     fn every_attention_routine_binds_its_entrypoints_whole_table() {
         let seen = Seen::default();
-        let (b, m, i, u, u8s) = (Buf(1), BufMut(2), I32s(3), U32s(4), U8s(5));
+        let (b, m, _i, _u, _u8s) = (Tensor::<bf16>::new(1), Tensor::<bf16>::new(2), Tensor::<i32>::new(3), Tensor::<u32>::new(4), Tensor::<u8>::new(5));
         sdpa_paged_decode(
             &seen,
-            InSlot::new(b),
-            Ask::new(b),
-            Ask::new(b),
-            OutSlot::new(m),
-            Param::new(4),
-            Ask::new(i),
-            Ask::new(i),
-            Ask::new(u),
-            Ask::new(u),
-            Held::new(16),
-            Param::new(8),
-            ParamF32::new(0.125),
-            Ask::new(u8s),
-            Ask::new(0),
-            Ask::new(u8s),
-            ParamOrLit::new(0),
-            Null::new(Env(b)),
-            Ask::new(64),
-            Ask::new(32),
-            Ask::new(1),
-        )
+            In::new(b),
+            Out::new(m),
+            Const::new(8),
+            Const::new(0.125),
+            Const::new(0),
+            Const::new(64),
+            Const::new(32))
         .expect("a launch");
         sdpa_paged_tiled(
             &seen,
-            InSlot::new(b),
-            Ask::new(b),
-            Ask::new(b),
-            OutSlot::new(m),
-            Param::new(4),
-            Ask::new(i),
-            Ask::new(i),
-            Ask::new(u),
-            Ask::new(u),
-            Held::new(16),
-            Param::new(8),
-            ParamF32::new(0.125),
-            Ask::new(u8s),
-            Ask::new(0),
-            Ask::new(u8s),
-            ParamOrLit::new(0),
-            Null::new(Env(b)),
-            Ask::new(64),
-            Ask::new(64),
-            Ask::new(32),
-        )
+            In::new(b),
+            Out::new(m),
+            Const::new(8),
+            Const::new(0.125),
+            Const::new(0),
+            Const::new(64),
+            Const::new(32))
         .expect("a launch");
         sdpa_paged_tiled_strided(
             &seen,
-            InSlot::new(b),
-            Ask::new(b),
-            Ask::new(b),
-            OutSlot::new(m),
-            Param::new(4),
-            Ask::new(i),
-            Ask::new(i),
-            Ask::new(u),
-            Ask::new(u),
-            Held::new(16),
-            Param::new(8),
-            ParamF32::new(0.125),
-            Ask::new(u8s),
-            Ask::new(0),
-            Ask::new(u8s),
-            ParamOrLit::new(0),
-            Null::new(Env(b)),
-            Ask::new(64),
-            Param::new(8192),
-            Param::new(4096),
-            Ask::new(256),
-            Ask::new(32),
-        )
+            In::new(b),
+            Out::new(m),
+            Const::new(8),
+            Const::new(0.125),
+            Const::new(0),
+            Const::new(256),
+            Const::new(32))
         .expect("a launch");
         sdpa_paged_mma(
             &seen,
-            InSlot::new(b),
-            Ask::new(b),
-            Ask::new(b),
-            OutSlot::new(m),
-            Param::new(4),
-            Ask::new(i),
-            Ask::new(i),
-            Ask::new(u),
-            Ask::new(u),
-            Held::new(16),
-            Param::new(8),
-            ParamF32::new(0.125),
-            Ask::new(u8s),
-            Ask::new(0),
-            Ask::new(u8s),
-            ParamOrLit::new(0),
-            Null::new(Env(b)),
-            Ask::new(64),
-            Ask::new(64),
-            Ask::new(32),
-        )
+            In::new(b),
+            Out::new(m),
+            Const::new(8),
+            Const::new(0.125),
+            Const::new(0),
+            Const::new(64),
+            Const::new(32))
         .expect("a launch");
         sdpa_vector_decode(
             &seen,
-            InSlot::new(b),
-            Held::new(b),
-            Held::new(b),
-            OutSlot::new(m),
-            Param::new(4),
-            Param::new(128),
-            Held::new(Usize(6)),
-            Held::new(Usize(7)),
-            Held::new(Usize(8)),
-            Held::new(Usize(9)),
-            ParamF32::new(0.125),
-            Ask::new(64),
-            Ask::new(32),
-            Ask::new(1),
-        )
+            In::new(b),
+            Out::new(m),
+            Const::new(0.125),
+            Const::new(64),
+            Const::new(32))
         .expect("a launch");
         sdpa_vector_decode_swa(
             &seen,
-            InSlot::new(b),
-            Held::new(b),
-            Held::new(b),
-            OutSlot::new(m),
-            Param::new(4),
-            Param::new(128),
-            Held::new(Usize(6)),
-            Held::new(Usize(7)),
-            Held::new(Usize(8)),
-            Held::new(Usize(9)),
-            ParamF32::new(0.125),
-            Param::new(512),
-            Param::new(8192),
-            Param::new(4096),
-            Ask::new(256),
-            Ask::new(32),
-            Ask::new(1),
-        )
+            In::new(b),
+            Out::new(m),
+            Const::new(0.125),
+            Const::new(512),
+            Const::new(256),
+            Const::new(32), Const::new(4096), Const::new(4096))
         .expect("a launch");
 
         // The buffer counts the shaders declare, in dispatch order.
@@ -1544,7 +1607,7 @@ mod tests {
             (11, VECTOR_FILE),
             (14, SLIDING_FILE),
         ];
-        let calls = seen.0.borrow();
+        let calls = seen.calls.borrow();
         for (call, (arity, file)) in calls.iter().zip(want) {
             assert_eq!(
                 call.1.len(),

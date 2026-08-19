@@ -11816,15 +11816,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 3
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -12911,15 +12923,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 7
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -14006,15 +14030,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 11
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -15101,15 +15137,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 15
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -16196,15 +16244,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 19
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -17291,15 +17351,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 23
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -18386,15 +18458,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 27
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -19481,15 +19565,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 31
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -20576,15 +20672,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 35
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -21671,15 +21779,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 39
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -22766,15 +22886,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 43
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -23861,15 +23993,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 47
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -24956,15 +25100,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 51
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -26051,15 +26207,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 55
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -27146,15 +27314,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 59
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -28241,15 +28421,27 @@
     },
     {
       "kind": {
+        "Prep": {
+          "prep": {
+            "DecodeAttention": {
+              "head_dim": 256,
+              "full_attention": true
+            }
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "attn::dispatch_attention_flashinfer_decode",
           "state": {
             "store": "KvCache",
             "layer": 63
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -28457,7 +28649,7 @@
     {
       "seam": "attn.out",
       "layer": 3,
-      "op": 63,
+      "op": 64,
       "values": [
         63
       ]
@@ -28465,7 +28657,7 @@
     {
       "seam": "attn.q",
       "layer": 4,
-      "op": 76,
+      "op": 77,
       "values": [
         78
       ]
@@ -28473,7 +28665,7 @@
     {
       "seam": "attn.out",
       "layer": 4,
-      "op": 78,
+      "op": 79,
       "values": [
         78
       ]
@@ -28481,7 +28673,7 @@
     {
       "seam": "attn.q",
       "layer": 5,
-      "op": 92,
+      "op": 93,
       "values": [
         96
       ]
@@ -28489,7 +28681,7 @@
     {
       "seam": "attn.out",
       "layer": 5,
-      "op": 94,
+      "op": 95,
       "values": [
         96
       ]
@@ -28497,7 +28689,7 @@
     {
       "seam": "attn.q",
       "layer": 6,
-      "op": 108,
+      "op": 109,
       "values": [
         114
       ]
@@ -28505,7 +28697,7 @@
     {
       "seam": "attn.out",
       "layer": 6,
-      "op": 110,
+      "op": 111,
       "values": [
         114
       ]
@@ -28513,7 +28705,7 @@
     {
       "seam": "attn.q",
       "layer": 7,
-      "op": 125,
+      "op": 126,
       "values": [
         134
       ]
@@ -28521,7 +28713,7 @@
     {
       "seam": "attn.out",
       "layer": 7,
-      "op": 131,
+      "op": 133,
       "values": [
         134
       ]
@@ -28529,7 +28721,7 @@
     {
       "seam": "attn.q",
       "layer": 8,
-      "op": 144,
+      "op": 146,
       "values": [
         149
       ]
@@ -28537,7 +28729,7 @@
     {
       "seam": "attn.out",
       "layer": 8,
-      "op": 146,
+      "op": 148,
       "values": [
         149
       ]
@@ -28545,7 +28737,7 @@
     {
       "seam": "attn.q",
       "layer": 9,
-      "op": 160,
+      "op": 162,
       "values": [
         167
       ]
@@ -28553,7 +28745,7 @@
     {
       "seam": "attn.out",
       "layer": 9,
-      "op": 162,
+      "op": 164,
       "values": [
         167
       ]
@@ -28561,7 +28753,7 @@
     {
       "seam": "attn.q",
       "layer": 10,
-      "op": 176,
+      "op": 178,
       "values": [
         185
       ]
@@ -28569,7 +28761,7 @@
     {
       "seam": "attn.out",
       "layer": 10,
-      "op": 178,
+      "op": 180,
       "values": [
         185
       ]
@@ -28577,7 +28769,7 @@
     {
       "seam": "attn.q",
       "layer": 11,
-      "op": 193,
+      "op": 195,
       "values": [
         205
       ]
@@ -28585,7 +28777,7 @@
     {
       "seam": "attn.out",
       "layer": 11,
-      "op": 199,
+      "op": 202,
       "values": [
         205
       ]
@@ -28593,7 +28785,7 @@
     {
       "seam": "attn.q",
       "layer": 12,
-      "op": 212,
+      "op": 215,
       "values": [
         220
       ]
@@ -28601,7 +28793,7 @@
     {
       "seam": "attn.out",
       "layer": 12,
-      "op": 214,
+      "op": 217,
       "values": [
         220
       ]
@@ -28609,7 +28801,7 @@
     {
       "seam": "attn.q",
       "layer": 13,
-      "op": 228,
+      "op": 231,
       "values": [
         238
       ]
@@ -28617,7 +28809,7 @@
     {
       "seam": "attn.out",
       "layer": 13,
-      "op": 230,
+      "op": 233,
       "values": [
         238
       ]
@@ -28625,7 +28817,7 @@
     {
       "seam": "attn.q",
       "layer": 14,
-      "op": 244,
+      "op": 247,
       "values": [
         256
       ]
@@ -28633,7 +28825,7 @@
     {
       "seam": "attn.out",
       "layer": 14,
-      "op": 246,
+      "op": 249,
       "values": [
         256
       ]
@@ -28641,7 +28833,7 @@
     {
       "seam": "attn.q",
       "layer": 15,
-      "op": 261,
+      "op": 264,
       "values": [
         276
       ]
@@ -28649,7 +28841,7 @@
     {
       "seam": "attn.out",
       "layer": 15,
-      "op": 267,
+      "op": 271,
       "values": [
         276
       ]
@@ -28657,7 +28849,7 @@
     {
       "seam": "attn.q",
       "layer": 16,
-      "op": 280,
+      "op": 284,
       "values": [
         291
       ]
@@ -28665,7 +28857,7 @@
     {
       "seam": "attn.out",
       "layer": 16,
-      "op": 282,
+      "op": 286,
       "values": [
         291
       ]
@@ -28673,7 +28865,7 @@
     {
       "seam": "attn.q",
       "layer": 17,
-      "op": 296,
+      "op": 300,
       "values": [
         309
       ]
@@ -28681,7 +28873,7 @@
     {
       "seam": "attn.out",
       "layer": 17,
-      "op": 298,
+      "op": 302,
       "values": [
         309
       ]
@@ -28689,7 +28881,7 @@
     {
       "seam": "attn.q",
       "layer": 18,
-      "op": 312,
+      "op": 316,
       "values": [
         327
       ]
@@ -28697,7 +28889,7 @@
     {
       "seam": "attn.out",
       "layer": 18,
-      "op": 314,
+      "op": 318,
       "values": [
         327
       ]
@@ -28705,7 +28897,7 @@
     {
       "seam": "attn.q",
       "layer": 19,
-      "op": 329,
+      "op": 333,
       "values": [
         347
       ]
@@ -28713,7 +28905,7 @@
     {
       "seam": "attn.out",
       "layer": 19,
-      "op": 335,
+      "op": 340,
       "values": [
         347
       ]
@@ -28721,7 +28913,7 @@
     {
       "seam": "attn.q",
       "layer": 20,
-      "op": 348,
+      "op": 353,
       "values": [
         362
       ]
@@ -28729,7 +28921,7 @@
     {
       "seam": "attn.out",
       "layer": 20,
-      "op": 350,
+      "op": 355,
       "values": [
         362
       ]
@@ -28737,7 +28929,7 @@
     {
       "seam": "attn.q",
       "layer": 21,
-      "op": 364,
+      "op": 369,
       "values": [
         380
       ]
@@ -28745,7 +28937,7 @@
     {
       "seam": "attn.out",
       "layer": 21,
-      "op": 366,
+      "op": 371,
       "values": [
         380
       ]
@@ -28753,7 +28945,7 @@
     {
       "seam": "attn.q",
       "layer": 22,
-      "op": 380,
+      "op": 385,
       "values": [
         398
       ]
@@ -28761,7 +28953,7 @@
     {
       "seam": "attn.out",
       "layer": 22,
-      "op": 382,
+      "op": 387,
       "values": [
         398
       ]
@@ -28769,7 +28961,7 @@
     {
       "seam": "attn.q",
       "layer": 23,
-      "op": 397,
+      "op": 402,
       "values": [
         418
       ]
@@ -28777,7 +28969,7 @@
     {
       "seam": "attn.out",
       "layer": 23,
-      "op": 403,
+      "op": 409,
       "values": [
         418
       ]
@@ -28785,7 +28977,7 @@
     {
       "seam": "attn.q",
       "layer": 24,
-      "op": 416,
+      "op": 422,
       "values": [
         433
       ]
@@ -28793,7 +28985,7 @@
     {
       "seam": "attn.out",
       "layer": 24,
-      "op": 418,
+      "op": 424,
       "values": [
         433
       ]
@@ -28801,7 +28993,7 @@
     {
       "seam": "attn.q",
       "layer": 25,
-      "op": 432,
+      "op": 438,
       "values": [
         451
       ]
@@ -28809,7 +29001,7 @@
     {
       "seam": "attn.out",
       "layer": 25,
-      "op": 434,
+      "op": 440,
       "values": [
         451
       ]
@@ -28817,7 +29009,7 @@
     {
       "seam": "attn.q",
       "layer": 26,
-      "op": 448,
+      "op": 454,
       "values": [
         469
       ]
@@ -28825,7 +29017,7 @@
     {
       "seam": "attn.out",
       "layer": 26,
-      "op": 450,
+      "op": 456,
       "values": [
         469
       ]
@@ -28833,7 +29025,7 @@
     {
       "seam": "attn.q",
       "layer": 27,
-      "op": 465,
+      "op": 471,
       "values": [
         489
       ]
@@ -28841,7 +29033,7 @@
     {
       "seam": "attn.out",
       "layer": 27,
-      "op": 471,
+      "op": 478,
       "values": [
         489
       ]
@@ -28849,7 +29041,7 @@
     {
       "seam": "attn.q",
       "layer": 28,
-      "op": 484,
+      "op": 491,
       "values": [
         504
       ]
@@ -28857,7 +29049,7 @@
     {
       "seam": "attn.out",
       "layer": 28,
-      "op": 486,
+      "op": 493,
       "values": [
         504
       ]
@@ -28865,7 +29057,7 @@
     {
       "seam": "attn.q",
       "layer": 29,
-      "op": 500,
+      "op": 507,
       "values": [
         522
       ]
@@ -28873,7 +29065,7 @@
     {
       "seam": "attn.out",
       "layer": 29,
-      "op": 502,
+      "op": 509,
       "values": [
         522
       ]
@@ -28881,7 +29073,7 @@
     {
       "seam": "attn.q",
       "layer": 30,
-      "op": 516,
+      "op": 523,
       "values": [
         540
       ]
@@ -28889,7 +29081,7 @@
     {
       "seam": "attn.out",
       "layer": 30,
-      "op": 518,
+      "op": 525,
       "values": [
         540
       ]
@@ -28897,7 +29089,7 @@
     {
       "seam": "attn.q",
       "layer": 31,
-      "op": 533,
+      "op": 540,
       "values": [
         560
       ]
@@ -28905,7 +29097,7 @@
     {
       "seam": "attn.out",
       "layer": 31,
-      "op": 539,
+      "op": 547,
       "values": [
         560
       ]
@@ -28913,7 +29105,7 @@
     {
       "seam": "attn.q",
       "layer": 32,
-      "op": 552,
+      "op": 560,
       "values": [
         575
       ]
@@ -28921,7 +29113,7 @@
     {
       "seam": "attn.out",
       "layer": 32,
-      "op": 554,
+      "op": 562,
       "values": [
         575
       ]
@@ -28929,7 +29121,7 @@
     {
       "seam": "attn.q",
       "layer": 33,
-      "op": 568,
+      "op": 576,
       "values": [
         593
       ]
@@ -28937,7 +29129,7 @@
     {
       "seam": "attn.out",
       "layer": 33,
-      "op": 570,
+      "op": 578,
       "values": [
         593
       ]
@@ -28945,7 +29137,7 @@
     {
       "seam": "attn.q",
       "layer": 34,
-      "op": 584,
+      "op": 592,
       "values": [
         611
       ]
@@ -28953,7 +29145,7 @@
     {
       "seam": "attn.out",
       "layer": 34,
-      "op": 586,
+      "op": 594,
       "values": [
         611
       ]
@@ -28961,7 +29153,7 @@
     {
       "seam": "attn.q",
       "layer": 35,
-      "op": 601,
+      "op": 609,
       "values": [
         631
       ]
@@ -28969,7 +29161,7 @@
     {
       "seam": "attn.out",
       "layer": 35,
-      "op": 607,
+      "op": 616,
       "values": [
         631
       ]
@@ -28977,7 +29169,7 @@
     {
       "seam": "attn.q",
       "layer": 36,
-      "op": 620,
+      "op": 629,
       "values": [
         646
       ]
@@ -28985,7 +29177,7 @@
     {
       "seam": "attn.out",
       "layer": 36,
-      "op": 622,
+      "op": 631,
       "values": [
         646
       ]
@@ -28993,7 +29185,7 @@
     {
       "seam": "attn.q",
       "layer": 37,
-      "op": 636,
+      "op": 645,
       "values": [
         664
       ]
@@ -29001,7 +29193,7 @@
     {
       "seam": "attn.out",
       "layer": 37,
-      "op": 638,
+      "op": 647,
       "values": [
         664
       ]
@@ -29009,7 +29201,7 @@
     {
       "seam": "attn.q",
       "layer": 38,
-      "op": 652,
+      "op": 661,
       "values": [
         682
       ]
@@ -29017,7 +29209,7 @@
     {
       "seam": "attn.out",
       "layer": 38,
-      "op": 654,
+      "op": 663,
       "values": [
         682
       ]
@@ -29025,7 +29217,7 @@
     {
       "seam": "attn.q",
       "layer": 39,
-      "op": 669,
+      "op": 678,
       "values": [
         702
       ]
@@ -29033,7 +29225,7 @@
     {
       "seam": "attn.out",
       "layer": 39,
-      "op": 675,
+      "op": 685,
       "values": [
         702
       ]
@@ -29041,7 +29233,7 @@
     {
       "seam": "attn.q",
       "layer": 40,
-      "op": 688,
+      "op": 698,
       "values": [
         717
       ]
@@ -29049,7 +29241,7 @@
     {
       "seam": "attn.out",
       "layer": 40,
-      "op": 690,
+      "op": 700,
       "values": [
         717
       ]
@@ -29057,7 +29249,7 @@
     {
       "seam": "attn.q",
       "layer": 41,
-      "op": 704,
+      "op": 714,
       "values": [
         735
       ]
@@ -29065,7 +29257,7 @@
     {
       "seam": "attn.out",
       "layer": 41,
-      "op": 706,
+      "op": 716,
       "values": [
         735
       ]
@@ -29073,7 +29265,7 @@
     {
       "seam": "attn.q",
       "layer": 42,
-      "op": 720,
+      "op": 730,
       "values": [
         753
       ]
@@ -29081,7 +29273,7 @@
     {
       "seam": "attn.out",
       "layer": 42,
-      "op": 722,
+      "op": 732,
       "values": [
         753
       ]
@@ -29089,7 +29281,7 @@
     {
       "seam": "attn.q",
       "layer": 43,
-      "op": 737,
+      "op": 747,
       "values": [
         773
       ]
@@ -29097,7 +29289,7 @@
     {
       "seam": "attn.out",
       "layer": 43,
-      "op": 743,
+      "op": 754,
       "values": [
         773
       ]
@@ -29105,7 +29297,7 @@
     {
       "seam": "attn.q",
       "layer": 44,
-      "op": 756,
+      "op": 767,
       "values": [
         788
       ]
@@ -29113,7 +29305,7 @@
     {
       "seam": "attn.out",
       "layer": 44,
-      "op": 758,
+      "op": 769,
       "values": [
         788
       ]
@@ -29121,7 +29313,7 @@
     {
       "seam": "attn.q",
       "layer": 45,
-      "op": 772,
+      "op": 783,
       "values": [
         806
       ]
@@ -29129,7 +29321,7 @@
     {
       "seam": "attn.out",
       "layer": 45,
-      "op": 774,
+      "op": 785,
       "values": [
         806
       ]
@@ -29137,7 +29329,7 @@
     {
       "seam": "attn.q",
       "layer": 46,
-      "op": 788,
+      "op": 799,
       "values": [
         824
       ]
@@ -29145,7 +29337,7 @@
     {
       "seam": "attn.out",
       "layer": 46,
-      "op": 790,
+      "op": 801,
       "values": [
         824
       ]
@@ -29153,7 +29345,7 @@
     {
       "seam": "attn.q",
       "layer": 47,
-      "op": 805,
+      "op": 816,
       "values": [
         844
       ]
@@ -29161,7 +29353,7 @@
     {
       "seam": "attn.out",
       "layer": 47,
-      "op": 811,
+      "op": 823,
       "values": [
         844
       ]
@@ -29169,7 +29361,7 @@
     {
       "seam": "attn.q",
       "layer": 48,
-      "op": 824,
+      "op": 836,
       "values": [
         859
       ]
@@ -29177,7 +29369,7 @@
     {
       "seam": "attn.out",
       "layer": 48,
-      "op": 826,
+      "op": 838,
       "values": [
         859
       ]
@@ -29185,7 +29377,7 @@
     {
       "seam": "attn.q",
       "layer": 49,
-      "op": 840,
+      "op": 852,
       "values": [
         877
       ]
@@ -29193,7 +29385,7 @@
     {
       "seam": "attn.out",
       "layer": 49,
-      "op": 842,
+      "op": 854,
       "values": [
         877
       ]
@@ -29201,7 +29393,7 @@
     {
       "seam": "attn.q",
       "layer": 50,
-      "op": 856,
+      "op": 868,
       "values": [
         895
       ]
@@ -29209,7 +29401,7 @@
     {
       "seam": "attn.out",
       "layer": 50,
-      "op": 858,
+      "op": 870,
       "values": [
         895
       ]
@@ -29217,7 +29409,7 @@
     {
       "seam": "attn.q",
       "layer": 51,
-      "op": 873,
+      "op": 885,
       "values": [
         915
       ]
@@ -29225,7 +29417,7 @@
     {
       "seam": "attn.out",
       "layer": 51,
-      "op": 879,
+      "op": 892,
       "values": [
         915
       ]
@@ -29233,7 +29425,7 @@
     {
       "seam": "attn.q",
       "layer": 52,
-      "op": 892,
+      "op": 905,
       "values": [
         930
       ]
@@ -29241,7 +29433,7 @@
     {
       "seam": "attn.out",
       "layer": 52,
-      "op": 894,
+      "op": 907,
       "values": [
         930
       ]
@@ -29249,7 +29441,7 @@
     {
       "seam": "attn.q",
       "layer": 53,
-      "op": 908,
+      "op": 921,
       "values": [
         948
       ]
@@ -29257,7 +29449,7 @@
     {
       "seam": "attn.out",
       "layer": 53,
-      "op": 910,
+      "op": 923,
       "values": [
         948
       ]
@@ -29265,7 +29457,7 @@
     {
       "seam": "attn.q",
       "layer": 54,
-      "op": 924,
+      "op": 937,
       "values": [
         966
       ]
@@ -29273,7 +29465,7 @@
     {
       "seam": "attn.out",
       "layer": 54,
-      "op": 926,
+      "op": 939,
       "values": [
         966
       ]
@@ -29281,7 +29473,7 @@
     {
       "seam": "attn.q",
       "layer": 55,
-      "op": 941,
+      "op": 954,
       "values": [
         986
       ]
@@ -29289,7 +29481,7 @@
     {
       "seam": "attn.out",
       "layer": 55,
-      "op": 947,
+      "op": 961,
       "values": [
         986
       ]
@@ -29297,7 +29489,7 @@
     {
       "seam": "attn.q",
       "layer": 56,
-      "op": 960,
+      "op": 974,
       "values": [
         1001
       ]
@@ -29305,7 +29497,7 @@
     {
       "seam": "attn.out",
       "layer": 56,
-      "op": 962,
+      "op": 976,
       "values": [
         1001
       ]
@@ -29313,7 +29505,7 @@
     {
       "seam": "attn.q",
       "layer": 57,
-      "op": 976,
+      "op": 990,
       "values": [
         1019
       ]
@@ -29321,7 +29513,7 @@
     {
       "seam": "attn.out",
       "layer": 57,
-      "op": 978,
+      "op": 992,
       "values": [
         1019
       ]
@@ -29329,7 +29521,7 @@
     {
       "seam": "attn.q",
       "layer": 58,
-      "op": 992,
+      "op": 1006,
       "values": [
         1037
       ]
@@ -29337,7 +29529,7 @@
     {
       "seam": "attn.out",
       "layer": 58,
-      "op": 994,
+      "op": 1008,
       "values": [
         1037
       ]
@@ -29345,7 +29537,7 @@
     {
       "seam": "attn.q",
       "layer": 59,
-      "op": 1009,
+      "op": 1023,
       "values": [
         1057
       ]
@@ -29353,7 +29545,7 @@
     {
       "seam": "attn.out",
       "layer": 59,
-      "op": 1015,
+      "op": 1030,
       "values": [
         1057
       ]
@@ -29361,7 +29553,7 @@
     {
       "seam": "attn.q",
       "layer": 60,
-      "op": 1028,
+      "op": 1043,
       "values": [
         1072
       ]
@@ -29369,7 +29561,7 @@
     {
       "seam": "attn.out",
       "layer": 60,
-      "op": 1030,
+      "op": 1045,
       "values": [
         1072
       ]
@@ -29377,7 +29569,7 @@
     {
       "seam": "attn.q",
       "layer": 61,
-      "op": 1044,
+      "op": 1059,
       "values": [
         1090
       ]
@@ -29385,7 +29577,7 @@
     {
       "seam": "attn.out",
       "layer": 61,
-      "op": 1046,
+      "op": 1061,
       "values": [
         1090
       ]
@@ -29393,7 +29585,7 @@
     {
       "seam": "attn.q",
       "layer": 62,
-      "op": 1060,
+      "op": 1075,
       "values": [
         1108
       ]
@@ -29401,7 +29593,7 @@
     {
       "seam": "attn.out",
       "layer": 62,
-      "op": 1062,
+      "op": 1077,
       "values": [
         1108
       ]
@@ -29409,7 +29601,7 @@
     {
       "seam": "attn.q",
       "layer": 63,
-      "op": 1077,
+      "op": 1092,
       "values": [
         1128
       ]
@@ -29417,7 +29609,7 @@
     {
       "seam": "attn.out",
       "layer": 63,
-      "op": 1083,
+      "op": 1099,
       "values": [
         1128
       ]

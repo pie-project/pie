@@ -219,6 +219,18 @@ impl Session {
                 if !plane.engine_reads() {
                     continue;
                 }
+                // WHAT THE PROGRAM ACTUALLY PUBLISHED. A sampling program that
+                // commits and publishes the wrong cell is invisible from both
+                // ends: the driver saw a successful fire and the engine saw a
+                // token. `PIE_TRACE_VALUES=1` prints the wire bytes.
+                if std::env::var_os("PIE_TRACE_VALUES").is_some() {
+                    eprintln!(
+                        "[put] channel={c} dtype={:?} numel={} wire={:?}",
+                        shape.dtype,
+                        shape.numel,
+                        &wire[..wire.len().min(32)]
+                    );
+                }
                 if !plane.publish(&wire) {
                     // The engine is behind; leave the cell so the next fire's
                     // readiness declines and retries — lossless.

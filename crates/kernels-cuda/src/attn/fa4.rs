@@ -25,6 +25,7 @@
 //! which names one carried file — `attn/fa4.cuh` — so the test attributes all
 //! four ids to it.
 
+use kernels::{Bind, Fire};
 use core::ptr::NonNull;
 
 use crate::jit::abi::bf16;
@@ -341,14 +342,13 @@ const fn plan(
 /// which is why this takes a `Ctx` rather than being a free arithmetic
 /// function — the plan depends on the device.
 pub fn split_scratch_elems(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     seqlen_q: u32,
     seqlen_k: u32,
     batch: u32,
     heads_q: u32,
     heads_kv: u32,
-    head_dim: u32,
-) -> (usize, usize) {
+    head_dim: u32) -> (usize, usize) {
     let num_sms = ctx.multiprocessors().unwrap_or(0);
     let p = plan(seqlen_q, seqlen_k, batch, heads_q, heads_kv, num_sms, true);
     if p.splits == 1 {
@@ -474,7 +474,7 @@ pub struct Fa4 {
 /// Every non-null pointer in `job` must address device memory of the extent
 /// its shape and strides describe, live across the launch, and `ctx`'s stream
 /// must outlive it — the obligation any `cudaLaunchKernel` carries.
-pub unsafe fn forward(ctx: &Ctx, job: Fa4) -> Result<(), Refusal> {
+pub unsafe fn forward(ctx: &Ctx<'_>, job: Fa4) -> Result<(), Refusal> {
     // The head dim is refused here, before any pointer is looked at, so an
     // unsupported one is named rather than reaching a plan that would have to
     // invent a geometry for it. Which tile it gets is decided below.
@@ -551,12 +551,7 @@ pub unsafe fn forward(ctx: &Ctx, job: Fa4) -> Result<(), Refusal> {
     //
     // SAFETY: the caller's contract -- every pointer bound here addresses live
     // device memory of the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "attn/fa4.cuh",
-            instantiation,
-            Launch::grid(grid, [num_threads, 1, 1]).smem(smem),
-            &[
+    ctx.fire(Fire::at("attn/fa4.cuh", instantiation).apply(Launch::grid(grid, [num_threads, 1, 1]).smem(smem)), &[
                 job.q.arg(),
                 job.k.arg(),
                 job.v.arg(),
@@ -584,9 +579,7 @@ pub unsafe fn forward(ctx: &Ctx, job: Fa4) -> Result<(), Refusal> {
                 (splits as i32).arg(),
                 (job.heads_q as i32).arg(),
                 job.scale_log2.arg(),
-            ],
-        )?;
-    }
+            ])?;
 
     if splits == 1 {
         return Ok(());
@@ -598,14 +591,7 @@ pub unsafe fn forward(ctx: &Ctx, job: Fa4) -> Result<(), Refusal> {
     // per channel.
     let rows = job.batch * job.heads_q * job.seqlen_q;
     let combine = combine_instantiation(job.head_dim).ok_or(NO_HEAD_DIM)?;
-
-    // SAFETY: as above, plus the scratch the forward launch just wrote.
-    unsafe {
-        ctx.launch(
-            "attn/fa4.cuh",
-            combine,
-            Launch::grid([rows, 1, 1], [job.head_dim, 1, 1]),
-            &[
+    ctx.fire(Fire::at("attn/fa4.cuh", combine).apply(Launch::grid([rows, 1, 1], [job.head_dim, 1, 1])), &[
                 job.o_partial.cast_const().arg(),
                 job.lse_partial.cast_const().arg(),
                 job.o.arg(),
@@ -618,9 +604,7 @@ pub unsafe fn forward(ctx: &Ctx, job: Fa4) -> Result<(), Refusal> {
                 job.o_stride_h.arg(),
                 job.lse_stride_b.arg(),
                 job.lse_stride_h.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 #[cfg(test)]

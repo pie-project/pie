@@ -6,15 +6,36 @@
 //! granularity (`_per_channel`, `_per_group`, `_per_token_group`) is part of
 //! the symbol name because the kernels differ, not the call. Every
 //! `# Safety` section also assumes `ctx`'s stream is live across the launch.
+//!
+//! # The six that take raw pointers
+//!
+//! `In`/`Out` say a STATEMENT places this operand, so a launcher no trace
+//! reaches must not wear them: the wrapper would promise a statement that does
+//! not exist, and its `rows`/`width` would be the zeros every caller already
+//! passed. Those six are plain `unsafe fn`s, out of [`ROUTINES`] and out of
+//! `driver-cuda`'s arm registry, reached by path from their one caller:
+//!
+//! * THE LOADER'S TWO — [`quantize_bf16_to_mxfp4_e2m1_per_block`] and
+//!   [`quantize_bf16_to_fp8_e4m3_per_channel`]. `model-loader`'s transform
+//!   plan runs them once at load over a CHECKPOINT MATRIX. The plan still
+//!   names them as strings (`plan/passes/tile.rs`), which is the loader's own
+//!   vocabulary and not this crate's registry.
+//! * THE QUANTISED GEMM'S STAGING FOUR — [`quantize_bf16_to_int8_per_channel`],
+//!   [`dequant_int8_to_bf16_per_channel`], [`dequant_int32_w8a8_to_bf16`] and
+//!   [`quantize_bf16_to_fp8_e4m3_per_token_group`], fired mid-matmul by
+//!   `gemm/quant.rs`. A text states the matmul and the weight REPRESENTATION;
+//!   the staging is what reading that representation costs, chosen inside the
+//!   body from the dtypes.
+//!
+//! A `#[routine]` wrapper could be added over any of them the day a trace
+//! states one — the pure `fn` is the half that would not need rewriting.
 
-#![allow(clippy::too_many_arguments)]
-
-use crate::jit::{Ctx, Family, Launch, Routine};
-use crate::routine;
-use crate::jit::Abi;
-use crate::jit::abi::Inst;
+use kernels::{Bind, Fire};
+use kernels_macros::routine;
+use crate::jit::{Ctx, Launch};
+use crate::jit::abi::Tensor;
 use crate::jit::abi::{bf16, f16};
-use kernels::routine::{Bank, Env, In, Out, Param, ParamF32};
+use kernels::routine::{Asks, Const, In, InOut, Out};
 use kernels::keys;
 use kernels::Refusal;
 
@@ -171,50 +192,40 @@ fn extent(symbol: &str, n: usize) -> u32 {
 /// `dst[i] = (bf16)src[i]` for `n` fp32 elements — `quant::cast_fp32_to_bf16`.
 /// # Safety
 /// `src_fp32` must address `n` live fp32 elements and `dst_bf16` `n` writable bf16 elements.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn cast_fp32_to<T>(
-    ctx: &Ctx,
-    src_fp32: In<0, f32>,
-    dst_bf16: Out<0, T>,
-    // `usize`, not `i32`: the only typed caller is a byte run that can
-    // exceed `i32::MAX`, with no rows/width to split it into.
-    #[source(OutElements(0))] n: usize,
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *mut T: Abi,
-{
+    ctx: &Ctx<'_>,
+    src_fp32: In<Tensor<f32>>,
+    dst_bf16: Out<Tensor<T>>) -> Result<(), Refusal> {
+    // THE ELEMENT COUNT COMES OFF THE MARK, not off a fact. `keys::
+    // OutElements0` is *"rows times the result's row width"* -- the two
+    // numbers this operand already carries -- and asking for it made a
+    // hand-written caller unable to state it at all: `Ctx::on(stream)` has no
+    // fire behind it, so the ask refuses. `Region::elements` is the same
+    // product, read from the value the caller placed.
+    let n = usize::try_from(dst_bf16.all("the cast's destination width")?.elements())
+        .map_err(|_| Refusal::Empty { what: "the cast's element count" })?;
     let launch = elementwise(extent("quant::cast_fp32_to_bf16", n));
-    // SAFETY: `call()`'s contract — every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "quant/dtype_cast.cuh",
-            &format!("::pie::quant::cast_f32_to<{}>", T::CPP),
-            launch,
-            &[src_fp32.ptr.arg(), dst_bf16.ptr.arg(), n.arg()],
-        )
-    }
+    ctx.fire(Fire::at("quant/dtype_cast.cuh", crate::jit::symbol(&format!("::pie::quant::cast_f32_to<{}>", T::CPP))).apply(launch), &[src_fp32.arg(), dst_bf16.arg(), n.arg()])
 }
 
 /// `buf[r, c] *= l[c]` over a `rows x width` bf16 buffer, in place.
 /// # Safety
 /// `buf_bf16` must address `buf_bf16.rows * buf_bf16.width` writable bf16
 /// elements, `l_bf16` `buf_bf16.width` readable ones.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn scale_rows<T>(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     // In place: `dsl::cuda::scale_rows` hands back the same buffer it took as
-    // input 0, so this result is also that operand.
-    buf_bf16: Out<0, T>,
-    l_bf16: In<1, T>,
+    // input 0, so this result is also that operand -- which is `InOut`, and
+    // which is also what makes `l_bf16` input 1 rather than input 0.
+    buf_bf16: InOut<Tensor<T>>,
+    l_bf16: In<Tensor<T>>,
     // Load-bearing: `route_rows` clamps a zero width up to one warp, so an
     // unguarded empty rectangle would launch successfully and do nothing.
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
-{
+
+
+) -> Result<(), Refusal> {
     // `Refusal::Empty`, not a panic: `unsigned_abs` would turn a negative
     // rows into a small positive launch if the sign weren't rejected first.
     let rows = buf_bf16.rows;
@@ -229,17 +240,7 @@ where
     // here is built the same way, for the same reason.
     let buf = buf_bf16.all("width")?;
     let launch = route_rows(rows.unsigned_abs(), buf.width.unsigned_abs());
-    // SAFETY: `call()`'s contract — every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "quant/dtype_cast.cuh",
-            &format!("::pie::quant::scale_rows<{}>", T::CPP),
-            launch,
-            // A row pitch, not a width — `dtype_cast.cuh` also indexes the
-            // scale vector by it, which has no extent of its own to state.
-            &[buf.ptr.arg(), l_bf16.ptr.arg(), buf.stride.0.arg()],
-        )
-    }
+    ctx.fire(Fire::at("quant/dtype_cast.cuh", crate::jit::symbol(&format!("::pie::quant::scale_rows<{}>", T::CPP))).apply(launch), &[buf.ptr.arg(), l_bf16.arg(), buf.stride.arg()])
 }
 
 /// Narrow a bf16 activation to fp16 — `quant::bf16_to_fp16`.
@@ -248,12 +249,11 @@ where
 /// [`Refusal::Narrow`] when it does not fit one 32-bit launch extent.
 /// # Safety
 /// `in_bf16` must address `n` live bf16 elements, `out_fp16` `n` writable fp16 elements.
-#[kernels_macros::routine]
+#[routine]
 pub fn bf16_to_fp16(
-    ctx: &Ctx,
-    in_bf16: In<0, bf16>,
-    out_fp16: Out<0, f16>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    in_bf16: In<Tensor<bf16>>,
+    out_fp16: Out<Tensor<f16>>) -> Result<(), Refusal> {
     // In 64 bits, since an `i32` multiply would wrap. `Region::elements`
     // computes the same product saturated in `i32`, not refused.
     let count = i64::from(out_fp16.rows) * i64::from(out_fp16.width);
@@ -264,165 +264,104 @@ pub fn bf16_to_fp16(
         return Err(Refusal::Narrow { what: "the output rectangle in one 32-bit launch extent", at: count });
     };
     let launch = slab(grid);
-    // SAFETY: `call()`'s contract — every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "quant/dequant_wna16.cuh",
-            "::pie::quant::bf16_to_narrow<::pie::f16>",
-            launch,
-            &[in_bf16.ptr.arg(), out_fp16.ptr.arg(), count.arg()],
-        )
-    }
+    ctx.fire(Fire::at("quant/dequant_wna16.cuh", "::pie::quant::bf16_to_narrow<::pie::f16>").apply(launch), &[in_bf16.arg(), out_fp16.arg(), count.arg()])
 }
 
 /// One f32 scale for a whole FP8 E4M3 tensor —
 /// # Safety
 /// `fp8_in` addresses `n` live E4M3 bytes, `bf16_out` `n` writable bf16 elements.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn dequant_fp8_e4m3_to<T>(
-    ctx: &Ctx,
-    fp8_in: In<0, u8>,
-    bf16_out: Out<0, T>,
+    ctx: &Ctx<'_>,
+    fp8_in: In<Tensor<u8>>,
+    bf16_out: Out<Tensor<T>>,
     // A weight walker: this launcher and those through
     // `mxfp4_scales_to_marlin_e8m0` dequantise a weight, whose shape is a
     // checkpoint property, not a fire fact. Its leading extent (`rows`/
     // `out_dim`) has no `Source`: `keys::Rows` would compile but read the
     // fire's token count instead. Its trailing extent (`cols`/`in_dim`) is
     // a row pitch a region already carries; `scale` here is `params[0]`.
-    scale: ParamF32<0>,
+    scale: Const<f32>,
     // The weight's own shape, which the statement carries at `params[1..3]`.
     // Not `keys::Rows` — that is the fire's token count.
-    rows: Param<1, i32>,
-    cols: Param<2, i32>,
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *mut T: Abi,
-{
+    rows: Const<i32>,
+    cols: Const<i32>) -> Result<(), Refusal> {
     let n = (*rows as usize).saturating_mul(*cols as usize);
     let launch = elementwise(extent("quant::dequant_fp8_e4m3_to_bf16", n));
-    // SAFETY: `call()`'s contract — every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "quant/dequant_fp8.cuh",
-            &format!("::pie::quant::dequant_fp8_e4m3<{}>", T::CPP),
-            launch,
-            &[fp8_in.ptr.arg(), bf16_out.ptr.arg(), scale.arg(), n.arg()],
-        )
-    }
+    ctx.fire(Fire::at("quant/dequant_fp8.cuh", crate::jit::symbol(&format!("::pie::quant::dequant_fp8_e4m3<{}>", T::CPP))).apply(launch), &[fp8_in.arg(), bf16_out.arg(), scale.arg(), n.arg()])
 }
 
 /// One f32 scale per output channel —
 /// # Safety
 /// `fp8_in` addresses `rows * cols` live E4M3 bytes, `bf16_out` as many
 /// writable bf16 elements, `scale_inv` `rows` f32.
-#[kernels_macros::routine]
+#[routine]
 pub fn dequant_fp8_e4m3_to_bf16_per_channel(
-    ctx: &Ctx,
-    fp8_in: In<0, u8>,
-    bf16_out: Out<0, bf16>,
-    scale_inv: In<1, f32>,
+    ctx: &Ctx<'_>,
+    fp8_in: In<Tensor<u8>>,
+    bf16_out: Out<Tensor<bf16>>,
+    scale_inv: In<Tensor<f32>>,
     // The weight's own shape, at `params[1..3]`; see `dequant_fp8_e4m3_to`.
-    rows: Param<1, i32>,
-    cols: Param<2, i32>,
-) -> Result<(), Refusal> {
+    rows: Const<i32>,
+    cols: Const<i32>) -> Result<(), Refusal> {
     let launch = route_rows(rows.unsigned_abs(), cols.unsigned_abs());
-    // SAFETY: `call()`'s contract — every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "quant/dequant_fp8.cuh",
-            "::pie::quant::dequant_fp8_e4m3_per_channel<::pie::bf16>",
-            launch,
-            &[fp8_in.ptr.arg(), bf16_out.ptr.arg(), scale_inv.ptr.arg(), cols.arg()],
-        )
-    }
+    ctx.fire(Fire::at("quant/dequant_fp8.cuh", "::pie::quant::dequant_fp8_e4m3_per_channel<::pie::bf16>").apply(launch), &[fp8_in.arg(), bf16_out.arg(), scale_inv.arg(), cols.arg()])
 }
 
 /// One f32 scale per contiguous group along K, the DeepSeek block-FP8 weight
 /// # Safety
 /// `fp8_in` addresses `rows * cols` live E4M3 bytes, `bf16_out` as many
 /// writable bf16 elements, `scales` `rows * ceil(cols / group_size)` f32.
-#[kernels_macros::routine]
+#[routine]
 pub fn dequant_fp8_e4m3_to_bf16_per_group(
-    ctx: &Ctx,
-    fp8_in: In<0, u8>,
-    bf16_out: Out<0, bf16>,
-    scales: In<1, f32>,
-    // `rows` reads `Env<keys::Rows>` — the fire's token window, not this
-    // weight's checkpoint-fixed count (wrong, but pre-existing:
-    // `rectangle_rows` discards the `Dim::Const` leading extent). `cols`'s
-    // `OutWidth(0)` is correct.
-    rows: Env<keys::Rows>,
-    #[source(OutWidth(0))]
-    cols: i32,
-    group_size: Param<0, i32>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    fp8_in: In<Tensor<u8>>,
+    bf16_out: Out<Tensor<bf16>>,
+    scales: In<Tensor<f32>>,
+    group_size: Const<i32>) -> Result<(), Refusal> {
+    let rows = ctx.ask::<i32, keys::Rows>()?;
+    let cols = bf16_out.width;
     let launch = route_rows(rows.unsigned_abs(), cols.unsigned_abs());
-    // SAFETY: `call()`'s contract — every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "quant/dequant_fp8.cuh",
-            "::pie::quant::dequant_fp8_e4m3_per_group<::pie::bf16>",
-            launch,
-            &[fp8_in.ptr.arg(), bf16_out.ptr.arg(), scales.ptr.arg(), cols.arg(), group_size.arg()],
-        )
-    }
+    ctx.fire(Fire::at("quant/dequant_fp8.cuh", "::pie::quant::dequant_fp8_e4m3_per_group<::pie::bf16>").apply(launch), &[fp8_in.arg(), bf16_out.arg(), scales.arg(), cols.arg(), group_size.arg()])
 }
 
 /// Packed E2M1 nibbles and E8M0 block scales to bf16 —
 /// # Safety
 /// `packed` addresses `out_dim * in_dim / 2` live bytes, `block_scale`
 /// `out_dim * in_dim / 32`, `out` `out_dim * in_dim` writable bf16 elements.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn dequant_mxfp4_to<T>(
-    ctx: &Ctx,
-    packed: In<0, u8>,
-    block_scale: In<1, u8>,
-    out: Out<0, T>,
+    ctx: &Ctx<'_>,
+    packed: In<Tensor<u8>>,
+    block_scale: In<Tensor<u8>>,
+    out: Out<Tensor<T>>,
     // The weight's own shape, at `params[0..2]`; this form spends no `params`
     // on a scale, so it starts at zero.
-    out_dim: Param<0, i32>,
-    in_dim: Param<1, i32>,
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *mut T: Abi,
-{
+    out_dim: Const<i32>,
+    in_dim: Const<i32>) -> Result<(), Refusal> {
     let launch = route_rows(out_dim.unsigned_abs(), in_dim.unsigned_abs());
-    // SAFETY: `call()`'s contract — every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "quant/dequant_fp4.cuh",
-            &format!("::pie::quant::dequant_mxfp4<{}>", T::CPP),
-            launch,
-            &[packed.ptr.arg(), block_scale.ptr.arg(), out.ptr.arg(), in_dim.arg()],
-        )
-    }
+    ctx.fire(Fire::at("quant/dequant_fp4.cuh", crate::jit::symbol(&format!("::pie::quant::dequant_mxfp4<{}>", T::CPP))).apply(launch), &[packed.arg(), block_scale.arg(), out.arg(), in_dim.arg()])
 }
 
 /// INT4B8 words with a bf16 scale per group along K —
 /// # Safety
 /// `packed` addresses `out_dim * in_dim / 8` live `int32`s, `scale`
 /// `out_dim * in_dim / group_size` bf16, `out` `out_dim * in_dim` writable bf16.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn dequant_wna16_int4b8_to<T>(
-    ctx: &Ctx,
-    packed: In<0, i32>,
-    scale: In<1, T>,
-    out: Out<0, T>,
-    // A weight walker — see [`dequant_fp8_e4m3_to`]'s block. `out.rows`/
-    // The weight's own shape, at `params[1..3]`; `[0]` is the group size.
-    out_dim: Param<1, i32>,
-    in_dim: Param<2, i32>,
-    // `group_size` is `Param<0, i32>`, the same slot and quantisation
-    // convention as `dequant_fp8_e4m3_to_bf16_per_group`'s.
-    group_size: Param<0, i32>,
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
-{
+    ctx: &Ctx<'_>,
+    packed: In<Tensor<i32>>,
+    scale: In<Tensor<T>>,
+    out: Out<Tensor<T>>,
+    // FIRST, BECAUSE IT IS `params[0]` -- the quantisation convention
+    // `dequant_fp8_e4m3_to_bf16_per_group` shares. The slot is the mark's
+    // position among the params marks now, so the order in this list IS the
+    // order in the statement's run.
+    group_size: Const<i32>,
+    // A weight walker — see [`dequant_fp8_e4m3_to`]'s block.
+    // The weight's own shape, at `params[1..3]`.
+    out_dim: Const<i32>,
+    in_dim: Const<i32>) -> Result<(), Refusal> {
     /// [`kernels::LaunchRule::ElementwiseRows`], as `bind/launch.rs` evaluates it.
     const fn elementwise_rows(rows: u32, width: u32) -> Launch {
     Launch::grid([rows, width.div_ceil(BLOCK), 1], [BLOCK, 1, 1])
@@ -442,26 +381,18 @@ where
         });
     }
     let launch = elementwise_rows(out_dim.unsigned_abs(), in_dim.unsigned_abs());
-    // SAFETY: `call()`'s contract — every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "quant/dequant_wna16.cuh",
-            &format!("::pie::quant::dequant_wna16_int4b8<{}>", T::CPP),
-            launch,
-            &[packed.ptr.arg(), scale.ptr.arg(), out.ptr.arg(), in_dim.arg(), group_size.arg()],
-        )
-    }
+    ctx.fire(Fire::at("quant/dequant_wna16.cuh", crate::jit::symbol(&format!("::pie::quant::dequant_wna16_int4b8<{}>", T::CPP))).apply(launch), &[packed.arg(), scale.arg(), out.arg(), in_dim.arg(), group_size.arg()])
 }
 
 /// E8M0 block scales into Marlin's order —
 /// # Safety
 /// `raw` addresses `source_rows * source_stride_groups` live E8M0 bytes, `out`
 /// `selected_rows * target_groups` writable ones.
-#[kernels_macros::routine]
+#[routine]
 pub fn mxfp4_scales_to_marlin_e8m0(
-    ctx: &Ctx,
-    raw: In<0, u8>,
-    out: Out<0, u8>,
+    ctx: &Ctx<'_>,
+    raw: In<Tensor<u8>>,
+    out: Out<Tensor<u8>>,
     // Nine scalars: seven ride `params[]` (`Param<N, i32>`); `selected_rows`
     // and `target_groups` are a weight-shaped result's own extents (no
     // `Source` names them — see [`dequant_fp8_e4m3_to`]'s block), and the
@@ -469,29 +400,20 @@ pub fn mxfp4_scales_to_marlin_e8m0(
     // holds. No windowed view is built (a window needs a byte offset, which
     // needs the pointee's size this signature lacks), so the kernel bounds-
     // checks and zero-fills silently past them (`mxfp4_marlin.cuh`) instead.
-    source_rows: Param<0, i32>,
-    source_row_offset: Param<1, i32>,
-    #[source(Rows)]
-    selected_rows: i32,
-    valid_rows: Param<2, i32>,
-    source_stride_groups: Param<3, i32>,
-    source_group_offset: Param<4, i32>,
-    source_groups: Param<5, i32>,
-    #[source(OutWidth(0))]
-    target_groups: i32,
-    row_select: Param<6, i32>,
-) -> Result<(), Refusal> {
+    source_rows: Const<i32>,
+    source_row_offset: Const<i32>,
+    valid_rows: Const<i32>,
+    source_stride_groups: Const<i32>,
+    source_group_offset: Const<i32>,
+    source_groups: Const<i32>,
+    row_select: Const<i32>) -> Result<(), Refusal> {
+    let selected_rows = ctx.ask::<i32, keys::Rows>()?;
+    let target_groups = out.width;
     let total = selected_rows.unsigned_abs().saturating_mul(target_groups.unsigned_abs());
     let launch = elementwise(total);
-    // SAFETY: `call()`'s contract — every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "quant/mxfp4_marlin.cuh",
-            "::pie::quant::mxfp4_scales_to_marlin_e8m0<::pie::u8>",
-            launch,
-            &[
-                raw.ptr.arg(),
-                out.ptr.arg(),
+    ctx.fire(Fire::at("quant/mxfp4_marlin.cuh", "::pie::quant::mxfp4_scales_to_marlin_e8m0<::pie::u8>").apply(launch), &[
+                raw.arg(),
+                out.arg(),
                 source_rows.arg(),
                 source_row_offset.arg(),
                 selected_rows.arg(),
@@ -501,139 +423,109 @@ pub fn mxfp4_scales_to_marlin_e8m0(
                 source_groups.arg(),
                 target_groups.arg(),
                 row_select.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// A bf16 rectangle to MXFP4 nibbles plus their E8M0 block scales —
+///
+/// One of THE LOADER'S TWO, and not a `#[routine]`: `model-loader`'s transform
+/// plan fires it once at load against a checkpoint matrix, so there is no
+/// statement to derive an operand from and no fire whose rectangle `rows` and
+/// `cols` could be. See the module header.
+///
 /// # Safety
 /// `w_bf16` addresses `rows * cols` live bf16, `w_packed` `rows * cols / 2`
 /// writable bytes, `w_scale_e8m0` `rows * cols / 32` writable bytes.
-#[kernels_macros::routine]
-pub fn quantize_bf16_to_mxfp4_e2m1_per_block(
-    ctx: &Ctx,
-    w_bf16: In<0, bf16>,
-    w_packed: Out<0, u8>,
-    w_scale_e8m0: Out<1, u8>,
-    // Unbound, unlike the weight walkers above: no statement at all — this
-    // loader quantiser runs once at load, from the transform plan.
+pub unsafe fn quantize_bf16_to_mxfp4_e2m1_per_block(
+    ctx: &Ctx<'_>,
+    w_bf16: *const bf16,
+    w_packed: *mut u8,
+    w_scale_e8m0: *mut u8,
     rows: i32,
-    cols: i32,
-) -> Result<(), Refusal> {
+    cols: i32) -> Result<(), Refusal> {
     if cols < 32 {
         return Err(Refusal::Narrow { what: "cols, in 32-element blocks", at: i64::from(cols) });
     }
     let launch = route_rows(rows.unsigned_abs(), cols.unsigned_abs() / 32);
-    // SAFETY: `call()`'s contract — every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "quant/quant_bf16_to_mxfp4.cuh",
-            "::pie::quant::quant_bf16_to_mxfp4_row<::pie::bf16>",
-            launch,
-            &[w_bf16.ptr.arg(), w_packed.ptr.arg(), w_scale_e8m0.ptr.arg(), cols.arg()],
-        )
-    }
+    ctx.fire(Fire::at("quant/quant_bf16_to_mxfp4.cuh", "::pie::quant::quant_bf16_to_mxfp4_row<::pie::bf16>").apply(launch), &[w_bf16.arg(), w_packed.arg(), w_scale_e8m0.arg(), cols.arg()])
 }
 
 /// Per-row FP8 E4M3 quantisation with the scale emitted beside it —
+///
+/// The loader's other quantiser — see [`quantize_bf16_to_mxfp4_e2m1_per_block`].
+///
 /// # Safety
 /// `w_bf16` addresses `rows * cols` live bf16, `w_fp8` as many writable
 /// bytes, `scale_inv` `rows` writable f32.
-#[kernels_macros::routine]
-pub fn quantize_bf16_to_fp8_e4m3_per_channel(
-    ctx: &Ctx,
-    w_bf16: In<0, bf16>,
-    w_fp8: Out<0, u8>,
-    scale_inv: Out<1, f32>,
-    // The loader's other quantiser -- see [`quantize_bf16_to_mxfp4_e2m1_per_block`].
+pub unsafe fn quantize_bf16_to_fp8_e4m3_per_channel(
+    ctx: &Ctx<'_>,
+    w_bf16: *const bf16,
+    w_fp8: *mut u8,
+    scale_inv: *mut f32,
     rows: i32,
-    cols: i32,
-) -> Result<(), Refusal> {
+    cols: i32) -> Result<(), Refusal> {
     let launch = rms(rows.unsigned_abs());
-    // SAFETY: `call()`'s contract — every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "quant/quant_bf16_to_fp8.cuh",
-            "::pie::quant::quant_per_channel<::pie::quant::fp8_e4m3>",
-            launch,
-            &[w_bf16.ptr.arg(), w_fp8.ptr.arg(), scale_inv.ptr.arg(), cols.arg()],
-        )
-    }
+    ctx.fire(Fire::at("quant/quant_bf16_to_fp8.cuh", "::pie::quant::quant_per_channel<::pie::quant::fp8_e4m3>").apply(launch), &[w_bf16.arg(), w_fp8.arg(), scale_inv.arg(), cols.arg()])
 }
 
 /// Per-row symmetric INT8 quantisation of a `[rows, cols]` bf16 rectangle —
+///
+/// THE QUANTISED GEMM'S STAGING FOUR (with
+/// [`dequant_int8_to_bf16_per_channel`], [`dequant_int32_w8a8_to_bf16`] and
+/// [`quantize_bf16_to_fp8_e4m3_per_token_group`]): none is a `#[routine]`,
+/// because `gemm/quant.rs` fires them from inside a matmul body. The caller is
+/// a matmul, not a fire, so no trace states the rectangle. See the module
+/// header.
+///
 /// # Safety
 /// `w_bf16` addresses `rows * cols` live bf16, `out_int8` as many writable
 /// signed bytes, `scale_inv` `rows` writable f32.
-#[kernels_macros::routine]
-pub fn quantize_bf16_to_int8_per_channel(
-    ctx: &Ctx,
-    w_bf16: In<0, bf16>,
-    out_int8: Out<0, i8>,
-    scale_inv: Out<1, f32>,
-    // The quantised GEMM's staging four (with
-    // [`dequant_int8_to_bf16_per_channel`], [`dequant_int32_w8a8_to_bf16`]
-    // and [`quantize_bf16_to_fp8_e4m3_per_token_group`]): all unsourced,
-    // fired mid-matmul by `gemm/quant.rs`, so no trace states the rectangle.
+pub unsafe fn quantize_bf16_to_int8_per_channel(
+    ctx: &Ctx<'_>,
+    w_bf16: *const bf16,
+    out_int8: *mut i8,
+    scale_inv: *mut f32,
     rows: i32,
-    cols: i32,
-) -> Result<(), Refusal> {
+    cols: i32) -> Result<(), Refusal> {
     let launch = rms(rows.unsigned_abs());
-    // SAFETY: `call()`'s contract — every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "quant/quant_bf16_to_fp8.cuh",
-            "::pie::quant::quant_per_channel<::pie::quant::int8_sym>",
-            launch,
-            &[w_bf16.ptr.arg(), out_int8.ptr.arg(), scale_inv.ptr.arg(), cols.arg()],
-        )
-    }
+    ctx.fire(Fire::at("quant/quant_bf16_to_fp8.cuh", "::pie::quant::quant_per_channel<::pie::quant::int8_sym>").apply(launch), &[w_bf16.arg(), out_int8.arg(), scale_inv.arg(), cols.arg()])
 }
 
 /// INT8 back to bf16 through a per-channel scale —
+///
+/// Staging four — see [`quantize_bf16_to_int8_per_channel`].
+///
 /// # Safety
 /// `w_int8` addresses `rows * cols` live signed bytes, `out` as many writable
 /// bf16, `scale_inv` `rows` f32.
-#[kernels_macros::routine]
-pub fn dequant_int8_to_bf16_per_channel(
-    ctx: &Ctx,
-    w_int8: In<0, i8>,
-    out: Out<0, bf16>,
-    scale_inv: In<1, f32>,
-    // Staging four -- see [`quantize_bf16_to_int8_per_channel`].
+pub unsafe fn dequant_int8_to_bf16_per_channel(
+    ctx: &Ctx<'_>,
+    w_int8: *const i8,
+    out: *mut bf16,
+    scale_inv: *const f32,
     rows: i32,
-    cols: i32,
-) -> Result<(), Refusal> {
+    cols: i32) -> Result<(), Refusal> {
     let n = rows.unsigned_abs() as usize * cols.unsigned_abs() as usize;
     let launch = elementwise(extent("quant::dequant_int8_to_bf16_per_channel", n));
-    // SAFETY: `call()`'s contract — every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "quant/quant_bf16_to_fp8.cuh",
-            "::pie::quant::dequant_int8_per_channel<::pie::bf16>",
-            launch,
-            &[w_int8.ptr.arg(), out.ptr.arg(), scale_inv.ptr.arg(), cols.arg(), n.arg()],
-        )
-    }
+    ctx.fire(Fire::at("quant/quant_bf16_to_fp8.cuh", "::pie::quant::dequant_int8_per_channel<::pie::bf16>").apply(launch), &[w_int8.arg(), out.arg(), scale_inv.arg(), cols.arg(), n.arg()])
 }
 
 /// The W8A8 epilogue: an `[M, N]` int32 accumulator widened to bf16 through a
+///
+/// Staging four — see [`quantize_bf16_to_int8_per_channel`]. `n` here is a
+/// width, not the flat element count other launchers spell the same way.
+///
 /// # Safety
 /// `acc` addresses `m * n` live i32, `act_scale_inv` `m` f32, `w_scale_inv`
 /// `n` f32, `out` `m * n` writable bf16.
-#[kernels_macros::routine]
-pub fn dequant_int32_w8a8_to_bf16(
-    ctx: &Ctx,
-    acc: In<0, i32>,
-    act_scale_inv: In<1, f32>,
-    w_scale_inv: In<2, f32>,
-    out: Out<0, bf16>,
-    // Staging four — see [`quantize_bf16_to_int8_per_channel`]. `n` here is
-    // a width, not the flat element count other launchers spell the same way.
+pub unsafe fn dequant_int32_w8a8_to_bf16(
+    ctx: &Ctx<'_>,
+    acc: *const i32,
+    act_scale_inv: *const f32,
+    w_scale_inv: *const f32,
+    out: *mut bf16,
     m: i32,
-    n: i32,
-) -> Result<(), Refusal> {
+    n: i32) -> Result<(), Refusal> {
     const W8A8_BY: u32 = 8;
 
     /// `quant_bf16_to_fp8.cu` — `constexpr int BX = 32, BY = 8;`, the W8A8 tile.
@@ -643,56 +535,40 @@ pub fn dequant_int32_w8a8_to_bf16(
         [n.unsigned_abs().div_ceil(W8A8_BX), m.unsigned_abs().div_ceil(W8A8_BY), 1],
         [W8A8_BX, W8A8_BY, 1],
     );
-    // SAFETY: `call()`'s contract — every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "quant/quant_bf16_to_fp8.cuh",
-            "::pie::quant::w8a8_dequant",
-            launch,
-            &[acc.ptr.arg(), act_scale_inv.ptr.arg(), w_scale_inv.ptr.arg(), out.ptr.arg(), m.arg(), n.arg()],
-        )
-    }
+    ctx.fire(Fire::at("quant/quant_bf16_to_fp8.cuh", "::pie::quant::w8a8_dequant").apply(launch), &[acc.arg(), act_scale_inv.arg(), w_scale_inv.arg(), out.arg(), m.arg(), n.arg()])
 }
 
 /// Blockwise (per-token-group) FP8 E4M3 activation quantisation — the
+///
+/// Staging four — see [`quantize_bf16_to_int8_per_channel`]. `m` is a token
+/// count, still unbindable: the caller is a matmul body, not a fire.
+///
 /// # Safety
 /// `act_bf16` addresses `m * k` live bf16, `act_fp8` as many writable bytes,
 /// `act_scale` `m * ceil(k / group_size)` writable f32.
-#[kernels_macros::routine]
-pub fn quantize_bf16_to_fp8_e4m3_per_token_group(
-    ctx: &Ctx,
-    act_bf16: In<0, bf16>,
-    act_fp8: Out<0, u8>,
-    act_scale: Out<1, f32>,
-    // Staging four — see [`quantize_bf16_to_int8_per_channel`]. `m` is a
-    // token count, still unbindable: the caller is a matmul body, not a fire.
+pub unsafe fn quantize_bf16_to_fp8_e4m3_per_token_group(
+    ctx: &Ctx<'_>,
+    act_bf16: *const bf16,
+    act_fp8: *mut u8,
+    act_scale: *mut f32,
     m: i32,
     k: i32,
-    group_size: i32,
-) -> Result<(), Refusal> {
+    group_size: i32) -> Result<(), Refusal> {
     /// `quant_bf16_to_fp8.cu` — the blockwise FP8 quantiser's `128`.
-           const GROUP_QUANT_BLOCK: u32 = 128;
+    const GROUP_QUANT_BLOCK: u32 = 128;
 
     let n_groups = (k + group_size - 1) / group_size;
     let launch =
         Launch::grid([n_groups.unsigned_abs(), m.unsigned_abs(), 1], [GROUP_QUANT_BLOCK, 1, 1]);
-    // SAFETY: `call()`'s contract — every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "quant/quant_bf16_to_fp8.cuh",
-            "::pie::quant::quant_act_fp8_per_group",
-            launch,
-            &[
-                act_bf16.ptr.arg(),
-                act_fp8.ptr.arg(),
-                act_scale.ptr.arg(),
+    ctx.fire(Fire::at("quant/quant_bf16_to_fp8.cuh", "::pie::quant::quant_act_fp8_per_group").apply(launch), &[
+                act_bf16.arg(),
+                act_fp8.arg(),
+                act_scale.arg(),
                 m.arg(),
                 k.arg(),
                 group_size.arg(),
                 n_groups.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `dequant_fp4.cu` — `dim3(routes, ceil(width / 16))`.
@@ -770,39 +646,46 @@ fn wna16_axis(what: &'static str, axis: i32, group_size: i32) -> Result<(), Refu
 /// `act`/`topk_idx` address their `.rows * .width` extents (fp16, `int32`);
 /// the four banks one device pointer per expert; `gate_out`/`up_out` each
 /// `gate_out.rows * gate_out.width` writable bf16 elements.
-#[allow(clippy::too_many_arguments)]
-#[kernels_macros::routine]
+#[routine]
 pub fn mxfp4_moe_gate_up_decode_bf16(
-    ctx: &Ctx,
-    // Inverted: the statement places `vec![experts.id, x.id]`, so `act` is
-    // `In(1)` and `topk_idx` `In(0)` — `In(0)` here would compile and bind
-    // the index run where the activation belongs.
-    act: In<1, f16>,
-    topk_idx: In<0, i32>,
-    // `Bank<0, _>`, not `Weight<0, _>`: both compile, but `Weight` derives
-    // `WeightNamed` (`spec.weight`), a different table than this positional
-    // bank at `args[n_in + n_out]`.
-    packed_ptrs: Bank<0, *const u8>,
-    // The bank's other three planes, not separate operands: the driver
-    // resolves `_scales`/`_gate_bias`/`_up_bias` off the one named bank by
-    // suffix. `Env<keys::WeightScales>` names this one.
-    scale_ptrs: Env<keys::WeightScales>,
-    // Always `Env`, never bound: whether either bias plane exists is a
-    // property of which gpt-oss export loaded — no CUDA statement observes
-    // the tensor inventory — so an absent plane binds null instead of refusing.
-    gate_bias_ptrs: Env<*const *const c_void>,
-    up_bias_ptrs: Env<*const *const c_void>,
+    ctx: &Ctx<'_>,
+    // THE ORDER IS THE SLOT. The statement places `vec![experts.id, x.id]`,
+    // so the index run is operand 0 and the activation operand 1 — and the
+    // mark's POSITION is what says so now, where `In<1, _>`/`In<0, _>` used
+    // to say it against the declaration order. Swapping these two lines binds
+    // the index run where the activation belongs, and compiles.
+    topk_idx: In<Tensor<i32>>,
+    act: In<Tensor<f16>>,
+    // The one bank the statement names. `Const<Tensor<_>>` derives the chain
+    // `Or(Named("weight"), Slot(Weight, 0))` — the named bank first and the
+    // positional one after.
+    packed_ptrs: Const<Tensor<u8>>,
     // `gate_out.width` is the fanned-out result row that `per_route` divides.
-    gate_out: Out<0, bf16>,
-    up_out: Out<1, bf16>,
-    // gpt-oss's clamp and SwiGLU alpha, both `Source::Named` facts
-    // (`keys::GluLimit`, `keys::GluAlpha`) computed the same way by
-    // `mlp::gpt_oss_glu`. Adjacent same-typed f32s — a swap compiles.
-    glu_limit: Env<keys::GluLimit>,
-    glu_alpha: Env<keys::GluAlpha>,
-) -> Result<(), Refusal> {
+    gate_out: Out<Tensor<bf16>>,
+    up_out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: every one of these was `Env<keys::_>` before the
+    // four marks, and no builder ever began stating them. A `Const` mark
+    // PROMISES the statement carries the number at its slot in the params
+    // run; where nothing states one the promise is broken at the fire, not
+    // at the type. See `.wiki/migration.md` §11.20.
+    let glu_limit = ctx.ask::<f32, keys::GluLimit>()?;
+    let glu_alpha = ctx.ask::<f32, keys::GluAlpha>()?;
+
     // The fanout is `topk_idx`'s own rectangle: the index run is
     // `[Tokens, Const(top_k)]`, one `i32` per (token, route).
+    // THE BANK'S OTHER THREE PLANES, ASKED FOR RATHER THAN PLACED. The driver
+    // resolves `_scales`/`_gate_bias`/`_up_bias` off the ONE named bank by
+    // suffix, so no statement places them and none ever did (they were
+    // `Env<keys::WeightScales>` and two nulls). A `Const<Tensor<_>>` here
+    // would derive `Or(Named("weight2"), Slot(Weight, 1))` — `spec.weight2`,
+    // a different fact — and would also make the statement one weight short.
+    //
+    // Whether either bias plane exists is a property of which gpt-oss export
+    // loaded; no CUDA statement observes the tensor inventory, so an absent
+    // plane binds null instead of refusing.
+    let scale_ptrs = ctx.ask::<*const u8, keys::WeightScales>()?;
+    let gate_bias_ptrs = ctx.absent()?;
+    let up_bias_ptrs = ctx.absent()?;
     let top_k = topk_idx.width;
     let intermediate = per_route(gate_out.width, top_k)?;
     let routes = routes_of(topk_idx.rows, top_k)?;
@@ -811,21 +694,15 @@ pub fn mxfp4_moe_gate_up_decode_bf16(
     // `gate_out.width` are already refused before a view could fire `Absent`.
     let x = act.all("hidden")?;
     let launch = routed_qmv_quad(routes, intermediate.unsigned_abs());
-    // SAFETY: `call()`'s contract — every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "quant/dequant_fp4.cuh",
-            "::pie::quant::mxfp4_moe_gate_up_decode<::pie::i32(4)>",
-            launch,
-            &[
+    ctx.fire(Fire::at("quant/dequant_fp4.cuh", "::pie::quant::mxfp4_moe_gate_up_decode<::pie::i32(4)>").apply(launch), &[
                 x.ptr.arg(),
-                topk_idx.ptr.arg(),
-                packed_ptrs.ptr.arg(),
+                topk_idx.arg(),
+                packed_ptrs.arg(),
                 scale_ptrs.arg(),
-                gate_bias_ptrs.arg(),
-                up_bias_ptrs.arg(),
-                gate_out.ptr.arg(),
-                up_out.ptr.arg(),
+                gate_bias_ptrs,
+                up_bias_ptrs,
+                gate_out.arg(),
+                up_out.arg(),
                 // The optional fp16 side-output: the kernel writes it when
                 // non-null, and no caller wants it.
                 Option::<NonNull<f16>>::None.arg(),
@@ -835,34 +712,31 @@ pub fn mxfp4_moe_gate_up_decode_bf16(
                 // A pitch: `dequant_fp4.cuh` also reads it as the expert
                 // row's word count (`words_per_row = hidden / 8`) — a
                 // `Bank` has no width of its own to carry that separately.
-                x.stride.0.arg(),
+                x.stride.arg(),
                 intermediate.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// gpt-oss's routed down projection, decode-shaped —
 /// # Safety
 /// As [`mxfp4_moe_gate_up_decode_bf16`], with `act` addressing the routed
 /// extent (`act.rows * act.width`) and `out` `out.rows * out.width` writable bf16.
-#[allow(clippy::too_many_arguments)]
-#[kernels_macros::routine]
+#[routine]
 pub fn mxfp4_moe_down_decode_bf16(
-    ctx: &Ctx,
-    // [`mxfp4_moe_gate_up_decode_bf16`]'s three pointer bindings and
-    // reasons: `act`/`topk_idx` inverted, `packed_ptrs` a positional `Bank`.
-    act: In<1, f16>,
-    topk_idx: In<0, i32>,
-    packed_ptrs: Bank<0, *const u8>,
-    // The `_scales` plane of the one stated bank — `keys::WeightScales`, as its twin names it.
-    scale_ptrs: Env<keys::WeightScales>,
-    // The bank's `_bias` plane — `keys::WeightBias`, not `keys::NamedWeight2`
-    // (`spec.weight2`, a different fact this driver has). `Unstated`, not
-    // null: every gpt-oss export publishes `{down}_bias`.
-    bias_ptrs: Env<keys::WeightBias>,
-    out: Out<0, bf16>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    // [`mxfp4_moe_gate_up_decode_bf16`]'s bindings and reasons: the index run
+    // is operand 0 and the activation operand 1, and `packed_ptrs` is the one
+    // bank the statement names.
+    topk_idx: In<Tensor<i32>>,
+    act: In<Tensor<f16>>,
+    packed_ptrs: Const<Tensor<u8>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    // The `_scales` and `_bias` planes of the one stated bank, asked for as
+    // its twin asks — see [`mxfp4_moe_gate_up_decode_bf16`]. `keys::WeightBias`,
+    // not `keys::NamedWeight2` (`spec.weight2`, a different fact this driver
+    // has); every gpt-oss export publishes `{down}_bias`.
+    let scale_ptrs = ctx.ask::<*const u8, keys::WeightScales>()?;
+    let bias_ptrs = ctx.ask::<*const u8, keys::WeightBias>()?;
     // `top_k` off `topk_idx`, not `act` — this family states
     // `vec![experts.id, x.id]`, so the index run is operand zero.
     let top_k = topk_idx.width;
@@ -874,24 +748,16 @@ pub fn mxfp4_moe_down_decode_bf16(
     // a region's token pitch — using that would multiply every address by
     // `top_k`. The fanned-out row is a reshape `Region` can't express yet.
     let launch = routed_qmv_quad(routes, hidden.unsigned_abs());
-    // SAFETY: `call()`'s contract — every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "quant/dequant_fp4.cuh",
-            "::pie::quant::mxfp4_moe_down_decode<::pie::i32(4)>",
-            launch,
-            &[
-                act.ptr.arg(),
-                topk_idx.ptr.arg(),
-                packed_ptrs.ptr.arg(),
+    ctx.fire(Fire::at("quant/dequant_fp4.cuh", "::pie::quant::mxfp4_moe_down_decode<::pie::i32(4)>").apply(launch), &[
+                act.arg(),
+                topk_idx.arg(),
+                packed_ptrs.arg(),
                 scale_ptrs.arg(),
                 bias_ptrs.arg(),
-                out.ptr.arg(),
+                out.arg(),
                 hidden.arg(),
                 intermediate.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// The routed W4A16 gate and up projections, decode-shaped —
@@ -899,32 +765,31 @@ pub fn mxfp4_moe_down_decode_bf16(
 /// `act`/`topk_idx` address their `.rows * .width` extents (fp16, `int32`);
 /// the four banks one device pointer per expert; `gate_out`/`up_out` each
 /// `gate_out.rows * topk_idx.width * gate_out.width` writable bf16 elements.
-#[allow(clippy::too_many_arguments)]
-#[kernels_macros::routine]
+#[routine]
 pub fn wna16_gate_up_decode_bf16(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     // Reversed from the MXFP4 pair: here operand 0 is `act` (`hidden`) and
     // operand 1 is `topk_idx` (`top_k`) — not a transcription slip, the
     // statement really places them the other way round.
-    act: In<0, f16>,
-    topk_idx: In<1, i32>,
+    act: In<Tensor<f16>>,
+    topk_idx: In<Tensor<i32>>,
     // Four positional banks (`args[n_in + n_out]`), read via `Bank<N, _>`;
     // `Weight<N, _>` would compile too but derive `WeightNamed`, a
     // different table, silently.
-    gate_packed_ptrs: Bank<0, *const i32>,
-    gate_scale_ptrs: Bank<1, *const c_void>,
-    up_packed_ptrs: Bank<2, *const i32>,
-    up_scale_ptrs: Bank<3, *const c_void>,
+    gate_packed_ptrs: Const<Tensor<i32>>,
+    gate_scale_ptrs: Const<Tensor<c_void>>,
+    up_packed_ptrs: Const<Tensor<i32>>,
+    up_scale_ptrs: Const<Tensor<c_void>>,
     // `gate_out.width` is already per-route here, unlike the mxfp4 pair's
     // (`[Tokens, top_k, intermediate]`, undone by `per_route`): this states
     // `[Tokens, intermediate]` directly, so no `per_route` appears below.
-    gate_out: Out<0, bf16>,
-    up_out: Out<1, bf16>,
-    // Unbound: a packed weight's checkpoint property, not a launch shape.
-    // Also why this symbol never fires: `Fire::wna16_group_size` answers
-    // `None` unconditionally, so the arm refuses every fire that reaches it.
-    group_size: i32,
-) -> Result<(), Refusal> {
+    gate_out: Out<Tensor<bf16>>,
+    up_out: Out<Tensor<bf16>>,
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<i32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
+    group_size: i32) -> Result<(), Refusal> {
     let top_k = topk_idx.width;
     let routes = routes_of(topk_idx.rows, top_k)?;
     wna16_axis("hidden", act.width, group_size)?;
@@ -938,57 +803,49 @@ pub fn wna16_gate_up_decode_bf16(
     let x = act.all("hidden")?;
     let gate = gate_out.all("the routed row")?;
     let launch = routed_qmv(routes, gate.width.unsigned_abs());
-    // SAFETY: `call()`'s contract — every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "quant/dequant_wna16.cuh",
-            "::pie::quant::wna16_gate_up_decode<::pie::i32(0)>",
-            launch,
-            &[
+    ctx.fire(Fire::at("quant/dequant_wna16.cuh", "::pie::quant::wna16_gate_up_decode<::pie::i32(0)>").apply(launch), &[
                 x.ptr.arg(),
-                topk_idx.ptr.arg(),
-                gate_packed_ptrs.ptr.arg(),
-                gate_scale_ptrs.ptr.arg(),
-                up_packed_ptrs.ptr.arg(),
-                up_scale_ptrs.ptr.arg(),
+                topk_idx.arg(),
+                gate_packed_ptrs.arg(),
+                gate_scale_ptrs.arg(),
+                up_packed_ptrs.arg(),
+                up_scale_ptrs.arg(),
                 gate.ptr.arg(),
-                up_out.ptr.arg(),
+                up_out.arg(),
                 top_k.arg(),
                 // Two pitches: `x.stride.0` advances a token row,
                 // `gate.stride.0` a route — `gate_out`'s width is already
                 // per-route, so there's no `per_route` division to undo.
-                x.stride.0.arg(),
-                gate.stride.0.arg(),
+                x.stride.arg(),
+                gate.stride.arg(),
                 group_size.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// The routed W4A16 down projection, decode-shaped —
 /// # Safety
 /// As [`wna16_gate_up_decode_bf16`], with `act` addressing `act.rows *
 /// act.width` fp16 elements and `out` `out.rows * out.width` writable bf16.
-#[allow(clippy::too_many_arguments)]
-#[kernels_macros::routine]
+#[routine]
 pub fn wna16_down_decode_bf16(
-    ctx: &Ctx,
-    // [`wna16_gate_up_decode_bf16`]'s operand order, unchanged: same
+    ctx: &Ctx<'_>,
+    // [`wna16_gate_up_decode_bf16`]'s operand order, unchanged: Env<same, keys::Unstated>
     // statement shape, so `act`/`topk_idx` invert the same way.
-    act: In<0, f16>,
-    topk_idx: In<1, i32>,
-    // [`wna16_gate_up_decode_bf16`]'s four, halved: one bank and its
+    act: In<Tensor<f16>>,
+    topk_idx: In<Tensor<i32>>,
+    // [`wna16_gate_up_decode_bf16`]'s four, halved: Env<one bank and its, keys::Unstated>
     // scales, positional `Bank`s for the same reason `Weight<0, _>` would
     // silently read a different table.
-    down_packed_ptrs: Bank<0, *const i32>,
-    down_scale_ptrs: Bank<1, *const c_void>,
+    down_packed_ptrs: Const<Tensor<i32>>,
+    down_scale_ptrs: Const<Tensor<c_void>>,
     // The down leg swaps which side each width comes from: `hidden` is the
     // result's (`out.width`) and `intermediate` the activation's.
-    out: Out<0, bf16>,
-    // Unbound and fatal, exactly as the gate/up leg's: a packed weight's
-    // checkpoint property that `Fire::wna16_group_size` never supplies.
-    group_size: i32,
-) -> Result<(), Refusal> {
+    out: Out<Tensor<bf16>>,
+    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
+    // `Env<i32, keys::Unstated>`, a mark that claimed no source at
+    // all; `#[unbound]` is that sentence without the fake key.
+    #[unbound]
+    group_size: i32) -> Result<(), Refusal> {
     /// `dequant_wna16.cu` — [`routed_qmv`]'s two axes swapped.
     const fn routed_qmv_transposed(routes: u32, width: u32) -> Launch {
         Launch::grid([width.div_ceil(BLOCK / WARP), routes, 1], [BLOCK, 1, 1])
@@ -1005,147 +862,88 @@ pub fn wna16_down_decode_bf16(
     let x = act.all("intermediate")?;
     let y = out.all("the routed row")?;
     let launch = routed_qmv_transposed(routes, y.width.unsigned_abs());
-    // SAFETY: `call()`'s contract — every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "quant/dequant_wna16.cuh",
-            "::pie::quant::wna16_down_decode<::pie::i32(0)>",
-            launch,
-            &[
+    ctx.fire(Fire::at("quant/dequant_wna16.cuh", "::pie::quant::wna16_down_decode<::pie::i32(0)>").apply(launch), &[
                 x.ptr.arg(),
-                topk_idx.ptr.arg(),
-                down_packed_ptrs.ptr.arg(),
-                down_scale_ptrs.ptr.arg(),
+                topk_idx.arg(),
+                down_packed_ptrs.arg(),
+                down_scale_ptrs.arg(),
                 y.ptr.arg(),
                 top_k.arg(),
                 // The gate/up leg's two pitches with the sides swapped:
                 // here both regions are strided by the route, and the
                 // result's width is the `hidden` the transposed grid covers.
-                y.stride.0.arg(),
-                x.stride.0.arg(),
+                y.stride.arg(),
+                x.stride.arg(),
                 group_size.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 // The derived operand column: every `pub fn` below carries
-// `#[kernels_macros::routine]`, emitting a `&[kernels::Derived]` naming each
+// `#[routine]`, emitting a `&[kernels::Derived]` naming each
 // parameter's source. These `assert!`s pin what it derives today — a
 // `const` can't be a test, so a derivation change stops this compiling.
 const _: () = {
     assert!(<scale_rows as ::kernels::Derivation>::DERIVED.len() == 2);
-    assert!(matches!(<scale_rows as ::kernels::Derivation>::DERIVED[0].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(matches!(<scale_rows as ::kernels::Derivation>::DERIVED[1].source, Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(scale_rows::<bf16>)[0], Some(kernels::Source::Alias(0, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(scale_rows::<bf16>)[1], Some(kernels::Source::Slot(kernels::Kind::In, 1))));
 
-    assert!(<mxfp4_moe_gate_up_decode_bf16 as ::kernels::Derivation>::DERIVED.len() == 10);
-    assert!(matches!(<mxfp4_moe_gate_up_decode_bf16 as ::kernels::Derivation>::DERIVED[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 1))));
-    // `stated` blocks a binder from "correcting" this index to a guess.
-    assert!(<mxfp4_moe_gate_up_decode_bf16 as ::kernels::Derivation>::DERIVED[0].stated);
-    assert!(matches!(<mxfp4_moe_gate_up_decode_bf16 as ::kernels::Derivation>::DERIVED[1].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(<mxfp4_moe_gate_up_decode_bf16 as ::kernels::Derivation>::DERIVED[2].source, Some(kernels::Source::Slot(kernels::Kind::Weight, 0))));
-    // The scales plane: swapping in `WeightUpBias` here would compile and
-    // bind a plane that is usually absent.
-    assert!(kernels::source_is_named(
-        &<mxfp4_moe_gate_up_decode_bf16 as ::kernels::Derivation>::DERIVED[3].source,
-        <kernels::keys::WeightScales as kernels::keys::Fact>::KEY
-    ));
-    // The nulled bias planes: `Unstated`, not a gap — their existence is a
-    // property of which gpt-oss export loaded, which no statement observes.
-    assert!(!<mxfp4_moe_gate_up_decode_bf16 as ::kernels::Derivation>::DERIVED[4].nullable);
-    assert!(<mxfp4_moe_gate_up_decode_bf16 as ::kernels::Derivation>::DERIVED[4].source.is_none());
-    assert!(<mxfp4_moe_gate_up_decode_bf16 as ::kernels::Derivation>::DERIVED[5].source.is_none());
-    // The two GLU constants, pinned apart: adjacent same-shaped `f32`s, so a
-    // swap would be invisible to both the type system and this length.
-    assert!(kernels::source_is_named(
-        &<mxfp4_moe_gate_up_decode_bf16 as ::kernels::Derivation>::DERIVED[8].source,
-        <kernels::keys::GluLimit as kernels::keys::Fact>::KEY
-    ));
-    assert!(kernels::source_is_named(
-        &<mxfp4_moe_gate_up_decode_bf16 as ::kernels::Derivation>::DERIVED[9].source,
-        <kernels::keys::GluAlpha as kernels::keys::Fact>::KEY
-    ));
+    // SIX, NOT TEN: the bank's `_scales`/`_gate_bias`/`_up_bias` planes are
+    // asked for in the body, not placed by the statement. `[0]` is the INDEX
+    // run and `[1]` the activation — this family states `vec![experts.id,
+    // x.id]`, so the order of these two lines is the binding.
+    assert!(<mxfp4_moe_gate_up_decode_bf16 as ::kernels::Derivation>::DERIVED.len() == 5);
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(mxfp4_moe_gate_up_decode_bf16)[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(mxfp4_moe_gate_up_decode_bf16)[1], Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(mxfp4_moe_gate_up_decode_bf16)[2], Some(kernels::Source::Or(kernels::Source::Named(_), kernels::Source::Slot(kernels::Kind::Weight, 0)))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(mxfp4_moe_gate_up_decode_bf16)[3], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    // The two GLU constants are ASKED for now, so nothing follows the second
+    // result in this column.
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(mxfp4_moe_gate_up_decode_bf16)[4], Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
 
-    // `scale_ptrs`/`bias_ptrs`, pinned apart: two suffixes off one bank,
-    // adjacent slots, same pointer type — a swap a length check would miss.
-    assert!(<mxfp4_moe_down_decode_bf16 as ::kernels::Derivation>::DERIVED.len() == 6);
-    assert!(matches!(<mxfp4_moe_down_decode_bf16 as ::kernels::Derivation>::DERIVED[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 1))));
-    assert!(matches!(<mxfp4_moe_down_decode_bf16 as ::kernels::Derivation>::DERIVED[1].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(<mxfp4_moe_down_decode_bf16 as ::kernels::Derivation>::DERIVED[2].source, Some(kernels::Source::Slot(kernels::Kind::Weight, 0))));
-    assert!(kernels::source_is_named(
-        &<mxfp4_moe_down_decode_bf16 as ::kernels::Derivation>::DERIVED[3].source,
-        <kernels::keys::WeightScales as kernels::keys::Fact>::KEY
-    ));
-    assert!(kernels::source_is_named(
-        &<mxfp4_moe_down_decode_bf16 as ::kernels::Derivation>::DERIVED[4].source,
-        <kernels::keys::WeightBias as kernels::keys::Fact>::KEY
-    ));
-    assert!(matches!(<mxfp4_moe_down_decode_bf16 as ::kernels::Derivation>::DERIVED[5].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    // The down leg's mirror, four marks: index, activation, the one bank and
+    // the result. Its `_scales` and `_bias` planes are asked for too.
+    assert!(<mxfp4_moe_down_decode_bf16 as ::kernels::Derivation>::DERIVED.len() == 4);
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(mxfp4_moe_down_decode_bf16)[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(mxfp4_moe_down_decode_bf16)[1], Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(mxfp4_moe_down_decode_bf16)[2], Some(kernels::Source::Or(kernels::Source::Named(_), kernels::Source::Slot(kernels::Kind::Weight, 0)))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(mxfp4_moe_down_decode_bf16)[3], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
 
     // The mirror's load-bearing record: `[0]`/`[1]` are `In(0)`/`In(1)` here,
     // the opposite twenty lines up — only these four lines catch a reorder.
     assert!(<wna16_gate_up_decode_bf16 as ::kernels::Derivation>::DERIVED.len() == 9);
-    assert!(matches!(<wna16_gate_up_decode_bf16 as ::kernels::Derivation>::DERIVED[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(<wna16_gate_up_decode_bf16 as ::kernels::Derivation>::DERIVED[0].stated);
-    assert!(matches!(<wna16_gate_up_decode_bf16 as ::kernels::Derivation>::DERIVED[1].source, Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(wna16_gate_up_decode_bf16)[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(wna16_gate_up_decode_bf16)[1], Some(kernels::Source::Slot(kernels::Kind::In, 1))));
     // The positional bank, not `Facts::weight_named`.
-    assert!(matches!(<wna16_gate_up_decode_bf16 as ::kernels::Derivation>::DERIVED[5].source, Some(kernels::Source::Slot(kernels::Kind::Weight, 3))));
-    assert!(matches!(<wna16_gate_up_decode_bf16 as ::kernels::Derivation>::DERIVED[6].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(matches!(<wna16_gate_up_decode_bf16 as ::kernels::Derivation>::DERIVED[7].source, Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(wna16_gate_up_decode_bf16)[5], Some(kernels::Source::Slot(kernels::Kind::Weight, 3))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(wna16_gate_up_decode_bf16)[6], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(wna16_gate_up_decode_bf16)[7], Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
 
     // The down leg's `[0]`/`[1]` follow its gate/up twin, not the MXFP4
     // pair — the direction a reader is likeliest to guess backwards.
     assert!(<wna16_down_decode_bf16 as ::kernels::Derivation>::DERIVED.len() == 6);
-    assert!(matches!(<wna16_down_decode_bf16 as ::kernels::Derivation>::DERIVED[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(<wna16_down_decode_bf16 as ::kernels::Derivation>::DERIVED[1].source, Some(kernels::Source::Slot(kernels::Kind::In, 1))));
-    assert!(matches!(<wna16_down_decode_bf16 as ::kernels::Derivation>::DERIVED[4].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(wna16_down_decode_bf16)[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(wna16_down_decode_bf16)[1], Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(wna16_down_decode_bf16)[4], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
 
     // The weight's own shape rides `params[1..3]`, `group_size` `params[0]`.
     assert!(<dequant_wna16_int4b8_to as ::kernels::Derivation>::DERIVED.len() == 6);
-    assert!(matches!(<dequant_wna16_int4b8_to as ::kernels::Derivation>::DERIVED[2].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(matches!(<dequant_wna16_int4b8_to as ::kernels::Derivation>::DERIVED[3].source, Some(kernels::Source::Slot(kernels::Kind::Param, 1))));
-    assert!(matches!(<dequant_wna16_int4b8_to as ::kernels::Derivation>::DERIVED[4].source, Some(kernels::Source::Slot(kernels::Kind::Param, 2))));
-    assert!(matches!(<dequant_wna16_int4b8_to as ::kernels::Derivation>::DERIVED[5].source, Some(kernels::Source::Slot(kernels::Kind::Param, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(dequant_wna16_int4b8_to::<bf16>)[2], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(dequant_wna16_int4b8_to::<bf16>)[3], Some(kernels::Source::Slot(kernels::Kind::Param, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(dequant_wna16_int4b8_to::<bf16>)[4], Some(kernels::Source::Slot(kernels::Kind::Param, 1))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(dequant_wna16_int4b8_to::<bf16>)[5], Some(kernels::Source::Slot(kernels::Kind::Param, 2))));
 
     // The weight walkers, pinned `None` on purpose: the arm passes
     // `cx.rows().count` for a checkpoint's output-channel count, so copying
     // the arm to "fix" the column means deleting this line first.
     assert!(<dequant_fp8_e4m3_to_bf16_per_channel as ::kernels::Derivation>::DERIVED.len() == 5);
-    assert!(matches!(<dequant_fp8_e4m3_to_bf16_per_channel as ::kernels::Derivation>::DERIVED[3].source, Some(kernels::Source::Slot(kernels::Kind::Param, 1))));
-    assert!(matches!(<dequant_fp8_e4m3_to_bf16_per_channel as ::kernels::Derivation>::DERIVED[4].source, Some(kernels::Source::Slot(kernels::Kind::Param, 2))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(dequant_fp8_e4m3_to_bf16_per_channel)[3], Some(kernels::Source::Slot(kernels::Kind::Param, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(dequant_fp8_e4m3_to_bf16_per_channel)[4], Some(kernels::Source::Slot(kernels::Kind::Param, 1))));
 };
 
-/// This family's routines, and what a trace may say about each: none
-/// carries `whole`, `in_place` or `depth_prefix_plan` — a family of pure
-/// element-for-element conversions states nothing extra.
-pub static ROUTINES: &[Routine] = &[
-    routine!(cast_fp32_to_bf16 = cast_fp32_to::<bf16>, ),
-    routine!(scale_rows_bf16 = scale_rows::<bf16>, ),
-    routine!(bf16_to_fp16, ),
-    routine!(dequant_fp8_e4m3_to_bf16 = dequant_fp8_e4m3_to::<bf16>, ),
-    routine!(dequant_fp8_e4m3_to_bf16_per_channel, ),
-    routine!(dequant_fp8_e4m3_to_bf16_per_group, ),
-    routine!(dequant_mxfp4_to_bf16 = dequant_mxfp4_to::<bf16>, ),
-    routine!(dequant_wna16_int4b8_to_bf16 = dequant_wna16_int4b8_to::<bf16>, ),
-    routine!(mxfp4_scales_to_marlin_e8m0, ),
-    routine!(quantize_bf16_to_mxfp4_e2m1_per_block, ),
-    routine!(quantize_bf16_to_fp8_e4m3_per_channel, ),
-    routine!(quantize_bf16_to_int8_per_channel, ),
-    routine!(dequant_int8_to_bf16_per_channel, ),
-    routine!(dequant_int32_w8a8_to_bf16, ),
-    routine!(quantize_bf16_to_fp8_e4m3_per_token_group, ),
-    routine!(mxfp4_moe_gate_up_decode_bf16, ),
-    routine!(mxfp4_moe_down_decode_bf16, ),
-    routine!(wna16_gate_up_decode_bf16, ),
-    routine!(wna16_down_decode_bf16, ),
-];
-
-/// `quant`, as a trace names it.
-pub static FAMILY: Family = crate::family!(ROUTINES);
 
 #[cfg(test)]
 mod tests {
-    use super::{Ctx, In, Out, Refusal, scale_rows};
+    use super::{Ctx, In, InOut, Refusal, scale_rows};
     use crate::jit::abi::bf16;
 
     /// A degenerate extent is refused, and a negative one is too.
@@ -1162,14 +960,14 @@ mod tests {
         let l = std::ptr::null::<bf16>();
         for rows in [0, -1, -4, i32::MIN] {
             assert_eq!(
-                scale_rows(&ctx, Out { ptr: buf, rows, width: 128 }, In { ptr: l, rows: 0, width: 0 }),
+                scale_rows::<bf16>(&ctx, InOut { ptr: buf, rows, width: 128 }, In { ptr: l, rows: 0, width: 0 }),
                 Err(Refusal::Empty { what: "rows" }),
                 "rows {rows} must refuse"
             );
         }
         for width in [0, -1, -128, i32::MIN] {
             assert_eq!(
-                scale_rows(&ctx, Out { ptr: buf, rows: 4, width }, In { ptr: l, rows: 0, width: 0 }),
+                scale_rows::<bf16>(&ctx, InOut { ptr: buf, rows: 4, width }, In { ptr: l, rows: 0, width: 0 }),
                 Err(Refusal::Empty { what: "width" }),
                 "width {width} must refuse"
             );
@@ -1180,54 +978,62 @@ mod tests {
 // `dequant_fp8_e4m3_to_bf16_per_group`'s three marked parameters, pinned to
 // the sources the arm used to bind by hand.
 const _: () = {
-    let d = <dequant_fp8_e4m3_to_bf16_per_group as kernels::Derivation>::DERIVED;
-    assert!(d.len() == 6);
-    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(matches!(d[2].source, Some(kernels::Source::Slot(kernels::Kind::In, 1))));
-    assert!(matches!(d[3].source, Some(kernels::Source::Named(_))));
-    assert!(matches!(d[4].source, Some(kernels::Source::Slot(kernels::Kind::OutWidth, 0))));
-    assert!(matches!(d[5].source, Some(kernels::Source::Slot(kernels::Kind::Param, 0))));
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dequant_fp8_e4m3_to_bf16_per_group);
+    assert!(d.len() == 4);
+    assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(d[2], Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    assert!(matches!(d[3], Some(kernels::Source::Slot(kernels::Kind::Param, 0))));
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
 };
 
 // The weight's shape rides `params[1..3]`; `params[0]` is the per-tensor
 // scale, read as f32, so the two channels do not collide.
 const _: () = {
-    let d = <dequant_fp8_e4m3_to as kernels::Derivation>::DERIVED;
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dequant_fp8_e4m3_to::<bf16>);
     assert!(d.len() == 5);
-    assert!(matches!(d[2].source, Some(kernels::Source::Slot(kernels::Kind::ParamF32, 0))));
-    assert!(matches!(d[3].source, Some(kernels::Source::Slot(kernels::Kind::Param, 1))));
-    assert!(matches!(d[4].source, Some(kernels::Source::Slot(kernels::Kind::Param, 2))));
+    assert!(matches!(d[2], Some(kernels::Source::Slot(kernels::Kind::ParamF32, 0))));
+    assert!(matches!(d[3], Some(kernels::Source::Slot(kernels::Kind::Param, 1))));
+    assert!(matches!(d[4], Some(kernels::Source::Slot(kernels::Kind::Param, 2))));
 };
 
 // Seven of the nine scalars are `Param<N, i32>` at specific slots (an
 // off-by-one silently repacks the wrong window); the other two (`d[4]`,
 // `d[9]`) are `None` — a weight's own shape. `raw`/`out` stay `In(0)`/`Out(0)`.
 const _: () = {
-    let d = <mxfp4_scales_to_marlin_e8m0 as kernels::Derivation>::DERIVED;
-    assert!(d.len() == 11);
-    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(mxfp4_scales_to_marlin_e8m0);
+    assert!(d.len() == 9);
+    assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
     // One assert per slot (a `const` can't loop); the slot number is the
     // only record of which `params[]` entry each scalar came from.
-    assert!(matches!(d[2].source, Some(kernels::Source::Slot(kernels::Kind::Param, 0))));
-    assert!(matches!(d[3].source, Some(kernels::Source::Slot(kernels::Kind::Param, 1))));
-    assert!(matches!(d[4].source, Some(kernels::Source::Named(_))));
-    assert!(matches!(d[5].source, Some(kernels::Source::Slot(kernels::Kind::Param, 2))));
-    assert!(matches!(d[6].source, Some(kernels::Source::Slot(kernels::Kind::Param, 3))));
-    assert!(matches!(d[7].source, Some(kernels::Source::Slot(kernels::Kind::Param, 4))));
-    assert!(matches!(d[8].source, Some(kernels::Source::Slot(kernels::Kind::Param, 5))));
-    assert!(matches!(d[9].source, Some(kernels::Source::Slot(kernels::Kind::OutWidth, 0))));
-    assert!(matches!(d[10].source, Some(kernels::Source::Slot(kernels::Kind::Param, 6))));
+    assert!(matches!(d[2], Some(kernels::Source::Slot(kernels::Kind::Param, 0))));
+    assert!(matches!(d[3], Some(kernels::Source::Slot(kernels::Kind::Param, 1))));
+    assert!(matches!(d[4], Some(kernels::Source::Slot(kernels::Kind::Param, 2))));
+    assert!(matches!(d[5], Some(kernels::Source::Slot(kernels::Kind::Param, 3))));
+    assert!(matches!(d[6], Some(kernels::Source::Slot(kernels::Kind::Param, 4))));
+    assert!(matches!(d[7], Some(kernels::Source::Slot(kernels::Kind::Param, 5))));
+    assert!(matches!(d[8], Some(kernels::Source::Slot(kernels::Kind::Param, 6))));
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
 };
 
 // The five weight walkers: every slot sourced, so each row derives.
 const _: () = {
     let mut ok = true;
     let mut i = 0;
-    let d = <dequant_wna16_int4b8_to as kernels::Derivation>::DERIVED;
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dequant_wna16_int4b8_to::<bf16>);
     while i < d.len() {
-        if d[i].source.is_none() {
+        if d[i].is_none() {
             ok = false;
         }
         i += 1;

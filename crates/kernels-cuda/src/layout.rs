@@ -5,23 +5,20 @@
 //! and the derived column binds them. The four envelope roots are the
 //! exception: the driver composes their operands while building a wave, so
 //! their host programs live in `crate::driver_internal`.
-#![allow(clippy::too_many_arguments)]
 
-use crate::jit::{Ctx, Family, Launch, Routine, aligned16};
+use kernels::{Bind, Fire};
+use kernels_macros::routine;
+use crate::jit::{Ctx, Launch, aligned16};
 // The one host program declared elsewhere still needs a bare identifier here.
-use crate::driver_internal::split_q_gate_bf16;
-use crate::routine;
-use crate::jit::Abi;
-use crate::jit::abi::Inst;
+use crate::jit::abi::Tensor;
 use crate::jit::abi::bf16;
-use kernels::Env;
 use kernels::Refusal;
 use kernels::Region;
 // `keys` is imported as the module, not the facts inside it: `stated_source`
 // only emits a source when the path's second-to-last segment is `keys`, so
 // `use kernels::keys::Vocab;` would silently derive `None`.
 use kernels::keys;
-use kernels::{In, Out, Unbound, Weight};
+use kernels::routine::{Asks, Const, In, Out};
 
 // The four roots below get no `routine!` line — the driver composes their
 // operands while building a wave, not a statement. They still exist so
@@ -82,13 +79,12 @@ const fn this_family(refusal: Refusal) -> Refusal {
 ///
 /// `src` addresses `n * (left_dim + right_dim)` live bf16 elements; `left`
 /// and `right` `n * left_dim`/`n * right_dim` writable ones.
-#[kernels_macros::routine]
+#[routine]
 pub fn split_bf16_rows(
-    ctx: &Ctx,
-    src: In<0, bf16>,
-    left: Out<0, bf16>,
-    right: Out<1, bf16>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    src: In<Tensor<bf16>>,
+    left: Out<Tensor<bf16>>,
+    right: Out<Tensor<bf16>>) -> Result<(), Refusal> {
     // Views come from the results, not `src`; `all()` also catches a
     // zero-width half that `route_rows`'s `.max(1)` would otherwise hide.
     let left_half = stated(left.all("left_dim or right_dim"))?;
@@ -97,15 +93,7 @@ pub fn split_bf16_rows(
     // Row pitches, not element counts; `.0` reads one back as a plain `i32`.
     let left_dim = left_half.stride;
     let right_dim = right_half.stride;
-    // SAFETY: every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "layout/deinterleave.cuh",
-            "::pie::layout::split_rows<::pie::bf16>",
-            route_rows(n, left_dim.0),
-            &[src.ptr.arg(), left.ptr.arg(), right.ptr.arg(), left_dim.arg(), right_dim.arg()],
-        )
-    }
+    ctx.fire(Fire::at("layout/deinterleave.cuh", "::pie::layout::split_rows<::pie::bf16>").apply(route_rows(n, left_dim.0)), &[src.arg(), left.arg(), right.arg(), left_dim.arg(), right_dim.arg()])
 }
 
 /// `layout::split_qwen_gdn_ba_bf16` — Qwen's GDN bank, split by halves.
@@ -114,32 +102,18 @@ pub fn split_bf16_rows(
 ///
 /// `ba` addresses `n * 2 * v_h` live bf16 elements; `b_out`/`a_out`
 /// `n * v_h` writable ones each.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn split_qwen_gdn_ba<T>(
-    ctx: &Ctx,
-    ba: In<0, T>,
-    b_out: Out<0, T>,
-    a_out: Out<1, T>,
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
-{
+    ctx: &Ctx<'_>,
+    ba: In<Tensor<T>>,
+    b_out: Out<Tensor<T>>,
+    a_out: Out<Tensor<T>>) -> Result<(), Refusal> {
     // One view, off result 0, serves both halves: the kernel strides each by
     // the same `v_h` pitch.
     let half = stated(b_out.all("v_h"))?;
     let n = half.rows;
     let v_h = half.stride;
-    // SAFETY: every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "layout/deinterleave.cuh",
-            &format!("::pie::layout::split_qwen_gdn_ba<{}>", T::CPP),
-            route_rows(n, v_h.0),
-            &[ba.ptr.arg(), b_out.ptr.arg(), a_out.ptr.arg(), v_h.arg()],
-        )
-    }
+    ctx.fire(Fire::at("layout/deinterleave.cuh", crate::jit::symbol(&format!("::pie::layout::split_qwen_gdn_ba<{}>", T::CPP))).apply(route_rows(n, v_h.0)), &[ba.arg(), b_out.arg(), a_out.arg(), v_h.arg()])
 }
 
 /// `layout::deinterleave_rows_bf16` — gpt-oss's parity split, row-shaped.
@@ -148,32 +122,18 @@ where
 ///
 /// `fused` addresses `2 * rows * h` live bf16 elements; `gate_out`/`up_out`
 /// `rows * h` writable ones each.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn deinterleave_rows<T>(
-    ctx: &Ctx,
-    fused: In<0, T>,
-    gate_out: Out<0, T>,
-    up_out: Out<1, T>,
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
-{
+    ctx: &Ctx<'_>,
+    fused: In<Tensor<T>>,
+    gate_out: Out<Tensor<T>>,
+    up_out: Out<Tensor<T>>) -> Result<(), Refusal> {
     // Unstated: shapes come off `gate_out` itself — `h` its row pitch,
     // `rows` its row count.
     let gate = stated(gate_out.all("h"))?;
     let rows = gate.rows;
     let h = gate.stride;
-    // SAFETY: every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "layout/deinterleave.cuh",
-            &format!("::pie::layout::deinterleave_rows<{}>", T::CPP),
-            route_rows(rows, h.0),
-            &[fused.ptr.arg(), gate_out.ptr.arg(), up_out.ptr.arg(), h.arg()],
-        )
-    }
+    ctx.fire(Fire::at("layout/deinterleave.cuh", crate::jit::symbol(&format!("::pie::layout::deinterleave_rows<{}>", T::CPP))).apply(route_rows(rows, h.0)), &[fused.arg(), gate_out.arg(), up_out.arg(), h.arg()])
 }
 
 /// `layout::deinterleave_vec_bf16` — the same split, one thread per element.
@@ -182,18 +142,12 @@ where
 ///
 /// `fused` addresses `2 * i` live bf16 elements; `gate_out`/`up_out` `i`
 /// writable ones each.
-#[kernels_macros::routine]
+#[routine(bf16)]
 pub fn deinterleave_vec<T>(
-    ctx: &Ctx,
-    fused: In<0, T>,
-    gate_out: Out<0, T>,
-    up_out: Out<1, T>,
-) -> Result<(), Refusal>
-where
-    T: Inst + kernels::Elem,
-    *const T: Abi,
-    *mut T: Abi,
-{
+    ctx: &Ctx<'_>,
+    fused: In<Tensor<T>>,
+    gate_out: Out<Tensor<T>>,
+    up_out: Out<Tensor<T>>) -> Result<(), Refusal> {
     // `i` is `rows * width`, saturating (`Region::elements`). `all()` catches
     // a zero width; this catches a zero row count.
     let gate = stated(gate_out.all("i"))?;
@@ -201,15 +155,7 @@ where
     if i <= 0 {
         return Err(Refusal::Empty { what: "i" });
     }
-    // SAFETY: every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "layout/deinterleave.cuh",
-            &format!("::pie::layout::deinterleave_vec<{}>", T::CPP),
-            elementwise(i.unsigned_abs()),
-            &[fused.ptr.arg(), gate_out.ptr.arg(), up_out.ptr.arg(), i.arg()],
-        )
-    }
+    ctx.fire(Fire::at("layout/deinterleave.cuh", crate::jit::symbol(&format!("::pie::layout::deinterleave_vec<{}>", T::CPP))).apply(elementwise(i.unsigned_abs())), &[fused.arg(), gate_out.arg(), up_out.arg(), i.arg()])
 }
 
 /// `layout::concat_bf16_rows` — `[N, left] ++ [N, right]`.
@@ -218,13 +164,12 @@ where
 ///
 /// `left`/`right` address `rows * left_dim`/`rows * right_dim` live bf16
 /// elements; `out` `rows * (left_dim + right_dim)` writable ones.
-#[kernels_macros::routine]
+#[routine]
 pub fn concat_bf16_rows(
-    ctx: &Ctx,
-    left: In<0, bf16>,
-    right: In<1, bf16>,
-    out: Out<0, bf16>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    left: In<Tensor<bf16>>,
+    right: In<Tensor<bf16>>,
+    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
     // Each operand needs its own view: one guard on the summed width would
     // miss a zero-width half (`0 + 512` is still a nonzero 512).
     let left_half = stated(left.all("left_dim or right_dim"))?;
@@ -232,15 +177,7 @@ pub fn concat_bf16_rows(
     let rows = out.rows;
     let left_dim = left_half.stride;
     let right_dim = right_half.stride;
-    // SAFETY: every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "layout/deinterleave.cuh",
-            "::pie::layout::concat_rows<::pie::bf16>",
-            route_rows(rows, left_dim.0),
-            &[left.ptr.arg(), right.ptr.arg(), out.ptr.arg(), left_dim.arg(), right_dim.arg()],
-        )
-    }
+    ctx.fire(Fire::at("layout/deinterleave.cuh", "::pie::layout::concat_rows<::pie::bf16>").apply(route_rows(rows, left_dim.0)), &[left.arg(), right.arg(), out.arg(), left_dim.arg(), right_dim.arg()])
 }
 
 /// `layout::gather_bf16_rows` — the epilogue's gather.
@@ -250,29 +187,19 @@ pub fn concat_bf16_rows(
 /// `src` addresses the rows `row_indices` names at `width` u16 elements
 /// each; `row_indices` `num_dst_rows` live `i32`s; `dst` `num_dst_rows *
 /// width` writable u16 elements.
-#[kernels_macros::routine]
+#[routine]
 pub fn gather_bf16_rows(
-    ctx: &Ctx,
-    src: In<0, u16>,
-    // Environmental — the fire supplies this, not a statement, hence `Env`.
-    row_indices: Env<keys::SamplingIndices>,
-    dst: Out<0, u16>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    src: In<Tensor<u16>>,
+    dst: Out<Tensor<u16>>) -> Result<(), Refusal> {
+    let row_indices = ctx.ask::<*const i32, keys::SamplingIndices>()?;
     // `dst` is the dense side, so its view supplies rows and width; `src`
     // has neither since `row_indices` indexes it. The width is a pitch
     // shared by both, advancing a source row and a destination slot alike.
     let dense = stated(dst.all("width"))?;
     let num_dst_rows = dense.rows;
     let width = dense.stride;
-    // SAFETY: every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "layout/gather_rows.cuh",
-            "::pie::layout::gather_rows<::pie::u16>",
-            route_rows(num_dst_rows, width.0),
-            &[src.ptr.arg(), row_indices.arg(), dst.ptr.arg(), width.arg()],
-        )
-    }
+    ctx.fire(Fire::at("layout/gather_rows.cuh", "::pie::layout::gather_rows<::pie::u16>").apply(route_rows(num_dst_rows, width.0)), &[src.arg(), row_indices.arg(), dst.arg(), width.arg()])
 }
 
 /// `layout::transpose_bf16_nld_to_lnd` — the PLE relay.
@@ -288,45 +215,40 @@ pub fn gather_bf16_rows(
 /// # Safety
 ///
 /// `src`/`dst` address `n * width` live u16 elements, `dst` writable.
-#[kernels_macros::routine]
+#[routine]
 pub fn transpose_bf16_nld_to_lnd(
-    ctx: &Ctx,
-    src: In<0, u16>,
-    dst: Out<0, u16>,
-    // Neither operand carries this: `width` is `layers * dim`, and the
-    // factor split isn't in the rectangle — so `dim` is a checkpoint fact.
-    dim: Env<keys::PleDim>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    src: In<Tensor<u16>>,
+    dst: Out<Tensor<u16>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: every one of these was `Env<keys::_>` before the
+    // four marks, and no builder ever began stating them. A `Const` mark
+    // PROMISES the statement carries the number at its slot in the params
+    // run; where nothing states one the promise is broken at the fire, not
+    // at the type. See `.wiki/migration.md` §11.20.
+    let dim = ctx.ask::<i32, keys::PleDim>()?;
+
     // Off `src`, not `dst`: this transposes, so `dst` is the same elements
     // reordered. `.width`, not `.stride` — no pitch reaches this kernel,
     // which rebuilds addresses from `n`, `layers` and `dim`.
     let source = stated(src.all("width"))?;
     let n = source.rows;
     let width = source.width;
-    // `**dim`: comparison, `%`, `/` and `try_from` don't deref through the
+    // `*dim`: comparison, `%`, `/` and `try_from` don't deref through the
     // wrapper the way a method call does.
-    if **dim <= 0 {
+    if dim <= 0 {
         return Err(Refusal::Empty { what: "ple_dim" });
     }
-    if width % **dim != 0 {
+    if width % dim != 0 {
         return Err(Refusal::Narrow {
             what: "the row is not a whole number of PLE planes",
             at: i64::from(width),
         });
     }
-    let layers = width / **dim;
+    let layers = width / dim;
     let total = usize::try_from(n).unwrap_or(0)
         * usize::try_from(layers).unwrap_or(0)
-        * usize::try_from(**dim).unwrap_or(0);
-    // SAFETY: every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "layout/gather_rows.cuh",
-            "::pie::layout::transpose_nld_to_lnd<::pie::u16>",
-            elementwise(u32::try_from(total).unwrap_or(u32::MAX)),
-            &[src.ptr.arg(), dst.ptr.arg(), n.arg(), layers.arg(), dim.arg(), total.arg()],
-        )
-    }
+        * usize::try_from(dim).unwrap_or(0);
+    ctx.fire(Fire::at("layout/gather_rows.cuh", "::pie::layout::transpose_nld_to_lnd<::pie::u16>").apply(elementwise(u32::try_from(total).unwrap_or(u32::MAX))), &[src.arg(), dst.arg(), n.arg(), layers.arg(), dim.arg(), total.arg()])
 }
 
 /// `layout::copy_if_valid_slot` — copy a slot's bytes if the slot is valid.
@@ -335,28 +257,22 @@ pub fn transpose_bf16_nld_to_lnd(
 ///
 /// `src`/`dst` address `bytes` live bytes, `dst` writable, `slot_ids`
 /// indexable at `request`.
-#[kernels_macros::routine]
+#[routine]
 pub fn copy_if_valid_slot(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     // The pointers state their slots; the scalars below don't.
-    src: In<0, u8>,
-    dst: Out<0, u8>,
-    // `bytes`/`request` are both unbound, bare `usize`s — swapping them
-    // compiles cleanly. `bytes` is a byte count, not an element count.
-    bytes: usize,
-    // The index is stated (`In<1, _>`), not left to counting position.
-    slot_ids: In<1, i32>,
-    request: usize,
-) -> Result<(), Refusal> {
-    // SAFETY: every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "layout/slot_ops.cuh",
-            "::pie::layout::copy_if_valid_slot",
-            Launch::grid([1, 1, 1], [256, 1, 1]),
-            &[src.ptr.arg(), dst.ptr.arg(), bytes.arg(), slot_ids.ptr.arg(), request.arg()],
-        )
-    }
+    src: In<Tensor<u8>>,
+    dst: Out<Tensor<u8>>,
+    // `bytes`/`request` are both checkpoint constants, not facts the
+    // environment answers — a statement stating this row states them too, so
+    // each claims the next params-run slot rather than `ctx.ask`ing for one.
+    // Swapping them compiles cleanly; `bytes` is a byte count, not an
+    // element count.
+    bytes: Const<usize>,
+    // The index is stated (`In<1, *const _>`), not left to counting position.
+    slot_ids: In<Tensor<i32>>,
+    request: Const<usize>) -> Result<(), Refusal> {
+    ctx.fire(Fire::at("layout/slot_ops.cuh", "::pie::layout::copy_if_valid_slot").apply(Launch::grid([1, 1, 1], [256, 1, 1])), &[src.arg(), dst.arg(), bytes.arg(), slot_ids.arg(), request.arg()])
 }
 
 const fn threads_for(head_dim: i32) -> u32 {
@@ -369,24 +285,22 @@ const fn threads_for(head_dim: i32) -> u32 {
 ///
 /// Every pointer is a device address the caller keeps live, with `ctx`'s
 /// stream live across the launch.
-#[kernels_macros::routine]
+#[routine(untraced)]
 pub fn envelope_merge_written(
-    ctx: &Ctx,
-    // Unbound throughout: fired by path (`bind/abi.rs`, `attn/mod.rs`), not a
-    // statement, so `In`/`Out` would be the wrong kind — a path-fired launch
-    // has no `Facts`, even for the five pointers matching a `keys::` entry.
-    k_curr: Unbound<*const bf16>,
-    w_page: Unbound<*const u32>,
-    w_off: Unbound<*const u32>,
-    row_valid: Unbound<crate::jit::abi::MaybeConst<u8>>,
-    env_min: Unbound<*mut bf16>,
-    env_max: Unbound<*mut bf16>,
-    // Same reason: no statement means no result to ask a width from and no
-    // fire to count rows on.
+    ctx: &Ctx<'_>,
+    // Fired by path (`attn/mod.rs`), not a statement, so every parameter
+    // below is a plain value the caller already has in hand rather than a
+    // mark — a path-fired launch has no `Facts`, even for the pointers
+    // matching a `keys::` entry.
+    k_curr: *const bf16,
+    w_page: *const u32,
+    w_off: *const u32,
+    row_valid: crate::jit::abi::MaybeConst<u8>,
+    env_min: *mut bf16,
+    env_max: *mut bf16,
     num_tokens: i32,
     num_kv_heads: i32,
-    head_dim: i32,
-) -> Result<(), Refusal> {
+    head_dim: i32) -> Result<(), Refusal> {
     const FUSE_MAX_TOKENS: i32 = 128;
 
     let launch = Launch::grid(
@@ -396,61 +310,42 @@ pub fn envelope_merge_written(
 
     if num_tokens <= FUSE_MAX_TOKENS {
         // SAFETY: every pointer is live for the extent the kernel reads it as.
-        return unsafe {
-            ctx.launch(
-                "layout/envelope.cuh",
-                "::pie::layout::merge_written_fused<::pie::i32(0)>",
-                launch,
-                &[
-                    k_curr.ptr.arg(),
-                    w_page.ptr.arg(),
-                    w_off.ptr.arg(),
-                    row_valid.ptr.arg(),
-                    env_min.ptr.arg(),
-                    env_max.ptr.arg(),
+        return ctx.fire(Fire::at("layout/envelope.cuh", "::pie::layout::merge_written_fused<::pie::i32(0)>").apply(launch), &[
+                    k_curr.arg(),
+                    w_page.arg(),
+                    w_off.arg(),
+                    row_valid.arg(),
+                    env_min.arg(),
+                    env_max.arg(),
                     num_tokens.arg(),
                     num_kv_heads.arg(),
                     head_dim.arg(),
-                ],
-            )
-        };
+                ]);
     }
 
     // Two launches, in order: the reset seeds every page this batch starts,
     // or a merge running first would have its folds overwritten.
     // SAFETY: every pointer is live for the extent the kernel reads it as.
-    unsafe {
-        ctx.launch(
-            "layout/envelope.cuh",
-            "::pie::layout::reset_started_pages<::pie::i32(0)>",
-            launch,
-            &[
-                w_page.ptr.arg(),
-                w_off.ptr.arg(),
-                row_valid.ptr.arg(),
-                env_min.ptr.arg(),
-                env_max.ptr.arg(),
+    ctx.fire(Fire::at("layout/envelope.cuh", "::pie::layout::reset_started_pages<::pie::i32(0)>").apply(launch), &[
+                w_page.arg(),
+                w_off.arg(),
+                row_valid.arg(),
+                env_min.arg(),
+                env_max.arg(),
                 num_tokens.arg(),
                 num_kv_heads.arg(),
                 head_dim.arg(),
-            ],
-        )?;
-        ctx.launch(
-            "layout/envelope.cuh",
-            "::pie::layout::merge_written<::pie::i32(0)>",
-            launch,
-            &[
-                k_curr.ptr.arg(),
-                w_page.ptr.arg(),
-                row_valid.ptr.arg(),
-                env_min.ptr.arg(),
-                env_max.ptr.arg(),
+            ])?;
+        ctx.fire(Fire::at("layout/envelope.cuh", "::pie::layout::merge_written<::pie::i32(0)>").apply(launch), &[
+                k_curr.arg(),
+                w_page.arg(),
+                row_valid.arg(),
+                env_min.arg(),
+                env_max.arg(),
                 num_tokens.arg(),
                 num_kv_heads.arg(),
                 head_dim.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 /// `layout::envelope_seed_empty_bf16` — write the `+inf`/`-inf` identity
@@ -459,17 +354,16 @@ pub fn envelope_merge_written(
 ///
 /// Both planes are device addresses the caller keeps live, with `ctx`'s
 /// stream live across the launch.
-#[kernels_macros::routine]
+#[routine(untraced)]
 pub fn envelope_seed_empty(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     // The pool's planes — see `envelope_merge_written`'s standing note. This
     // fires once at pool construction, before any fire exists.
-    env_min: Unbound<*mut bf16>,
-    env_max: Unbound<*mut bf16>,
+    env_min: *mut bf16,
+    env_max: *mut bf16,
     num_pages: i32,
     num_kv_heads: i32,
-    head_dim: i32,
-) -> Result<(), Refusal> {
+    head_dim: i32) -> Result<(), Refusal> {
     const SEED_BLOCK: u32 = 256;
 
     let n = usize::try_from(num_pages).unwrap_or(0)
@@ -479,14 +373,7 @@ pub fn envelope_seed_empty(
 
     // SAFETY: every pointer is live device memory of the extent the kernel
     // reads it as.
-    unsafe {
-        ctx.launch(
-            "layout/envelope.cuh",
-            "::pie::layout::seed_empty<::pie::i32(0)>",
-            Launch::grid([u32::try_from(blocks).unwrap_or(u32::MAX), 1, 1], [SEED_BLOCK, 1, 1]),
-            &[env_min.ptr.arg(), env_max.ptr.arg(), n.arg()],
-        )
-    }
+    ctx.fire(Fire::at("layout/envelope.cuh", "::pie::layout::seed_empty<::pie::i32(0)>").apply(Launch::grid([u32::try_from(blocks).unwrap_or(u32::MAX), 1, 1], [SEED_BLOCK, 1, 1])), &[env_min.arg(), env_max.arg(), n.arg()])
 }
 
 /// `layout::envelope_update_appended_bf16` — fold the pages an append touched
@@ -495,50 +382,42 @@ pub fn envelope_seed_empty(
 ///
 /// Every pointer is a device address the caller keeps live across the launch,
 /// and `ctx`'s stream is held live for the same window.
-#[kernels_macros::routine]
+#[routine(untraced)]
 pub fn envelope_update_appended(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     // Same standing note as `envelope_merge_written`. `k_pages` is `*const
     // bf16` where `keys::KvKeys` is `*mut u8` — same key, but this parameter
     // has already picked an element type the fact deliberately leaves open.
-    k_pages: Unbound<*const bf16>,
-    qo_indptr: Unbound<*const u32>,
-    kv_page_indices: Unbound<*const u32>,
-    kv_page_indptr: Unbound<*const u32>,
-    kv_last_page_lens: Unbound<*const u32>,
-    env_min: Unbound<*mut bf16>,
-    env_max: Unbound<*mut bf16>,
+    k_pages: *const bf16,
+    qo_indptr: *const u32,
+    kv_page_indices: *const u32,
+    kv_page_indptr: *const u32,
+    kv_last_page_lens: *const u32,
+    env_min: *mut bf16,
+    env_max: *mut bf16,
     num_requests: i32,
     max_touched: i32,
     page_size: i32,
     num_kv_heads: i32,
-    head_dim: i32,
-) -> Result<(), Refusal> {
+    head_dim: i32) -> Result<(), Refusal> {
     // SAFETY: every pointer is live device memory of the extent the kernel
     // reads it as.
-    unsafe {
-        ctx.launch(
-            "layout/envelope.cuh",
-            "::pie::layout::update_appended<::pie::bf16>",
-            Launch::grid(
+    ctx.fire(Fire::at("layout/envelope.cuh", "::pie::layout::update_appended<::pie::bf16>").apply(Launch::grid(
                 [max_touched.unsigned_abs(), num_kv_heads.unsigned_abs(), 1],
                 [threads_for(head_dim), 1, 1],
-            ),
-            &[
-                k_pages.ptr.arg(),
-                qo_indptr.ptr.arg(),
-                kv_page_indices.ptr.arg(),
-                kv_page_indptr.ptr.arg(),
-                kv_last_page_lens.ptr.arg(),
-                env_min.ptr.arg(),
-                env_max.ptr.arg(),
+            )), &[
+                k_pages.arg(),
+                qo_indptr.arg(),
+                kv_page_indices.arg(),
+                kv_page_indptr.arg(),
+                kv_last_page_lens.arg(),
+                env_min.arg(),
+                env_max.arg(),
                 num_requests.arg(),
                 page_size.arg(),
                 num_kv_heads.arg(),
                 head_dim.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 const VEC_WIDTH: i32 = 8;
@@ -556,18 +435,28 @@ pub fn vectorisable(hidden: i32, weight: *const bf16, y: *const bf16) -> bool {
 /// `token_ids` must address `num_tokens` live `i32`s, `weight` `vocab *
 /// hidden` live bf16 elements, `y` `num_tokens * hidden` writable ones, and
 /// `ctx`'s stream must be live across the launch.
-#[kernels_macros::routine]
+#[routine]
 pub fn embed_bf16(
-    ctx: &Ctx,
-    // `Env<keys::TokenIds>`, not `Env<*const i32>`: both derive the same
-    // source, but only the key survives a parameter rename.
-    token_ids: Env<keys::TokenIds>,
-    weight: Weight<0, *const bf16>,
-    y: Out<0, bf16>,
-    // `vocab` is the named weight's vocabulary, not a region's shape — no
-    // operand in this signature carries it.
-    vocab: Env<keys::Vocab>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    weight: Const<Tensor<bf16>>,
+    y: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    let token_ids = ctx.ask::<*const i32, keys::TokenIds>()?;
+    // `vocab` IS the named weight's vocabulary and no operand carries it —
+    // and it cannot be a `Const` either, because the statement that fires
+    // this has no params run to put it in. `OpKind::Embed` is a SEMANTIC op:
+    // it carries a weight name and nothing else, and `lower::walk` builds a
+    // params run only for `OpKind::Launch`. So a `Const<i32>` here promised a
+    // number no trace text can pass, and the promise was broken at the FIRST
+    // launch of every fire — `layout::embed_bf16: the fire does not carry a
+    // statement parameter`, which is where the CUDA e2e path died.
+    //
+    // HEAD spelled it `Env<keys::Vocab>` and `driver-cuda`'s hand arm still
+    // binds `ArgValue::I32(f.vocab()?)`. The rule on `Asks` says a fact the
+    // checkpoint fixes is a constant and constants belong in the statement;
+    // the rule that OVERRIDES it is that a `Const` mark promises the
+    // statement carries the number, and where no trace text can keep the
+    // promise the mark is wrong however the first rule reads.
+    let vocab = ctx.ask::<i32, keys::Vocab>()?;
     const EMBED_BLOCK: u32 = 256;
 
     let dst = stated(y.all("hidden"))?;
@@ -576,7 +465,7 @@ pub fn embed_bf16(
     // `y` by it, and the vectorised path also divides by it via `.0`.
     let hidden = dst.stride;
 
-    let vec = vectorisable(hidden.0, weight.ptr, dst.ptr.cast_const());
+    let vec = vectorisable(hidden.0, weight.v, dst.ptr.cast_const());
     let per_row = if vec { hidden.0 / VEC_WIDTH } else { hidden.0 };
     let total = i64::from(num_tokens) * i64::from(per_row);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -585,22 +474,15 @@ pub fn embed_bf16(
                                       ::pie::true_type::value>" } else { "::pie::layout::embed<::pie::false_type::value>" };
     // SAFETY: every pointer is live device memory of the extent the kernel
     // reads it as.
-    unsafe {
-        ctx.launch(
-            "layout/embed.cuh",
-            instantiation,
-            Launch::grid([blocks, 1, 1], [EMBED_BLOCK, 1, 1]),
-            &[
+    ctx.fire(Fire::at("layout/embed.cuh", instantiation).apply(Launch::grid([blocks, 1, 1], [EMBED_BLOCK, 1, 1])), &[
                 token_ids.arg(),
-                weight.ptr.arg(),
+                weight.arg(),
                 dst.ptr.arg(),
                 hidden.arg(),
                 vocab.arg(),
                 num_tokens.arg(),
                 per_row.arg(),
-            ],
-        )
-    }
+            ])
 }
 
 // `#[routine]` derives the argument column from the signature alone, and a
@@ -631,61 +513,74 @@ pub(crate) const fn derived_name_is(actual: &str, expected: &str) -> bool {
 const _: () = {
     // Entries 0 and 1 are what the macro gets wrong from the signature
     // alone.
-    assert!(<embed_bf16 as ::kernels::Derivation>::DERIVED.len() == 4);
-    assert!(kernels::source_is_named(&<embed_bf16 as ::kernels::Derivation>::DERIVED[0].source, <kernels::keys::TokenIds as kernels::keys::Fact>::KEY));
-    assert!(kernels::source_is_named(&<embed_bf16 as ::kernels::Derivation>::DERIVED[1].source, <kernels::keys::NamedWeight as kernels::keys::Fact>::KEY));
-    assert!(matches!(<embed_bf16 as ::kernels::Derivation>::DERIVED[2].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(kernels::source_is_named(&<embed_bf16 as ::kernels::Derivation>::DERIVED[3].source, <kernels::keys::Vocab as kernels::keys::Fact>::KEY));
-    assert!(!<embed_bf16 as ::kernels::Derivation>::DERIVED[2].nullable);
+    const _T0: [(); 1] = [(); matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(embed_bf16)[0], Some(kernels::Source::Or(_, _))) as usize];
+    const _T1: [(); 1] = [(); matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(embed_bf16)[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))) as usize];
+    // TWO ENTRIES, NOT THREE. `vocab` left the column when it stopped being a
+    // `Const`: the statement that fires this is an `OpKind::Embed`, which has
+    // no params run for a scalar to be read out of, so the fact is asked in
+    // the body. A third entry here again would mean a scalar came back to a
+    // signature nothing can state one for.
+    assert!(<embed_bf16 as ::kernels::Derivation>::DERIVED.len() == 2);
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(embed_bf16)[0], Some(kernels::Source::Or(kernels::Source::Named(_), kernels::Source::Slot(kernels::Kind::Weight, 0)))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(embed_bf16)[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
     // Stated, so `alias()` must leave it alone — it only ever corrects a
     // derived guess, not a stated index.
-    assert!(<embed_bf16 as ::kernels::Derivation>::DERIVED[2].stated);
 
-    assert!(<gather_bf16_rows as ::kernels::Derivation>::DERIVED.len() == 3);
-    assert!(matches!(<gather_bf16_rows as ::kernels::Derivation>::DERIVED[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(kernels::source_is_named(&<gather_bf16_rows as ::kernels::Derivation>::DERIVED[1].source, <kernels::keys::SamplingIndices as kernels::keys::Fact>::KEY));
-    assert!(matches!(<gather_bf16_rows as ::kernels::Derivation>::DERIVED[2].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(<gather_bf16_rows as ::kernels::Derivation>::DERIVED.len() == 2);
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(gather_bf16_rows)[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(gather_bf16_rows)[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
     // Result zero answers both itself: its `rows` is the row count, its
     // `width` the out width.
-    assert!(<gather_bf16_rows as ::kernels::Derivation>::DERIVED[0].stated);
-    assert!(<gather_bf16_rows as ::kernels::Derivation>::DERIVED[2].stated);
 
     // Pinned for the second result: no scalar is left for a subtraction to
     // answer wrongly.
     assert!(<split_bf16_rows as ::kernels::Derivation>::DERIVED.len() == 3);
-    assert!(matches!(<split_bf16_rows as ::kernels::Derivation>::DERIVED[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(<split_bf16_rows as ::kernels::Derivation>::DERIVED[1].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(matches!(<split_bf16_rows as ::kernels::Derivation>::DERIVED[2].source, Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
-    assert!(<split_bf16_rows as ::kernels::Derivation>::DERIVED[2].stated);
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(split_bf16_rows)[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(split_bf16_rows)[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(split_bf16_rows)[2], Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
     assert!(<split_qwen_gdn_ba as ::kernels::Derivation>::DERIVED.len() == 3);
-    assert!(matches!(<split_qwen_gdn_ba as ::kernels::Derivation>::DERIVED[2].source, Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(split_qwen_gdn_ba::<crate::jit::abi::bf16>)[2], Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
 
     // Pinned against entry 2 flipping back if the PLE width word is ever
     // removed.
-    assert!(<transpose_bf16_nld_to_lnd as ::kernels::Derivation>::DERIVED.len() == 3);
-    assert!(matches!(<transpose_bf16_nld_to_lnd as ::kernels::Derivation>::DERIVED[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(<transpose_bf16_nld_to_lnd as ::kernels::Derivation>::DERIVED[1].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(kernels::source_is_named(&<transpose_bf16_nld_to_lnd as ::kernels::Derivation>::DERIVED[2].source, <kernels::keys::PleDim as kernels::keys::Fact>::KEY));
+    assert!(<transpose_bf16_nld_to_lnd as ::kernels::Derivation>::DERIVED.len() == 2);
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(transpose_bf16_nld_to_lnd)[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(transpose_bf16_nld_to_lnd)[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
 
     // `bytes`/`request` stay unbound — see the note at the signature above.
     // Entries 0, 1 and 3 state which operand, nothing about shape.
     assert!(<copy_if_valid_slot as ::kernels::Derivation>::DERIVED.len() == 5);
-    assert!(<copy_if_valid_slot as ::kernels::Derivation>::DERIVED[2].source.is_none());
-    assert!(<copy_if_valid_slot as ::kernels::Derivation>::DERIVED[4].source.is_none());
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(copy_if_valid_slot)[2], Some(kernels::Source::Slot(kernels::Kind::Param, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(copy_if_valid_slot)[4], Some(kernels::Source::Slot(kernels::Kind::Param, 1))));
     // Non-adjacent but still interchangeable: both `usize`, both `None` — a
     // source pin can't tell them apart, so name pins hold them apart.
     assert!(derived_name_is(<copy_if_valid_slot as ::kernels::Derivation>::DERIVED[2].name, "bytes"));
     assert!(derived_name_is(<copy_if_valid_slot as ::kernels::Derivation>::DERIVED[4].name, "request"));
 
     // Unbound because a path-fired launch has no stated `Facts`: an
-    // `In<0, _>` here would force every caller to invent a rows/width for
+    // `In<0, *const _>` here would force every caller to invent a rows/width for
     // the driver's own arena.
+    const _TSRC: [(); 999] = [(); {
+        let s = kernels::routine::sources::<crate::jit::Cuda, _, _>(envelope_update_appended);
+        let mut all_none = true;
+        let mut i = 0;
+        while i < s.len() { if s[i].is_some() { all_none = false; } i += 1; }
+        if all_none { 999 } else { 0 }
+    }];
+    // A `untraced` ROW CARRIES NO COLUMN, and that is the claim: the
+    // driver fires it through a typed call, so nothing binds it from a
+    // statement and a row that grew a column would mean something had
+    // started to.
     assert!(<envelope_update_appended as ::kernels::Derivation>::DERIVED.len() == 12);
-    assert!(<envelope_update_appended as ::kernels::Derivation>::DERIVED[7].source.is_none());
-    assert!(<envelope_update_appended as ::kernels::Derivation>::DERIVED[8].source.is_none());
-    assert!(<envelope_update_appended as ::kernels::Derivation>::DERIVED[9].source.is_none());
-    assert!(<envelope_update_appended as ::kernels::Derivation>::DERIVED[10].source.is_none());
-    assert!(<envelope_update_appended as ::kernels::Derivation>::DERIVED[11].source.is_none());
+    // AND NO SOURCE COLUMN AT ALL. The five entries this used to pin as `None`
+    // -- `num_requests`, `max_touched`, `page_size`, `num_kv_heads`,
+    // `head_dim` -- were the shape of a column that existed and answered
+    // nothing. A `untraced` row has none, which is the stronger claim and
+    // the true one; the NAMES below are what still hold the order.
+    assert!(<envelope_update_appended as ::kernels::Derivation>::SOURCES.is_empty());
     // `None` five times asserts nothing about order; the names below fix the
     // launch order — permuting the last three (a page geometry) is a wrong
     // stride, not a type error.
@@ -707,45 +602,16 @@ const _: () = {
     // Unstated launchers, pinned as the baseline: if `model-dsl` ever states
     // one of them, this is what it is checked against.
     assert!(<deinterleave_rows as ::kernels::Derivation>::DERIVED.len() == 3);
-    assert!(matches!(<deinterleave_rows as ::kernels::Derivation>::DERIVED[1].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(matches!(<deinterleave_rows as ::kernels::Derivation>::DERIVED[2].source, Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(deinterleave_rows::<bf16>)[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(deinterleave_rows::<bf16>)[2], Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
     assert!(<deinterleave_vec as ::kernels::Derivation>::DERIVED.len() == 3);
-    assert!(matches!(<deinterleave_vec as ::kernels::Derivation>::DERIVED[2].source, Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(deinterleave_vec::<bf16>)[2], Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
     assert!(<concat_bf16_rows as ::kernels::Derivation>::DERIVED.len() == 3);
-    assert!(matches!(<concat_bf16_rows as ::kernels::Derivation>::DERIVED[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(<concat_bf16_rows as ::kernels::Derivation>::DERIVED[1].source, Some(kernels::Source::Slot(kernels::Kind::In, 1))));
-    assert!(matches!(<concat_bf16_rows as ::kernels::Derivation>::DERIVED[2].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(concat_bf16_rows)[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(concat_bf16_rows)[1], Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(concat_bf16_rows)[2], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
 };
 
-/// This family's routines, and what a trace may say about each.
-///
-/// The argument lists are derived from the `fn`s above — `routine!` sees
-/// only the identifier. Nothing here states `whole`, an in-place pair or a
-/// depth-prefix plan: every one of these kernels reads one buffer and
-/// writes another.
-pub static ROUTINES: &[Routine] = &[
-    routine!(split_bf16_rows, ),
-    // Named after the generic `fn`, so one derived column serves every
-    // instantiation.
-    routine!(split_qwen_gdn_ba_bf16 = split_qwen_gdn_ba::<bf16>, ),
-    routine!(deinterleave_rows_bf16 = deinterleave_rows::<bf16>, ),
-    routine!(deinterleave_vec_bf16 = deinterleave_vec::<bf16>, ),
-    routine!(concat_bf16_rows, ),
-    routine!(gather_bf16_rows, ),
-    routine!(transpose_bf16_nld_to_lnd, ),
-    routine!(copy_if_valid_slot, ),
-    routine!(envelope_merge_written, ),
-    routine!(envelope_seed_empty, ),
-    routine!(envelope_update_appended, ),
-    routine!(embed_bf16, ),
-    // Declared here though the host program is `driver_internal`'s:
-    // `Family::symbol` reads this module path's first segment, and only
-    // here is that `layout::`.
-    routine!(split_q_gate_bf16, ),
-];
-
-/// `layout`, as a trace names it.
-pub static FAMILY: Family = crate::family!(ROUTINES);
 
 // Three facts every view above relies on, none checkable at run time:
 // `Stride` is layout-identical to `i32` (every `.0` depends on it, and `Ty`

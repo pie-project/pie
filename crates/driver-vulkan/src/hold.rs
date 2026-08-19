@@ -67,10 +67,6 @@
 //! goes unanswered here and that is the right answer rather than a gap.
 
 use kernels::routine::Refusal;
-use kernels_vulkan::routine::{
-    Buf, BufMut, F32sMut,
-};
-
 use model_compiler::lower::Arg;
 
 use crate::binding::{FireNumber, FireTable, Resolve};
@@ -280,10 +276,9 @@ impl<'a, 'h> Handles<'a, 'h> {
     ///
     /// [`Refusal::Absent`] when the statement has fewer, which is an arm
     /// asking for an operand its trace does not carry.
-    pub fn input(&mut self, i: usize) -> Result<Buf, Refusal> {
+    pub fn input(&mut self, i: usize) -> Result<u32, Refusal> {
         let at = self.ins.get(i).copied();
         self.pick(at, "an input the statement does not carry")
-            .map(Buf)
     }
 
     /// The statement's `i`-th result.
@@ -291,10 +286,9 @@ impl<'a, 'h> Handles<'a, 'h> {
     /// # Errors
     ///
     /// [`Refusal::Absent`] when the statement has fewer.
-    pub fn output(&mut self, i: usize) -> Result<BufMut, Refusal> {
+    pub fn output(&mut self, i: usize) -> Result<u32, Refusal> {
         let at = self.outs.get(i).copied();
         self.pick(at, "a result the statement does not carry")
-            .map(BufMut)
     }
 
     /// The statement's `i`-th result, read rather than written.
@@ -306,10 +300,9 @@ impl<'a, 'h> Handles<'a, 'h> {
     /// # Errors
     ///
     /// [`Refusal::Absent`] when the statement has fewer.
-    pub fn output_read(&mut self, i: usize) -> Result<Buf, Refusal> {
+    pub fn output_read(&mut self, i: usize) -> Result<u32, Refusal> {
         let at = self.outs.get(i).copied();
         self.pick(at, "a result the statement does not carry")
-            .map(Buf)
     }
 
     /// The `i`-th weight the statement names.
@@ -317,10 +310,9 @@ impl<'a, 'h> Handles<'a, 'h> {
     /// # Errors
     ///
     /// [`Refusal::Absent`] when the statement names fewer.
-    pub fn weight(&mut self, i: usize) -> Result<Buf, Refusal> {
+    pub fn weight(&mut self, i: usize) -> Result<u32, Refusal> {
         let at = self.weights.get(i).copied();
         self.pick(at, "a weight the statement does not name")
-            .map(Buf)
     }
 
     /// One of the FIRE's tables: the token ids, the positions, the sampled
@@ -338,11 +330,11 @@ impl<'a, 'h> Handles<'a, 'h> {
     /// [`Unbindable::NoDriverResource`](crate::binding::Unbindable). A decode
     /// has no sampling indices, and a statement that asks for them in one is a
     /// trace mismatch.
-    pub fn table(&mut self, which: FireTable) -> Result<Buf, Refusal> {
+    pub fn table(&mut self, which: FireTable) -> Result<u32, Refusal> {
         let buffer = self.resolver.table(which).ok_or(Refusal::Absent {
             what: "a fire table this run does not hold",
         })?;
-        Ok(Buf(self.take(Bound::whole(buffer))))
+        Ok(self.take(Bound::whole(buffer)))
     }
 
     /// The same, written through.
@@ -350,11 +342,11 @@ impl<'a, 'h> Handles<'a, 'h> {
     /// # Errors
     ///
     /// See [`Handles::table`].
-    pub fn table_mut(&mut self, which: FireTable) -> Result<BufMut, Refusal> {
+    pub fn table_mut(&mut self, which: FireTable) -> Result<u32, Refusal> {
         let buffer = self.resolver.table(which).ok_or(Refusal::Absent {
             what: "a fire table this run does not hold",
         })?;
-        Ok(BufMut(self.take(Bound::whole(buffer))))
+        Ok(self.take(Bound::whole(buffer)))
     }
 
     /// A layer's KV cache, keys or values.
@@ -362,11 +354,11 @@ impl<'a, 'h> Handles<'a, 'h> {
     /// # Errors
     ///
     /// [`Refusal::Absent`] when this fire has no paged cache.
-    pub fn kv(&mut self, layer: u16, values: bool) -> Result<BufMut, Refusal> {
+    pub fn kv(&mut self, layer: u16, values: bool) -> Result<u32, Refusal> {
         let buffer = self.resolver.kv(layer, values).ok_or(Refusal::Absent {
             what: "a KV cache this run does not hold",
         })?;
-        Ok(BufMut(self.take(Bound::whole(buffer))))
+        Ok(self.take(Bound::whole(buffer)))
     }
 
     /// The same, read rather than written — what a paged attention takes.
@@ -374,11 +366,11 @@ impl<'a, 'h> Handles<'a, 'h> {
     /// # Errors
     ///
     /// See [`Handles::kv`].
-    pub fn kv_read(&mut self, layer: u16, values: bool) -> Result<Buf, Refusal> {
+    pub fn kv_read(&mut self, layer: u16, values: bool) -> Result<u32, Refusal> {
         let buffer = self.resolver.kv(layer, values).ok_or(Refusal::Absent {
             what: "a KV cache this run does not hold",
         })?;
-        Ok(Buf(self.take(Bound::whole(buffer))))
+        Ok(self.take(Bound::whole(buffer)))
     }
 
     /// A number the driver keeps for the KV pool — a stride, a page size.
@@ -439,8 +431,8 @@ impl<'a, 'h> Handles<'a, 'h> {
     ///
     /// Six of this backend's modules read their parameters out of a storage
     /// block rather than a push range -- `route_sort`'s 28 bytes at binding 4
-    /// of 6, `combine_sorted`'s 12 at 3 of 5 -- and a routine whose signature
-    /// names a `params: Buf` is one of them. The block is a DESCRIPTOR there,
+    /// of 6, `combine_sorted`'s 12 at 3 of 5 -- and a routine that forwards
+    /// `ctx.params()` is one of them. The block is a DESCRIPTOR there,
     /// so the arm has to put something in its slot.
     ///
     /// What it cannot put there is an address. The scalar runs of a whole
@@ -460,13 +452,13 @@ impl<'a, 'h> Handles<'a, 'h> {
     /// a block, of one zero word. The shader dereferences the pointer whether
     /// or not it reads a field, and a descriptor pointing at nothing is a
     /// device fault rather than a refusal.
-    pub fn params_block(&mut self) -> Buf {
-        Buf(BLOCK)
+    pub fn params_block(&mut self) -> u32 {
+        BLOCK
     }
 
     /// A handle for a slot the routine drops. See [`UNBOUND`].
-    pub fn unbound(&mut self) -> Buf {
-        Buf(UNBOUND)
+    pub fn unbound(&mut self) -> u32 {
+        UNBOUND
     }
 
     /// One of the fire's tables, or [`UNBOUND`] if this fire holds none.
@@ -476,10 +468,10 @@ impl<'a, 'h> Handles<'a, 'h> {
     /// the split count at one, the body takes the single-pass path and the
     /// handle is dropped -- so an absent table is a fact the arm reads, not a
     /// refusal it raises.
-    pub fn table_or_unbound(&mut self, which: FireTable) -> F32sMut {
+    pub fn table_or_unbound(&mut self, which: FireTable) -> u32 {
         match self.resolver.table(which) {
-            Some(buffer) => F32sMut(self.take(Bound::whole(buffer))),
-            None => F32sMut(UNBOUND),
+            Some(buffer) => self.take(Bound::whole(buffer)),
+            None => UNBOUND,
         }
     }
 
@@ -571,8 +563,9 @@ pub const UNBOUND: u32 = u32::MAX - 1;
 ///
 /// The trace concatenates inputs, then results, then weights, and the binder
 /// keeps that order. `results` is how many of the widthed ones are results,
-/// which the ROUTINE knows — it is the count of [`kernels::Ty::BufMut`] in its
-/// signature — where the table path read it off the row's `Out` sources.
+/// which the ROUTINE knows — it is the count of writable types in its
+/// signature, [`kernels::Binds::Writes`] — where the table path read it off
+/// the row's `Out` sources.
 #[must_use]
 pub fn split(args: &[Arg], results: usize) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
     let widthed: Vec<usize> = args
@@ -596,12 +589,12 @@ pub fn split(args: &[Arg], results: usize) -> (Vec<usize>, Vec<usize>, Vec<usize
     (ins, outs, weights)
 }
 
-/// How many of a routine's `BufMut` operands the STATEMENT supplies.
+/// How many of a routine's WRITABLE operands the STATEMENT supplies.
 ///
 /// [`split`]'s `results` is meant to be this number, and for ninety-eight
-/// routines it is exactly the count of [`kernels::Ty::BufMut`] in the
-/// signature. For two it is not, and the difference is not cosmetic: it
-/// silently swallowed every paged decode.
+/// routines it is exactly the count of writable types in the signature. For two
+/// it is not, and the difference is not cosmetic: it silently swallowed every
+/// paged decode.
 ///
 /// `attn::kv_append` and `attn::kv_append_paged` write the KV cache, and the
 /// cache is not an operand the trace carries -- the arm draws it from the POOL
@@ -609,7 +602,7 @@ pub fn split(args: &[Arg], results: usize) -> (Vec<usize>, Vec<usize>, Vec<usize
 /// naming `Source::KvKeys` and `Source::KvValues` where every other result
 /// named `Out(n)`, so the table path counted ZERO outputs for them. The
 /// routine signature cannot say it: `Provenance` distinguishes `Trace` from
-/// `Env` and a `BufMut` the driver supplies is neither.
+/// `Env` and a writable operand the driver supplies is neither.
 ///
 /// So it is stated here, which is the same place the row's `Source` column
 /// lived -- driver-side, beside the arm that does the drawing.
@@ -618,12 +611,20 @@ pub fn split(args: &[Arg], results: usize) -> (Vec<usize>, Vec<usize>, Vec<usize
 /// counting two results made [`split`] hand both inputs to `outs` and leave
 /// `ins` empty. `o.input(0)` then refused `Absent`, every `kv_append_paged`
 /// rectangle was unplannable, and thirty-seven device tests went red at once.
+///
+/// # Why it asks [`kernels::Ty::binds`] rather than testing `Ty::BufMut`
+///
+/// Because `BufMut` is one writable type of ten and this counted only that one
+/// -- the narrow count `driver-wgpu`'s `results` already refused to copy, its
+/// doc naming `ssm`'s `F32sMut` recurrent state as the case it misses. A
+/// signature naming its activation element binds `Ty::Bf16sMut` and would have
+/// been the second such case. The classification is `kernels`' to make, once.
 #[must_use]
 pub fn traced_results(routine: &kernels_vulkan::routine::Routine) -> usize {
     let declared = routine
         .args
         .iter()
-        .filter(|(ty, _)| *ty == kernels::Ty::BufMut)
+        .filter(|ty| ty.binds() == kernels::Binds::Writes)
         .count();
     // Named by ROUTINE rather than by entrypoint, because the fact is about
     // where the cache comes from and every instantiation of these two draws it
@@ -811,16 +812,24 @@ pub fn spelled(symbol: &str) -> Option<Spelled> {
     })
 }
 
-/// One routine of `family` by name, for a registry line to point at.
+/// One routine by name, for a registry line to point at.
+///
+/// ONE SLICE AND NOT TEN. This took a family's own `ROUTINES` beside the name,
+/// and the families no longer have one: `#[routine]` registers into a
+/// `linkme` distributed slice, so `kernels_vulkan::ROUTINES` is every routine
+/// the crate declares and the linker assembles it. There is no membership list
+/// to add a routine to -- which is the last hand-written thing about one, and
+/// the last that could be forgotten.
+///
+/// Searching the whole slice rather than a family's is safe because the names
+/// are unique across it, which `kernels-vulkan`'s own
+/// `no_symbol_is_declared_twice` keeps true.
 ///
 /// A `panic` rather than an `Option` because it is reached at most once per
 /// entry and only ever fails when this file names a routine the crate does not
 /// have -- which is a mistake in the line below it, not a condition.
-fn of(
-    family: &'static [kernels_vulkan::routine::Routine],
-    name: &'static str,
-) -> &'static kernels_vulkan::routine::Routine {
-    match family.iter().find(|r| r.name == name) {
+fn of(name: &'static str) -> &'static kernels_vulkan::routine::Routine {
+    match kernels_vulkan::ROUTINES.iter().find(|r| r.name == name) {
         Some(r) => r,
         None => panic!("the arm registry names a routine this crate does not hold"),
     }
@@ -831,479 +840,416 @@ static LIVE: std::sync::LazyLock<Vec<Crossed>> = std::sync::LazyLock::new(|| {
         // sample -- sample/argmax.slang
         Crossed {
             stem: "argmax_logits",
-            routine: Some(of(kernels_vulkan::sample::ROUTINES, "argmax_logits")),
+            routine: Some(of("argmax_logits")),
         },
         // ptir -- ptir/logits_copy.slang
         Crossed {
             stem: "copy_logits_bf16",
-            routine: Some(of(kernels_vulkan::ptir::ROUTINES, "copy_logits_bf16")),
+            routine: Some(of("copy_logits_bf16")),
         },
         // mlp -- mlp/gated.slang
         Crossed {
             stem: "geglu_tanh",
-            routine: Some(of(kernels_vulkan::mlp::ROUTINES, "geglu_tanh")),
+            routine: Some(of("geglu_tanh")),
         },
         Crossed {
             stem: "geglu_tanh_strided",
-            routine: Some(of(kernels_vulkan::mlp::ROUTINES, "geglu_tanh_strided")),
+            routine: Some(of("geglu_tanh_strided")),
         },
         Crossed {
             stem: "gptoss_swiglu",
-            routine: Some(of(kernels_vulkan::mlp::ROUTINES, "gptoss_swiglu")),
+            routine: Some(of("gptoss_swiglu")),
         },
         Crossed {
             stem: "silu_mul",
-            routine: Some(of(kernels_vulkan::mlp::ROUTINES, "silu_mul")),
+            routine: Some(of("silu_mul")),
         },
         // layout -- layout/embed.slang, layout/ple.slang, layout/gather.slang
         Crossed {
             stem: "embed_gather_4bit",
-            routine: Some(of(kernels_vulkan::layout::ROUTINES, "embed_gather_4bit")),
+            routine: Some(of("embed_gather_4bit")),
         },
         Crossed {
             stem: "embed_gather_mb_4bit",
-            routine: Some(of(kernels_vulkan::layout::ROUTINES, "embed_gather_mb_4bit")),
+            routine: Some(of("embed_gather_mb_4bit")),
         },
         Crossed {
             stem: "embed_gather_scaled_4bit",
-            routine: Some(of(
-                kernels_vulkan::layout::ROUTINES,
-                "embed_gather_scaled_4bit",
-            )),
+            routine: Some(of("embed_gather_scaled_4bit")),
         },
         Crossed {
             stem: "embed_gather_scaled_mb_4bit",
-            routine: Some(of(
-                kernels_vulkan::layout::ROUTINES,
-                "embed_gather_scaled_mb_4bit",
-            )),
+            routine: Some(of("embed_gather_scaled_mb_4bit")),
         },
         Crossed {
             stem: "ple_combine",
-            routine: Some(of(kernels_vulkan::layout::ROUTINES, "ple_combine")),
+            routine: Some(of("ple_combine")),
         },
         Crossed {
             stem: "row_gather",
-            routine: Some(of(kernels_vulkan::layout::ROUTINES, "row_gather")),
+            routine: Some(of("row_gather")),
         },
         Crossed {
             stem: "silu_mul_strided",
-            routine: Some(of(kernels_vulkan::mlp::ROUTINES, "silu_mul_strided")),
+            routine: Some(of("silu_mul_strided")),
         },
         // rope
         Crossed {
             stem: "neox_decode",
-            routine: Some(of(kernels_vulkan::rope::ROUTINES, "neox_decode")),
+            routine: Some(of("neox_decode")),
         },
         Crossed {
             stem: "neox_mb",
-            routine: Some(of(kernels_vulkan::rope::ROUTINES, "neox_mb")),
+            routine: Some(of("neox_mb")),
         },
         Crossed {
             stem: "neox_prop_decode",
-            routine: Some(of(kernels_vulkan::rope::ROUTINES, "neox_prop_decode")),
+            routine: Some(of("neox_prop_decode")),
         },
         Crossed {
             stem: "neox_prop_mb",
-            routine: Some(of(kernels_vulkan::rope::ROUTINES, "neox_prop_mb")),
+            routine: Some(of("neox_prop_mb")),
         },
         Crossed {
             stem: "neox_freqs_decode",
-            routine: Some(of(kernels_vulkan::rope::ROUTINES, "neox_freqs_decode")),
+            routine: Some(of("neox_freqs_decode")),
         },
         Crossed {
             stem: "neox_freqs_mb",
-            routine: Some(of(kernels_vulkan::rope::ROUTINES, "neox_freqs_mb")),
+            routine: Some(of("neox_freqs_mb")),
         },
         Crossed {
             stem: "neox_strided",
-            routine: Some(of(kernels_vulkan::rope::ROUTINES, "neox_strided")),
+            routine: Some(of("neox_strided")),
         },
         // norm
         Crossed {
             stem: "rms_single_row",
-            routine: Some(of(kernels_vulkan::norm::ROUTINES, "rms_single_row")),
+            routine: Some(of("rms_single_row")),
         },
         Crossed {
             stem: "vnorm_single_row",
-            routine: Some(of(kernels_vulkan::norm::ROUTINES, "vnorm_single_row")),
+            routine: Some(of("vnorm_single_row")),
         },
         Crossed {
             stem: "rms_residual",
-            routine: Some(of(kernels_vulkan::norm::ROUTINES, "rms_residual")),
+            routine: Some(of("rms_residual")),
         },
         Crossed {
             stem: "rms_residual_scaled",
-            routine: Some(of(kernels_vulkan::norm::ROUTINES, "rms_residual_scaled")),
+            routine: Some(of("rms_residual_scaled")),
         },
         Crossed {
             stem: "rms_strided_row",
-            routine: Some(of(kernels_vulkan::norm::ROUTINES, "rms_strided_row")),
+            routine: Some(of("rms_strided_row")),
         },
         Crossed {
             stem: "rms_strided_head_row",
-            routine: Some(of(kernels_vulkan::norm::ROUTINES, "rms_strided_head_row")),
+            routine: Some(of("rms_strided_head_row")),
         },
         Crossed {
             stem: "rms_rope",
-            routine: Some(of(kernels_vulkan::norm::ROUTINES, "rms_rope")),
+            routine: Some(of("rms_rope")),
         },
         Crossed {
             stem: "gated_rms",
-            routine: Some(of(kernels_vulkan::norm::ROUTINES, "gated_rms")),
+            routine: Some(of("gated_rms")),
         },
         Crossed {
             stem: "gated_rms_strided",
-            routine: Some(of(kernels_vulkan::norm::ROUTINES, "gated_rms_strided")),
+            routine: Some(of("gated_rms_strided")),
         },
         Crossed {
             stem: "layer_scalar_mul",
-            routine: Some(of(kernels_vulkan::norm::ROUTINES, "layer_scalar_mul")),
+            routine: Some(of("layer_scalar_mul")),
         },
         Crossed {
             stem: "residual_add",
-            routine: Some(of(kernels_vulkan::norm::ROUTINES, "residual_add")),
+            routine: Some(of("residual_add")),
         },
         Crossed {
             stem: "residual_add_strided",
-            routine: Some(of(kernels_vulkan::norm::ROUTINES, "residual_add_strided")),
+            routine: Some(of("residual_add_strided")),
         },
         Crossed {
             stem: "add_bias",
-            routine: Some(of(kernels_vulkan::norm::ROUTINES, "add_bias")),
+            routine: Some(of("add_bias")),
         },
         // ssm
         Crossed {
             stem: "gdn_prep",
-            routine: Some(of(kernels_vulkan::ssm::ROUTINES, "gdn_prep")),
+            routine: Some(of("gdn_prep")),
         },
         Crossed {
             stem: "gdn_prep_slotted",
-            routine: Some(of(kernels_vulkan::ssm::ROUTINES, "gdn_prep_slotted")),
+            routine: Some(of("gdn_prep_slotted")),
         },
         Crossed {
             stem: "gdn_prep_prefill",
-            routine: Some(of(kernels_vulkan::ssm::ROUTINES, "gdn_prep_prefill")),
+            routine: Some(of("gdn_prep_prefill")),
         },
         Crossed {
             stem: "gdn_core",
-            routine: Some(of(kernels_vulkan::ssm::ROUTINES, "gdn_core")),
+            routine: Some(of("gdn_core")),
         },
         Crossed {
             stem: "gdn_core_slotted",
-            routine: Some(of(kernels_vulkan::ssm::ROUTINES, "gdn_core_slotted")),
+            routine: Some(of("gdn_core_slotted")),
         },
         Crossed {
             stem: "gdn_core_recurrent",
-            routine: Some(of(kernels_vulkan::ssm::ROUTINES, "gdn_core_recurrent")),
+            routine: Some(of("gdn_core_recurrent")),
         },
         Crossed {
             stem: "gdn_core_recurrent_slotted",
-            routine: Some(of(
-                kernels_vulkan::ssm::ROUTINES,
-                "gdn_core_recurrent_slotted",
-            )),
+            routine: Some(of("gdn_core_recurrent_slotted")),
         },
         Crossed {
             stem: "gdn_core_recurrent_prefill",
-            routine: Some(of(
-                kernels_vulkan::ssm::ROUTINES,
-                "gdn_core_recurrent_prefill",
-            )),
+            routine: Some(of("gdn_core_recurrent_prefill")),
         },
         // moe
         Crossed {
             stem: "router_topk",
-            routine: Some(of(kernels_vulkan::moe::ROUTINES, "router_topk")),
+            routine: Some(of("router_topk")),
         },
         Crossed {
             stem: "router_topk_scaled",
-            routine: Some(of(kernels_vulkan::moe::ROUTINES, "router_topk_scaled")),
+            routine: Some(of("router_topk_scaled")),
         },
         Crossed {
             stem: "route_sort",
-            routine: Some(of(kernels_vulkan::moe::ROUTINES, "route_sort")),
+            routine: Some(of("route_sort")),
         },
         Crossed {
             stem: "route_gather",
-            routine: Some(of(kernels_vulkan::moe::ROUTINES, "route_gather")),
+            routine: Some(of("route_gather")),
         },
         Crossed {
             stem: "combine_sorted",
-            routine: Some(of(kernels_vulkan::moe::ROUTINES, "combine_sorted")),
+            routine: Some(of("combine_sorted")),
         },
         Crossed {
             stem: "shared_expert_combine",
-            routine: Some(of(kernels_vulkan::moe::ROUTINES, "shared_expert_combine")),
+            routine: Some(of("shared_expert_combine")),
         },
         Crossed {
             stem: "shared_expert_combine_strided",
-            routine: Some(of(
-                kernels_vulkan::moe::ROUTINES,
-                "shared_expert_combine_strided",
-            )),
+            routine: Some(of("shared_expert_combine_strided")),
         },
         Crossed {
             stem: "affine_qmv_routed",
-            routine: Some(of(kernels_vulkan::moe::ROUTINES, "qmv_routed")),
+            routine: Some(of("qmv_routed")),
         },
         Crossed {
             stem: "affine_qmv_routed_bias",
-            routine: Some(of(kernels_vulkan::moe::ROUTINES, "qmv_routed_bias")),
+            routine: Some(of("qmv_routed_bias")),
         },
         Crossed {
             stem: "mxfp4_qmv_routed_bias",
-            routine: Some(of(kernels_vulkan::moe::ROUTINES, "mxfp4_qmv_routed_bias")),
+            routine: Some(of("mxfp4_qmv_routed_bias")),
         },
         Crossed {
             stem: "affine_qmm_t_routed",
-            routine: Some(of(kernels_vulkan::moe::ROUTINES, "qmm_t_routed")),
+            routine: Some(of("qmm_t_routed")),
         },
         Crossed {
             stem: "affine_qmm_t_routed_fp16",
-            routine: Some(of(kernels_vulkan::moe::ROUTINES, "qmm_t_routed_fp16")),
+            routine: Some(of("qmm_t_routed_fp16")),
         },
         Crossed {
             stem: "mxfp4_qmm_t_routed_bias",
-            routine: Some(of(kernels_vulkan::moe::ROUTINES, "mxfp4_qmm_t_routed_bias")),
+            routine: Some(of("mxfp4_qmm_t_routed_bias")),
         },
         // attn
         Crossed {
             stem: "sdpa_paged_decode",
-            routine: Some(of(kernels_vulkan::attn::ROUTINES, "sdpa_paged_decode")),
+            routine: Some(of("sdpa_paged_decode")),
         },
         Crossed {
             stem: "sdpa_paged_decode_sink",
-            routine: Some(of(kernels_vulkan::attn::ROUTINES, "sdpa_paged_decode_sink")),
+            routine: Some(of("sdpa_paged_decode_sink")),
         },
         Crossed {
             stem: "sdpa_paged_tiled",
-            routine: Some(of(kernels_vulkan::attn::ROUTINES, "sdpa_paged_tiled")),
+            routine: Some(of("sdpa_paged_tiled")),
         },
         Crossed {
             stem: "sdpa_paged_tiled_sink",
-            routine: Some(of(kernels_vulkan::attn::ROUTINES, "sdpa_paged_tiled_sink")),
+            routine: Some(of("sdpa_paged_tiled_sink")),
         },
         Crossed {
             stem: "sdpa_paged_tiled_strided",
-            routine: Some(of(
-                kernels_vulkan::attn::ROUTINES,
-                "sdpa_paged_tiled_strided",
-            )),
+            routine: Some(of("sdpa_paged_tiled_strided")),
         },
         Crossed {
             stem: "sdpa_paged_mma",
-            routine: Some(of(kernels_vulkan::attn::ROUTINES, "sdpa_paged_mma")),
+            routine: Some(of("sdpa_paged_mma")),
         },
         Crossed {
             stem: "sdpa_paged_mma_sink",
-            routine: Some(of(kernels_vulkan::attn::ROUTINES, "sdpa_paged_mma_sink")),
+            routine: Some(of("sdpa_paged_mma_sink")),
         },
         Crossed {
             stem: "sdpa_vector_decode",
-            routine: Some(of(kernels_vulkan::attn::ROUTINES, "sdpa_vector_decode")),
+            routine: Some(of("sdpa_vector_decode")),
         },
         Crossed {
             stem: "sdpa_vector_decode_swa",
-            routine: Some(of(kernels_vulkan::attn::ROUTINES, "sdpa_vector_decode_swa")),
+            routine: Some(of("sdpa_vector_decode_swa")),
         },
         Crossed {
             stem: "sdpa_vector_decode_sink",
-            routine: Some(of(
-                kernels_vulkan::attn::ROUTINES,
-                "sdpa_vector_decode_sink",
-            )),
+            routine: Some(of("sdpa_vector_decode_sink")),
         },
         Crossed {
             stem: "kv_append",
-            routine: Some(of(kernels_vulkan::attn::ROUTINES, "kv_append")),
+            routine: Some(of("kv_append")),
         },
         Crossed {
             stem: "kv_append_paged",
-            routine: Some(of(kernels_vulkan::attn::ROUTINES, "kv_append_paged")),
+            routine: Some(of("kv_append_paged")),
         },
         Crossed {
             stem: "split_qkv_bf16",
-            routine: Some(of(kernels_vulkan::attn::ROUTINES, "split_qkv_bf16")),
+            routine: Some(of("split_qkv_bf16")),
         },
         Crossed {
             stem: "gate",
-            routine: Some(of(kernels_vulkan::attn::ROUTINES, "gate")),
+            routine: Some(of("gate")),
         },
         Crossed {
             stem: "q_gate_split",
-            routine: Some(of(kernels_vulkan::attn::ROUTINES, "q_gate_split")),
+            routine: Some(of("q_gate_split")),
         },
         Crossed {
             stem: "logit_softcap",
-            routine: Some(of(kernels_vulkan::attn::ROUTINES, "logit_softcap")),
+            routine: Some(of("logit_softcap")),
         },
         // quant
         Crossed {
             stem: "cast_qmm_input_bfloat16_to_float16",
-            routine: Some(of(
-                kernels_vulkan::quant::ROUTINES,
-                "cast_qmm_input_bfloat16_to_float16",
-            )),
+            routine: Some(of("cast_qmm_input_bfloat16_to_float16")),
         },
         Crossed {
             stem: "cast_qmm_input_strided_bfloat16_to_float16",
-            routine: Some(of(
-                kernels_vulkan::quant::ROUTINES,
-                "cast_qmm_input_strided_bfloat16_to_float16",
-            )),
+            routine: Some(of("cast_qmm_input_strided_bfloat16_to_float16")),
         },
         Crossed {
             stem: "affine_encode_u4_bf16",
-            routine: Some(of(kernels_vulkan::quant::ROUTINES, "encode_u4_bf16")),
+            routine: Some(of("encode_u4_bf16")),
         },
         Crossed {
             stem: "affine_encode_u4_f32",
-            routine: Some(of(kernels_vulkan::quant::ROUTINES, "encode_u4_f32")),
+            routine: Some(of("encode_u4_f32")),
         },
         Crossed {
             stem: "mxfp4_dequant_bf16",
-            routine: Some(of(kernels_vulkan::quant::ROUTINES, "mxfp4_dequant_bf16")),
+            routine: Some(of("mxfp4_dequant_bf16")),
         },
         Crossed {
             stem: "qmm_splitk_reduce",
-            routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmm_splitk_reduce")),
+            routine: Some(of("qmm_splitk_reduce")),
         },
         Crossed {
             stem: "qmm_splitk_reduce_f32",
-            routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmm_splitk_reduce_f32")),
+            routine: Some(of("qmm_splitk_reduce_f32")),
         },
         Crossed {
             stem: "affine_qmm_t",
-            routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmm_t")),
+            routine: Some(of("qmm_t")),
         },
         Crossed {
             stem: "affine_qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4",
-            routine: Some(of(
-                kernels_vulkan::quant::ROUTINES,
-                "qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4",
-            )),
+            routine: Some(of("qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4")),
         },
         Crossed {
             stem: "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2",
-            routine: Some(of(
-                kernels_vulkan::quant::ROUTINES,
-                "qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2",
-            )),
+            routine: Some(of("qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2")),
         },
         Crossed {
             stem: "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2",
-            routine: Some(of(
-                kernels_vulkan::quant::ROUTINES,
-                "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2",
-            )),
+            routine: Some(of("qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2")),
         },
         Crossed {
             stem: "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1",
-            routine: Some(of(
-                kernels_vulkan::quant::ROUTINES,
-                "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1",
-            )),
+            routine: Some(of("qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1")),
         },
         Crossed {
             stem: "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4",
-            routine: Some(of(
-                kernels_vulkan::quant::ROUTINES,
-                "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4",
-            )),
+            routine: Some(of("qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4")),
         },
         Crossed {
             stem: "affine_qmm_t_bias",
-            routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmm_t_bias")),
+            routine: Some(of("qmm_t_bias")),
         },
         Crossed {
             stem: "affine_qmm_t_bias_fp16_precast",
-            routine: Some(of(
-                kernels_vulkan::quant::ROUTINES,
-                "qmm_t_bias_fp16_precast",
-            )),
+            routine: Some(of("qmm_t_bias_fp16_precast")),
         },
         Crossed {
             stem: "affine_qmm_t_fp16_precast",
-            routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmm_t_fp16_precast")),
+            routine: Some(of("qmm_t_fp16_precast")),
         },
         Crossed {
             stem: "affine_qmm_t_residual",
-            routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmm_t_residual")),
+            routine: Some(of("qmm_t_residual")),
         },
         Crossed {
             stem: "affine_qmm_t_residual_fp16_precast",
-            routine: Some(of(
-                kernels_vulkan::quant::ROUTINES,
-                "qmm_t_residual_fp16_precast",
-            )),
+            routine: Some(of("qmm_t_residual_fp16_precast")),
         },
         Crossed {
             stem: "affine_qmm_t_splitk",
-            routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmm_t_splitk")),
+            routine: Some(of("qmm_t_splitk")),
         },
         Crossed {
             stem: "affine_qmm_t_splitk_f32",
-            routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmm_t_splitk_f32")),
+            routine: Some(of("qmm_t_splitk_f32")),
         },
         Crossed {
             stem: "affine_qmm_t_splitk_fp16_precast",
-            routine: Some(of(
-                kernels_vulkan::quant::ROUTINES,
-                "qmm_t_splitk_fp16_precast",
-            )),
+            routine: Some(of("qmm_t_splitk_fp16_precast")),
         },
         Crossed {
             stem: "affine_qmm_t_splitk_fp16_precast_f32",
-            routine: Some(of(
-                kernels_vulkan::quant::ROUTINES,
-                "qmm_t_splitk_fp16_precast_f32",
-            )),
+            routine: Some(of("qmm_t_splitk_fp16_precast_f32")),
         },
         Crossed {
             stem: "affine_qmm_t_strided",
-            routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmm_t_strided")),
+            routine: Some(of("qmm_t_strided")),
         },
         Crossed {
             stem: "affine_qmm_t_strided_fp16_precast",
-            routine: Some(of(
-                kernels_vulkan::quant::ROUTINES,
-                "qmm_t_strided_fp16_precast",
-            )),
+            routine: Some(of("qmm_t_strided_fp16_precast")),
         },
         Crossed {
             stem: "affine_qmm_t_strided_fp16_precast_residual",
-            routine: Some(of(
-                kernels_vulkan::quant::ROUTINES,
-                "qmm_t_strided_fp16_precast_residual",
-            )),
+            routine: Some(of("qmm_t_strided_fp16_precast_residual")),
         },
         Crossed {
             stem: "affine_qmm_t_strided_residual",
-            routine: Some(of(
-                kernels_vulkan::quant::ROUTINES,
-                "qmm_t_strided_residual",
-            )),
+            routine: Some(of("qmm_t_strided_residual")),
         },
         Crossed {
             stem: "affine_qmv_fast",
-            routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmv_fast")),
+            routine: Some(of("qmv_fast")),
         },
         Crossed {
             stem: "affine_qmv_fast_residual",
-            routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmv_fast_residual")),
+            routine: Some(of("qmv_fast_residual")),
         },
         Crossed {
             stem: "affine_qmv_tail",
-            routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmv_tail")),
+            routine: Some(of("qmv_tail")),
         },
         Crossed {
             stem: "affine_qmv_tail_bias",
-            routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmv_tail_bias")),
+            routine: Some(of("qmv_tail_bias")),
         },
         Crossed {
             stem: "affine_qmv_wide_strided",
-            routine: Some(of(kernels_vulkan::quant::ROUTINES, "qmv_wide_strided")),
+            routine: Some(of("qmv_wide_strided")),
         },
     ]
 });
@@ -1590,7 +1536,7 @@ mod tests {
             assert_eq!(
                 r.args
                     .iter()
-                    .filter(|(ty, _)| *ty == kernels::Ty::BufMut)
+                    .filter(|ty| ty.binds() == kernels::Binds::Writes)
                     .count(),
                 2,
                 "`{name}` states two mutable buffers"
@@ -1616,7 +1562,7 @@ mod tests {
             let declared = r
                 .args
                 .iter()
-                .filter(|(ty, _)| *ty == kernels::Ty::BufMut)
+                .filter(|ty| ty.binds() == kernels::Binds::Writes)
                 .count();
             assert_eq!(
                 traced_results(r),

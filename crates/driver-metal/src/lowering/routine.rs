@@ -33,7 +33,7 @@
 use core::cell::RefCell;
 
 use kernels::Ty;
-use kernels::routine::{Provenance, Refusal, Routine};
+use kernels::routine::{Refusal, Routine};
 use kernels_metal::routine::{ArgValue, Encode, Fire, Metal};
 
 use crate::lowering::hold::Staged;
@@ -75,10 +75,23 @@ pub struct Planner<'r> {
     /// argument arrives as an [`ArgValue::U32`] and is not one. The type is
     /// the only place that difference is written down, which is why a planner
     /// is given the routine and not just its values.
-    types: &'r [(Ty, Provenance)],
+    types: &'r [Ty],
     /// The buffers this launch bound, in the trace's order. A body's handle is
     /// an index into this.
     handles: &'r [BoundArg],
+    /// WHAT THIS FIRE ANSWERS, for a body that asks.
+    ///
+    /// `Env` left the parameter list, so a fact only the fire can answer is no
+    /// longer bound into the values before the body runs. The body asks, and
+    /// this is the same [`crate::lowering::hold::Handles`] the binder used,
+    /// through the same [`kernels::bind::one`].
+    ///
+    /// `RefCell` because answering MINTS: a staged fact takes a handle, and
+    /// the body holds only a `&self`.
+    answers: Option<(
+        &'r RefCell<crate::lowering::hold::Handles<'r>>,
+        crate::lowering::hold::Facts,
+    )>,
     /// The layers the rectangle covers, and which traced op it came from.
     ///
     /// From the LAUNCH, not from the body: where in the trace a rectangle sits
@@ -109,7 +122,23 @@ impl<'r> Planner<'r> {
             op,
             staged,
             out: RefCell::new(Vec::new()),
+            answers: None,
         }
+    }
+
+    /// The same planner, able to ANSWER a body that asks.
+    ///
+    /// Separate from [`Self::new`] because a probe planner has no fire behind
+    /// it and must not pretend to: a body that asks on one gets
+    /// [`Refusal::Unstated`], which is the honest answer.
+    #[must_use]
+    pub fn answering(
+        mut self,
+        handles: &'r RefCell<crate::lowering::hold::Handles<'r>>,
+        facts: crate::lowering::hold::Facts,
+    ) -> Self {
+        self.answers = Some((handles, facts));
+        self
     }
 
     /// The dispatches the body asked for, in the order it asked.
@@ -140,7 +169,7 @@ impl<'r> Planner<'r> {
 /// yet — see the `InPacked` arm.
 fn lay_out(
     values: &[ArgValue],
-    types: &[(Ty, Provenance)],
+    types: &[Ty],
     handles: &[BoundArg],
     staged: Staged<'_>,
 ) -> Result<(Vec<BoundArg>, Vec<ParamSlot>, Vec<u32>), Refusal> {
@@ -164,7 +193,7 @@ fn lay_out(
         // the only statement of that. Under `kernel!` it was said twice, in
         // the row and in the shader's struct, and only one of the two was
         // ever checked.
-        if types.get(slot).map(|(ty, _)| *ty) == Some(Ty::InPacked) {
+        if types.get(slot).copied() == Some(Ty::InPacked) {
             let ArgValue::U32(word) = *value else {
                 return Err(Refusal::Kind {
                     at: slot,
@@ -191,7 +220,15 @@ fn lay_out(
         // but zero.
         if staged.block
             == Some(match *value {
-                ArgValue::Buffer(handle) | ArgValue::BufferMut(handle) => handle,
+                // A `Shaped` HANDLE IS STILL A HANDLE, here as much as in the
+                // arm below. Leaving it out made the staged block unmatchable
+                // the moment a params handle arrived with its rectangle beside
+                // it -- `packed` was never set, the encoder bound a scalar run
+                // where a struct pointer belongs, and no test could see it
+                // because both are a handle at a slot.
+                ArgValue::Buffer(handle)
+                | ArgValue::BufferMut(handle)
+                | ArgValue::Shaped { handle, .. } => handle,
                 _ => u32::MAX,
             })
         {
@@ -205,7 +242,12 @@ fn lay_out(
             continue;
         }
         match *value {
-            ArgValue::Buffer(handle) | ArgValue::BufferMut(handle) => {
+            // A `Shaped` HANDLE IS STILL A HANDLE: it carries the rectangle
+            // the statement gave the operand, which the marks read and an
+            // encoder does not.
+            ArgValue::Buffer(handle)
+            | ArgValue::BufferMut(handle)
+            | ArgValue::Shaped { handle, .. } => {
                 let bound = handles
                     .get(handle as usize)
                     .ok_or(Refusal::Absent { what: "a buffer" })?;
@@ -365,7 +407,18 @@ fn directed(args: &[BoundArg], values: &[ArgValue]) -> Touches {
 }
 
 impl Encode for Planner<'_> {
-    fn dispatch(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
+    fn resolve(
+        &self,
+        ty: kernels::Ty,
+        source: kernels::Source,
+    ) -> Result<ArgValue, Refusal> {
+        let (handles, facts) = self.answers.ok_or(Refusal::Unstated {
+            what: "a fact, on a planner with no fire behind it",
+        })?;
+        crate::lowering::bind::one(ty, source, &mut handles.borrow_mut(), facts)
+    }
+
+    fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
         // A body with nothing to do should have refused already. A zero here
         // would become `dispatchThreads:` over an empty grid, which runs
         // nothing and reports success — so the buffer keeps whatever it held
@@ -391,7 +444,29 @@ impl Encode for Planner<'_> {
 
         // `bound` is what the slots hold; `args` is what the routine SAID.
         // The direction comes off the latter -- see `ArgValue::BufferMut`.
-        let (bound, param_slots, params) = lay_out(args, self.types, self.handles, self.staged)?;
+        //
+        // THE LIVE HANDLE LIST, NOT THE SNAPSHOT `Planner::new` WAS GIVEN.
+        // Binding the column mints a handle per operand and `plan_routine`
+        // copies the list out before it runs the body -- but a body that ASKS
+        // mints more, into the `Handles` the cell holds, and their indices
+        // point past the copy. The lookup below then answered
+        // `Refusal::Absent { what: "a buffer" }` for every fact a body reached
+        // through `ctx.ask`: the positions table, the KV pages, the mask.
+        //
+        // A probe planner has no cell and keeps the snapshot, which is right:
+        // nothing can have minted anything.
+        // AND THE STAGED BLOCK IS LIVE FOR THE SAME REASON. `ctx.params()`
+        // goes through `resolve` like every other ask, so a body that forwards
+        // its params run MINTS the block while it runs -- after this planner's
+        // snapshot was taken. Reading `self.staged` here left `block` at
+        // `None`, `lay_out` never recognised the pointer, and the encoder
+        // bound a scalar run where a `constant RmsParams&` belongs. Both are
+        // a handle at a slot, so nothing downstream could tell them apart.
+        let live = self.answers.map(|(cell, _)| cell.borrow());
+        let handles = live.as_deref().map_or(self.handles, |h| h.bound());
+        let staged = live.as_deref().map_or(self.staged, super::hold::Handles::staged);
+        let (bound, param_slots, params) = lay_out(args, self.types, handles, staged)?;
+        drop(live);
         self.out.borrow_mut().push(Dispatch {
             symbol: fire.entrypoint,
             file: fire.file,
@@ -423,363 +498,126 @@ impl Encode for Planner<'_> {
 /// name. Where it does not, the shader ships under a prefix the routine does
 /// not carry: every `affine_*` quant entrypoint is spelled from a routine
 /// called `qmm_t` or `qmv_fast`.
-const LIVE: &[(&[Routine<Metal>], &[(&str, &str)])] = &[
-    (
-        kernels_metal::ssm::ROUTINES,
-        &[
-            ("gdn_core", "gdn_core"),
-            (
-                "gdn_core_recurrent",
-                "gdn_core_recurrent",
-            ),
-            (
-                "gdn_core_recurrent_prefill",
-                "gdn_core_recurrent_prefill",
-            ),
-            (
-                "gdn_core_recurrent_slotted",
-                "gdn_core_recurrent_slotted",
-            ),
-            (
-                "gdn_core_slotted",
-                "gdn_core_slotted",
-            ),
-            ("gdn_prep", "gdn_prep"),
-            (
-                "gdn_prep_prefill",
-                "gdn_prep_prefill",
-            ),
-            (
-                "gdn_prep_slotted",
-                "gdn_prep_slotted",
-            ),
-        ],
-    ),
-    (
-        kernels_metal::ptir::ROUTINES,
-        &[(
-            "copy_logits_bf16",
-            "copy_logits_bf16",
-        )],
-    ),
-    (
-        kernels_metal::moe::ROUTINES,
-        &[
-            (
-                "combine_sorted",
-                "combine_sorted",
-            ),
-            (
-                "mxfp4_qmm_t_routed_bias",
-                "mxfp4_qmm_t_routed_bias",
-            ),
-            (
-                "mxfp4_qmv_routed_bias",
-                "mxfp4_qmv_routed_bias",
-            ),
-            (
-                "qmm_t_routed",
-                "affine_qmm_t_routed",
-            ),
-            (
-                "qmm_t_routed_fp16",
-                "affine_qmm_t_routed_fp16",
-            ),
-            ("qmv_routed", "affine_qmv_routed"),
-            (
-                "qmv_routed_bias",
-                "affine_qmv_routed_bias",
-            ),
-            ("route_gather", "route_gather"),
-            ("route_sort", "route_sort"),
-            ("router_topk", "router_topk"),
-            (
-                "router_topk_scaled",
-                "router_topk_scaled",
-            ),
-            (
-                "shared_expert_combine",
-                "shared_expert_combine",
-            ),
-            (
-                "shared_expert_combine_strided",
-                "shared_expert_combine_strided",
-            ),
-        ],
-    ),
-    (
-        kernels_metal::attn::ROUTINES,
-        &[
-            ("gate", "gate"),
-            ("kv_append", "kv_append"),
-            (
-                "kv_append_paged",
-                "kv_append_paged",
-            ),
-            ("logit_softcap", "logit_softcap"),
-            ("q_gate_split", "q_gate_split"),
-            (
-                "sdpa_paged_decode",
-                "sdpa_paged_decode",
-            ),
-            (
-                "sdpa_paged_decode_sink",
-                "sdpa_paged_decode_sink",
-            ),
-            (
-                "sdpa_paged_mma",
-                "sdpa_paged_mma",
-            ),
-            (
-                "sdpa_paged_mma_sink",
-                "sdpa_paged_mma_sink",
-            ),
-            (
-                "sdpa_paged_tiled",
-                "sdpa_paged_tiled",
-            ),
-            (
-                "sdpa_paged_tiled_sink",
-                "sdpa_paged_tiled_sink",
-            ),
-            (
-                "sdpa_paged_tiled_strided",
-                "sdpa_paged_tiled_strided",
-            ),
-            (
-                "sdpa_vector_decode",
-                "sdpa_vector_decode",
-            ),
-            (
-                "sdpa_vector_decode_sink",
-                "sdpa_vector_decode_sink",
-            ),
-            (
-                "sdpa_vector_decode_swa",
-                "sdpa_vector_decode_swa",
-            ),
-            (
-                "split_qkv_bf16",
-                "split_qkv_bf16",
-            ),
-        ],
-    ),
-    (
-        kernels_metal::quant::ROUTINES,
-        &[
-            (
-                "cast_qmm_input_bfloat16_to_float16",
-                "cast_qmm_input_bfloat16_to_float16",
-            ),
-            (
-                "cast_qmm_input_strided_bfloat16_to_float16",
-                "cast_qmm_input_strided_bfloat16_to_float16",
-            ),
-            (
-                "encode_u4_bf16",
-                "affine_encode_u4_bf16",
-            ),
-            (
-                "encode_u4_f32",
-                "affine_encode_u4_f32",
-            ),
-            (
-                "mxfp4_dequant_bf16",
-                "mxfp4_dequant_bf16",
-            ),
-            (
-                "qmm_splitk_reduce",
-                "qmm_splitk_reduce",
-            ),
-            (
-                "qmm_splitk_reduce_f32",
-                "qmm_splitk_reduce_f32",
-            ),
-            ("qmm_t", "affine_qmm_t"),
-            (
-                "qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4",
-                "affine_qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4",
-            ),
-            (
-                "qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2",
-                "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2",
-            ),
-            (
-                "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2",
-                "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2",
-            ),
-            (
-                "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1",
-                "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1",
-            ),
-            (
-                "qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4",
-                "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4",
-            ),
-            ("qmm_t_bias", "affine_qmm_t_bias"),
-            (
-                "qmm_t_bias_fp16_precast",
-                "affine_qmm_t_bias_fp16_precast",
-            ),
-            (
-                "qmm_t_fp16_precast",
-                "affine_qmm_t_fp16_precast",
-            ),
-            (
-                "qmm_t_residual",
-                "affine_qmm_t_residual",
-            ),
-            (
-                "qmm_t_residual_fp16_precast",
-                "affine_qmm_t_residual_fp16_precast",
-            ),
-            (
-                "qmm_t_splitk",
-                "affine_qmm_t_splitk",
-            ),
-            (
-                "qmm_t_splitk_f32",
-                "affine_qmm_t_splitk_f32",
-            ),
-            (
-                "qmm_t_splitk_fp16_precast",
-                "affine_qmm_t_splitk_fp16_precast",
-            ),
-            (
-                "qmm_t_splitk_fp16_precast_f32",
-                "affine_qmm_t_splitk_fp16_precast_f32",
-            ),
-            (
-                "qmm_t_strided",
-                "affine_qmm_t_strided",
-            ),
-            (
-                "qmm_t_strided_fp16_precast",
-                "affine_qmm_t_strided_fp16_precast",
-            ),
-            (
-                "qmm_t_strided_fp16_precast_residual",
-                "affine_qmm_t_strided_fp16_precast_residual",
-            ),
-            (
-                "qmm_t_strided_residual",
-                "affine_qmm_t_strided_residual",
-            ),
-            ("qmv_fast", "affine_qmv_fast"),
-            (
-                "qmv_fast_residual",
-                "affine_qmv_fast_residual",
-            ),
-            ("qmv_tail", "affine_qmv_tail"),
-            (
-                "qmv_tail_bias",
-                "affine_qmv_tail_bias",
-            ),
-            (
-                "qmv_wide_strided",
-                "affine_qmv_wide_strided",
-            ),
-        ],
-    ),
-    (
-        kernels_metal::norm::ROUTINES,
-        &[
-            ("add_bias", "add_bias"),
-            ("gated_rms", "gated_rms"),
-            (
-                "gated_rms_strided",
-                "gated_rms_strided",
-            ),
-            (
-                "layer_scalar_mul",
-                "layer_scalar_mul",
-            ),
-            ("residual_add", "residual_add"),
-            (
-                "residual_add_strided",
-                "residual_add_strided",
-            ),
-            ("rms_residual", "rms_residual"),
-            (
-                "rms_residual_scaled",
-                "rms_residual_scaled",
-            ),
-            (
-                "rms_single_row",
-                "rms_single_row",
-            ),
-            (
-                "rms_strided_head_row",
-                "rms_strided_head_row",
-            ),
-            (
-                "rms_strided_row",
-                "rms_strided_row",
-            ),
-            (
-                "vnorm_single_row",
-                "vnorm_single_row",
-            ),
-        ],
-    ),
-    (
-        kernels_metal::rope::ROUTINES,
-        &[
-            ("neox_decode", "neox_decode"),
-            ("neox_mb", "neox_mb"),
-            (
-                "neox_prop_decode",
-                "neox_prop_decode",
-            ),
-            ("neox_prop_mb", "neox_prop_mb"),
-            (
-                "neox_freqs_decode",
-                "neox_freqs_decode",
-            ),
-            ("neox_freqs_mb", "neox_freqs_mb"),
-            ("neox_strided", "neox_strided"),
-        ],
-    ),
-    (
-        kernels_metal::layout::ROUTINES,
-        &[
-            (
-                "embed_gather_4bit",
-                "embed_gather_4bit",
-            ),
-            (
-                "embed_gather_mb_4bit",
-                "embed_gather_mb_4bit",
-            ),
-            (
-                "embed_gather_scaled_4bit",
-                "embed_gather_scaled_4bit",
-            ),
-            (
-                "embed_gather_scaled_mb_4bit",
-                "embed_gather_scaled_mb_4bit",
-            ),
-            ("ple_combine", "ple_combine"),
-            ("row_gather", "row_gather"),
-        ],
-    ),
-    (
-        kernels_metal::mlp::ROUTINES,
-        &[
-            ("geglu_tanh", "geglu_tanh"),
-            (
-                "geglu_tanh_strided",
-                "geglu_tanh_strided",
-            ),
-            ("gptoss_swiglu", "gptoss_swiglu"),
-            ("silu_mul", "silu_mul"),
-        ],
-    ),
-    (
-        kernels_metal::sample::ROUTINES,
-        &[("argmax_logits", "argmax_logits")],
-    ),
+const LIVE: &[(&str, &str)] = &[
+    ("gdn_core", "gdn_core"),
+    ("gdn_prep", "gdn_prep"),
+    ("qmv_routed", "affine_qmv_routed"),
+    ("route_gather", "route_gather"),
+    ("route_sort", "route_sort"),
+    ("router_topk", "router_topk"),
+    ("gate", "gate"),
+    ("kv_append", "kv_append"),
+    ("logit_softcap", "logit_softcap"),
+    ("q_gate_split", "q_gate_split"),
+    ("qmm_t", "affine_qmm_t"),
+    ("qmm_t_bias", "affine_qmm_t_bias"),
+    ("qmv_fast", "affine_qmv_fast"),
+    ("qmv_tail", "affine_qmv_tail"),
+    ("add_bias", "add_bias"),
+    ("gated_rms", "gated_rms"),
+    ("residual_add", "residual_add"),
+    ("rms_residual", "rms_residual"),
+    ("neox_decode", "neox_decode"),
+    ("neox_mb", "neox_mb"),
+    ("neox_prop_mb", "neox_prop_mb"),
+    ("neox_freqs_mb", "neox_freqs_mb"),
+    ("neox_strided", "neox_strided"),
+    ("ple_combine", "ple_combine"),
+    ("row_gather", "row_gather"),
+    ("geglu_tanh", "geglu_tanh"),
+    ("gptoss_swiglu", "gptoss_swiglu"),
+    ("silu_mul", "silu_mul"),
+    ("argmax_logits", "argmax_logits"),
+    // THE SEVENTY THE FLATTENING DROPPED. `LIVE` was `&[(&[Routine],
+    // &[(name, stem)])]` -- twenty-eight FAMILY rows holding ninety-nine
+    // arms between them -- and collapsing it to one pair per row kept a
+    // row's first arm and lost the rest. Nothing said so: `arm_for` still
+    // answered for what remained, and a routine whose arm was gone came
+    // back `Unclaimed` at dispatch, which reads like a family that never
+    // crossed rather than one whose crossing was deleted.
+    ("gdn_core_recurrent", "gdn_core_recurrent"),
+    ("gdn_core_recurrent_prefill", "gdn_core_recurrent_prefill"),
+    ("gdn_core_recurrent_slotted", "gdn_core_recurrent_slotted"),
+    ("gdn_core_slotted", "gdn_core_slotted"),
+    ("gdn_prep_prefill", "gdn_prep_prefill"),
+    ("gdn_prep_slotted", "gdn_prep_slotted"),
+    ("copy_logits_bf16", "copy_logits_bf16"),
+    ("combine_sorted", "combine_sorted"),
+    ("mxfp4_qmm_t_routed_bias", "mxfp4_qmm_t_routed_bias"),
+    ("mxfp4_qmv_routed_bias", "mxfp4_qmv_routed_bias"),
+    ("qmm_t_routed", "affine_qmm_t_routed"),
+    ("qmm_t_routed_fp16", "affine_qmm_t_routed_fp16"),
+    ("qmv_routed_bias", "affine_qmv_routed_bias"),
+    ("router_topk_scaled", "router_topk_scaled"),
+    ("shared_expert_combine", "shared_expert_combine"),
+    ("shared_expert_combine_strided", "shared_expert_combine_strided"),
+    ("kv_append_paged", "kv_append_paged"),
+    ("sdpa_paged_decode", "sdpa_paged_decode"),
+    ("sdpa_paged_decode_sink", "sdpa_paged_decode_sink"),
+    ("sdpa_paged_mma", "sdpa_paged_mma"),
+    ("sdpa_paged_mma_sink", "sdpa_paged_mma_sink"),
+    ("sdpa_paged_tiled", "sdpa_paged_tiled"),
+    ("sdpa_paged_tiled_sink", "sdpa_paged_tiled_sink"),
+    ("sdpa_paged_tiled_strided", "sdpa_paged_tiled_strided"),
+    ("sdpa_vector_decode", "sdpa_vector_decode"),
+    ("sdpa_vector_decode_sink", "sdpa_vector_decode_sink"),
+    ("sdpa_vector_decode_swa", "sdpa_vector_decode_swa"),
+    ("split_qkv_bf16", "split_qkv_bf16"),
+    ("cast_qmm_input_bfloat16_to_float16", "cast_qmm_input_bfloat16_to_float16"),
+    ("cast_qmm_input_strided_bfloat16_to_float16", "cast_qmm_input_strided_bfloat16_to_float16"),
+    ("encode_u4_bf16", "affine_encode_u4_bf16"),
+    ("encode_u4_f32", "affine_encode_u4_f32"),
+    ("mxfp4_dequant_bf16", "mxfp4_dequant_bf16"),
+    ("qmm_splitk_reduce", "qmm_splitk_reduce"),
+    ("qmm_splitk_reduce_f32", "qmm_splitk_reduce_f32"),
+    ("qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4", "affine_qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4"),
+    ("qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2", "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2"),
+    ("qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2", "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2"),
+    ("qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1", "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1"),
+    ("qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4", "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4"),
+    ("qmm_t_bias_fp16_precast", "affine_qmm_t_bias_fp16_precast"),
+    ("qmm_t_fp16_precast", "affine_qmm_t_fp16_precast"),
+    ("qmm_t_residual", "affine_qmm_t_residual"),
+    ("qmm_t_residual_fp16_precast", "affine_qmm_t_residual_fp16_precast"),
+    ("qmm_t_splitk", "affine_qmm_t_splitk"),
+    ("qmm_t_splitk_f32", "affine_qmm_t_splitk_f32"),
+    ("qmm_t_splitk_fp16_precast", "affine_qmm_t_splitk_fp16_precast"),
+    ("qmm_t_splitk_fp16_precast_f32", "affine_qmm_t_splitk_fp16_precast_f32"),
+    ("qmm_t_strided", "affine_qmm_t_strided"),
+    ("qmm_t_strided_fp16_precast", "affine_qmm_t_strided_fp16_precast"),
+    ("qmm_t_strided_fp16_precast_residual", "affine_qmm_t_strided_fp16_precast_residual"),
+    ("qmm_t_strided_residual", "affine_qmm_t_strided_residual"),
+    ("qmv_fast_residual", "affine_qmv_fast_residual"),
+    ("qmv_tail_bias", "affine_qmv_tail_bias"),
+    ("qmv_wide_strided", "affine_qmv_wide_strided"),
+    ("gated_rms_strided", "gated_rms_strided"),
+    ("layer_scalar_mul", "layer_scalar_mul"),
+    ("residual_add_strided", "residual_add_strided"),
+    ("rms_residual_scaled", "rms_residual_scaled"),
+    ("rms_single_row", "rms_single_row"),
+    ("rms_strided_head_row", "rms_strided_head_row"),
+    ("rms_strided_row", "rms_strided_row"),
+    ("vnorm_single_row", "vnorm_single_row"),
+    ("neox_prop_decode", "neox_prop_decode"),
+    ("neox_freqs_decode", "neox_freqs_decode"),
+    ("embed_gather_4bit", "embed_gather_4bit"),
+    ("embed_gather_mb_4bit", "embed_gather_mb_4bit"),
+    ("embed_gather_scaled_4bit", "embed_gather_scaled_4bit"),
+    ("embed_gather_scaled_mb_4bit", "embed_gather_scaled_mb_4bit"),
+    ("geglu_tanh_strided", "geglu_tanh_strided"),
 ];
+
+/// The routine `name` names, out of the crate-wide slice.
+///
+/// [`LIVE`] USED TO CARRY THE SCOPE as well as the pairs: each row was
+/// `(&[Routine], &[(name, stem)])`, and the first half existed only to bound
+/// the `r.name == name` search to one family. Names are unique across the
+/// crate -- `no_symbol_is_declared_twice` is what says so -- so the bound was
+/// never doing anything, and with the families gone there is nothing to write
+/// it with.
+fn row(name: &str) -> Option<&'static Routine<Metal>> {
+    kernels_metal::ROUTINES.iter().find(|r| r.name == name)
+}
 
 /// The routine this driver calls for `name`, if its family has crossed.
 ///
@@ -798,10 +636,8 @@ const LIVE: &[(&[Routine<Metal>], &[(&str, &str)])] = &[
 /// `every_routine_this_backend_builds_has_an_arm` refuses.
 #[must_use]
 pub fn arm_for(name: &str) -> Option<&'static Routine<Metal>> {
-    LIVE.iter().find_map(|(routines, arms)| {
-        arms.iter().find(|(n, _)| *n == name)?;
-        routines.iter().find(|r| r.name == name)
-    })
+    LIVE.iter().find(|(n, _)| *n == name)?;
+    row(name)
 }
 
 /// The routine a plan's SYMBOL names, by the longest stem it starts with.
@@ -844,11 +680,10 @@ pub fn crossed(symbol: &str) -> Option<&'static Routine<Metal>> {
         .map(|(stem, _)| stem.len())
         .max();
     LIVE.iter()
-        .flat_map(|(routines, arms)| arms.iter().map(move |arm| (routines, arm)))
-        .filter(|(_, (_, stem))| claims(stem))
-        .max_by_key(|(_, (_, stem))| stem.len())
-        .filter(|(_, (_, stem))| dark.is_none_or(|d| stem.len() > d))
-        .and_then(|(routines, (name, _))| routines.iter().find(|r| r.name == *name))
+        .filter(|(_, stem)| claims(stem))
+        .max_by_key(|(_, stem)| stem.len())
+        .filter(|(_, stem)| dark.is_none_or(|d| stem.len() > d))
+        .and_then(|(name, _)| row(name))
 }
 
 /// Every stem this backend crosses, with the routine it names.
@@ -861,11 +696,7 @@ pub fn crossed(symbol: &str) -> Option<&'static Routine<Metal>> {
 /// nothing and says so by passing.
 #[must_use]
 pub fn stems() -> impl Iterator<Item = (&'static str, &'static Routine<Metal>)> {
-    LIVE.iter().flat_map(|(routines, arms)| {
-        arms.iter().filter_map(move |(name, stem)| {
-            Some((*stem, routines.iter().find(|r| r.name == *name)?))
-        })
-    })
+    LIVE.iter().filter_map(|(name, stem)| Some((*stem, row(name)?)))
 }
 
 /// Entrypoint stems this backend deliberately does NOT cross, and why.
@@ -899,7 +730,8 @@ mod tests {
         block: None,
         words: &[],
     };
-    use kernels_metal::routine::{Bind, Buf, BufMut, Ctx, Env, Usize};
+    use kernels::Grid;
+    use kernels_metal::routine::{Bind, Ctx, In, Out, Tensor, Usize, bf16};
 
     fn handle(address: u64, width: u32) -> BoundArg {
         BoundArg {
@@ -922,29 +754,28 @@ mod tests {
     /// what `tests/` is for once a family has crossed.
     fn scale_rows(
         ctx: &Ctx<'_>,
-        x: Buf,
-        out: BufMut,
+        x: In<Tensor<bf16>>,
+        out: Out<Tensor<bf16>>,
         width: u32,
         stride: Usize,
-        rows: Env<u32>,
+        // A PLAIN NUMBER: this probe's `fn` is not a `#[routine]`, so `Env`
+        // was never marking a column here -- it only kept the scalar from
+        // reading as an operand, which nothing counts any more.
+        rows: u32,
     ) -> Result<(), Refusal> {
-        if *rows == 0 {
+        if rows == 0 {
             return Err(Refusal::Empty { what: "rows" });
         }
-        ctx.dispatch(
-            Fire {
-                entrypoint: "scale_rows_bfloat16",
-                file: "norm/scale.metal",
-                lanes: [width, *rows, 1],
-                group: [32, 1, 1],
-            },
-            &[x.v(), out.v(), width.v(), stride.v()],
+        ctx.fire(
+            Fire::at("norm/scale.metal", "scale_rows_bfloat16")
+                .apply(Grid::of([width, rows, 1], [32, 1, 1])),
+            &[x.arg(), out.arg(), width.arg(), stride.arg()],
         )
     }
 
     /// The row `scale_rows` derives, for a planner to read its types off.
     static ROUTINE: std::sync::LazyLock<Routine<Metal>> =
-        std::sync::LazyLock::new(|| kernels_metal::routine!(scale_rows));
+        std::sync::LazyLock::new(|| kernels::routine!(Metal, "scale_rows", scale_rows, namespace = ""));
 
     /// The planner turns a body's statement into the dispatch the encoder
     /// already knows how to run.
@@ -960,7 +791,7 @@ mod tests {
         let handles = [handle(0x1000, 64), handle(0x2000, 64)];
         let planner = Planner::new(&ROUTINE, &handles, NO_BLOCK, 0..1, 7);
 
-        scale_rows(&planner, Buf(0), BufMut(1), 64, Usize(128), Env(8))
+        scale_rows(&planner, In::new(Tensor::new(0)), Out::new(Tensor::new(1)), 64, Usize(128), 8)
             .expect("eight rows is a launch");
 
         let plan = planner.finish();
@@ -1020,20 +851,22 @@ mod tests {
     /// `pad` is taken once and bound at every hole, so the dispatch list and
     /// the parameter list are different lists: `out` is the signature's
     /// second entry and the dispatch's fourth. See [`directed`].
-    fn holed(ctx: &Ctx<'_>, pad: Buf, out: BufMut, x: Buf, width: u32) -> Result<(), Refusal> {
-        ctx.dispatch(
-            Fire {
-                entrypoint: "holed_bfloat16",
-                file: "norm/scale.metal",
-                lanes: [width, 1, 1],
-                group: [32, 1, 1],
-            },
-            &[pad.v(), pad.v(), x.v(), out.v(), width.v()],
+    fn holed(
+        ctx: &Ctx<'_>,
+        pad: In<Tensor<bf16>>,
+        out: Out<Tensor<bf16>>,
+        x: In<Tensor<bf16>>,
+        width: u32,
+    ) -> Result<(), Refusal> {
+        ctx.fire(
+            Fire::at("norm/scale.metal", "holed_bfloat16")
+                .apply(Grid::of([width, 1, 1], [32, 1, 1])),
+            &[pad.arg(), pad.arg(), x.arg(), out.arg(), width.arg()],
         )
     }
 
     static HOLED: std::sync::LazyLock<Routine<Metal>> =
-        std::sync::LazyLock::new(|| kernels_metal::routine!(holed));
+        std::sync::LazyLock::new(|| kernels::routine!(Metal, "holed", holed, namespace = ""));
 
     /// A padded routine still says which buffer it WRITES.
     ///
@@ -1048,7 +881,7 @@ mod tests {
     fn a_body_with_pad_slots_still_declares_the_buffer_it_writes() {
         let handles = [handle(0x1000, 64), handle(0x2000, 64), handle(0x3000, 64)];
         let planner = Planner::new(&HOLED, &handles, NO_BLOCK, 0..1, 0);
-        holed(&planner, Buf(0), BufMut(1), Buf(2), 64).expect("a launch");
+        holed(&planner, In::new(Tensor::new(0)), Out::new(Tensor::new(1)), In::new(Tensor::new(2)), 64).expect("a launch");
         let plan = planner.finish();
         let d = &plan[0];
         assert_eq!(
@@ -1073,7 +906,7 @@ mod tests {
         let handles = [handle(0x1000, 64), handle(0x2000, 64)];
         let planner = Planner::new(&ROUTINE, &handles, NO_BLOCK, 0..1, 7);
         assert_eq!(
-            scale_rows(&planner, Buf(0), BufMut(1), 64, Usize(128), Env(0)),
+            scale_rows(&planner, In::new(Tensor::new(0)), Out::new(Tensor::new(1)), 64, Usize(128), 0),
             Err(Refusal::Empty { what: "rows" })
         );
         assert!(planner.finish().is_empty());
@@ -1085,7 +918,7 @@ mod tests {
         let handles = [handle(0x1000, 64)];
         let planner = Planner::new(&ROUTINE, &handles, NO_BLOCK, 0..1, 7);
         assert_eq!(
-            scale_rows(&planner, Buf(0), BufMut(1), 64, Usize(128), Env(8)),
+            scale_rows(&planner, In::new(Tensor::new(0)), Out::new(Tensor::new(1)), 64, Usize(128), 8),
             Err(Refusal::Absent { what: "a buffer" })
         );
         assert!(
@@ -1107,7 +940,7 @@ mod tests {
         let handles = [handle(0x1000, 64), handle(0x2000, 64)];
         let planner = Planner::new(&ROUTINE, &handles, NO_BLOCK, 0..1, 7);
         assert_eq!(
-            scale_rows(&planner, Buf(0), BufMut(1), 0, Usize(128), Env(8)),
+            scale_rows(&planner, In::new(Tensor::new(0)), Out::new(Tensor::new(1)), 0, Usize(128), 8),
             Err(Refusal::Grid {
                 what: "the threads a routine asked for",
                 at: 0
@@ -1124,11 +957,14 @@ mod tests {
         assert_eq!(
             ROUTINE.args,
             &[
-                (Ty::Buf, Provenance::Trace),
-                (Ty::BufMut, Provenance::Trace),
-                (Ty::U32, Provenance::Trace),
-                (Ty::Usize, Provenance::Trace),
-                (Ty::U32, Provenance::Env),
+                // `Bf16s`, not `Buf`: the ELEMENT states the type now, and
+                // `In<Tensor<bf16>>` records which element it carries where
+                // the untyped handle recorded only that it was a buffer.
+                Ty::Bf16s,
+                Ty::Bf16sMut,
+                Ty::U32,
+                Ty::Usize,
+                Ty::U32,
             ]
         );
     }
@@ -1147,16 +983,13 @@ mod tests {
     /// the same shape one level down.
     #[test]
     fn every_arm_names_a_routine_that_exists() {
-        for (routines, arms) in LIVE {
-            for (name, _) in *arms {
-                assert!(
-                    routines.iter().any(|r| r.name == *name),
-                    "{name}: an arm for a routine this family does not have \
-                     -- `arm_for` answers `None`, so nothing could dispatch \
-                     the symbol at all"
-                );
-                assert!(arm_for(name).is_some(), "{name}");
-            }
+        for (name, _) in LIVE {
+            assert!(
+                row(name).is_some(),
+                "{name}: an arm for a routine no module declares -- `arm_for` \
+                 answers `None`, so nothing could dispatch the symbol at all"
+            );
+            assert!(arm_for(name).is_some(), "{name}");
         }
     }
 
@@ -1167,8 +1000,8 @@ mod tests {
     /// a table path that Stage 5 is about to delete.
     #[test]
     fn every_routine_this_backend_builds_has_an_arm() {
-        let live: usize = LIVE.iter().map(|(_, arms)| arms.len()).sum();
-        let built: usize = LIVE.iter().map(|(routines, _)| routines.len()).sum();
+        let live: usize = LIVE.len();
+        let built: usize = kernels_metal::ROUTINES.len();
         assert_eq!(live, built, "an arm per routine, all ten families");
         assert_eq!(live, 99);
         for name in ["rms_single_row", "sdpa_paged_decode", "qmm_t", "gdn_core"] {
@@ -1263,6 +1096,8 @@ mod tests {
         let fits = |ty: Ty, v: ArgValue| match ty {
             Ty::BufMut
             | Ty::Buf
+            | Ty::Bf16s
+            | Ty::Bf16sMut
             | Ty::I32s
             | Ty::I32sMut
             | Ty::U32s
@@ -1270,7 +1105,22 @@ mod tests {
             | Ty::U8s
             | Ty::U8sMut
             | Ty::F32s
-            | Ty::F32sMut => matches!(v, ArgValue::Buffer(_) | ArgValue::BufferMut(_)),
+            | Ty::F32sMut
+            // THE HALF PAIR, WHICH THE MARKS MADE REACHABLE. `Tensor<f16>` is
+            // an element like any other now, so a routine can declare one --
+            // the precast matmuls do -- and it binds a handle exactly as the
+            // other twelve do.
+            | Ty::F16s
+            | Ty::F16sMut => matches!(
+                v,
+                // `Shaped` IS A BUFFER, and `kind()` already says so -- it is
+                // a handle that carries the rectangle the statement gave the
+                // operand, which the binder produces wherever a mark's region
+                // is known. Leaving it out here read as "the binder bound a
+                // buffer where a buffer was wanted", which is not a sentence
+                // anyone could act on.
+                ArgValue::Buffer(_) | ArgValue::BufferMut(_) | ArgValue::Shaped { .. }
+            ),
             Ty::I32 => matches!(v, ArgValue::I32(_)),
             // `InPacked` carries a `u32`'s value and is not a `u32`: it is a
             // FIELD of the preceding params struct, which is why it has a kind
@@ -1310,9 +1160,9 @@ mod tests {
         };
 
         let mut wrong: Vec<String> = Vec::new();
-        for (routines, arms) in LIVE {
-            for (name, stem) in *arms {
-                let Some(routine) = routines.iter().find(|r| r.name == *name) else {
+        for (name, stem) in LIVE {
+            {
+                let Some(routine) = row(name) else {
                     wrong.push(format!("  {stem} -> `{name}`: no routine of that name"));
                     continue;
                 };
@@ -1348,7 +1198,7 @@ mod tests {
                     ));
                     continue;
                 }
-                for (at, (value, (ty, _))) in built.iter().zip(routine.args).enumerate() {
+                for (at, (value, ty)) in built.iter().zip(routine.args).enumerate() {
                     if !fits(*ty, *value) {
                         wrong.push(format!(
                             "  {stem} -> `{name}`: argument {at} is {ty:?} and \
@@ -1413,8 +1263,8 @@ mod tests {
     /// a way `max_by_key` resolves silently.
     #[test]
     fn every_stem_finds_its_own_routine() {
-        for (_, arms) in LIVE {
-            for (name, stem) in *arms {
+        {
+            for (name, stem) in LIVE {
                 let got = crossed(stem)
                     .unwrap_or_else(|| panic!("`{stem}` resolves nothing"))
                     .name;
@@ -1526,9 +1376,9 @@ mod tests {
 
         let mut unanswered: Vec<String> = Vec::new();
         let mut asked = 0usize;
-        for (routines, arms) in LIVE {
-            for (name, _stem) in *arms {
-                let Some(routine) = routines.iter().find(|r| r.name == *name) else {
+        {
+            for (name, _stem) in LIVE {
+                let Some(routine) = row(name) else {
                     continue;
                 };
                 for at in 0..routine.args.len() {
@@ -1563,16 +1413,20 @@ mod tests {
         // `find` stopped matching, and it has happened twice on this ladder.
         let total: usize = LIVE
             .iter()
-            .flat_map(|(routines, arms)| {
-                arms.iter()
-                    .filter_map(|(name, _)| routines.iter().find(|r| r.name == *name))
-            })
+            .filter_map(|(name, _)| row(name))
             .map(|routine| routine.args.len())
             .sum();
         assert_eq!(asked, total, "every argument of every routine is asked");
+        // THE FLOOR MOVED BECAUSE THE COLUMN DID. It read `> 900` against a
+        // column of a thousand-odd, and the marks migration took it to 572:
+        // every fact a body now reaches for with `ctx.ask` has left the
+        // parameter run, and `args` enumerates the run. The floor is still a
+        // floor -- it catches `LIVE` emptying or the `find` going quiet, which
+        // is what it is for -- and 500 is the same distance below 572 that 900
+        // was below the old count.
         assert!(
-            asked > 900,
-            "only {asked} arguments asked; the column is 1,000-odd"
+            asked > 500,
+            "only {asked} arguments asked; the column is 570-odd"
         );
         println!("arguments asked: {asked}");
     }

@@ -7664,7 +7664,8 @@
             "layer": 0
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -7999,7 +8000,8 @@
             "layer": 1
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -8334,7 +8336,8 @@
             "layer": 2
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -8669,7 +8672,8 @@
             "layer": 3
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -9004,7 +9008,8 @@
             "layer": 4
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -9364,10 +9369,7 @@
           "state": {
             "store": "KvCache",
             "layer": 5
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -9701,7 +9703,8 @@
             "layer": 6
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -10036,7 +10039,8 @@
             "layer": 7
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -10371,7 +10375,8 @@
             "layer": 8
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -10706,7 +10711,8 @@
             "layer": 9
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -11041,7 +11047,8 @@
             "layer": 10
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -11401,10 +11408,7 @@
           "state": {
             "store": "KvCache",
             "layer": 11
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -11738,7 +11742,8 @@
             "layer": 12
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -12073,7 +12078,8 @@
             "layer": 13
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -12408,7 +12414,8 @@
             "layer": 14
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -12743,7 +12750,8 @@
             "layer": 15
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -13078,7 +13086,8 @@
             "layer": 16
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -13438,10 +13447,7 @@
           "state": {
             "store": "KvCache",
             "layer": 17
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -13775,7 +13781,8 @@
             "layer": 18
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -14110,7 +14117,8 @@
             "layer": 19
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -14445,7 +14453,8 @@
             "layer": 20
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -14780,7 +14789,8 @@
             "layer": 21
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -15115,7 +15125,8 @@
             "layer": 22
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -15475,10 +15486,7 @@
           "state": {
             "store": "KvCache",
             "layer": 23
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -15696,7 +15704,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.24.q_norm"
           ]
@@ -15732,7 +15740,8 @@
             "layer": 22
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -15951,7 +15960,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.25.q_norm"
           ]
@@ -15987,7 +15996,8 @@
             "layer": 22
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -16206,7 +16216,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.26.q_norm"
           ]
@@ -16242,7 +16252,8 @@
             "layer": 22
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -16461,7 +16472,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.27.q_norm"
           ]
@@ -16497,7 +16508,8 @@
             "layer": 22
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -16716,7 +16728,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.28.q_norm"
           ]
@@ -16752,7 +16764,8 @@
             "layer": 22
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -16986,7 +16999,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::rope_partial_bf16",
+          "kernel": "rope::rope_partial_q_bf16",
           "params": [
             128
           ]
@@ -17020,10 +17033,7 @@
           "state": {
             "store": "KvCache",
             "layer": 23
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -17241,7 +17251,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.30.q_norm"
           ]
@@ -17277,7 +17287,8 @@
             "layer": 22
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -17496,7 +17507,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.31.q_norm"
           ]
@@ -17532,7 +17543,8 @@
             "layer": 22
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -17751,7 +17763,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.32.q_norm"
           ]
@@ -17787,7 +17799,8 @@
             "layer": 22
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -18006,7 +18019,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.33.q_norm"
           ]
@@ -18042,7 +18055,8 @@
             "layer": 22
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -18261,7 +18275,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.34.q_norm"
           ]
@@ -18297,7 +18311,8 @@
             "layer": 22
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -18531,7 +18546,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::rope_partial_bf16",
+          "kernel": "rope::rope_partial_q_bf16",
           "params": [
             128
           ]
@@ -18565,10 +18580,7 @@
           "state": {
             "store": "KvCache",
             "layer": 23
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [
@@ -18786,7 +18798,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.36.q_norm"
           ]
@@ -18822,7 +18834,8 @@
             "layer": 22
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -19041,7 +19054,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.37.q_norm"
           ]
@@ -19077,7 +19090,8 @@
             "layer": 22
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -19296,7 +19310,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.38.q_norm"
           ]
@@ -19332,7 +19346,8 @@
             "layer": 22
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -19551,7 +19566,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.39.q_norm"
           ]
@@ -19587,7 +19602,8 @@
             "layer": 22
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -19806,7 +19822,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::qk_rmsnorm_rope_bf16_rounded",
+          "kernel": "rope::q_rmsnorm_rope_bf16_rounded",
           "weights": [
             "layer.40.q_norm"
           ]
@@ -19842,7 +19858,8 @@
             "layer": 22
           },
           "params": [
-            4294967295
+            0,
+            1065353216
           ]
         }
       },
@@ -20076,7 +20093,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "rope::rope_partial_bf16",
+          "kernel": "rope::rope_partial_q_bf16",
           "params": [
             128
           ]
@@ -20110,10 +20127,7 @@
           "state": {
             "store": "KvCache",
             "layer": 23
-          },
-          "params": [
-            4294967295
-          ]
+          }
         }
       },
       "inputs": [

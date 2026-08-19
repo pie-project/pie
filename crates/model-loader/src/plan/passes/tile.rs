@@ -38,14 +38,20 @@ use crate::types::{BackendKind, BufferId, DType, Encoding, QuantScheme};
 ///
 /// What keeps them honest is the other side: with `feature = "cuda"` on,
 /// `executor::cuda` calls exactly these as the typed `x::quant` host programs
-/// they are, and a test resolves each against `kernels_cuda::routine`. A
-/// symbol that stopped existing fails that build rather than becoming a plan
-/// nothing can run.
+/// they are, so a symbol that stopped existing fails that build rather than
+/// becoming a plan nothing can run.
+///
+/// THE FOUR ARE NOT ALL THE SAME KIND OF NAME. The first two are `kernels-
+/// cuda` ROUTINES and a test resolves each against `kernels_cuda::routine`.
+/// The two quantisers are not routines and must not be looked for there: no
+/// trace states a load-time weight transform, so they are plain `unsafe fn`s
+/// and these strings are the LOADER's own vocabulary — the word a plan
+/// carries from `tile` to `executor::cuda`'s dispatch, and nothing wider.
 ///
 /// The typed call and the string are two halves of one claim, and only
 /// together: the call is checked by the compiler and does not know what this
 /// constant says; the constant is what a plan carries and the compiler cannot
-/// read it. The test is where the two meet.
+/// read it. `executor::cuda`'s test is where the two meet.
 pub const CUDA_CAST_FP32_TO_BF16: &str = "quant::cast_fp32_to_bf16";
 pub const CUDA_SCALE_ROWS_BF16: &str = "quant::scale_rows_bf16";
 pub const CUDA_QUANTIZE_BF16_TO_MXFP4: &str = "quant::quantize_bf16_to_mxfp4_e2m1_per_block";

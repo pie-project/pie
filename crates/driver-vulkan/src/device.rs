@@ -3559,8 +3559,9 @@ impl Span {
 ///     dispatches may overlap, so the earlier one's reads can land after the
 ///     later one's write and see the new bytes.
 ///
-/// An operand the kernel row marks [`kernels::Ty::BufMut`] counts as both,
-/// since "may write through" does not say it does not also read.
+/// An operand the kernel row marks writable — [`kernels::Binds::Writes`] —
+/// counts as both, since "may write through" does not say it does not also
+/// read.
 ///
 /// The write-after-read case is the one this crate cannot demonstrate, and
 /// that is recorded rather than hidden. Dropping it entirely leaves the

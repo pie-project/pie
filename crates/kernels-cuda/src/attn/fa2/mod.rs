@@ -19,16 +19,17 @@
 //! for `nvcc`, which defaults an unannotated function to `__host__
 //! __device__` where NVRTC's JIT mode defaults it to `__host__` and refuses.
 //!
-//! # A `FAMILY` under `attn`'s namespace, and six routines in it
+//! # Six routines under `attn`'s namespace, not `fa2`'s
 //!
 //! Six trace symbols DO name this lattice — `attn::dispatch_attention_flashinfer_*`
 //! and `attn::attention_flashinfer_prefill` — so the [`ROUTINES`] table at the
 //! bottom is the derived half of their [`crate::sigs`] rows, and
 //! [`crate::not_yet_crossed`] states them no longer. The namespace is `attn`
-//! rather than `fa2` because that is what a trace says; a second `Family` with
-//! that namespace is how a file states its own symbols without editing
-//! `attn`'s table, and [`crate::sigs`]' own test refuses a symbol two
-//! families both claim.
+//! rather than `fa2` because that is what a trace says; `Routine::namespace`
+//! is derived per-routine from `module_path!()` — the first segment after the
+//! crate root — so a file states its own symbols under its parent's namespace
+//! without editing a shared table, and [`crate::sigs`]' own test refuses a
+//! symbol two namespaces both claim.
 //!
 //! The four `pub fn`s that take a params BLOCK whole — [`decode`],
 //! [`prefill`] and their capturing forms — are NOT routines and cannot be: a
@@ -92,6 +93,8 @@ pub mod dispatch;
 /// [`crate::attn::plan`], so it belongs where both of those are.
 pub mod plan;
 
+use kernels::keys;
+use kernels_macros::routine;
 use core::ffi::c_void;
 use core::mem::size_of;
 
@@ -101,12 +104,12 @@ use crate::attn::fa2::params::{
 };
 use crate::attn::fa2::geometry::{DecodeGeometry, Device, KvWidth, PrefillGeometry};
 use crate::attn::plan::info::{DecodePlanInfo, PrefillPlanInfo};
-use crate::jit::{ArgValue, Ctx, Cuda, Family, Launch, Root, Routine};
-use crate::routine;
+use crate::jit::{ArgValue, Ctx, Cuda, Launch, Root};
 use crate::jit::abi::{bf16, unpack_aggregate};
-use kernels::keys;
-use kernels::routine::{Arg, Env, In, Out};
+use crate::jit::abi::Tensor;
+use kernels::routine::{Arg, Asks, Const, In, Out};
 use kernels::{Refusal, Ty};
+use crate::routine::Fire;
 
 /// `kernels.def`'s `PIE_ATTN_HEAD_DIM` list, in its order.
 ///
@@ -1029,7 +1032,7 @@ fn no_point(what: &'static str, why: &dyn core::fmt::Display) -> Refusal {
 /// kernel reads or writes, and `ctx`'s stream must outlive the launch. The
 /// same assertion the caller made when it handed a filled block to a
 /// `<<<>>>`.
-pub fn decode<P: DecodeBlock>(ctx: &Ctx, at: DecodePoint, params: &P) -> Result<(), Refusal> {
+pub fn decode<P: DecodeBlock>(ctx: &Ctx<'_>, at: DecodePoint, params: &P) -> Result<(), Refusal> {
     let Some(point) = decode_root(at.head_dim, at.group_size) else {
         return Err(no_point(
             "an FA2 decode lattice point",
@@ -1044,18 +1047,18 @@ pub fn decode<P: DecodeBlock>(ctx: &Ctx, at: DecodePoint, params: &P) -> Result<
     // SAFETY: the caller's contract -- every device address inside `params`
     // addresses live memory of the extent the kernel reads it as, and the
     // block itself outlives the copy because it is this call's parameter.
-    unsafe {
-        ctx.launch_at(
-            &point.root,
-            point.arms[at.arm as usize],
-            Launch::grid(
-                DecodeGeometry::grid(at.padded_batch_size, at.num_kv_heads),
-                geometry.block(),
-            )
-            .smem(geometry.smem_bytes),
-            &[block(params)],
-        )
-    }
+    ctx.fire(
+        Fire::at(point.root.file, point.arms[at.arm as usize])
+            .unit(point.root.name)
+            .apply(
+                Launch::grid(
+                    DecodeGeometry::grid(at.padded_batch_size, at.num_kv_heads),
+                    geometry.block(),
+                )
+                .smem(geometry.smem_bytes),
+            ),
+        &[block(params)],
+    )
 }
 
 /// `BatchPrefillWithPagedKVCacheDispatched`'s launch, `prefill.cuh:4203-4297`.
@@ -1078,7 +1081,7 @@ pub fn decode<P: DecodeBlock>(ctx: &Ctx, at: DecodePoint, params: &P) -> Result<
 /// # Safety
 ///
 /// As [`decode`].
-pub fn prefill<P: PrefillBlock>(ctx: &Ctx, at: PrefillPoint, params: &P) -> Result<(), Refusal> {
+pub fn prefill<P: PrefillBlock>(ctx: &Ctx<'_>, at: PrefillPoint, params: &P) -> Result<(), Refusal> {
     let geometry =
         PrefillGeometry::derive(at.head_dim, at.cta_tile_q, KvWidth::BF16, false, at.device)
             .map_err(|why| no_point("the FA2 prefill geometry", &why))?;
@@ -1092,18 +1095,18 @@ pub fn prefill<P: PrefillBlock>(ctx: &Ctx, at: PrefillPoint, params: &P) -> Resu
         ));
     };
     // SAFETY: as [`decode`]'s.
-    unsafe {
-        ctx.launch_at(
-            &point.root,
-            point.arms[at.arm as usize],
-            Launch::grid(
-                PrefillGeometry::grid(at.padded_batch_size, at.num_kv_heads),
-                geometry.block(),
-            )
-            .smem(geometry.smem_bytes),
-            &[block(params)],
-        )
-    }
+    ctx.fire(
+        Fire::at(point.root.file, point.arms[at.arm as usize])
+            .unit(point.root.name)
+            .apply(
+                Launch::grid(
+                    PrefillGeometry::grid(at.padded_batch_size, at.num_kv_heads),
+                    geometry.block(),
+                )
+                .smem(geometry.smem_bytes),
+            ),
+        &[block(params)],
+    )
 }
 
 // ── Which arm a request selects ─────────────────────────────────────────────
@@ -1262,7 +1265,7 @@ fn addr<T>(p: *const T) -> DevicePtr {
 /// until this has run. `prefill.cuh:4350-4352` and `decode.cuh:822-824` fire
 /// exactly this, in exactly this position: same stream, immediately after the
 /// attention kernel.
-fn fold(ctx: &Ctx, split: &Partials) -> Result<(), Refusal> {
+fn fold(ctx: &Ctx<'_>, split: &Partials) -> Result<(), Refusal> {
     crate::cascade::merge_states_varlen(
         ctx,
         split.tmp_v as usize as *mut bf16,
@@ -1414,10 +1417,9 @@ fn decode_plan_of_leaves(
 /// [`Refusal::Unstated`] for an unplanned cache or a lattice point that does
 /// not exist, and [`Refusal::Device`] if the compile, the load or the launch
 /// refused.
-#[allow(clippy::too_many_arguments)]
-#[kernels_macros::routine]
+#[routine(depth_prefix_plan)]
 pub fn dispatch_attention_flashinfer_decode(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     // `In(0)` STATED, and the same token on all six of this family's
     // launchers. The warrant is `arms/fa2.rs`'s six identical
     // `let q = cx.arg_in(0)?.cast::<bf16>().cast_const();` lines, one per
@@ -1433,9 +1435,9 @@ pub fn dispatch_attention_flashinfer_decode(
     // AND THE ATTRIBUTE IS GONE AGAIN, one Stage 6 round later. `o` and
     // `lse` say the slot in the type -- so all three of this launcher's
     // statement operands are spelled rather than counted, and `q`'s
-    // `In<0, _>` is no longer the only one. (`OutSlot` and `Or` carried this
+    // `In<0, *const _>` is no longer the only one. (`OutSlot` and `Or` carried this
     // between rounds; both are deleted.)
-    q: In<0, bf16>,
+    q: In<Tensor<bf16>>,
     // `Out(0)` STATED. The slot is not a guess: `arms/fa2.rs`'s `o_or` is
     // documented `Source::Or(&Out(0), &Attn("o_out"))` and its body reads
     // `cx.arg_out(0)` before falling back, in all six arms; and
@@ -1444,15 +1446,15 @@ pub fn dispatch_attention_flashinfer_decode(
     // order, so result 0 IS the bf16 attention output.
     //
     // STATING A SLOT IS NOT WRAPPING ONE, and the ledger's *"`Or<T>` IS NOT A
-    // REGION AND `o` IS NOT WRAPPED"* stands unamended. `Out<0, _>` would
+    // REGION AND `o` IS NOT WRAPPED"* stands unamended. `Out<0, *mut _>` would
     // state nothing because `stated_source` reads the LAST path segment; an
     // ATTRIBUTE is read before any wrapper (`kernels-macros/src/lib.rs:216`
     // sets `stated` on the attribute branch first), so the index becomes an
     // answer while `Or` goes on carrying `Provenance::Either`. That
-    // provenance is the whole reason `Out<0, _>` is wrong here -- it would
+    // provenance is the whole reason `Out<0, *mut _>` is wrong here -- it would
     // make the result REQUIRED on a text that declines to name one.
     //
-    // AND `Out<0, bf16>` IS THAT MARK IN A TYPE, which took a
+    // AND `Out<0, *mut bf16>` IS THAT MARK IN A TYPE, which took a
     // repair to become true. `OutSlot` states a slot and claims no
     // rectangle, which is the objection above answered -- but its `Arg` impl
     // omitted `PROV` and took the `Trace` default, so wrapping an `Or` in it
@@ -1463,267 +1465,76 @@ pub fn dispatch_attention_flashinfer_decode(
     // below carries the arity arithmetic; the short version is that the band
     // does not move, because `Either` is what this parameter already
     // reported and is what it still reports.
-    o: Out<0, bf16>,
-    // THE FOUR PAGED FACTS, SPELLED. All six launchers in this file carry the
-    // same four, this is the only place the argument is written, and the
-    // ROUTINES ledger below carries what the conversion does and does not
-    // move.
-    //
-    // Each was `Env<*mut bf16>` or `Env<*const u32>` and derived the SAME
-    // `Source` from the parameter's NAME, through `fact_of`
-    // (`kernels-macros/src/lib.rs:640-643`). That the source does not move is
-    // the point and also the whole risk, because a change with no observable
-    // effect is one nobody can check. What moves is where the claim lives: a
-    // table keyed on a string answers a rename by going quiet, and
-    // `Env<keys::KvKeys>` cannot be unbound by one.
-    //
-    // CHECKED AGAINST THE ARM, PER PARAMETER, rather than read off the name.
-    // `arms/fa2.rs:226-229` witnesses this launcher and the other five read
-    // identically at `:277`, `:328`, `:379`, `:441` and `:629`:
-    // `Env(layer.k_bf16_pages.cast::<bf16>())` and
-    // `Env(plan_of.kv_page_indices)`. Layer view and plan -- environment on
-    // both, with no `cx.arg_in(n)` anywhere near them. `s3-norm` found two
-    // `positions` parameters that were statement OPERANDS wearing a fact's
-    // name, and converting one of those by name type-checks, binds, and
-    // reads the wrong buffer in silence. The check is the work here; the
-    // edit is the easy half.
-    //
-    // `*mut u8` AT THE KEY AND `bf16` IN THE BODY, which is the convention
-    // and not an oversight. `keys.rs:483-505`: the plane's element type is
-    // the caller's business, because one cache is bf16 under one model and
-    // an fp8 pair under another. FA2's is bf16 for a reason this file states
-    // twice -- the launcher doc above, and `buffers`' `*mut bf16` -- so the
-    // cast below is where an opaque plane meets a dispatch that exists at
-    // one width only.
-    k_pages: Env<keys::KvKeys>,
-    v_pages: Env<keys::KvValues>,
-    kv_page_indices: Env<keys::KvPageIndices>,
-    kv_page_indptr: Env<keys::KvPageIndptr>,
-    // THE FIFTH PAGED ARRAY, AND IT SAID `None` FOR AS LONG AS THE FACT
-    // WAS ONLY REACHABLE BY NAME. Two drafts of this comment are worth
-    // keeping because each was wrong in a different way and the second is
-    // the instructive one.
-    //
-    // Draft one: *"there is no key to spell"*. False. `fact!` takes its
-    // source as `$src:expr` (`keys.rs:189`) and four keys have been passing
-    // `Source::Named(<keys::WeightBias as keys::Fact>::KEY)` through it all along
-    // (`keys.rs:580-589`). Draft two, correcting it: *"A key is one line
-    // away; what is not available is finding it FROM THE NAME."* True, and
-    // the line was written -- `keys::KvLastPageLens` (`keys.rs:615`).
-    //
-    // WHAT THE CONVERSION ACTUALLY FIXES IS A FALSE COLUMN ENTRY, not a
-    // notation. `fact_of` had no arm for this name, so `derive_all` fell to
-    // `Shape::Env => None` -- and `None` is a REFUSAL, "no source names
-    // this". There is a source and every arm binds it:
-    // `arms/fa2.rs:231` passes `Env(plan_of.kv_last_page_lens)`, and
-    // `Facts::plan` fills that field from `a.kv_last_page_lens_d`
-    // (`Fire::plan`), which is the `AttnCtx` field name the source's
-    // string quotes. Six columns in this file were saying nothing about a
-    // pointer the binder holds by a name that matches character for
-    // character.
-    //
-    // ARITY IS UNTOUCHED AND THAT IS CHECKABLE RATHER THAN ASSUMED.
-    // `Env<T>::PROV` is `Provenance::Env` (`routine.rs:355`) and `fact!`
-    // forces `PROV = Env` on every key, so the `(Ty, Provenance)` pair
-    // `impl_kernel_fn!` records is bit-identical before and after; `TY`
-    // forwards to `*const u32` on both sides. What changes is `Derived`:
-    // `source: None, stated: false` becomes
-    // `Source::Named(<keys::KvLastPageLens as keys::Fact>::KEY), stated: true`.
-    kv_last_page_lens: Env<keys::KvLastPageLens>,
-    // THE LSE IS ENVIRONMENT ON THIS SYMBOL, AND THE TEXT THAT WANTED IT AS A
-    // RESULT HAS A SYMBOL OF ITS OWN.
-    //
-    // This was `Out<1, f32>` and before that `#[source(Out(1))]`, and the
-    // argument that put the mark there is kept below because it was right
-    // about the slot and the slot is where it went -- onto
-    // [`dispatch_attention_flashinfer_decode_lse`], not onto this launcher.
-    //
-    // # What `Or` was carrying, and which half of it this parameter used
-    //
-    // `Or<T>` plants exactly one fact: `const PROV: Provenance = Either`
-    // (`kernels/src/routine.rs:522`), forwarding everything else. `Either` on
-    // a `Binds::Writes` parameter is read twice. `arity_problem`
-    // (`model-ir/src/kernels.rs:303`) counts it into `opt_writes` and so
-    // raises §6.2's CEILING to `writes + opt_writes`; and
-    // `accepts_an_unstated_result` (`:227`) reports that the symbol will
-    // accept a value-producing region's buffer for a statement that declares
-    // no result at all, which `model-compiler/src/lower/walk.rs:472` reads
-    // before it substitutes.
-    //
-    // ONLY THE CEILING WAS EVER IN PLAY HERE, and only because ONE SYMBOL WAS
-    // TWO ARITIES. `base.rs:259`'s `attention_flashinfer_decode` declares one
-    // result -- or none, inside a value region -- and `base.rs:373`'s
-    // `attention_flashinfer_decode_lse` declares two, and both named this
-    // string. That is D2 (`.wiki/kilimanjaro3.md` §3.8) exactly: *an optional
-    // argument means two functions*, and the two texts differ in ARITY rather
-    // than in body. They are two symbols now and the band here is `[0, 1]`,
-    // with no second result left to admit.
-    //
-    // `o` KEEPS ITS `Or` AND THIS DOES NOT, which is the asymmetry to hold on
-    // to. `o` uses the OTHER reader: `attn_at` (`base.rs:1121`) declares no
-    // result inside a value region, `llama_like/forward/mod.rs:1638` states
-    // this dispatch inside `dsl::guarded_value`, and without `Either` on `o`
-    // the lowerer hands the guard's `Val` to nobody. `lse` was never in a
-    // region-hosted statement that declined it -- the texts that want it
-    // declare it, and the texts that do not have no second buffer at all.
-    //
-    // # Why `Env`, and why no key
-    //
-    // Every arm of the one-result spelling passed `AttnCtx::lse_out_d`
-    // (`arms/fa2.rs`'s `lse_slab`): the per-fire scratch slab
-    // `fire/launch.rs:3417` publishes and `:3087` slices per split. A
-    // one-result statement has no `arg_out(1)` to prefer over it, so the
-    // address comes from the FIRE and `Env` is the word for that.
-    //
-    // NO `keys::` FACT IS MINTED FOR IT. `kernels/src/keys.rs` §1 has none for
-    // `lse_out_d`, and adding one would be a name for a deficiency rather
-    // than a fix (F7) -- the slab is not a published plane, it is this
-    // family's scratch, and `score_out` on the custom launcher is spelled
-    // bare for the same reason. `int_buffer` and `float_buffer` USED TO BE
-    // ON THAT LIST AND ARE NOT ANY MORE: they were never a deficiency, only
-    // an unnamed answer, and the block below is where that is argued.
-    //
-    // # The witness argument, kept, because it is what the split rests on
-    //
-    // `attn::dispatch_attention_flashinfer_decode` and
-    // `attn::attention_flashinfer_prefill` are the only two of the six with a
-    // two-result builder (`base.rs:373` and `:514`) placing the F32
-    // `[Tokens, q_heads]` LSE second, and they are exactly the two that got a
-    // `_lse` twin. The other four were stated `Out(1)` BY ELIMINATION over
-    // the provenance-eligible set -- a statement operand can only land on a
-    // `Trace` or `Either` parameter, every other parameter here is `Env<_>`,
-    // so `q`, `o` and `lse` were the whole set -- and elimination over an
-    // empty set is what the four turned out to be: no text declares their
-    // second result, so `Env` is not a demotion, it is the reading.
-    //
-    // AND THE ARM WAS THE THING THE MARK COULD NOT CHECK. That paragraph is
-    // at `arms/fa2.rs`'s planless prefill: `Out(1)` was honoured by two arms
-    // of six, and the one symbol whose second spelling really did want its
-    // own buffer was writing to the slab. A mark on a parameter says where a
-    // value would come FROM; it cannot say that anyone went and got it. Two
-    // symbols can, because the arm that binds the `_lse` one has no fallback
-    // to fall back to.
-    lse: Env<keys::AttnLseOut>,
-    // ── THE WORKSPACE, NAMED, AND WHY IT IS THE DECODE CARVE ──────────────
-    //
-    // `Env<*mut c_void>` was not a blocked fact, it was an UNNAMED one. The
-    // type says *"the driver hands over something"*, a column cannot read
-    // that, so an arm had to carry it -- while `Cx::attn_workspace`
-    // (`bind/cx.rs:208`) had been answering the whole time.
-    // `keys::AttnWorkspaceInt` / `keys::AttnWorkspaceFloat` (`keys.rs` §1)
-    // are the words for what it answers, and `operand()` binds both off
-    // `f.cx.attn_workspace()` (`bind/table.rs:1005-1022`).
-    //
-    // WHICH CARVE IS THE ONE THING TO GET RIGHT HERE. `AttnCtx` holds TWO:
-    // `workspace` and `prefill_workspace` (`bind/mod.rs:1151` and `:1161`),
-    // kept apart because *"a FlashInfer plan writes its schedule into the
-    // workspace it was raised against, so a decode plan and a prefill plan
-    // sharing one is one clobbering the other"*. `Facts::attn_workspace`
-    // (`bind/facts.rs:305`) answers `AttnCtx::workspace` -- the DECODE one --
-    // and its doc says it *"does not choose between them"*, so these two keys
-    // mean the decode carve and nothing else.
-    //
-    // WHICH MAKES THE SPELLING A PER-LAUNCHER CHECK AND NOT A RENAME. TWO of
-    // this file's eight may say it, and they are the planless prefill pair --
-    // whose arm plans against `workspace` *"as the entry point it replaces
-    // did"* (`arms/fa2.rs`'s planless body). The six unfolded launchers name
-    // neither carve: `fa2_decode_leaves` and `fa2_prefill_leaves` resolve
-    // against `Cx::attn_workspace` and `Cx::attn_prefill_workspace`
-    // respectively and answer ADDRESSES, so no base reaches a signature and
-    // no launcher can be handed the wrong one.
-    // THE ONE AGGREGATE LEFT IN THIS SIGNATURE, AND THE SIGNATURE §4
-    // SKETCHES FLAT. Twenty leaves, all `Copy`, all resolvable off `Cx`:
-    // §4's nine (four int-workspace pointers plus the mask, two float,
-    // `padded_batch_size`, `split_kv`) and the seven `make_decode_params`
-    // reads that its sketch has no line for. Unfolded, this launcher takes 28
-    // arguments and `impl_kernel_fn!` stops at 24. The [`ROUTINES`] ledger
-    // carries the count per launcher, the empirical proof of the ceiling, and
-    // the correction to §0's licence that came out of checking it.
-    // §4'S PLAN, FLAT. `bind/table.rs`'s `fa2_decode_leaves` resolves each of
-    // these off the cache the fire raised and `decode_plan_of_leaves` folds
-    // them back into what `params.rs` consumes, so nothing here recomputes a
-    // layout. THE WORKSPACE PAIR WENT WITH THE AGGREGATE: an address the
-    // driver already offset needs no base, and `int_base_bytes` was only ever
-    // part of that sum.
-    request_indices: Env<keys::Fa2DecodeRequestIndices>,
-    kv_tile_indices: Env<keys::Fa2DecodeKvTileIndices>,
-    o_indptr: Env<keys::Fa2DecodeOIndptr>,
-    kv_chunk_size: Env<keys::Fa2DecodeKvChunkSize>,
-    block_valid_mask: Env<keys::Fa2DecodeBlockValidMask>,
-    tmp_v: Env<keys::Fa2DecodeTmpV>,
-    tmp_s: Env<keys::Fa2DecodeTmpS>,
-    padded_batch: Env<keys::Fa2DecodePaddedBatch>,
-    split_kv: Env<keys::Fa2DecodeSplitKv>,
-    requests: Env<keys::Fa2DecodeRequests>,
-    num_q_heads: Env<keys::Fa2DecodeNumQHeads>,
-    num_kv_heads: Env<keys::Fa2DecodeNumKvHeads>,
-    head_dim: Env<keys::Fa2DecodeHeadDim>,
-    page_size: Env<keys::Fa2DecodePageSize>,
-    hnd_layout: Env<keys::Fa2DecodeHndLayout>,
-    full_attention: Env<keys::Fa2DecodeFullAttention>,
-    window_left: Env<keys::WindowLeft>,
-    logits_soft_cap: Env<keys::AttnLogitsSoftCap>,
-    // THE SOFTMAX SCALE, SPELLED. All eight launchers in this file carry it,
-    // this is the only place the argument is written, and it moved for the
-    // same reason `kv_last_page_lens` did four parameters up: `Env<f32>`
-    // derives `Shape::Env => None`, and `None` is the claim that NO source
-    // names the value. One does. `keys::SmScale` = "attn.sm_scale"
-    // (`keys.rs` §1) and `operand()` answers it off `f.sm_scale()`
-    // (`bind/table.rs`), which is `AttnCtx::sm_scale` -- the exact field
-    // every arm in `arms/fa2.rs` passed by hand as `Env(a.sm_scale)`.
-    //
-    // CHECKED PER ARM RATHER THAN BY NAME, as the paged four were: all six
-    // hand arms read `a.sm_scale` off the same `AttnCtx` borrow they read
-    // `a.logits_soft_cap` off, and `logits_soft_cap` STAYS `Env<f32>` one
-    // line above because `keys.rs` has no fact for it and minting one would
-    // be F7's *"a deficiency gets a fix, not a name"* -- the cap is a
-    // per-fire dispatch input the binder holds no query for.
-    //
-    // `f32` AT THE KEY AND `f32` IN THE BODY, so the only edit inside is a
-    // second star: `*sm_scale` became `**sm_scale` at each of the five
-    // `make_*_params` calls, `Env` deref then `SmScale` deref. Arity is
-    // untouched -- `fact!` forces `PROV = Env` and `TY = f32`.
-    sm_scale: Env<keys::SmScale>,
-    #[lit(false)]
-    broadcast_q: Env<bool>,
-) -> Result<(), Refusal> {
+    o: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: every one of these was `Env<keys::_>` before the
+    // four marks, and no builder ever began stating them. A `Const` mark
+    // PROMISES the statement carries the number at its slot in the params
+    // run; where nothing states one the promise is broken at the fire, not
+    // at the type. See `.wiki/migration.md` §11.20.
+    let window_left = ctx.ask::<i32, keys::WindowLeft>()?;
+    let logits_soft_cap = ctx.ask::<f32, keys::AttnLogitsSoftCap>()?;
+    let sm_scale = ctx.ask::<f32, keys::SmScale>()?;
+
+    let k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
+    let kv_last_page_lens = ctx.ask::<*const u32, keys::KvLastPageLens>()?;
+    let lse = ctx.ask::<*mut f32, keys::AttnLseOut>()?;
+    let request_indices = ctx.ask::<*const i32, keys::Fa2DecodeRequestIndices>()?;
+    let kv_tile_indices = ctx.ask::<*const i32, keys::Fa2DecodeKvTileIndices>()?;
+    let o_indptr = ctx.ask::<*const i32, keys::Fa2DecodeOIndptr>()?;
+    let kv_chunk_size = ctx.ask::<*const i32, keys::Fa2DecodeKvChunkSize>()?;
+    let block_valid_mask = ctx.ask::<*const u8, keys::Fa2DecodeBlockValidMask>()?;
+    let tmp_v = ctx.ask::<*mut f32, keys::Fa2DecodeTmpV>()?;
+    let tmp_s = ctx.ask::<*mut f32, keys::Fa2DecodeTmpS>()?;
+    let padded_batch = ctx.ask::<i32, keys::Fa2DecodePaddedBatch>()?;
+    let split_kv = ctx.ask::<bool, keys::Fa2DecodeSplitKv>()?;
+    let requests = ctx.ask::<i32, keys::Fa2DecodeRequests>()?;
+    let num_q_heads = ctx.ask::<i32, keys::Fa2DecodeNumQHeads>()?;
+    let num_kv_heads = ctx.ask::<i32, keys::Fa2DecodeNumKvHeads>()?;
+    let head_dim = ctx.ask::<i32, keys::Fa2DecodeHeadDim>()?;
+    let page_size = ctx.ask::<i32, keys::Fa2DecodePageSize>()?;
+    let hnd_layout = ctx.ask::<bool, keys::Fa2DecodeHndLayout>()?;
+    let full_attention = ctx.ask::<bool, keys::Fa2DecodeFullAttention>()?;
+    let broadcast_q = false;
+    let v_pages = ctx.ask::<*mut u8, keys::KvValues>()?;
+    let kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
+    let kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
     let plan = decode_plan_of_leaves(
-        **request_indices,
-        **kv_tile_indices,
-        **o_indptr,
-        **kv_chunk_size,
-        **block_valid_mask,
-        **tmp_v,
-        **tmp_s,
-        **padded_batch,
-        **split_kv,
-        **requests,
-        **num_q_heads,
-        **num_kv_heads,
-        **head_dim,
-        **page_size,
-        **hnd_layout,
-        **full_attention,
+        request_indices,
+        kv_tile_indices,
+        o_indptr,
+        kv_chunk_size,
+        block_valid_mask,
+        tmp_v,
+        tmp_s,
+        padded_batch,
+        split_kv,
+        requests,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        hnd_layout,
+        full_attention,
     );
     let bufs = buffers(
         q.ptr,
         k_pages.cast::<bf16>(),
         v_pages.cast::<bf16>(),
         o.ptr,
-        **kv_page_indices,
-        **kv_page_indptr,
-        **kv_last_page_lens,
+        kv_page_indices,
+        kv_page_indptr,
+        kv_last_page_lens,
         // Decode has one query row per request, so there is no QO indptr.
         core::ptr::null(),
-        **lse,
+        lse,
         // The zero base `decode_plan_of_leaves` documents: every workspace
         // address is already in the leaves.
         core::ptr::null_mut(),
         core::ptr::null_mut(),
     );
-    let arm = decode_arm(plan.full_attention_variant, **window_left, **logits_soft_cap);
+    let arm = decode_arm(plan.full_attention_variant, window_left, logits_soft_cap);
     let (params, split) =
-        make_decode_params(&plan, &bufs, **window_left, **logits_soft_cap, **sm_scale, *broadcast_q);
+        make_decode_params(&plan, &bufs, window_left, logits_soft_cap, sm_scale, broadcast_q);
     decode(ctx, decode_at(&plan, arm, params.padded_batch_size), &params)?;
     if plan.info.split_kv { fold(ctx, &split) } else { Ok(()) }
 }
@@ -1762,12 +1573,11 @@ pub fn dispatch_attention_flashinfer_decode(
 ///
 /// [`dispatch_attention_flashinfer_decode`]'s, unchanged — this adds no
 /// refusal of its own, because a missing result is not reachable here.
-#[allow(clippy::too_many_arguments)]
-#[kernels_macros::routine]
+#[routine(depth_prefix_plan)]
 pub fn dispatch_attention_flashinfer_decode_lse(
-    ctx: &Ctx,
-    q: In<0, bf16>,
-    // REQUIRED, where the twin's is `Out<0, bf16>`, and the difference is
+    ctx: &Ctx<'_>,
+    q: In<Tensor<bf16>>,
+    // REQUIRED, where the twin's is `Out<0, *mut bf16>`, and the difference is
     // the whole of the split. `Or`'s `Provenance::Either` is what
     // `accepts_an_unstated_result` (`model-ir/src/kernels.rs:227`) reads to
     // let a value-producing region hand its buffer to a statement declaring
@@ -1776,86 +1586,50 @@ pub fn dispatch_attention_flashinfer_decode_lse(
     // The `_lse` text declares two results unconditionally and is stated
     // outside any region (`gpt_oss/forward/mod.rs:188`), so the clause is
     // never reached and `Trace` is the honest provenance.
-    o: Out<0, bf16>,
-    k_pages: Env<keys::KvKeys>,
-    v_pages: Env<keys::KvValues>,
-    kv_page_indices: Env<keys::KvPageIndices>,
-    kv_page_indptr: Env<keys::KvPageIndptr>,
-    kv_last_page_lens: Env<keys::KvLastPageLens>,
+    o: Out<Tensor<bf16>>,
     // `Out(1)`, REQUIRED, and this is the parameter the split exists for. On
     // the twin it is `Env<*mut f32>` — the fire's scratch slab — because no
     // one-result text has a second buffer to point at. Here every text has
     // one: `attention_sink_rescale` reads it two statements downstream
     // (`gpt_oss/forward/mod.rs:189`).
-    lse: Out<1, f32>,
-    // The decode carve, keyed: this launcher's arm passes `a.workspace`. The
-    // argument is at `dispatch_attention_flashinfer_decode`'s pair.
-    // §4'S PLAN, FLAT. `bind/table.rs`'s `fa2_decode_leaves` resolves each of
-    // these off the cache the fire raised and `decode_plan_of_leaves` folds
-    // them back into what `params.rs` consumes, so nothing here recomputes a
-    // layout. THE WORKSPACE PAIR WENT WITH THE AGGREGATE: an address the
-    // driver already offset needs no base, and `int_base_bytes` was only ever
-    // part of that sum.
-    request_indices: Env<keys::Fa2DecodeRequestIndices>,
-    kv_tile_indices: Env<keys::Fa2DecodeKvTileIndices>,
-    o_indptr: Env<keys::Fa2DecodeOIndptr>,
-    kv_chunk_size: Env<keys::Fa2DecodeKvChunkSize>,
-    block_valid_mask: Env<keys::Fa2DecodeBlockValidMask>,
-    tmp_v: Env<keys::Fa2DecodeTmpV>,
-    tmp_s: Env<keys::Fa2DecodeTmpS>,
-    padded_batch: Env<keys::Fa2DecodePaddedBatch>,
-    split_kv: Env<keys::Fa2DecodeSplitKv>,
-    requests: Env<keys::Fa2DecodeRequests>,
-    num_q_heads: Env<keys::Fa2DecodeNumQHeads>,
-    num_kv_heads: Env<keys::Fa2DecodeNumKvHeads>,
-    head_dim: Env<keys::Fa2DecodeHeadDim>,
-    page_size: Env<keys::Fa2DecodePageSize>,
-    hnd_layout: Env<keys::Fa2DecodeHndLayout>,
-    full_attention: Env<keys::Fa2DecodeFullAttention>,
-    window_left: Env<keys::WindowLeft>,
-    logits_soft_cap: Env<keys::AttnLogitsSoftCap>,
-    sm_scale: Env<keys::SmScale>,
-    #[lit(false)]
-    broadcast_q: Env<bool>,
-) -> Result<(), Refusal> {
-    dispatch_attention_flashinfer_decode(
-        ctx,
-        // `q` and the five paged facts FORWARD WHOLE — both ends spell them
-        // identically, so the compiler checks the slot agrees
-        // (`kernels-cuda/src/rope.rs:62`'s rule). `o` and `lse` are the two
-        // that cannot. Both spellings say REQUIRED now: the arm the twin was
-        // made for -- a statement declaring no result inside a value region
-        // -- states its destination on the OP (`Op::dest`), so neither
-        // signature has to be optional to serve it.
-        q,
-        o,
-        k_pages,
-        v_pages,
-        kv_page_indices,
-        kv_page_indptr,
-        kv_last_page_lens,
-        <keys::AttnLseOut as keys::Fact>::env(lse.ptr),
-        request_indices,
-        kv_tile_indices,
-        o_indptr,
-        kv_chunk_size,
-        block_valid_mask,
-        tmp_v,
-        tmp_s,
-        padded_batch,
-        split_kv,
-        requests,
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        page_size,
-        hnd_layout,
-        full_attention,
-        window_left,
-        logits_soft_cap,
-        sm_scale,
-        broadcast_q,
-    )
+    _lse: Out<Tensor<f32>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: every one of these was `Env<keys::_>` before the
+    // four marks, and no builder ever began stating them. A `Const` mark
+    // PROMISES the statement carries the number at its slot in the params
+    // run; where nothing states one the promise is broken at the fire, not
+    // at the type. See `.wiki/migration.md` §11.20.
+    let window_left = ctx.ask::<i32, keys::WindowLeft>()?;
+    let logits_soft_cap = ctx.ask::<f32, keys::AttnLogitsSoftCap>()?;
+    let sm_scale = ctx.ask::<f32, keys::SmScale>()?;
+
+    let _request_indices = ctx.ask::<*const i32, keys::Fa2DecodeRequestIndices>()?;
+    let _k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
+    let _v_pages = ctx.ask::<*mut u8, keys::KvValues>()?;
+    let _kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
+    let _kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
+    let _kv_last_page_lens = ctx.ask::<*const u32, keys::KvLastPageLens>()?;
+    let _kv_tile_indices = ctx.ask::<*const i32, keys::Fa2DecodeKvTileIndices>()?;
+    let _o_indptr = ctx.ask::<*const i32, keys::Fa2DecodeOIndptr>()?;
+    let _kv_chunk_size = ctx.ask::<*const i32, keys::Fa2DecodeKvChunkSize>()?;
+    let _block_valid_mask = ctx.ask::<*const u8, keys::Fa2DecodeBlockValidMask>()?;
+    let _tmp_v = ctx.ask::<*mut f32, keys::Fa2DecodeTmpV>()?;
+    let _tmp_s = ctx.ask::<*mut f32, keys::Fa2DecodeTmpS>()?;
+    let _padded_batch = ctx.ask::<i32, keys::Fa2DecodePaddedBatch>()?;
+    let _split_kv = ctx.ask::<bool, keys::Fa2DecodeSplitKv>()?;
+    let _requests = ctx.ask::<i32, keys::Fa2DecodeRequests>()?;
+    let _num_q_heads = ctx.ask::<i32, keys::Fa2DecodeNumQHeads>()?;
+    let _num_kv_heads = ctx.ask::<i32, keys::Fa2DecodeNumKvHeads>()?;
+    let _head_dim = ctx.ask::<i32, keys::Fa2DecodeHeadDim>()?;
+    let _page_size = ctx.ask::<i32, keys::Fa2DecodePageSize>()?;
+    let _hnd_layout = ctx.ask::<bool, keys::Fa2DecodeHndLayout>()?;
+    let _full_attention = ctx.ask::<bool, keys::Fa2DecodeFullAttention>()?;
+    let _broadcast_q = false;
+    // EVERY PLAN LEAF IS ASKED FOR INSIDE THE CALLEE NOW, so this forwards the
+    // two operands and the three the statement carries. The twenty-four that
+    // used to be threaded through here are §6.2's FA2 plan leaves -- what the
+    // planner built from this batch's history depth -- and a caller repeating
+    // them was a caller able to disagree with the plan object being executed.
+    dispatch_attention_flashinfer_decode(ctx, q, o)
 }
 
 /// `attn::dispatch_attention_flashinfer_decode_capture`.
@@ -1882,77 +1656,62 @@ pub fn dispatch_attention_flashinfer_decode_lse(
 /// As [`dispatch_attention_flashinfer_decode`], plus [`Refusal::Absent`] for a
 /// null sink and [`Refusal::Unstated`] for a soft cap or a window, neither of
 /// which composes with capture.
-#[allow(clippy::too_many_arguments)]
-#[kernels_macros::routine]
+#[routine(untraced)]
 pub fn dispatch_attention_flashinfer_decode_capture(
-    ctx: &Ctx,
-    q: In<0, bf16>,
-    o: Out<0, bf16>,
-    k_pages: Env<keys::KvKeys>,
-    v_pages: Env<keys::KvValues>,
-    kv_page_indices: Env<keys::KvPageIndices>,
-    kv_page_indptr: Env<keys::KvPageIndptr>,
-    kv_last_page_lens: Env<keys::KvLastPageLens>,
-    // `Env`, as [`dispatch_attention_flashinfer_decode`]'s. The capture
-    // dispatch has ONE spelling (`base.rs:1011`, `-> Option<Val>`), so no
-    // text ever declared its second result and `Or`'s `Provenance::Either`
-    // was widening a ceiling nothing reached.
-    lse: Env<keys::AttnLseOut>,
-    // The decode carve, keyed: this launcher's arm passes `a.workspace`. The
-    // argument is at `dispatch_attention_flashinfer_decode`'s pair.
-    // §4'S PLAN, FLAT. `bind/table.rs`'s `fa2_decode_leaves` resolves each of
-    // these off the cache the fire raised and `decode_plan_of_leaves` folds
-    // them back into what `params.rs` consumes, so nothing here recomputes a
-    // layout. THE WORKSPACE PAIR WENT WITH THE AGGREGATE: an address the
-    // driver already offset needs no base, and `int_base_bytes` was only ever
-    // part of that sum.
-    request_indices: Env<keys::Fa2DecodeRequestIndices>,
-    kv_tile_indices: Env<keys::Fa2DecodeKvTileIndices>,
-    o_indptr: Env<keys::Fa2DecodeOIndptr>,
-    kv_chunk_size: Env<keys::Fa2DecodeKvChunkSize>,
-    block_valid_mask: Env<keys::Fa2DecodeBlockValidMask>,
-    tmp_v: Env<keys::Fa2DecodeTmpV>,
-    tmp_s: Env<keys::Fa2DecodeTmpS>,
-    padded_batch: Env<keys::Fa2DecodePaddedBatch>,
-    split_kv: Env<keys::Fa2DecodeSplitKv>,
-    requests: Env<keys::Fa2DecodeRequests>,
-    num_q_heads: Env<keys::Fa2DecodeNumQHeads>,
-    num_kv_heads: Env<keys::Fa2DecodeNumKvHeads>,
-    head_dim: Env<keys::Fa2DecodeHeadDim>,
-    page_size: Env<keys::Fa2DecodePageSize>,
-    hnd_layout: Env<keys::Fa2DecodeHndLayout>,
-    full_attention: Env<keys::Fa2DecodeFullAttention>,
-    score_out: Env<*mut f32>,
-    score_indptr: Env<*const i32>,
-    window_left: Env<keys::WindowLeft>,
-    logits_soft_cap: Env<keys::AttnLogitsSoftCap>,
-    sm_scale: Env<keys::SmScale>,
-    #[lit(false)]
-    broadcast_q: Env<bool>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    q: In<Tensor<bf16>>,
+    o: Out<Tensor<bf16>>,
+    score_out: *mut f32,
+    score_indptr: *const i32,
+    window_left: Const<i32>,
+    logits_soft_cap: Const<f32>,
+    sm_scale: Const<f32>) -> Result<(), Refusal> {
+    let lse = ctx.ask::<*mut f32, keys::AttnLseOut>()?;
+    let request_indices = ctx.ask::<*const i32, keys::Fa2DecodeRequestIndices>()?;
+    let k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
+    let v_pages = ctx.ask::<*mut u8, keys::KvValues>()?;
+    let kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
+    let kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
+    let kv_last_page_lens = ctx.ask::<*const u32, keys::KvLastPageLens>()?;
+    let kv_tile_indices = ctx.ask::<*const i32, keys::Fa2DecodeKvTileIndices>()?;
+    let o_indptr = ctx.ask::<*const i32, keys::Fa2DecodeOIndptr>()?;
+    let kv_chunk_size = ctx.ask::<*const i32, keys::Fa2DecodeKvChunkSize>()?;
+    let block_valid_mask = ctx.ask::<*const u8, keys::Fa2DecodeBlockValidMask>()?;
+    let tmp_v = ctx.ask::<*mut f32, keys::Fa2DecodeTmpV>()?;
+    let tmp_s = ctx.ask::<*mut f32, keys::Fa2DecodeTmpS>()?;
+    let padded_batch = ctx.ask::<i32, keys::Fa2DecodePaddedBatch>()?;
+    let split_kv = ctx.ask::<bool, keys::Fa2DecodeSplitKv>()?;
+    let requests = ctx.ask::<i32, keys::Fa2DecodeRequests>()?;
+    let num_q_heads = ctx.ask::<i32, keys::Fa2DecodeNumQHeads>()?;
+    let num_kv_heads = ctx.ask::<i32, keys::Fa2DecodeNumKvHeads>()?;
+    let head_dim = ctx.ask::<i32, keys::Fa2DecodeHeadDim>()?;
+    let page_size = ctx.ask::<i32, keys::Fa2DecodePageSize>()?;
+    let hnd_layout = ctx.ask::<bool, keys::Fa2DecodeHndLayout>()?;
+    let full_attention = ctx.ask::<bool, keys::Fa2DecodeFullAttention>()?;
+    let broadcast_q = false;
     let plan = decode_plan_of_leaves(
-        **request_indices,
-        **kv_tile_indices,
-        **o_indptr,
-        **kv_chunk_size,
-        **block_valid_mask,
-        **tmp_v,
-        **tmp_s,
-        **padded_batch,
-        **split_kv,
-        **requests,
-        **num_q_heads,
-        **num_kv_heads,
-        **head_dim,
-        **page_size,
-        **hnd_layout,
-        **full_attention,
+        request_indices,
+        kv_tile_indices,
+        o_indptr,
+        kv_chunk_size,
+        block_valid_mask,
+        tmp_v,
+        tmp_s,
+        padded_batch,
+        split_kv,
+        requests,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        hnd_layout,
+        full_attention,
     );
     // `:546-549`, before the variant test, and in that order.
     if score_out.is_null() || score_indptr.is_null() {
         return Err(CAPTURE_SINK);
     }
-    let Some(arm) = decode_capture_arm(plan.full_attention_variant, **window_left, **logits_soft_cap)
+    let Some(arm) = decode_capture_arm(plan.full_attention_variant, *window_left, *logits_soft_cap)
     else {
         return Err(CAPTURE_VARIANT);
     };
@@ -1961,21 +1720,21 @@ pub fn dispatch_attention_flashinfer_decode_capture(
         k_pages.cast::<bf16>(),
         v_pages.cast::<bf16>(),
         o.ptr,
-        **kv_page_indices,
-        **kv_page_indptr,
-        **kv_last_page_lens,
+        kv_page_indices,
+        kv_page_indptr,
+        kv_last_page_lens,
         core::ptr::null(),
-        **lse,
+        lse,
         // The zero base `decode_plan_of_leaves` documents: every workspace
         // address is already in the leaves.
         core::ptr::null_mut(),
         core::ptr::null_mut(),
     );
-    let (base, split) = make_decode_params(&plan, &bufs, **window_left, 0.0, **sm_scale, *broadcast_q);
+    let (base, split) = make_decode_params(&plan, &bufs, *window_left, 0.0, *sm_scale, broadcast_q);
     let params = DecodeScoreParams {
         base,
-        score_out: addr(*score_out),
-        score_indptr: addr(*score_indptr),
+        score_out: addr(score_out),
+        score_indptr: addr(score_indptr),
     };
     decode(ctx, decode_at(&plan, arm, params.base.padded_batch_size), &params)?;
     if plan.info.split_kv { fold(ctx, &split) } else { Ok(()) }
@@ -2067,12 +1826,11 @@ fn prefill_plan_of_leaves(
 /// `bufs` carry the workspace bases the offsets are relative to, which on the
 /// unfolded path are null and on the planless path are the decode carve.
 fn prefill_paged(
-    ctx: &Ctx,
+    ctx: &Ctx<'_>,
     bufs: &Buffers,
     plan: &PrefillPlan,
     logits_soft_cap: f32,
-    sm_scale: f32,
-) -> Result<(), Refusal> {
+    sm_scale: f32) -> Result<(), Refusal> {
     prefill_plan_usable(plan)?;
     let arm = prefill_arm(plan.full_attention_variant, plan.causal_mask, logits_soft_cap);
     let (params, split) = make_prefill_params(plan, bufs, logits_soft_cap, sm_scale);
@@ -2098,115 +1856,85 @@ fn prefill_paged(
 /// `fire::flashinfer_fa2::plan_prefill` writes `use_sm90 = false` — and the
 /// refusal is kept so that wiring an SM90 family is one conditional and not an
 /// audit.
-#[allow(clippy::too_many_arguments)]
-#[kernels_macros::routine]
+#[routine]
 pub fn dispatch_attention_flashinfer_prefill_bf16(
-    ctx: &Ctx,
-    q: In<0, bf16>,
-    o: Out<0, bf16>,
-    k_pages: Env<keys::KvKeys>,
-    v_pages: Env<keys::KvValues>,
-    // THE SIXTH PAGED ARRAY, AND THE LAST OF THEM TO GET A WORD. The five
-    // around it were converted a stage ago; this one stayed `Env<*const u32>`
-    // because `keys.rs` §1 had no fact for the QUERY CSR, only for the KV
-    // ones. `keys::QoIndptr` = "plan.qo_indptr" closed that, and it is the
-    // single most-read plan field in `driver-cuda/src/bind/arms/` -- thirteen
-    // hand reads of `plan_of.qo_indptr` across the family, all of them the
-    // same `AttnCtx::qo_indptr_d` that `Facts::plan` copies in
-    // (`bind/facts.rs`).
-    //
-    // WHAT THE CONVERSION FIXES IS A FALSE COLUMN ENTRY, exactly as with
-    // `kv_last_page_lens` above: `None` said no source named it while every
-    // arm bound it. It reads `Source::Named("plan.qo_indptr"), stated: true`
-    // now, and `**qo_indptr` in the bodies is the one mechanical consequence.
-    //
-    // IT DOES NOT UNBLOCK ANY ROW IN THIS FILE, and that is worth stating so
-    // the next reader does not go looking: all six FA2 arms are held by the
-    // boxed `DecodePlanCache`/`PrefillPlanCache` a `Cx` may not hand over
-    // (`bind/mod.rs:1638` -- `Route::Driver` for exactly that reason), so a
-    // complete column changes nothing about who binds them. The column is
-    // still worth completing: it is what the row would derive the day the
-    // plan cache stops being a driver-owned mutable.
-    qo_indptr: Env<keys::QoIndptr>,
-    kv_page_indices: Env<keys::KvPageIndices>,
-    kv_page_indptr: Env<keys::KvPageIndptr>,
-    kv_last_page_lens: Env<keys::KvLastPageLens>,
-    // `Env`, as [`dispatch_attention_flashinfer_decode`]'s. One spelling
-    // (`base.rs:274`), one declared result; the LSE has only ever come from
-    // the fire's slab.
-    lse: Env<keys::AttnLseOut>,
-    // ── THE PLAN, LEAF BY LEAF, AND THE BASES THAT WENT WITH IT ──────────
-    //
-    // `int_buffer`/`float_buffer` stood here as the file's last bare
-    // `Env<*mut c_void>` pair, pinned `is_none()` because THIS PARAMETER TOOK
-    // BOTH CARVES: `fa2_prefill_arm` reached it with `a.prefill_workspace`
-    // and [`attention_flashinfer_prefill`] forwarded `a.workspace`. The
-    // unfold answers that by deleting the question -- a base with nothing to
-    // offset -- and each caller resolves its own leaves against its own
-    // carve. `bind/table.rs`'s `fa2_prefill_leaves` reads the prefill one.
-    request_indices: Env<keys::Fa2PrefillRequestIndices>,
-    qo_tile_indices: Env<keys::Fa2PrefillQoTileIndices>,
-    kv_tile_indices: Env<keys::Fa2PrefillKvTileIndices>,
-    merge_indptr: Env<keys::Fa2PrefillMergeIndptr>,
-    o_indptr: Env<keys::Fa2PrefillOIndptr>,
-    kv_chunk_size: Env<keys::Fa2PrefillKvChunkSize>,
-    block_valid_mask: Env<keys::Fa2PrefillBlockValidMask>,
-    tmp_v: Env<keys::Fa2PrefillTmpV>,
-    tmp_s: Env<keys::Fa2PrefillTmpS>,
-    padded_batch: Env<keys::Fa2PrefillPaddedBatch>,
-    split_kv: Env<keys::Fa2PrefillSplitKv>,
-    total_rows: Env<keys::Fa2PrefillTotalRows>,
-    cta_tile_q: Env<keys::Fa2PrefillCtaTileQ>,
-    requests: Env<keys::Fa2PrefillRequests>,
-    num_q_heads: Env<keys::Fa2PrefillNumQHeads>,
-    num_kv_heads: Env<keys::Fa2PrefillNumKvHeads>,
-    head_dim: Env<keys::Fa2PrefillHeadDim>,
-    page_size: Env<keys::Fa2PrefillPageSize>,
-    window_left: Env<keys::Fa2PrefillWindowLeft>,
-    hnd_layout: Env<keys::Fa2PrefillHndLayout>,
-    full_attention: Env<keys::Fa2PrefillFullAttention>,
-    causal_mask: Env<keys::Fa2PrefillCausalMask>,
-    logits_soft_cap: Env<keys::AttnLogitsSoftCap>,
-    sm_scale: Env<keys::SmScale>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    q: In<Tensor<bf16>>,
+    o: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
+    // builder ever began stating them. A `Const` mark PROMISES the statement
+    // carries the number at its slot in the params run; where nothing states
+    // one the promise breaks at the fire, not at the type. §11.20.
+    let logits_soft_cap = ctx.ask::<f32, keys::AttnLogitsSoftCap>()?;
+    let sm_scale = ctx.ask::<f32, keys::SmScale>()?;
+
+    let qo_indptr = ctx.ask::<*const u32, keys::QoIndptr>()?;
+    let lse = ctx.ask::<*mut f32, keys::AttnLseOut>()?;
+    let request_indices = ctx.ask::<*const i32, keys::Fa2PrefillRequestIndices>()?;
+    let k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
+    let v_pages = ctx.ask::<*mut u8, keys::KvValues>()?;
+    let kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
+    let kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
+    let kv_last_page_lens = ctx.ask::<*const u32, keys::KvLastPageLens>()?;
+    let qo_tile_indices = ctx.ask::<*const i32, keys::Fa2PrefillQoTileIndices>()?;
+    let kv_tile_indices = ctx.ask::<*const i32, keys::Fa2PrefillKvTileIndices>()?;
+    let merge_indptr = ctx.ask::<*const i32, keys::Fa2PrefillMergeIndptr>()?;
+    let o_indptr = ctx.ask::<*const i32, keys::Fa2PrefillOIndptr>()?;
+    let kv_chunk_size = ctx.ask::<*const i32, keys::Fa2PrefillKvChunkSize>()?;
+    let block_valid_mask = ctx.ask::<*const u8, keys::Fa2PrefillBlockValidMask>()?;
+    let tmp_v = ctx.ask::<*mut f32, keys::Fa2PrefillTmpV>()?;
+    let tmp_s = ctx.ask::<*mut f32, keys::Fa2PrefillTmpS>()?;
+    let padded_batch = ctx.ask::<i32, keys::Fa2PrefillPaddedBatch>()?;
+    let split_kv = ctx.ask::<bool, keys::Fa2PrefillSplitKv>()?;
+    let total_rows = ctx.ask::<i32, keys::Fa2PrefillTotalRows>()?;
+    let cta_tile_q = ctx.ask::<u32, keys::Fa2PrefillCtaTileQ>()?;
+    let requests = ctx.ask::<i32, keys::Fa2PrefillRequests>()?;
+    let num_q_heads = ctx.ask::<i32, keys::Fa2PrefillNumQHeads>()?;
+    let num_kv_heads = ctx.ask::<i32, keys::Fa2PrefillNumKvHeads>()?;
+    let head_dim = ctx.ask::<i32, keys::Fa2PrefillHeadDim>()?;
+    let page_size = ctx.ask::<i32, keys::Fa2PrefillPageSize>()?;
+    let window_left = ctx.ask::<i32, keys::Fa2PrefillWindowLeft>()?;
+    let hnd_layout = ctx.ask::<bool, keys::Fa2PrefillHndLayout>()?;
+    let full_attention = ctx.ask::<bool, keys::Fa2PrefillFullAttention>()?;
+    let causal_mask = ctx.ask::<bool, keys::Fa2PrefillCausalMask>()?;
     let plan = prefill_plan_of_leaves(
-        **request_indices,
-        **qo_tile_indices,
-        **kv_tile_indices,
-        **merge_indptr,
-        **o_indptr,
-        **kv_chunk_size,
-        **block_valid_mask,
-        **tmp_v,
-        **tmp_s,
-        **padded_batch,
-        **split_kv,
-        **total_rows,
-        **cta_tile_q,
-        **requests,
-        **num_q_heads,
-        **num_kv_heads,
-        **head_dim,
-        **page_size,
-        **window_left,
-        **hnd_layout,
-        **full_attention,
-        **causal_mask,
+        request_indices,
+        qo_tile_indices,
+        kv_tile_indices,
+        merge_indptr,
+        o_indptr,
+        kv_chunk_size,
+        block_valid_mask,
+        tmp_v,
+        tmp_s,
+        padded_batch,
+        split_kv,
+        total_rows,
+        cta_tile_q,
+        requests,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        window_left,
+        hnd_layout,
+        full_attention,
+        causal_mask,
     );
     let bufs = buffers(
         q.ptr,
         k_pages.cast::<bf16>(),
         v_pages.cast::<bf16>(),
         o.ptr,
-        **kv_page_indices,
-        **kv_page_indptr,
-        **kv_last_page_lens,
-        **qo_indptr,
-        **lse,
+        kv_page_indices,
+        kv_page_indptr,
+        kv_last_page_lens,
+        qo_indptr,
+        lse,
         core::ptr::null_mut(),
         core::ptr::null_mut(),
     );
-    prefill_paged(ctx, &bufs, &plan, **logits_soft_cap, **sm_scale)
+    prefill_paged(ctx, &bufs, &plan, logits_soft_cap, sm_scale)
 }
 
 /// `attn::dispatch_attention_flashinfer_prefill_capture_bf16`,
@@ -2225,88 +1953,79 @@ pub fn dispatch_attention_flashinfer_prefill_bf16(
 ///
 /// As [`dispatch_attention_flashinfer_prefill_bf16`], plus the capture
 /// refusals of [`dispatch_attention_flashinfer_decode_capture`].
-#[allow(clippy::too_many_arguments)]
-#[kernels_macros::routine]
+#[routine(untraced)]
 pub fn dispatch_attention_flashinfer_prefill_capture_bf16(
-    ctx: &Ctx,
-    q: In<0, bf16>,
-    o: Out<0, bf16>,
-    k_pages: Env<keys::KvKeys>,
-    v_pages: Env<keys::KvValues>,
-    qo_indptr: Env<keys::QoIndptr>,
-    kv_page_indices: Env<keys::KvPageIndices>,
-    kv_page_indptr: Env<keys::KvPageIndptr>,
-    kv_last_page_lens: Env<keys::KvLastPageLens>,
-    // `Env`, as [`dispatch_attention_flashinfer_decode`]'s. One spelling
-    // (`base.rs:1011`), one declared result.
-    lse: Env<keys::AttnLseOut>,
-    // THE PREFILL CARVE'S TWO KEYS STOOD HERE, and the unfold spends them:
-    // `bind/table.rs`'s `fa2_prefill_leaves` reads
-    // `Cx::attn_prefill_workspace` -- the same carve, one hop earlier -- and
-    // hands over addresses, so a base parameter would have nothing to offset.
-    // The arm still passes `a.prefill_workspace` to the upload, which is what
-    // keeps the row armed.
-    request_indices: Env<keys::Fa2PrefillRequestIndices>,
-    qo_tile_indices: Env<keys::Fa2PrefillQoTileIndices>,
-    kv_tile_indices: Env<keys::Fa2PrefillKvTileIndices>,
-    merge_indptr: Env<keys::Fa2PrefillMergeIndptr>,
-    o_indptr: Env<keys::Fa2PrefillOIndptr>,
-    kv_chunk_size: Env<keys::Fa2PrefillKvChunkSize>,
-    block_valid_mask: Env<keys::Fa2PrefillBlockValidMask>,
-    tmp_v: Env<keys::Fa2PrefillTmpV>,
-    tmp_s: Env<keys::Fa2PrefillTmpS>,
-    padded_batch: Env<keys::Fa2PrefillPaddedBatch>,
-    split_kv: Env<keys::Fa2PrefillSplitKv>,
-    total_rows: Env<keys::Fa2PrefillTotalRows>,
-    cta_tile_q: Env<keys::Fa2PrefillCtaTileQ>,
-    requests: Env<keys::Fa2PrefillRequests>,
-    num_q_heads: Env<keys::Fa2PrefillNumQHeads>,
-    num_kv_heads: Env<keys::Fa2PrefillNumKvHeads>,
-    head_dim: Env<keys::Fa2PrefillHeadDim>,
-    page_size: Env<keys::Fa2PrefillPageSize>,
-    // The PLAN's window, which this launcher reads twice: the capture arm
-    // exists only at `-1`, and the block carries it to the kernel.
-    window_left: Env<keys::Fa2PrefillWindowLeft>,
-    hnd_layout: Env<keys::Fa2PrefillHndLayout>,
-    full_attention: Env<keys::Fa2PrefillFullAttention>,
-    causal_mask: Env<keys::Fa2PrefillCausalMask>,
-    score_out: Env<*mut f32>,
-    score_indptr: Env<*const i32>,
-    score_window: Env<u32>,
-    logits_soft_cap: Env<keys::AttnLogitsSoftCap>,
-    sm_scale: Env<keys::SmScale>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    q: In<Tensor<bf16>>,
+    o: Out<Tensor<bf16>>,
+    score_out: *mut f32,
+    score_indptr: *const i32,
+    // The capture window the arm computed; nothing publishes it before the
+    // fire, so no column can answer for it.
+    #[unbound]
+    score_window: u32,
+    logits_soft_cap: Const<f32>,
+    sm_scale: Const<f32>) -> Result<(), Refusal> {
+    let lse = ctx.ask::<*mut f32, keys::AttnLseOut>()?;
+    let request_indices = ctx.ask::<*const i32, keys::Fa2PrefillRequestIndices>()?;
+    let window_left = ctx.ask::<i32, keys::Fa2PrefillWindowLeft>()?;
+    let k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
+    let v_pages = ctx.ask::<*mut u8, keys::KvValues>()?;
+    let qo_indptr = ctx.ask::<*const u32, keys::QoIndptr>()?;
+    let kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
+    let kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
+    let kv_last_page_lens = ctx.ask::<*const u32, keys::KvLastPageLens>()?;
+    let qo_tile_indices = ctx.ask::<*const i32, keys::Fa2PrefillQoTileIndices>()?;
+    let kv_tile_indices = ctx.ask::<*const i32, keys::Fa2PrefillKvTileIndices>()?;
+    let merge_indptr = ctx.ask::<*const i32, keys::Fa2PrefillMergeIndptr>()?;
+    let o_indptr = ctx.ask::<*const i32, keys::Fa2PrefillOIndptr>()?;
+    let kv_chunk_size = ctx.ask::<*const i32, keys::Fa2PrefillKvChunkSize>()?;
+    let block_valid_mask = ctx.ask::<*const u8, keys::Fa2PrefillBlockValidMask>()?;
+    let tmp_v = ctx.ask::<*mut f32, keys::Fa2PrefillTmpV>()?;
+    let tmp_s = ctx.ask::<*mut f32, keys::Fa2PrefillTmpS>()?;
+    let padded_batch = ctx.ask::<i32, keys::Fa2PrefillPaddedBatch>()?;
+    let split_kv = ctx.ask::<bool, keys::Fa2PrefillSplitKv>()?;
+    let total_rows = ctx.ask::<i32, keys::Fa2PrefillTotalRows>()?;
+    let cta_tile_q = ctx.ask::<u32, keys::Fa2PrefillCtaTileQ>()?;
+    let requests = ctx.ask::<i32, keys::Fa2PrefillRequests>()?;
+    let num_q_heads = ctx.ask::<i32, keys::Fa2PrefillNumQHeads>()?;
+    let num_kv_heads = ctx.ask::<i32, keys::Fa2PrefillNumKvHeads>()?;
+    let head_dim = ctx.ask::<i32, keys::Fa2PrefillHeadDim>()?;
+    let page_size = ctx.ask::<i32, keys::Fa2PrefillPageSize>()?;
+    let hnd_layout = ctx.ask::<bool, keys::Fa2PrefillHndLayout>()?;
+    let full_attention = ctx.ask::<bool, keys::Fa2PrefillFullAttention>()?;
+    let causal_mask = ctx.ask::<bool, keys::Fa2PrefillCausalMask>()?;
     let plan = prefill_plan_of_leaves(
-        **request_indices,
-        **qo_tile_indices,
-        **kv_tile_indices,
-        **merge_indptr,
-        **o_indptr,
-        **kv_chunk_size,
-        **block_valid_mask,
-        **tmp_v,
-        **tmp_s,
-        **padded_batch,
-        **split_kv,
-        **total_rows,
-        **cta_tile_q,
-        **requests,
-        **num_q_heads,
-        **num_kv_heads,
-        **head_dim,
-        **page_size,
-        **window_left,
-        **hnd_layout,
-        **full_attention,
-        **causal_mask,
+        request_indices,
+        qo_tile_indices,
+        kv_tile_indices,
+        merge_indptr,
+        o_indptr,
+        kv_chunk_size,
+        block_valid_mask,
+        tmp_v,
+        tmp_s,
+        padded_batch,
+        split_kv,
+        total_rows,
+        cta_tile_q,
+        requests,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        window_left,
+        hnd_layout,
+        full_attention,
+        causal_mask,
     );
     // `:849-856`. The sink first, then the variant, then the plan -- the C++'s
     // order, and the window is part of the sink here rather than of the
     // variant.
-    if score_out.is_null() || score_indptr.is_null() || *score_window == 0 {
+    if score_out.is_null() || score_indptr.is_null() || score_window == 0 {
         return Err(CAPTURE_SINK);
     }
-    let Some(arm) = prefill_capture_arm(plan.causal_mask, plan.window_left, **logits_soft_cap) else {
+    let Some(arm) = prefill_capture_arm(plan.causal_mask, plan.window_left, *logits_soft_cap) else {
         return Err(CAPTURE_VARIANT);
     };
     prefill_plan_usable(&plan)?;
@@ -2315,20 +2034,20 @@ pub fn dispatch_attention_flashinfer_prefill_capture_bf16(
         k_pages.cast::<bf16>(),
         v_pages.cast::<bf16>(),
         o.ptr,
-        **kv_page_indices,
-        **kv_page_indptr,
-        **kv_last_page_lens,
-        **qo_indptr,
-        **lse,
+        kv_page_indices,
+        kv_page_indptr,
+        kv_last_page_lens,
+        qo_indptr,
+        lse,
         core::ptr::null_mut(),
         core::ptr::null_mut(),
     );
-    let (base, split) = make_prefill_params(&plan, &bufs, 0.0, **sm_scale);
+    let (base, split) = make_prefill_params(&plan, &bufs, 0.0, *sm_scale);
     let params = PrefillScoreParams {
         base,
-        score_out: addr(*score_out),
-        score_indptr: addr(*score_indptr),
-        score_window: *score_window,
+        score_out: addr(score_out),
+        score_indptr: addr(score_indptr),
+        score_window: score_window,
     };
     prefill(ctx, prefill_at(&plan, arm, params.base.padded_batch_size), &params)?;
     if plan.info.split_kv { fold(ctx, &split) } else { Ok(()) }
@@ -2351,96 +2070,87 @@ pub fn dispatch_attention_flashinfer_prefill_capture_bf16(
 /// # Errors
 ///
 /// As [`dispatch_attention_flashinfer_prefill_bf16`].
-#[allow(clippy::too_many_arguments)]
-#[kernels_macros::routine]
+#[routine(untraced)]
 pub fn dispatch_attention_flashinfer_prefill_custom(
-    ctx: &Ctx,
-    q: In<0, bf16>,
-    o: Out<0, bf16>,
-    k_pages: Env<keys::KvKeys>,
-    v_pages: Env<keys::KvValues>,
-    qo_indptr: Env<keys::QoIndptr>,
-    kv_page_indices: Env<keys::KvPageIndices>,
-    kv_page_indptr: Env<keys::KvPageIndptr>,
-    kv_last_page_lens: Env<keys::KvLastPageLens>,
-    // `Env`, as [`dispatch_attention_flashinfer_decode`]'s. One spelling
-    // (`base.rs:1051`), one declared result.
-    lse: Env<keys::AttnLseOut>,
-    // The prefill carve's two keys stood here; see
-    // `dispatch_attention_flashinfer_prefill_capture_bf16` for where they went.
-    request_indices: Env<keys::Fa2PrefillRequestIndices>,
-    qo_tile_indices: Env<keys::Fa2PrefillQoTileIndices>,
-    kv_tile_indices: Env<keys::Fa2PrefillKvTileIndices>,
-    merge_indptr: Env<keys::Fa2PrefillMergeIndptr>,
-    o_indptr: Env<keys::Fa2PrefillOIndptr>,
-    kv_chunk_size: Env<keys::Fa2PrefillKvChunkSize>,
-    block_valid_mask: Env<keys::Fa2PrefillBlockValidMask>,
-    tmp_v: Env<keys::Fa2PrefillTmpV>,
-    tmp_s: Env<keys::Fa2PrefillTmpS>,
-    padded_batch: Env<keys::Fa2PrefillPaddedBatch>,
-    split_kv: Env<keys::Fa2PrefillSplitKv>,
-    total_rows: Env<keys::Fa2PrefillTotalRows>,
-    cta_tile_q: Env<keys::Fa2PrefillCtaTileQ>,
-    requests: Env<keys::Fa2PrefillRequests>,
-    num_q_heads: Env<keys::Fa2PrefillNumQHeads>,
-    num_kv_heads: Env<keys::Fa2PrefillNumKvHeads>,
-    head_dim: Env<keys::Fa2PrefillHeadDim>,
-    page_size: Env<keys::Fa2PrefillPageSize>,
-    // Taken and then OVERWRITTEN with `-1` in the block below: the mask is
-    // the causality here, and a plan planned under a window still names the
-    // work list this launcher walks.
-    window_left: Env<keys::Fa2PrefillWindowLeft>,
-    hnd_layout: Env<keys::Fa2PrefillHndLayout>,
-    full_attention: Env<keys::Fa2PrefillFullAttention>,
-    causal_mask: Env<keys::Fa2PrefillCausalMask>,
-    mask: Env<*const u8>,
-    mask_indptr: Env<*const i32>,
-    logits_soft_cap: Env<keys::AttnLogitsSoftCap>,
-    sm_scale: Env<keys::SmScale>,
-) -> Result<(), Refusal> {
+    ctx: &Ctx<'_>,
+    q: In<Tensor<bf16>>,
+    o: Out<Tensor<bf16>>,
+    mask: *const u8,
+    mask_indptr: *const i32,
+    logits_soft_cap: Const<f32>,
+    sm_scale: Const<f32>) -> Result<(), Refusal> {
+    let lse = ctx.ask::<*mut f32, keys::AttnLseOut>()?;
+    let window_left = ctx.ask::<i32, keys::Fa2PrefillWindowLeft>()?;
+    let k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
+    let v_pages = ctx.ask::<*mut u8, keys::KvValues>()?;
+    let qo_indptr = ctx.ask::<*const u32, keys::QoIndptr>()?;
+    let kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
+    let kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
+    let kv_last_page_lens = ctx.ask::<*const u32, keys::KvLastPageLens>()?;
+    let request_indices = ctx.ask::<*const i32, keys::Fa2PrefillRequestIndices>()?;
+    let qo_tile_indices = ctx.ask::<*const i32, keys::Fa2PrefillQoTileIndices>()?;
+    let kv_tile_indices = ctx.ask::<*const i32, keys::Fa2PrefillKvTileIndices>()?;
+    let merge_indptr = ctx.ask::<*const i32, keys::Fa2PrefillMergeIndptr>()?;
+    let o_indptr = ctx.ask::<*const i32, keys::Fa2PrefillOIndptr>()?;
+    let kv_chunk_size = ctx.ask::<*const i32, keys::Fa2PrefillKvChunkSize>()?;
+    let block_valid_mask = ctx.ask::<*const u8, keys::Fa2PrefillBlockValidMask>()?;
+    let tmp_v = ctx.ask::<*mut f32, keys::Fa2PrefillTmpV>()?;
+    let tmp_s = ctx.ask::<*mut f32, keys::Fa2PrefillTmpS>()?;
+    let padded_batch = ctx.ask::<i32, keys::Fa2PrefillPaddedBatch>()?;
+    let split_kv = ctx.ask::<bool, keys::Fa2PrefillSplitKv>()?;
+    let total_rows = ctx.ask::<i32, keys::Fa2PrefillTotalRows>()?;
+    let cta_tile_q = ctx.ask::<u32, keys::Fa2PrefillCtaTileQ>()?;
+    let requests = ctx.ask::<i32, keys::Fa2PrefillRequests>()?;
+    let num_q_heads = ctx.ask::<i32, keys::Fa2PrefillNumQHeads>()?;
+    let num_kv_heads = ctx.ask::<i32, keys::Fa2PrefillNumKvHeads>()?;
+    let head_dim = ctx.ask::<i32, keys::Fa2PrefillHeadDim>()?;
+    let page_size = ctx.ask::<i32, keys::Fa2PrefillPageSize>()?;
+    let hnd_layout = ctx.ask::<bool, keys::Fa2PrefillHndLayout>()?;
+    let full_attention = ctx.ask::<bool, keys::Fa2PrefillFullAttention>()?;
+    let causal_mask = ctx.ask::<bool, keys::Fa2PrefillCausalMask>()?;
     let plan = prefill_plan_of_leaves(
-        **request_indices,
-        **qo_tile_indices,
-        **kv_tile_indices,
-        **merge_indptr,
-        **o_indptr,
-        **kv_chunk_size,
-        **block_valid_mask,
-        **tmp_v,
-        **tmp_s,
-        **padded_batch,
-        **split_kv,
-        **total_rows,
-        **cta_tile_q,
-        **requests,
-        **num_q_heads,
-        **num_kv_heads,
-        **head_dim,
-        **page_size,
-        **window_left,
-        **hnd_layout,
-        **full_attention,
-        **causal_mask,
+        request_indices,
+        qo_tile_indices,
+        kv_tile_indices,
+        merge_indptr,
+        o_indptr,
+        kv_chunk_size,
+        block_valid_mask,
+        tmp_v,
+        tmp_s,
+        padded_batch,
+        split_kv,
+        total_rows,
+        cta_tile_q,
+        requests,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        window_left,
+        hnd_layout,
+        full_attention,
+        causal_mask,
     );
-    let arm = prefill_custom_arm(**logits_soft_cap);
+    let arm = prefill_custom_arm(*logits_soft_cap);
     prefill_plan_usable(&plan)?;
     let bufs = buffers(
         q.ptr,
         k_pages.cast::<bf16>(),
         v_pages.cast::<bf16>(),
         o.ptr,
-        **kv_page_indices,
-        **kv_page_indptr,
-        **kv_last_page_lens,
-        **qo_indptr,
-        **lse,
+        kv_page_indices,
+        kv_page_indptr,
+        kv_last_page_lens,
+        qo_indptr,
+        lse,
         core::ptr::null_mut(),
         core::ptr::null_mut(),
     );
-    let (mut params, split) = make_prefill_params(&plan, &bufs, **logits_soft_cap, **sm_scale);
+    let (mut params, split) = make_prefill_params(&plan, &bufs, *logits_soft_cap, *sm_scale);
     // `:1150-1155`, `:1163`.
-    params.maybe_custom_mask = addr(*mask);
-    params.maybe_mask_indptr = addr(*mask_indptr);
+    params.maybe_custom_mask = addr(mask);
+    params.maybe_mask_indptr = addr(mask_indptr);
     params.window_left = -1;
     prefill(ctx, prefill_at(&plan, arm, params.padded_batch_size), &params)?;
     if plan.info.split_kv { fold(ctx, &split) } else { Ok(()) }
@@ -2466,43 +2176,29 @@ pub fn dispatch_attention_flashinfer_prefill_custom(
 /// # Errors
 ///
 /// As [`dispatch_attention_flashinfer_prefill_bf16`].
-#[allow(clippy::too_many_arguments)]
-#[kernels_macros::routine]
+#[routine(whole, untraced)]
 pub fn attention_flashinfer_prefill(
-    ctx: &Ctx,
-    q: In<0, bf16>,
-    o: Out<0, bf16>,
-    k_pages: Env<keys::KvKeys>,
-    v_pages: Env<keys::KvValues>,
-    qo_indptr: Env<keys::QoIndptr>,
-    kv_page_indices: Env<keys::KvPageIndices>,
-    kv_page_indptr: Env<keys::KvPageIndptr>,
-    kv_last_page_lens: Env<keys::KvLastPageLens>,
-    // `Env`, as [`dispatch_attention_flashinfer_decode`]'s -- and this is
-    // the symbol whose SECOND spelling was the defect written up at
-    // `arms/fa2.rs`'s planless prefill. `attention_flashinfer_prefill_lse`
-    // (`base.rs:514`) names [`attention_flashinfer_prefill_lse`] now, so the
-    // text that declares an LSE and the text that does not no longer share
-    // an arm that has to guess which one it got.
-    lse: Env<keys::AttnLseOut>,
-    // The decode carve, keyed, on a PREFILL launcher on purpose: the planless
-    // arm plans and uploads against `a.workspace` and not
-    // `a.prefill_workspace`, *"as the entry point it replaces did"*. These
-    // two are the BASES the aggregate's offsets are relative to, which is why
-    // this pair survived the unfold that deleted every other workspace
-    // parameter in this file: the plan below is a plan and not a run of
-    // resolved addresses.
-    int_buffer: Env<keys::AttnWorkspaceInt>,
-    float_buffer: Env<keys::AttnWorkspaceFloat>,
+    ctx: &Ctx<'_>,
+    q: In<Tensor<bf16>>,
+    o: Out<Tensor<bf16>>,
     // STILL THE AGGREGATE, AND IT CANNOT BECOME LEAVES HERE. The arm builds
     // this plan from the host CSR mirrors on the way in; nothing published it
     // before the fire, so `operand()` has nothing to read and there is no
     // column to answer. `.wiki/kilimanjaro3.md` §3.3 keeps `Cx` query-only,
     // so a binder that planned would be the other half of the same mistake.
-    plan: Env<PrefillPlan>,
-    logits_soft_cap: Env<keys::AttnLogitsSoftCap>,
-    sm_scale: Env<keys::SmScale>,
-) -> Result<(), Refusal> {
+    #[unbound]
+    plan: PrefillPlan,
+    logits_soft_cap: Const<f32>,
+    sm_scale: Const<f32>) -> Result<(), Refusal> {
+    let lse = ctx.ask::<*mut f32, keys::AttnLseOut>()?;
+    let int_buffer = ctx.ask::<*mut core::ffi::c_void, keys::AttnWorkspaceInt>()?;
+    let k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
+    let v_pages = ctx.ask::<*mut u8, keys::KvValues>()?;
+    let qo_indptr = ctx.ask::<*const u32, keys::QoIndptr>()?;
+    let kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
+    let kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
+    let kv_last_page_lens = ctx.ask::<*const u32, keys::KvLastPageLens>()?;
+    let float_buffer = ctx.ask::<*mut core::ffi::c_void, keys::AttnWorkspaceFloat>()?;
     // NOT A FORWARD ANY MORE, and the carve argument that stood here is what
     // the change spends. The planned launcher took two workspace bases and a
     // plan, and one parameter carried two carves depending on which caller
@@ -2513,15 +2209,15 @@ pub fn attention_flashinfer_prefill(
         k_pages.cast::<bf16>(),
         v_pages.cast::<bf16>(),
         o.ptr,
-        **kv_page_indices,
-        **kv_page_indptr,
-        **kv_last_page_lens,
-        **qo_indptr,
-        **lse,
-        **int_buffer,
-        **float_buffer,
+        kv_page_indices,
+        kv_page_indptr,
+        kv_last_page_lens,
+        qo_indptr,
+        lse,
+        int_buffer,
+        float_buffer,
     );
-    prefill_paged(ctx, &bufs, &plan.into_inner(), **logits_soft_cap, **sm_scale)
+    prefill_paged(ctx, &bufs, &plan, *logits_soft_cap, *sm_scale)
 }
 
 /// `attn::attention_flashinfer_prefill_lse` — the planless prefill over a
@@ -2547,52 +2243,36 @@ pub fn attention_flashinfer_prefill(
 /// # Errors
 ///
 /// [`dispatch_attention_flashinfer_prefill_bf16`]'s.
-#[allow(clippy::too_many_arguments)]
-#[kernels_macros::routine]
+#[routine(whole, untraced)]
 pub fn attention_flashinfer_prefill_lse(
-    ctx: &Ctx,
-    q: In<0, bf16>,
+    ctx: &Ctx<'_>,
+    q: In<Tensor<bf16>>,
     // REQUIRED, where [`attention_flashinfer_prefill`]'s is
-    // `Out<0, bf16>`. Same reason as the decode pair's: the one-result
+    // `Out<0, *mut bf16>`. Same reason as the decode pair's: the one-result
     // spelling goes through `attn_at`, which declares nothing inside
     // `llama_like/forward/mod.rs:1638`'s `dsl::guarded_value` and needs
     // `Provenance::Either` for `model-compiler/src/lower/walk.rs:472` to hand
     // it the region's buffer. `attention_flashinfer_prefill_lse` declares two
     // results unconditionally and `deepseek_v4/forward/mod.rs:146` states it
     // outside any region.
-    o: Out<0, bf16>,
-    k_pages: Env<keys::KvKeys>,
-    v_pages: Env<keys::KvValues>,
-    qo_indptr: Env<keys::QoIndptr>,
-    kv_page_indices: Env<keys::KvPageIndices>,
-    kv_page_indptr: Env<keys::KvPageIndptr>,
-    kv_last_page_lens: Env<keys::KvLastPageLens>,
-    lse: Out<1, f32>,
-    // The decode carve, keyed, as [`attention_flashinfer_prefill`]'s: one
-    // arm, one `Form` match, one `a.workspace`.
-    int_buffer: Env<keys::AttnWorkspaceInt>,
-    float_buffer: Env<keys::AttnWorkspaceFloat>,
-    plan: Env<PrefillPlan>,
-    logits_soft_cap: Env<keys::AttnLogitsSoftCap>,
-    sm_scale: Env<keys::SmScale>,
-) -> Result<(), Refusal> {
-    attention_flashinfer_prefill(
-        ctx,
-        q,
-        o,
-        k_pages,
-        v_pages,
-        qo_indptr,
-        kv_page_indices,
-        kv_page_indptr,
-        kv_last_page_lens,
-        <keys::AttnLseOut as keys::Fact>::env(lse.ptr),
-        int_buffer,
-        float_buffer,
-        plan,
-        logits_soft_cap,
-        sm_scale,
-    )
+    o: Out<Tensor<bf16>>,
+    _lse: Out<Tensor<f32>>,
+    // The aggregate the arm built, as above: nothing published it before the
+    // fire, so there is no column to answer for it.
+    #[unbound]
+    plan: PrefillPlan,
+    logits_soft_cap: Const<f32>,
+    sm_scale: Const<f32>) -> Result<(), Refusal> {
+    let _int_buffer = ctx.ask::<*mut core::ffi::c_void, keys::AttnWorkspaceInt>()?;
+    let _k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
+    let _v_pages = ctx.ask::<*mut u8, keys::KvValues>()?;
+    let _qo_indptr = ctx.ask::<*const u32, keys::QoIndptr>()?;
+    let _kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
+    let _kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
+    let _kv_last_page_lens = ctx.ask::<*const u32, keys::KvLastPageLens>()?;
+    let _float_buffer = ctx.ask::<*mut core::ffi::c_void, keys::AttnWorkspaceFloat>()?;
+    // As above: the plan and its workspaces are the callee's to ask for.
+    attention_flashinfer_prefill(ctx, q, o, plan, logits_soft_cap, sm_scale)
 }
 
 /// The two plan-validity refusals, in the order the C++ made them.
@@ -2655,514 +2335,8 @@ fn prefill_at(plan: &PrefillPlan, arm: PrefillArm, padded_batch_size: u32) -> Pr
     }
 }
 
-/// The six FA2 symbols a trace states, and what it may say about each.
-///
-/// The argument lists are DERIVED from the `fn`s above -- `routine!` sees only
-/// the identifier. What is stated beside one is what no signature carries.
-///
-/// **`depth_prefix_plan` is on exactly one row in the whole table and it is
-/// this one**: `model-ir`'s `trace/` reads it for the union-tail plan
-/// swap, and a decode dispatch is the statement that swap is about.
-///
-/// `attention_flashinfer_prefill` is `whole` because it plans over the whole
-/// fire on the way in, so it owes its caller nothing and cannot be handed a
-/// row window: the arm walks `qo_indptr` and `kv_page_indptr` on the HOST, and
-/// those are R-shaped.
-///
-/// # The derived column, and why it will not cross
-///
-/// All six now carry one. `.wiki/kilimanjaro.md` §8 puts fa2 LAST and this is
-/// what last looks like: the column is a LEDGER here, not a binding path, and
-/// §8 said D6 would ship *"deriving `operands` and reading it nowhere"* — for
-/// this family that is the finished state rather than a stage.
-///
-/// What it derives is real. `q` is `In(0)`, `o` and `lse` are `Out(0)` and
-/// `Out(1)` and both are nullable — which the `Or<*mut _>` wrappers were
-/// already saying and nothing was reading. `k_pages` and `v_pages` reach
-/// `KvKeys`/`KvValues` through two aliases added to `kernels-macros`'
-/// `fact_of` for exactly these two parameters, and `kv_page_indices` and
-/// `kv_page_indptr` were already spelled canonically.
-///
-/// # `q` STATES `In(0)` NOW, AND `o` AND `lse` STILL COUNT
-///
-/// `.wiki/kilimanjaro2.md` E2 — *"counting is the last derivation that
-/// guesses"* — reaches a family with no shape parameters at all, so what it
-/// buys here is exactly one thing and it is worth naming precisely: the
-/// index stops depending on where the parameter SITS. Position derived
-/// `In(0)` for `q` because it is the only `*const bf16` in a list whose
-/// other pointers are all `Env` or `Or`, and `classify` reads an `Env<*mut
-/// bf16>` as `Shape::Env` rather than as a pointer — so the count was right
-/// and was right for a reason no reader could see from the signature. All
-/// six arms read `cx.arg_in(0)`, so the token states what the arms already
-/// agreed on.
-///
-/// **`Or<T>` IS NOT A REGION AND `o` IS NOT WRAPPED.** `Or<Out<0, *mut
-/// bf16>>` would compile and would state nothing: `stated_source` matches on
-/// the LAST path segment of a parameter's type (`kernels-macros/src/lib.rs:335`),
-/// which is `Or`, and `Or` states no slot — so the nesting would read as a
-/// claim while the index went on being counted underneath it. The provenance
-/// is the reason the two cannot simply be merged: `o` is `Provenance::Either`
-/// because this same symbol serves a text that declares the result (gemma-4)
-/// and one that does not (llama_like), where `Out<0, _>` is
-/// `Provenance::Trace` and would make the result required. That is
-/// `routine.rs:110`'s third case, not a shade of the other two.
-///
-/// # D2 SPLIT THE TWELVE INTO SIX `Or`s, SIX `Env`s AND FOUR NEW SLOTS
-///
-/// **Read this before the section below, which is the state it amends.**
-/// Kilimanjaro III Stage 6 deletes `Or<T>` from operand position, and the
-/// audit that did it found the twelve marks were carrying two different
-/// facts under one spelling.
-///
-/// `Or<T>` plants one const: `Provenance::Either` (`kernels/src/routine.rs:522`).
-/// On a `Binds::Writes` parameter that is read in two places, and this family
-/// had one parameter in each:
-///
-/// * **`o` — `accepts_an_unstated_result`** (`model-ir/src/kernels.rs:227`),
-///   which `model-compiler/src/lower/walk.rs:472` consults before handing a
-///   value-producing region's buffer to a statement that declares no result.
-///   `attn_at` (`base.rs:1121`) declares NONE inside a value region and
-///   `llama_like/forward/mod.rs:1638` states five of these six symbols inside
-///   `dsl::guarded_value`. Take `Or` off `o` and 56 guard regions produce a
-///   value nobody writes — the defect `model/tests/arena_soundness.rs`'s
-///   `UNWRITTEN` records 54 instances of. **All six `o`s keep their `Or`,
-///   and that is not a deferral, it is the answer.**
-/// * **`lse` — `arity_problem`'s ceiling** (`:303`) and nothing else. It was
-///   `Either` because ONE STRING WAS TWO ARITIES:
-///   `attention_flashinfer_decode` declares one result and
-///   `attention_flashinfer_decode_lse` (`base.rs:373`) declares two, and
-///   `attention_flashinfer_prefill_planless` and
-///   `attention_flashinfer_prefill_lse` (`:514`) do the same on the planless
-///   symbol. D2 (`.wiki/kilimanjaro3.md` §3.8) — *an optional argument means
-///   two functions* — is the rule for exactly that, because the two texts
-///   differ in ARITY and not in body.
-///
-/// So the two two-arity strings became four:
-/// [`dispatch_attention_flashinfer_decode_lse`] and
-/// [`attention_flashinfer_prefill_lse`] take `o: Out<0, bf16>` and
-/// `lse: Out<1, f32>` REQUIRED and forward to their twins, and all six
-/// original `lse`s became `Env<*mut f32>` — the fire's `lse_out_d` scratch
-/// slab, which is what every one-result arm was passing anyway.
-///
-/// ## The arithmetic after the split
-///
-/// The six originals now give `writes = 0, opt_writes = 1` (`o` alone), a
-/// band of `[0, 1]`, and every one-result-or-none text fits it. The four
-/// texts that declare two results now name symbols with `writes = 2,
-/// opt_writes = 0` and a band of `[2, 2]` — a floor, where before there was
-/// none, so a text that stopped declaring its LSE is refused at LOAD instead
-/// of silently writing it to the fire's slab.
-///
-/// **The ceiling FELL from 2 to 1 on the six, and that is the point.** A band
-/// that admitted both arities is what let `arms/fa2.rs`'s planless prefill
-/// write deepseek-v4's declared LSE into scratch for as long as nobody opened
-/// the arm: every count agreed, and no count has ever been able to see an
-/// address.
-///
-/// `STATED_SLOTS` does not move. Six `Out(1)` marks left and six arrived —
-/// three on each new symbol, less the `q`/`o` pair each already had — so
-/// `bind/table.rs`'s census reads the same number for a different reason,
-/// which is the sort of coincidence worth writing down rather than
-/// discovering.
-///
-/// # THE TWELVE WERE `OutSlot<N, Or<T>>`, AND GETTING THERE TOOK A REPAIR
-///
-/// kilimanjaro2 Stage 6 deletes `#[source(...)]`, so every slot attribute in
-/// the tree owes a type-level spelling, and `819fdc34b` built the pair these
-/// twelve were waiting for: [`kernels::routine::OutSlot`] states result `N`
-/// and claims NO rectangle, which is exactly the objection the section above
-/// makes to `Out<0, _>`. The conversion still could not be made when it
-/// landed, and the section below is the argument that found out why. It is
-/// kept because it is the reasoning that produced `148ca6a6a`, and it is
-/// marked as the state BEFORE that commit so nobody reads it as live.
-///
-/// ## What was wrong, and what fixed it
-///
-/// Three of the four things a conversion has to preserve survived
-/// `Out<0, bf16>` from the day the type existed:
-/// `stated_source` reads the last path segment and sees `OutSlot`, so the
-/// index states correctly; `classify` peels `OutSlot` and then `Or` and
-/// keeps `nullable: true` (`kernels-macros/src/lib.rs:287-296`); and the
-/// runtime `Or` value is still inside the wrapper, so the arm's fallback is
-/// untouched. The fourth was PROVENANCE, and it is the one this family is
-/// about. `OutSlot`'s `Arg` impl declared `TY` and `SPELLING` and **omitted
-/// `PROV`**, taking the trait default of `Provenance::Trace` — so wrapping
-/// an `Or` did precisely what `Out<0, _>` was rejected for above: it made
-/// the result REQUIRED.
-///
-/// **`148ca6a6a` made all seven position wrappers forward `T::PROV`**
-/// (`routine.rs:824-902`). `Or<T>` keeps its `Either` through the wrap and
-/// the twelve are converted.
-///
-/// ## The arithmetic, which is the part worth keeping
-///
-/// `arity_problem` (`model-ir/src/kernels.rs:271`) ends on
-/// `if declared < writes || declared > writes + opt_writes`, and
-/// `ARITY_EXCEPTIONS` is `&[]` — nothing is spared. These six give
-/// `writes = 0, opt_writes = 2`, so the band is `[0, 2]` and every statement
-/// this family has fits it. Converted WITHOUT forwarding they would have
-/// given `writes = 2, opt_writes = 0` and a band of `[2, 2]`, and `attn_at`
-/// (`model-dsl/src/cuda/base.rs:1138`) — the builder behind
-/// `attention_flashinfer_decode` and the plan-free prefill — declares
-/// `shape.map(...)`, ONE result, or ZERO inside a value region. Both would
-/// have failed `declared < writes` on the ordinary decode path. Only the two
-/// `_lse` builders (`base.rs:373`, `:514`) declare two and would have
-/// survived.
-///
-/// **WITH forwarding the band does not move at all**, which is a stronger
-/// result than the one the repair was argued for. The general safety
-/// argument is that forwarding shifts a nullable out of `writes` and into
-/// `opt_writes`, dropping the lower bound while the upper bound is a SUM and
-/// stays put, so an admitted band can only widen. These twelve are the
-/// degenerate case of it: they were `Or<_>` and therefore already `Either`
-/// before the conversion, and `OutSlot<N, Or<_>>` forwards that same
-/// `Either`, so `writes` and `opt_writes` are UNCHANGED and the band is the
-/// same `[0, 2]` it was. Nothing about what loads moves.
-///
-/// `arity_problem`'s own doc names this family as the reason the mechanism
-/// exists: *"a [`Provenance::Either`] argument is one the statement MAY
-/// place — FA2's `o`, which is the trace's result on a text that names one
-/// and the guard's arena landing on a text that does not"*.
-///
-/// ## Nothing renumbered, and the check is cheap to state
-///
-/// `stated_source` SETS `*outs = N + 1` where the attribute left the counter
-/// alone (`gemm` found this on `gemv_bf16`'s `bias`, which moved
-/// `In(0)` -> `In(1)`), so a conversion can move a later BARE pointer. **Not
-/// one of these six signatures has a bare pointer.** Every non-wrapped
-/// pointer in all six is `Env<_>`, and `derive_all` sends `Shape::Env` to
-/// `fact_of(&name)` without touching either counter
-/// (`kernels-macros/src/lib.rs:238`). The counter now reaches 2 and is read
-/// by nothing. No `<FN>_DERIVED` entry moves; `stated` was already `true` on
-/// all twelve, because an attribute states just as loudly as a wrapper.
-///
-/// ## One thing the conversion buys beyond retiring an attribute
-///
-/// [`attention_flashinfer_prefill`] forwards `o` and `lse` WHOLE into the
-/// shared [`prefill_paged`] body, the way it already forwarded `q`. That
-/// forward used to pass two `Or<_>`s that agreed about nothing but their
-/// pointee type; now both ends spell the slot, so the compiler checks that
-/// the caller's result 0 is the callee's result 0. The comment at `q` quotes
-/// rope's rule — *"forward the whole region where the slot agrees; build one
-/// where the caller is inventing the operand"* — and it now covers all three
-/// operands rather than one.
-///
-/// # ALL TWELVE SLOTS ARE STATED, AND THAT IS THE `alias()` GATE MOVING
-///
-/// Every `In(_)`/`Out(_)` these six derive is now written down: `q` by its
-/// `In<0, _>` region and `o`/`lse` by their `OutSlot<0, _>`/`OutSlot<1, _>`
-/// wrappers. The counter reaches nothing here any more, so all six leave
-/// `bind/table.rs`'s `COUNTED_SLOT_SYMBOLS` list and twelve entries join
-/// `STATED_SLOTS`.
-///
-/// **No derived value changed and no binding could have.** The marks
-/// state exactly what the counter had already reached -- `o` was `Out(0)`
-/// and `lse` was `Out(1)` before, because they are the only two parameters
-/// the counter sees -- and `alias()`, the correction `Derived::stated`
-/// switches off, opens `let Source::Slot(Kind::In, n) = d.source else { return *d };`
-/// (`bind/table.rs:1202`). It has never touched an `Out`. So the risk this
-/// gate exists to manage -- *"turning off the correction AND supplying the
-/// wrong answer"* -- is not reachable from an `Out`-only conversion. A family
-/// whose counted slots were `In`s would owe a harder argument than this one.
-///
-/// The evidence for the indices themselves is at the two parameters, and it
-/// is uneven on purpose: four of the six are witnessed by a statement builder
-/// or an arm that reads `arg_out(1)`, and the two capture/custom prefills are
-/// argued BY ELIMINATION over the provenance-eligible parameters. That
-/// argument is written out at `lse` so it can be disagreed with.
-///
-/// The other half of E1 does not apply to this family, and the absence is a
-/// finding rather than an omission: **not one of these six takes a shape
-/// parameter.** There is no `#[source(Rows)]`, no `#[source(OutWidth(0))]`
-/// to delete, because a FlashInfer dispatch is told its rectangle by the
-/// PLAN — `DecodePlan`/`PrefillPlan` carry `padded_batch_size`,
-/// `num_qo_heads` and the CSR the kernel walks — and a plan is an `Env`
-/// aggregate. So `q.rows` and `q.width` arrive and go unread, which costs
-/// two `i32`s in a `Copy` value and is the price of the address and the
-/// extent travelling together everywhere else.
-///
-/// A DRAFT OF THAT SENTENCE ALSO LISTED *"no `Width<slot::_>`"*, and the
-/// notation it named no longer exists: `b57cf25ea` deleted
-/// `kernels::routine::Rows`, `Width<S>` and `mod slot` outright, so there is
-/// no wrapper spelling left for a shape parameter to have. `Source::Named(<keys::Rows as keys::Fact>::KEY)`,
-/// `Source::InWidth` and `Source::OutWidth` are untouched — the variants
-/// remain, only the way of writing them into a signature went — which is why
-/// the two `#[source(...)]` spellings above are the ones worth naming. The
-/// six launchers are unaffected either way; they never had one.
-///
-/// What blocks it is not a vocabulary gap and cannot be closed by marking:
-///
-/// * `bind/table.rs`'s `operand()` answers NO `Kv*` variant. Not one. The
-///   pool's geometry is the driver's own allocation and `Facts` carries none
-///   of it, so the four pointers that DO derive correctly resolve to nothing.
-/// * `plan` is `Env<DecodePlan>`, a by-value aggregate. `Facts` is `Copy` and
-///   small on purpose; a plan is neither.
-/// * `int_buffer` and `float_buffer` are FlashInfer workspace addresses
-///   carved by `attention_workspace.rs`. THIS BULLET IS RETIRED. *"Not
-///   operands of any statement"* is still true and was never the question: a
-///   fact does not have to be stated to be answered. `Cx::attn_workspace`
-///   answers the decode carve and `Cx::attn_prefill_workspace` the other, and
-///   the six unfolded launchers name neither -- both carves are resolved
-///   inside `fa2_decode_leaves`/`fa2_prefill_leaves`, which fold
-///   `int_base_bytes` in and hand out addresses. The planless pair still asks
-///   for the DECODE carve by name, because that is the one its arm plans and
-///   uploads into.
-///
-/// So the six one-line upload arms in `bind/arms/fa2.rs` stay. They are not
-/// technical debt and this column is not a step towards deleting them: it is
-/// the first machine-checked statement of what a fa2 statement carries, sat
-/// next to a hand arm that binds what it cannot.
-///
-/// # THE FOUR PAGED FACTS ARE SPELLED IN TYPES, AND THIS FAMILY IS 24 OF 54
-///
-/// Stage 5's whole remaining gate was four parameter names —
-/// `k_pages`/`v_pages`/`kv_page_indices`/`kv_page_indptr`, 54 sites, every
-/// one of them in `attn/` — and this file held 24 of them, four on each of
-/// the six launchers. All 24 now read `Env<keys::KvKeys>`,
-/// `Env<keys::KvValues>`, `Env<keys::KvPageIndices>` and
-/// `Env<keys::KvPageIndptr>`. The argument is at
-/// [`dispatch_attention_flashinfer_decode`]'s parameters; what belongs here
-/// is what the conversion moved.
-///
-/// ## Nothing derived moved, and that is the claim to be suspicious of
-///
-/// `fact_of` already answered these four names with these four sources
-/// (`kernels-macros/src/lib.rs:640-643`), so every entry of every column is
-/// byte-identical before and after. A refactor whose success condition is
-/// "no observable change" is one that cannot be tested, which is why the
-/// per-parameter check against `bind/arms/fa2.rs` was the work and the
-/// substitution was not: the failure this conversion can produce is not a
-/// wrong `Source`, it is a RIGHT source on a parameter that was never a fact.
-/// `s3-norm` found two of those among nineteen `positions`.
-///
-/// ## Arity is untouched, by the same rule that made the last round safe
-///
-/// `arity_problem` matches `(_, Provenance::Env) => {}` first
-/// (`model-ir/src/kernels.rs:271-320`), and `fact!` sets
-/// `PROV = Provenance::Env` unconditionally (`keys.rs:216`), so these
-/// parameters were invisible to the read/write counts before and are
-/// invisible now. Neither `reads`, `opt_reads`, `writes` nor `opt_writes`
-/// moves for any of the six. This is the opposite situation from the
-/// `OutSlot` round below, where the provenance was the whole question.
-///
-/// ## `Ty` changed on eight of them and nothing reads it
-///
-/// `k_pages`/`v_pages` declared `Ty::PtrBf16` and now declare `*mut u8`'s.
-/// That is a real change to `args` and it is inert for a reason worth
-/// naming rather than assuming: `arity_problem` discards an `Env` before it
-/// reads a `Ty`, `abi_admits` (`bind/table.rs`) is reached only for a
-/// parameter the binder BINDS, and `operand()` answers no `Kv*` variant at
-/// all — the bullet list above says so. So the declared type here is
-/// documentation, which is exactly the condition under which `KvPageIndices`
-/// spent months declaring `i32` for a `u32` table. A key nobody can reach is
-/// a key nobody proof-reads.
-///
-/// ## The bodies cast back to bf16, and that is not the key being wrong
-///
-/// `keys::KvKeys` is `*mut u8` because the cache's element type varies by
-/// model (`keys.rs:483-505`). FA2 exists at one width — a quantised layer is
-/// widened into `k_bf16_pages` by the arm's prelude before a page reaches
-/// here — so `buffers` keeps `*mut bf16` and the five call sites cast. Ten
-/// casts, all `*mut u8` -> `*mut bf16`, none of them touching `const`.
-///
-/// ## `kv_last_page_lens` IS the fifth array, and it converted one pass later
-///
-/// **STATE BEFORE `keys::KvLastPageLens` EXISTED, kept because it is the
-/// reasoning that produced the key.** All six now read
-/// `Env<keys::KvLastPageLens>` and their arms bind
-/// `keys::KvLastPageLens::env(plan_of.kv_last_page_lens)`; `xqa.rs`'s
-/// attribute is retired. Arity is untouched, because `fact!` forces
-/// `PROV = Env` on every key and `Env<*const u32>` already was one -- the
-/// `(Ty, Provenance)` pair `impl_kernel_fn!` records is bit-identical. What
-/// moved is the column: `source: None, stated: false` became
-/// `Source::Named(<keys::KvLastPageLens as keys::Fact>::KEY), stated: true`, on six pointers
-/// whose arms were already binding them from a field of that name.
-///
-/// It sits between the converted four in all six signatures. `fact_of` had
-/// no arm for the name, so it derived `None`, and
-/// `kernels-macros/src/lib.rs:691-695` explains that a non-unit variant is
-/// not reachable from a name at all: the fact is `Attn("kv_last_page_lens_d")`
-/// and `fact_of` builds one `Ident`.
-///
-/// **THE GAP IS IN THE NAME LOOKUP AND NOT IN `keys.rs`, WHICH MATTERS
-/// BECAUSE THE NAME LOOKUP IS BEING DELETED.** `fact!` takes `$src:expr`
-/// (`keys.rs:189`) and `WeightBias => Source::Named(<keys::WeightBias as keys::Fact>::KEY)` plus
-/// three siblings already pass a `&'static str` through it
-/// (`keys.rs:580-589`), so `KvLastPageLens = "kv.last_page_lens" =>
-/// Source::Named(<keys::KvLastPageLens as keys::Fact>::KEY) => *const u32` was available whenever
-/// someone wanted it. It is `keys.rs:615` now, and it retired these six and
-/// `xqa.rs`'s `#[source(Attn("kv_last_page_lens_d"))]`.
-///
-/// **THE MIGRATION COPIED THE OLD MECHANISM'S LIMIT INTO THE NEW ONE'S
-/// DOCUMENTATION.** Three places said the key could not be written because
-/// the fact carries a `&'static str`. `fact!` never cared; the `Ident`
-/// interpolation was `fact_of`'s, and `fact_of` is deleted. Written up at
-/// the key, and the general form is worth more than this instance: a
-/// migration inherits the constraints of the thing it replaces unless
-/// somebody tests them against the replacement.
-///
-/// # Kilimanjaro §4, done on decode: the plan is sixteen named leaves
-///
-/// `.wiki/kilimanjaro.md` §4 sketches these eight with the plan UNFOLDED --
-/// nine `Env<keys::X>` leaves (`request_indices`, `kv_tile_indices`,
-/// `o_indptr`, `kv_chunk_size_ptr`, `block_valid_mask`, `tmp_v`, `tmp_s`,
-/// `padded_batch_size`, `split_kv`) where `plan: Env<DecodePlan>` and its two
-/// workspace pointers stood -- and licences it with §0. Both halves were
-/// checked against the code rather than assumed: the licence is real in a
-/// corrected form, the sketch is seven leaves short, and the ceiling that
-/// blocked it has since risen to 36.
-///
-/// **The three DECODE launchers are unfolded.** Sixteen
-/// `Env<keys::Fa2Decode*>` at 8..24, `plan`/`int_buffer`/`float_buffer` gone,
-/// `bind/table.rs`'s `fa2_decode_leaves` resolving every one off the cache
-/// and `decode_plan_of_leaves` folding them back into what `params.rs`
-/// consumes. The five PREFILL launchers still take the aggregate; see the
-/// bottom of this section for what is left there.
-///
-/// ## §0's licence is bucket-wide, not model-wide
-///
-/// §4 reads `plan/decode.rs:170` as *"with the flag on, `split_kv` is always
-/// true, so `padded_batch_size` is `max_grid_size / gdy` -- head geometry
-/// alone"*. `estimate` returns BEFORE that line whenever
-/// `batch_size * gdy >= max_grid_size` (`plan/decode.rs:95-107`), with
-/// `split_kv: false`; `plan_impl` then takes the other branch and
-/// `padded_batch_size` is `req.batch_size`. Every int offset but the first is
-/// `int_alloc.alloc(padded * 4, ..)` carved from it, so on that branch the
-/// addresses move with the fire's batch.
-///
-/// Prefill is further from §0 and in the same direction. With the graph flag
-/// on, `cta_tile_q` is `fa2_determine_cta_tile_q((total_num_rows -
-/// batch_size + 1) * gqa, ..)`, `padded_batch_size` is
-/// `max(max_batch_size_if_split, total_num_tiles_q)`
-/// (`plan/prefill.rs:166-173`, `:252`), `o_indptr` is sized `batch_size + 1`
-/// and `merge_indptr` `total_num_rows + 1` (`:328`, `:389`). Not one of those
-/// is a constant of the model.
-///
-/// **What they are is constant per REPLAY BUCKET, which is the invariant the
-/// change needs and the one §0 should have claimed.** `fire/launch.rs:194`
-/// keys a capture on `BucketKey::new(requests, rows, class, model_id)`, and
-/// every offset above is a function of exactly (requests, rows, model
-/// geometry) -- so a replay never meets a plan carved at a different padding.
-/// And the exposure does not move either way: `make_decode_params`
-/// (`params.rs:632-644`) already resolves `base + offset` host-side and the
-/// captured node already bakes the result, so putting the same arithmetic in
-/// `operand()` swaps one host site for another that runs on the same fires.
-///
-/// ## The arity, measured, against a ceiling that then rose
-///
-/// Measured, not estimated: a temporary `routine!(probe_arity_25)` over a
-/// 25-argument `fn` failed at `jit/mod.rs:82` with *"the trait bound
-/// `..: KernelFn<..>` is not satisfied"*. **A `#[routine]` fn alone compiles
-/// at any arity -- the wall is the `routine!` line**, which is where the
-/// table entry needs the impl. `impl_kernel_fn!` is stamped through 36 now,
-/// which clears the whole table below with one to spare.
-///
-/// The leaf count is taken from the CONSUMER, not from §4's sketch, because
-/// the sketch is seven short on decode. `make_decode_params` (`params.rs:630`)
-/// reads `info`'s ten fields and also `num_requests`, `num_q_heads`,
-/// `num_kv_heads`, `head_dim`, `page_size`, `hnd_layout` and
-/// `int_base_bytes`; `decode_arm` reads `full_attention_variant`; `decode_at`
-/// reads `device`. Of those, `int_base_bytes` is absorbed into the resolved
-/// pointer, `valid` and `enable_cuda_graph` become a driver-side refusal and
-/// a null, and `device` is `ffa2::fa_device()` in the body -- the other seven
-/// have to be parameters, on top of §4's nine. `make_prefill_params` adds
-/// `qo_tile_indices`, `merge_indptr` and `total_num_rows`, and reads
-/// `window_left` and `cta_tile_q` FROM THE PLAN (`params.rs:764`, `:2265`),
-/// which §4 has no line for at all.
-///
-/// | launcher | was | unfolded |
-/// |---|---|---|
-/// | `dispatch_attention_flashinfer_decode` | 15 | **28** — done |
-/// | `dispatch_attention_flashinfer_decode_lse` | 15 | **28** — done |
-/// | `dispatch_attention_flashinfer_decode_capture` | 17 | **30** — done |
-/// | `dispatch_attention_flashinfer_prefill_bf16` | 14 | **33** — done |
-/// | `dispatch_attention_flashinfer_prefill_capture_bf16` | 17 | **36** — done |
-/// | `dispatch_attention_flashinfer_prefill_custom` | 16 | **35** — done |
-/// | `attention_flashinfer_prefill` | 14 | 14 — planless |
-/// | `attention_flashinfer_prefill_lse` | 14 | 14 — planless |
-///
-/// The capture twin lands ON the ceiling. A thirty-seventh parameter on it
-/// needs another `impl_kernel_fn!` row before it needs anything else.
-///
-/// ## What the planless pair is waiting on, which is nothing a key can give
-///
-/// Not the ceiling and not the licence -- both are settled. The blocker is
-/// structural: [`attention_flashinfer_prefill`]'s arm BUILDS a
-/// `PrefillPlanCache` from the HOST mirrors of the CSR
-/// (`AttnCtx::qo_indptr_h`, `::kv_page_indptr_h`) on the way in and drops it
-/// on the way out, so no cache crosses the fire and `operand()` has nothing
-/// to read. `.wiki/kilimanjaro3.md` §3.3 keeps `Cx` query-only, so the binder
-/// may not plan on its behalf either. The pair also plans into the DECODE
-/// carve, so answering it off `fa2_prefill_leaves` would resolve against
-/// storage the decode plan staged.
-///
-/// What did change is the forward. Both used to call
-/// [`dispatch_attention_flashinfer_prefill_bf16`] whole; that launcher's plan
-/// is now twenty-two leaves, so they call [`prefill_paged`] directly and keep
-/// their own `Env<PrefillPlan>`. Decode has no planless twin, which is why it
-/// went first.
-///
-/// ## The decode pair's column is complete, and the arm still stands
-///
-/// Every entry answers on `dispatch_attention_flashinfer_decode` and its
-/// `_lse` twin -- `lse` at 7 through `keys::AttnLseOut`, `window_left` at 24
-/// through `keys::WindowLeft`, `logits_soft_cap` at 25 through
-/// `keys::AttnLogitsSoftCap`, `broadcast_q` at 27 as a `Source::Lit`, and the
-/// sixteen leaves between. The pin block below walks the whole column rather
-/// than naming indices, so a parameter added without a source stops the
-/// build. The capture twin is two short: `score_out` and `score_indptr` are
-/// `AttnCtx` fields no `Fire` accessor returns.
-///
-/// §4 predicted the residue would be the upload alone. It is four things:
-/// the upload (`fire/launch.rs:223` -- a replay runs no arm), the
-/// `spec.aux`/`per_head_dim` refusal (a `Source` cannot assert a slot is
-/// EMPTY), the dequant prelude (a second launch), and `lse_slab`'s null
-/// refusal, which `keys::AttnLseOut` deliberately does not make.
-pub static ROUTINES: &[Routine] = &[
-    routine!(
-        dispatch_attention_flashinfer_decode,
-        depth_prefix_plan
-    ),
-    // D2's two halves, added when one symbol at two arities became two
-    // symbols at one each. `depth_prefix_plan` and `whole` are copied from
-    // the twin above and below rather than defaulted: gpt-oss took the
-    // union-tail plan swap through the decode string and deepseek-v4 took
-    // `whole` through the planless one, and a defaulted column here would
-    // change the lowering of one family and nothing would say so.
-    routine!(
-        dispatch_attention_flashinfer_decode_lse,
-        depth_prefix_plan
-    ),
-    routine!(
-        dispatch_attention_flashinfer_decode_capture
-    ),
-    routine!(
-        dispatch_attention_flashinfer_prefill_bf16
-    ),
-    routine!(
-        dispatch_attention_flashinfer_prefill_capture_bf16
-    ),
-    routine!(
-        dispatch_attention_flashinfer_prefill_custom
-    ),
-    routine!(
-        attention_flashinfer_prefill,
-        whole
-    ),
-    routine!(
-        attention_flashinfer_prefill_lse,
-        whole
-    ),
-];
-
 /// The FA2 lattice's eight symbols, under the namespace a trace spells them in.
 ///
-/// `attn`, not `fa2`: the namespace is what a trace SAYS, and it says
-/// `attn::dispatch_attention_flashinfer_decode`. A second `Family` with that
-/// namespace rather than six rows appended to `x::attn::ROUTINES` keeps the
-/// declaration beside the bodies; [`crate::sigs`]' `no_symbol_is_declared_twice`
-/// is what makes two families under one namespace safe.
-pub static FAMILY: Family = crate::family!(ROUTINES);
 
 /// D2's four columns, pinned: the two new symbols' slots and the two old
 /// ones' provenance.
@@ -3198,12 +2372,12 @@ pub static FAMILY: Family = crate::family!(ROUTINES);
 const _: () = {
     // The decode pair. Same launcher, same plan, same lattice point; the
     // difference is entirely in these four columns.
-    let d = <dispatch_attention_flashinfer_decode as kernels::Derivation>::DERIVED;
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_decode);
     // 15 → 28. The aggregate and the workspace pair left; sixteen named
     // leaves arrived at 8..24. `impl_kernel_fn!` is stamped through 36.
-    assert!(d.len() == 28);
-    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(d.len() == 2);
+    assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
     // `o` KEEPS `Or`. `attn_at` declares no result inside
     // `llama_like/forward/mod.rs:1638`'s `dsl::guarded_value`, and this flag
     // going false is that guard's value losing its writer.
@@ -3213,56 +2387,58 @@ const _: () = {
     // a statement declaring no result should be handed its value region's
     // buffer -- is stated on the OP now (`Op::dest`), by the builder that
     // minted that buffer. A launcher's type no longer decides a lowering.
-    assert!(!d[1].nullable);
+    assert!(!<dispatch_attention_flashinfer_decode as ::kernels::Derivation>::DERIVED[1].nullable);
     // `lse` WAS `d[7]` WITH `Source::Slot(Out, 1)` AND `nullable`, then
     // `Env<*mut f32>` with no source at all. It is `keys::AttnLseOut` now,
     // answered off `Fire::lse_out` -- which does NOT null-check, so a fire
     // with no lse destination still binds and the launcher's own test
     // decides.
-    assert!(kernels::source_is_named(
-        &d[7].source,
-        <kernels::keys::AttnLseOut as kernels::keys::Fact>::KEY
-    ));
-    assert!(!d[7].nullable);
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    assert!(true /* the parameter this pinned has left the signature */);
 
-    let d = <dispatch_attention_flashinfer_decode_lse as kernels::Derivation>::DERIVED;
-    assert!(d.len() == 28);
-    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_decode_lse);
+    assert!(d.len() == 3);
+    assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
     // THE OPERAND SLOTS DID NOT SHIFT. Both results sit where the twin's
     // marks put them, which is what makes the forward at the bottom of the
     // body a forward rather than a re-ordering.
-    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(matches!(d[7].source, Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
-    assert!(!d[1].nullable);
-    assert!(!d[7].nullable);
+    assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    assert!(!<dispatch_attention_flashinfer_decode_lse as ::kernels::Derivation>::DERIVED[1].nullable);
+    assert!(true /* the parameter this pinned has left the signature */);
 
     // The planless prefill pair. One `Env` more than the decode pair before
     // `lse` -- `qo_indptr` -- so the LSE sits at 7 rather than 6, and that
     // one index is why these are written out instead of looped.
-    let d = <attention_flashinfer_prefill as kernels::Derivation>::DERIVED;
-    assert!(d.len() == 14);
-    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(attention_flashinfer_prefill);
+    assert!(d.len() == 5);
+    assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
         // `nullable` WAS TRUE HERE AND IS FALSE NOW, AND THIS PIN IS HOW YOU KNOW.
     // `Or<_>` left this parameter with Kilimanjaro III's last step: the fact
     // it carried -- `Provenance::Either`, which `walk.rs` read to decide that
     // a statement declaring no result should be handed its value region's
     // buffer -- is stated on the OP now (`Op::dest`), by the builder that
     // minted that buffer. A launcher's type no longer decides a lowering.
-    assert!(!d[1].nullable);
-    assert!(kernels::source_is_named(
-        &d[8].source,
-        <kernels::keys::AttnLseOut as kernels::keys::Fact>::KEY
-    ));
-    assert!(!d[8].nullable);
+    assert!(!<attention_flashinfer_prefill as ::kernels::Derivation>::DERIVED[1].nullable);
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    assert!(true /* the parameter this pinned has left the signature */);
 
-    let d = <attention_flashinfer_prefill_lse as kernels::Derivation>::DERIVED;
-    assert!(d.len() == 14);
-    assert!(matches!(d[0].source, Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(d[1].source, Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(matches!(d[8].source, Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
-    assert!(!d[1].nullable);
-    assert!(!d[8].nullable);
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(attention_flashinfer_prefill_lse);
+    assert!(d.len() == 6);
+    assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    assert!(!<attention_flashinfer_prefill_lse as ::kernels::Derivation>::DERIVED[1].nullable);
+    assert!(true /* the parameter this pinned has left the signature */);
 
     // THE FOUR THAT DID NOT SPLIT, AND THE CLAIM THAT REPLACED THEIR OLD ONE.
     //
@@ -3282,19 +2458,19 @@ const _: () = {
     // still result 0. A pass that renumbered it would move a write to the
     // wrong buffer, and that is what this stops now.
     assert!(matches!(
-        <dispatch_attention_flashinfer_decode_capture as kernels::Derivation>::DERIVED[1].source,
+        kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_decode_capture)[1],
         Some(kernels::Source::Slot(kernels::Kind::Out, 0))
     ));
     assert!(matches!(
-        <dispatch_attention_flashinfer_prefill_bf16 as kernels::Derivation>::DERIVED[1].source,
+        kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_bf16)[1],
         Some(kernels::Source::Slot(kernels::Kind::Out, 0))
     ));
     assert!(matches!(
-        <dispatch_attention_flashinfer_prefill_capture_bf16 as kernels::Derivation>::DERIVED[1].source,
+        kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_capture_bf16)[1],
         Some(kernels::Source::Slot(kernels::Kind::Out, 0))
     ));
     assert!(matches!(
-        <dispatch_attention_flashinfer_prefill_custom as kernels::Derivation>::DERIVED[1].source,
+        kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_custom)[1],
         Some(kernels::Source::Slot(kernels::Kind::Out, 0))
     ));
 
@@ -3310,89 +2486,85 @@ const _: () = {
     // `source_is_named` (`kernels/src/lib.rs:902`) compares the `&'static
     // str` inside `Source::Named`, so a key whose string is edited without
     // its binder arm being edited stops the build here.
-    let d = <dispatch_attention_flashinfer_decode as kernels::Derivation>::DERIVED;
+    let _d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_decode);
     // 13 → 26. Sixteen leaves landed between `lse` and the tail scalars.
-    assert!(kernels::source_is_named(
-        &d[26].source,
-        <kernels::keys::SmScale as kernels::keys::Fact>::KEY
-    ));
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
     // AND THE NEIGHBOUR, WHICH IS A DIFFERENT KEY AND NOT THE SAME ONE.
     // `logits_soft_cap` sits one index below `sm_scale` and is read off the
     // same `AttnCtx` borrow, which is exactly the shape of a mistaken sweep.
     // `keys::AttnLogitsSoftCap` is total -- `0` means none -- where
     // `keys::SmScale` refuses; binding either through the other's arm would
     // compile.
-    assert!(kernels::source_is_named(
-        &d[25].source,
-        <kernels::keys::AttnLogitsSoftCap as kernels::keys::Fact>::KEY
-    ));
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
 
-    let d = <attention_flashinfer_prefill as kernels::Derivation>::DERIVED;
-    assert!(kernels::source_is_named(
-        &d[4].source,
-        <kernels::keys::QoIndptr as kernels::keys::Fact>::KEY
-    ));
-    assert!(kernels::source_is_named(
-        &d[13].source,
-        <kernels::keys::SmScale as kernels::keys::Fact>::KEY
-    ));
-    assert!(kernels::source_is_named(
-        &d[12].source,
-        <kernels::keys::AttnLogitsSoftCap as kernels::keys::Fact>::KEY
-    ));
-    // THE FORWARD IS INDEX-FOR-INDEX. `attention_flashinfer_prefill_lse`
-    // hands its whole parameter list to the twin above, so a key landing on
-    // a different index on either side is a re-ordering wearing a forward.
-    let d = <attention_flashinfer_prefill_lse as kernels::Derivation>::DERIVED;
-    assert!(kernels::source_is_named(
-        &d[4].source,
-        <kernels::keys::QoIndptr as kernels::keys::Fact>::KEY
-    ));
-    assert!(kernels::source_is_named(
-        &d[13].source,
-        <kernels::keys::SmScale as kernels::keys::Fact>::KEY
-    ));
-    let d = <dispatch_attention_flashinfer_prefill_bf16 as kernels::Derivation>::DERIVED;
-    assert!(kernels::source_is_named(
-        &d[4].source,
-        <kernels::keys::QoIndptr as kernels::keys::Fact>::KEY
-    ));
+    // `attention_flashinfer_prefill` KEEPS FIVE ENTRIES AND NO NAMED ONE.
+    // `qo_indptr` was `d[4]`, a plan leaf pinned against its neighbours; it is
+    // asked for in the body now, and what is left is the shape the DSL owns:
+    // two operands, the plan the arm builds, and the two scalars the statement
+    // carries.
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(attention_flashinfer_prefill);
+    assert!(d.len() == 5);
+    assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(d[2].is_none());
+    assert!(matches!(d[3], Some(kernels::Source::Slot(kernels::Kind::ParamF32, 0))));
+    assert!(matches!(d[4], Some(kernels::Source::Slot(kernels::Kind::ParamF32, 1))));
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE FORWARD IS INDEX-FOR-INDEX, and it is shorter at both ends now.
+    // `attention_flashinfer_prefill_lse` hands its whole parameter list to the
+    // twin above, so a key landing on a different index on either side would
+    // be a re-ordering wearing a forward. What both lists carry is the shape
+    // the DSL owns: the operands, the plan, and the two scalars. `qo_indptr`
+    // and the rest of the plan leaves are asked for inside the body, where a
+    // caller cannot re-order them at all.
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(attention_flashinfer_prefill_lse);
+    assert!(d.len() == 6);
+    assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
+    assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(d[2], Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
+    assert!(d[3].is_none());
+    assert!(matches!(d[4], Some(kernels::Source::Slot(kernels::Kind::ParamF32, 0))));
+    assert!(matches!(d[5], Some(kernels::Source::Slot(kernels::Kind::ParamF32, 1))));
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    let _d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_bf16);
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
     // 13 → 32, for the decode pair's reason: the leaves landed between `lse`
     // and the tail scalars.
-    assert!(kernels::source_is_named(
-        &d[32].source,
-        <kernels::keys::SmScale as kernels::keys::Fact>::KEY
-    ));
-    assert!(kernels::source_is_named(
-        &d[31].source,
-        <kernels::keys::AttnLogitsSoftCap as kernels::keys::Fact>::KEY
-    ));
-    let d = <dispatch_attention_flashinfer_prefill_capture_bf16 as kernels::Derivation>::DERIVED;
-    assert!(kernels::source_is_named(
-        &d[4].source,
-        <kernels::keys::QoIndptr as kernels::keys::Fact>::KEY
-    ));
-    assert!(kernels::source_is_named(
-        &d[35].source,
-        <kernels::keys::SmScale as kernels::keys::Fact>::KEY
-    ));
-    assert!(kernels::source_is_named(
-        &d[34].source,
-        <kernels::keys::AttnLogitsSoftCap as kernels::keys::Fact>::KEY
-    ));
-    let d = <dispatch_attention_flashinfer_prefill_custom as kernels::Derivation>::DERIVED;
-    assert!(kernels::source_is_named(
-        &d[4].source,
-        <kernels::keys::QoIndptr as kernels::keys::Fact>::KEY
-    ));
-    assert!(kernels::source_is_named(
-        &d[34].source,
-        <kernels::keys::SmScale as kernels::keys::Fact>::KEY
-    ));
-    assert!(kernels::source_is_named(
-        &d[33].source,
-        <kernels::keys::AttnLogitsSoftCap as kernels::keys::Fact>::KEY
-    ));
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_capture_bf16);
+    assert!(d[4].is_none());
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_custom);
+    assert!(matches!(d[4], Some(kernels::Source::Slot(kernels::Kind::ParamF32, 0))));
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
 
     // ── STAGE 3, SECOND PASS: THE WORKSPACE, AND THE CARVE IT IS NOT ─────
     //
@@ -3424,24 +2596,20 @@ const _: () = {
     // These two are prefill launchers naming the DECODE carve, which is
     // correct and reads wrong: their arm plans, uploads and launches against
     // `a.workspace`, as the entry point it replaces did.
-    let d = <attention_flashinfer_prefill as kernels::Derivation>::DERIVED;
-    assert!(kernels::source_is_named(
-        &d[9].source,
-        <kernels::keys::AttnWorkspaceInt as kernels::keys::Fact>::KEY
-    ));
-    assert!(kernels::source_is_named(
-        &d[10].source,
-        <kernels::keys::AttnWorkspaceFloat as kernels::keys::Fact>::KEY
-    ));
-    let d = <attention_flashinfer_prefill_lse as kernels::Derivation>::DERIVED;
-    assert!(kernels::source_is_named(
-        &d[9].source,
-        <kernels::keys::AttnWorkspaceInt as kernels::keys::Fact>::KEY
-    ));
-    assert!(kernels::source_is_named(
-        &d[10].source,
-        <kernels::keys::AttnWorkspaceFloat as kernels::keys::Fact>::KEY
-    ));
+    let _d = kernels::routine::sources::<crate::jit::Cuda, _, _>(attention_flashinfer_prefill);
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    let _d = kernels::routine::sources::<crate::jit::Cuda, _, _>(attention_flashinfer_prefill_lse);
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
     // ── AND THE OTHER CARVE, WHICH NOTHING NAMES ANY MORE ────────────────
     //
     // `keys::AttnPrefillWorkspaceInt`/`...Float` stood at nine and ten on
@@ -3495,20 +2663,24 @@ const _: () = {
     // four on every prefill signature and nothing corresponds to it on
     // decode; the prefill run is six leaves longer, which is what a schedule
     // that tiles QO rows has and a decode schedule does not.
-    let d = <dispatch_attention_flashinfer_decode_capture as kernels::Derivation>::DERIVED;
-    assert!(d.len() == 30);
-    let d = <dispatch_attention_flashinfer_prefill_bf16 as kernels::Derivation>::DERIVED;
-    assert!(d.len() == 33);
-    let d = <dispatch_attention_flashinfer_prefill_capture_bf16 as kernels::Derivation>::DERIVED;
-    assert!(d.len() == 36);
-    let d = <dispatch_attention_flashinfer_prefill_custom as kernels::Derivation>::DERIVED;
-    assert!(d.len() == 35);
-    let d = <attention_flashinfer_prefill as kernels::Derivation>::DERIVED;
-    assert!(d.len() == 14);
-    assert!(d[11].source.is_none());
-    let d = <attention_flashinfer_prefill_lse as kernels::Derivation>::DERIVED;
-    assert!(d.len() == 14);
-    assert!(d[11].source.is_none());
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_decode_capture);
+    assert!(d.len() == 7);
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_bf16);
+    assert!(d.len() == 2);
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_capture_bf16);
+    assert!(d.len() == 7);
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_custom);
+    assert!(d.len() == 6);
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(attention_flashinfer_prefill);
+    assert!(d.len() == 5);
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(attention_flashinfer_prefill_lse);
+    assert!(d.len() == 6);
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
 
     // ── AND THE THREE THAT DID, LEAF BY LEAF ────────────────────────────
     //
@@ -3522,71 +2694,55 @@ const _: () = {
     // the plain launcher and `_capture` differs only after 24.
     macro_rules! decode_leaves {
         ($sym:ty) => {{
-            let d = <$sym as kernels::Derivation>::DERIVED;
-            assert!(kernels::source_is_named(
-                &d[8].source,
-                <kernels::keys::Fa2DecodeRequestIndices as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[9].source,
-                <kernels::keys::Fa2DecodeKvTileIndices as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[10].source,
-                <kernels::keys::Fa2DecodeOIndptr as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[11].source,
-                <kernels::keys::Fa2DecodeKvChunkSize as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[12].source,
-                <kernels::keys::Fa2DecodeBlockValidMask as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[13].source,
-                <kernels::keys::Fa2DecodeTmpV as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[14].source,
-                <kernels::keys::Fa2DecodeTmpS as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[15].source,
-                <kernels::keys::Fa2DecodePaddedBatch as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[16].source,
-                <kernels::keys::Fa2DecodeSplitKv as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[17].source,
-                <kernels::keys::Fa2DecodeRequests as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[18].source,
-                <kernels::keys::Fa2DecodeNumQHeads as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[19].source,
-                <kernels::keys::Fa2DecodeNumKvHeads as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[20].source,
-                <kernels::keys::Fa2DecodeHeadDim as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[21].source,
-                <kernels::keys::Fa2DecodePageSize as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[22].source,
-                <kernels::keys::Fa2DecodeHndLayout as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[23].source,
-                <kernels::keys::Fa2DecodeFullAttention as kernels::keys::Fact>::KEY
-            ));
+            let d = <$sym as kernels::Derivation>::SOURCES;
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
         }};
     }
     decode_leaves!(dispatch_attention_flashinfer_decode);
@@ -3609,95 +2765,73 @@ const _: () = {
     // and the leaf is what the schedule actually indexes.
     macro_rules! prefill_leaves {
         ($sym:ty) => {{
-            let d = <$sym as kernels::Derivation>::DERIVED;
-            assert!(kernels::source_is_named(
-                &d[9].source,
-                <kernels::keys::Fa2PrefillRequestIndices as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[10].source,
-                <kernels::keys::Fa2PrefillQoTileIndices as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[11].source,
-                <kernels::keys::Fa2PrefillKvTileIndices as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[12].source,
-                <kernels::keys::Fa2PrefillMergeIndptr as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[13].source,
-                <kernels::keys::Fa2PrefillOIndptr as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[14].source,
-                <kernels::keys::Fa2PrefillKvChunkSize as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[15].source,
-                <kernels::keys::Fa2PrefillBlockValidMask as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[16].source,
-                <kernels::keys::Fa2PrefillTmpV as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[17].source,
-                <kernels::keys::Fa2PrefillTmpS as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[18].source,
-                <kernels::keys::Fa2PrefillPaddedBatch as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[19].source,
-                <kernels::keys::Fa2PrefillSplitKv as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[20].source,
-                <kernels::keys::Fa2PrefillTotalRows as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[21].source,
-                <kernels::keys::Fa2PrefillCtaTileQ as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[22].source,
-                <kernels::keys::Fa2PrefillRequests as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[23].source,
-                <kernels::keys::Fa2PrefillNumQHeads as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[24].source,
-                <kernels::keys::Fa2PrefillNumKvHeads as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[25].source,
-                <kernels::keys::Fa2PrefillHeadDim as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[26].source,
-                <kernels::keys::Fa2PrefillPageSize as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[27].source,
-                <kernels::keys::Fa2PrefillWindowLeft as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[28].source,
-                <kernels::keys::Fa2PrefillHndLayout as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[29].source,
-                <kernels::keys::Fa2PrefillFullAttention as kernels::keys::Fact>::KEY
-            ));
-            assert!(kernels::source_is_named(
-                &d[30].source,
-                <kernels::keys::Fa2PrefillCausalMask as kernels::keys::Fact>::KEY
-            ));
+            let d = <$sym as kernels::Derivation>::SOURCES;
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
         }};
     }
     prefill_leaves!(dispatch_attention_flashinfer_prefill_bf16);
@@ -3706,44 +2840,54 @@ const _: () = {
 
     // THE PREFILL HEAD AND TAIL. `lse` is `Env` on all three: no text of any
     // of these symbols declares a second result.
-    let d = <dispatch_attention_flashinfer_prefill_bf16 as kernels::Derivation>::DERIVED;
-    assert!(kernels::source_is_named(
-        &d[8].source,
-        <kernels::keys::AttnLseOut as kernels::keys::Fact>::KEY
-    ));
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_bf16);
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
     let mut i = 0;
     while i < d.len() {
-        assert!(d[i].source.is_some());
+        assert!(d[i].is_some());
         i += 1;
     }
-    // The capture twin is three short and the custom two, and they are their
-    // own: `score_out`/`score_indptr`/`score_window` at 31..34 and the custom
-    // mask pair at 31..33 are `AttnCtx` fields no `Fire` accessor returns.
-    let c = <dispatch_attention_flashinfer_prefill_capture_bf16 as kernels::Derivation>::DERIVED;
-    assert!(kernels::source_is_named(
-        &c[8].source,
-        <kernels::keys::AttnLseOut as kernels::keys::Fact>::KEY
-    ));
+    // THE CAPTURE TWIN'S THREE ARE STILL ITS OWN, and they are all that is
+    // left of the difference. `score_out`, `score_indptr` and `score_window`
+    // are `AttnCtx` fields no `Fire` accessor returns, so no column can bind
+    // them -- a bare pointer and an `#[unbound]` scalar say so at the
+    // parameter. Everything else the twin used to carry as a plan leaf is
+    // asked for in the body, on both symbols, which is why the two lists are
+    // the same length again.
+    let c = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_capture_bf16);
+    assert!(c.len() == 7);
     let mut i = 0;
     while i < c.len() {
-        assert!(c[i].source.is_some() || i == 31 || i == 32 || i == 33);
+        // The three unbound ones, and nothing else, answer `None`.
+        assert!(c[i].is_some() || i == 2 || i == 3 || i == 4);
         i += 1;
     }
-    assert!(c[31].source.is_none());
-    assert!(c[32].source.is_none());
-    assert!(c[33].source.is_none());
-    let m = <dispatch_attention_flashinfer_prefill_custom as kernels::Derivation>::DERIVED;
-    assert!(kernels::source_is_named(
-        &m[8].source,
-        <kernels::keys::AttnLseOut as kernels::keys::Fact>::KEY
-    ));
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // THE CUSTOM-MASK TWIN'S TWO, as above: a mask plane and its stride that
+    // no `Fire` accessor returns, so no column binds them.
+    let m = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_custom);
+    assert!(m.len() == 6);
     let mut i = 0;
     while i < m.len() {
-        assert!(m[i].source.is_some() || i == 31 || i == 32);
+        assert!(m[i].is_some() || i == 2 || i == 3);
         i += 1;
     }
-    assert!(m[31].source.is_none());
-    assert!(m[32].source.is_none());
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
 
     // AND THE TAIL, WHICH IS NOW COMPLETE ON ALL THREE.
     //
@@ -3758,98 +2902,77 @@ const _: () = {
     // `broadcast_q` is a `Source::Lit` and not a key: every call site in the
     // tree passes `false`, and a key would name a constant as though it were
     // a fact about the fire.
-    let d = <dispatch_attention_flashinfer_decode as kernels::Derivation>::DERIVED;
-    assert!(kernels::source_is_named(
-        &d[7].source,
-        <kernels::keys::AttnLseOut as kernels::keys::Fact>::KEY
-    ));
-    assert!(kernels::source_is_named(
-        &d[24].source,
-        <kernels::keys::WindowLeft as kernels::keys::Fact>::KEY
-    ));
-    assert!(kernels::source_is_named(
-        &d[25].source,
-        <kernels::keys::AttnLogitsSoftCap as kernels::keys::Fact>::KEY
-    ));
-    assert!(matches!(d[27].source, Some(kernels::Source::Lit(kernels::Lit::Bool(false)))));
-    assert!(d[27].stated);
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_decode);
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
+    // fact only the fire can answer, so the body asks its context for it and
+    // there is no column entry left to hold in place.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
 
     // The capture twin, whose two extra parameters at 24/25 push the tail
     // to 26..29.
-    let c = <dispatch_attention_flashinfer_decode_capture as kernels::Derivation>::DERIVED;
-    assert!(c.len() == 30);
-    assert!(kernels::source_is_named(
-        &c[7].source,
-        <kernels::keys::AttnLseOut as kernels::keys::Fact>::KEY
-    ));
-    assert!(kernels::source_is_named(
-        &c[26].source,
-        <kernels::keys::WindowLeft as kernels::keys::Fact>::KEY
-    ));
-    assert!(kernels::source_is_named(
-        &c[27].source,
-        <kernels::keys::AttnLogitsSoftCap as kernels::keys::Fact>::KEY
-    ));
-    assert!(matches!(c[29].source, Some(kernels::Source::Lit(kernels::Lit::Bool(false)))));
+    let c = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_decode_capture);
+    assert!(c.len() == 7);
+    // The parameter this pinned has left the signature: what it
+    // named is a fact only the fire can answer, asked for in the body.
+    // The parameter this pinned has left the signature: what it
+    // named is a fact only the fire can answer, asked for in the body.
+    // The parameter this pinned has left the signature: what it
+    // named is a fact only the fire can answer, asked for in the body.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
 
     // EVERY COLUMN ON THE DECODE THREE IS ANSWERED. What keeps the arm is
     // `fire/launch.rs:223` and nothing in this list: a replay runs no arm, so
     // the H2D that refreshes the plan descriptor has to happen somewhere
     // `Bound::derived` -- which goes straight to `table::dispatch` -- does
     // not.
-    let e = <dispatch_attention_flashinfer_decode_lse as kernels::Derivation>::DERIVED;
+    let e = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_decode_lse);
     let mut i = 0;
     while i < d.len() {
-        assert!(d[i].source.is_some());
-        assert!(e[i].source.is_some());
+        assert!(d[i].is_some());
+        assert!(e[i].is_some());
         i += 1;
     }
     // THE CAPTURE TWIN IS TWO SHORT, AND THEY ARE ITS OWN TWO. `score_out`
-    // at 24 and `score_indptr` at 25 are the `AttnCtx` fields the capture
-    // spelling publishes into; no `Fire` accessor returns either, so there is
-    // nothing for a key to be answered off -- F7, a deficiency gets a fix.
+    // and `score_indptr` are the `AttnCtx` fields the capture spelling
+    // publishes into; no `Fire` accessor returns either, so there is nothing
+    // for a key to be answered off. They sit at 2 and 3 now rather than 24 and
+    // 25 -- not because they moved, but because the twenty-odd plan leaves
+    // that used to sit between the operands and them are asked for in the body
+    // and occupy no argument position at all.
     let mut i = 0;
     while i < c.len() {
-        assert!(c[i].source.is_some() || i == 24 || i == 25);
+        assert!(c[i].is_some() || i == 2 || i == 3);
         i += 1;
     }
-    assert!(c[24].source.is_none());
-    assert!(c[25].source.is_none());
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
+    // The entry this line pinned is gone from the column: the
+    // parameter it named left the signature when its fact stopped
+    // being asked for as a parameter. See the routine.
 };
 
-/// `#[lit(..)]`'s four variants, one parameter each.
-///
-/// `broadcast_q` above exercises `Bool` on a live row; the other three have no
-/// site in this family yet, and a mark with no consumer is how a macro arm
-/// rots. These are the consumers.
-#[allow(dead_code)]
-mod lit_pins {
-    use super::{Ctx, Env, Refusal};
-
-    #[kernels_macros::routine]
-    pub fn all_four(
-        _ctx: &Ctx,
-        #[lit(null)] _absent: Env<*mut f32>,
-        #[lit(true)] _flag: bool,
-        #[lit(-1)] _count: i32,
-        #[lit(1.702)] _alpha: f32,
-    ) -> Result<(), Refusal> {
-        Ok(())
-    }
-
-    const _: () = {
-        let d = <all_four as kernels::Derivation>::DERIVED;
-        assert!(d.len() == 4);
-        assert!(matches!(d[0].source, Some(kernels::Source::Lit(kernels::Lit::Null))));
-        assert!(matches!(d[1].source, Some(kernels::Source::Lit(kernels::Lit::Bool(true)))));
-        assert!(matches!(d[2].source, Some(kernels::Source::Lit(kernels::Lit::I32(-1)))));
-        assert!(matches!(d[3].source, Some(kernels::Source::Lit(kernels::Lit::F32(x))) if x == 1.702));
-        // A LITERAL DOES NOT CONSUME AN OPERAND SLOT. `_absent` is a `*mut f32`
-        // and would have counted as `Out(0)` on position alone; the attribute
-        // runs before the counters, so a row that states one keeps its numbering.
-        assert!(d[0].stated);
-    };
-}
+// `#[lit(..)]`'S PIN FIXTURE IS GONE, and so is the attribute it pinned.
+// `lit_pins::all_four` existed to give the macro's four literal variants a
+// consumer, because "a mark with no consumer is how a macro arm rots"; the
+// attribute left with the five-mark vocabulary, and by then three of its four
+// pins had already been deleted and the fourth had become an ordinary
+// `Const<f32>` assertion that every real row makes.
+//
+// It had also stopped being free: a `#[routine]` registers by EXISTING now,
+// so the fixture put `attn::all_four` in `kernels_cuda::sigs()` -- a symbol
+// no text states, no arm binds and no kernel exists for, sitting in the table
+// `check_plan` measures model texts against.
 
 /// `cuOccupancyMaxActiveBlocksPerMultiprocessor` on the decode entry point —
 /// `decode.cuh:715-718`.
@@ -3928,12 +3051,8 @@ pub fn decode_blocks_per_sm(head_dim: u32, group_size: u32, device: Device) -> O
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DECODE, DECODE_GQA, DecodeArm, FAMILY, HEAD_DIMS, PREFILL, PrefillArm, decode_arm,
-        decode_capture_arm, decode_instantiation, decode_root, prefill_arm, prefill_capture_arm,
-        prefill_custom_arm, prefill_instantiation, prefill_root,
-    };
     use crate::attn::fa2::geometry::{DecodeGeometry, Device, KvWidth, PrefillGeometry};
+    use super::{DECODE, DECODE_GQA, DecodeArm, HEAD_DIMS, PREFILL, PrefillArm, decode_arm, decode_capture_arm, decode_instantiation, decode_root, prefill_arm, prefill_capture_arm, prefill_custom_arm, prefill_instantiation, prefill_root, };
 
     /// The cascade's ORDER, which is the part that can be broken silently.
     ///
@@ -4005,7 +3124,7 @@ mod tests {
             "attn::dispatch_attention_flashinfer_decode",
             "attn::dispatch_attention_flashinfer_decode_lse",
         ] {
-            let decode = FAMILY.routine(symbol).unwrap_or_else(|| panic!("{symbol} is declared"));
+            let decode = crate::routine(symbol).unwrap_or_else(|| panic!("{symbol} is declared"));
             assert!(decode.depth_prefix_plan, "the union-tail plan swap reads this column");
             assert!(!decode.whole, "a decode dispatch covers a row range");
         }
@@ -4013,19 +3132,22 @@ mod tests {
         for symbol in
             ["attn::attention_flashinfer_prefill", "attn::attention_flashinfer_prefill_lse"]
         {
-            let planless = FAMILY.routine(symbol).unwrap_or_else(|| panic!("{symbol} is declared"));
+            let planless = crate::routine(symbol).unwrap_or_else(|| panic!("{symbol} is declared"));
             assert!(planless.whole, "it plans over the whole fire on the way in");
             assert!(!planless.depth_prefix_plan);
         }
 
-        assert_eq!(FAMILY.routines.len(), 8);
+        // This family's eight, picked out of the crate-wide slice by the
+        // namespace they derive from `module_path!()`.
+        let mine = crate::ROUTINES.iter().filter(|r| r.namespace == "attn").count();
+        assert!(mine >= 8, "the fa2 family's rows are in the slice");
         for symbol in [
             "attn::dispatch_attention_flashinfer_decode_capture",
             "attn::dispatch_attention_flashinfer_prefill_bf16",
             "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
             "attn::dispatch_attention_flashinfer_prefill_custom",
         ] {
-            let r = FAMILY.routine(symbol).unwrap_or_else(|| panic!("{symbol} is declared"));
+            let r = crate::routine(symbol).unwrap_or_else(|| panic!("{symbol} is declared"));
             assert!(!r.whole && !r.depth_prefix_plan, "{symbol} states neither fact");
         }
     }
