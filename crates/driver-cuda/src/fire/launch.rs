@@ -655,7 +655,7 @@ fn deliver_logits(
     let logits_value = (0..lowered.launches.len()).rev().find_map(|i| {
         dplan.spec(i).outs.first().and_then(|a| match a {
             Arg::Named { value, .. } => Some(*value),
-            Arg::Arena { .. } | Arg::Weight(_) => None,
+            Arg::Arena { .. } | Arg::Weight(_) | Arg::Raised { .. } => None,
         })
     });
     // The step's instances, one per wire request (`request_instances`): the
@@ -1220,6 +1220,13 @@ struct PlanGeometry<'a> {
 struct AttnPlans {
     decode_plan: *mut std::ffi::c_void,
     decode_plan_full: *mut std::ffi::c_void,
+    /// What each decode schedule was raised AT, as `(head_dim, full_attention)`.
+    ///
+    /// The pointers alone cannot be matched to a statement -- which is what
+    /// `bind::attn_plan` guesses at, from the window on the `LaunchSpec`. A
+    /// prep states both halves, so with these a statement's own value picks
+    /// its schedule and nothing infers.
+    decode_raised_at: (Option<(u32, bool)>, Option<(u32, bool)>),
     prefill_plan: *mut std::ffi::c_void,
     workspace: crate::bind::abi::AttentionWorkspaceView,
     /// The workspace the prefill arm binds — the decode one for the planless
@@ -1291,12 +1298,39 @@ fn raise_attn_plans(
                     decode_wanted.push((head_dim, full_attention));
                 }
             }
-            // The widest stated, so a stack whose layers disagree plans the
-            // schedule that addresses the most: one prefill plan is raised.
-            PrepKind::PrefillAttention { head_dim } => {
-                prefill_head_dim =
-                    Some(prefill_head_dim.map_or(head_dim, |d: u32| d.max(head_dim)));
-            }
+            // ONE WIDTH, AND A SECOND IS REFUSED RATHER THAN MAXED.
+            //
+            // This read `d.max(head_dim)` and called it *"the widest stated, so
+            // a stack whose layers disagree plans the schedule that addresses
+            // the most"*. What that actually did was plan at the wider width
+            // and then run every narrower layer against a work list built for
+            // it -- silently, because the launcher read the plan's own head dim
+            // back rather than restating its statement's, so the two could not
+            // be compared. The read-back was standing in for a check nobody
+            // made (`.wiki/designs/design-struct.md` §2.2).
+            //
+            // The collapse has never collapsed anything: no row in the catalog
+            // states more than one prefill width -- the three that state two
+            // schedules at all are gemma-2 and the two gemma-4s, and all three
+            // are DECODE, which raises a pair for exactly this reason. So the
+            // max was not serving a live case; it was a silent wrong answer
+            // waiting for one.
+            //
+            // A refusal and not a second plan, because a second plan is a
+            // second 48 MB workspace -- a plan writes into the workspace it was
+            // raised against -- and that is a resource decision no stack has
+            // yet asked anyone to make. The day one does, this says so.
+            PrepKind::PrefillAttention { head_dim } => match prefill_head_dim {
+                Some(d) if d != head_dim => {
+                    tracing::error!(
+                        first = d,
+                        second = head_dim,
+                        "the text states two prefill attention widths and one schedule is raised"
+                    );
+                    return Err(-1);
+                }
+                _ => prefill_head_dim = Some(head_dim),
+            },
         }
     }
     let states_decode_dispatch = !decode_wanted.is_empty();
@@ -1366,9 +1400,19 @@ fn raise_attn_plans(
     }
     ws.end_plan_update(&mut sops, raw_stream)?;
 
+    // WHAT EACH SLOT TOOK, in the same three arms the match above has: the
+    // pair case fills both, and the single case fills the first with whatever
+    // the text stated (or nothing, for a pure-prefill trace).
+    let decode_raised_at = match (windowed, full) {
+        (Some((d_win, f_win)), Some((d_full, f_full))) if d_win != d_full => {
+            (Some((d_win, f_win)), Some((d_full, f_full)))
+        }
+        _ => (windowed.or(full), None),
+    };
     Ok(AttnPlans {
         decode_plan: decode_plan.as_ptr(),
         decode_plan_full: decode_plan_full_ptr,
+        decode_raised_at,
         prefill_plan: prefill_plan.as_ptr(),
         workspace: ws.view(),
         prefill_workspace: if planless_prefill { ws.view() } else { prefill_ws.view() },
@@ -1535,7 +1579,7 @@ fn lora_pins(
         .position(|x| lowered.kernels[x.kernel as usize] == "gemm::lora_qkv_correction")?;
     let named = |a: &Arg| match a {
         Arg::Named { value, .. } => Some(*value),
-        Arg::Arena { .. } | Arg::Weight(_) => None,
+        Arg::Arena { .. } | Arg::Weight(_) | Arg::Raised { .. } => None,
     };
     let mut args =
         lowered.launches[at].args.clone().filter_map(|ai| named(&lowered.args[ai as usize]));
@@ -1659,7 +1703,7 @@ fn run_sampling_programs(
     let readout = (0..lowered.launches.len()).rev().find_map(|i| {
         dplan.spec(i).outs.first().and_then(|a| match a {
             Arg::Named { value, .. } => Some(*value),
-            Arg::Arena { .. } | Arg::Weight(_) => None,
+            Arg::Arena { .. } | Arg::Weight(_) | Arg::Raised { .. } => None,
         })
     });
     let logits_base = readout.and_then(|v| named_bufs.get(&v)).map_or(0, |b| b.as_ptr() as u64);
@@ -2423,6 +2467,7 @@ pub(crate) fn step_impl(
     let AttnPlans {
         decode_plan,
         decode_plan_full,
+        decode_raised_at,
         prefill_plan,
         workspace,
         prefill_workspace,
@@ -2509,6 +2554,15 @@ pub(crate) fn step_impl(
     struct LiveResolver<'a> {
         model: &'a LoadedModel,
         named: &'a std::collections::BTreeMap<ValueId, crate::device::DeviceBuffer>,
+        /// What `raise_attn_plans` raised, by the VALUE each prep published.
+        ///
+        /// A map and not a pointer, because the answer is per statement. One
+        /// prefill schedule stands today and every prefill prep's value points
+        /// at it -- but the SHAPE is what stage 6b needs, where a stack whose
+        /// layers disagree about head dim raises one schedule per width and
+        /// two entries here point at two different plans. A resolver keyed on
+        /// the word could not express that: both spell `fa2.prefill`.
+        raised: std::collections::BTreeMap<ValueId, *mut std::ffi::c_void>,
     }
     impl Resolver for LiveResolver<'_> {
         fn weight(&mut self, name: &str) -> Option<*const std::ffi::c_void> {
@@ -2522,6 +2576,21 @@ pub(crate) fn step_impl(
         }
         fn named(&mut self, value: ValueId) -> Option<*mut std::ffi::c_void> {
             self.named.get(&value).map(|b| b.as_ptr())
+        }
+        fn raised(&mut self, value: ValueId, key: &str) -> Option<*const std::ffi::c_void> {
+            let _ = key;
+            // THE EDGE, RESOLVED BY NAME AND NOT BY GUESS. `bind::attn_plan`
+            // recovers which plan a statement wants from a family string and,
+            // for decode, from the window on its `LaunchSpec`; a statement
+            // that NAMES its raise needs neither. This is that half.
+            //
+            // Decode is not answered here and the omission is deliberate: two
+            // decode schedules may stand at once and which one a statement
+            // executes is still `attn_plan`'s guess. Stage 7 of
+            // `.wiki/designs/design-struct.md` is where that guess dies, and
+            // answering it now with either pointer would be the guess again,
+            // one layer down and harder to see.
+            self.raised.get(&value).copied().map(<*mut std::ffi::c_void>::cast_const)
         }
     }
 
@@ -2770,7 +2839,47 @@ pub(crate) fn step_impl(
         None
     };
     let named_bufs = &state.fire_arrays.named;
-    let mut resolver = LiveResolver { model, named: named_bufs };
+    // EVERY PREFILL PREP'S VALUE, AT THE SCHEDULE THIS FIRE RAISED. Decode is
+    // deliberately absent: two decode schedules may stand at once and which a
+    // statement executes is still `bind::attn_plan`'s guess off the window.
+    // Stage 7 is where that guess dies; entering either pointer here would be
+    // the guess again, one layer down.
+    // EVERY PREP'S VALUE, AT THE SCHEDULE IT ASKED FOR -- and the decode half
+    // is what deletes `bind::attn_plan`'s guess. That function recovered which
+    // decode schedule a statement wanted from the window on its `LaunchSpec`,
+    // because a prep published nothing to name. It publishes a value now and
+    // the prep states both halves it was raised on, so the match is an
+    // equality rather than an inference.
+    let raised: std::collections::BTreeMap<ValueId, *mut std::ffi::c_void> = {
+        use model_ir::trace::PrepKind;
+        let (first, second) = decode_raised_at;
+        let decode_for = |want: (u32, bool)| -> Option<*mut std::ffi::c_void> {
+            if second == Some(want) && !decode_plan_full.is_null() {
+                return Some(decode_plan_full);
+            }
+            // ONE SCHEDULE SERVES BOTH WINDOWS AT ONE WIDTH. `raise_attn_plans`
+            // raises a pair only where the two differ in WIDTH -- "the width is
+            // what the plan is" -- so a text stating `(256, false)` and
+            // `(256, true)` gets one schedule and both preps point at it.
+            first.filter(|f| f.0 == want.0).map(|_| decode_plan)
+        };
+        lowered
+            .preps
+            .iter()
+            .filter_map(|p| {
+                let ptr = match p.kind {
+                    PrepKind::PrefillAttention { .. } => {
+                        (!prefill_plan.is_null()).then_some(prefill_plan)
+                    }
+                    PrepKind::DecodeAttention { head_dim, full_attention } => {
+                        decode_for((head_dim, full_attention))
+                    }
+                }?;
+                Some((p.value, ptr))
+            })
+            .collect()
+    };
+    let mut resolver = LiveResolver { model, named: named_bufs, raised };
     // Which prepared state each rectangle gets.
     let regions = match tail_ctx.as_ref() {
         Some(tail) => AttnRegions::split(&attn, tail),

@@ -122,7 +122,7 @@ pub fn split_qwen_gdn_ba<T>(
 ///
 /// `fused` addresses `2 * rows * h` live bf16 elements; `gate_out`/`up_out`
 /// `rows * h` writable ones each.
-#[routine(bf16)]
+#[routine(bf16, internal)]
 pub fn deinterleave_rows<T>(
     ctx: &Ctx<'_>,
     fused: In<Tensor<T>>,
@@ -142,7 +142,7 @@ pub fn deinterleave_rows<T>(
 ///
 /// `fused` addresses `2 * i` live bf16 elements; `gate_out`/`up_out` `i`
 /// writable ones each.
-#[routine(bf16)]
+#[routine(bf16, internal)]
 pub fn deinterleave_vec<T>(
     ctx: &Ctx<'_>,
     fused: In<Tensor<T>>,
@@ -164,7 +164,7 @@ pub fn deinterleave_vec<T>(
 ///
 /// `left`/`right` address `rows * left_dim`/`rows * right_dim` live bf16
 /// elements; `out` `rows * (left_dim + right_dim)` writable ones.
-#[routine]
+#[routine(internal)]
 pub fn concat_bf16_rows(
     ctx: &Ctx<'_>,
     left: In<Tensor<bf16>>,
@@ -257,7 +257,7 @@ pub fn transpose_bf16_nld_to_lnd(
 ///
 /// `src`/`dst` address `bytes` live bytes, `dst` writable, `slot_ids`
 /// indexable at `request`.
-#[routine]
+#[routine(internal)]
 pub fn copy_if_valid_slot(
     ctx: &Ctx<'_>,
     // The pointers state their slots; the scalars below don't.
@@ -285,7 +285,7 @@ const fn threads_for(head_dim: i32) -> u32 {
 ///
 /// Every pointer is a device address the caller keeps live, with `ctx`'s
 /// stream live across the launch.
-#[routine(untraced)]
+#[routine(untraced, internal)]
 pub fn envelope_merge_written(
     ctx: &Ctx<'_>,
     // Fired by path (`attn/mod.rs`), not a statement, so every parameter
@@ -354,7 +354,7 @@ pub fn envelope_merge_written(
 ///
 /// Both planes are device addresses the caller keeps live, with `ctx`'s
 /// stream live across the launch.
-#[routine(untraced)]
+#[routine(untraced, internal)]
 pub fn envelope_seed_empty(
     ctx: &Ctx<'_>,
     // The pool's planes — see `envelope_merge_written`'s standing note. This
@@ -382,7 +382,7 @@ pub fn envelope_seed_empty(
 ///
 /// Every pointer is a device address the caller keeps live across the launch,
 /// and `ctx`'s stream is held live for the same window.
-#[routine(untraced)]
+#[routine(untraced, internal)]
 pub fn envelope_update_appended(
     ctx: &Ctx<'_>,
     // Same standing note as `envelope_merge_written`. `k_pages` is `*const

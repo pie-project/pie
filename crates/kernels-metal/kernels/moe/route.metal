@@ -36,7 +36,35 @@
 
 using namespace metal;
 
-#include "params.h"
+// THE FOUR PARAMETER BLOCKS ARE GONE, AND `moe/params.h` WITH THEM.
+//
+// `router_topk` took a `constant RouterParams&`, `route_sort` and
+// `route_gather` a `constant MoeRouteParams&`, and `combine_sorted` a
+// `constant ExpertCombineParams&` -- one buffer each, holding every field, at
+// the address of the statement's staged scalar run. That is where the tree's
+// packed-params convention came from and it is the convention being unwound:
+// a struct pointer is one slot for many numbers, so nothing between the text
+// and the shader could name any single one of them, and a text that stated
+// FEWER words than the struct declares was undetectable. It happened here.
+// `driver-metal/tests/packed_params_cover_the_struct.rs` exists because
+// `RouterParams` is four `unsigned int` and a text stated two: this file read
+// `p.softmax_over_all` at byte 8 and `p.logits_pitch` at byte 12 out of the
+// NEXT dispatch's scalars, which is a routing that softmaxes over all experts
+// because a neighbouring statement's first word happened to be nonzero, and a
+// logits stride taken from its second. Both produce weights and neither
+// faults.
+//
+// Every field is a `const constant uint&` of its own now, one `setBytes` each
+// where the block was one address, at ascending buffer indices AFTER this
+// kernel's real operands -- which is how `driver-metal`'s `lay_out` numbers a
+// routine's arguments: an argument's slot is its position in the list the body
+// fired. The routines state one `Const<u32>` mark per field, in the struct's
+// order, because that order is the statement's: word 0 of `route_sort`'s run
+// is `n` on every plane and always was.
+//
+// Deleting a block from the MIDDLE of an operand list renumbers what follows
+// it, and three of these four sat in the middle. `per_expert_scale`, and both
+// `inv`s, each moved down one; each says so where it is declared.
 
 // Top-k over each router-logit row, then a softmax over only the selected
 // values. One threadgroup owns one row and one lane owns one expert.
@@ -54,21 +82,38 @@ template <typename T, bool SCALED>
     const device T* logits     [[buffer(0)]],
     device int* expert_ids     [[buffer(1)]],
     device T* expert_weights   [[buffer(2)]],
-    constant RouterParams& p   [[buffer(3)]],
-    const device T* per_expert_scale [[buffer(4)]],
+    // MOVED DOWN A SLOT, because `RouterParams` was buffer 3 and this was 4.
+    // Still bound by the unscaled instantiation: the slot is positional, so it
+    // has to hold an address whether or not `SCALED` dereferences it.
+    const device T* per_expert_scale [[buffer(3)]],
+    // `RouterParams`, field for field and in its order.
+    //
+    // `logits_pitch` of zero means the pitch IS `n_experts`, which is
+    // load-bearing: a router reading a slice of a wider activation has a pitch
+    // that is not its expert count, and a host with no slice writes 0 rather
+    // than restating the count. `softmax_over_all` is the word this file's
+    // header names: 0 softmaxes the SELECTED logits so the k weights sum to
+    // one -- `norm_topk_prob: true`, and what every family here shipped with --
+    // while 1 softmaxes over ALL experts and then selects, so they sum to less
+    // and scale the routed FFN's contribution down with them. Zero is the old
+    // behaviour, so a site that does not state it keeps it.
+    const constant uint& n_experts         [[buffer(4)]],
+    const constant uint& experts_per_token [[buffer(5)]],
+    const constant uint& softmax_over_all  [[buffer(6)]],
+    const constant uint& logits_pitch      [[buffer(7)]],
     uint3 lid3 [[thread_position_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint3 tgsize [[threads_per_threadgroup]],
     uint3 tgid [[threadgroup_position_in_grid]]) {
   const uint lid = lid3.x;
-  const uint n = p.n_experts;
-  const uint k = min(p.experts_per_token, kRouterMaxTopK);
+  const uint n = n_experts;
+  const uint k = min(experts_per_token, kRouterMaxTopK);
   const uint n_simd = min((tgsize.x + 31u) / 32u, kRouterMaxSimdgroups);
   constexpr float NEG_INF = -3.0e38f;
 
   const uint row = tgid.y;
-  logits += size_t(row) * size_t(p.logits_pitch != 0u ? p.logits_pitch : n);
+  logits += size_t(row) * size_t(logits_pitch != 0u ? logits_pitch : n);
   expert_ids += size_t(row) * size_t(k);
   expert_weights += size_t(row) * size_t(k);
 
@@ -86,7 +131,7 @@ template <typename T, bool SCALED>
   // top-k read out of it, so the k weights sum to less than one. Take that
   // denominator here, before the selection loop consumes `v` -- each lane
   // still holds its own logit and nothing has been knocked out yet.
-  if (p.softmax_over_all != 0u) {
+  if (softmax_over_all != 0u) {
     const float m0 = simd_max(v);
     if (simd_lid == 0) part_v[simd_gid] = m0;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -141,7 +186,7 @@ template <typename T, bool SCALED>
     // a sum. Which max and which sum is the whole of `norm_topk_prob`.
     float mx = all_max;
     float sum = all_sum;
-    if (p.softmax_over_all == 0u) {
+    if (softmax_over_all == 0u) {
       mx = NEG_INF;
       for (uint r = 0; r < k; ++r) mx = max(mx, chosen[r]);
       sum = 0.0f;
@@ -162,12 +207,16 @@ template <typename T, bool SCALED>
   template [[host_name("router_topk_" #name)]]                     \
   [[kernel]] void router_topk<itype, false>(                       \
       const device itype*, device int*, device itype*,             \
-      constant RouterParams&, const device itype*,                 \
+      const device itype*,                                         \
+      const constant uint&, const constant uint&,                  \
+      const constant uint&, const constant uint&,                  \
       uint3, uint, uint, uint3, uint3);                            \
   template [[host_name("router_topk_scaled_" #name)]]              \
   [[kernel]] void router_topk<itype, true>(                        \
       const device itype*, device int*, device itype*,             \
-      constant RouterParams&, const device itype*,                 \
+      const device itype*,                                         \
+      const constant uint&, const constant uint&,                  \
+      const constant uint&, const constant uint&,                  \
       uint3, uint, uint, uint3, uint3);
 
 instantiate_router_topk(bfloat16, bfloat)
@@ -208,31 +257,52 @@ constant constexpr uint kMaxExperts = 1024;
     device int* perm            [[buffer(1)]],
     device int* row_expert      [[buffer(2)]],
     device int* tile_expert     [[buffer(3)]],
-    constant MoeRouteParams& p  [[buffer(4)]],
-    device int* inv             [[buffer(5)]],
+    // MOVED DOWN A SLOT, because `MoeRouteParams` was buffer 4 and this was 5.
+    device int* inv             [[buffer(4)]],
+    // `MoeRouteParams`, field for field, and SHARED WITH `route_gather` below.
+    //
+    // One layout for the sort and the gather so that the padding one writes
+    // and the bounds the other reads cannot disagree. That is not two structs
+    // that happen to look alike: `model-dsl` states the same seven words for
+    // both statements, and both routines take the same seven marks in the same
+    // order -- three of which the gather never reads and carries anyway, so
+    // that `width` is word 5 and `x_pitch` word 6 in both.
+    //
+    // `n` is the number of (row, slot) PAIRS -- one per expert choice -- while
+    // `padded` is the length of the permutation, `n` rounded up so every
+    // expert's span is a whole number of `tile_rows` tiles. The two are
+    // different numbers and this kernel reads both; a body that used one for
+    // the other would clear a permutation shorter than it fills.
+    const constant uint& n                 [[buffer(5)]],
+    const constant uint& n_experts         [[buffer(6)]],
+    const constant uint& experts_per_token [[buffer(7)]],
+    const constant uint& tile_rows         [[buffer(8)]],
+    const constant uint& padded            [[buffer(9)]],
+    const constant uint& width             [[buffer(10)]],
+    const constant uint& x_pitch           [[buffer(11)]],
     uint lid                    [[thread_position_in_threadgroup]],
     uint nthreads               [[threads_per_threadgroup]]) {
     threadgroup atomic_uint counts[kMaxExperts];
     threadgroup uint base[kMaxExperts];
     threadgroup uint sg_sum[32];
 
-    const uint E = min(p.n_experts, kMaxExperts);
-    const uint tile = p.tile_rows < 1u ? 1u : p.tile_rows;
-    const uint tiles = p.padded / tile;
+    const uint E = min(n_experts, kMaxExperts);
+    const uint tile = tile_rows < 1u ? 1u : tile_rows;
+    const uint tiles = padded / tile;
 
     // Clear first, and clear EVERYTHING: the padding rows are read by the
     // gather and the spare tiles by the matmul, so a stale -1 that was never
     // written is a row of some previous layer's routing.
     for (uint e = lid; e < E; e += nthreads) atomic_store_explicit(&counts[e], 0u, memory_order_relaxed);
-    for (uint i = lid; i < p.padded; i += nthreads) {
+    for (uint i = lid; i < padded; i += nthreads) {
         perm[i] = -1;
         row_expert[i] = 0;
     }
     for (uint t = lid; t < tiles; t += nthreads) tile_expert[t] = -1;
-    for (uint i = lid; i < p.n; i += nthreads) inv[i] = -1;
+    for (uint i = lid; i < n; i += nthreads) inv[i] = -1;
     threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
-    for (uint i = lid; i < p.n; i += nthreads) {
+    for (uint i = lid; i < n; i += nthreads) {
         const int e = expert_ids[i];
         if (e >= 0 && uint(e) < E) {
             atomic_fetch_add_explicit(&counts[e], 1u, memory_order_relaxed);
@@ -288,11 +358,11 @@ constant constexpr uint kMaxExperts = 1024;
     // what has to be visible here is `base` and the reset cursors.
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint i = lid; i < p.n; i += nthreads) {
+    for (uint i = lid; i < n; i += nthreads) {
         const int e = expert_ids[i];
         if (e < 0 || uint(e) >= E) continue;
         const uint at = base[e] + atomic_fetch_add_explicit(&counts[e], 1u, memory_order_relaxed);
-        if (at < p.padded) {
+        if (at < padded) {
             perm[at] = int(i);
             row_expert[at] = e;
             inv[i] = int(at);
@@ -314,14 +384,31 @@ constant constexpr uint kMaxExperts = 1024;
     const device bfloat* x     [[buffer(0)]],
     device bfloat* out         [[buffer(1)]],
     const device int* perm     [[buffer(2)]],
-    constant MoeRouteParams& p [[buffer(3)]],
+    // THE SORT'S BLOCK, WHOLE, and three of these seven words are never read
+    // here. Deliberate, and `route_sort`'s note above says why: the sort's
+    // `padded` is this kernel's row bound, so a gather carrying its own
+    // shorter block would be a second place for the same number to be stated
+    // and a second place for it to be wrong. `n`, `n_experts` and `tile_rows`
+    // are the sort's alone and ride here so that the two kernels take the same
+    // marks at the same slots.
+    const constant uint& n                 [[buffer(3)]],
+    const constant uint& n_experts         [[buffer(4)]],
+    const constant uint& experts_per_token [[buffer(5)]],
+    const constant uint& tile_rows         [[buffer(6)]],
+    const constant uint& padded            [[buffer(7)]],
+    const constant uint& width             [[buffer(8)]],
+    const constant uint& x_pitch           [[buffer(9)]],
     uint2 gid                  [[thread_position_in_grid]]) {
-    if (gid.x >= p.width || gid.y >= p.padded) return;
+    if (gid.x >= width || gid.y >= padded) return;
     const int sel = perm[gid.y];
-    const uint k = p.experts_per_token < 1u ? 1u : p.experts_per_token;
-    const uint x_pitch = p.x_pitch != 0u ? p.x_pitch : p.width;
-    out[uint(gid.y) * p.width + gid.x] =
-        sel < 0 ? bfloat(0) : x[(uint(sel) / k) * x_pitch + gid.x];
+    const uint k = experts_per_token < 1u ? 1u : experts_per_token;
+    // Named `pitch` and not `x_pitch`: the resolved value is not the stated
+    // one when the caller writes zero, and a local shadowing the argument it
+    // is derived from would leave the two spellings meaning different things
+    // in one body.
+    const uint pitch = x_pitch != 0u ? x_pitch : width;
+    out[uint(gid.y) * width + gid.x] =
+        sel < 0 ? bfloat(0) : x[(uint(sel) / k) * pitch + gid.x];
 }
 
 /// Sum a token's k expert outputs, weighted by the router's softmax, reading
@@ -340,20 +427,31 @@ constant constexpr uint kMaxExperts = 1024;
     const device bfloat* y              [[buffer(0)]],
     const device bfloat* expert_weights [[buffer(1)]],
     device bfloat* out                  [[buffer(2)]],
-    constant ExpertCombineParams& p     [[buffer(3)]],
-    const device int* inv               [[buffer(4)]],
+    // MOVED DOWN A SLOT, because `ExpertCombineParams` was buffer 3 and this
+    // was 4.
+    const device int* inv               [[buffer(3)]],
+    // `ExpertCombineParams`, field for field. `out_pitch` of zero means
+    // `width`, for the same reason `RouterParams::logits_pitch`'s zero means
+    // `n_experts`: the mixture's output is token-major and lands in whatever
+    // layout the caller's activations are in. A batched decode's are packed; a
+    // prefill's are a uniform `scratch_widest_elems` apart, because a
+    // per-token DAG binds one offset for every value it touches. Nonzero is
+    // the second case.
+    const constant uint& width             [[buffer(4)]],
+    const constant uint& experts_per_token [[buffer(5)]],
+    const constant uint& out_pitch         [[buffer(6)]],
     uint2 gid                           [[thread_position_in_grid]]) {
   const uint c = gid.x;
-  if (c >= p.width) return;
+  if (c >= width) return;
   const uint row = gid.y;
-  const uint k = p.experts_per_token;
+  const uint k = experts_per_token;
   float acc = 0;
   for (uint e = 0; e < k; ++e) {
     const int at = inv[row * k + e];
     if (at < 0) continue;
-    acc += float(expert_weights[row * k + e]) * float(y[uint(at) * p.width + c]);
+    acc += float(expert_weights[row * k + e]) * float(y[uint(at) * width + c]);
   }
-  out[row * (p.out_pitch != 0u ? p.out_pitch : p.width) + c] = static_cast<bfloat>(acc);
+  out[row * (out_pitch != 0u ? out_pitch : width) + c] = static_cast<bfloat>(acc);
 }
 
 // ── The shared expert ────────────────────────────────────────────────────────

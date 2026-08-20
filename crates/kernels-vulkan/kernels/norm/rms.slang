@@ -13,21 +13,41 @@
 // 1280-thread workgroup that no implementation allows, and the gain is applied
 // in float before the single bf16 round on the way out.
 //
-// What moved is where the scalars ride. Metal binds `RmsParams` as buffer 3 and
-// `row_pitch` as buffer 4; here `RmsParams` stays a buffer -- the row says
-// `params: Buf`, and a struct is a struct -- and `row_pitch` becomes a push
-// constant, because the row says `I32` and this backend's rule is that a scalar
-// rides the push block. `src/lib.rs` states the rule; this is the first shader
-// that shows both halves of it.
+// What moved is where the scalars ride. Every one of them is in the push block
+// below, which is this backend's rule stated whole: a scalar rides the push
+// range, and there is nothing else left here for one to ride.
 //
-// The one real divergence is the reduction: Metal's `simd_sum` over a
-// 32-wide simdgroup becomes `WaveActiveSum` over a subgroup whose width the
+// IT USED TO BE BOTH AT ONCE, and this was the shader the rule was written
+// against. `eps`, `axis_size`, `w_stride`, `plus_one` and `gain` were
+// `RmsParams` on a storage binding -- Metal's buffer-3 layout, carried over
+// whole through `norm/rms_params.slang` -- while `row_pitch` was a push
+// constant, so the module declared a descriptor for twenty live bytes AND a
+// push range beside it. That is the one arrangement `binding::params` cannot
+// serve: it asks push first, and a module answering with the right push size
+// "is not also hiding a parameter buffer", so the two roads could only ever
+// work because the driver's table path knew this kernel by name.
+//
+// `norm::rms_single_row` and its four siblings state all five as `Const` marks
+// now -- words 0 through 4 of the same statement run the struct was staged
+// from, in the struct's own order because that order is the statement's -- and
+// `Encoder::words` builds the block from the arguments the BODY passes, in the
+// order it passes them. So `row_pitch` is LAST: a stride folded in ahead of the
+// five would renumber the fields all five entrypoints share.
+//
+// The struct's departure also RENUMBERED THE BINDINGS, which no other kernel in
+// this sweep needed. `PIE_PARAMS` held binding 3 with the residual arms' `r`
+// and `s` declared after it, and a descriptor set is written from a DENSE list
+// -- `encode` pushes one buffer per bound operand and `declared.bindings`
+// counts them -- so a hole at 3 is an arity refusal, not a gap. `r` is binding
+// 3 now and `s` is 4.
+//
+// The one real divergence from Metal is the reduction: Metal's `simd_sum` over
+// a 32-wide simdgroup becomes `WaveActiveSum` over a subgroup whose width the
 // implementation chooses, and the partials array is sized for the worst case
 // rather than for 32. `common/reduce.slang` is where that argument lives.
 
 #include "common/bf16.slang"
 #include "common/reduce.slang"
-#include "norm/rms_params.slang"
 
 // Four elements per lane, which is Metal's `N_READS` and the same number for
 // the same reason: it is the widest load that stays a single vec4's worth of
@@ -41,19 +61,40 @@
 PIE_BUFFER_RO(0, x);
 PIE_BUFFER_RO(1, w);
 PIE_BUFFER_RW(2, out_);
-PIE_PARAMS(3, RmsParams, p);
 
+// BINDING 3, WHICH WAS 4, AND 4, WHICH WAS 5 -- see the header. The
+// conditional bindings still come after the unconditional ones, so folding the
+// residual in does not renumber the three every form shares.
 #if defined(PIE_RESIDUAL)
-PIE_BUFFER_RO(4, r);
+PIE_BUFFER_RO(3, r);
 #if defined(PIE_SCALED)
-PIE_BUFFER_RO(5, s);
+PIE_BUFFER_RO(4, s);
 #endif
 #endif
 
+// Twenty bytes, or twenty-four where a stride rides along, against the 128
+// `Device::max_push` guarantees. `PIE_HEAD_ROWS` is only ever built with
+// `PIE_STRIDED` beside it -- see the instantiation lines at the foot of this
+// file -- so the two-level form takes the six-word arm as well.
 #if defined(PIE_STRIDED)
-struct Push { int row_pitch; };
-[[vk::push_constant]] ConstantBuffer<Push> pc;
+struct Push {
+    float eps;
+    uint axis_size;
+    uint w_stride;
+    uint plus_one;
+    float gain;
+    int row_pitch;
+};
+#else
+struct Push {
+    float eps;
+    uint axis_size;
+    uint w_stride;
+    uint plus_one;
+    float gain;
+};
 #endif
+[[vk::push_constant]] ConstantBuffer<Push> pc;
 
 /// The row this workgroup owns, as an element offset.
 ///
@@ -66,11 +107,11 @@ struct Push { int row_pitch; };
 uint row_base(uint3 group) {
 #if defined(PIE_HEAD_ROWS)
     return group.z * uint(pc.row_pitch)
-         + group.y * p.axis_size;
+         + group.y * pc.axis_size;
 #elif defined(PIE_STRIDED)
     return group.x * uint(pc.row_pitch);
 #else
-    return group.x * p.axis_size;
+    return group.x * pc.axis_size;
 #endif
 }
 
@@ -81,14 +122,14 @@ uint row_base(uint3 group) {
 /// round, because MLX materialises `add(weight, 1.0f)` in float and a parity
 /// walk against it has to make the same choice.
 float gain_at(uint i) {
-    float wv = PIE_LOAD(w[p.w_stride * i]);
-    return p.gain * (p.plus_one != 0u ? (1.0 + wv) : wv);
+    float wv = PIE_LOAD(w[pc.w_stride * i]);
+    return pc.gain * (pc.plus_one != 0u ? (1.0 + wv) : wv);
 }
 
 [numthreads(PIE_GROUP_X, 1, 1)]
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint base = row_base(group);
-    uint axis_size = p.axis_size;
+    uint axis_size = pc.axis_size;
     uint span = uint(PIE_GROUP_X) * uint(N_READS);
     uint lid = local.x;
 
@@ -101,7 +142,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             }
         }
     }
-    float inv = pie_inv_rms(acc, axis_size, p.eps);
+    float inv = pie_inv_rms(acc, axis_size, pc.eps);
 
 #if defined(PIE_RESIDUAL) && defined(PIE_SCALED)
     // One number for the whole row, and every invocation reads it: a broadcast

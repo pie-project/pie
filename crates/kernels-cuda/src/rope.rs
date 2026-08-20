@@ -828,7 +828,7 @@ pub fn rope_partial_q_bf16(
 /// # Errors
 ///
 /// [`rope_partial`]'s.
-#[routine]
+#[routine(internal)]
 pub fn rope_partial_f16(
     ctx: &Ctx<'_>,
     q: InOut<Tensor<f16>>,

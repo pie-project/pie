@@ -235,7 +235,7 @@
 //! instead of one and is why the scratch is shared across a whole page move
 //! rather than allocated per copy.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
@@ -252,6 +252,9 @@ pub mod probe {
     static LAUNCHES: AtomicU64 = AtomicU64::new(0);
     static ENCODE_NS: AtomicU64 = AtomicU64::new(0);
     static GPU_NS: AtomicU64 = AtomicU64::new(0);
+    static READ_NS: AtomicU64 = AtomicU64::new(0);
+    static READ_N: AtomicU64 = AtomicU64::new(0);
+    static READ_B: AtomicU64 = AtomicU64::new(0);
     static ON: AtomicBool = AtomicBool::new(false);
     static INIT: std::sync::Once = std::sync::Once::new();
 
@@ -264,15 +267,18 @@ pub mod probe {
                     loop {
                         std::thread::sleep(std::time::Duration::from_secs(1));
                         let (fires, launches, encode, gpu) = take();
+                        let (reads, read_ms, read_bytes) = taken_reads();
                         if fires == 0 {
                             continue;
                         }
                         eprintln!(
                             "[probe] fires={fires} launches={launches} \
                              launches/fire={:.1} encode={encode:.1}ms gpu={gpu:.1}ms \
-                             gpu/launch={:.0}us",
+                             gpu/launch={:.0}us reads={reads} read={read_ms:.1}ms \
+                             read/fire={:.0}B",
                             launches as f64 / fires as f64,
                             gpu * 1000.0 / launches as f64,
+                            read_bytes as f64 / fires as f64,
                         );
                         report();
                     }
@@ -306,6 +312,28 @@ pub mod probe {
             LAUNCHES.swap(0, Relaxed),
             ENCODE_NS.swap(0, Relaxed) as f64 / 1e6,
             GPU_NS.swap(0, Relaxed) as f64 / 1e6,
+        )
+    }
+
+    /// Fold one readback's duration and size into the counters.
+    ///
+    /// A readback is the one place a fire's answer crosses back to the host,
+    /// and it was the only part of a decoded token the line above could not
+    /// see: it is neither encode nor GPU, so it landed in the gap between
+    /// `gpu` and the wall clock along with the scheduler and the guest.
+    pub fn read(started: Option<Instant>, bytes: usize) {
+        let Some(started) = started else { return };
+        READ_NS.fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+        READ_N.fetch_add(1, Relaxed);
+        READ_B.fetch_add(bytes as u64, Relaxed);
+    }
+
+    /// Take and clear the readback counters: `(calls, ms, bytes)`.
+    fn taken_reads() -> (u64, f64, u64) {
+        (
+            READ_N.swap(0, Relaxed),
+            READ_NS.swap(0, Relaxed) as f64 / 1e6,
+            READ_B.swap(0, Relaxed),
         )
     }
 
@@ -1167,6 +1195,57 @@ pub struct Device {
     /// `e.to_string()` threw that away, and `Shell::admit` had no way to tell
     /// them apart.
     errors: Arc<Mutex<Vec<(bool, String)>>>,
+    /// The one `MAP_READ` buffer every [`Self::read`] copies through.
+    ///
+    /// Grown to the largest range ever asked for and never shrunk. See
+    /// `read` for why one buffer is enough.
+    staging: Mutex<Option<wgpu::Buffer>>,
+    /// Bind groups already built, keyed by what they bind.
+    ///
+    /// A bind group is IMMUTABLE -- it names buffers and ranges, never
+    /// contents -- so two dispatches that name the same layout and the same
+    /// ranges can share one, however often the bytes inside those ranges
+    /// change. Decode re-states the same 228 launches over the same arena
+    /// every token, so without this the encoder built 228 bind groups and
+    /// ~200 uniform buffers PER TOKEN and threw them all away.
+    ///
+    /// The key holds `wgpu` handles rather than pointers on purpose. Every
+    /// handle in `wgpu` 30 is `Eq + Hash` against the resource itself, so a
+    /// buffer that has been dropped cannot be impersonated by a later
+    /// allocation landing at the same address -- which a pointer key would
+    /// have allowed, silently and with correct-looking output.
+    cached: Mutex<Cache>,
+}
+
+/// What [`Device::bind`] does not have to build twice.
+///
+/// Bounded rather than evicted one at a time: the entries hold their buffers
+/// alive, so a plan whose shapes keep changing would otherwise pin every arena
+/// it ever bound. Past [`Cache::CEILING`] entries the whole map is dropped,
+/// which costs one cold token and cannot leak.
+#[derive(Default)]
+struct Cache {
+    /// `@group(0)`, keyed by the layout and the ranges bound to it.
+    storage: HashMap<(wgpu::BindGroupLayout, Vec<(u32, wgpu::Buffer, u64, u64)>), wgpu::BindGroup>,
+    /// `@group(1)`, keyed by the layout and the BYTES. The block is small and
+    /// its contents are the binding, so caching it by value also removes the
+    /// `write_buffer` that used to follow every allocation.
+    uniform: HashMap<(wgpu::BindGroupLayout, Vec<u8>), (wgpu::BindGroup, wgpu::Buffer)>,
+}
+
+impl Cache {
+    /// How many entries either map keeps before it is dropped whole.
+    const CEILING: usize = 4096;
+
+    /// Drop whichever map has outgrown [`Self::CEILING`].
+    fn trim(&mut self) {
+        if self.storage.len() > Self::CEILING {
+            self.storage.clear();
+        }
+        if self.uniform.len() > Self::CEILING {
+            self.uniform.clear();
+        }
+    }
 }
 
 /// How many `@group(0)` bindings each entrypoint's module declares.
@@ -1388,6 +1467,8 @@ impl Device {
             tiers,
             unreachable,
             errors,
+            staging: Mutex::default(),
+            cached: Mutex::default(),
         })
     }
 
@@ -1800,13 +1881,22 @@ impl Device {
         // this clamp cannot cut into what was asked for.
         let span = span.min(buffer.size - from);
 
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: span,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.drained()?;
+        // ONE STAGING BUFFER FOR THE PROCESS, grown as needed and never
+        // shrunk. This function is synchronous -- it submits, waits, maps,
+        // copies out and unmaps before it returns -- so the buffer is idle and
+        // unmapped by the time any other reader can reach it, and the lock is
+        // what makes "any other reader" wait rather than race.
+        let watch = probe::now();
+        self.grow_staging(span)?;
+        // Held for the rest of the body: the mapping below is only valid while
+        // nothing else touches it.
+        let held = self
+            .staging
+            .lock()
+            .map_err(|_| Failed::Wgpu("the readback buffer was poisoned".into()))?;
+        let staging = held
+            .as_ref()
+            .ok_or_else(|| Failed::Wgpu("the readback buffer went missing".into()))?;
 
         let mut encoder = self
             .device
@@ -1817,15 +1907,63 @@ impl Device {
         self.queue.submit([encoder.finish()]);
         self.drained()?;
 
+        let bytes = self.mapped(staging, skip, span, len as usize)?;
+        probe::read(watch, bytes.len());
+        Ok(bytes)
+    }
+
+    /// Grow the one process-wide `MAP_READ` buffer to at least `span`.
+    ///
+    /// Never shrunk: a reader that asked for a large range once will ask
+    /// again, and the allocation is what this exists to avoid.
+    ///
+    /// # Errors
+    ///
+    /// [`Failed::Wgpu`] where the allocation is refused or the lock is
+    /// poisoned.
+    fn grow_staging(&self, span: u64) -> Result<(), Failed> {
+        let mut held = self
+            .staging
+            .lock()
+            .map_err(|_| Failed::Wgpu("the readback buffer was poisoned".into()))?;
+        if held.as_ref().is_none_or(|b| b.size() < span) {
+            *held = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("readback"),
+                size: span,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.drained()?;
+        }
+        Ok(())
+    }
+
+    /// Map `staging`'s first `span` bytes, take `len` of them from `skip`, and
+    /// unmap.
+    ///
+    /// The poll is what RUNS the map callback: `map_async` queues it and
+    /// nothing else drives it. Where the copy rode a submission that has
+    /// already been waited on -- which is what [`Self::run_all_reading`]
+    /// arranges -- this drains a callback rather than making a round trip.
+    ///
+    /// # Errors
+    ///
+    /// [`Failed::Wgpu`] where the poll times out or the map is refused.
+    fn mapped(
+        &self,
+        staging: &wgpu::Buffer,
+        skip: usize,
+        span: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, Failed> {
         let answer: Arc<Mutex<Option<Result<(), wgpu::BufferAsyncError>>>> =
             Arc::new(Mutex::new(None));
         let park = Arc::clone(&answer);
-        staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-            *park.lock().unwrap_or_else(|p| p.into_inner()) = Some(r);
-        });
-        // The poll is what runs the callback: `map_async` queues it and
-        // nothing else drives it. Waiting on the LAST submission is what makes
-        // the copy above have happened.
+        staging
+            .slice(0..span)
+            .map_async(wgpu::MapMode::Read, move |r| {
+                *park.lock().unwrap_or_else(|p| p.into_inner()) = Some(r);
+            });
         let deadline = wait();
         self.device
             .poll(wgpu::PollType::Wait {
@@ -1843,12 +1981,11 @@ impl Device {
                 ));
             }
         }
-
         let view = staging
-            .slice(..)
+            .slice(0..span)
             .get_mapped_range()
             .map_err(|e| Failed::Wgpu(format!("the readback did not map: {e}")))?;
-        let bytes = view[skip..(skip + len as usize).min(view.len())].to_vec();
+        let bytes = view[skip..(skip + len).min(view.len())].to_vec();
         // Both, in this order. A `BufferView` borrows the mapping and `unmap`
         // takes it away, so a staging buffer left mapped is one that cannot be
         // dropped cleanly.
@@ -2074,9 +2211,35 @@ impl Device {
     /// anything after it, which singles out no dispatch and must not pretend
     /// to.
     pub fn run_all(&self, run: &[Recorded<'_, '_>]) -> Result<Ran, (Stage, Failed)> {
+        self.run_all_reading(run, None).map(|(ran, _)| ran)
+    }
+
+    /// [`Self::run_all`], with a range copied back to the host in the SAME
+    /// command buffer.
+    ///
+    /// A fire's answer has to cross to the host, and doing that as its own
+    /// submission costs a whole queue round trip: measured on an M4 with
+    /// Llama-3.2-1B, a decoded token spent 0.71 ms in [`Self::read_at`] of
+    /// which 0.67 ms was the poll — the submit was 14 us and the 256 KiB
+    /// memcpy 23 us. The copy is ordered after every pass in the buffer that
+    /// wrote the range, so folding it in is the same read one submission
+    /// earlier, and the map it needs afterwards finds the work already done.
+    ///
+    /// `read` is `(buffer, offset, length)`. The bytes come back as the second
+    /// half of the answer, empty where nothing was asked for.
+    ///
+    /// # Errors
+    ///
+    /// What [`Self::run_all`] returns, plus the map's own failure at
+    /// [`Stage::Submission`].
+    pub fn run_all_reading(
+        &self,
+        run: &[Recorded<'_, '_>],
+        read: Option<(&Buffer, u64, u64)>,
+    ) -> Result<(Ran, Vec<u8>), (Stage, Failed)> {
         let started = probe::now();
         if run.is_empty() {
-            return Ok(Ran::default());
+            return Ok((Ran::default(), Vec::new()));
         }
         // Every check first, so a refusal has submitted nothing. `Failed::Aliased`
         // is deliberately NOT among them: the shadow below is what answers it.
@@ -2147,10 +2310,13 @@ impl Device {
                 );
             }
             probe::record(run.len(), started, probe::now());
-            return Ok(Ran {
-                shadowed: copies,
-                buffers: run.len(),
-            });
+            return Ok((
+                Ran {
+                    shadowed: copies,
+                    buffers: run.len(),
+                },
+                Vec::new(),
+            ));
         }
         // ONE command buffer for the whole fire, copies and passes alike.
         //
@@ -2216,11 +2382,36 @@ impl Device {
                 }
             }
         }
+        // THE ANSWER, in the buffer that produced it. Sized and aligned the
+        // way `read_at` does it, and skipped whole where the range does not
+        // fit -- a caller that asked for one past the end gets the empty
+        // answer and its own `read_at` refusal, which is where that range is
+        // checked and named.
+        let whole = Stage::Submission { of: run.len() };
+        let mut staged: Option<(usize, u64)> = None;
+        if let Some((buffer, offset, len)) = read
+            && len > 0
+            && offset.saturating_add(len) <= buffer.size
+        {
+            let align = wgpu::COPY_BUFFER_ALIGNMENT;
+            let from = offset - offset % align;
+            let skip = (offset - from) as usize;
+            let span = ((len + (offset - from)).next_multiple_of(align)).min(buffer.size - from);
+            self.grow_staging(span).map_err(|e| (whole, e))?;
+            let held = self
+                .staging
+                .lock()
+                .map_err(|_| (whole, Failed::Wgpu("the readback buffer was poisoned".into())))?;
+            let into = held
+                .as_ref()
+                .ok_or_else(|| (whole, Failed::Wgpu("the readback buffer went missing".into())))?;
+            work.copy_buffer_to_buffer(&buffer.inner, from, into, 0, Some(span));
+            staged = Some((skip, span));
+        }
         submission.push(work.finish());
         let buffers = submission.len();
         let encoded = probe::now();
         self.queue.submit(submission);
-        let whole = Stage::Submission { of: run.len() };
         self.drained().map_err(|e| (whole, e))?;
         // The wait is what makes a caller's next `read` see this fire, and it
         // is also what makes the scalar blocks and the scratch buffers safe to
@@ -2230,10 +2421,30 @@ impl Device {
         probe::record(run.len(), started, encoded);
         drop(bound);
         drop(shadows);
-        Ok(Ran {
-            shadowed: copies,
-            buffers,
-        })
+        // AFTER the wait, so the map finds a submission that has already run
+        // and the poll below is a callback drain rather than a round trip.
+        let answer = match staged {
+            Some((skip, span)) => {
+                let watch = probe::now();
+                let held = self.staging.lock().map_err(|_| {
+                    (whole, Failed::Wgpu("the readback buffer was poisoned".into()))
+                })?;
+                let into = held.as_ref().ok_or_else(|| {
+                    (whole, Failed::Wgpu("the readback buffer went missing".into()))
+                })?;
+                let bytes = self.mapped(into, skip, span, read.map_or(0, |r| r.2 as usize));
+                probe::read(watch, bytes.as_ref().map_or(0, Vec::len));
+                bytes.map_err(|e| (whole, e))?
+            }
+            None => Vec::new(),
+        };
+        Ok((
+            Ran {
+                shadowed: copies,
+                buffers,
+            },
+            answer,
+        ))
     }
 
     /// The read-only ranges this dispatch cannot bind where they are.
@@ -2470,30 +2681,90 @@ impl Device {
                 }
             })
             .collect();
-        let storage = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &pipeline.storage,
-            entries: &entries,
-        });
-        self.drained()?;
+        // What the entries name, in a form that outlives the borrows above and
+        // identifies the same binding on a later fire.
+        let key = (
+            pipeline.storage.clone(),
+            entries
+                .iter()
+                .map(|e| match &e.resource {
+                    wgpu::BindingResource::Buffer(b) => (
+                        e.binding,
+                        b.buffer.clone(),
+                        b.offset,
+                        b.size.map_or(0, std::num::NonZeroU64::get),
+                    ),
+                    // Unreachable: every entry above is built as a `Buffer`.
+                    // Keyed as a distinct zero-length range rather than
+                    // panicking, which at worst costs a miss.
+                    _ => (e.binding, one.buffers[0].buffer().inner.clone(), 0, 0),
+                })
+                .collect::<Vec<_>>(),
+        );
+        let hit = self
+            .cached
+            .lock()
+            .map_err(|_| Failed::Wgpu("the bind cache was poisoned".into()))?
+            .storage
+            .get(&key)
+            .cloned();
+        let storage = match hit {
+            Some(group) => group,
+            None => {
+                let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &pipeline.storage,
+                    entries: &entries,
+                });
+                self.drained()?;
+                let mut cache = self
+                    .cached
+                    .lock()
+                    .map_err(|_| Failed::Wgpu("the bind cache was poisoned".into()))?;
+                cache.trim();
+                cache.storage.insert(key, group.clone());
+                group
+            }
+        };
 
         let (uniform, block) = match (&pipeline.uniform, one.uniform.is_empty()) {
             (Some(layout), false) => {
-                let block = self.uniform(one.uniform)?;
-                let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: UNIFORM_BINDING,
-                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &block.inner,
-                            offset: 0,
-                            size: wgpu::BufferSize::new(block.size),
-                        }),
-                    }],
-                });
-                self.drained()?;
-                (Some(group), Some(block.inner))
+                let key = (layout.clone(), one.uniform.to_vec());
+                let hit = self
+                    .cached
+                    .lock()
+                    .map_err(|_| Failed::Wgpu("the bind cache was poisoned".into()))?
+                    .uniform
+                    .get(&key)
+                    .cloned();
+                let (group, inner) = match hit {
+                    Some(both) => both,
+                    None => {
+                        let block = self.uniform(one.uniform)?;
+                        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None,
+                            layout,
+                            entries: &[wgpu::BindGroupEntry {
+                                binding: UNIFORM_BINDING,
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer: &block.inner,
+                                    offset: 0,
+                                    size: wgpu::BufferSize::new(block.size),
+                                }),
+                            }],
+                        });
+                        self.drained()?;
+                        let mut cache = self
+                            .cached
+                            .lock()
+                            .map_err(|_| Failed::Wgpu("the bind cache was poisoned".into()))?;
+                        cache.trim();
+                        let both = (group, block.inner);
+                        cache.uniform.insert(key, both.clone());
+                        both
+                    }
+                };
+                (Some(group), Some(inner))
             }
             // `check` already refused the two mixed cases -- a block with no
             // layout, or a layout with no block -- so this is the module that

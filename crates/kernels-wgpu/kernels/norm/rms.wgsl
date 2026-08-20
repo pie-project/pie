@@ -15,17 +15,14 @@
 //
 // Three things moved.
 //
-// **Where the scalar rides.** Metal binds `RmsParams` as buffer 3 and
-// `row_pitch` as buffer 4; Vulkan keeps the struct a buffer and sends the
-// scalar to a push block. WebGPU has no push constants at all, so `row_pitch`
-// is the one field of the `@group(1) @binding(0)` uniform block, while
-// `RmsParams` stays a STORAGE buffer at binding 3 -- the row says `params: Buf`
-// and a struct is a struct. `src/lib.rs` states the rule:
-// The ROUTINE's signature picks the storage and uniform runs: buffers in the
+// **Where the scalars ride.** Metal binds five `constant` references from
+// buffer 3 up and Vulkan pushes the same five words; WebGPU has no push
+// constants at all, so every one of them is a FIELD of the one `@group(1)
+// @binding(0)` uniform block declared below. `src/lib.rs` states the rule:
+// the ROUTINE's signature picks the storage and uniform runs -- buffers in the
 // order the body asks for them, scalars as the fields of the `@group(1)` block
 // `driver-wgpu::lowering::routine::bind` packs. The strided pair's buffers
-// follow the sibling kernels' order and its scalar follows
-// `norm/residual_add.wgsl`.
+// follow the sibling kernels' order.
 //
 // **Every bf16 index.** WGSL has no 16-bit storage type, so `x`, `w`, `out`
 // and the residual cross as `array<u32>` with TWO values per word
@@ -40,6 +37,50 @@
 // `gl_NumSubgroups`, so `pie_inv_rms` is told the lane and the workgroup width
 // rather than reading them. They must be `local_invocation_id.x` and the
 // `@workgroup_size` below, which is why both come from `PIE_LANES`.
+//
+// ## One block, where there were two
+//
+// `eps`, `axis_size`, `w_stride`, `plus_one` and `gain` were a `RmsParams`
+// STRUCT on `@group(0) @binding(3)` -- MLX's Metal layout, ported through
+// `norm/rms_params.h`, staged from the statement's params run whole and read
+// by FIELD -- while the strided pair's `row_pitch` was a number the BODY
+// passed and therefore a `@group(1)` uniform of its own. The two roads carried
+// scalars to one shader at once, and `driver-wgpu::lowering::routine::bind`
+// has a branch for exactly that pair: the body's scalars to the uniform, the
+// statement's run to the storage pointer, because appending them to the run
+// would leave the uniform empty and `Device::check_bindable` refuses that by
+// name.
+//
+// All five are marks now -- `norm::rms_single_row` and its four siblings state
+// every one of them, where they used to state two and read three out of a
+// struct nothing in Rust could name -- and a mark is the SAME word of the SAME
+// run, reached by index instead of by field. Nothing about which numbers
+// arrive has changed. What changes is that they arrive the way `row_pitch`
+// already did, so this module declares no storage block at all and takes that
+// branch no longer.
+//
+// ## The one kernel in the sweep whose bindings had to be renumbered
+//
+// `params` was not the LAST binding here. It sat at 3 with the residual arms'
+// `r` and `s` declared after it, so deleting it left a hole at 3 -- and a hole
+// is not free on this backend: `driver-wgpu` builds a bind group from the
+// module's DECLARATIONS, so every declared slot is one the dispatch has to
+// fill and a gap is a layout the dispatch cannot satisfy. `r` is binding 3 now
+// and `s` is 4, and `norm::rms_residual`/`rms_residual_scaled` bind them
+// there.
+//
+// ## The field order is the body's argument order
+//
+// `driver-wgpu::lowering::routine::bind` packs the block by walking the fire's
+// argument list and appending each scalar's own width, so the struct below is
+// what the five bodies pass, in the order they pass it. That is the STRUCT's
+// old order, field for field, because that order was the statement's: word 0
+// is the epsilon, word 4 is the gain, and a body that reordered them would
+// read a gain as an epsilon with no error anywhere.
+//
+// `row_pitch` keeps the END of the strided arms' block for the same reason a
+// stride keeps the end of every list in this family: folded in ahead of the
+// five, it would renumber the fields all five entrypoints share.
 
 //#include "common/bf16.inc.wgsl"
 //#include "common/reduce.inc.wgsl"
@@ -49,33 +90,51 @@
 // 256 and reduced over 128 would silently norm by half a row.
 const PIE_LANES = 256u;
 
-struct RmsParams {
-    eps: f32,
-    axis_size: u32,
-    w_stride: u32,
-    plus_one: u32,
-    gain: f32,
-}
-
 @group(0) @binding(0) var<storage, read_write> x: array<u32>;
 @group(0) @binding(1) var<storage, read_write> w: array<u32>;
 // Atomic ONLY because of the odd-width edge `store_half` handles; see there.
 // The element type does not change what the host binds -- it is still a
 // read_write storage buffer of 4-byte words -- so the row's ABI is untouched.
 @group(0) @binding(2) var<storage, read_write> out_: array<atomic<u32>>;
-@group(0) @binding(3) var<storage, read_write> params: RmsParams;
 
+// BINDING 3, WHICH WAS 4, AND 4, WHICH WAS 5. The `RmsParams` storage block
+// held 3 and these two were declared after it; with the block gone they close
+// up rather than leave a hole, because a declared-and-unfilled slot is a bind
+// group `driver-wgpu` cannot build. The conditional bindings still come after
+// the unconditional ones, so folding the residual in does not renumber the
+// three every form shares.
 //#if defined(PIE_RESIDUAL)
-@group(0) @binding(4) var<storage, read_write> r: array<u32>;
+@group(0) @binding(3) var<storage, read_write> r: array<u32>;
 //#if defined(PIE_SCALED)
-@group(0) @binding(5) var<storage, read_write> s: array<u32>;
+@group(0) @binding(4) var<storage, read_write> s: array<u32>;
 //#endif
 //#endif
 
+// The shared prefix is written out once per arm rather than shared between
+// them, because a WGSL struct cannot be extended: the strided arms' pitch is a
+// SIXTH FIELD and not a second block, for the reason the header gives at
+// length. `PIE_HEAD_ROWS` is only ever built with `PIE_STRIDED` beside it --
+// see the instantiation lines at the foot of this file -- so the two-level
+// form takes the six-field arm as well.
 //#if defined(PIE_STRIDED)
-struct Strided { row_pitch: i32 }
-@group(1) @binding(0) var<uniform> strided: Strided;
+struct Params {
+    eps: f32,
+    axis_size: u32,
+    w_stride: u32,
+    plus_one: u32,
+    gain: f32,
+    row_pitch: i32,
+}
+//#else
+struct Params {
+    eps: f32,
+    axis_size: u32,
+    w_stride: u32,
+    plus_one: u32,
+    gain: f32,
+}
 //#endif
+@group(1) @binding(0) var<uniform> params: Params;
 
 // The half-index split, one helper per buffer.
 //
@@ -136,9 +195,9 @@ fn store_half(i: u32, value: f32) {
 // Metal's does.
 fn row_base(wg: vec3<u32>) -> u32 {
 //#if defined(PIE_HEAD_ROWS)
-    return wg.z * u32(strided.row_pitch) + wg.y * params.axis_size;
+    return wg.z * u32(params.row_pitch) + wg.y * params.axis_size;
 //#elif defined(PIE_STRIDED)
-    return wg.x * u32(strided.row_pitch);
+    return wg.x * u32(params.row_pitch);
 //#else
     return wg.x * params.axis_size;
 //#endif

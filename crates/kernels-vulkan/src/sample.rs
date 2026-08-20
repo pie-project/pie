@@ -6,18 +6,7 @@
 
 use kernels_macros::routine;
 use crate::routine::{Asks, Bind, Ctx, Fire, In, Out, Tensor, bf16, keys};
-use kernels::KernelSig;
 use kernels::routine::Refusal;
-
-
-/// The entrypoints this family's routines spell, now that its rows are gone.
-///
-/// A row's `axes` used to generate these, and `entrypoints()` collected them
-/// off the table. A retired row still has its shader and its module -- the
-/// crossing moved WHO NAMES IT, not what exists -- so the name has to be
-/// stated somewhere or the census would read a successful crossing as a
-/// shader that had disappeared. See [`crate::RETIRED`].
-pub static ENTRYPOINTS: &[&str] = &["argmax_logits_bfloat16"];
 
 /// `sample/argmax.slang:11` — `#define PIE_GROUP_X 1024`.
 ///

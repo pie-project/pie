@@ -16,22 +16,43 @@
 //
 // Launch: dispatchThreads grid=(V_d, V_h, 1), tg=(V_d, 1, 1) -> one threadgroup
 // per value-head, V_d lanes cooperatively reduce the sum-of-squares.
+//
+// THE TWO SCALARS ARE SCALARS, NOT A STRUCT.
+//
+// `eps` and `vd` took `constant GatedRmsParams& p [[buffer(4)]]` -- MLX's
+// layout out of `norm/rms_params.h`, and the shape `kernels-vulkan` and
+// `kernels-wgpu` then copied. Both words are live, so nothing is deleted here:
+// `gated_rms` states them as `eps: Const<f32>` and `vd: Const<i32>` rather
+// than forwarding `ctx.params()` whole, and binds two `setBytes` where it
+// bound a staged block. Words 0 and 1 of the statement's run are the same two
+// numbers they always were, reached by index instead of by struct field.
+//
+// The buffer indices ASCEND IN THE STRUCT'S ORDER, because that order is the
+// statement's, and `row_pitch` keeps the END of the strided form's list: it
+// was buffer 5 behind a block of two words and it is buffer 6 in front of two
+// scalars, which is the same place. A stride folded in ahead of the pair would
+// renumber what the two entrypoints share, and the pair is what they share.
+//
+// `vd` is `uint` here while the mark is `Const<i32>`, exactly as
+// `RmsParams.axis_size` is against `rms_strided_head_row`'s `axis`: the run is
+// a `Vec<u32>` and the bits are the value, and the mark's Rust type is about
+// what the BODY may do with the number -- this one hands it to `head_width`,
+// which refuses a non-positive extent.
 
 #include <metal_stdlib>
 using namespace metal;
 
-#include "rms_params.h"
 #include "rms_reduce.h"
 
 template <typename T>
 METAL_FUNC void gated_rms_body(
     const device T* x, const device T* z, const device T* w, device T* out,
-    constant GatedRmsParams& p, size_t idx, uint lid,
+    float eps, uint vd, size_t idx, uint lid,
     threadgroup float* inv_rms, threadgroup float* partials,
     uint simd_lane, uint simd_group) {
   const float xi = float(x[idx]);
   const float inv = rms_inv_from_lane_sum(
-      xi * xi, p.vd, p.eps, inv_rms, partials, simd_lane, simd_group);
+      xi * xi, vd, eps, inv_rms, partials, simd_lane, simd_group);
   const float zr = float(z[idx]);
   const float y = 1.0f / (1.0f + metal::exp(-metal::fabs(zr)));
   const float sig = zr < 0.0f ? 1.0f - y : y;
@@ -46,7 +67,8 @@ template <typename T>
     const device T* z        [[buffer(1)]],   // gate     [V_h, V_d]
     const device T* w        [[buffer(2)]],   // gate_norm_w [V_d] (raw, act dtype)
     device T* out            [[buffer(3)]],   // [V_h, V_d]
-    constant GatedRmsParams& p [[buffer(4)]],
+    const constant float& eps  [[buffer(4)]],
+    const constant uint& vd    [[buffer(5)]],
     uint3 tgpos       [[threadgroup_position_in_grid]],
     uint3 tpg         [[threadgroups_per_grid]],
     uint3 lid3        [[thread_position_in_threadgroup]],
@@ -55,9 +77,9 @@ template <typename T>
   threadgroup float inv_rms[1], partials[32];
   const uint lid = lid3.x;
   const size_t idx =
-      size_t(tgpos.z * tpg.y + tgpos.y) * p.vd + lid;
+      size_t(tgpos.z * tpg.y + tgpos.y) * vd + lid;
   gated_rms_body(
-      x, z, w, out, p, idx, lid,
+      x, z, w, out, eps, vd, idx, lid,
       inv_rms, partials, simd_lane, simd_group);
 }
 
@@ -67,8 +89,9 @@ template <typename T>
     const device T* z        [[buffer(1)]],
     const device T* w        [[buffer(2)]],
     device T* out            [[buffer(3)]],
-    constant GatedRmsParams& p [[buffer(4)]],
-    constant int& row_pitch    [[buffer(5)]],
+    const constant float& eps  [[buffer(4)]],
+    const constant uint& vd    [[buffer(5)]],
+    const constant int& row_pitch [[buffer(6)]],
     uint3 tgpos       [[threadgroup_position_in_grid]],
     uint3 tpg         [[threadgroups_per_grid]],
     uint3 lid3        [[thread_position_in_threadgroup]],
@@ -77,10 +100,10 @@ template <typename T>
   threadgroup float inv_rms[1], partials[32];
   const uint lid = lid3.x;
   const size_t idx =
-      size_t(tgpos.z) * size_t(row_pitch) + size_t(tgpos.y) * p.vd + lid;
+      size_t(tgpos.z) * size_t(row_pitch) + size_t(tgpos.y) * vd + lid;
   (void)tpg;
   gated_rms_body(
-      x, z, w, out, p, idx, lid,
+      x, z, w, out, eps, vd, idx, lid,
       inv_rms, partials, simd_lane, simd_group);
 }
 
@@ -88,7 +111,8 @@ template <typename T>
   template [[host_name("gated_rms_strided_" #name)]] [[kernel]] void \
   gated_rms_strided<itype>(                                       \
       const device itype*, const device itype*, const device itype*, \
-      device itype*, constant GatedRmsParams&, constant int&, uint3, uint3, uint3, uint, uint);
+      device itype*, const constant float&, const constant uint&,    \
+      const constant int&, uint3, uint3, uint3, uint, uint);
 
 instantiate_gated_rms_strided(bfloat16, bfloat)
 
@@ -96,6 +120,7 @@ instantiate_gated_rms_strided(bfloat16, bfloat)
   template [[host_name("gated_rms_" #name)]]                      \
   [[kernel]] void gated_rms<itype>(                               \
       const device itype*, const device itype*, const device itype*, \
-      device itype*, constant GatedRmsParams&, uint3, uint3, uint3, uint, uint);
+      device itype*, const constant float&, const constant uint&,    \
+      uint3, uint3, uint3, uint, uint);
 
 instantiate_gated_rms(bfloat16, bfloat)

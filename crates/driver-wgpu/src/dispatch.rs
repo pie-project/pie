@@ -222,7 +222,8 @@ fn widths<'a>(lowered: &'a Lowered, launch: &Launch) -> impl DoubleEndedIterator
         .iter()
         .filter_map(|arg| match arg {
             Arg::Arena { width, .. } | Arg::Named { width, .. } => Some(*width),
-            Arg::Weight(_) => None,
+            // A raise has no row width to contribute; see `Arg::Raised`.
+            Arg::Weight(_) | Arg::Raised { .. } => None,
         })
 }
 
@@ -687,6 +688,8 @@ mod tests {
 
     fn plan(symbol: &str, args: Vec<Arg>, params: Vec<u32>) -> Lowered {
         Lowered {
+            // A hand-built lowering states no per-argument rows; zero is "no opinion".
+            arg_rows: Vec::new(),
             launches: vec![Launch {
                 kernel: 0,
                 rows: 0..4,

@@ -94,18 +94,21 @@ pub fn causal_conv1d_update_batched<T>(
     // The statement's second named weight (`spec.weight2`), not the
     // `_bias`-suffixed key; null when qwen3.5 builds this conv with no bias.
     bias: Option<Const<Tensor<T>>>,
-    y: Out<Tensor<T>>) -> Result<(), Refusal>
+    y: Out<Tensor<T>>,
+    // STATED, NOT ASKED. These are the CHECKPOINT's geometry -- §11.20's
+    // case, *"a number the checkpoint fixes at load is a constant, and a
+    // constant belongs in the statement"* -- and `kernels-metal` and
+    // `kernels-vulkan` have spelled them `Const<i32>` since that ruling. This
+    // plane asked for them through `keys::Gdn*`: one fact, two spellings.
+    c: Const<i32>,
+    k: Const<i32>) -> Result<(), Refusal>
 where
     MaybeConst<T>: Abi,
 {
-    // ASKED, NOT `Const`: every one of these was `Env<keys::_>` before the
-    // four marks, and no builder ever began stating them. A `Const` mark
-    // PROMISES the statement carries the number at its slot in the params
-    // run; where nothing states one the promise is broken at the fire, not
-    // at the type. See `.wiki/migration.md` §11.20.
-    let c = ctx.ask::<i32, keys::GdnConvDim>()?;
-    let k = ctx.ask::<i32, keys::GdnConvK>()?;
-
+    // ASKED, AND THESE THREE STAY ASKED: a slab the allocator placed, its
+    // pitch, and the fire's request-to-slot table. §6.3 and §6.1, neither of
+    // which a statement can carry. The GEOMETRY that stood beside them is
+    // `Const` now -- see the marks above.
     let state_base = ctx.ask::<*mut core::ffi::c_void, keys::GdnConvSlab>()?;
     let slot_stride_elems = ctx.ask::<i64, keys::GdnConvStride>()?;
     let slot_ids = ctx.ask::<*const i32, keys::GdnSlotIds>()?;
@@ -182,9 +185,11 @@ pub fn causal_conv1d_prefill_batched<T>(
     y: Out<Tensor<T>>,
     // The two trailing nulls below are a kernel capability (speculative
     // state commit) nothing upstream produces yet, so it isn't a parameter.
-
-
-) -> Result<(), Refusal>
+    //
+    // STATED, NOT ASKED. The checkpoint's geometry -- §11.20's case, and the
+    // spelling `kernels-metal` and `kernels-vulkan` have used since it.
+    c: Const<i32>,
+    k: Const<i32>) -> Result<(), Refusal>
 where
     MaybeConst<T>: Abi,
 {
@@ -193,8 +198,6 @@ where
     // PROMISES the statement carries the number at its slot in the params
     // run; where nothing states one the promise is broken at the fire, not
     // at the type. See `.wiki/migration.md` §11.20.
-    let c = ctx.ask::<i32, keys::GdnConvDim>()?;
-    let k = ctx.ask::<i32, keys::GdnConvK>()?;
 
     let state_out_base = ctx.ask::<*mut core::ffi::c_void, keys::GdnConvSlab>()?;
     let slot_stride_elems = ctx.ask::<i64, keys::GdnConvStride>()?;
@@ -1054,15 +1057,20 @@ pub fn chunk_gated_delta_prefill_batched(
     v: In<Tensor<f32>>,
     g_log: In<Tensor<f32>>,
     beta: In<Tensor<f32>>,
-    out: Out<Tensor<f32>>) -> Result<(), Refusal> {
+    out: Out<Tensor<f32>>,
+    // STATED, NOT ASKED. These are the CHECKPOINT's geometry -- §11.20's
+    // case, *"a number the checkpoint fixes at load is a constant, and a
+    // constant belongs in the statement"* -- and `kernels-metal` and
+    // `kernels-vulkan` have spelled them `Const<i32>` since that ruling. This
+    // plane asked for them through `keys::Gdn*`: one fact, two spellings.
+    k_h: Const<i32>,
+    v_h: Const<i32>,
+    k_d: Const<i32>,
+    v_d: Const<i32>) -> Result<(), Refusal> {
     // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
     // builder ever began stating them. A `Const` mark PROMISES the statement
     // carries the number at its slot in the params run; where nothing states
     // one the promise breaks at the fire, not at the type. §11.20.
-    let k_h = ctx.ask::<i32, keys::GdnKHeads>()?;
-    let v_h = ctx.ask::<i32, keys::GdnVHeads>()?;
-    let k_d = ctx.ask::<i32, keys::GdnKDim>()?;
-    let v_d = ctx.ask::<i32, keys::GdnVDim>()?;
 
     let r = ctx.ask::<i32, keys::RequestCount>()?;
     let state_base = ctx.ask::<*mut core::ffi::c_void, keys::GdnRecurrentSlab>()?;
@@ -1087,7 +1095,7 @@ pub fn chunk_gated_delta_prefill_batched(
             out: out.ptr,
             write_state,
         },
-        Shape { r: r, k_h: k_h, v_h: v_h, k_d: k_d, v_d: v_d },
+        Shape { r: r, k_h: *k_h, v_h: *v_h, k_d: *k_d, v_d: *v_d },
     )
 }
 
@@ -1106,19 +1114,20 @@ pub fn chunk_gated_delta_prefill_batched_state_bf16(
     beta: In<Tensor<f32>>,
     out: Out<Tensor<f32>>,
     // One trailing null; see [`chunk_gated_delta_prefill_batched`]'s note.
-
-
-
-) -> Result<(), Refusal> {
+    // STATED, NOT ASKED. These are the CHECKPOINT's geometry -- §11.20's
+    // case, *"a number the checkpoint fixes at load is a constant, and a
+    // constant belongs in the statement"* -- and `kernels-metal` and
+    // `kernels-vulkan` have spelled them `Const<i32>` since that ruling. This
+    // plane asked for them through `keys::Gdn*`: one fact, two spellings.
+    k_h: Const<i32>,
+    v_h: Const<i32>,
+    k_d: Const<i32>,
+    v_d: Const<i32>) -> Result<(), Refusal> {
     // ASKED, NOT `Const`: every one of these was `Env<keys::_>` before the
     // four marks, and no builder ever began stating them. A `Const` mark
     // PROMISES the statement carries the number at its slot in the params
     // run; where nothing states one the promise is broken at the fire, not
     // at the type. See `.wiki/migration.md` §11.20.
-    let k_h = ctx.ask::<i32, keys::GdnKHeads>()?;
-    let v_h = ctx.ask::<i32, keys::GdnVHeads>()?;
-    let k_d = ctx.ask::<i32, keys::GdnKDim>()?;
-    let v_d = ctx.ask::<i32, keys::GdnVDim>()?;
 
     let r = ctx.ask::<i32, keys::RequestCount>()?;
     let state_base = ctx.ask::<*mut core::ffi::c_void, keys::GdnRecurrentSlab>()?;
@@ -1143,7 +1152,7 @@ pub fn chunk_gated_delta_prefill_batched_state_bf16(
             out: out.ptr,
             write_state,
         },
-        Shape { r: r, k_h: k_h, v_h: v_h, k_d: k_d, v_d: v_d },
+        Shape { r: r, k_h: *k_h, v_h: *v_h, k_d: *k_d, v_d: *v_d },
     )
 }
 
@@ -1159,14 +1168,19 @@ pub fn chunk_gated_delta_prefill_batched_cached(
     v: In<Tensor<f32>>,
     g_log: In<Tensor<f32>>,
     beta: In<Tensor<f32>>,
-    out: Out<Tensor<f32>>) -> Result<(), Refusal> {
+    out: Out<Tensor<f32>>,
+    // STATED, NOT ASKED. These are the CHECKPOINT's geometry -- §11.20's
+    // case, *"a number the checkpoint fixes at load is a constant, and a
+    // constant belongs in the statement"* -- and `kernels-metal` and
+    // `kernels-vulkan` have spelled them `Const<i32>` since that ruling. This
+    // plane asked for them through `keys::Gdn*`: one fact, two spellings.
+    v_h: Const<i32>,
+    k_d: Const<i32>,
+    v_d: Const<i32>) -> Result<(), Refusal> {
     // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
     // builder ever began stating them. A `Const` mark PROMISES the statement
     // carries the number at its slot in the params run; where nothing states
     // one the promise breaks at the fire, not at the type. §11.20.
-    let v_h = ctx.ask::<i32, keys::GdnVHeads>()?;
-    let k_d = ctx.ask::<i32, keys::GdnKDim>()?;
-    let v_d = ctx.ask::<i32, keys::GdnVDim>()?;
 
     let r = ctx.ask::<i32, keys::RequestCount>()?;
     let state_base = ctx.ask::<*mut core::ffi::c_void, keys::GdnRecurrentSlab>()?;
@@ -1190,7 +1204,7 @@ pub fn chunk_gated_delta_prefill_batched_cached(
             out: out.ptr,
             write_state,
         },
-        Shape { r: r, k_h: 0, v_h: v_h, k_d: k_d, v_d: v_d },
+        Shape { r: r, k_h: 0, v_h: *v_h, k_d: *k_d, v_d: *v_d },
     )
 }
 
@@ -1206,14 +1220,19 @@ pub fn chunk_gated_delta_prefill_batched_cached_state_bf16(
     v: In<Tensor<f32>>,
     g_log: In<Tensor<f32>>,
     beta: In<Tensor<f32>>,
-    out: Out<Tensor<f32>>) -> Result<(), Refusal> {
+    out: Out<Tensor<f32>>,
+    // STATED, NOT ASKED. These are the CHECKPOINT's geometry -- §11.20's
+    // case, *"a number the checkpoint fixes at load is a constant, and a
+    // constant belongs in the statement"* -- and `kernels-metal` and
+    // `kernels-vulkan` have spelled them `Const<i32>` since that ruling. This
+    // plane asked for them through `keys::Gdn*`: one fact, two spellings.
+    v_h: Const<i32>,
+    k_d: Const<i32>,
+    v_d: Const<i32>) -> Result<(), Refusal> {
     // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
     // builder ever began stating them. A `Const` mark PROMISES the statement
     // carries the number at its slot in the params run; where nothing states
     // one the promise breaks at the fire, not at the type. §11.20.
-    let v_h = ctx.ask::<i32, keys::GdnVHeads>()?;
-    let k_d = ctx.ask::<i32, keys::GdnKDim>()?;
-    let v_d = ctx.ask::<i32, keys::GdnVDim>()?;
 
     let r = ctx.ask::<i32, keys::RequestCount>()?;
     let state_base = ctx.ask::<*mut core::ffi::c_void, keys::GdnRecurrentSlab>()?;
@@ -1237,7 +1256,7 @@ pub fn chunk_gated_delta_prefill_batched_cached_state_bf16(
             out: out.ptr,
             write_state,
         },
-        Shape { r: r, k_h: 0, v_h: v_h, k_d: k_d, v_d: v_d },
+        Shape { r: r, k_h: 0, v_h: *v_h, k_d: *k_d, v_d: *v_d },
     )
 }
 
@@ -1255,16 +1274,21 @@ pub fn recurrent_gated_delta_step_batched_gqa_state_bf16(
     v: In<Tensor<f32>>,
     g_log: In<Tensor<f32>>,
     beta: In<Tensor<f32>>,
-    out: Out<Tensor<f32>>) -> Result<(), Refusal> {
+    out: Out<Tensor<f32>>,
+    // STATED, NOT ASKED. These are the CHECKPOINT's geometry -- §11.20's
+    // case, *"a number the checkpoint fixes at load is a constant, and a
+    // constant belongs in the statement"* -- and `kernels-metal` and
+    // `kernels-vulkan` have spelled them `Const<i32>` since that ruling. This
+    // plane asked for them through `keys::Gdn*`: one fact, two spellings.
+    k_h: Const<i32>,
+    v_h: Const<i32>,
+    k_d: Const<i32>,
+    v_d: Const<i32>) -> Result<(), Refusal> {
     // ASKED, NOT `Const`: every one of these was `Env<keys::_>` before the
     // four marks, and no builder ever began stating them. A `Const` mark
     // PROMISES the statement carries the number at its slot in the params
     // run; where nothing states one the promise is broken at the fire, not
     // at the type. See `.wiki/migration.md` §11.20.
-    let k_h = ctx.ask::<i32, keys::GdnKHeads>()?;
-    let v_h = ctx.ask::<i32, keys::GdnVHeads>()?;
-    let k_d = ctx.ask::<i32, keys::GdnKDim>()?;
-    let v_d = ctx.ask::<i32, keys::GdnVDim>()?;
 
     let r = ctx.ask::<i32, keys::RequestCount>()?;
     let state_base = ctx.ask::<*mut core::ffi::c_void, keys::GdnRecurrentSlab>()?;
@@ -1274,12 +1298,12 @@ pub fn recurrent_gated_delta_step_batched_gqa_state_bf16(
 
     const GDN_SMEM_ARM_WIDTH: i32 = 128;
 
-    if v_h % k_h != 0 {
-        return Err(Refusal::Narrow { what: "v_h per k_h", at: i64::from(v_h) });
+    if *v_h % *k_h != 0 {
+        return Err(Refusal::Narrow { what: "v_h per k_h", at: i64::from(*v_h) });
     }
     // The shared-memory arm is compiled for one head width only, so both
     // extents must be it; anything else takes the HBM arm.
-    let (instantiation, launch) = if v_d == GDN_SMEM_ARM_WIDTH && k_d == GDN_SMEM_ARM_WIDTH {
+    let (instantiation, launch) = if *v_d == GDN_SMEM_ARM_WIDTH && *k_d == GDN_SMEM_ARM_WIDTH {
         (
             "::pie::ssm::recurrent_step_batched_gqa_smem<::pie::ssm::gqa_smem_bv>",
             Launch::grid(
@@ -1326,14 +1350,19 @@ pub fn recurrent_gated_delta_step_batched(
     v: In<Tensor<f32>>,
     g_log: In<Tensor<f32>>,
     beta: In<Tensor<f32>>,
-    out: Out<Tensor<f32>>) -> Result<(), Refusal> {
+    out: Out<Tensor<f32>>,
+    // STATED, NOT ASKED. These are the CHECKPOINT's geometry -- §11.20's
+    // case, *"a number the checkpoint fixes at load is a constant, and a
+    // constant belongs in the statement"* -- and `kernels-metal` and
+    // `kernels-vulkan` have spelled them `Const<i32>` since that ruling. This
+    // plane asked for them through `keys::Gdn*`: one fact, two spellings.
+    v_h: Const<i32>,
+    k_d: Const<i32>,
+    v_d: Const<i32>) -> Result<(), Refusal> {
     // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
     // builder ever began stating them. A `Const` mark PROMISES the statement
     // carries the number at its slot in the params run; where nothing states
     // one the promise breaks at the fire, not at the type. §11.20.
-    let v_h = ctx.ask::<i32, keys::GdnVHeads>()?;
-    let k_d = ctx.ask::<i32, keys::GdnKDim>()?;
-    let v_d = ctx.ask::<i32, keys::GdnVDim>()?;
 
     let r = ctx.ask::<i32, keys::RequestCount>()?;
     let state_base = ctx.ask::<*mut core::ffi::c_void, keys::GdnRecurrentSlab>()?;
@@ -1368,15 +1397,20 @@ pub fn recurrent_gated_delta_step_batched_state_bf16(
     v: In<Tensor<f32>>,
     g_log: In<Tensor<f32>>,
     beta: In<Tensor<f32>>,
-    out: Out<Tensor<f32>>) -> Result<(), Refusal> {
+    out: Out<Tensor<f32>>,
+    // STATED, NOT ASKED. These are the CHECKPOINT's geometry -- §11.20's
+    // case, *"a number the checkpoint fixes at load is a constant, and a
+    // constant belongs in the statement"* -- and `kernels-metal` and
+    // `kernels-vulkan` have spelled them `Const<i32>` since that ruling. This
+    // plane asked for them through `keys::Gdn*`: one fact, two spellings.
+    v_h: Const<i32>,
+    k_d: Const<i32>,
+    v_d: Const<i32>) -> Result<(), Refusal> {
     // ASKED, NOT `Const`: every one of these was `Env<keys::_>` before the
     // four marks, and no builder ever began stating them. A `Const` mark
     // PROMISES the statement carries the number at its slot in the params
     // run; where nothing states one the promise is broken at the fire, not
     // at the type. See `.wiki/migration.md` §11.20.
-    let v_h = ctx.ask::<i32, keys::GdnVHeads>()?;
-    let k_d = ctx.ask::<i32, keys::GdnKDim>()?;
-    let v_d = ctx.ask::<i32, keys::GdnVDim>()?;
 
     let r = ctx.ask::<i32, keys::RequestCount>()?;
     let state_base = ctx.ask::<*mut core::ffi::c_void, keys::GdnRecurrentSlab>()?;
@@ -1411,22 +1445,27 @@ pub fn recurrent_gated_delta_step_batched_gqa(
     v: In<Tensor<f32>>,
     g_log: In<Tensor<f32>>,
     beta: In<Tensor<f32>>,
-    out: Out<Tensor<f32>>) -> Result<(), Refusal> {
+    out: Out<Tensor<f32>>,
+    // STATED, NOT ASKED. These are the CHECKPOINT's geometry -- §11.20's
+    // case, *"a number the checkpoint fixes at load is a constant, and a
+    // constant belongs in the statement"* -- and `kernels-metal` and
+    // `kernels-vulkan` have spelled them `Const<i32>` since that ruling. This
+    // plane asked for them through `keys::Gdn*`: one fact, two spellings.
+    k_h: Const<i32>,
+    v_h: Const<i32>,
+    k_d: Const<i32>,
+    v_d: Const<i32>) -> Result<(), Refusal> {
     // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
     // builder ever began stating them. A `Const` mark PROMISES the statement
     // carries the number at its slot in the params run; where nothing states
     // one the promise breaks at the fire, not at the type. §11.20.
-    let k_h = ctx.ask::<i32, keys::GdnKHeads>()?;
-    let v_h = ctx.ask::<i32, keys::GdnVHeads>()?;
-    let k_d = ctx.ask::<i32, keys::GdnKDim>()?;
-    let v_d = ctx.ask::<i32, keys::GdnVDim>()?;
 
     let r = ctx.ask::<i32, keys::RequestCount>()?;
     let state_base = ctx.ask::<*mut core::ffi::c_void, keys::GdnRecurrentSlab>()?;
     let slot_ids = ctx.ask::<*const i32, keys::GdnSlotIds>()?;
     let slot_stride_elems = ctx.ask::<i64, keys::GdnStateStride>()?;
-    if v_h % k_h != 0 {
-        return Err(Refusal::Narrow { what: "v_h per k_h", at: i64::from(v_h) });
+    if *v_h % *k_h != 0 {
+        return Err(Refusal::Narrow { what: "v_h per k_h", at: i64::from(*v_h) });
     }
     ctx.fire(Fire::at("ssm/gated_delta_net.cuh", "::pie::ssm::recurrent_step_batched_gqa<::pie::ssm::f32, false>").apply(recurrent_scan(r.unsigned_abs(), v_h.unsigned_abs(), k_d.unsigned_abs())), &[
                 q_norm_kh.arg(),
@@ -1458,15 +1497,20 @@ pub fn chunk_gated_delta_prefill_batched_warp_tiled_gqa(
     v: In<Tensor<f32>>,
     g_log: In<Tensor<f32>>,
     beta: In<Tensor<f32>>,
-    out: Out<Tensor<f32>>) -> Result<(), Refusal> {
+    out: Out<Tensor<f32>>,
+    // STATED, NOT ASKED. These are the CHECKPOINT's geometry -- §11.20's
+    // case, *"a number the checkpoint fixes at load is a constant, and a
+    // constant belongs in the statement"* -- and `kernels-metal` and
+    // `kernels-vulkan` have spelled them `Const<i32>` since that ruling. This
+    // plane asked for them through `keys::Gdn*`: one fact, two spellings.
+    k_h: Const<i32>,
+    v_h: Const<i32>,
+    k_d: Const<i32>,
+    v_d: Const<i32>) -> Result<(), Refusal> {
     // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
     // builder ever began stating them. A `Const` mark PROMISES the statement
     // carries the number at its slot in the params run; where nothing states
     // one the promise breaks at the fire, not at the type. §11.20.
-    let k_h = ctx.ask::<i32, keys::GdnKHeads>()?;
-    let v_h = ctx.ask::<i32, keys::GdnVHeads>()?;
-    let k_d = ctx.ask::<i32, keys::GdnKDim>()?;
-    let v_d = ctx.ask::<i32, keys::GdnVDim>()?;
 
     let r = ctx.ask::<i32, keys::RequestCount>()?;
     let state_base = ctx.ask::<*mut core::ffi::c_void, keys::GdnRecurrentSlab>()?;
@@ -1474,8 +1518,8 @@ pub fn chunk_gated_delta_prefill_batched_warp_tiled_gqa(
     let qo_indptr = ctx.ask::<*const u32, keys::QoIndptr>()?;
     let slot_stride_elems = ctx.ask::<i64, keys::GdnStateStride>()?;
     let write_state = ctx.ask::<bool, keys::GdnWriteState>()?;
-    if v_h % k_h != 0 {
-        return Err(Refusal::Narrow { what: "v_h per k_h", at: i64::from(v_h) });
+    if *v_h % *k_h != 0 {
+        return Err(Refusal::Narrow { what: "v_h per k_h", at: i64::from(*v_h) });
     }
     ctx.fire(Fire::at("ssm/gated_delta_net.cuh", "::pie::ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa<::pie::ssm::f32, false>").apply(warp_tiled_scan(r.unsigned_abs(), v_h.unsigned_abs(), v_d.unsigned_abs())), &[
                 q_norm_kh.arg(),
@@ -1510,15 +1554,20 @@ pub fn chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
     v: In<Tensor<f32>>,
     g_log: In<Tensor<f32>>,
     beta: In<Tensor<f32>>,
-    out: Out<Tensor<f32>>) -> Result<(), Refusal> {
+    out: Out<Tensor<f32>>,
+    // STATED, NOT ASKED. These are the CHECKPOINT's geometry -- §11.20's
+    // case, *"a number the checkpoint fixes at load is a constant, and a
+    // constant belongs in the statement"* -- and `kernels-metal` and
+    // `kernels-vulkan` have spelled them `Const<i32>` since that ruling. This
+    // plane asked for them through `keys::Gdn*`: one fact, two spellings.
+    k_h: Const<i32>,
+    v_h: Const<i32>,
+    k_d: Const<i32>,
+    v_d: Const<i32>) -> Result<(), Refusal> {
     // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
     // builder ever began stating them. A `Const` mark PROMISES the statement
     // carries the number at its slot in the params run; where nothing states
     // one the promise breaks at the fire, not at the type. §11.20.
-    let k_h = ctx.ask::<i32, keys::GdnKHeads>()?;
-    let v_h = ctx.ask::<i32, keys::GdnVHeads>()?;
-    let k_d = ctx.ask::<i32, keys::GdnKDim>()?;
-    let v_d = ctx.ask::<i32, keys::GdnVDim>()?;
 
     let r = ctx.ask::<i32, keys::RequestCount>()?;
     let state_base = ctx.ask::<*mut core::ffi::c_void, keys::GdnRecurrentSlab>()?;
@@ -1526,8 +1575,8 @@ pub fn chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
     let qo_indptr = ctx.ask::<*const u32, keys::QoIndptr>()?;
     let slot_stride_elems = ctx.ask::<i64, keys::GdnStateStride>()?;
     let write_state = ctx.ask::<bool, keys::GdnWriteState>()?;
-    if v_h % k_h != 0 {
-        return Err(Refusal::Narrow { what: "v_h per k_h", at: i64::from(v_h) });
+    if *v_h % *k_h != 0 {
+        return Err(Refusal::Narrow { what: "v_h per k_h", at: i64::from(*v_h) });
     }
     ctx.fire(Fire::at("ssm/gated_delta_net.cuh", "::pie::ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa<::pie::ssm::state_bf16, false>").apply(warp_tiled_scan(r.unsigned_abs(), v_h.unsigned_abs(), v_d.unsigned_abs())), &[
                 q_norm_kh.arg(),
@@ -1624,7 +1673,7 @@ const _: () = {
     // asked for with `ctx.ask` instead of restated by the statement), so
     // `out` sits one slot after `beta` rather than three slots downstream.
     // `out` is required now (`DERIVED[5].nullable` is `false`).
-    assert!(<recurrent_gated_delta_step_batched as ::kernels::Derivation>::DERIVED.len() == 6);
+    assert!(<recurrent_gated_delta_step_batched as ::kernels::Derivation>::DERIVED.len() == 9);
     assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(recurrent_gated_delta_step_batched)[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
     assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(recurrent_gated_delta_step_batched)[4], Some(kernels::Source::Slot(kernels::Kind::In, 4))));
     assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(recurrent_gated_delta_step_batched)[5], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
@@ -1716,17 +1765,17 @@ const _: () = {
     // The decode leg's `r` is `x.rows`; the prefill leg's is `RequestCount`
     // — one token per request only on the decode leg, so the two stop
     // agreeing on prefill and nothing pins them apart here.
-    assert!(<causal_conv1d_update_batched as ::kernels::Derivation>::DERIVED.len() == 4);
+    assert!(<causal_conv1d_update_batched as ::kernels::Derivation>::DERIVED.len() == 6);
 
     // Same parameter, same index, both now `RequestCount` in the two
     // launchers differing only by state dtype; these two lines catch it if
     // they diverge again.
-    assert!(<recurrent_gated_delta_step_batched_state_bf16 as ::kernels::Derivation>::DERIVED.len() == 6);
+    assert!(<recurrent_gated_delta_step_batched_state_bf16 as ::kernels::Derivation>::DERIVED.len() == 9);
 
     // `write_state` derives `GdnWriteState` now rather than being bare; its
     // index (15, last of six) proves the five scalars in front of it
     // shifted no slot when they became `Env<keys::_>`.
-    assert!(<chunk_gated_delta_prefill_batched as ::kernels::Derivation>::DERIVED.len() == 6);
+    assert!(<chunk_gated_delta_prefill_batched as ::kernels::Derivation>::DERIVED.len() == 10);
     assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(chunk_gated_delta_prefill_batched)[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
     assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(chunk_gated_delta_prefill_batched)[4], Some(kernels::Source::Slot(kernels::Kind::In, 4))));
     // Same move as [`recurrent_gated_delta_step_batched`]'s `[5]`: `[4]`
@@ -1888,7 +1937,7 @@ const _: () = {
     // the five `In`s, and each column's length is what catches a parameter
     // leaving rather than moving.
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(chunk_gated_delta_prefill_batched);
-    assert!(d.len() == 6);
+    assert!(d.len() == 10);
     assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
     assert!(matches!(d[4], Some(kernels::Source::Slot(kernels::Kind::In, 4))));
     assert!(matches!(d[5], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
@@ -1896,7 +1945,7 @@ const _: () = {
     assert!(!<chunk_gated_delta_prefill_batched as ::kernels::Derivation>::DERIVED[5].nullable);
 
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(chunk_gated_delta_prefill_batched_state_bf16);
-    assert!(d.len() == 6);
+    assert!(d.len() == 10);
     assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
     assert!(matches!(d[5], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
     // As above.
@@ -1906,19 +1955,19 @@ const _: () = {
     // that left is behind `out` and not in front of it: `out` is still at 5,
     // only the trailing `Param` run got one entry shorter.
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(chunk_gated_delta_prefill_batched_cached);
-    assert!(d.len() == 6);
+    assert!(d.len() == 9);
     assert!(matches!(d[5], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
     // As above.
     assert!(!<chunk_gated_delta_prefill_batched_cached as ::kernels::Derivation>::DERIVED[5].nullable);
 
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(chunk_gated_delta_prefill_batched_cached_state_bf16);
-    assert!(d.len() == 6);
+    assert!(d.len() == 9);
     assert!(matches!(d[5], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
     // As above.
     assert!(!<chunk_gated_delta_prefill_batched_cached_state_bf16 as ::kernels::Derivation>::DERIVED[5].nullable);
 
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(chunk_gated_delta_prefill_batched_warp_tiled_gqa);
-    assert!(d.len() == 6);
+    assert!(d.len() == 10);
     assert!(matches!(d[5], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
     // As above.
     assert!(!<chunk_gated_delta_prefill_batched_warp_tiled_gqa as ::kernels::Derivation>::DERIVED[5].nullable);
@@ -1928,8 +1977,12 @@ const _: () = {
     // what `resolve` walks out of the TYPES. Keeping them apart is what
     // stopped the two disagreeing, and the claim below is about sources.
     let d = <chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16 as kernels::Derivation>::SOURCES;
-    assert!(d.len() == 6);
+    assert!(d.len() == 10);
     assert!(matches!(d[5], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    // AND THE FOUR THE GEOMETRY TOOK, which is what the count grew by. They
+    // are the statement's now, at its own params slots.
+    assert!(matches!(d[6], Some(kernels::Source::Slot(kernels::Kind::Param, 0))));
+    assert!(matches!(d[9], Some(kernels::Source::Slot(kernels::Kind::Param, 3))));
     // As above.
     assert!(!<chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16 as ::kernels::Derivation>::DERIVED[5].nullable);
 
@@ -1938,23 +1991,23 @@ const _: () = {
     // slot right after the five `In`s. All four `nullable` lines are
     // negated for the same reason as the six above.
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(recurrent_gated_delta_step_batched);
-    assert!(d.len() == 6);
+    assert!(d.len() == 9);
     assert!(matches!(d[5], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
     assert!(!<recurrent_gated_delta_step_batched as ::kernels::Derivation>::DERIVED[5].nullable);
 
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(recurrent_gated_delta_step_batched_state_bf16);
-    assert!(d.len() == 6);
+    assert!(d.len() == 9);
     assert!(matches!(d[5], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
     assert!(!<recurrent_gated_delta_step_batched_state_bf16 as ::kernels::Derivation>::DERIVED[5].nullable);
 
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(recurrent_gated_delta_step_batched_gqa);
-    assert!(d.len() == 6);
+    assert!(d.len() == 10);
     assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
     assert!(matches!(d[5], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
     assert!(!<recurrent_gated_delta_step_batched_gqa as ::kernels::Derivation>::DERIVED[5].nullable);
 
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(recurrent_gated_delta_step_batched_gqa_state_bf16);
-    assert!(d.len() == 6);
+    assert!(d.len() == 10);
     assert!(matches!(d[5], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
     assert!(!<recurrent_gated_delta_step_batched_gqa_state_bf16 as ::kernels::Derivation>::DERIVED[5].nullable);
 
@@ -1987,9 +2040,11 @@ const _: () = {
 // because the prefill leg puts `y` in front of its state; that asymmetry is
 // real, in the C++, and why both rows are written out rather than shared.
 const _: () = {
-    // FOUR, NOT SIX: `c` and `k` are the GDN conv geometry and are asked for.
+    // SIX AGAIN: `c` and `k` are the GDN conv geometry, and they are STATED
+    // rather than asked. The line before this one read "four, not six" and was
+    // the count of what the ask had taken out of the column.
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(causal_conv1d_update_batched::<bf16>);
-    assert!(d.len() == 4);
+    assert!(d.len() == 6);
     assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
     assert!(matches!(d[1], Some(kernels::Source::Or(kernels::Source::Named(_), kernels::Source::Slot(kernels::Kind::Weight, 0)))));
     // `NamedWeight2` (`spec.weight2`); `nullable` is what lets qwen3.5's
@@ -2005,8 +2060,9 @@ const _: () = {
 
     // FOUR HERE TOO, and the prefill leg's own asymmetry is unchanged: `y`
     // still precedes its state, which is why both rows are written out.
+    // SIX, as the update twin: the conv geometry is stated on both.
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(causal_conv1d_prefill_batched::<bf16>);
-    assert!(d.len() == 4);
+    assert!(d.len() == 6);
     assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
     assert!(matches!(d[1], Some(kernels::Source::Or(kernels::Source::Named(_), kernels::Source::Slot(kernels::Kind::Weight, 0)))));
     assert!(matches!(d[2], Some(kernels::Source::Or(kernels::Source::Named(_), kernels::Source::Slot(kernels::Kind::Weight, 1)))));
@@ -2060,7 +2116,7 @@ const _: () = {
     // The decode step: `n_out` was always 1 here, so this column resolved
     // all along.
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(recurrent_gated_delta_step_batched);
-    assert!(d.len() == 6);
+    assert!(d.len() == 9);
     assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
     assert!(matches!(d[4], Some(kernels::Source::Slot(kernels::Kind::In, 4))));
     assert!(matches!(d[5], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
@@ -2068,7 +2124,7 @@ const _: () = {
     // The prefill leg, the one the fix was for: `qo_indptr` at 7 pushes
     // stride and `out` one right of the decode step's column.
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(chunk_gated_delta_prefill_batched);
-    assert!(d.len() == 6);
+    assert!(d.len() == 10);
     assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
     assert!(matches!(d[4], Some(kernels::Source::Slot(kernels::Kind::In, 4))));
     assert!(matches!(d[5], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));

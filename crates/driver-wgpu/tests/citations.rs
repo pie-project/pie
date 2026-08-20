@@ -269,13 +269,30 @@ fn prose(text: &str) -> (String, Vec<usize>) {
 /// describe the lost test WITHOUT naming it, which is exactly the vagueness
 /// this file is meant to prevent.
 ///
-/// Scoped to the CURRENT comment block. `prose` separates blocks with `\0`,
-/// so a `RETIRED:` three comments earlier cannot excuse a live citation.
-fn retiring(before: &str) -> bool {
-    before
-        .rsplit('\0')
-        .next()
-        .is_some_and(|block| block.contains("RETIRED"))
+/// Scoped to the CURRENT comment block, and to the WHOLE of it. `prose`
+/// separates blocks with `\0`, so a `RETIRED:` three comments earlier cannot
+/// excuse a live citation -- but the marker may sit on either side of the name
+/// within one block, because the two idioms put it on opposite sides: a
+/// retirement writes "RETIRED: it was `x`" and an epitaph writes "`x` STOOD
+/// HERE". Looking only at the text BEFORE the citation admits the first and
+/// refuses the second.
+///
+/// # Two markers, because the tree writes epitaphs two ways
+///
+/// `RETIRED` was the only one here and `X STOOD HERE` is the commoner idiom by
+/// a wide margin -- sixty-odd sites across ten crates, against a handful. The
+/// four this missed were all the second form, in `kernels-wgpu`'s entrypoint
+/// census, where two tests went tautological when the census started being
+/// READ OFF the tree instead of written beside it.
+///
+/// Both are deliberate and both are loud. What neither admits is a citation
+/// with no marker at all, which is still the case this exists to catch: a
+/// comment that names a test as its evidence and is simply out of date.
+fn retiring(stream: &str, at: usize) -> bool {
+    let from = stream[..at].rfind('\0').map_or(0, |i| i + 1);
+    let to = stream[at..].find('\0').map_or(stream.len(), |i| at + i);
+    let block = &stream[from..to];
+    block.contains("RETIRED") || block.contains("STOOD HERE")
 }
 
 fn whose(before: &str) -> bool {
@@ -431,7 +448,7 @@ fn every_proof_these_crates_cite_by_name_can_be_found() {
                 if !opens_like_a_test || !reads_like_a_test || names.contains(&cited) {
                     continue;
                 }
-                if whose(&stream[..open]) || retiring(&stream[..open]) {
+                if whose(&stream[..open]) || retiring(&stream, open) {
                     continue;
                 }
                 let line = at.get(open).copied().unwrap_or(0);
@@ -466,7 +483,7 @@ fn every_proof_these_crates_cite_by_name_can_be_found() {
 /// comparison: "a test that asserts WHICH refusal came back is the only way
 /// an alignment failure stays distinguishable from a length one."
 ///
-/// It is a principle this crate mostly keeps — **seventy-five of ninety-eight**
+/// It is a principle this crate mostly keeps — **seventy-six of ninety-nine**
 /// refusal variants are named in a test — and nothing measured the rest. A
 /// refusal nothing names is one whose condition could be inverted, or whose
 /// message could describe a different fault, with every suite still green: it
@@ -704,8 +721,8 @@ fn every_refusal_this_crate_builds_is_one_a_test_names() {
     // less coverage than there is. Here the sentence fails.
     assert_eq!(
         (refusals.len(), refusals.len() - unnamed.len()),
-        (98, 75),
-        "this test's own doc says seventy-five of ninety-eight refusal variants \
+        (99, 76),
+        "this test's own doc says seventy-six of ninety-nine refusal variants \
          are named by a test. Update the sentence with the number."
     );
 }

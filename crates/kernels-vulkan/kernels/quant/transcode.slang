@@ -4,6 +4,14 @@
 // sign chooses the dominant endpoint, endpoint snapping changes the scale rather
 // than the code, `w_max` starts at zero, and ties round away from zero. MXFP4
 // decode shares `common/mxfp4.slang` with runtime readers so paths cannot drift.
+//
+// BOTH SCALAR PAIRS RIDE A PUSH BLOCK, which is what `quant/transcode.wgsl`
+// already did and this file did not. The two counts were a `DequantParams` and
+// an `EncodeParams` storage struct apiece -- eight bytes on a descriptor -- and
+// each is now the routine's own run: the group or block COUNT, which the body
+// derives from `keys::Rows`, followed by the group or block SIZE, which the
+// statement states as a `Const<i32>` mark. Same two words, same order, no
+// binding.
 
 #include "common/bf16.slang"
 #include "common/mxfp4.slang"
@@ -12,8 +20,8 @@
 [[vk::binding(0)]] StructuredBuffer<uint8_t> payload;
 [[vk::binding(1)]] StructuredBuffer<uint8_t> exponents;
 PIE_BUFFER_RW(2, out_);
-struct DequantParams { uint blocks; uint block_size; };
-PIE_PARAMS(3, DequantParams, p);
+struct Push { uint blocks; uint block_size; };
+[[vk::push_constant]] ConstantBuffer<Push> pc;
 #else
 #if defined(PIE_F32_INPUT)
 [[vk::binding(0)]] StructuredBuffer<float> input_f32;
@@ -23,8 +31,8 @@ PIE_BUFFER_RO(0, input_bf16);
 [[vk::binding(1)]] RWStructuredBuffer<uint> codes;
 PIE_BUFFER_RW(2, scales);
 PIE_BUFFER_RW(3, biases);
-struct EncodeParams { uint groups; uint group_size; };
-PIE_PARAMS(4, EncodeParams, p);
+struct Push { uint groups; uint group_size; };
+[[vk::push_constant]] ConstantBuffer<Push> pc;
 #endif
 
 float round_away(float x) { return x < 0.0 ? -floor(-x + 0.5) : floor(x + 0.5); }
@@ -47,10 +55,10 @@ float round_away(float x) { return x < 0.0 ? -floor(-x + 0.5) : floor(x + 0.5); 
 [numthreads(1, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
     uint gid = tid.x;
-    if (gid >= p.blocks) return;
+    if (gid >= pc.blocks) return;
     float factor = mxfp4_block_scale(uint(exponents[gid]));
-    uint first = gid * p.block_size;
-    for (uint i = 0u; i < p.block_size; i += 2u) {
+    uint first = gid * pc.block_size;
+    for (uint i = 0u; i < pc.block_size; i += 2u) {
         uint byte_ = uint(payload[(first + i) / 2u]);
         out_[first + i] = PIE_STORE(mxfp4_lo(byte_) * factor);
         out_[first + i + 1u] = PIE_STORE(mxfp4_hi(byte_) * factor);
@@ -81,11 +89,11 @@ float2 mlx_affine_params(float w_min, float w_max) {
 [numthreads(1, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
     uint gid = tid.x;
-    if (gid >= p.groups) return;
-    uint first = gid * p.group_size;
+    if (gid >= pc.groups) return;
+    uint first = gid * pc.group_size;
     float w_min = asfloat(0x7f800000u);
     float w_max = 0.0;
-    for (uint i = 0u; i < p.group_size; i++) {
+    for (uint i = 0u; i < pc.group_size; i++) {
         float v = input_at(first + i);
         w_min = min(w_min, v);
         w_max = max(w_max, v);
@@ -93,7 +101,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float2 prm = mlx_affine_params(w_min, w_max);
     scales[gid] = PIE_STORE(prm.x);
     biases[gid] = PIE_STORE(prm.y);
-    for (uint word = 0u; word < p.group_size / 8u; word++) {
+    for (uint word = 0u; word < pc.group_size / 8u; word++) {
         uint packed = 0u;
         for (uint k = 0u; k < 8u; k++) {
             float v = input_at(first + word * 8u + k);

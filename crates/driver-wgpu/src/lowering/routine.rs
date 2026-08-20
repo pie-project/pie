@@ -571,6 +571,13 @@ pub fn plan<'a, R: crate::binding::Resolve>(
         min_offset,
     } = sources;
     let args = &lowered.args[launch.args.start as usize..launch.args.end as usize];
+    // Parallel to `args`, and short rather than absent on a `Lowered` a test
+    // built by hand -- `get` below answers `None` and the launch's rectangle
+    // stands, which is what this driver did before the row count existed.
+    let arg_rows = lowered
+        .arg_rows
+        .get(launch.args.start as usize..launch.args.end as usize)
+        .unwrap_or(&[]);
     let scalars = &lowered.params[launch.params.start as usize..launch.params.end as usize];
     // The fire's own numbers, asked for once and handed to the arm as a map.
     // A `Resolve` answers each independently and an arm that took the resolver
@@ -626,8 +633,30 @@ pub fn plan<'a, R: crate::binding::Resolve>(
     let mut bounds = Vec::with_capacity(handles.asked().len());
     for (at, arg) in handles.asked().iter().enumerate() {
         match arg {
-            super::hold::Asked::Operand(arg) => {
-                let bound = crate::binding::resolve(arg, launch, arena, resolver, min_offset)
+            super::hold::Asked::Operand(which, arg) => {
+                // AN OPERAND'S ROW SPACE IS NOT ALWAYS THE LAUNCH'S, and
+                // `Lowered::arg_rows` is where the lowering says so. The
+                // epilogue gather is the case that matters: its rectangle is
+                // `n_requests` rows and its INPUT spans the token stream, so
+                // measured by the launch alone that input binds one row and
+                // WGSL clamps the rest of the reads to zero.
+                //
+                // WIDER ONLY -- a count under the launch's would shrink an
+                // operand the launch is about to write, and catching that
+                // overrun is `binding::extent`'s whole job on an output.
+                let own = arg_rows.get(*which).copied().unwrap_or(0);
+                let covered = launch.rows.end - launch.rows.start;
+                let widened;
+                let against = if own > covered {
+                    widened = Launch {
+                        rows: launch.rows.start..launch.rows.start + own,
+                        ..launch.clone()
+                    };
+                    &widened
+                } else {
+                    launch
+                };
+                let bound = crate::binding::resolve(arg, against, arena, resolver, min_offset)
                     .map_err(|why| Unplanned::Operand { at, why })?;
                 bounds.push(Placed::Buffer(bound));
             }
@@ -1192,6 +1221,10 @@ mod tests {
             whole: false,
             depth_prefix_plan: false,
             derived: &[],
+            internal: false,
+            asked: &[],
+            no_join: false,
+            driver: false,
         };
         assert_eq!(state(&QUIET, &[]), Err(Unplanned::Silent));
     }
@@ -1304,6 +1337,8 @@ mod tests {
         // the resolver -- which is what the first draft of this test did, and
         // it caught the wrong refusal.
         let lowered = Lowered {
+            // A hand-built lowering states no per-argument rows; zero is "no opinion".
+            arg_rows: Vec::new(),
             args: (0..4)
                 .map(|n| Arg::Arena {
                     at: n * 64,

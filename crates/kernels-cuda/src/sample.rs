@@ -110,7 +110,7 @@ pub fn lm_head_gemv_argmax_int8(
 ///
 /// `call()`'s contract: `logits` addresses `rows * vocab` live bf16 elements
 /// and `out` `rows` writable `i32`s.
-#[routine(bf16)]
+#[routine(bf16, internal)]
 pub fn argmax<T>(
     ctx: &Ctx<'_>,
     logits: In<Tensor<T>>,
@@ -133,7 +133,7 @@ pub fn argmax<T>(
 /// `sample::argmax_f32` — the fp32 twin.
 ///
 /// [`argmax`]'s obligation, with `f32` for `bf16`.
-#[routine]
+#[routine(internal)]
 pub fn argmax_f32(ctx: &Ctx<'_>, logits: In<Tensor<f32>>, out: Out<Tensor<i32>>) -> Result<(), Refusal> {
     if logits.width <= 0 {
         return Err(Refusal::Empty { what: "vocab" });
@@ -148,7 +148,7 @@ pub fn argmax_f32(ctx: &Ctx<'_>, logits: In<Tensor<f32>>, out: Out<Tensor<i32>>)
 ///
 /// [`argmax`]'s contract, plus `row_indices` addressing `rows` live `i32`s
 /// and `out` writable at every index it names.
-#[routine(bf16)]
+#[routine(bf16, internal)]
 pub fn argmax_compact_scatter<T>(
     ctx: &Ctx<'_>,
     logits: In<Tensor<T>>,

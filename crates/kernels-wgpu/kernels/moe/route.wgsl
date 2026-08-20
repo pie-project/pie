@@ -2,11 +2,47 @@
 // and combine the sorted results back.
 //
 // Five kernels in one file, the way `moe/route.comp` and `route.metal` have
-// them: they share the three param blocks and the routing vocabulary, and a
-// split would put `route_sort`'s output layout and `combine_sorted`'s reading
-// of it in two places that can drift.
+// them: they share the routing vocabulary, and a split would put
+// `route_sort`'s output layout and `combine_sorted`'s reading of it in two
+// places that can drift.
 //
-// Three things here are this backend's and not the port's.
+// **THE SCALARS ARE MARKS NOW, NOT THREE STORAGE STRUCTS.** Four of the five
+// arms below used to bind a `RouterParams`, a `MoeRouteParams` or an
+// `ExpertCombineParams` out of `moe/params.inc.wgsl` on a `@group(0)` storage
+// binding -- MLX's Metal layout, carried here through `route.metal` and
+// `route.slang` -- and read their numbers as struct FIELDS. Every one of those
+// fields is a `Const<u32>` mark in its routine's signature now, which is the
+// same word of the same `Lowered::params` run reached by its index instead of
+// by an offset, and `driver-wgpu::lowering::routine::bind` packs the run into
+// the `@group(1)` uniform block each arm declares for itself.
+//
+// The FIELD ORDER is still the contract and it is still the statement's. A
+// uniform block's layout on this backend is the order the BODY passed its
+// scalars, so each `Params` below lists its fields in exactly the order
+// `kernels_wgpu::moe` fires them and in exactly the order the deleted struct
+// spelled them. A field moved here is a number read at the wrong offset there,
+// and everything after it shifts by four bytes; nothing reports that, because
+// the block is bytes and neither wgpu nor a validation layer knows what they
+// were meant to be.
+//
+// The move also closes a hole the struct form held open, and it is not a
+// hypothetical one: `driver-metal/tests/packed_params_cover_the_struct.rs`
+// exists because a text stated TWO words where `route.metal` reads four, so
+// `softmax_over_all` and `logits_pitch` came out of the NEXT dispatch's
+// scalars -- a routing that softmaxes over every expert because a neighbouring
+// statement's first word happened to be nonzero, and a logits stride taken
+// from its second. Both produce weights and neither faults. A mark cannot be
+// short that way: the signature names every word, so a statement carrying
+// fewer refuses instead of reading past the end of its own run.
+//
+// **A BLOCK IS GONE FROM THE MIDDLE OF THREE OF THE FOUR BIND GROUPS**, which
+// is the one mechanical consequence worth stating once here. The driver builds
+// `@group(0)` from the buffers the body passed, densely and in the order it
+// passed them, so deleting a binding that sat BETWEEN two operands renumbers
+// every operand after it. `per_expert_scale`, `inv` in the sort and `inv` in
+// the combine each moved down one; each says so where it is declared.
+//
+// Three further things here are this backend's and not the port's.
 //
 // **A workgroup is 256 invocations, not 1024.** WebGPU's guaranteed
 // `maxComputeInvocationsPerWorkgroup` is 256, where the GLSL sibling declares
@@ -40,7 +76,6 @@
 // at its own writer's value.
 
 //#include "common/bf16.inc.wgsl"
-//#include "moe/params.inc.wgsl"
 
 // The widest routing the tree compiles for. A `var<workgroup>` is sized by a
 // const-expression in WGSL, so the staging arrays are sized for the ceiling and
@@ -67,8 +102,34 @@ const ROUTER_LANES = 256u;
 // `k` of them per row -- and is correct for every `k` rather than for the even
 // ones.
 @group(0) @binding(2) var<storage, read_write> expert_weights: array<atomic<u32>>;
-@group(0) @binding(3) var<storage, read_write> params: RouterParams;
-@group(0) @binding(4) var<storage, read_write> per_expert_scale: array<u32>;
+// MOVED DOWN A BINDING, because the block that used to sit between this and the
+// weights is gone. `RouterParams` was binding 3 and the scale was 4; see the
+// header for why a deletion from the middle of the list renumbers what follows
+// it. The unscaled instantiation reads nothing here and naga strips it from
+// that module's layout entirely, which is why `router_topk` binds three buffers
+// where `router_topk_scaled` binds four -- the same arrangement as before, one
+// binding lower.
+@group(0) @binding(3) var<storage, read_write> per_expert_scale: array<u32>;
+
+// `RouterParams`, field for field and in its order.
+//
+// `logits_pitch` of zero means "tightly packed", i.e. the pitch IS `n_experts`.
+// The zero is load-bearing: a router reading a slice of a wider activation has
+// a pitch that is not its expert count, and a host with no slice writes 0
+// rather than having to state the count twice.
+//
+// `softmax_over_all` is the word the packed-params test was written about. It
+// decides the DENOMINATOR of every routing weight -- 0 softmaxes the k selected
+// logits so they sum to one, 1 softmaxes over every expert and then selects, so
+// they sum to less -- and both readings produce plausible weights, which is
+// exactly why an unstated word here was invisible.
+struct Params {
+    n_experts: u32,
+    experts_per_token: u32,
+    softmax_over_all: u32,
+    logits_pitch: u32,
+}
+@group(1) @binding(0) var<uniform> params: Params;
 
 var<workgroup> s_logits: array<f32, ROUTER_MAX_EXPERTS>;
 var<workgroup> chosen: array<f32, ROUTER_MAX_TOPK>;
@@ -200,8 +261,34 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 @group(0) @binding(1) var<storage, read_write> perm: array<i32>;
 @group(0) @binding(2) var<storage, read_write> row_expert: array<i32>;
 @group(0) @binding(3) var<storage, read_write> tile_expert: array<i32>;
-@group(0) @binding(4) var<storage, read_write> params: MoeRouteParams;
-@group(0) @binding(5) var<storage, read_write> inv: array<i32>;
+// MOVED DOWN A BINDING for the reason `per_expert_scale` did: `MoeRouteParams`
+// was binding 4 with this operand declared after it, and the block is gone.
+@group(0) @binding(4) var<storage, read_write> inv: array<i32>;
+
+// `MoeRouteParams`, field for field, and SHARED WITH `route_gather` below.
+//
+// One layout for the sort and the gather so that the padding one writes and the
+// bounds the other reads cannot disagree, which is not a resemblance between
+// two structs that happen to look alike: `model-dsl` states the same seven
+// words for both statements, and both routines take the same seven marks in the
+// same order. Three of them are dead in the gather and it carries them anyway,
+// for exactly this reason.
+//
+// `n` is the number of (row, slot) PAIRS -- one per expert choice -- while
+// `padded` is the length of the permutation, `n` rounded up so every expert's
+// span is a whole number of `tile_rows` tiles. The two are different numbers
+// and the sort reads both; a body that used one for the other would clear a
+// permutation shorter than it fills.
+struct Params {
+    n: u32,
+    n_experts: u32,
+    experts_per_token: u32,
+    tile_rows: u32,
+    padded: u32,
+    width: u32,
+    x_pitch: u32,
+}
+@group(1) @binding(0) var<uniform> params: Params;
 
 // The counting sort's two arrays. See the header for why `counts` being
 // workgroup memory is what makes an atomic expressible here.
@@ -304,7 +391,27 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
 // some `c`, and a read-modify-write then keeps one and drops the other.
 @group(0) @binding(1) var<storage, read_write> out_: array<atomic<u32>>;
 @group(0) @binding(2) var<storage, read_write> perm: array<i32>;
-@group(0) @binding(3) var<storage, read_write> params: MoeRouteParams;
+
+// THE SORT'S BLOCK, WHOLE, and three of these seven words are never read here.
+//
+// That is the point rather than an oversight. `route_sort` and `route_gather`
+// are two statements over ONE description of a routing -- `model-dsl` writes the
+// same seven words for both -- and the sort's `padded` is the gather's row
+// bound, so a gather that carried its own shorter block would be a second place
+// for the same number to be stated and a second place for it to be wrong. `n`,
+// `n_experts` and `tile_rows` are the sort's alone; they ride here so that
+// `width` is word 5 and `x_pitch` word 6 in BOTH, which is what lets the two
+// routines take the same marks in the same order.
+struct Params {
+    n: u32,
+    n_experts: u32,
+    experts_per_token: u32,
+    tile_rows: u32,
+    padded: u32,
+    width: u32,
+    x_pitch: u32,
+}
+@group(1) @binding(0) var<uniform> params: Params;
 
 // The gather moves BITS, not numbers: the GLSL sibling assigns `out_[..] =
 // x[..]` with no widening, and a round trip through f32 would be a rounding
@@ -360,8 +467,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // another workgroup writes. Two atomics settle both without the body having to
 // know which case it is in.
 @group(0) @binding(2) var<storage, read_write> out_: array<atomic<u32>>;
-@group(0) @binding(3) var<storage, read_write> params: ExpertCombineParams;
-@group(0) @binding(4) var<storage, read_write> inv: array<i32>;
+// MOVED DOWN A BINDING: `ExpertCombineParams` was binding 3 with this operand
+// after it, and the block is gone. Same renumbering as the other two arms.
+@group(0) @binding(3) var<storage, read_write> inv: array<i32>;
+
+// `ExpertCombineParams`, field for field. `out_pitch` of zero means `width`,
+// for the same reason `logits_pitch`'s zero means `n_experts`: the mixture's
+// output lands in whatever layout the caller's activations are in -- a batched
+// decode's are packed and a prefill's are a uniform scratch stride apart -- and
+// a host with nothing to say writes 0 rather than restating the width.
+struct Params {
+    width: u32,
+    experts_per_token: u32,
+    out_pitch: u32,
+}
+@group(1) @binding(0) var<uniform> params: Params;
 
 fn load_y(i: u32) -> f32 {
     let word = y[i >> 1u];

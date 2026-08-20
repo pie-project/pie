@@ -278,12 +278,33 @@ fn dot_page(q_base: u32, page_base: u32, kv_head: i32, kp: i32) -> f32 {
 // d_64, 4 at d_128, 2 at d_256 and 1 at d_512, where the shape degenerates to
 // the one this arm had.
 const PIE_KB: u32 = 256u / PIE_PAIRS;
-var<workgroup> pie_sdpa_part: array<f32, PIE_KB * PIE_PAIRS>;
-// The value pairs of the block, staged so the accumulate can read a key it did
-// not load. Reading V before the reduction rather than after is the old body's
-// finding and is kept -- V does not depend on the score, and the reduction is a
-// long wait to start the load after.
-var<workgroup> pie_sdpa_vpart: array<vec2<f32>, PIE_KB * PIE_PAIRS>;
+// Blocks of keys one tree serves, on top of the `PIE_KB` the y axis already
+// gives it. A rendezvous of every simdgroup in the workgroup is the cost this
+// kernel pays most often, and a lane can carry several keys' partials as
+// cheaply as one, so the tree folds `PIE_KR` blocks at a time and the barrier
+// count falls by the same factor.
+//
+// Eight, not four: the value staging that used to sit beside the scores is
+// gone (see the y-axis note in `decode_row`), so the budget it held pays for
+// twice the blocking instead. `PIE_KB * PIE_PAIRS` is 256 at every
+// instantiated head dim, so the score array is `PIE_KR` KiB everywhere -- 8
+// KiB, plus 2 KiB of merge state, against the 16352-byte floor `wgpu`'s
+// downlevel defaults guarantee. Sixteen does not fit that floor.
+//
+// Measured at 8 against 4: decode 102.9 -> 104.0 tok/s at 512 context and
+// 71.2 -> 74.0 at 2048.
+const PIE_KR: u32 = 8u;
+const PIE_KSPAN: u32 = PIE_KR * PIE_KB;
+var<workgroup> pie_sdpa_part: array<f32, PIE_KSPAN * PIE_PAIRS>;
+// The per-y-lane softmax states, staged ONCE at the end of the row so the y
+// axis can be folded away. See "THE Y AXIS CARRIES ITS OWN SOFTMAX" below for
+// why the accumulator needs a slot per lane and the max and sum need one per
+// y lane: the running max and denominator are functions of the SCORES, which
+// every lane of a y row shares, while the accumulator is this lane's two head
+// elements and nobody else's.
+var<workgroup> pie_sdpa_macc: array<vec2<f32>, PIE_KB * PIE_PAIRS>;
+var<workgroup> pie_sdpa_mmax: array<f32, PIE_KB>;
+var<workgroup> pie_sdpa_msum: array<f32, PIE_KB>;
 
 fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32) {
     let d_out = lane * 2u;
@@ -339,23 +360,33 @@ fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32) {
     // Recorded so the next person spends the ten minutes on the bench rather
     // than on the edit. `how_long_a_decodes_kernels_take` is how to check.
     //
-    // # The one restructure none of the above covers
+    // # The restructure none of the above covers, and what was DONE instead
     //
-    // Every measurement above keeps the SHAPE: each lane owns two head-dim
-    // elements, all lanes cooperate on one key, and the tree runs ONCE PER KEY
-    // -- 2048 reductions at 2048 keys. Flash-decoding inverts it: give each
-    // lane its own KEYS, let it carry a private running max/sum/accumulator
-    // over the whole head dim, and merge across lanes ONCE at the end. The
-    // multiply-adds are identical and the 63-add tree stops being per key,
-    // which is the third of the kernel the note above calls inherent -- it is
-    // inherent to reducing 64 lanes PER KEY, not to the problem.
+    // The note used to propose full flash-decoding: give each of the 32 x
+    // lanes its own KEYS over the whole head dim, and merge once at the end.
+    // That trades a perfectly coalesced 128-byte key load for 32 per-lane
+    // contiguous ones, which is why it was never taken.
     //
-    // It is not free: lanes would read different key rows instead of one row
-    // cooperatively, trading a perfectly coalesced load for a per-lane
-    // contiguous one, and the online-softmax merge has to be written and shown
-    // to be exact. So it is a rewrite with a real correctness surface, not a
-    // tweak, and the ceiling on it is the 1.5x that removing a third implies.
-    // Named here because everything cheaper has been tried and written down.
+    // The Y axis gives the same win at none of that cost, and is what this
+    // body now does. `ky` ALREADY owns keys -- it always did, that is what the
+    // second workgroup axis is for -- so letting it own a softmax STATE as
+    // well changes no load at all. What it removes is the redundancy that sat
+    // between the two: the fold used to walk all `PIE_KSPAN` staged slots on
+    // every one of the `PIE_KB` y lanes, so a `PIE_KB`-deep serial dependence
+    // chain ran `PIE_KB` times over and every staged value pair was read
+    // `PIE_KB` times from workgroup memory. Now each y lane folds only the
+    // `PIE_KR` keys it loaded, V never reaches workgroup memory at all, and
+    // `PIE_KB` states merge once after the last block.
+    //
+    // Measured on an M4 with Llama-3.2-1B, end to end through the engine:
+    // decode 89.8 -> 102.9 tok/s at 512 context and 52.7 -> 71.2 at 2048.
+    // The gain grows with the context because that is where this kernel's
+    // share of the token grows. Workgroup memory fell from 12 KiB to 6 KiB,
+    // which is a second effect: two of these fit in an Apple core's 32 KiB
+    // where two-and-a-bit did before.
+    //
+    // What is left in here is the 63-add tree, still once per key. That is
+    // the restructure above, and it is still not obviously worth its load.
     var max_score = PIE_SDPA_NEG_INF;
     var sum_exp = 0.0;
     var acc = vec2<f32>(0.0, 0.0);
@@ -378,7 +409,7 @@ fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32) {
     // rendezvous seven times out of eight.
     var kp0 = start;
     while (kp0 <= q_pos) {
-        let kn = min(i32(PIE_KB), q_pos + 1 - kp0);
+        let kn = min(i32(PIE_KSPAN), q_pos + 1 - kp0);
         // ONE KEY PER Y LANE. The block's keys are loaded and dotted at the
         // same time rather than one after another, which is the whole point of
         // the second workgroup axis: this kernel dispatches one workgroup per
@@ -388,23 +419,36 @@ fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32) {
         // V is read here, before the reduction, which is the old body's finding
         // and is kept: it does not depend on the score, and the reduction is a
         // long wait to start the load after.
-        var part = 0.0;
-        var v_pair = vec2<f32>(0.0, 0.0);
-        if (i32(ky) < kn) {
-            let slot = page_slot_at(page_base, kp0 + i32(ky));
-            let k_base = (slot * u32(params.n_kv_heads) + u32(kv_head)) * PIE_HEAD_DIM;
-            v_pair = vec2<f32>(v_at(k_base + d_out), v_at(k_base + d_out + 1u));
-            part = params.scale * q_at(q_base + d_out) * k_at(k_base + d_out)
-                + params.scale * q_at(q_base + d_out + 1u) * k_at(k_base + d_out + 1u);
+        // THIS LANE'S `PIE_KR` KEYS, staged before any reduction. Lane `ky`
+        // owns offsets `ky`, `ky + PIE_KB`, ... so the slot a key lands in IS
+        // its offset in the block, and the fold below can read its own scores
+        // without arithmetic.
+        //
+        // V never reaches workgroup memory. The lane that loads key `q`'s
+        // value pair for head elements `2*lane, 2*lane+1` is exactly the lane
+        // that accumulates them, so the pair stays in registers.
+        var v_keep: array<vec2<f32>, PIE_KR>;
+        for (var r = 0u; r < PIE_KR; r = r + 1u) {
+            let q = r * PIE_KB + ky;
+            var part = 0.0;
+            var v_pair = vec2<f32>(0.0, 0.0);
+            if (i32(q) < kn) {
+                let slot = page_slot_at(page_base, kp0 + i32(q));
+                let k_base = (slot * u32(params.n_kv_heads) + u32(kv_head)) * PIE_HEAD_DIM;
+                v_pair = vec2<f32>(v_at(k_base + d_out), v_at(k_base + d_out + 1u));
+                part = params.scale * q_at(q_base + d_out) * k_at(k_base + d_out)
+                    + params.scale * q_at(q_base + d_out + 1u) * k_at(k_base + d_out + 1u);
+            }
+            v_keep[r] = v_pair;
+            pie_sdpa_part[q * PIE_PAIRS + lane] = part;
         }
-        pie_sdpa_vpart[ky * PIE_PAIRS + lane] = v_pair;
-        pie_sdpa_part[ky * PIE_PAIRS + lane] = part;
         workgroupBarrier();
         for (var half = PIE_PAIRS >> 1u; half > 0u; half = half >> 1u) {
             if (lane < half) {
-                pie_sdpa_part[ky * PIE_PAIRS + lane] =
-                    pie_sdpa_part[ky * PIE_PAIRS + lane]
-                    + pie_sdpa_part[ky * PIE_PAIRS + lane + half];
+                for (var r = 0u; r < PIE_KR; r = r + 1u) {
+                    let at = (r * PIE_KB + ky) * PIE_PAIRS + lane;
+                    pie_sdpa_part[at] = pie_sdpa_part[at] + pie_sdpa_part[at + half];
+                }
             }
             workgroupBarrier();
         }
@@ -413,20 +457,54 @@ fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32) {
         // makes the reduction above legal, and it is why the mask is applied
         // HERE and not as a `-inf` score -- a score equal to the running max
         // contributes `exp(0)` to the denominator, and the running max starts
-        // at `-inf`.
-        for (var j = 0u; j < PIE_KB; j = j + 1u) {
-            let kp = kp0 + i32(j);
-            if (i32(j) < kn && keeps(row, kp, q_pos, start)) {
-                let step = pie_sdpa_online_update(pie_sdpa_part[j * PIE_PAIRS], max_score, sum_exp);
+        // at a finite floor.
+        //
+        // THE Y AXIS CARRIES ITS OWN SOFTMAX. This loop used to walk all
+        // `PIE_KSPAN` slots on every one of the `PIE_KB` y lanes, which meant
+        // `PIE_KB` copies of one serial dependence chain and `PIE_KB` reads of
+        // every staged value. Now y lane `ky` folds only the `PIE_KR` keys it
+        // loaded, into a softmax state of its own, and the states meet once
+        // after the last block. The partition is exact: an online softmax over
+        // a disjoint cover merges to the same numerator and denominator as one
+        // pass over the union, which is what flash-decoding rests on.
+        for (var r = 0u; r < PIE_KR; r = r + 1u) {
+            let q = r * PIE_KB + ky;
+            let kp = kp0 + i32(q);
+            if (i32(q) < kn && keeps(row, kp, q_pos, start)) {
+                let step = pie_sdpa_online_update(pie_sdpa_part[q * PIE_PAIRS], max_score, sum_exp);
                 max_score = step.max_score;
                 sum_exp = step.sum_exp;
-                acc = acc * step.history_scale
-                    + step.score_scale * pie_sdpa_vpart[j * PIE_PAIRS + lane];
+                acc = acc * step.history_scale + step.score_scale * v_keep[r];
             }
         }
-        // The next block's partials overwrite what lane 0 was just read for.
+        // The next block's partials overwrite what this fold just read.
         workgroupBarrier();
-        kp0 = kp0 + i32(PIE_KB);
+        kp0 = kp0 + i32(PIE_KSPAN);
+    }
+    // THE MERGE. `PIE_KB` states, each over a disjoint set of this row's keys,
+    // become one. Every lane runs the same fold so every lane leaves holding
+    // the answer, which is what the sink merge and the single writer below
+    // already assumed.
+    pie_sdpa_macc[ky * PIE_PAIRS + lane] = acc;
+    if (lane == 0u) {
+        pie_sdpa_mmax[ky] = max_score;
+        pie_sdpa_msum[ky] = sum_exp;
+    }
+    workgroupBarrier();
+    max_score = PIE_SDPA_NEG_INF;
+    sum_exp = 0.0;
+    acc = vec2<f32>(0.0, 0.0);
+    for (var t = 0u; t < PIE_KB; t = t + 1u) {
+        let other_max = pie_sdpa_mmax[t];
+        let merged_max = max(max_score, other_max);
+        // Both are `PIE_SDPA_NEG_INF` until a state with keys arrives, and
+        // that floor is finite for the reason the header of the online include
+        // gives: `exp(-inf - -inf)` is NaN and `exp(0)` is 1.
+        let history_scale = exp(max_score - merged_max);
+        let other_scale = exp(other_max - merged_max);
+        max_score = merged_max;
+        sum_exp = sum_exp * history_scale + pie_sdpa_msum[t] * other_scale;
+        acc = acc * history_scale + other_scale * pie_sdpa_macc[t * PIE_PAIRS + lane];
     }
 //#if defined(PIE_WITH_SINK)
     let merged = pie_sdpa_merge_sink(sink_at(q_head), max_score, sum_exp);
@@ -437,11 +515,8 @@ fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32) {
     var norm = acc;
     if (sum_exp != 0.0) { norm = acc / sum_exp; }
     let at = (o_base + d_out) >> 1u;
-    // Every y lane carried the same online-softmax state and the same
-    // accumulator -- the running max and sum are functions of the SCORES, which
-    // the whole workgroup shares -- so they all hold this answer and one writes
-    // it. The redundancy is eight fused multiply-adds against eight keys' worth
-    // of loads and a reduction.
+    // Every y lane ran the merge above, so they all hold this answer and one
+    // writes it. The redundancy is `PIE_KB` fused multiply-adds, once per row.
     if (ky == 0u && at < arrayLength(&out_)) { out_[at] = pie_pack_bf16(norm.x, norm.y); }
 }
 

@@ -152,7 +152,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.0.mlp_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [

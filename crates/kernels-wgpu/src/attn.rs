@@ -7,7 +7,6 @@
 //! runtime PSO failure naming a string and is now a fact the table states.
 
 use kernels_macros::routine;
-use kernels::KernelSig;
 use kernels::BindMut;
 
 // ── R4, THE NOTATION NO CENSUS IN THIS REFACTOR HAS MEASURED ──
@@ -32,141 +31,6 @@ use kernels::BindMut;
 // planes ask the fire, and metal's fire answers zero because metal stages no
 // mask -- which is a fact about that driver, stated in that driver, rather
 // than a literal frozen into six signature rows.
-
-pub static KERNELS: &[KernelSig] = &[
-    // 1 in split_qkv.wgsl
-    // Three results, which is what makes the row's `Out` indices load-bearing:
-    // the reorder reads how many values a kernel produces off the row, and a
-    // statement writing three states them all after its inputs.
-    // 1 in attn_gate.wgsl
-    // 1 in kv_append.wgsl
-    // The first row to name STATE. The cache is not an operand — no traced
-    // value stands for it, because it outlives the fire — so the pointers come
-    // from the driver's pool through `Resolver::kv` and the row is what asks.
-    // 1 in kv_append_paged.wgsl
-    // Sparse indices, and the gaps are stated. Buffers 4, 6-9 and 11 belong to
-    // a shared ring ABI this kernel does not read; a row is positional, so it
-    // lists them with no source rather than closing the gap and shifting
-    // everything after.
-    // 1 in logit_softcap.wgsl
-    // gemma's logit softcap: `cap * tanh(x / cap)`, applied to the readout so
-    // no logit runs away. A statement and not a mode -- a deployment without
-    // one names nothing here rather than passing an infinite cap.
-    // 1 in attn_gate.wgsl
-    // 7 in sdpa_paged.wgsl.
-    //
-    // NOT a clean product, and the row says so by listing its tails. `_p32`
-    // and `_p32_sg8` are the same template at `<…, 32, true, 32>` and
-    // `<…, 32, true, 8>` where the plain form is `<…, 0, false, 32>`, so they
-    // are points of a page-shape axis rather than kernels — but they are only
-    // compiled at the head dims that wanted them, so a `head dim × page shape`
-    // product would name five entrypoints no shader instantiates.
-    //
-    // `lacks` on this and on `sdpa_vector_decode`: this tree has no page-mask
-    // substitution path either, so an `attn.q` tap with a PageMaskSink is
-    // unservable here, and no capture variant exists so neither can publish
-    // scores. The declaration says so instead of a pipeline build discovering
-    // it.
-    // Seventeen buffers, and the row is the only place they are written down.
-    // Six are the FIRE's tables — the positions, which request owns each
-    // token, the page CSR, the mask and its enable — and the ROW names which,
-    // because a text cannot state this fire's data. `sinks` stays a gap:
-    // gpt-oss reads it and `llama_like` has none, so the row keeps the slot
-    // and no statement fills it until a text that has sinks does.
-    // 1 in sdpa_paged.wgsl
-    // The SAME template at `sinks = true`, so the same row with one slot
-    // filled. A sink is a per-head learned logit that joins the softmax
-    // without a value behind it -- gpt-oss's, and the reason the slot has been
-    // open on `sdpa_paged_decode` since the rows were written.
-    // 1 in sdpa_paged_mma.wgsl
-    // Metal's MMA entrypoint names over a scalar body -- see that shader's
-    // header for why the name is an ABI point and not a hardware claim. The
-    // OPERANDS are `sdpa_paged_tiled`'s exactly, because the two shaders take
-    // the same eleven buffers and the same seven scalars; what differs on
-    // Metal is the threadgroup width, which is `LaunchRule::SdpaMma`, and what
-    // differs here is nothing at all.
-    //
-    // Stating them is not cosmetic. Upstream's lowering picks this row for a
-    // sinked prefill, and while it was UNSTATED the plan supplied FIVE scalars
-    // into a uniform block the shader reads SEVEN fields of --
-    // `every_launchs_scalars_land_where_its_module_reads_them` says so by name.
-    //
-    // The pitch is `Env<_, keys::AttentionMaskStride>`, which is the reason a
-    // user mask works on this backend: the driver staged the rectangle and
-    // knows how wide it made each row. `kernels-metal` said `Param(3)` here
-    // until all three planes were unified on the fire's answer.
-    // 1 in sdpa_paged_mma.wgsl
-    // The same template at `sinks = true`, exactly as `sdpa_paged_tiled_sink`
-    // is to `sdpa_paged_tiled`.
-    // 4 in sdpa_paged.wgsl
-    // `sdpa_paged_decode`'s seventeen operands in the same order, plus an
-    // eighteenth: the fire's true row count. The grid rounds the rows up to
-    // whole tiles -- see `kernels::LaunchRule::SdpaTiled` -- so the threads of
-    // a partial last tile are past the end and this is what tells them.
-    //
-    // The pitch is `Env<_, keys::AttentionMaskStride>`, which is the reason a
-    // user mask works on this backend at all: the driver staged the rectangle
-    // and knows how wide it made each row. `kernels-metal` said `Param(3)`
-    // here until all three planes were unified on the fire's answer.
-    // 1 in sdpa_paged.wgsl
-    // The same template at `sinks = true`, exactly as `sdpa_paged_decode_sink`
-    // is to `sdpa_paged_decode`.
-    // 1 in sdpa_paged.wgsl
-    // 3 in sdpa_vector.wgsl
-    // Dense 0..10, and the row is where the WIDTHS live: the four strides are
-    // `const constant size_t&` — eight bytes — while the params channel is
-    // `u32`. A driver handing a four-byte slot to an eight-byte read gives the
-    // kernel the next scalar as this one's high half, so the row's `Usize`
-    // says widen and the stage does.
-    // 1 in sdpa_sliding.wgsl
-    // 2 in sdpa_sliding.wgsl
-    // `sdpa_vector_decode` over a SLIDING window, and the window is an
-    // operand rather than a flag -- the port's rule that a per-fire choice the
-    // C++ made at encode time becomes data on the dispatch.
-    //
-    // Two row pitches the contiguous form does not have: gemma reads its query
-    // out of a wider buffer than it writes.
-];
-/// The entrypoints of this family's routines whose ROWS have been RETIRED.
-///
-/// `refactor-bigplan.md` §7 Stage 3. Not every kernel here has crossed its
-/// arm — this family still states rows for the ones that have not — so this
-/// is the retired SUBSET rather than the whole family, and
-/// `a_retired_familys_stated_entrypoints_are_what_its_bodies_fire` compares
-/// it against the bodies that fire them.
-///
-/// See [`crate::sample::ENTRYPOINTS`] for why a retired row's entrypoints
-/// have to be stated at all.
-pub static ENTRYPOINTS: &[&str] = &[
-    "kv_append_bfloat16",
-    "kv_append_paged_bfloat16",
-    "sdpa_paged_decode_bfloat16_d_128",
-    "sdpa_paged_decode_bfloat16_d_128_p32",
-    "sdpa_paged_decode_bfloat16_d_256",
-    "sdpa_paged_decode_bfloat16_d_512",
-    "sdpa_paged_decode_bfloat16_d_64",
-    "sdpa_paged_decode_bfloat16_d_64_p32",
-    "sdpa_paged_decode_bfloat16_d_64_p32_sg8",
-    "sdpa_paged_decode_sink_bfloat16_d_64",
-    "sdpa_paged_mma_bfloat16_d_64",
-    "sdpa_paged_mma_sink_bfloat16_d_64",
-    "sdpa_paged_tiled_bfloat16_d_128",
-    "sdpa_paged_tiled_bfloat16_d_256",
-    "sdpa_paged_tiled_bfloat16_d_512",
-    "sdpa_paged_tiled_bfloat16_d_64",
-    "sdpa_paged_tiled_sink_bfloat16_d_64",
-    "sdpa_paged_tiled_strided_bfloat16_d_256",
-    "sdpa_vector_decode_bfloat16_d_128",
-    "sdpa_vector_decode_bfloat16_d_256",
-    "sdpa_vector_decode_bfloat16_d_64",
-    "sdpa_vector_decode_sink_bfloat16_d_64",
-    "sdpa_vector_decode_swa_bfloat16_d_256",
-    "sdpa_vector_decode_swa_bfloat16_d_512",
-    "gate_bfloat16",
-    "logit_softcap_bfloat16",
-    "q_gate_split_bfloat16",
-    "split_qkv_bf16",
-];
 
 use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, InOut, Out, Tensor, Usize, bf16, keys};
 use kernels::routine::Refusal;
@@ -407,15 +271,22 @@ fn head_grid(head_dim: i32, heads: i32, depth: i32) -> Result<[u32; 3], Refusal>
     ])
 }
 
-/// One packed row cut into three, at two boundaries the caller does not state.
+/// One packed row cut into three, at two boundaries the statement states.
 ///
-/// `q_width` and `kv_width` ride in `params` rather than in the push block --
-/// the shader reads them out of a `SplitQkvParams` struct -- so this signature
-/// cannot check them and does not pretend to. What it does state is
-/// `packed_width`, which is `q_width + 2 * kv_width` and is the extent the
-/// grid needs; the shader recomputes the same sum from its own copy and
+/// `q_width` and `kv_width` used to ride in `params` -- the shader read them
+/// out of a `SplitQkvParams` struct -- so this signature could not name either
+/// one and this paragraph said so. They are MARKS now, which is the same two
+/// words of the same statement run reached by index instead of by field, and
+/// the routine names them in the order the struct laid them out.
+///
+/// What the extent still comes from is `packed_width`, taken off the operand
+/// rather than summed from the pair: it is `q_width + 2 * kv_width` and it is
+/// what the grid needs. The shader recomputes that sum from the marks and
 /// guards on it, so a `packed_width` that disagreed would leave a tail of the
-/// row uncopied rather than write out of bounds.
+/// row uncopied rather than write out of bounds. The two are not checked
+/// against each other here, because the operand's width is the rectangle the
+/// arena allocated and the marks are what the text said -- a disagreement is a
+/// fact about the plan, not about this fire.
 ///
 /// # Errors
 ///
@@ -426,13 +297,24 @@ pub fn split_qkv_bf16(
     packed: In<Tensor<bf16>>,
     q: Out<Tensor<bf16>>,
     k: Out<Tensor<bf16>>,
-    v: Out<Tensor<bf16>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
+    v: Out<Tensor<bf16>>,
+    // THE TWO BOUNDARIES, WHICH WERE `SplitQkvParams`'s two fields. They rode
+    // a staged block because the row named `params: Buf`, and the cost was
+    // that no signature could name either width -- so this doc said, truly,
+    // that it could not check them. Both are `Const<u32>` marks now, at words
+    // 0 and 1 of the same statement run the struct was staged from, IN THE
+    // STRUCT'S ORDER because it is the statement's: `q_width` first and
+    // `kv_width` second. Swapping the two would cut both boundaries inside a
+    // neighbouring projection rather than refuse, which is why the order is
+    // written down here rather than left to the reader to infer from the
+    // shader.
+    q_width: Const<u32>,
+    kv_width: Const<u32>) -> Result<(), Refusal> {
     let packed_width = packed.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
         Fire::at("attn/split_qkv.wgsl", "split_qkv_bf16").apply(elementwise_rows(packed_width, rows)?),
-        &[packed.arg(), q.arg(), k.arg(), v.arg(), params],
+        &[packed.arg(), q.arg(), k.arg(), v.arg(), q_width.arg(), kv_width.arg()],
     )
 }
 
@@ -622,8 +504,12 @@ pub fn kv_append_paged(
 
 /// gemma's final logit softcap: `cap * tanh(x / cap)`.
 ///
-/// The cap rides in `params` with a trailing word nothing reads, so the only
-/// extent this body states is the element count.
+/// The cap is the only scalar this kernel reads, so it is a MARK rather than a
+/// struct: `attn/logit_softcap.wgsl` takes it as the one field of its
+/// `@group(1)` uniform block. It used to ride a `SoftcapParams { cap, unused }`
+/// storage buffer -- MLX's layout, ported twice -- whose second word existed
+/// only to hold the struct's size. Word 0 of the statement's run is the same
+/// number either way; the mark reaches it by index instead of by field.
 ///
 /// # Errors
 ///
@@ -632,8 +518,8 @@ pub fn kv_append_paged(
 pub fn logit_softcap(
     ctx: &Ctx<'_>,
     logits: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
+    out: Out<Tensor<bf16>>,
+    cap: Const<f32>) -> Result<(), Refusal> {
     // THE ELEMENT COUNT, DERIVED RATHER THAN ASKED. HEAD spelled it
     // `Reckoned<Times<Say<Width>, Say<Rows>>>` -- a product of two facts,
     // not a fact -- and the migration turned it into `keys::Elements`,
@@ -642,7 +528,7 @@ pub fn logit_softcap(
     let n = out.rows.saturating_mul(out.width);
     ctx.fire(
         Fire::at("attn/logit_softcap.wgsl", "logit_softcap_bfloat16").apply(elementwise(n, 1)?),
-        &[logits.arg(), out.arg(), params],
+        &[logits.arg(), out.arg(), cap.arg()],
     )
 }
 
@@ -1341,7 +1227,6 @@ pub fn sdpa_vector_decode_sink(
         ],
     )
 }
-
 
 #[cfg(test)]
 mod tests {

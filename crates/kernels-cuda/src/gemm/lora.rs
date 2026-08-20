@@ -245,7 +245,7 @@ pub fn bf16_row(base: *const c_void, row: u32, width: i32) -> *const c_void {
 /// scratch's, and every pointer [`Staged`] carries must be one the staging
 /// laid down for THIS fire — a slab from a previous fire is a set of
 /// addresses that have since been reused.
-#[routine(untraced)]
+#[routine(untraced, driver)]
 pub fn lora_qkv_correction(
     ctx: &Ctx<'_>,
     staged: Staged<'_>,

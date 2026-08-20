@@ -3,24 +3,9 @@
 //! declared here by hand rather than lowered.
 
 use kernels_macros::routine;
-use kernels::KernelSig;
 use kernels::routine::{Refusal};
 
 use crate::routine::{Asks, Bind, Ctx, Fire, In, Out, Tensor, bf16, keys};
-
-/// EMPTY: this family's row has been RETIRED.
-///
-/// The row was never filled — no operands, no launch rule, no axes — because
-/// this backend's channel-plane interpreter never dispatches the kernel. It
-/// recorded what the shader tree CONTAINS rather than what this driver fires,
-/// and `driver-wgpu::lowering::arm::copy_logits_bf16` records that instead.
-pub static KERNELS: &[KernelSig] = &[];
-
-/// The entrypoints this family's routines spell, now that its row is gone.
-///
-/// See [`crate::sample::ENTRYPOINTS`]: `entrypoints()` is what every sweep
-/// walks, and one of them compiles each name on a real adapter.
-pub static ENTRYPOINTS: &[&str] = &["copy_logits_bf16"];
 
 /// The PTIR logits stage, GPU-side.
 ///

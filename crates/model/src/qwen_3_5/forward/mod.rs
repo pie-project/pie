@@ -645,9 +645,17 @@ fn gdn_attn_body_cuda(
     // differs, and that class match lives in `qwen3_5_hybrid_cuda_text`.
     // CommitAdvance never enters this body at all: it is its own pass
     // (the retired commit-advance pass), not a variant of the layer loop.
+    let conv_geom = cuda::GdnShape {
+        k_heads: facts.key_heads,
+        v_heads: facts.value_heads,
+        k_dim: facts.key_head_dim,
+        v_dim: facts.value_head_dim,
+        conv_dim: facts.conv_dim(),
+        conv_k: facts.conv_kernel,
+    };
     let qkv = match class {
-        FireClass::Decode => cuda::gdn_conv_update_batched(&qkv, &w.conv, &w.rs),
-        FireClass::Prefill => cuda::gdn_conv_prefill_batched(&qkv, &w.conv, &w.rs),
+        FireClass::Decode => cuda::gdn_conv_update_batched(&qkv, &w.conv, &w.rs, conv_geom),
+        FireClass::Prefill => cuda::gdn_conv_prefill_batched(&qkv, &w.conv, &w.rs, conv_geom),
     };
     let (q, k, v, g, beta) = gdn_prep(
         &qkv,
@@ -670,9 +678,20 @@ fn gdn_attn_body_cuda(
     // GQA (value heads sharing fewer key heads) picks the `_gqa` decode
     // step; the prefill kernels state their own layout handling.
     let gqa = facts.value_heads != facts.key_heads;
+    // THE GEOMETRY THE STATEMENT CARRIES. Six numbers the checkpoint fixes at
+    // load; the CUDA kernels asked for them through `keys::Gdn*` while metal
+    // and vulkan have stated them since §11.12. See `dsl::cuda::GdnShape`.
+    let geom = cuda::GdnShape {
+        k_heads: facts.key_heads,
+        v_heads: facts.value_heads,
+        k_dim: facts.key_head_dim,
+        v_dim: facts.value_head_dim,
+        conv_dim: facts.conv_dim(),
+        conv_k: facts.conv_kernel,
+    };
     let core = match class {
         FireClass::Decode => {
-            cuda::gdn_step_batched(&q, &k, &v, &g, &beta, &w.rs, gqa, c.state_bf16)
+            cuda::gdn_step_batched(&q, &k, &v, &g, &beta, &w.rs, gqa, c.state_bf16, geom)
         }
         FireClass::Prefill => {
             // The prefill recurrence three-way, as the first
@@ -716,6 +735,7 @@ fn gdn_attn_body_cuda(
                                     &beta,
                                     &w.rs,
                                     c.state_bf16,
+                                    geom,
                                 );
                             },
                         );
@@ -736,14 +756,14 @@ fn gdn_attn_body_cuda(
                                 facts.value_heads,
                                 facts.key_head_dim,
                             );
-                            cuda::gdn_prefill_cached(&qr, &kr, &v, &g, &beta, &w.rs, c.state_bf16);
+                            cuda::gdn_prefill_cached(&qr, &kr, &v, &g, &beta, &w.rs, c.state_bf16, geom);
                         } else {
-                            cuda::gdn_prefill_cached(&q, &k, &v, &g, &beta, &w.rs, c.state_bf16);
+                            cuda::gdn_prefill_cached(&q, &k, &v, &g, &beta, &w.rs, c.state_bf16, geom);
                         }
                     });
                 },
                 || {
-                    cuda::gdn_prefill_fla(&q, &k, &v, &g, &beta, &w.rs, c.state_bf16);
+                    cuda::gdn_prefill_fla(&q, &k, &v, &g, &beta, &w.rs, c.state_bf16, geom);
                 },
             )
             .expect("the guarded recurrence produces its value")

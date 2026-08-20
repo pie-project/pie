@@ -2030,6 +2030,8 @@ fn fire_one<M: driver_wgpu::serve::Modules>(
 ) -> Result<driver_wgpu::serve::Fired, driver_wgpu::serve::Unfired> {
     let arena = device.zeroed(256).expect("a 256-byte arena");
     let mut pipelines = Pipelines::default();
+    // The bytes `fire` copies out with the work are the readout's, which this
+    // fixture's plan does not state; the count is what it is checking.
     driver_wgpu::serve::fire(
         device,
         &mut pipelines,
@@ -2057,6 +2059,7 @@ fn fire_one<M: driver_wgpu::serve::Modules>(
             prefix: None,
         },
     )
+    .map(|(fired, _)| fired)
 }
 
 /// A launch naming a symbol no module has is refused BY THAT NAME, and refused
@@ -2260,13 +2263,13 @@ fn the_four_ways_a_read_out_is_refused_each_say_which() {
 
     // 1. No exit at all. A text that computes something other than a
     //    distribution is a legitimate text; the caller asked the wrong thing.
-    match driver_wgpu::serve::logits(&device, &arena, &with(None, 256)) {
+    match driver_wgpu::serve::logits(&device, &arena, &with(None, 256), &[]) {
         Err(driver_wgpu::serve::Unread::NoExit) => {}
         other => panic!("expected `NoExit`, got {other:?}"),
     }
 
     // 2. A range that runs off the arena the LOWERING sized.
-    match driver_wgpu::serve::logits(&device, &arena, &with(Some(readout(0, 4, 64, 4)), 256)) {
+    match driver_wgpu::serve::logits(&device, &arena, &with(Some(readout(0, 4, 64, 4), &[]), 256)) {
         Err(driver_wgpu::serve::Unread::PastArena { at, extent, arena }) => {
             assert_eq!((at, extent, arena), (0, 1024, 256));
         }
@@ -2277,7 +2280,7 @@ fn the_four_ways_a_read_out_is_refused_each_say_which() {
     //    everything else is a plan this reader cannot honour, and guessing
     //    would read two elements as one.
     for odd in [1u32, 3, 8] {
-        match driver_wgpu::serve::logits(&device, &arena, &with(Some(readout(0, 1, 4, odd)), 256)) {
+        match driver_wgpu::serve::logits(&device, &arena, &with(Some(readout(0, 1, 4, odd), &[]), 256)) {
             Err(driver_wgpu::serve::Unread::Width(b)) => assert_eq!(b, odd),
             other => panic!("expected `Width({odd})`, got {other:?}"),
         }
@@ -2287,7 +2290,7 @@ fn the_four_ways_a_read_out_is_refused_each_say_which() {
     //    bigger than the buffer it was handed passes the range check above and
     //    is refused here instead.
     let refused =
-        driver_wgpu::serve::logits(&device, &arena, &with(Some(readout(0, 4, 256, 4)), 1 << 20));
+        driver_wgpu::serve::logits(&device, &arena, &with(Some(readout(0, 4, 256, 4), &[]), 1 << 20));
     match refused {
         Err(driver_wgpu::serve::Unread::Refused(why)) => assert!(
             !why.to_string().is_empty(),

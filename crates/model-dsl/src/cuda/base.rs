@@ -164,20 +164,20 @@ pub fn attention_xqa_decode(q: &Val, kv: &Kv, window_left: i32) -> Option<Val> {
 ///
 /// Restating it costs nothing: the driver asks whether ANY prep names the
 /// decode schedule, and raises one plan either way.
-pub fn decode_plan(t: &Trace, head_dim: u32, full_attention: bool) {
+pub fn decode_plan(t: &Trace, head_dim: u32, full_attention: bool) -> model_ir::trace::ValueId {
     t.with(None, |b| {
-        b.push_prep(model_ir::trace::PrepKind::DecodeAttention { head_dim, full_attention });
-    });
+        b.push_prep(model_ir::trace::PrepKind::DecodeAttention { head_dim, full_attention })
+    })
 }
 
 /// [`decode_plan`]'s prefill twin, stated by the three PLANNED prefill helpers.
 ///
 /// The planless pair state nothing: they walk their own schedule from the host
 /// CSR mirrors when the statement runs, so there is none to raise.
-pub fn prefill_plan(t: &Trace, head_dim: u32) {
+pub fn prefill_plan(t: &Trace, head_dim: u32) -> model_ir::trace::ValueId {
     t.with(None, |b| {
-        b.push_prep(model_ir::trace::PrepKind::PrefillAttention { head_dim });
-    });
+        b.push_prep(model_ir::trace::PrepKind::PrefillAttention { head_dim })
+    })
 }
 
 /// `kernels::attn::dispatch_attention_flashinfer_decode` against the decode plan its contract
@@ -188,14 +188,15 @@ pub fn attention_flashinfer_decode(
     window_left: i32,
     head_dim: u32,
 ) -> Option<Val> {
-    decode_plan(&q.t, head_dim, window_left == -1);
-    attn_at(
+    let plan = decode_plan(&q.t, head_dim, window_left == -1);
+    attn_at_planned(
         q,
         kv,
         "attn::dispatch_attention_flashinfer_decode",
         // The plain decode declares no `Const` at all -- every number it uses
         // is a fact it asks for -- so its statement carries none.
         vec![],
+        Some(plan),
     )
 }
 
@@ -214,12 +215,17 @@ pub fn attention_flashinfer_prefill(
     // the signature because a caller states the deployment's window here
     // and the guard predicates above still read the same number.
     let _ = window_left;
-    prefill_plan(&q.t, head_dim);
-    attn_at(
+    // THE EDGE, WRITTEN DOWN. The prep raised this fire's prefill schedule and
+    // the statement below executes it; until the value existed the driver had
+    // to recover which was which from a family string. See
+    // `.wiki/designs/design-struct.md`.
+    let plan = prefill_plan(&q.t, head_dim);
+    attn_at_planned(
         q,
         kv,
         "attn::dispatch_attention_flashinfer_prefill_bf16",
         cap_and_scale(soft_cap, sm_scale, head_dim),
+        Some(plan),
     )
 }
 
@@ -297,15 +303,17 @@ pub fn attention_flashinfer_decode_lse(
     head_dim: u32,
 ) -> (Val, Val) {
     // No window here: the `_lse` decode is stated by families that attend the
-    // whole context, and `attn_plan` picks the full plan on an unbounded one.
-    decode_plan(&q.t, head_dim, true);
+    // whole context. It said *"and `attn_plan` picks the full plan on an
+    // unbounded one"* -- which was the guess. The statement names its schedule
+    // now and nothing picks.
+    let plan = decode_plan(&q.t, head_dim, true);
     let shape = q.t.inner.borrow().value_shape(q.id);
     let ids = q.t.with(Some(kv.l), |b| {
         b.launch(
             "attn::dispatch_attention_flashinfer_decode_lse",
             vec![],
             kv_state(kv),
-            vec![q.id],
+            vec![q.id, plan],
             vec![
                 (shape, DType::BF16),
                 (Shape(vec![Dim::Tokens, Dim::Const(q_heads)]), DType::F32),
@@ -589,26 +597,75 @@ pub fn write_kv_to_pages(k: &Val, v: &Val, kv: &Kv) {
     );
 }
 
+/// THE GDN GEOMETRY THE STATEMENT CARRIES.
+///
+/// Seven numbers the CHECKPOINT fixes at load. They reached the CUDA kernels
+/// as `keys::Gdn*` -- eleven keys resolving through one `f.cx.gdn()` -- while
+/// `kernels-metal` and `kernels-vulkan` have spelled the same numbers
+/// `Const<i32>` since §11.12 ruled that a constant belongs in the statement.
+/// One fact, two spellings; this is the CUDA side catching up.
+///
+/// A struct and not seven arguments, for `kernels-metal`'s `GdnShape`'s
+/// reason: they travel together, and a caller free to pass them separately is
+/// a caller free to pass them inconsistently.
+#[derive(Clone, Copy, Debug)]
+pub struct GdnShape {
+    /// Key heads (compact, pre-GQA-repeat).
+    pub k_heads: u32,
+    /// Value heads.
+    pub v_heads: u32,
+    /// Key head width.
+    pub k_dim: u32,
+    /// Value head width.
+    pub v_dim: u32,
+    /// Channels the causal convolution carries: `2*Hk*Dk + Hv*Dv`.
+    pub conv_dim: u32,
+    /// Convolution kernel width.
+    pub conv_k: u32,
+}
+
+impl GdnShape {
+    /// `[k_heads, v_heads, k_dim, v_dim]` -- the GQA recurrence forms' run.
+    #[must_use]
+    fn gqa(self) -> Vec<u32> {
+        vec![self.k_heads, self.v_heads, self.k_dim, self.v_dim]
+    }
+
+    /// `[v_heads, k_dim, v_dim]` -- the forms that index the compact K layout
+    /// directly and never need the key head count.
+    #[must_use]
+    fn compact(self) -> Vec<u32> {
+        vec![self.v_heads, self.k_dim, self.v_dim]
+    }
+
+    /// `[conv_dim, conv_k]` -- the two conv walks'.
+    #[must_use]
+    fn conv(self) -> Vec<u32> {
+        vec![self.conv_dim, self.conv_k]
+    }
+}
+
 /// `kernels::ssm::causal_conv1d_update_batched_bf16`: the slot-indirected decode conv update (+
 /// fused SiLU) against the layer's per-request conv slab. Shape-preserving, like the semantic
 /// [`causal_conv1d`](crate::causal_conv1d) it lowers.
-pub fn gdn_conv_update_batched(x: &Val, w: &ConvW, rs: &Rs) -> Val {
-    gdn_conv(x, w, rs, "ssm::causal_conv1d_update_batched_bf16")
+pub fn gdn_conv_update_batched(x: &Val, w: &ConvW, rs: &Rs, shape: GdnShape) -> Val {
+    gdn_conv(x, w, rs, "ssm::causal_conv1d_update_batched_bf16", shape)
 }
 
 /// `kernels::ssm::causal_conv1d_prefill_batched_bf16`: the batched prefill conv walk (each
 /// request walking its qo_indptr window and persisting the trailing K-window into the slab).
-pub fn gdn_conv_prefill_batched(x: &Val, w: &ConvW, rs: &Rs) -> Val {
-    gdn_conv(x, w, rs, "ssm::causal_conv1d_prefill_batched_bf16")
+pub fn gdn_conv_prefill_batched(x: &Val, w: &ConvW, rs: &Rs, shape: GdnShape) -> Val {
+    gdn_conv(x, w, rs, "ssm::causal_conv1d_prefill_batched_bf16", shape)
 }
 
-fn gdn_conv(x: &Val, w: &ConvW, rs: &Rs, kernel: &str) -> Val {
+fn gdn_conv(x: &Val, w: &ConvW, rs: &Rs, kernel: &str, geom: GdnShape) -> Val {
     let ids = x.t.with(Some(w.layer), |b| {
         let shape = b.value_shape(x.id);
-        b.launch(
+        b.launch_with_params(
             kernel,
             vec![w.name.clone()],
             rs_state(rs),
+            geom.conv(),
             vec![x.id],
             vec![(shape, DType::BF16)],
         )
@@ -634,6 +691,7 @@ pub fn gdn_step_batched(
     rs: &Rs,
     gqa: bool,
     state_bf16: bool,
+    geom: GdnShape,
 ) -> Val {
     let kernel = match (gqa, state_bf16) {
         (true, true) => "ssm::recurrent_gated_delta_step_batched_gqa_state_bf16",
@@ -643,10 +701,14 @@ pub fn gdn_step_batched(
     };
     let ids = q.t.with(Some(rs.l), |b| {
         let shape = b.value_shape(v.id);
-        b.launch(
+        b.launch_with_params(
             kernel,
             vec![],
             rs_state(rs),
+            // THE RUN THE ROUTINE'S MARKS DECLARE, and the two differ: the GQA
+            // forms take the key head count and the compact ones index that
+            // layout directly and never need it.
+            if gqa { geom.gqa() } else { geom.compact() },
             vec![q.id, k.id, v.id, g.id, beta.id],
             vec![(shape, DType::F32)],
         )
@@ -668,6 +730,7 @@ pub fn gdn_prefill_warp_tiled(
     beta: &Val,
     rs: &Rs,
     state_bf16: bool,
+    geom: GdnShape,
 ) {
     // One arm per state dtype; no exported non-GQA duplicate.
     let kernel = if state_bf16 {
@@ -675,7 +738,7 @@ pub fn gdn_prefill_warp_tiled(
     } else {
         "ssm::chunk_gated_delta_prefill_batched_warp_tiled_gqa"
     };
-    gdn_prefill(q, k, v, g, beta, rs, kernel);
+    gdn_prefill(q, k, v, g, beta, rs, kernel, geom.gqa());
 }
 
 /// Cached prefill recurrence; indexes repeated `[Vh]`, so the guard materializes heads first.
@@ -688,34 +751,45 @@ pub fn gdn_prefill_cached(
     beta: &Val,
     rs: &Rs,
     state_bf16: bool,
+    geom: GdnShape,
 ) {
     let kernel = if state_bf16 {
         "ssm::chunk_gated_delta_prefill_batched_cached_state_bf16"
     } else {
         "ssm::chunk_gated_delta_prefill_batched_cached"
     };
-    gdn_prefill(q, k, v, g, beta, rs, kernel);
+    gdn_prefill(q, k, v, g, beta, rs, kernel, geom.compact());
 }
 
 /// `kernels::ssm::chunk_gated_delta_prefill_batched[_state_bf16]`: the batched GQA-aware FLA
 /// prefill recurrence — the fallback arm (it indexes the compact K_h layout directly, so no
 /// repeats). Guard-region launch, output-less like the warp-tiled form.
-pub fn gdn_prefill_fla(q: &Val, k: &Val, v: &Val, g: &Val, beta: &Val, rs: &Rs, state_bf16: bool) {
+pub fn gdn_prefill_fla(q: &Val, k: &Val, v: &Val, g: &Val, beta: &Val, rs: &Rs, state_bf16: bool, geom: GdnShape) {
     let kernel = if state_bf16 {
         "ssm::chunk_gated_delta_prefill_batched_state_bf16"
     } else {
         "ssm::chunk_gated_delta_prefill_batched"
     };
-    gdn_prefill(q, k, v, g, beta, rs, kernel);
+    gdn_prefill(q, k, v, g, beta, rs, kernel, geom.gqa());
 }
 
-fn gdn_prefill(q: &Val, k: &Val, v: &Val, g: &Val, beta: &Val, rs: &Rs, kernel: &str) {
-    record(
+fn gdn_prefill(
+    q: &Val,
+    k: &Val,
+    v: &Val,
+    g: &Val,
+    beta: &Val,
+    rs: &Rs,
+    kernel: &str,
+    params: Vec<u32>,
+) {
+    record_with_params(
         &q.t,
         Some(rs.l),
         kernel,
         vec![],
         rs_state(rs),
+        params,
         vec![q.id, k.id, v.id, g.id, beta.id],
         None,
     );
@@ -786,8 +860,8 @@ pub fn attention_flashinfer_decode_capture(
     soft_cap: f32,
     sm_scale: f32,
 ) -> Option<Val> {
-    decode_plan(&q.t, head_dim, window_left == -1);
-    attn_at(
+    let plan = decode_plan(&q.t, head_dim, window_left == -1);
+    attn_at_planned(
         q,
         kv,
         "attn::dispatch_attention_flashinfer_decode_capture",
@@ -798,6 +872,7 @@ pub fn attention_flashinfer_decode_capture(
             p.extend(cap_and_scale(soft_cap, sm_scale, head_dim));
             p
         },
+        Some(plan),
     )
 }
 
@@ -817,12 +892,13 @@ pub fn attention_flashinfer_prefill_capture(
     // the signature because a caller states the deployment's window here
     // and the guard predicates above still read the same number.
     let _ = window_left;
-    prefill_plan(&q.t, head_dim);
-    attn_at(
+    let plan = prefill_plan(&q.t, head_dim);
+    attn_at_planned(
         q,
         kv,
         "attn::dispatch_attention_flashinfer_prefill_capture_bf16",
         cap_and_scale(soft_cap, sm_scale, head_dim),
+        Some(plan),
     )
 }
 
@@ -864,12 +940,13 @@ pub fn attention_flashinfer_prefill_custom(
     // the signature because a caller states the deployment's window here
     // and the guard predicates above still read the same number.
     let _ = window_left;
-    prefill_plan(&q.t, head_dim);
-    attn_at(
+    let plan = prefill_plan(&q.t, head_dim);
+    attn_at_planned(
         q,
         kv,
         "attn::dispatch_attention_flashinfer_prefill_custom",
         cap_and_scale(soft_cap, sm_scale, head_dim),
+        Some(plan),
     )
 }
 
@@ -914,8 +991,27 @@ pub fn dequant_only(kv: &Kv) {
 /// another, the count matched for the routines that take exactly one scalar,
 /// and `check_plan`'s params rule only ever counted them.
 fn attn_at(q: &Val, kv: &Kv, kernel: &str, params: Vec<u32>) -> Option<Val> {
+    attn_at_planned(q, kv, kernel, params, None)
+}
+
+/// [`attn_at`], with the raise the statement names.
+///
+/// `plan` is placed as input 1, after `q`. The order is the routine's: `q`
+/// keeps `In(0)`, which half this family's comments and every one of its
+/// tests state, and the raise takes the slot after it. A launcher that does
+/// not yet take the operand passes `None` and places what it always did --
+/// which is what keeps the five siblings firing while this one moves.
+fn attn_at_planned(
+    q: &Val,
+    kv: &Kv,
+    kernel: &str,
+    params: Vec<u32>,
+    plan: Option<model_ir::trace::ValueId>,
+) -> Option<Val> {
     let out = q.t.inner.borrow().inside_value_region();
     let shape = (!out).then(|| q.t.inner.borrow().value_shape(q.id));
+    let mut inputs = vec![q.id];
+    inputs.extend(plan);
     record_with_params(
         &q.t,
         Some(kv.l),
@@ -923,7 +1019,7 @@ fn attn_at(q: &Val, kv: &Kv, kernel: &str, params: Vec<u32>) -> Option<Val> {
         vec![],
         kv_state(kv),
         params,
-        vec![q.id],
+        inputs,
         shape.map(|s| (s, DType::BF16)),
     )
 }

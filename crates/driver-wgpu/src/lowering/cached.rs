@@ -206,6 +206,7 @@ mod tests {
                     shape: VShape(Vec::new()),
                     dtype: DType::BF16,
                     dyn_axis: None,
+                    raised: None,
                 })
                 .collect(),
             ops: (0..n)
@@ -257,6 +258,7 @@ mod tests {
                 shape: VShape(Vec::new()),
                 dtype: DType::BF16,
                 dyn_axis: None,
+                raised: None,
             }],
             ops: vec![Op {
                 kind: OpKind::Embed {

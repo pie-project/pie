@@ -6,8 +6,8 @@
 
 /// The kernel-facing records and the generated `extern "C"` bridge.
 pub mod abi;
-/// Trace symbol → what runs it.
-pub mod arms;
+/// Trace symbol → what runs it, derived from the routine's own row.
+pub mod route;
 /// The query-only fire vocabulary an arm reads facts through.
 pub mod cx;
 /// The driver's answer to every fact a bind arm can ask for.
@@ -36,6 +36,23 @@ pub trait Resolver {
     fn weight(&mut self, name: &str) -> Option<*const c_void>;
     /// The device pointer for a backend-named value (`Buffers::NAMED`).
     fn named(&mut self, value: ValueId) -> Option<*mut c_void>;
+    /// The object a `Prep` raised, by the VALUE the statement names.
+    ///
+    /// The value and not the key, because the key cannot tell two apart: a
+    /// stack whose layers disagree about head dim wants one schedule per
+    /// width, and both would spell `fa2.prefill`. The key rides along for the
+    /// refusal's sake and for a resolver that holds exactly one.
+    ///
+    /// Defaulted to `None` because most resolvers hold no raises -- the
+    /// fixtures, the store-backed map, the two shader planes' -- and a
+    /// resolver that holds none should say so once here rather than at eight
+    /// impls. `None` is a REFUSAL at the bind and not a null: an argument
+    /// nothing can bind must stop the fire, because the alternative is a
+    /// launch reading address zero.
+    fn raised(&mut self, value: ValueId, key: &str) -> Option<*const c_void> {
+        let _ = (value, key);
+        None
+    }
 }
 
 /// One resolved operand: where it is, and how wide one row is.
@@ -69,6 +86,16 @@ pub enum BindRefusal {
         at: usize,
         /// What the frame actually holds.
         arena_bytes: usize,
+    },
+    /// The plan places a raise this resolver does not hold.
+    ///
+    /// Drift, in the shape `UnknownWeight` has: the trace was built against a
+    /// fire that raises this and the resolver answering is one that does not.
+    /// A refusal and never a null -- an argument nothing can bind must stop
+    /// the fire, because the alternative is a launch reading address zero.
+    RaisedUnbound {
+        /// The raise, by the word its `raise!` declared.
+        key: String,
     },
     /// The trace names a weight the resolver does not hold.
     UnknownWeight(String),
@@ -106,7 +133,7 @@ pub struct LaunchSpec {
     /// sent as `u32`, so `-1` arrives as `0xFFFF_FFFF`; [`window_of`] casts it.
     pub params: Vec<u32>,
     /// What fires this symbol, resolved at load. **No string compare at fire.**
-    pub route: arms::Route,
+    pub route: route::Route,
 }
 
 /// The window a launch attends over: the STATEMENT's, else the context's.
@@ -123,7 +150,7 @@ fn window_of(spec: &LaunchSpec, a: &AttnCtx, layer: u32) -> i32 {
 #[derive(Debug, Clone)]
 pub struct DispatchPlan {
     specs: Vec<LaunchSpec>,
-    routes: Vec<arms::Route>,
+    routes: Vec<route::Route>,
     unfireable: Vec<Unfireable>,
     /// What the boot said, so a re-lowering (a warm-up) resolves the same way.
     boot: Boot,
@@ -147,12 +174,12 @@ impl core::fmt::Display for Unfireable {
 /// Resolve every symbol a lowering names to the thing that will fire it: one
 /// scan of the symbol table by kernel id, pure in the table and [`Boot`].
 #[must_use]
-pub fn resolve(lowered: &Lowered, boot: Boot) -> Vec<arms::Route> {
+pub fn resolve(lowered: &Lowered, boot: Boot) -> Vec<route::Route> {
     lowered.kernels.iter().map(|symbol| boot.route(symbol)).collect()
 }
 
 /// What the boot decided. `None` means "the boot did not say", not "false":
-/// the caller gets [`Route::Unbound`](arms::Route::Unbound), not a kernel.
+/// the caller gets [`Route::Unbound`](route::Route::Unbound), not a kernel.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Boot {
     /// Whether the KV cache stores the model's own bf16; must match the fire's
@@ -163,14 +190,14 @@ pub struct Boot {
 impl Boot {
     /// One symbol's route, with the boot's answer folded in.
     #[must_use]
-    pub fn route(self, symbol: &str) -> arms::Route {
+    pub fn route(self, symbol: &str) -> route::Route {
         if symbol != STATED_KV_WRITE {
-            return arms::route(symbol);
+            return route::route(symbol);
         }
         match self.kv_native_bf16 {
-            Some(native) => arms::route(kernels_cuda::attn::kv_paged::write_kv_to_pages(native)),
+            Some(native) => route::route(kernels_cuda::attn::kv_paged::write_kv_to_pages(native)),
             // Not `Unknown`: the symbol is declared, the boot fact is not.
-            None => arms::Route::Unbound("a KV cache dtype for the writer the boot chose"),
+            None => route::Route::Unbound("a KV cache dtype for the writer the boot chose"),
         }
     }
 }
@@ -405,10 +432,16 @@ impl DispatchPlan {
         &self.unfireable
     }
 
-    /// Row-world progress: `(row-world symbols, distinct symbols)`.
+    /// Sweep progress: `(symbols nothing can fire, distinct symbols)`.
+    ///
+    /// The first half used to count `Route::Rows` -- the symbols the sweep
+    /// still owed a port. There is no such answer any more, so what it counts
+    /// is what remains of the same question: a name this driver cannot route
+    /// at all.
     #[must_use]
     pub fn sweep_progress(&self) -> (usize, usize) {
-        (self.routes.iter().filter(|r| r.is_row_world()).count(), self.routes.len())
+        let stuck = self.routes.iter().filter(|r| matches!(r, route::Route::Unknown)).count();
+        (stuck, self.routes.len())
     }
 }
 
@@ -821,7 +854,7 @@ impl DispatchCtx {
 
     /// gemma3n's per-layer `std_mult` for `gaussian_topk`. Zero where no sparse
     /// layer is stated, which the kernel reads as "keep everything".
-    #[expect(dead_code, reason = "the FLOOR half of an unbound row; see bind::arms::mlp")]
+    #[expect(dead_code, reason = "the FLOOR half of an unbound row")]
     pub(crate) fn altup_std_mult(&self, layer: usize) -> f32 {
         self.altup_std_mult_by_layer.get(layer).copied().unwrap_or(0.0)
     }
@@ -979,17 +1012,33 @@ pub enum DispatchRefusal {
 /// The plan pointer a launch is handed; decode's full plan on a `-1` window.
 #[cfg(feature = "_cuda")]
 #[must_use]
-pub fn attn_plan(a: &AttnCtx, spec: &LaunchSpec, layer: u32, family: &str) -> *mut c_void {
-    match family {
-        "decode" => {
-            if window_of(spec, a, layer) == -1 && !a.decode_plan_full.is_null() {
-                a.decode_plan_full
-            } else {
-                a.decode_plan
-            }
-        }
-        _ => a.prefill_plan,
-    }
+/// The PREFILL schedule this fire raised.
+///
+/// # What this was, and what deleted it
+///
+/// It took a `family: &str` and a `LaunchSpec`, and for decode it GUESSED:
+///
+/// ```ignore
+/// "decode" => if window_of(spec, a, layer) == -1 && !a.decode_plan_full.is_null() {
+///     a.decode_plan_full
+/// } else {
+///     a.decode_plan
+/// }
+/// ```
+///
+/// Which schedule a statement executes, recovered from the window on its spec,
+/// because `OpKind::Prep` published nothing a statement could name. It
+/// publishes a value now and the resolver answers by it
+/// (`fire::launch`'s `raised` map), so the guess has no caller and the decode
+/// arm is gone with it. What is left takes no family and no spec, because
+/// there is nothing left to choose between: one prefill schedule stands, and
+/// `raise_attn_plans` refuses a text that would want two.
+///
+/// The one caller is `keys::Fa2PrefillPlanCache` — the PLANLESS leg, which
+/// walks its own schedule inside the fire and needs the cache to write into.
+#[must_use]
+pub fn attn_plan(a: &AttnCtx) -> *mut c_void {
+    a.prefill_plan
 }
 
 // MLA's absorb pair stays hand-written: both take four extents as `Param`,
@@ -1100,12 +1149,11 @@ pub fn dispatch<R: Resolver>(
 ) -> Result<(), DispatchRefusal> {
     let rows = i32::try_from(bound.rows.end - bound.rows.start).expect("rows fit i32");
 
-    // `Route::Rows` falls through to the `other` arm, which refuses by name.
 
     // The route was resolved at model load; no symbol string is compared here,
     // and a refusal in this match is the final answer, never a fallthrough.
     match spec.route {
-        arms::Route::Bound(entry) => {
+        route::Route::Bound(_) => {
             // Resolved before the `Cx` exists: a `Resolver` is `&mut` and a
             // bind body must not be able to make it answer twice differently.
             let w_named: *const c_void = spec
@@ -1125,13 +1173,23 @@ pub fn dispatch<R: Resolver>(
                 bank.and_then(|b| resolver.weight(&format!("{b}{suffix}")))
                     .unwrap_or(core::ptr::null())
             };
-            let w_suffixed: [(&'static str, *const c_void); 4] = [
+            let w_suffixed: [(&'static str, *const c_void); 9] = [
                 ("_scales", suffixed("_scales")),
                 ("_gate_bias", suffixed("_gate_bias")),
                 ("_up_bias", suffixed("_up_bias")),
                 // Without this entry gpt-oss' routed down projection fires
                 // biasless over a bias its checkpoint ships.
                 ("_bias", suffixed("_bias")),
+                // The two MXFP4 decode kernels index their weights per EXPERT,
+                // so they take arrays of bases rather than a base.
+                // `serve::load::build_moe_expert_ptrs` carves both beside the
+                // bank at load; nothing states them, because which address an
+                // expert's slab starts at is a fact about the load.
+                ("_ptrs", suffixed("_ptrs")),
+                ("_scales_ptrs", suffixed("_scales_ptrs")),
+                ("_bias_ptrs", suffixed("_bias_ptrs")),
+                ("_gate_bias_ptrs", suffixed("_gate_bias_ptrs")),
+                ("_up_bias_ptrs", suffixed("_up_bias_ptrs")),
             ];
             let fire = facts::Fire {
                 bound,
@@ -1144,19 +1202,18 @@ pub fn dispatch<R: Resolver>(
                 w_named2,
                 w_suffixed: &w_suffixed,
             };
-            return entry
-                .call(&cx::Cx::new(&fire), ctx.stream)
+            return table::derived_arm(&cx::Cx::new(&fire), ctx.stream)
                 .map_err(|r| DispatchRefusal::NoArm(format!("{}: {r}", bound.kernel)));
         }
         // Both already refused at load; reaching one is a driver bug.
-        arms::Route::Unbound(why) => {
+        route::Route::Unbound(why) => {
             return Err(DispatchRefusal::NoArm(format!(
                 "{}: {why} (load-time refusal; the lowering was fired without \
                  DispatchPlan::unfireable being checked)",
                 bound.kernel
             )));
         }
-        arms::Route::Unknown => {
+        route::Route::Unknown => {
             return Err(DispatchRefusal::NoArm(format!(
                 "{}: no contract and no row declares it (load-time refusal; \
                  the lowering was fired without DispatchPlan::unfireable \
@@ -1164,8 +1221,8 @@ pub fn dispatch<R: Resolver>(
                 bound.kernel
             )));
         }
-        // The driver's own ops and the row world: both fall through below.
-        arms::Route::Driver | arms::Route::Rows => {}
+        // The driver's own ops fall through to the match below.
+        route::Route::Driver => {}
     }
 
     // The GDN arms' shared read: the ctx itself.
@@ -1421,13 +1478,13 @@ pub fn dispatch<R: Resolver>(
             }
         }
         other => {
-            // Names the registry asked: "NoArm" alone sent readers to `x/`.
-            let registry = if spec.route.is_row_world() {
-                "no generated arm and no driver-op arm"
-            } else {
-                "a driver op with no arm"
-            };
-            return Err(DispatchRefusal::NoArm(format!("{other}: {registry}")));
+            // ONE MESSAGE, because there is one way to arrive: `Bound::driver`
+            // declared the symbol and this match has no arm for it. The second
+            // reading -- "no generated arm either" -- was `Route::Rows`, and a
+            // symbol reaching here through THAT is no longer possible.
+            return Err(DispatchRefusal::NoArm(format!(
+                "{other}: a driver op with no arm"
+            )));
         }
     }
     Ok(())
@@ -1734,6 +1791,15 @@ pub fn resolve_arg_windowed<R: Resolver>(
                 return Err(BindRefusal::ArenaOutOfBounds { at, arena_bytes: frame.arena_bytes });
             }
             BoundArg { ptr: unsafe { frame.arena.cast::<u8>().add(at) }.cast(), width: *width }
+        }
+        Arg::Raised { value, key } => {
+            // NO ROW WINDOW. `row` offsets a rectangle by its own pitch and a
+            // raise has neither; every launch that names one names the same
+            // object, which is what makes it one object.
+            let ptr = resolver
+                .raised(*value, key)
+                .ok_or_else(|| BindRefusal::RaisedUnbound { key: key.clone() })?;
+            BoundArg { ptr: ptr.cast_mut(), width: 0 }
         }
         Arg::Named { value, width, bytes: _ } => BoundArg {
             ptr: resolver.named(*value).ok_or(BindRefusal::UnknownNamed(*value))?,

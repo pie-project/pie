@@ -369,6 +369,7 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
         tp_size: state.tp_size,
     };
     wire_trace_names(&mut model);
+    build_moe_expert_ptrs(&mut model, row.load_shape().n_experts, &alloc);
 
     // Once, at load; see `LoadedModel::deployment`. From the matched row.
     model.deployment = row
@@ -739,6 +740,96 @@ fn synthetic_fire(
 /// contiguity rather than assumes: a GEMM handed a discontiguous operand reads
 /// what lies between.
 ///
+/// The per-expert POINTER ARRAYS an MXFP4 decode kernel indexes.
+///
+/// `quant::mxfp4_moe_gate_up_decode`'s `packed_ptrs` and `scale_ptrs` are
+/// `const u8* const*` over `num_experts` — the kernel's first act is
+/// `packed_ptrs[expert]`, with `expert` off the router's top-k run. Nothing
+/// states them and nothing can: a statement names the BANK, and which address
+/// each expert's slab begins at is a property of where the load put it.
+///
+/// So they are built here, once, beside the bank they slice. A bank is
+/// `[E, ...]` contiguous, so expert `e` begins at `base + e * (bytes / E)` —
+/// `WeightSpan` carries both halves of that and `LoadShape::n_experts` the
+/// third. The arrays are registered under the bank's own name plus a suffix,
+/// which is how `bind::dispatch`'s suffix reach already finds `_scales`, so the
+/// arm asks for them exactly as it asks for that.
+///
+/// Binding the bank's base where an array of bases belongs is what this
+/// replaces: `compute-sanitizer` measured the first eight bytes of MXFP4 weight
+/// data being dereferenced as a pointer. An illegal address poisons the
+/// context, so the fault surfaces on a later, unrelated `cuModuleLoadData` —
+/// which is why the rows were refused at load until something built these.
+fn build_moe_expert_ptrs(
+    model: &mut LoadedModel,
+    n_experts: u32,
+    alloc: &crate::device::Allocator,
+) {
+    let experts = n_experts as usize;
+    if experts == 0 {
+        return;
+    }
+    let Ok(stream) = crate::device::OwnedStream::new(0) else {
+        return;
+    };
+    // Collected first: the loop below inserts into the same map it reads.
+    // EVERY PLANE OF A BANK, not just the packed one. The kernel indexes all
+    // four the same way -- `packed_ptrs[expert]`, `scale_ptrs[expert]`,
+    // `gate_bias_ptrs[expert]`, `bias_ptrs[expert]` -- so a base bound at any
+    // of them is the same illegal address as a base bound at the first.
+    //
+    // Over the ALIASES as well as the weights, because a bank is normally
+    // neither: `wire_trace_names` publishes `layer.0.expert_gate_up_bank` as an
+    // alias onto the checkpoint's `...mlp.experts.gate_up_proj.weight`, and
+    // only a JOIN lands a trace name in `weights` directly. Reading one map
+    // found nothing and every fire refused for want of an array the load had
+    // silently declined to build.
+    let banks: Vec<String> = model
+        .weights
+        .keys()
+        .chain(model.aliases.keys())
+        .filter(|n| n.contains("_bank") && !n.ends_with("_ptrs"))
+        .cloned()
+        .collect();
+    for bank in banks {
+        // The same two-step `LoadedModel::weight` takes, for the same reason.
+        let Some(span) = model
+            .weights
+            .get(&bank)
+            .or_else(|| model.aliases.get(&bank).and_then(|t| model.weights.get(t)))
+            .copied()
+        else {
+            continue;
+        };
+        // A bank that does not divide is not `[E, ...]`, so it is not one of
+        // these — leave it alone rather than publish a stride that is a
+        // rounding of the truth.
+        if span.bytes == 0 || span.bytes % experts != 0 {
+            continue;
+        }
+        let stride = span.bytes / experts;
+        let mut host = Vec::with_capacity(experts * size_of::<u64>());
+        for e in 0..experts {
+            let at = (span.ptr as usize + e * stride) as u64;
+            host.extend_from_slice(&at.to_le_bytes());
+        }
+        let Ok(mut buffer) = alloc.alloc(host.len()) else {
+            continue;
+        };
+        if buffer.copy_from_host(&host, stream.as_ref()).is_err() {
+            continue;
+        }
+        if stream.as_ref().synchronize().is_err() {
+            continue;
+        }
+        model.weights.insert(
+            format!("{bank}_ptrs"),
+            crate::weights::stage::WeightSpan { ptr: buffer.as_ptr(), bytes: host.len() },
+        );
+        model.owned.push(buffer);
+    }
+}
+
 /// And reading a load-time scalar to the host: gemma-4's `layer_scalar` is one
 /// bf16 on device; `model` says which and in what order.
 fn wire_trace_names(model: &mut LoadedModel) {

@@ -28,7 +28,7 @@
 // PIE_BK x BN slab of the dequantised weight into workgroup memory first, so
 // each fetch is amortised over BN and BM lanes respectively -- the same shape
 // the coopmat tier stages for its matrix unit, minus the matrix unit. The
-// accumulation is fp32 either way, and `affine_value`/`load_x` are called
+// accumulation is fp32 either way, and `affine_quad`/`load_x` are called
 // exactly as Vulkan calls them, so the arithmetic is unchanged.
 //
 // The two barriers per K block are the hazard: `workgroupBarrier()` must be
@@ -372,6 +372,10 @@ const PIE_BN4 = PIE_BN / 4;
 // BN=16 gives 64 of them across 128 lanes -- the only declared shape that does
 // not fill the workgroup, and the reason `r` is bounds-checked below.
 const PIE_ACCV = (PIE_BM * PIE_BN4 + 127) / 128;
+// Whether a lane holds exactly two accumulators AND every lane is live, which
+// is `BM * BN4 == 256`. A const expression, so the branch it guards is folded
+// before register allocation ever sees the other arm.
+const PIE_ACC2 = PIE_BM * PIE_BN4 == 256;
 
 var<workgroup> xs: array<vec4<f32>, PIE_BM * PIE_BK4>;
 // Stored K-major (`ws[kk * BN4 + c4]`) though it is read column-major, so that
@@ -408,16 +412,29 @@ fn load_x(row: u32, kk: u32) -> f32 {
 //#endif
 }
 
-// One dequantised weight. `k` and not `row_stride` indexes the packed planes
-// even in the strided variants: the stride is the ACTIVATION's, the weight is
-// always densely packed by K.
-fn affine_value(col: u32, kk: u32) -> f32 {
+// Four consecutive K of one column, dequantised from ONE packed word.
+//
+// `k` and not `row_stride` indexes the packed planes even in the strided
+// variants: the stride is the ACTIVATION's, the weight is always densely
+// packed by K.
+//
+// A one-value-at-a-time dequant reads the word, the scale and the bias for
+// every single code, so staging a (BN, BK) weight tile that way issues three
+// global loads per value -- 3072 of them for the 1024 values a (32, 32) tile
+// stages. Four codes at a time is the widest step every declared width allows
+// (eight fit in a word at four bits, four at eight), and since `PIE_GROUP` is
+// never below 32 the four share a scale and a bias too. Twelve loads then
+// retire sixteen values where they used to retire four.
+//
+// `k` must be a multiple of four, which the caller's `k4 * 4` and `PIE_BK`
+// being a multiple of four together guarantee.
+fn affine_quad(col: u32, k: u32) -> vec4<f32> {
     let len = u32(params.k);
-    let word = w[pie_affine_word_of(col, len, kk)];
-    let g = pie_affine_scale_of(col, len, kk);
-    return pie_affine_value(
+    let word = w[pie_affine_word_of(col, len, k)];
+    let g = pie_affine_scale_of(col, len, k);
+    return pie_affine_dequant4(
         word,
-        pie_affine_code_of(kk),
+        pie_affine_code_of(k),
         qmm_bf16(scales[g >> 1u], g),
         qmm_bf16(biases[g >> 1u], g),
     );
@@ -512,23 +529,76 @@ fn main(
             if k4 + 3u < kn { v.w = load_x(tile_row + r, kb + k4 + 3u); }
             xs[e] = v;
         }
-        for (var e = local; e < u32(PIE_BN4 * PIE_BK); e = e + PIE_LANES) {
-            let c4 = e / u32(PIE_BK);
-            let kk = e - c4 * u32(PIE_BK);
-            var v = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        // FOUR K OF FOUR COLUMNS PER LANE, not one element. See `affine_quad`:
+        // the packed word and the scale/bias pair a code needs are shared by
+        // the four codes around it, so reading them once and expanding four
+        // cuts this pass's global traffic by four. The tile is written in the
+        // same K-major layout either way -- one lane's sixteen values are four
+        // `ws` vec4s, at four consecutive `kk` and one `c4`.
+        for (var e = local; e < u32(PIE_BN4 * PIE_BK4); e = e + PIE_LANES) {
+            let c4 = e / u32(PIE_BK4);
+            let kk = (e - c4 * u32(PIE_BK4)) * 4u;
+            var q0 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+            var q1 = q0;
+            var q2 = q0;
+            var q3 = q0;
             if kk < kn {
-                let c = c4 * 4u;
-                v = vec4<f32>(
-                    affine_value(tile_col + c + 0u, kb + kk),
-                    affine_value(tile_col + c + 1u, kb + kk),
-                    affine_value(tile_col + c + 2u, kb + kk),
-                    affine_value(tile_col + c + 3u, kb + kk),
-                );
+                let c = tile_col + c4 * 4u;
+                q0 = affine_quad(c + 0u, kb + kk);
+                q1 = affine_quad(c + 1u, kb + kk);
+                q2 = affine_quad(c + 2u, kb + kk);
+                q3 = affine_quad(c + 3u, kb + kk);
             }
-            ws[kk * u32(PIE_BN4) + c4] = v;
+            // K is not required to be a multiple of four, so the staged tail
+            // is zeroed component-wise rather than by the block guard above.
+            let base = kk * u32(PIE_BN4) + c4;
+            let n4 = u32(PIE_BN4);
+            ws[base + 0u * n4] = select(vec4<f32>(0.0, 0.0, 0.0, 0.0), vec4<f32>(q0.x, q1.x, q2.x, q3.x), kk + 0u < kn);
+            ws[base + 1u * n4] = select(vec4<f32>(0.0, 0.0, 0.0, 0.0), vec4<f32>(q0.y, q1.y, q2.y, q3.y), kk + 1u < kn);
+            ws[base + 2u * n4] = select(vec4<f32>(0.0, 0.0, 0.0, 0.0), vec4<f32>(q0.z, q1.z, q2.z, q3.z), kk + 2u < kn);
+            ws[base + 3u * n4] = select(vec4<f32>(0.0, 0.0, 0.0, 0.0), vec4<f32>(q0.w, q1.w, q2.w, q3.w), kk + 3u < kn);
         }
         workgroupBarrier();
 
+        // TWO ROWS OVER ONE COLUMN GROUP, where the general loop below runs
+        // each accumulator's whole K sweep on its own.
+        //
+        // `c4` is `idx % BN4` and `idx` differs between accumulators by
+        // exactly PIE_LANES, so where `BN4` divides 128 -- it is 4, 8 or 16 at
+        // every declared shape -- every accumulator a lane holds sits in the
+        // SAME column group and differs only in its row. The four `ws` vec4s
+        // an inner step reads are therefore the same four for both, and the
+        // general loop reads them twice: ten workgroup loads retire what six
+        // can.
+        //
+        // Guarded on two accumulators exactly, because that is the shape where
+        // `BM * BN4` is 256 and both rows are certainly live -- (32, 32),
+        // (64, 16) and (16, 64). The general loop keeps the `r >= BM` guard
+        // for (16, 16), whose 64 accumulators do not fill the workgroup.
+        //
+        // The accumulation order is UNCHANGED, which the parity walk against
+        // `kernels-metal` and `kernels-vulkan` requires: each accumulator
+        // still folds its own `xv.x * w0 + xv.y * w1 + ...` in that order.
+        if PIE_ACC2 {
+            let c4 = local % u32(PIE_BN4);
+            let r0 = local / u32(PIE_BN4);
+            let r1 = r0 + PIE_LANES / u32(PIE_BN4);
+            var s0 = acc[0];
+            var s1 = acc[min(1u, u32(PIE_ACCV) - 1u)];
+            for (var k4 = 0u; k4 < u32(PIE_BK4); k4 = k4 + 1u) {
+                let kk = k4 * 4u;
+                let w0 = ws[(kk + 0u) * u32(PIE_BN4) + c4];
+                let w1 = ws[(kk + 1u) * u32(PIE_BN4) + c4];
+                let w2 = ws[(kk + 2u) * u32(PIE_BN4) + c4];
+                let w3 = ws[(kk + 3u) * u32(PIE_BN4) + c4];
+                let x0 = xs[r0 * u32(PIE_BK4) + k4];
+                let x1 = xs[r1 * u32(PIE_BK4) + k4];
+                s0 = s0 + x0.x * w0 + x0.y * w1 + x0.z * w2 + x0.w * w3;
+                s1 = s1 + x1.x * w0 + x1.y * w1 + x1.z * w2 + x1.w * w3;
+            }
+            acc[0] = s0;
+            acc[min(1u, u32(PIE_ACCV) - 1u)] = s1;
+        } else {
         for (var a = 0u; a < u32(PIE_ACCV); a = a + 1u) {
             let idx = local + a * PIE_LANES;
             let r = idx / u32(PIE_BN4);
@@ -546,6 +616,7 @@ fn main(
                       + xv.w * ws[(kk + 3u) * u32(PIE_BN4) + c4];
             }
             acc[a] = s;
+        }
         }
 
         kb = kb + u32(PIE_BK);

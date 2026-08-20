@@ -1653,7 +1653,8 @@ static ALL_REDUCE_BF16_ROUTINE: ::kernels::routine::Routine<crate::Plane> =
         "all_reduce_bf16",
         all_reduce_bf16,
         namespace = "comm",
-        whole
+        whole,
+        driver
     );
 
 /// `comm::all_reduce_residual_rmsnorm_bf16`'s row.
@@ -1671,7 +1672,8 @@ static ALL_REDUCE_RESIDUAL_RMSNORM_BF16_ROUTINE: ::kernels::routine::Routine<cra
         "all_reduce_residual_rmsnorm_bf16",
         all_reduce_residual_rmsnorm_bf16,
         namespace = "comm",
-        whole
+        whole,
+        driver
     )
     .stating(&[Some(::kernels::Source::Alias(1, 0))]);
 

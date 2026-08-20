@@ -14,147 +14,6 @@
 //! refusing. `.wiki/kernel-metal-refactor.md` §9 records it.
 
 use kernels_macros::routine;
-use kernels::KernelSig;
-
-pub static KERNELS: &[KernelSig] = &[
-    // FIVE outputs, and that is the shape of the thing: a sort states the
-    // permutation, the per-row expert, the per-tile expert, and the inverse
-    // the combine reads back. A text that named fewer would leave the combine
-    // reading whatever was in the buffer.
-    // 9 in quantized_qmm_t.wgsl
-    // 1 in quantized_qmv.wgsl
-    //
-    // This row named no operands, which made it the one unstated row in the
-    // table that is provably REACHABLE. `model-ir`'s routed-QMV site
-    // picks the symbol with a `match` on the weight repr --
-    // `WeightRepr::Mxfp4Marlin => "mxfp4_qmv_routed_bias"` against
-    // `affine_qmv_routed{_bias}` for everything else -- and then makes ONE
-    // `with_params` call for both arms. So a driver does try to bind this, and
-    // an operand list it cannot read is a failure at launch rather than dead
-    // code.
-    //
-    // Found from the Vulkan side, by intersecting the operand-less rows with
-    // every symbol literal in `model-ir`: of the 57, exactly this one
-    // survived. `kernels-vulkan` states it identically.
-    //
-    // The list below is not invented to fill the hole. `qmv.wgsl` generates
-    // this symbol from `instantiate_gptoss_qmv` with `fn = qmv_routed_bias` --
-    // the SAME macro and the SAME template function as `qmv_routed_bias`
-    // directly above, differing only in the codec and the group/bits point,
-    // neither of which appears in the signature. The twelve parameters are
-    // therefore identical operand for operand, and this is that row's list
-    // copied across rather than reconstructed.
-    //
-    // `biases` stays in the ABI and stays unread: the MXFP4 codec has no
-    // separate bias plane, so the kernel takes the pointer and ignores it. A
-    // row is positional, so dropping the slot would shift everything after it.
-    // 54 in quantized_qmm_t.wgsl
-    // 9 in quantized_qmm_t.wgsl
-    // 1 in quantized_qmv.wgsl
-    // ONE affine format, and that is the kernel's design rather than a gap:
-    // `AffineQ::group_size` is a constant, so a second group point would name
-    // an instantiation that dequantises at 64 whatever it claims. A routed
-    // checkpoint at another group is meant to fail by name when its pipeline
-    // is built -- which `entrypoint()` now does at the call instead of in the
-    // shader compiler.
-    // 1 in quantized_qmv.wgsl
-    // 1 in moe_route.wgsl
-    // 1 in moe_route.wgsl
-];
-/// The entrypoints of this family's routines whose ROWS have been RETIRED.
-///
-/// `refactor-bigplan.md` §7 Stage 3. Not every kernel here has crossed its
-/// arm — this family still states rows for the ones that have not — so this
-/// is the retired SUBSET rather than the whole family, and
-/// `a_retired_familys_stated_entrypoints_are_what_its_bodies_fire` compares
-/// it against the bodies that fire them.
-///
-/// See [`crate::sample::ENTRYPOINTS`] for why a retired row's entrypoints
-/// have to be stated at all.
-pub static ENTRYPOINTS: &[&str] = &[
-    "affine_qmv_routed_bfloat16_gs_64_b_4",
-    "router_topk_bfloat16",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_16_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_16_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_16_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_32_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_32_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_32_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_64_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_64_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_64_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_16_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_16_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_16_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_32_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_32_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_32_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_64_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_64_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_64_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_16_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_16_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_16_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_32_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_32_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_32_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_64_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_64_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_64_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_16_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_16_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_16_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_32_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_32_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_32_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_64_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_64_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_64_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_16_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_16_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_32_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_32_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_64_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_64_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_16_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_16_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_16_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_32_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_32_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_32_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_64_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_64_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_64_bn_64",
-    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_16_bn_16",
-    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_16_bn_64",
-    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_32_bn_16",
-    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_32_bn_64",
-    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_64_bn_16",
-    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_64_bn_64",
-    "affine_qmv_routed_bias_bfloat16_gs_64_b_4",
-    "combine_sorted",
-    "mxfp4_qmm_t_routed_bias_bfloat16_bm_16_bn_16",
-    "mxfp4_qmm_t_routed_bias_bfloat16_bm_16_bn_32",
-    "mxfp4_qmm_t_routed_bias_bfloat16_bm_16_bn_64",
-    "mxfp4_qmm_t_routed_bias_bfloat16_bm_32_bn_16",
-    "mxfp4_qmm_t_routed_bias_bfloat16_bm_32_bn_32",
-    "mxfp4_qmm_t_routed_bias_bfloat16_bm_32_bn_64",
-    "mxfp4_qmm_t_routed_bias_bfloat16_bm_64_bn_16",
-    "mxfp4_qmm_t_routed_bias_bfloat16_bm_64_bn_32",
-    "mxfp4_qmm_t_routed_bias_bfloat16_bm_64_bn_64",
-    "mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4",
-    "route_gather",
-    "route_sort",
-    "router_topk_scaled_bfloat16",
-    "shared_expert_combine",
-    "shared_expert_combine_strided",
-];
 
 use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, Out, Tensor, bf16, keys};
 use kernels::routine::Refusal;
@@ -422,6 +281,20 @@ const _: () = {
 
 /// The router's top-k: which experts each row picks, and how much of each.
 ///
+/// FOUR MARKS WHERE `RouterParams` WAS ONE STORAGE BLOCK. The four are the
+/// struct's four fields in the struct's order, which is the statement's order,
+/// and `driver-wgpu::lowering::routine::bind` packs them into the `@group(1)`
+/// uniform block `moe/route.wgsl`'s router arm now declares — the same words of
+/// the same `Lowered::params` run the block was staged from, reached by index
+/// instead of by offset.
+///
+/// That the signature can NAME them is the point. `softmax_over_all` and
+/// `logits_pitch` are why `driver-metal/tests/packed_params_cover_the_struct.rs`
+/// exists: a text stated two words, the shader read four, and the router took
+/// the missing two out of the next dispatch's scalars. A mark cannot be short
+/// that way — the run is indexed by position and a statement that carries no
+/// such word refuses instead of reading past its own end.
+///
 /// # Errors
 ///
 /// See `router_grid`.
@@ -430,8 +303,14 @@ pub fn router_topk(
     ctx: &Ctx<'_>,
     logits: In<Tensor<bf16>>,
     expert_ids: Out<Tensor<i32>>,
-    expert_weights: Out<Tensor<bf16>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
+    expert_weights: Out<Tensor<bf16>>,
+    // `RouterParams`'s four fields, in its order. `logits_pitch` of zero means
+    // the pitch IS `n_experts`, and `softmax_over_all` picks the softmax's
+    // DENOMINATOR: zero over the k selected logits, nonzero over every expert.
+    n_experts: Const<u32>,
+    experts_per_token: Const<u32>,
+    softmax_over_all: Const<u32>,
+    logits_pitch: Const<u32>) -> Result<(), Refusal> {
     let per_expert_scale = ctx.absent()?;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
@@ -440,13 +319,27 @@ pub fn router_topk(
             logits.arg(),
             expert_ids.arg(),
             expert_weights.arg(),
-            params,
+            // The absent scale sits where the shader declares it — one binding
+            // lower than it did, because the block that used to precede it is
+            // gone and this backend numbers `@group(0)` densely from the list
+            // the body passed.
             per_expert_scale,
+            // AND THE SCALARS LAST, which is what fixes the uniform block's
+            // layout: `bind` splits the buffers out and packs what is left end
+            // to end in the order it was passed, so this list IS the order
+            // `struct Params` declares its fields in.
+            n_experts.arg(),
+            experts_per_token.arg(),
+            softmax_over_all.arg(),
+            logits_pitch.arg(),
         ],
     )
 }
 
 /// [`router_topk`] with a per-expert gain applied to the weights.
+///
+/// The same four marks, in the same order, because it is the same statement
+/// shape with one weight added — see [`router_topk`] for why they are marks.
 ///
 /// # Errors
 ///
@@ -457,8 +350,14 @@ pub fn router_topk_scaled(
     logits: In<Tensor<bf16>>,
     expert_ids: Out<Tensor<i32>>,
     expert_weights: Out<Tensor<bf16>>,
-    per_expert_scale: Const<Tensor<bf16>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
+    per_expert_scale: Const<Tensor<bf16>>,
+    // `RouterParams`'s four fields, in its order. A weight `Const` claims the
+    // WEIGHT run and a scalar one the params run, so the tensor above takes no
+    // slot from these four: `n_experts` is still word 0.
+    n_experts: Const<u32>,
+    experts_per_token: Const<u32>,
+    softmax_over_all: Const<u32>,
+    logits_pitch: Const<u32>) -> Result<(), Refusal> {
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
         Fire::at("moe/route.wgsl", "router_topk_scaled_bfloat16").apply(router_grid(rows)?),
@@ -466,8 +365,11 @@ pub fn router_topk_scaled(
             logits.arg(),
             expert_ids.arg(),
             expert_weights.arg(),
-            params,
             per_expert_scale.arg(),
+            n_experts.arg(),
+            experts_per_token.arg(),
+            softmax_over_all.arg(),
+            logits_pitch.arg(),
         ],
     )
 }
@@ -479,6 +381,12 @@ pub fn router_topk_scaled(
 /// `LaunchRule::RouterSort` had to split from `RouterLane` — the two look
 /// alike and one of them must not scale with rows.
 ///
+/// SEVEN MARKS WHERE `MoeRouteParams` WAS ONE STORAGE BLOCK, and
+/// [`route_gather`] takes the same seven in the same order. That sharing is the
+/// struct's own point carried forward: `model-dsl` states one seven-word run for
+/// both statements, so the padding this kernel writes and the bounds the gather
+/// reads cannot disagree.
+///
 /// # Errors
 ///
 /// None today; the signature is fallible because every routine's is.
@@ -489,8 +397,19 @@ pub fn route_sort(
     perm: Out<Tensor<i32>>,
     row_expert: Out<Tensor<i32>>,
     tile_expert: Out<Tensor<i32>>,
-    inv: Out<Tensor<i32>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
+    inv: Out<Tensor<i32>>,
+    // `MoeRouteParams`'s seven fields, in its order. `n` is the number of
+    // (row, slot) PAIRS and `padded` is the permutation's length, `n` rounded up
+    // so every expert's span is a whole number of `tile_rows` tiles; the two are
+    // different numbers and this kernel reads both, so swapping the marks would
+    // clear a permutation shorter than it fills.
+    n: Const<u32>,
+    n_experts: Const<u32>,
+    experts_per_token: Const<u32>,
+    tile_rows: Const<u32>,
+    padded: Const<u32>,
+    width: Const<u32>,
+    x_pitch: Const<u32>) -> Result<(), Refusal> {
     ctx.fire(
         Fire::at("moe/route.wgsl", "route_sort").apply([ROUTER_LANES, 1, 1]),
         &[
@@ -498,13 +417,32 @@ pub fn route_sort(
             perm.arg(),
             row_expert.arg(),
             tile_expert.arg(),
-            params,
+            // ONE BINDING LOWER THAN IT WAS: the block sat between `tile_expert`
+            // and this, and `@group(0)` is the body's buffer list packed dense.
             inv.arg(),
+            n.arg(),
+            n_experts.arg(),
+            experts_per_token.arg(),
+            tile_rows.arg(),
+            padded.arg(),
+            width.arg(),
+            x_pitch.arg(),
         ],
     )
 }
 
 /// Gather the rows into sorted order, padding each expert's run to a tile.
+///
+/// [`route_sort`]'s SEVEN MARKS, all of them, and this kernel reads four. `n`,
+/// `n_experts` and `tile_rows` are the sort's alone and are carried here anyway
+/// — one `MoeRouteParams` layout serves both statements, so `padded` is stated
+/// once and read by the kernel that pads and the kernel that is bounded by the
+/// padding. A gather with its own shorter block would be a second place for that
+/// number to be stated and a second place for it to be wrong.
+///
+/// The row extent still comes off the fire rather than off `padded`: the launch
+/// rule is what says how many rows a dispatch covers, and the mark is what the
+/// shader guards with.
 ///
 /// # Errors
 ///
@@ -514,17 +452,46 @@ pub fn route_gather(
     ctx: &Ctx<'_>,
     x: In<Tensor<bf16>>,
     out: Out<Tensor<bf16>>,
-    perm: In<Tensor<i32>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
-    let width = x.width;
-    let padded = ctx.ask::<i32, keys::Rows>()?;
+    perm: In<Tensor<i32>>,
+    // `MoeRouteParams`'s seven fields, in its order — [`route_sort`]'s exactly.
+    n: Const<u32>,
+    n_experts: Const<u32>,
+    experts_per_token: Const<u32>,
+    tile_rows: Const<u32>,
+    padded: Const<u32>,
+    width: Const<u32>,
+    x_pitch: Const<u32>) -> Result<(), Refusal> {
+    // THE OPERAND'S OWN RECTANGLE, and not the `width` mark beside it. The two
+    // are the same number for every text this tree writes; they are not the same
+    // FACT. `x.width` is what the arena allocated and is what the grid must
+    // cover, while the mark is what the statement said and is what the shader
+    // strides by — a disagreement is a fact about the plan, not about this fire.
+    let x_width = x.width;
+    let padded_rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("moe/route.wgsl", "route_gather").apply(rows_by_width(width, padded)?),
-        &[x.arg(), out.arg(), perm.arg(), params],
+        Fire::at("moe/route.wgsl", "route_gather").apply(rows_by_width(x_width, padded_rows)?),
+        &[
+            x.arg(),
+            out.arg(),
+            perm.arg(),
+            n.arg(),
+            n_experts.arg(),
+            experts_per_token.arg(),
+            tile_rows.arg(),
+            padded.arg(),
+            width.arg(),
+            x_pitch.arg(),
+        ],
     )
 }
 
 /// Blend each row's expert outputs back, through the sort's inverse.
+///
+/// THREE MARKS WHERE `ExpertCombineParams` WAS ONE STORAGE BLOCK, in its order.
+/// `out_pitch` of zero means `width`: the mixture's output lands in whatever
+/// layout the caller's activations are in, packed for a batched decode and a
+/// uniform scratch stride apart for a prefill, and a host with nothing to say
+/// writes 0 rather than restating the width.
 ///
 /// # Errors
 ///
@@ -535,13 +502,28 @@ pub fn combine_sorted(
     y: In<Tensor<bf16>>,
     expert_weights: In<Tensor<bf16>>,
     out: Out<Tensor<bf16>>,
-    inv: In<Tensor<i32>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
-    let width = y.width;
+    inv: In<Tensor<i32>>,
+    // `ExpertCombineParams`'s three fields, in its order.
+    width: Const<u32>,
+    experts_per_token: Const<u32>,
+    out_pitch: Const<u32>) -> Result<(), Refusal> {
+    // The OPERAND's rectangle, which is what the grid covers — see
+    // [`route_gather`] for why that is not the `width` mark beside it.
+    let y_width = y.width;
     let tokens = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("moe/route.wgsl", "combine_sorted").apply(rows_by_width(width, tokens)?),
-        &[y.arg(), expert_weights.arg(), out.arg(), params, inv.arg()],
+        Fire::at("moe/route.wgsl", "combine_sorted").apply(rows_by_width(y_width, tokens)?),
+        &[
+            y.arg(),
+            expert_weights.arg(),
+            out.arg(),
+            // ONE BINDING LOWER THAN IT WAS, for the reason `route_sort`'s
+            // `inv` moved: the block sat between `out` and this.
+            inv.arg(),
+            width.arg(),
+            experts_per_token.arg(),
+            out_pitch.arg(),
+        ],
     )
 }
 

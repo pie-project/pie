@@ -7,42 +7,9 @@
 //! somewhere else, which is the thing this refactor removes.
 
 use kernels_macros::routine;
-use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, InPacked, Out, Tensor, bf16, keys};
-use kernels::KernelSig;
+use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, Out, Tensor, bf16, keys};
 use kernels::shader::{elementwise, elementwise_rows};
 use kernels::routine::Refusal;
-
-
-/// The entrypoints this family's crossed routines spell, now that their
-/// rows are gone. See [`crate::RETIRED`].
-pub static ENTRYPOINTS: &[&str] = &[
-    "embed_gather_4bit_bfloat16_gs_32_b_4",
-    "embed_gather_4bit_bfloat16_gs_32_b_8",
-    "embed_gather_4bit_bfloat16_gs_64_b_4",
-    "embed_gather_4bit_bfloat16_gs_64_b_8",
-    "embed_gather_4bit_bfloat16_gs_128_b_4",
-    "embed_gather_4bit_bfloat16_gs_128_b_8",
-    "embed_gather_mb_4bit_bfloat16_gs_32_b_4",
-    "embed_gather_mb_4bit_bfloat16_gs_32_b_8",
-    "embed_gather_mb_4bit_bfloat16_gs_64_b_4",
-    "embed_gather_mb_4bit_bfloat16_gs_64_b_8",
-    "embed_gather_mb_4bit_bfloat16_gs_128_b_4",
-    "embed_gather_mb_4bit_bfloat16_gs_128_b_8",
-    "embed_gather_scaled_4bit_bfloat16_gs_32_b_4",
-    "embed_gather_scaled_4bit_bfloat16_gs_32_b_8",
-    "embed_gather_scaled_4bit_bfloat16_gs_64_b_4",
-    "embed_gather_scaled_4bit_bfloat16_gs_64_b_8",
-    "embed_gather_scaled_4bit_bfloat16_gs_128_b_4",
-    "embed_gather_scaled_4bit_bfloat16_gs_128_b_8",
-    "embed_gather_scaled_mb_4bit_bfloat16_gs_32_b_4",
-    "embed_gather_scaled_mb_4bit_bfloat16_gs_32_b_8",
-    "embed_gather_scaled_mb_4bit_bfloat16_gs_64_b_4",
-    "embed_gather_scaled_mb_4bit_bfloat16_gs_64_b_8",
-    "embed_gather_scaled_mb_4bit_bfloat16_gs_128_b_4",
-    "embed_gather_scaled_mb_4bit_bfloat16_gs_128_b_8",
-    "ple_combine_bfloat16",
-    "row_gather_bfloat16",
-];
 
 /// Which of the six affine points `(group, bits)` names, or a refusal.
 ///
@@ -272,8 +239,17 @@ pub fn embed_gather_scaled_mb_4bit(
 /// `[n_layers, ple_dim]` block at once.
 ///
 /// The scale is `1/sqrt(2)` and it is the JOIN's, not a deployment's -- two
-/// streams averaged in the root-mean-square sense -- so it rides the packed
-/// `PleCombineParams` buffer rather than an argument.
+/// streams averaged in the root-mean-square sense -- so it is the only scalar
+/// this kernel reads, and it is a MARK rather than a struct:
+/// `layout/ple_combine.slang` takes it as the one field of its push block. It
+/// used to ride a `PleCombineParams { inv_sqrt2, n }` storage buffer -- Metal's
+/// layout, ported whole and parked in `norm/rms_params.slang` beside the RMS
+/// family's -- whose second word was dead: `n` was one ROW's element count and
+/// the elementwise launch covers the whole rectangle, so it never bounded the
+/// dispatch it was named for and stayed only to hold the struct's size. That
+/// cost this plane a descriptor, a staging slot and the sentinel
+/// `Holds::params_block` mints for a buffer with no address, for four live
+/// bytes. Word 0 of the statement's run is the same number either way.
 ///
 /// `width` and `rows` are [`Env`]: the statement does not carry them and the
 /// environment always does. Under `kernel!` they were not arguments at all --
@@ -288,13 +264,17 @@ pub fn ple_combine(
     ctx: &Ctx<'_>,
     proj: In<Tensor<bf16>>,
     token: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
+    out: Out<Tensor<bf16>>,
+    // THE JOIN'S SCALE, which was `PleCombineParams`'s first field. The
+    // struct's other word -- a per-row element count bounding a whole-tensor
+    // grid -- was dead, so with the scale stated as a mark there is nothing
+    // left for a block to carry.
+    inv_sqrt2: Const<f32>) -> Result<(), Refusal> {
     let width = proj.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
         Fire::at(crate::routine::module_path("ple_combine_bfloat16", ctx.best()), "ple_combine_bfloat16").apply(elementwise(width, rows)?),
-        &[proj.arg(), token.arg(), out.arg(), params],
+        &[proj.arg(), token.arg(), out.arg(), inv_sqrt2.arg()],
     )
 }
 
@@ -304,14 +284,29 @@ pub fn ple_combine(
 /// A prefill's stream is one row per token and its readout is one distribution
 /// per request, so the sampled rows are picked out before the lm head runs.
 ///
-/// `count` is [`InPacked`], and on this backend that word does real work.
-/// `row_gather.slang` binds `RowGatherParams` as a std430 buffer at 2 and
-/// sends plain scalars to a PUSH block, so there is no trailing scalar slot to
-/// append a count to: the driver writes it into the struct's second field and
-/// the shader reads `p.count`. `kernels-metal` reads the same `Ty::InPacked`
-/// as "append to the scalar run", because there the packed slot IS the buffer.
-/// The type is now the only statement of it; under `kernel!` the fact was said
-/// twice, in the row and in the shader's struct, and only one was checked.
+/// # Two words, one push block, and the order is the body's
+///
+/// `count` used to be [`crate::routine::InPacked`], and on this backend that
+/// word did real work: `row_gather.slang` bound `RowGatherParams` as a std430
+/// buffer at 3 and sent plain scalars to a PUSH block, so there was no trailing
+/// scalar slot to append a count to -- the driver wrote it into the struct's
+/// second field and the shader read `p.count`. `kernels-metal` read the same
+/// `Ty::InPacked` as "append to the scalar run", because there the packed slot
+/// IS the buffer. The type was the only statement of it; under `kernel!` the
+/// fact was said twice, in the row and in the shader's struct, and only one was
+/// ever checked.
+///
+/// There is no struct now. `width` is the statement's word 0 read through a
+/// `Const<u32>` mark, and the request count -- which is the FIRE's and not the
+/// statement's, so it is asked for rather than marked -- is an ordinary scalar
+/// this body passes straight after it. `driver-vulkan`'s `Encoder::fire` builds
+/// the push range out of the body's scalars in the order the body passed them,
+/// so `[width, count]` is eight bytes with the layout the struct had, field for
+/// field, and `layout/row_gather.slang` reads `pc.width`/`pc.count` where it
+/// read `p.width`/`p.count`. The old worry -- that a count folded into the push
+/// block would push a word nothing read and leave the struct's field unwritten
+/// -- was about a block that was otherwise EMPTY, and this one is not: both its
+/// words are read.
 ///
 /// # Errors
 ///
@@ -320,18 +315,21 @@ pub fn ple_combine(
 pub fn row_gather(
     ctx: &Ctx<'_>,
     input: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    out: Out<Tensor<bf16>>,
+    // THE ROW PITCH, which was `RowGatherParams`'s first field and is the only
+    // word of the two the STATEMENT carries. The count below is the fire's.
+    width: Const<u32>) -> Result<(), Refusal> {
     let rows = ctx.ask::<Tensor<u32>, keys::SamplingIndices>()?;
-    let params = ctx.params()?;
-    let count = ctx.ask::<InPacked, keys::RequestCount>()?;
-    let width = input.width;
+    // A `u32` and no longer an `InPacked`: there is no struct for it to be a
+    // field of, so it is a scalar like any other and takes its place in the
+    // push block by the position the body gives it.
+    let count = ctx.ask::<u32, keys::RequestCount>()?;
     let row_count = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("row_gather_bfloat16", ctx.best()), "row_gather_bfloat16").apply(elementwise_rows(width, row_count)?),
-        &[input.arg(), out.arg(), rows.arg(), params, count.arg()],
+        Fire::at(crate::routine::module_path("row_gather_bfloat16", ctx.best()), "row_gather_bfloat16").apply(elementwise_rows(input.width, row_count)?),
+        &[input.arg(), out.arg(), rows.arg(), width.arg(), count.arg()],
     )
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -349,19 +347,23 @@ mod tests {
     /// this fact under different names, so a test that fires both in one
     /// function sets it again between calls. `token_ids` and
     /// `sampling_indices` are the two buffers every gather reads its indices
-    /// through; `request_count` is `row_gather`'s `InPacked` request count,
-    /// answered as the `u32` an `InPacked` unpacks from rather than as a
-    /// buffer. `params_handle` is `ctx.params()`'s own handle, split out from
-    /// the generic `Ty::Buf` catch-all only because
+    /// through; `request_count` is `row_gather`'s request count, a plain `u32`
+    /// now that there is no struct for it to be a packed field of.
+    ///
+    /// NO `params_handle` ANY MORE. It held `ctx.params()`'s own handle, split
+    /// out from the generic `Ty::Buf` catch-all only because
     /// `the_two_join_kernels_ask_for_the_grids_their_shaders_are_written_for`
-    /// asserts the exact bound list and needs it to read a specific number.
+    /// asserts the exact bound list and needed it to read a specific number.
+    /// `ple_combine` and `row_gather` were the two bodies that forwarded that
+    /// block; both state their scalars as `Const` marks now, a mark is passed
+    /// by the CALLER rather than resolved, and so this probe is never asked for
+    /// the params run at all.
     struct Seen {
         calls: RefCell<Vec<Call>>,
         rows: Cell<i32>,
         token_ids: Cell<u32>,
         sampling_indices: Cell<u32>,
         request_count: Cell<u32>,
-        params_handle: Cell<u32>,
         /// THE STATEMENT\'S SCALAR RUN, for a body that reads a word by
         /// index. Empty means "4096 at every slot", which is a plausible
         /// stride for the rows these tests build; a case that means a
@@ -377,7 +379,6 @@ mod tests {
                 token_ids: Cell::new(800),
                 sampling_indices: Cell::new(800),
                 request_count: Cell::new(1),
-                params_handle: Cell::new(900),
                 words: RefCell::default(),
             }
         }
@@ -416,9 +417,6 @@ mod tests {
                 return Ok(ArgValue::I32(
                     self.words.borrow().get(usize::from(n)).copied().unwrap_or(4096),
                 ));
-            }
-            if source == kernels::Source::Slot(kernels::Kind::Params, 0) {
-                return Ok(ArgValue::Buffer { handle: self.params_handle.get(), writes: false, rows: 0, width: 0 });
             }
             if matches!(ty, kernels::Ty::Buf) {
                 return Ok(ArgValue::Buffer { handle: 900, writes: false, rows: 0, width: 0 });
@@ -621,6 +619,14 @@ mod tests {
     /// `device::hazards` decides every barrier from what that bit says. A
     /// mark that bound read-only would cost no error and no crash, only a
     /// missing write-then-read barrier and a fluent wrong answer.
+    ///
+    /// The bound list below is also where `row_gather`'s two words are pinned.
+    /// The fourth entry used to be `Buffer { handle: 3 }` -- the handle
+    /// `ctx.params()` minted for the staged `RowGatherParams` block -- and the
+    /// fifth was the `InPacked` count the driver wrote into that struct's
+    /// second field. Both are plain scalars now, in the order
+    /// `layout/row_gather.slang` declares its push block, and they are
+    /// different numbers on purpose so a swap of the two cannot pass.
     #[test]
     fn the_two_join_kernels_ask_for_the_grids_their_shaders_are_written_for() {
         let seen = Seen::default();
@@ -631,6 +637,7 @@ mod tests {
             In { ptr: Tensor::<bf16>::new(0), rows: 0, width: 256 },
             In::new(Tensor::<bf16>::new(1)),
             Out::new(Tensor::<bf16>::new(2)),
+            Const::new(core::f32::consts::FRAC_1_SQRT_2),
         )
         .expect("twenty-six layers of PLE is a launch");
         // `row_gather` re-purposes `rows` as its own request count, and its
@@ -639,12 +646,12 @@ mod tests {
         // reads as.
         seen.rows.set(3);
         seen.sampling_indices.set(2);
-        seen.params_handle.set(3);
         seen.request_count.set(4);
         row_gather(
             &seen,
             In { ptr: Tensor::<bf16>::new(0), rows: 0, width: 2048 },
             Out::new(Tensor::<bf16>::new(1)),
+            Const::new(2048),
         )
         .expect("three requests is a launch");
 
@@ -681,16 +688,16 @@ mod tests {
                     rows: 0,
                     width: 0
                 },
-                ArgValue::Buffer {
-                    handle: 3,
-                    writes: false,
-                    rows: 0,
-                    width: 0
-                },
+                ArgValue::U32(2048),
                 ArgValue::U32(4),
             ],
-            "`count` is `InPacked`, which reaches the driver as a scalar it \
-             writes into the params STRUCT, not as a fifth descriptor"
+            "three descriptors and then the push block's two words, in the \
+             order `layout/row_gather.slang` declares them: the width the \
+             statement carries -- read at slot 0 by a `Const<u32>` mark where \
+             it used to be word 0 of a staged `RowGatherParams` -- and then \
+             the request count the fire answers, which was `InPacked` and \
+             reached the driver as a scalar it wrote into that struct's \
+             second field rather than as a value of its own"
         );
     }
 }

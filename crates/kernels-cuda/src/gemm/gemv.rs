@@ -38,7 +38,7 @@ fn unroll_depth(ctx: &Ctx<'_>) -> i32 {
 /// Single-row bf16 GEMV: `out[n] = sum_k W[n][k] * x[k] + bias[n] + beta * out[n]`.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-#[routine]
+#[routine(internal)]
 pub fn gemv_bf16(
     ctx: &Ctx<'_>,
     // The only launcher in this family where `weight` precedes `act`;

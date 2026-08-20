@@ -496,7 +496,7 @@ fn stated_by(
     let widths = || {
         args.iter().filter_map(|arg| match arg {
             Arg::Arena { width, .. } | Arg::Named { width, .. } => Some(*width),
-            Arg::Weight(_) => None,
+            Arg::Weight(_) | Arg::Raised { .. } => None,
         })
     };
     let facts = driver_wgpu::lowering::hold::facts(
@@ -996,6 +996,34 @@ enum Reaches {
     /// `binding::scalars` is what reads it, so nothing outside the plan is
     /// needed to fire this kernel.
     RunGrows(u32),
+    /// Every binding is accounted for, and the STATEMENT carries this many
+    /// more words than the module's block declares: the extra ones are
+    /// slot-holders and no shader reads them.
+    ///
+    /// The mirror of [`Self::RunGrows`], and it exists for the reason
+    /// [`Self::BodyDeclines`] does -- the subtraction that produced that one
+    /// SATURATES, so a statement with more words than the block came out as
+    /// `RunGrows(0)`, which reads as "the row supplies nothing" and means the
+    /// opposite of what happened. This file has now been bitten by the same
+    /// saturation twice, once per axis.
+    ///
+    /// It happens for two different reasons and the variant does not
+    /// distinguish them, because what a driver does about either is the same:
+    /// the block is packed from the fields the MODULE declares, in the
+    /// module's order, and a stated word with nowhere to land does not reach
+    /// the GPU. `affine_qmm_t`'s extra two are SELECTORS -- `group`, `bits`,
+    /// `bm`, `bn` pick the entrypoint and the block is `{ k, n }` -- and
+    /// gpt-oss's one is a field that died.
+    ///
+    /// The real case is `mlp::gptoss_swiglu`. `GptOssSwiGluParams` opened with
+    /// a per-row element count that the grid supplies and no body reads, and a
+    /// struct has to carry a dead field to keep the live ones at their
+    /// offsets. A uniform packed from the marks the statement PASSES does not,
+    /// so the block is `{ limit, alpha }` and the dead word never reaches the
+    /// GPU -- but the word is still STATED, because `Const` slots are the
+    /// statement's run counted in order and `limit` sits at word 1. The
+    /// slot-holder goes when the DSL stops stating it.
+    BlockDeclines(u32),
 }
 
 /// Every symbol the reachable texts launch, and how it must be called.
@@ -1014,11 +1042,19 @@ const REACHES: &[(&str, Reaches)] = &[
     // the direction a reader wants from this diff -- a tile change, not new
     // coverage.
     (
-        // `RunGrows(0)` since the tile axes became `Const<i32>`: `bm`/`bn`
-        // were facts the driver recovered from the SYMBOL and are the
-        // statement's now, so the run runs one word past the plan's block.
+        // FOUR STATED WORDS AND A TWO-FIELD BLOCK. `group`, `bits`, `bm` and
+        // `bn` are the statement's marks -- they were facts the driver
+        // recovered from the SYMBOL and they choose the entrypoint -- while
+        // the block the body fills is `{ k, n }`, both read off the operands'
+        // own rectangles. Four words stated, two words in the uniform.
+        //
+        // This read `RunGrows(0)` and the note beside it said, correctly, that
+        // the run runs past the plan's block. It could not say so in the
+        // VALUE, because the subtraction that produced it saturated at zero --
+        // the same trap `BodyDeclines` was added for, on the other axis. Now
+        // it does.
         "affine_qmm_t_bfloat16_gs_64_b_8_bm_32_bn_32",
-        Reaches::RunGrows(0),
+        Reaches::BlockDeclines(2),
     ),
     ("affine_qmv_fast_bfloat16_gs_64_b_8", Reaches::Uniform),
     // THE DENSE PROJECTIONS MOVED TO THE PRECAST PATH. Upstream's "metal: run
@@ -1106,24 +1142,49 @@ const REACHES: &[(&str, Reaches)] = &[
     ("add_bias_bfloat16", Reaches::RunGrows(1)),
     ("residual_add_bfloat16", Reaches::Bare),
     ("silu_mul_bfloat16", Reaches::Bare),
-    ("combine_sorted", Reaches::Storage(3)),
-    ("gptoss_swiglu_bfloat16", Reaches::Storage(3)),
-    ("rms_single_row_bfloat16", Reaches::Storage(3)),
-    // The residual-folding twin, and NEW here: upstream's "the kernel written
-    // for gemma-4 was never called by gemma-4" pointed that family's norm at
-    // this symbol, so a text started launching it. Its block sits at the same
-    // slot 3 as the plain form and the residual it folds is the operand AFTER
-    // it, at 4 -- the same shape `route_sort` is described with, which is why
-    // `Storage` carries a slot rather than an operand count.
-    ("rms_residual_bfloat16", Reaches::Storage(3)),
-    ("route_gather", Reaches::Storage(3)),
-    // The one with an operand AFTER its block, which is why `Storage` carries
-    // the slot instead of being derived from the operand count.
-    ("route_sort", Reaches::Storage(4)),
-    // A block at 3 of 5 and a GAP at 4: the unscaled top-k declares a
-    // per-expert scale buffer its body never reads, and the row leaves the slot
-    // empty so that the scaled twin's numbering is the same numbering.
-    ("router_topk_bfloat16", Reaches::Storage(3)),
+    // # NO SYMBOL IN THIS TABLE IS `Storage` ANY MORE
+    //
+    // These seven were, and the slot each carried was the point: `route_sort`
+    // put its 28-byte block at 4 of 6 with an operand AFTER it, so where a
+    // parameter struct sits is the kernel's own ABI and not a function of the
+    // operand count.
+    //
+    // Then the packed blocks came apart. `MoeRouteParams`, `ExpertCombineParams`,
+    // `RmsParams` and `GptOssSwiGluParams` became the marks their statements
+    // pass, and on this plane a mark rides the `@group(1)` uniform -- so every
+    // one of them is `Uniform` now and `@group(0)` is dense from zero. The
+    // operand that used to sit after a block moved DOWN by one, which is the
+    // half of this that a fixture gets wrong quietly: `route_sort`'s `inv` is
+    // at 4 rather than 5.
+    //
+    // `Reaches::Storage` is KEPT, and so is its slot, because a shader may
+    // declare a storage params block again -- the variant is what would say so
+    // by name. Its absence from this table is asserted in
+    // `every_launchs_scalars_land_where_its_module_reads_them`, which counts
+    // the three shapes over the whole corpus and now requires the storage one
+    // to be zero.
+    ("combine_sorted", Reaches::Uniform),
+    // TWO WORDS WHERE THE STATEMENT PASSES THREE, and the odd one out in this
+    // group. `GptOssSwiGluParams` opened with a per-row element count the grid
+    // supplies and no body reads; a struct had to carry it to keep `limit` and
+    // `alpha` at their offsets and a uniform packed from the marks does not.
+    // The mark stays because `Const` slots are the statement's run counted in
+    // order and `limit` sits at word 1. See `Reaches::BlockDeclines`.
+    ("gptoss_swiglu_bfloat16", Reaches::BlockDeclines(1)),
+    ("rms_single_row_bfloat16", Reaches::Uniform),
+    // The residual-folding twin: upstream's "the kernel written for gemma-4 was
+    // never called by gemma-4" pointed that family's norm at this symbol, so a
+    // text started launching it. Its residual used to be the operand AFTER the
+    // block at 3 and is at 3 itself now, with `s` behind it at 4 in the scaled
+    // form.
+    ("rms_residual_bfloat16", Reaches::Uniform),
+    ("route_gather", Reaches::Uniform),
+    ("route_sort", Reaches::Uniform),
+    // Five bindings with a GAP at 3: the unscaled top-k declares a per-expert
+    // scale buffer its body never reads, and the row leaves the slot empty so
+    // that the scaled twin's numbering is the same numbering. The gap moved
+    // down with everything else when the block left `@group(0)`.
+    ("router_topk_bfloat16", Reaches::Uniform),
     // One driver-owned table each: the token ids an embedding gathers by, the
     // positions a rope turns by, and the sampling indices a row gather reads.
     (
@@ -1317,8 +1378,15 @@ fn what_the_plan_states_and_what_the_module_binds_account_for_each_other() {
                 } else {
                     Reaches::Uniform
                 }
+            } else if uniform > params {
+                Reaches::RunGrows(uniform - params)
             } else {
-                Reaches::RunGrows(uniform.saturating_sub(params))
+                // NOT `RunGrows` OF A SATURATED SUBTRACTION. See
+                // `BlockDeclines`: this arm used to fall through to the same
+                // expression and report zero, which says the row supplies
+                // nothing when what happened is that the statement carries a
+                // word the block does not.
+                Reaches::BlockDeclines(params - uniform)
             };
 
             // The body's gaps and the module's unread bindings are the same
@@ -1544,8 +1612,15 @@ fn the_binder_this_crate_ships_resolves_every_operand_of_every_real_launch() {
     // `residual_add` rectangles went away and each bound 266,240 bytes across
     // its operands. Fewer rectangles binding fewer bytes is the whole content
     // of that upstream change.
+    // UP by 1,035,483,936 when `Lowered::arg_rows` let an operand state a row
+    // space wider than its launch's rectangle. The epilogue gather is the
+    // case: its rectangle is `n_requests` rows and its INPUT spans the token
+    // stream, so measured by the launch alone it bound ONE row and WGSL
+    // clamped the rest of its reads to zero. Binding the rows the operand
+    // actually spans is more bytes by construction, and it is the whole point
+    // of the field -- a jump in this direction is the fix, not a regression.
     assert_eq!(
-        total, 11_161_544_416,
+        total, 12_197_028_352,
         "the arena ranges this binder produces cover a different number of \
          bytes than `rows x width x bytes` over these plans did when it was \
          measured"
@@ -1878,10 +1953,32 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
         7224,
         "a different number of launches take each parameter shape"
     );
-    // And each shape occurs, or a branch that never runs is passing for the
-    // same reason an absent one would.
+    // And the shape that occurs occurs, or a branch that never runs is passing
+    // for the same reason an absent one would.
+    //
+    // # THE STORAGE SHAPE IS GONE, AND ZERO IS THE ANSWER NOW
+    //
+    // This asserted that BOTH homes are used, which was true while a params
+    // block was a `@group(0)` storage struct on some shaders and a `@group(1)`
+    // uniform on others. The packed blocks came apart -- `RmsParams`,
+    // `GegluStridedParams`, `GptOssSwiGluParams`, the moe router's and the
+    // sort's -- and every one of them landed in the uniform, because a
+    // descriptor for a handful of scalars buys nothing a uniform does not.
+    // `GegluParams { unused: u32 }` did not land anywhere: it was a whole
+    // binding for a field no body read.
+    //
+    // So `storage == 0` is the fact, and asserting it is worth more than
+    // deleting the line. It is the trip-wire for the shape coming back: a
+    // shader that reaches for a storage params block again fails HERE, with
+    // the count, rather than at whichever fixture happens to bind it.
     assert_ne!(uniform, 0, "no rectangle carries a uniform block");
-    assert_ne!(storage, 0, "no rectangle carries a storage block");
+    assert_eq!(
+        storage, 0,
+        "{storage} rectangles carry a STORAGE parameter block. Every params \
+         struct on this plane is a `@group(1)` uniform -- if one is a storage \
+         binding again, that is an ABI this walk and every device fixture \
+         beside it were written against the absence of."
+    );
     // The offset comparison above is a prefix, so it is satisfied by a body
     // that passes NOTHING. This is what stops that from being a pass.
     assert_ne!(
@@ -2303,13 +2400,17 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
         "the refusals and the successes do not account for every rectangle"
     );
 
-    // Both parameter homes are exercised. Stated as an identity against the
-    // corpus rather than as two literals -- the split is a property of which
-    // shaders declare a block where, and moves whenever a kernel's ABI does --
-    // plus a non-zero on each, because a change that routed everything one way
-    // would leave the other untested while this passed.
+    // The parameter home that exists is exercised, and the one that does not
+    // is asserted absent. See the same pair in
+    // `every_launchs_scalars_land_where_its_module_reads_them`: every packed
+    // block on this plane became a `@group(1)` uniform, so a storage params
+    // binding is not a smaller half of the split, it is a shape no shader has.
     assert_ne!(uniform, 0, "no dispatch takes a uniform block");
-    assert_ne!(storage, 0, "no dispatch takes a storage block");
+    assert_eq!(
+        storage, 0,
+        "{storage} dispatches take a STORAGE parameter block, and no shader on \
+         this plane declares one"
+    );
     assert!(
         uniform + storage <= planned,
         "more dispatches carry a block than were planned"
@@ -2467,8 +2568,41 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
         // row that holds one norm makes the two the same number, and one that
         // holds several does not -- which is exactly the case the old reading
         // sized wrong.
+        //
+        // DOWN BY 4,740,096 when `quant/qmv.wgsl` grew `PIE_MT`. A reducing
+        // matvec workgroup owns eight output columns and reads their weights
+        // over the whole of K; giving it FOUR activation rows instead of one
+        // divides the workgroup count on x by four and the weight traffic with
+        // it. The arithmetic is the same arithmetic -- the saving is that the
+        // packed matrix is read once per four tokens rather than once per
+        // token, which for a 512-token prefill of a 1B lm head was 67 GiB of
+        // it. `geometry::lanes(Rule::Qmv)` and `quant::qmv_grid`'s callers
+        // both state the quartering, and they have to agree.
+        //
+        // DOWN BY 22,253,400 -- the largest move this number has made, and it
+        // is one file. `rope/neox.wgsl` was `@workgroup_size(1)` because it
+        // read the rotated pair count off `num_workgroups.x`, where the count
+        // is a STRIDE and has to be exact: widen the group and the host rounds
+        // that count up and every pair rotates against the wrong partner. The
+        // file's header had weighed the price and recorded the way out without
+        // taking it, and the price was that this ONE shader dispatched
+        // twenty-two and a half million of the thirty-three million counted
+        // here.
+        //
+        // `rotary` is a field of all three of its uniform blocks now, so
+        // `pairs` comes off the block and the x axis is free. `rope_grid`
+        // divides it twice: by two, because an invocation owns a four-byte
+        // word and so covers two pairs -- the old grid launched a workgroup
+        // per pair and half of them returned at the guard -- and then by the
+        // 32-wide group. Sixty-four times fewer, and the `i0 >= pairs` guard
+        // was already covering both round-ups.
+        //
+        // Measured on an M4 while the change was made: a 512-row prefill of
+        // llama-3.2-1B went from 262,144 one-thread workgroups per rotation to
+        // 8,192 of thirty-two lanes, pp512 850 to 897 tok/s. This number is
+        // the reason that was worth doing and the record that it was done.
         workgroups,
-        38_047_114,
+        11_053_618,
         "the plans dispatch a different amount of work"
     );
     // The third dimension is a prefill's rows, and only the paged decodes put

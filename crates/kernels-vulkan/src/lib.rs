@@ -206,34 +206,6 @@ pub type Plane = crate::routine::Vulkan;
 /// The order is LINK ORDER and no reader may depend on it. Nothing does:
 /// lookups match on the full symbol, which `no_symbol_is_declared_twice`
 /// keeps unique.
-/// The entrypoints of the families whose `kernel!` rows have been RETIRED.
-///
-/// The crossing moves who NAMES an entrypoint, not whether it exists: the
-/// shader is still in the tree, `build.rs` still compiles it, and the driver
-/// still dispatches it -- through `driver-vulkan/src/arm.rs`'s stem lookup
-/// rather than through a row. So the name has to be stated somewhere, or
-/// `tests/entrypoints.rs` would read a family that crossed successfully as a
-/// family whose shaders had vanished, and the comparison against
-/// `kernels-metal` -- which has not retired these rows -- would report drift
-/// where there is none.
-///
-/// This list shrinks to nothing in the other direction: when the last family
-/// crosses, `KERNELS` is empty and this is the whole census. That is
-/// `.wiki/kernel-x/refactor-bigplan.md` §7 Stage 4, and it is why this is a
-/// list of families rather than one flat slice.
-const RETIRED: &[&[&str]] = &[
-    sample::ENTRYPOINTS,
-    ptir::ENTRYPOINTS,
-    mlp::ENTRYPOINTS,
-    layout::ENTRYPOINTS,
-    rope::ENTRYPOINTS,
-    norm::ENTRYPOINTS,
-    ssm::ENTRYPOINTS,
-    moe::ENTRYPOINTS,
-    attn::ENTRYPOINTS,
-    quant::ENTRYPOINTS,
-];
-
 // THE SLICE'S NAME IS A LINK-SECTION NAME, AND IT IS GLOBAL.
 //
 // `linkme` keys a distributed slice on the STATIC's identifier, not on the
@@ -275,17 +247,29 @@ pub use VULKAN_ROUTINES as ROUTINES;
 /// `KernelSig` at all.
 pub static KERNELS: &[kernels::KernelSig] = &[];
 
-/// Every entrypoint the table names, sorted.
+/// Every entrypoint this backend can dispatch, sorted.
 ///
-/// The set `scripts/vulkan-kernel-audit.py` compares against the shader tree,
-/// and — one for one — the set of `.spv` module names a `native` build writes.
+/// READ OFF THE SHADER TREE by `build.rs`, from the same `// pie:instantiate`
+/// lines it compiles. The set `scripts/vulkan-kernel-audit.py` prints, and —
+/// one for one — the set of `.spv` module names a `native` build writes.
+///
+/// The parse happens WITHOUT `native`, which is what lets this answer on a box
+/// with no Slang toolchain: declaring a variant is a comment, only compiling
+/// one needs `slangc`.
+///
+/// It USED TO be a hand-written `RETIRED` list of the same names, one slice per
+/// family. That list existed because retiring a `kernel!` row deleted the
+/// generator of its entrypoints while leaving the shader in the tree and a
+/// routine still firing it — so a reader keyed on this function would have
+/// taken a family that crossed SUCCESSFULLY for one whose shaders had
+/// vanished. Reading the tree answers that at the source, and drops the fourth
+/// reader of these directives: `build.rs`, the audit script and
+/// `tests/entrypoints.rs` all parse them, and only the list restated them.
+///
+/// `.wiki/kernel-x/refactor-bigplan.md` §7 Stage 4.
+#[must_use]
 pub fn entrypoints() -> Vec<String> {
-    let mut out: Vec<String> = RETIRED
-        .iter()
-        .flat_map(|family| family.iter().map(|n| (*n).to_owned()))
-        .collect();
-    out.sort();
-    out
+    module::CENSUS.iter().map(|n| (*n).to_owned()).collect()
 }
 
 
@@ -406,12 +390,6 @@ pub fn retired_rows() -> &'static [&'static str] {
         "qmv_wide_strided",
         "silu_mul_strided",
     ]
-}
-
-/// Every entrypoint whose row is gone and whose routine now answers for it.
-#[must_use]
-pub fn retired() -> Vec<&'static str> {
-    RETIRED.iter().flat_map(|f| f.iter().copied()).collect()
 }
 
 /// Every routine this backend has crossed, with the backend forgotten.

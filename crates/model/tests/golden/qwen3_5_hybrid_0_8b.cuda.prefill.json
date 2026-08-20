@@ -623,679 +623,9 @@
       "dtype": "BF16"
     },
     {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 7168
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 3584
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 6144
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 6144
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        },
-        {
-          "Const": 128
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        },
-        {
-          "Const": 128
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        },
-        {
-          "Const": 128
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        },
-        {
-          "Const": 128
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 7168
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 3584
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 6144
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 6144
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        },
-        {
-          "Const": 128
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        },
-        {
-          "Const": 128
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        },
-        {
-          "Const": 128
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        },
-        {
-          "Const": 128
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 7168
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 3584
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 6144
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 6144
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        },
-        {
-          "Const": 128
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        },
-        {
-          "Const": 128
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        },
-        {
-          "Const": 128
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        },
-        {
-          "Const": 128
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 7168
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 3584
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 4096
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 512
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 512
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 512
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 512
-        }
-      ],
-      "dtype": "BF16"
+      "shape": [],
+      "dtype": "I32",
+      "raised": "fa2.prefill"
     },
     {
       "shape": [
@@ -1973,679 +1303,9 @@
       "dtype": "BF16"
     },
     {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 7168
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 3584
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 6144
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 6144
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        },
-        {
-          "Const": 128
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        },
-        {
-          "Const": 128
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        },
-        {
-          "Const": 128
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        },
-        {
-          "Const": 128
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 7168
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 3584
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 6144
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 6144
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        },
-        {
-          "Const": 128
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        },
-        {
-          "Const": 128
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        },
-        {
-          "Const": 128
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        },
-        {
-          "Const": 128
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 7168
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 3584
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 6144
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 6144
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        },
-        {
-          "Const": 128
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        },
-        {
-          "Const": 128
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        },
-        {
-          "Const": 128
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        },
-        {
-          "Const": 128
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 7168
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 3584
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 1024
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 4096
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 512
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 512
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 512
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 512
-        }
-      ],
-      "dtype": "BF16"
+      "shape": [],
+      "dtype": "I32",
+      "raised": "fa2.prefill"
     },
     {
       "shape": [
@@ -3323,6 +1983,11 @@
       "dtype": "BF16"
     },
     {
+      "shape": [],
+      "dtype": "I32",
+      "raised": "fa2.prefill"
+    },
+    {
       "shape": [
         "Tokens",
         {
@@ -3996,6 +2661,1371 @@
         }
       ],
       "dtype": "BF16"
+    },
+    {
+      "shape": [],
+      "dtype": "I32",
+      "raised": "fa2.prefill"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 7168
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3584
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 7168
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3584
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 7168
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3584
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 7168
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3584
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [],
+      "dtype": "I32",
+      "raised": "fa2.prefill"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 7168
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3584
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 7168
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3584
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 7168
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3584
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 7168
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 3584
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [],
+      "dtype": "I32",
+      "raised": "fa2.prefill"
     },
     {
       "shape": [
@@ -4095,7 +4125,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.0.attn_norm"
           ]
@@ -4179,7 +4209,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 0
-          }
+          },
+          "params": [
+            6144,
+            4
+          ]
         }
       },
       "inputs": [
@@ -4257,7 +4291,13 @@
           "state": {
             "store": "RecurrentState",
             "layer": 0
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
@@ -4280,7 +4320,12 @@
           "state": {
             "store": "RecurrentState",
             "layer": 0
-          }
+          },
+          "params": [
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
@@ -4303,7 +4348,13 @@
           "state": {
             "store": "RecurrentState",
             "layer": 0
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
@@ -4366,7 +4417,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.0.mlp_norm"
           ]
@@ -4428,7 +4479,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.1.attn_norm"
           ]
@@ -4512,7 +4563,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 1
-          }
+          },
+          "params": [
+            6144,
+            4
+          ]
         }
       },
       "inputs": [
@@ -4590,7 +4645,13 @@
           "state": {
             "store": "RecurrentState",
             "layer": 1
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
@@ -4613,7 +4674,12 @@
           "state": {
             "store": "RecurrentState",
             "layer": 1
-          }
+          },
+          "params": [
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
@@ -4636,7 +4702,13 @@
           "state": {
             "store": "RecurrentState",
             "layer": 1
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
@@ -4699,7 +4771,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.1.mlp_norm"
           ]
@@ -4761,7 +4833,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.2.attn_norm"
           ]
@@ -4845,7 +4917,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 2
-          }
+          },
+          "params": [
+            6144,
+            4
+          ]
         }
       },
       "inputs": [
@@ -4923,7 +4999,13 @@
           "state": {
             "store": "RecurrentState",
             "layer": 2
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
@@ -4946,7 +5028,12 @@
           "state": {
             "store": "RecurrentState",
             "layer": 2
-          }
+          },
+          "params": [
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
@@ -4969,7 +5056,13 @@
           "state": {
             "store": "RecurrentState",
             "layer": 2
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
@@ -5032,7 +5125,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.2.mlp_norm"
           ]
@@ -5094,7 +5187,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.3.attn_norm"
           ]
@@ -5173,8 +5266,7 @@
       "kind": {
         "RmsnormPerHead": {
           "weight": "layer.3.q_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
+          "head_dim": 256
         }
       },
       "inputs": [
@@ -5189,8 +5281,7 @@
       "kind": {
         "RmsnormPerHead": {
           "weight": "layer.3.k_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
+          "head_dim": 256
         }
       },
       "inputs": [
@@ -5294,7 +5385,9 @@
         }
       },
       "inputs": [],
-      "outputs": [],
+      "outputs": [
+        65
+      ],
       "layer": null
     },
     {
@@ -5312,21 +5405,22 @@
         }
       },
       "inputs": [
-        63
+        63,
+        65
       ],
       "outputs": [
-        65
+        66
       ],
       "layer": 3
     },
     {
       "kind": "SigmoidGateMul",
       "inputs": [
-        65,
+        66,
         60
       ],
       "outputs": [
-        66
+        67
       ],
       "layer": 3
     },
@@ -5351,25 +5445,8 @@
         }
       },
       "inputs": [
-        66,
+        67,
         54
-      ],
-      "outputs": [
-        67
-      ],
-      "layer": 3
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
-          "weights": [
-            "layer.3.mlp_norm"
-          ]
-        }
-      },
-      "inputs": [
-        67
       ],
       "outputs": [
         68
@@ -5378,9 +5455,11 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.3.gate_up",
-          "beta_one": false
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.3.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -5393,8 +5472,9 @@
     },
     {
       "kind": {
-        "Launch": {
-          "kernel": "mlp::chunked_swiglu_bf16"
+        "Matmul": {
+          "weight": "layer.3.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -5407,14 +5487,12 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.3.down",
-          "beta_one": true
+        "Launch": {
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
-        70,
-        67
+        70
       ],
       "outputs": [
         71
@@ -5423,26 +5501,27 @@
     },
     {
       "kind": {
-        "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
-          "weights": [
-            "layer.4.attn_norm"
-          ]
+        "Matmul": {
+          "weight": "layer.3.down",
+          "beta_one": true
         }
       },
       "inputs": [
-        71
+        71,
+        68
       ],
       "outputs": [
         72
       ],
-      "layer": 4
+      "layer": 3
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.4.in_proj_qkv",
-          "beta_one": false
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.4.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -5456,15 +5535,30 @@
     {
       "kind": {
         "Matmul": {
+          "weight": "layer.4.in_proj_qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        73
+      ],
+      "outputs": [
+        74
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Matmul": {
           "weight": "layer.4.in_proj_z",
           "beta_one": false
         }
       },
       "inputs": [
-        72
+        73
       ],
       "outputs": [
-        74
+        75
       ],
       "layer": 4
     },
@@ -5476,10 +5570,10 @@
         }
       },
       "inputs": [
-        72
+        73
       ],
       "outputs": [
-        75
+        76
       ],
       "layer": 4
     },
@@ -5491,10 +5585,10 @@
         }
       },
       "inputs": [
-        72
+        73
       ],
       "outputs": [
-        76
+        77
       ],
       "layer": 4
     },
@@ -5508,14 +5602,18 @@
           "state": {
             "store": "RecurrentState",
             "layer": 4
-          }
+          },
+          "params": [
+            6144,
+            4
+          ]
         }
       },
       "inputs": [
-        73
+        74
       ],
       "outputs": [
-        77
+        78
       ],
       "layer": 4
     },
@@ -5527,16 +5625,16 @@
         }
       },
       "inputs": [
-        77,
-        75,
-        76
+        78,
+        76,
+        77
       ],
       "outputs": [
-        78,
         79,
         80,
         81,
-        82
+        82,
+        83
       ],
       "layer": 4
     },
@@ -5548,7 +5646,7 @@
         }
       },
       "inputs": [
-        78
+        79
       ],
       "outputs": [],
       "layer": 4
@@ -5575,7 +5673,7 @@
       },
       "inputs": [],
       "outputs": [
-        83
+        84
       ],
       "layer": 4
     },
@@ -5586,20 +5684,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 4
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        78,
         79,
         80,
         81,
-        82
+        82,
+        83
       ],
       "outputs": [],
       "layer": 4,
       "dest": [
-        83
+        84
       ]
     },
     {
@@ -5609,20 +5713,25 @@
           "state": {
             "store": "RecurrentState",
             "layer": 4
-          }
+          },
+          "params": [
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        78,
         79,
         80,
         81,
-        82
+        82,
+        83
       ],
       "outputs": [],
       "layer": 4,
       "dest": [
-        83
+        84
       ]
     },
     {
@@ -5632,20 +5741,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 4
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        78,
         79,
         80,
         81,
-        82
+        82,
+        83
       ],
       "outputs": [],
       "layer": 4,
       "dest": [
-        83
+        84
       ]
     },
     {
@@ -5656,7 +5771,7 @@
         }
       },
       "inputs": [
-        78
+        79
       ],
       "outputs": [],
       "layer": 4
@@ -5668,11 +5783,11 @@
         }
       },
       "inputs": [
-        83,
-        74
+        84,
+        75
       ],
       "outputs": [
-        84
+        85
       ],
       "layer": 4
     },
@@ -5684,25 +5799,8 @@
         }
       },
       "inputs": [
-        84,
-        71
-      ],
-      "outputs": [
-        85
-      ],
-      "layer": 4
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
-          "weights": [
-            "layer.4.mlp_norm"
-          ]
-        }
-      },
-      "inputs": [
-        85
+        85,
+        72
       ],
       "outputs": [
         86
@@ -5711,9 +5809,11 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.4.gate_up",
-          "beta_one": false
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.4.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -5726,8 +5826,9 @@
     },
     {
       "kind": {
-        "Launch": {
-          "kernel": "mlp::chunked_swiglu_bf16"
+        "Matmul": {
+          "weight": "layer.4.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -5740,14 +5841,12 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.4.down",
-          "beta_one": true
+        "Launch": {
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
-        88,
-        85
+        88
       ],
       "outputs": [
         89
@@ -5756,26 +5855,27 @@
     },
     {
       "kind": {
-        "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
-          "weights": [
-            "layer.5.attn_norm"
-          ]
+        "Matmul": {
+          "weight": "layer.4.down",
+          "beta_one": true
         }
       },
       "inputs": [
-        89
+        89,
+        86
       ],
       "outputs": [
         90
       ],
-      "layer": 5
+      "layer": 4
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.5.in_proj_qkv",
-          "beta_one": false
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.5.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -5789,15 +5889,30 @@
     {
       "kind": {
         "Matmul": {
+          "weight": "layer.5.in_proj_qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        91
+      ],
+      "outputs": [
+        92
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
           "weight": "layer.5.in_proj_z",
           "beta_one": false
         }
       },
       "inputs": [
-        90
+        91
       ],
       "outputs": [
-        92
+        93
       ],
       "layer": 5
     },
@@ -5809,10 +5924,10 @@
         }
       },
       "inputs": [
-        90
+        91
       ],
       "outputs": [
-        93
+        94
       ],
       "layer": 5
     },
@@ -5824,10 +5939,10 @@
         }
       },
       "inputs": [
-        90
+        91
       ],
       "outputs": [
-        94
+        95
       ],
       "layer": 5
     },
@@ -5841,14 +5956,18 @@
           "state": {
             "store": "RecurrentState",
             "layer": 5
-          }
+          },
+          "params": [
+            6144,
+            4
+          ]
         }
       },
       "inputs": [
-        91
+        92
       ],
       "outputs": [
-        95
+        96
       ],
       "layer": 5
     },
@@ -5860,16 +5979,16 @@
         }
       },
       "inputs": [
-        95,
-        93,
-        94
+        96,
+        94,
+        95
       ],
       "outputs": [
-        96,
         97,
         98,
         99,
-        100
+        100,
+        101
       ],
       "layer": 5
     },
@@ -5881,7 +6000,7 @@
         }
       },
       "inputs": [
-        96
+        97
       ],
       "outputs": [],
       "layer": 5
@@ -5908,7 +6027,7 @@
       },
       "inputs": [],
       "outputs": [
-        101
+        102
       ],
       "layer": 5
     },
@@ -5919,20 +6038,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 5
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        96,
         97,
         98,
         99,
-        100
+        100,
+        101
       ],
       "outputs": [],
       "layer": 5,
       "dest": [
-        101
+        102
       ]
     },
     {
@@ -5942,20 +6067,25 @@
           "state": {
             "store": "RecurrentState",
             "layer": 5
-          }
+          },
+          "params": [
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        96,
         97,
         98,
         99,
-        100
+        100,
+        101
       ],
       "outputs": [],
       "layer": 5,
       "dest": [
-        101
+        102
       ]
     },
     {
@@ -5965,20 +6095,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 5
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        96,
         97,
         98,
         99,
-        100
+        100,
+        101
       ],
       "outputs": [],
       "layer": 5,
       "dest": [
-        101
+        102
       ]
     },
     {
@@ -5989,7 +6125,7 @@
         }
       },
       "inputs": [
-        96
+        97
       ],
       "outputs": [],
       "layer": 5
@@ -6001,11 +6137,11 @@
         }
       },
       "inputs": [
-        101,
-        92
+        102,
+        93
       ],
       "outputs": [
-        102
+        103
       ],
       "layer": 5
     },
@@ -6017,25 +6153,8 @@
         }
       },
       "inputs": [
-        102,
-        89
-      ],
-      "outputs": [
-        103
-      ],
-      "layer": 5
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
-          "weights": [
-            "layer.5.mlp_norm"
-          ]
-        }
-      },
-      "inputs": [
-        103
+        103,
+        90
       ],
       "outputs": [
         104
@@ -6044,9 +6163,11 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.5.gate_up",
-          "beta_one": false
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.5.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -6059,8 +6180,9 @@
     },
     {
       "kind": {
-        "Launch": {
-          "kernel": "mlp::chunked_swiglu_bf16"
+        "Matmul": {
+          "weight": "layer.5.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -6073,14 +6195,12 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.5.down",
-          "beta_one": true
+        "Launch": {
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
-        106,
-        103
+        106
       ],
       "outputs": [
         107
@@ -6089,26 +6209,27 @@
     },
     {
       "kind": {
-        "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
-          "weights": [
-            "layer.6.attn_norm"
-          ]
+        "Matmul": {
+          "weight": "layer.5.down",
+          "beta_one": true
         }
       },
       "inputs": [
-        107
+        107,
+        104
       ],
       "outputs": [
         108
       ],
-      "layer": 6
+      "layer": 5
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.6.in_proj_qkv",
-          "beta_one": false
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.6.attn_norm"
+          ]
         }
       },
       "inputs": [
@@ -6122,15 +6243,30 @@
     {
       "kind": {
         "Matmul": {
+          "weight": "layer.6.in_proj_qkv",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        109
+      ],
+      "outputs": [
+        110
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Matmul": {
           "weight": "layer.6.in_proj_z",
           "beta_one": false
         }
       },
       "inputs": [
-        108
+        109
       ],
       "outputs": [
-        110
+        111
       ],
       "layer": 6
     },
@@ -6142,10 +6278,10 @@
         }
       },
       "inputs": [
-        108
+        109
       ],
       "outputs": [
-        111
+        112
       ],
       "layer": 6
     },
@@ -6157,10 +6293,10 @@
         }
       },
       "inputs": [
-        108
+        109
       ],
       "outputs": [
-        112
+        113
       ],
       "layer": 6
     },
@@ -6174,14 +6310,18 @@
           "state": {
             "store": "RecurrentState",
             "layer": 6
-          }
+          },
+          "params": [
+            6144,
+            4
+          ]
         }
       },
       "inputs": [
-        109
+        110
       ],
       "outputs": [
-        113
+        114
       ],
       "layer": 6
     },
@@ -6193,16 +6333,16 @@
         }
       },
       "inputs": [
-        113,
-        111,
-        112
+        114,
+        112,
+        113
       ],
       "outputs": [
-        114,
         115,
         116,
         117,
-        118
+        118,
+        119
       ],
       "layer": 6
     },
@@ -6214,7 +6354,7 @@
         }
       },
       "inputs": [
-        114
+        115
       ],
       "outputs": [],
       "layer": 6
@@ -6241,7 +6381,7 @@
       },
       "inputs": [],
       "outputs": [
-        119
+        120
       ],
       "layer": 6
     },
@@ -6252,20 +6392,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 6
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        114,
         115,
         116,
         117,
-        118
+        118,
+        119
       ],
       "outputs": [],
       "layer": 6,
       "dest": [
-        119
+        120
       ]
     },
     {
@@ -6275,20 +6421,25 @@
           "state": {
             "store": "RecurrentState",
             "layer": 6
-          }
+          },
+          "params": [
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        114,
         115,
         116,
         117,
-        118
+        118,
+        119
       ],
       "outputs": [],
       "layer": 6,
       "dest": [
-        119
+        120
       ]
     },
     {
@@ -6298,20 +6449,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 6
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        114,
         115,
         116,
         117,
-        118
+        118,
+        119
       ],
       "outputs": [],
       "layer": 6,
       "dest": [
-        119
+        120
       ]
     },
     {
@@ -6322,7 +6479,7 @@
         }
       },
       "inputs": [
-        114
+        115
       ],
       "outputs": [],
       "layer": 6
@@ -6334,11 +6491,11 @@
         }
       },
       "inputs": [
-        119,
-        110
+        120,
+        111
       ],
       "outputs": [
-        120
+        121
       ],
       "layer": 6
     },
@@ -6350,25 +6507,8 @@
         }
       },
       "inputs": [
-        120,
-        107
-      ],
-      "outputs": [
-        121
-      ],
-      "layer": 6
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
-          "weights": [
-            "layer.6.mlp_norm"
-          ]
-        }
-      },
-      "inputs": [
-        121
+        121,
+        108
       ],
       "outputs": [
         122
@@ -6377,9 +6517,11 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.6.gate_up",
-          "beta_one": false
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.6.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -6392,8 +6534,9 @@
     },
     {
       "kind": {
-        "Launch": {
-          "kernel": "mlp::chunked_swiglu_bf16"
+        "Matmul": {
+          "weight": "layer.6.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -6406,14 +6549,12 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.6.down",
-          "beta_one": true
+        "Launch": {
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
-        124,
-        121
+        124
       ],
       "outputs": [
         125
@@ -6422,18 +6563,34 @@
     },
     {
       "kind": {
+        "Matmul": {
+          "weight": "layer.6.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        125,
+        122
+      ],
+      "outputs": [
+        126
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.7.attn_norm"
           ]
         }
       },
       "inputs": [
-        125
+        126
       ],
       "outputs": [
-        126
+        127
       ],
       "layer": 7
     },
@@ -6445,10 +6602,10 @@
         }
       },
       "inputs": [
-        126
+        127
       ],
       "outputs": [
-        127
+        128
       ],
       "layer": 7
     },
@@ -6460,10 +6617,10 @@
         }
       },
       "inputs": [
-        126
+        127
       ],
       "outputs": [
-        128
+        129
       ],
       "layer": 7
     },
@@ -6475,10 +6632,10 @@
         }
       },
       "inputs": [
-        126
+        127
       ],
       "outputs": [
-        129
+        130
       ],
       "layer": 7
     },
@@ -6490,26 +6647,10 @@
         }
       },
       "inputs": [
-        127
+        128
       ],
       "outputs": [
-        130,
-        131
-      ],
-      "layer": 7
-    },
-    {
-      "kind": {
-        "RmsnormPerHead": {
-          "weight": "layer.7.q_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
-        }
-      },
-      "inputs": [
-        130
-      ],
-      "outputs": [
+        131,
         132
       ],
       "layer": 7
@@ -6517,16 +6658,30 @@
     {
       "kind": {
         "RmsnormPerHead": {
-          "weight": "layer.7.k_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
+          "weight": "layer.7.q_norm",
+          "head_dim": 256
         }
       },
       "inputs": [
-        128
+        131
       ],
       "outputs": [
         133
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.7.k_norm",
+          "head_dim": 256
+        }
+      },
+      "inputs": [
+        129
+      ],
+      "outputs": [
+        134
       ],
       "layer": 7
     },
@@ -6540,12 +6695,12 @@
         }
       },
       "inputs": [
-        132,
-        133
+        133,
+        134
       ],
       "outputs": [
-        134,
-        135
+        135,
+        136
       ],
       "layer": 7
     },
@@ -6557,7 +6712,7 @@
         }
       },
       "inputs": [
-        134
+        135
       ],
       "outputs": [],
       "layer": 7
@@ -6589,8 +6744,8 @@
         }
       },
       "inputs": [
-        135,
-        129
+        136,
+        130
       ],
       "outputs": [],
       "layer": 7
@@ -6606,8 +6761,8 @@
         }
       },
       "inputs": [
-        135,
-        129
+        136,
+        130
       ],
       "outputs": [],
       "layer": 7
@@ -6623,7 +6778,9 @@
         }
       },
       "inputs": [],
-      "outputs": [],
+      "outputs": [
+        137
+      ],
       "layer": null
     },
     {
@@ -6641,21 +6798,22 @@
         }
       },
       "inputs": [
-        134
+        135,
+        137
       ],
       "outputs": [
-        136
+        138
       ],
       "layer": 7
     },
     {
       "kind": "SigmoidGateMul",
       "inputs": [
-        136,
-        131
+        138,
+        132
       ],
       "outputs": [
-        137
+        139
       ],
       "layer": 7
     },
@@ -6667,7 +6825,7 @@
         }
       },
       "inputs": [
-        134
+        135
       ],
       "outputs": [],
       "layer": 7
@@ -6680,40 +6838,8 @@
         }
       },
       "inputs": [
-        137,
-        125
-      ],
-      "outputs": [
-        138
-      ],
-      "layer": 7
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
-          "weights": [
-            "layer.7.mlp_norm"
-          ]
-        }
-      },
-      "inputs": [
-        138
-      ],
-      "outputs": [
-        139
-      ],
-      "layer": 7
-    },
-    {
-      "kind": {
-        "Matmul": {
-          "weight": "layer.7.gate_up",
-          "beta_one": false
-        }
-      },
-      "inputs": [
-        139
+        139,
+        126
       ],
       "outputs": [
         140
@@ -6723,7 +6849,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "mlp::chunked_swiglu_bf16"
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.7.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -6737,13 +6866,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.7.down",
-          "beta_one": true
+          "weight": "layer.7.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
-        141,
-        138
+        141
       ],
       "outputs": [
         142
@@ -6753,10 +6881,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
-          "weights": [
-            "layer.8.attn_norm"
-          ]
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -6764,6 +6889,39 @@
       ],
       "outputs": [
         143
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.7.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        143,
+        140
+      ],
+      "outputs": [
+        144
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.8.attn_norm"
+          ]
+        }
+      },
+      "inputs": [
+        144
+      ],
+      "outputs": [
+        145
       ],
       "layer": 8
     },
@@ -6775,10 +6933,10 @@
         }
       },
       "inputs": [
-        143
+        145
       ],
       "outputs": [
-        144
+        146
       ],
       "layer": 8
     },
@@ -6790,10 +6948,10 @@
         }
       },
       "inputs": [
-        143
+        145
       ],
       "outputs": [
-        145
+        147
       ],
       "layer": 8
     },
@@ -6805,10 +6963,10 @@
         }
       },
       "inputs": [
-        143
+        145
       ],
       "outputs": [
-        146
+        148
       ],
       "layer": 8
     },
@@ -6820,10 +6978,10 @@
         }
       },
       "inputs": [
-        143
+        145
       ],
       "outputs": [
-        147
+        149
       ],
       "layer": 8
     },
@@ -6837,14 +6995,18 @@
           "state": {
             "store": "RecurrentState",
             "layer": 8
-          }
+          },
+          "params": [
+            6144,
+            4
+          ]
         }
       },
       "inputs": [
-        144
+        146
       ],
       "outputs": [
-        148
+        150
       ],
       "layer": 8
     },
@@ -6856,16 +7018,16 @@
         }
       },
       "inputs": [
+        150,
         148,
-        146,
-        147
+        149
       ],
       "outputs": [
-        149,
-        150,
         151,
         152,
-        153
+        153,
+        154,
+        155
       ],
       "layer": 8
     },
@@ -6877,7 +7039,7 @@
         }
       },
       "inputs": [
-        149
+        151
       ],
       "outputs": [],
       "layer": 8
@@ -6904,7 +7066,7 @@
       },
       "inputs": [],
       "outputs": [
-        154
+        156
       ],
       "layer": 8
     },
@@ -6915,20 +7077,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 8
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        149,
-        150,
         151,
         152,
-        153
+        153,
+        154,
+        155
       ],
       "outputs": [],
       "layer": 8,
       "dest": [
-        154
+        156
       ]
     },
     {
@@ -6938,20 +7106,25 @@
           "state": {
             "store": "RecurrentState",
             "layer": 8
-          }
+          },
+          "params": [
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        149,
-        150,
         151,
         152,
-        153
+        153,
+        154,
+        155
       ],
       "outputs": [],
       "layer": 8,
       "dest": [
-        154
+        156
       ]
     },
     {
@@ -6961,20 +7134,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 8
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        149,
-        150,
         151,
         152,
-        153
+        153,
+        154,
+        155
       ],
       "outputs": [],
       "layer": 8,
       "dest": [
-        154
+        156
       ]
     },
     {
@@ -6985,7 +7164,7 @@
         }
       },
       "inputs": [
-        149
+        151
       ],
       "outputs": [],
       "layer": 8
@@ -6997,11 +7176,11 @@
         }
       },
       "inputs": [
-        154,
-        145
+        156,
+        147
       ],
       "outputs": [
-        155
+        157
       ],
       "layer": 8
     },
@@ -7013,40 +7192,8 @@
         }
       },
       "inputs": [
-        155,
-        142
-      ],
-      "outputs": [
-        156
-      ],
-      "layer": 8
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
-          "weights": [
-            "layer.8.mlp_norm"
-          ]
-        }
-      },
-      "inputs": [
-        156
-      ],
-      "outputs": [
-        157
-      ],
-      "layer": 8
-    },
-    {
-      "kind": {
-        "Matmul": {
-          "weight": "layer.8.gate_up",
-          "beta_one": false
-        }
-      },
-      "inputs": [
-        157
+        157,
+        144
       ],
       "outputs": [
         158
@@ -7056,7 +7203,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "mlp::chunked_swiglu_bf16"
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.8.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -7070,13 +7220,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.8.down",
-          "beta_one": true
+          "weight": "layer.8.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
-        159,
-        156
+        159
       ],
       "outputs": [
         160
@@ -7086,10 +7235,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
-          "weights": [
-            "layer.9.attn_norm"
-          ]
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -7097,6 +7243,39 @@
       ],
       "outputs": [
         161
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.8.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        161,
+        158
+      ],
+      "outputs": [
+        162
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.9.attn_norm"
+          ]
+        }
+      },
+      "inputs": [
+        162
+      ],
+      "outputs": [
+        163
       ],
       "layer": 9
     },
@@ -7108,10 +7287,10 @@
         }
       },
       "inputs": [
-        161
+        163
       ],
       "outputs": [
-        162
+        164
       ],
       "layer": 9
     },
@@ -7123,10 +7302,10 @@
         }
       },
       "inputs": [
-        161
+        163
       ],
       "outputs": [
-        163
+        165
       ],
       "layer": 9
     },
@@ -7138,10 +7317,10 @@
         }
       },
       "inputs": [
-        161
+        163
       ],
       "outputs": [
-        164
+        166
       ],
       "layer": 9
     },
@@ -7153,10 +7332,10 @@
         }
       },
       "inputs": [
-        161
+        163
       ],
       "outputs": [
-        165
+        167
       ],
       "layer": 9
     },
@@ -7170,14 +7349,18 @@
           "state": {
             "store": "RecurrentState",
             "layer": 9
-          }
+          },
+          "params": [
+            6144,
+            4
+          ]
         }
       },
       "inputs": [
-        162
+        164
       ],
       "outputs": [
-        166
+        168
       ],
       "layer": 9
     },
@@ -7189,16 +7372,16 @@
         }
       },
       "inputs": [
+        168,
         166,
-        164,
-        165
+        167
       ],
       "outputs": [
-        167,
-        168,
         169,
         170,
-        171
+        171,
+        172,
+        173
       ],
       "layer": 9
     },
@@ -7210,7 +7393,7 @@
         }
       },
       "inputs": [
-        167
+        169
       ],
       "outputs": [],
       "layer": 9
@@ -7237,7 +7420,7 @@
       },
       "inputs": [],
       "outputs": [
-        172
+        174
       ],
       "layer": 9
     },
@@ -7248,20 +7431,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 9
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        167,
-        168,
         169,
         170,
-        171
+        171,
+        172,
+        173
       ],
       "outputs": [],
       "layer": 9,
       "dest": [
-        172
+        174
       ]
     },
     {
@@ -7271,20 +7460,25 @@
           "state": {
             "store": "RecurrentState",
             "layer": 9
-          }
+          },
+          "params": [
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        167,
-        168,
         169,
         170,
-        171
+        171,
+        172,
+        173
       ],
       "outputs": [],
       "layer": 9,
       "dest": [
-        172
+        174
       ]
     },
     {
@@ -7294,20 +7488,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 9
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        167,
-        168,
         169,
         170,
-        171
+        171,
+        172,
+        173
       ],
       "outputs": [],
       "layer": 9,
       "dest": [
-        172
+        174
       ]
     },
     {
@@ -7318,7 +7518,7 @@
         }
       },
       "inputs": [
-        167
+        169
       ],
       "outputs": [],
       "layer": 9
@@ -7330,11 +7530,11 @@
         }
       },
       "inputs": [
-        172,
-        163
+        174,
+        165
       ],
       "outputs": [
-        173
+        175
       ],
       "layer": 9
     },
@@ -7346,40 +7546,8 @@
         }
       },
       "inputs": [
-        173,
-        160
-      ],
-      "outputs": [
-        174
-      ],
-      "layer": 9
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
-          "weights": [
-            "layer.9.mlp_norm"
-          ]
-        }
-      },
-      "inputs": [
-        174
-      ],
-      "outputs": [
-        175
-      ],
-      "layer": 9
-    },
-    {
-      "kind": {
-        "Matmul": {
-          "weight": "layer.9.gate_up",
-          "beta_one": false
-        }
-      },
-      "inputs": [
-        175
+        175,
+        162
       ],
       "outputs": [
         176
@@ -7389,7 +7557,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "mlp::chunked_swiglu_bf16"
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.9.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -7403,13 +7574,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.9.down",
-          "beta_one": true
+          "weight": "layer.9.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
-        177,
-        174
+        177
       ],
       "outputs": [
         178
@@ -7419,10 +7589,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
-          "weights": [
-            "layer.10.attn_norm"
-          ]
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -7430,6 +7597,39 @@
       ],
       "outputs": [
         179
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.9.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        179,
+        176
+      ],
+      "outputs": [
+        180
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.10.attn_norm"
+          ]
+        }
+      },
+      "inputs": [
+        180
+      ],
+      "outputs": [
+        181
       ],
       "layer": 10
     },
@@ -7441,10 +7641,10 @@
         }
       },
       "inputs": [
-        179
+        181
       ],
       "outputs": [
-        180
+        182
       ],
       "layer": 10
     },
@@ -7456,10 +7656,10 @@
         }
       },
       "inputs": [
-        179
+        181
       ],
       "outputs": [
-        181
+        183
       ],
       "layer": 10
     },
@@ -7471,10 +7671,10 @@
         }
       },
       "inputs": [
-        179
+        181
       ],
       "outputs": [
-        182
+        184
       ],
       "layer": 10
     },
@@ -7486,10 +7686,10 @@
         }
       },
       "inputs": [
-        179
+        181
       ],
       "outputs": [
-        183
+        185
       ],
       "layer": 10
     },
@@ -7503,14 +7703,18 @@
           "state": {
             "store": "RecurrentState",
             "layer": 10
-          }
+          },
+          "params": [
+            6144,
+            4
+          ]
         }
       },
       "inputs": [
-        180
+        182
       ],
       "outputs": [
-        184
+        186
       ],
       "layer": 10
     },
@@ -7522,16 +7726,16 @@
         }
       },
       "inputs": [
+        186,
         184,
-        182,
-        183
+        185
       ],
       "outputs": [
-        185,
-        186,
         187,
         188,
-        189
+        189,
+        190,
+        191
       ],
       "layer": 10
     },
@@ -7543,7 +7747,7 @@
         }
       },
       "inputs": [
-        185
+        187
       ],
       "outputs": [],
       "layer": 10
@@ -7570,7 +7774,7 @@
       },
       "inputs": [],
       "outputs": [
-        190
+        192
       ],
       "layer": 10
     },
@@ -7581,20 +7785,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 10
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        185,
-        186,
         187,
         188,
-        189
+        189,
+        190,
+        191
       ],
       "outputs": [],
       "layer": 10,
       "dest": [
-        190
+        192
       ]
     },
     {
@@ -7604,20 +7814,25 @@
           "state": {
             "store": "RecurrentState",
             "layer": 10
-          }
+          },
+          "params": [
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        185,
-        186,
         187,
         188,
-        189
+        189,
+        190,
+        191
       ],
       "outputs": [],
       "layer": 10,
       "dest": [
-        190
+        192
       ]
     },
     {
@@ -7627,20 +7842,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 10
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        185,
-        186,
         187,
         188,
-        189
+        189,
+        190,
+        191
       ],
       "outputs": [],
       "layer": 10,
       "dest": [
-        190
+        192
       ]
     },
     {
@@ -7651,7 +7872,7 @@
         }
       },
       "inputs": [
-        185
+        187
       ],
       "outputs": [],
       "layer": 10
@@ -7663,11 +7884,11 @@
         }
       },
       "inputs": [
-        190,
-        181
+        192,
+        183
       ],
       "outputs": [
-        191
+        193
       ],
       "layer": 10
     },
@@ -7679,40 +7900,8 @@
         }
       },
       "inputs": [
-        191,
-        178
-      ],
-      "outputs": [
-        192
-      ],
-      "layer": 10
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
-          "weights": [
-            "layer.10.mlp_norm"
-          ]
-        }
-      },
-      "inputs": [
-        192
-      ],
-      "outputs": [
-        193
-      ],
-      "layer": 10
-    },
-    {
-      "kind": {
-        "Matmul": {
-          "weight": "layer.10.gate_up",
-          "beta_one": false
-        }
-      },
-      "inputs": [
-        193
+        193,
+        180
       ],
       "outputs": [
         194
@@ -7722,7 +7911,10 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "mlp::chunked_swiglu_bf16"
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.10.mlp_norm"
+          ]
         }
       },
       "inputs": [
@@ -7736,13 +7928,12 @@
     {
       "kind": {
         "Matmul": {
-          "weight": "layer.10.down",
-          "beta_one": true
+          "weight": "layer.10.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
-        195,
-        192
+        195
       ],
       "outputs": [
         196
@@ -7752,10 +7943,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
-          "weights": [
-            "layer.11.attn_norm"
-          ]
+          "kernel": "mlp::chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -7763,6 +7951,39 @@
       ],
       "outputs": [
         197
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.10.down",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        197,
+        194
+      ],
+      "outputs": [
+        198
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_bf16",
+          "weights": [
+            "layer.11.attn_norm"
+          ]
+        }
+      },
+      "inputs": [
+        198
+      ],
+      "outputs": [
+        199
       ],
       "layer": 11
     },
@@ -7774,10 +7995,10 @@
         }
       },
       "inputs": [
-        197
+        199
       ],
       "outputs": [
-        198
+        200
       ],
       "layer": 11
     },
@@ -7789,10 +8010,10 @@
         }
       },
       "inputs": [
-        197
+        199
       ],
       "outputs": [
-        199
+        201
       ],
       "layer": 11
     },
@@ -7804,10 +8025,10 @@
         }
       },
       "inputs": [
-        197
+        199
       ],
       "outputs": [
-        200
+        202
       ],
       "layer": 11
     },
@@ -7819,11 +8040,11 @@
         }
       },
       "inputs": [
-        198
+        200
       ],
       "outputs": [
-        201,
-        202
+        203,
+        204
       ],
       "layer": 11
     },
@@ -7831,15 +8052,14 @@
       "kind": {
         "RmsnormPerHead": {
           "weight": "layer.11.q_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
+          "head_dim": 256
         }
       },
       "inputs": [
-        201
+        203
       ],
       "outputs": [
-        203
+        205
       ],
       "layer": 11
     },
@@ -7847,15 +8067,14 @@
       "kind": {
         "RmsnormPerHead": {
           "weight": "layer.11.k_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
+          "head_dim": 256
         }
       },
       "inputs": [
-        199
+        201
       ],
       "outputs": [
-        204
+        206
       ],
       "layer": 11
     },
@@ -7869,12 +8088,12 @@
         }
       },
       "inputs": [
-        203,
-        204
-      ],
-      "outputs": [
         205,
         206
+      ],
+      "outputs": [
+        207,
+        208
       ],
       "layer": 11
     },
@@ -7886,7 +8105,7 @@
         }
       },
       "inputs": [
-        205
+        207
       ],
       "outputs": [],
       "layer": 11
@@ -7918,8 +8137,8 @@
         }
       },
       "inputs": [
-        206,
-        200
+        208,
+        202
       ],
       "outputs": [],
       "layer": 11
@@ -7935,8 +8154,8 @@
         }
       },
       "inputs": [
-        206,
-        200
+        208,
+        202
       ],
       "outputs": [],
       "layer": 11
@@ -7952,7 +8171,9 @@
         }
       },
       "inputs": [],
-      "outputs": [],
+      "outputs": [
+        209
+      ],
       "layer": null
     },
     {
@@ -7970,21 +8191,22 @@
         }
       },
       "inputs": [
-        205
+        207,
+        209
       ],
       "outputs": [
-        207
+        210
       ],
       "layer": 11
     },
     {
       "kind": "SigmoidGateMul",
       "inputs": [
-        207,
-        202
+        210,
+        204
       ],
       "outputs": [
-        208
+        211
       ],
       "layer": 11
     },
@@ -7996,7 +8218,7 @@
         }
       },
       "inputs": [
-        205
+        207
       ],
       "outputs": [],
       "layer": 11
@@ -8009,28 +8231,28 @@
         }
       },
       "inputs": [
-        208,
-        196
+        211,
+        198
       ],
       "outputs": [
-        209
+        212
       ],
       "layer": 11
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.11.mlp_norm"
           ]
         }
       },
       "inputs": [
-        209
+        212
       ],
       "outputs": [
-        210
+        213
       ],
       "layer": 11
     },
@@ -8042,10 +8264,10 @@
         }
       },
       "inputs": [
-        210
+        213
       ],
       "outputs": [
-        211
+        214
       ],
       "layer": 11
     },
@@ -8056,10 +8278,10 @@
         }
       },
       "inputs": [
-        211
+        214
       ],
       "outputs": [
-        212
+        215
       ],
       "layer": 11
     },
@@ -8071,28 +8293,28 @@
         }
       },
       "inputs": [
-        212,
-        209
+        215,
+        212
       ],
       "outputs": [
-        213
+        216
       ],
       "layer": 11
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.12.attn_norm"
           ]
         }
       },
       "inputs": [
-        213
+        216
       ],
       "outputs": [
-        214
+        217
       ],
       "layer": 12
     },
@@ -8104,10 +8326,10 @@
         }
       },
       "inputs": [
-        214
+        217
       ],
       "outputs": [
-        215
+        218
       ],
       "layer": 12
     },
@@ -8119,10 +8341,10 @@
         }
       },
       "inputs": [
-        214
+        217
       ],
       "outputs": [
-        216
+        219
       ],
       "layer": 12
     },
@@ -8134,10 +8356,10 @@
         }
       },
       "inputs": [
-        214
+        217
       ],
       "outputs": [
-        217
+        220
       ],
       "layer": 12
     },
@@ -8149,10 +8371,10 @@
         }
       },
       "inputs": [
-        214
+        217
       ],
       "outputs": [
-        218
+        221
       ],
       "layer": 12
     },
@@ -8166,14 +8388,18 @@
           "state": {
             "store": "RecurrentState",
             "layer": 12
-          }
+          },
+          "params": [
+            6144,
+            4
+          ]
         }
       },
       "inputs": [
-        215
+        218
       ],
       "outputs": [
-        219
+        222
       ],
       "layer": 12
     },
@@ -8185,16 +8411,16 @@
         }
       },
       "inputs": [
-        219,
-        217,
-        218
+        222,
+        220,
+        221
       ],
       "outputs": [
-        220,
-        221,
-        222,
         223,
-        224
+        224,
+        225,
+        226,
+        227
       ],
       "layer": 12
     },
@@ -8206,7 +8432,7 @@
         }
       },
       "inputs": [
-        220
+        223
       ],
       "outputs": [],
       "layer": 12
@@ -8233,7 +8459,7 @@
       },
       "inputs": [],
       "outputs": [
-        225
+        228
       ],
       "layer": 12
     },
@@ -8244,20 +8470,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 12
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        220,
-        221,
-        222,
         223,
-        224
+        224,
+        225,
+        226,
+        227
       ],
       "outputs": [],
       "layer": 12,
       "dest": [
-        225
+        228
       ]
     },
     {
@@ -8267,20 +8499,25 @@
           "state": {
             "store": "RecurrentState",
             "layer": 12
-          }
+          },
+          "params": [
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        220,
-        221,
-        222,
         223,
-        224
+        224,
+        225,
+        226,
+        227
       ],
       "outputs": [],
       "layer": 12,
       "dest": [
-        225
+        228
       ]
     },
     {
@@ -8290,20 +8527,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 12
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        220,
-        221,
-        222,
         223,
-        224
+        224,
+        225,
+        226,
+        227
       ],
       "outputs": [],
       "layer": 12,
       "dest": [
-        225
+        228
       ]
     },
     {
@@ -8314,7 +8557,7 @@
         }
       },
       "inputs": [
-        220
+        223
       ],
       "outputs": [],
       "layer": 12
@@ -8326,11 +8569,11 @@
         }
       },
       "inputs": [
-        225,
-        216
+        228,
+        219
       ],
       "outputs": [
-        226
+        229
       ],
       "layer": 12
     },
@@ -8342,28 +8585,28 @@
         }
       },
       "inputs": [
-        226,
-        213
+        229,
+        216
       ],
       "outputs": [
-        227
+        230
       ],
       "layer": 12
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.12.mlp_norm"
           ]
         }
       },
       "inputs": [
-        227
+        230
       ],
       "outputs": [
-        228
+        231
       ],
       "layer": 12
     },
@@ -8375,10 +8618,10 @@
         }
       },
       "inputs": [
-        228
+        231
       ],
       "outputs": [
-        229
+        232
       ],
       "layer": 12
     },
@@ -8389,10 +8632,10 @@
         }
       },
       "inputs": [
-        229
+        232
       ],
       "outputs": [
-        230
+        233
       ],
       "layer": 12
     },
@@ -8404,28 +8647,28 @@
         }
       },
       "inputs": [
-        230,
-        227
+        233,
+        230
       ],
       "outputs": [
-        231
+        234
       ],
       "layer": 12
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.13.attn_norm"
           ]
         }
       },
       "inputs": [
-        231
+        234
       ],
       "outputs": [
-        232
+        235
       ],
       "layer": 13
     },
@@ -8437,10 +8680,10 @@
         }
       },
       "inputs": [
-        232
+        235
       ],
       "outputs": [
-        233
+        236
       ],
       "layer": 13
     },
@@ -8452,10 +8695,10 @@
         }
       },
       "inputs": [
-        232
+        235
       ],
       "outputs": [
-        234
+        237
       ],
       "layer": 13
     },
@@ -8467,10 +8710,10 @@
         }
       },
       "inputs": [
-        232
+        235
       ],
       "outputs": [
-        235
+        238
       ],
       "layer": 13
     },
@@ -8482,10 +8725,10 @@
         }
       },
       "inputs": [
-        232
+        235
       ],
       "outputs": [
-        236
+        239
       ],
       "layer": 13
     },
@@ -8499,14 +8742,18 @@
           "state": {
             "store": "RecurrentState",
             "layer": 13
-          }
+          },
+          "params": [
+            6144,
+            4
+          ]
         }
       },
       "inputs": [
-        233
+        236
       ],
       "outputs": [
-        237
+        240
       ],
       "layer": 13
     },
@@ -8518,16 +8765,16 @@
         }
       },
       "inputs": [
-        237,
-        235,
-        236
+        240,
+        238,
+        239
       ],
       "outputs": [
-        238,
-        239,
-        240,
         241,
-        242
+        242,
+        243,
+        244,
+        245
       ],
       "layer": 13
     },
@@ -8539,7 +8786,7 @@
         }
       },
       "inputs": [
-        238
+        241
       ],
       "outputs": [],
       "layer": 13
@@ -8566,7 +8813,7 @@
       },
       "inputs": [],
       "outputs": [
-        243
+        246
       ],
       "layer": 13
     },
@@ -8577,20 +8824,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 13
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        238,
-        239,
-        240,
         241,
-        242
+        242,
+        243,
+        244,
+        245
       ],
       "outputs": [],
       "layer": 13,
       "dest": [
-        243
+        246
       ]
     },
     {
@@ -8600,20 +8853,25 @@
           "state": {
             "store": "RecurrentState",
             "layer": 13
-          }
+          },
+          "params": [
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        238,
-        239,
-        240,
         241,
-        242
+        242,
+        243,
+        244,
+        245
       ],
       "outputs": [],
       "layer": 13,
       "dest": [
-        243
+        246
       ]
     },
     {
@@ -8623,20 +8881,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 13
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        238,
-        239,
-        240,
         241,
-        242
+        242,
+        243,
+        244,
+        245
       ],
       "outputs": [],
       "layer": 13,
       "dest": [
-        243
+        246
       ]
     },
     {
@@ -8647,7 +8911,7 @@
         }
       },
       "inputs": [
-        238
+        241
       ],
       "outputs": [],
       "layer": 13
@@ -8659,11 +8923,11 @@
         }
       },
       "inputs": [
-        243,
-        234
+        246,
+        237
       ],
       "outputs": [
-        244
+        247
       ],
       "layer": 13
     },
@@ -8675,28 +8939,28 @@
         }
       },
       "inputs": [
-        244,
-        231
+        247,
+        234
       ],
       "outputs": [
-        245
+        248
       ],
       "layer": 13
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.13.mlp_norm"
           ]
         }
       },
       "inputs": [
-        245
+        248
       ],
       "outputs": [
-        246
+        249
       ],
       "layer": 13
     },
@@ -8708,10 +8972,10 @@
         }
       },
       "inputs": [
-        246
+        249
       ],
       "outputs": [
-        247
+        250
       ],
       "layer": 13
     },
@@ -8722,10 +8986,10 @@
         }
       },
       "inputs": [
-        247
+        250
       ],
       "outputs": [
-        248
+        251
       ],
       "layer": 13
     },
@@ -8737,28 +9001,28 @@
         }
       },
       "inputs": [
-        248,
-        245
+        251,
+        248
       ],
       "outputs": [
-        249
+        252
       ],
       "layer": 13
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.14.attn_norm"
           ]
         }
       },
       "inputs": [
-        249
+        252
       ],
       "outputs": [
-        250
+        253
       ],
       "layer": 14
     },
@@ -8770,10 +9034,10 @@
         }
       },
       "inputs": [
-        250
+        253
       ],
       "outputs": [
-        251
+        254
       ],
       "layer": 14
     },
@@ -8785,10 +9049,10 @@
         }
       },
       "inputs": [
-        250
+        253
       ],
       "outputs": [
-        252
+        255
       ],
       "layer": 14
     },
@@ -8800,10 +9064,10 @@
         }
       },
       "inputs": [
-        250
+        253
       ],
       "outputs": [
-        253
+        256
       ],
       "layer": 14
     },
@@ -8815,10 +9079,10 @@
         }
       },
       "inputs": [
-        250
+        253
       ],
       "outputs": [
-        254
+        257
       ],
       "layer": 14
     },
@@ -8832,14 +9096,18 @@
           "state": {
             "store": "RecurrentState",
             "layer": 14
-          }
+          },
+          "params": [
+            6144,
+            4
+          ]
         }
       },
       "inputs": [
-        251
+        254
       ],
       "outputs": [
-        255
+        258
       ],
       "layer": 14
     },
@@ -8851,16 +9119,16 @@
         }
       },
       "inputs": [
-        255,
-        253,
-        254
+        258,
+        256,
+        257
       ],
       "outputs": [
-        256,
-        257,
-        258,
         259,
-        260
+        260,
+        261,
+        262,
+        263
       ],
       "layer": 14
     },
@@ -8872,7 +9140,7 @@
         }
       },
       "inputs": [
-        256
+        259
       ],
       "outputs": [],
       "layer": 14
@@ -8899,7 +9167,7 @@
       },
       "inputs": [],
       "outputs": [
-        261
+        264
       ],
       "layer": 14
     },
@@ -8910,20 +9178,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 14
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        256,
-        257,
-        258,
         259,
-        260
+        260,
+        261,
+        262,
+        263
       ],
       "outputs": [],
       "layer": 14,
       "dest": [
-        261
+        264
       ]
     },
     {
@@ -8933,20 +9207,25 @@
           "state": {
             "store": "RecurrentState",
             "layer": 14
-          }
+          },
+          "params": [
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        256,
-        257,
-        258,
         259,
-        260
+        260,
+        261,
+        262,
+        263
       ],
       "outputs": [],
       "layer": 14,
       "dest": [
-        261
+        264
       ]
     },
     {
@@ -8956,20 +9235,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 14
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        256,
-        257,
-        258,
         259,
-        260
+        260,
+        261,
+        262,
+        263
       ],
       "outputs": [],
       "layer": 14,
       "dest": [
-        261
+        264
       ]
     },
     {
@@ -8980,7 +9265,7 @@
         }
       },
       "inputs": [
-        256
+        259
       ],
       "outputs": [],
       "layer": 14
@@ -8992,11 +9277,11 @@
         }
       },
       "inputs": [
-        261,
-        252
+        264,
+        255
       ],
       "outputs": [
-        262
+        265
       ],
       "layer": 14
     },
@@ -9008,28 +9293,28 @@
         }
       },
       "inputs": [
-        262,
-        249
+        265,
+        252
       ],
       "outputs": [
-        263
+        266
       ],
       "layer": 14
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.14.mlp_norm"
           ]
         }
       },
       "inputs": [
-        263
+        266
       ],
       "outputs": [
-        264
+        267
       ],
       "layer": 14
     },
@@ -9041,10 +9326,10 @@
         }
       },
       "inputs": [
-        264
+        267
       ],
       "outputs": [
-        265
+        268
       ],
       "layer": 14
     },
@@ -9055,10 +9340,10 @@
         }
       },
       "inputs": [
-        265
+        268
       ],
       "outputs": [
-        266
+        269
       ],
       "layer": 14
     },
@@ -9070,28 +9355,28 @@
         }
       },
       "inputs": [
-        266,
-        263
+        269,
+        266
       ],
       "outputs": [
-        267
+        270
       ],
       "layer": 14
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.15.attn_norm"
           ]
         }
       },
       "inputs": [
-        267
+        270
       ],
       "outputs": [
-        268
+        271
       ],
       "layer": 15
     },
@@ -9103,10 +9388,10 @@
         }
       },
       "inputs": [
-        268
+        271
       ],
       "outputs": [
-        269
+        272
       ],
       "layer": 15
     },
@@ -9118,10 +9403,10 @@
         }
       },
       "inputs": [
-        268
+        271
       ],
       "outputs": [
-        270
+        273
       ],
       "layer": 15
     },
@@ -9133,10 +9418,10 @@
         }
       },
       "inputs": [
-        268
+        271
       ],
       "outputs": [
-        271
+        274
       ],
       "layer": 15
     },
@@ -9148,11 +9433,11 @@
         }
       },
       "inputs": [
-        269
+        272
       ],
       "outputs": [
-        272,
-        273
+        275,
+        276
       ],
       "layer": 15
     },
@@ -9160,15 +9445,14 @@
       "kind": {
         "RmsnormPerHead": {
           "weight": "layer.15.q_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
+          "head_dim": 256
         }
       },
       "inputs": [
-        272
+        275
       ],
       "outputs": [
-        274
+        277
       ],
       "layer": 15
     },
@@ -9176,15 +9460,14 @@
       "kind": {
         "RmsnormPerHead": {
           "weight": "layer.15.k_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
+          "head_dim": 256
         }
       },
       "inputs": [
-        270
+        273
       ],
       "outputs": [
-        275
+        278
       ],
       "layer": 15
     },
@@ -9198,12 +9481,12 @@
         }
       },
       "inputs": [
-        274,
-        275
+        277,
+        278
       ],
       "outputs": [
-        276,
-        277
+        279,
+        280
       ],
       "layer": 15
     },
@@ -9215,7 +9498,7 @@
         }
       },
       "inputs": [
-        276
+        279
       ],
       "outputs": [],
       "layer": 15
@@ -9247,8 +9530,8 @@
         }
       },
       "inputs": [
-        277,
-        271
+        280,
+        274
       ],
       "outputs": [],
       "layer": 15
@@ -9264,8 +9547,8 @@
         }
       },
       "inputs": [
-        277,
-        271
+        280,
+        274
       ],
       "outputs": [],
       "layer": 15
@@ -9281,7 +9564,9 @@
         }
       },
       "inputs": [],
-      "outputs": [],
+      "outputs": [
+        281
+      ],
       "layer": null
     },
     {
@@ -9299,21 +9584,22 @@
         }
       },
       "inputs": [
-        276
+        279,
+        281
       ],
       "outputs": [
-        278
+        282
       ],
       "layer": 15
     },
     {
       "kind": "SigmoidGateMul",
       "inputs": [
-        278,
-        273
+        282,
+        276
       ],
       "outputs": [
-        279
+        283
       ],
       "layer": 15
     },
@@ -9325,7 +9611,7 @@
         }
       },
       "inputs": [
-        276
+        279
       ],
       "outputs": [],
       "layer": 15
@@ -9338,28 +9624,28 @@
         }
       },
       "inputs": [
-        279,
-        267
+        283,
+        270
       ],
       "outputs": [
-        280
+        284
       ],
       "layer": 15
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.15.mlp_norm"
           ]
         }
       },
       "inputs": [
-        280
+        284
       ],
       "outputs": [
-        281
+        285
       ],
       "layer": 15
     },
@@ -9371,10 +9657,10 @@
         }
       },
       "inputs": [
-        281
+        285
       ],
       "outputs": [
-        282
+        286
       ],
       "layer": 15
     },
@@ -9385,10 +9671,10 @@
         }
       },
       "inputs": [
-        282
+        286
       ],
       "outputs": [
-        283
+        287
       ],
       "layer": 15
     },
@@ -9400,28 +9686,28 @@
         }
       },
       "inputs": [
-        283,
-        280
+        287,
+        284
       ],
       "outputs": [
-        284
+        288
       ],
       "layer": 15
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.16.attn_norm"
           ]
         }
       },
       "inputs": [
-        284
+        288
       ],
       "outputs": [
-        285
+        289
       ],
       "layer": 16
     },
@@ -9433,10 +9719,10 @@
         }
       },
       "inputs": [
-        285
+        289
       ],
       "outputs": [
-        286
+        290
       ],
       "layer": 16
     },
@@ -9448,10 +9734,10 @@
         }
       },
       "inputs": [
-        285
+        289
       ],
       "outputs": [
-        287
+        291
       ],
       "layer": 16
     },
@@ -9463,10 +9749,10 @@
         }
       },
       "inputs": [
-        285
+        289
       ],
       "outputs": [
-        288
+        292
       ],
       "layer": 16
     },
@@ -9478,10 +9764,10 @@
         }
       },
       "inputs": [
-        285
+        289
       ],
       "outputs": [
-        289
+        293
       ],
       "layer": 16
     },
@@ -9495,14 +9781,18 @@
           "state": {
             "store": "RecurrentState",
             "layer": 16
-          }
+          },
+          "params": [
+            6144,
+            4
+          ]
         }
       },
       "inputs": [
-        286
+        290
       ],
       "outputs": [
-        290
+        294
       ],
       "layer": 16
     },
@@ -9514,16 +9804,16 @@
         }
       },
       "inputs": [
-        290,
-        288,
-        289
+        294,
+        292,
+        293
       ],
       "outputs": [
-        291,
-        292,
-        293,
-        294,
-        295
+        295,
+        296,
+        297,
+        298,
+        299
       ],
       "layer": 16
     },
@@ -9535,7 +9825,7 @@
         }
       },
       "inputs": [
-        291
+        295
       ],
       "outputs": [],
       "layer": 16
@@ -9562,7 +9852,7 @@
       },
       "inputs": [],
       "outputs": [
-        296
+        300
       ],
       "layer": 16
     },
@@ -9573,20 +9863,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 16
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        291,
-        292,
-        293,
-        294,
-        295
+        295,
+        296,
+        297,
+        298,
+        299
       ],
       "outputs": [],
       "layer": 16,
       "dest": [
-        296
+        300
       ]
     },
     {
@@ -9596,20 +9892,25 @@
           "state": {
             "store": "RecurrentState",
             "layer": 16
-          }
+          },
+          "params": [
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        291,
-        292,
-        293,
-        294,
-        295
+        295,
+        296,
+        297,
+        298,
+        299
       ],
       "outputs": [],
       "layer": 16,
       "dest": [
-        296
+        300
       ]
     },
     {
@@ -9619,20 +9920,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 16
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        291,
-        292,
-        293,
-        294,
-        295
+        295,
+        296,
+        297,
+        298,
+        299
       ],
       "outputs": [],
       "layer": 16,
       "dest": [
-        296
+        300
       ]
     },
     {
@@ -9643,7 +9950,7 @@
         }
       },
       "inputs": [
-        291
+        295
       ],
       "outputs": [],
       "layer": 16
@@ -9655,11 +9962,11 @@
         }
       },
       "inputs": [
-        296,
-        287
+        300,
+        291
       ],
       "outputs": [
-        297
+        301
       ],
       "layer": 16
     },
@@ -9671,28 +9978,28 @@
         }
       },
       "inputs": [
-        297,
-        284
+        301,
+        288
       ],
       "outputs": [
-        298
+        302
       ],
       "layer": 16
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.16.mlp_norm"
           ]
         }
       },
       "inputs": [
-        298
+        302
       ],
       "outputs": [
-        299
+        303
       ],
       "layer": 16
     },
@@ -9704,10 +10011,10 @@
         }
       },
       "inputs": [
-        299
+        303
       ],
       "outputs": [
-        300
+        304
       ],
       "layer": 16
     },
@@ -9718,10 +10025,10 @@
         }
       },
       "inputs": [
-        300
+        304
       ],
       "outputs": [
-        301
+        305
       ],
       "layer": 16
     },
@@ -9733,28 +10040,28 @@
         }
       },
       "inputs": [
-        301,
-        298
+        305,
+        302
       ],
       "outputs": [
-        302
+        306
       ],
       "layer": 16
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.17.attn_norm"
           ]
         }
       },
       "inputs": [
-        302
+        306
       ],
       "outputs": [
-        303
+        307
       ],
       "layer": 17
     },
@@ -9766,10 +10073,10 @@
         }
       },
       "inputs": [
-        303
+        307
       ],
       "outputs": [
-        304
+        308
       ],
       "layer": 17
     },
@@ -9781,10 +10088,10 @@
         }
       },
       "inputs": [
-        303
+        307
       ],
       "outputs": [
-        305
+        309
       ],
       "layer": 17
     },
@@ -9796,10 +10103,10 @@
         }
       },
       "inputs": [
-        303
+        307
       ],
       "outputs": [
-        306
+        310
       ],
       "layer": 17
     },
@@ -9811,10 +10118,10 @@
         }
       },
       "inputs": [
-        303
+        307
       ],
       "outputs": [
-        307
+        311
       ],
       "layer": 17
     },
@@ -9828,14 +10135,18 @@
           "state": {
             "store": "RecurrentState",
             "layer": 17
-          }
+          },
+          "params": [
+            6144,
+            4
+          ]
         }
       },
       "inputs": [
-        304
+        308
       ],
       "outputs": [
-        308
+        312
       ],
       "layer": 17
     },
@@ -9847,16 +10158,16 @@
         }
       },
       "inputs": [
-        308,
-        306,
-        307
+        312,
+        310,
+        311
       ],
       "outputs": [
-        309,
-        310,
-        311,
-        312,
-        313
+        313,
+        314,
+        315,
+        316,
+        317
       ],
       "layer": 17
     },
@@ -9868,7 +10179,7 @@
         }
       },
       "inputs": [
-        309
+        313
       ],
       "outputs": [],
       "layer": 17
@@ -9895,7 +10206,7 @@
       },
       "inputs": [],
       "outputs": [
-        314
+        318
       ],
       "layer": 17
     },
@@ -9906,20 +10217,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 17
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        309,
-        310,
-        311,
-        312,
-        313
+        313,
+        314,
+        315,
+        316,
+        317
       ],
       "outputs": [],
       "layer": 17,
       "dest": [
-        314
+        318
       ]
     },
     {
@@ -9929,20 +10246,25 @@
           "state": {
             "store": "RecurrentState",
             "layer": 17
-          }
+          },
+          "params": [
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        309,
-        310,
-        311,
-        312,
-        313
+        313,
+        314,
+        315,
+        316,
+        317
       ],
       "outputs": [],
       "layer": 17,
       "dest": [
-        314
+        318
       ]
     },
     {
@@ -9952,20 +10274,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 17
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        309,
-        310,
-        311,
-        312,
-        313
+        313,
+        314,
+        315,
+        316,
+        317
       ],
       "outputs": [],
       "layer": 17,
       "dest": [
-        314
+        318
       ]
     },
     {
@@ -9976,7 +10304,7 @@
         }
       },
       "inputs": [
-        309
+        313
       ],
       "outputs": [],
       "layer": 17
@@ -9988,11 +10316,11 @@
         }
       },
       "inputs": [
-        314,
-        305
+        318,
+        309
       ],
       "outputs": [
-        315
+        319
       ],
       "layer": 17
     },
@@ -10004,28 +10332,28 @@
         }
       },
       "inputs": [
-        315,
-        302
+        319,
+        306
       ],
       "outputs": [
-        316
+        320
       ],
       "layer": 17
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.17.mlp_norm"
           ]
         }
       },
       "inputs": [
-        316
+        320
       ],
       "outputs": [
-        317
+        321
       ],
       "layer": 17
     },
@@ -10037,10 +10365,10 @@
         }
       },
       "inputs": [
-        317
+        321
       ],
       "outputs": [
-        318
+        322
       ],
       "layer": 17
     },
@@ -10051,10 +10379,10 @@
         }
       },
       "inputs": [
-        318
+        322
       ],
       "outputs": [
-        319
+        323
       ],
       "layer": 17
     },
@@ -10066,28 +10394,28 @@
         }
       },
       "inputs": [
-        319,
-        316
+        323,
+        320
       ],
       "outputs": [
-        320
+        324
       ],
       "layer": 17
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.18.attn_norm"
           ]
         }
       },
       "inputs": [
-        320
+        324
       ],
       "outputs": [
-        321
+        325
       ],
       "layer": 18
     },
@@ -10099,10 +10427,10 @@
         }
       },
       "inputs": [
-        321
+        325
       ],
       "outputs": [
-        322
+        326
       ],
       "layer": 18
     },
@@ -10114,10 +10442,10 @@
         }
       },
       "inputs": [
-        321
+        325
       ],
       "outputs": [
-        323
+        327
       ],
       "layer": 18
     },
@@ -10129,10 +10457,10 @@
         }
       },
       "inputs": [
-        321
+        325
       ],
       "outputs": [
-        324
+        328
       ],
       "layer": 18
     },
@@ -10144,10 +10472,10 @@
         }
       },
       "inputs": [
-        321
+        325
       ],
       "outputs": [
-        325
+        329
       ],
       "layer": 18
     },
@@ -10161,14 +10489,18 @@
           "state": {
             "store": "RecurrentState",
             "layer": 18
-          }
+          },
+          "params": [
+            6144,
+            4
+          ]
         }
       },
       "inputs": [
-        322
+        326
       ],
       "outputs": [
-        326
+        330
       ],
       "layer": 18
     },
@@ -10180,16 +10512,16 @@
         }
       },
       "inputs": [
-        326,
-        324,
-        325
+        330,
+        328,
+        329
       ],
       "outputs": [
-        327,
-        328,
-        329,
-        330,
-        331
+        331,
+        332,
+        333,
+        334,
+        335
       ],
       "layer": 18
     },
@@ -10201,7 +10533,7 @@
         }
       },
       "inputs": [
-        327
+        331
       ],
       "outputs": [],
       "layer": 18
@@ -10228,7 +10560,7 @@
       },
       "inputs": [],
       "outputs": [
-        332
+        336
       ],
       "layer": 18
     },
@@ -10239,20 +10571,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 18
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        327,
-        328,
-        329,
-        330,
-        331
+        331,
+        332,
+        333,
+        334,
+        335
       ],
       "outputs": [],
       "layer": 18,
       "dest": [
-        332
+        336
       ]
     },
     {
@@ -10262,20 +10600,25 @@
           "state": {
             "store": "RecurrentState",
             "layer": 18
-          }
+          },
+          "params": [
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        327,
-        328,
-        329,
-        330,
-        331
+        331,
+        332,
+        333,
+        334,
+        335
       ],
       "outputs": [],
       "layer": 18,
       "dest": [
-        332
+        336
       ]
     },
     {
@@ -10285,20 +10628,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 18
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        327,
-        328,
-        329,
-        330,
-        331
+        331,
+        332,
+        333,
+        334,
+        335
       ],
       "outputs": [],
       "layer": 18,
       "dest": [
-        332
+        336
       ]
     },
     {
@@ -10309,7 +10658,7 @@
         }
       },
       "inputs": [
-        327
+        331
       ],
       "outputs": [],
       "layer": 18
@@ -10321,11 +10670,11 @@
         }
       },
       "inputs": [
-        332,
-        323
+        336,
+        327
       ],
       "outputs": [
-        333
+        337
       ],
       "layer": 18
     },
@@ -10337,28 +10686,28 @@
         }
       },
       "inputs": [
-        333,
-        320
+        337,
+        324
       ],
       "outputs": [
-        334
+        338
       ],
       "layer": 18
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.18.mlp_norm"
           ]
         }
       },
       "inputs": [
-        334
+        338
       ],
       "outputs": [
-        335
+        339
       ],
       "layer": 18
     },
@@ -10370,10 +10719,10 @@
         }
       },
       "inputs": [
-        335
+        339
       ],
       "outputs": [
-        336
+        340
       ],
       "layer": 18
     },
@@ -10384,10 +10733,10 @@
         }
       },
       "inputs": [
-        336
+        340
       ],
       "outputs": [
-        337
+        341
       ],
       "layer": 18
     },
@@ -10399,28 +10748,28 @@
         }
       },
       "inputs": [
-        337,
-        334
+        341,
+        338
       ],
       "outputs": [
-        338
+        342
       ],
       "layer": 18
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.19.attn_norm"
           ]
         }
       },
       "inputs": [
-        338
+        342
       ],
       "outputs": [
-        339
+        343
       ],
       "layer": 19
     },
@@ -10432,10 +10781,10 @@
         }
       },
       "inputs": [
-        339
+        343
       ],
       "outputs": [
-        340
+        344
       ],
       "layer": 19
     },
@@ -10444,53 +10793,6 @@
         "Matmul": {
           "weight": "layer.19.k_proj",
           "beta_one": false
-        }
-      },
-      "inputs": [
-        339
-      ],
-      "outputs": [
-        341
-      ],
-      "layer": 19
-    },
-    {
-      "kind": {
-        "Matmul": {
-          "weight": "layer.19.v_proj",
-          "beta_one": false
-        }
-      },
-      "inputs": [
-        339
-      ],
-      "outputs": [
-        342
-      ],
-      "layer": 19
-    },
-    {
-      "kind": {
-        "SplitQGate": {
-          "heads": 8,
-          "head_dim": 256
-        }
-      },
-      "inputs": [
-        340
-      ],
-      "outputs": [
-        343,
-        344
-      ],
-      "layer": 19
-    },
-    {
-      "kind": {
-        "RmsnormPerHead": {
-          "weight": "layer.19.q_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
         }
       },
       "inputs": [
@@ -10503,17 +10805,62 @@
     },
     {
       "kind": {
-        "RmsnormPerHead": {
-          "weight": "layer.19.k_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
+        "Matmul": {
+          "weight": "layer.19.v_proj",
+          "beta_one": false
         }
       },
       "inputs": [
-        341
+        343
       ],
       "outputs": [
         346
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "SplitQGate": {
+          "heads": 8,
+          "head_dim": 256
+        }
+      },
+      "inputs": [
+        344
+      ],
+      "outputs": [
+        347,
+        348
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.19.q_norm",
+          "head_dim": 256
+        }
+      },
+      "inputs": [
+        347
+      ],
+      "outputs": [
+        349
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.19.k_norm",
+          "head_dim": 256
+        }
+      },
+      "inputs": [
+        345
+      ],
+      "outputs": [
+        350
       ],
       "layer": 19
     },
@@ -10527,12 +10874,12 @@
         }
       },
       "inputs": [
-        345,
-        346
+        349,
+        350
       ],
       "outputs": [
-        347,
-        348
+        351,
+        352
       ],
       "layer": 19
     },
@@ -10544,7 +10891,7 @@
         }
       },
       "inputs": [
-        347
+        351
       ],
       "outputs": [],
       "layer": 19
@@ -10576,8 +10923,8 @@
         }
       },
       "inputs": [
-        348,
-        342
+        352,
+        346
       ],
       "outputs": [],
       "layer": 19
@@ -10593,8 +10940,8 @@
         }
       },
       "inputs": [
-        348,
-        342
+        352,
+        346
       ],
       "outputs": [],
       "layer": 19
@@ -10610,7 +10957,9 @@
         }
       },
       "inputs": [],
-      "outputs": [],
+      "outputs": [
+        353
+      ],
       "layer": null
     },
     {
@@ -10628,21 +10977,22 @@
         }
       },
       "inputs": [
-        347
+        351,
+        353
       ],
       "outputs": [
-        349
+        354
       ],
       "layer": 19
     },
     {
       "kind": "SigmoidGateMul",
       "inputs": [
-        349,
-        344
+        354,
+        348
       ],
       "outputs": [
-        350
+        355
       ],
       "layer": 19
     },
@@ -10654,7 +11004,7 @@
         }
       },
       "inputs": [
-        347
+        351
       ],
       "outputs": [],
       "layer": 19
@@ -10667,28 +11017,28 @@
         }
       },
       "inputs": [
-        350,
-        338
+        355,
+        342
       ],
       "outputs": [
-        351
+        356
       ],
       "layer": 19
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.19.mlp_norm"
           ]
         }
       },
       "inputs": [
-        351
+        356
       ],
       "outputs": [
-        352
+        357
       ],
       "layer": 19
     },
@@ -10700,10 +11050,10 @@
         }
       },
       "inputs": [
-        352
+        357
       ],
       "outputs": [
-        353
+        358
       ],
       "layer": 19
     },
@@ -10714,10 +11064,10 @@
         }
       },
       "inputs": [
-        353
+        358
       ],
       "outputs": [
-        354
+        359
       ],
       "layer": 19
     },
@@ -10729,28 +11079,28 @@
         }
       },
       "inputs": [
-        354,
-        351
+        359,
+        356
       ],
       "outputs": [
-        355
+        360
       ],
       "layer": 19
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.20.attn_norm"
           ]
         }
       },
       "inputs": [
-        355
+        360
       ],
       "outputs": [
-        356
+        361
       ],
       "layer": 20
     },
@@ -10762,10 +11112,10 @@
         }
       },
       "inputs": [
-        356
+        361
       ],
       "outputs": [
-        357
+        362
       ],
       "layer": 20
     },
@@ -10777,10 +11127,10 @@
         }
       },
       "inputs": [
-        356
+        361
       ],
       "outputs": [
-        358
+        363
       ],
       "layer": 20
     },
@@ -10792,10 +11142,10 @@
         }
       },
       "inputs": [
-        356
+        361
       ],
       "outputs": [
-        359
+        364
       ],
       "layer": 20
     },
@@ -10807,10 +11157,10 @@
         }
       },
       "inputs": [
-        356
+        361
       ],
       "outputs": [
-        360
+        365
       ],
       "layer": 20
     },
@@ -10824,14 +11174,18 @@
           "state": {
             "store": "RecurrentState",
             "layer": 20
-          }
+          },
+          "params": [
+            6144,
+            4
+          ]
         }
       },
       "inputs": [
-        357
+        362
       ],
       "outputs": [
-        361
+        366
       ],
       "layer": 20
     },
@@ -10843,16 +11197,16 @@
         }
       },
       "inputs": [
-        361,
-        359,
-        360
+        366,
+        364,
+        365
       ],
       "outputs": [
-        362,
-        363,
-        364,
-        365,
-        366
+        367,
+        368,
+        369,
+        370,
+        371
       ],
       "layer": 20
     },
@@ -10864,7 +11218,7 @@
         }
       },
       "inputs": [
-        362
+        367
       ],
       "outputs": [],
       "layer": 20
@@ -10891,7 +11245,7 @@
       },
       "inputs": [],
       "outputs": [
-        367
+        372
       ],
       "layer": 20
     },
@@ -10902,20 +11256,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 20
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        362,
-        363,
-        364,
-        365,
-        366
+        367,
+        368,
+        369,
+        370,
+        371
       ],
       "outputs": [],
       "layer": 20,
       "dest": [
-        367
+        372
       ]
     },
     {
@@ -10925,20 +11285,25 @@
           "state": {
             "store": "RecurrentState",
             "layer": 20
-          }
+          },
+          "params": [
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        362,
-        363,
-        364,
-        365,
-        366
+        367,
+        368,
+        369,
+        370,
+        371
       ],
       "outputs": [],
       "layer": 20,
       "dest": [
-        367
+        372
       ]
     },
     {
@@ -10948,20 +11313,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 20
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        362,
-        363,
-        364,
-        365,
-        366
+        367,
+        368,
+        369,
+        370,
+        371
       ],
       "outputs": [],
       "layer": 20,
       "dest": [
-        367
+        372
       ]
     },
     {
@@ -10972,7 +11343,7 @@
         }
       },
       "inputs": [
-        362
+        367
       ],
       "outputs": [],
       "layer": 20
@@ -10984,11 +11355,11 @@
         }
       },
       "inputs": [
-        367,
-        358
+        372,
+        363
       ],
       "outputs": [
-        368
+        373
       ],
       "layer": 20
     },
@@ -11000,28 +11371,28 @@
         }
       },
       "inputs": [
-        368,
-        355
+        373,
+        360
       ],
       "outputs": [
-        369
+        374
       ],
       "layer": 20
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.20.mlp_norm"
           ]
         }
       },
       "inputs": [
-        369
+        374
       ],
       "outputs": [
-        370
+        375
       ],
       "layer": 20
     },
@@ -11033,10 +11404,10 @@
         }
       },
       "inputs": [
-        370
+        375
       ],
       "outputs": [
-        371
+        376
       ],
       "layer": 20
     },
@@ -11047,10 +11418,10 @@
         }
       },
       "inputs": [
-        371
+        376
       ],
       "outputs": [
-        372
+        377
       ],
       "layer": 20
     },
@@ -11062,28 +11433,28 @@
         }
       },
       "inputs": [
-        372,
-        369
+        377,
+        374
       ],
       "outputs": [
-        373
+        378
       ],
       "layer": 20
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.21.attn_norm"
           ]
         }
       },
       "inputs": [
-        373
+        378
       ],
       "outputs": [
-        374
+        379
       ],
       "layer": 21
     },
@@ -11095,10 +11466,10 @@
         }
       },
       "inputs": [
-        374
+        379
       ],
       "outputs": [
-        375
+        380
       ],
       "layer": 21
     },
@@ -11110,10 +11481,10 @@
         }
       },
       "inputs": [
-        374
+        379
       ],
       "outputs": [
-        376
+        381
       ],
       "layer": 21
     },
@@ -11125,10 +11496,10 @@
         }
       },
       "inputs": [
-        374
+        379
       ],
       "outputs": [
-        377
+        382
       ],
       "layer": 21
     },
@@ -11140,10 +11511,10 @@
         }
       },
       "inputs": [
-        374
+        379
       ],
       "outputs": [
-        378
+        383
       ],
       "layer": 21
     },
@@ -11157,14 +11528,18 @@
           "state": {
             "store": "RecurrentState",
             "layer": 21
-          }
+          },
+          "params": [
+            6144,
+            4
+          ]
         }
       },
       "inputs": [
-        375
+        380
       ],
       "outputs": [
-        379
+        384
       ],
       "layer": 21
     },
@@ -11176,16 +11551,16 @@
         }
       },
       "inputs": [
-        379,
-        377,
-        378
+        384,
+        382,
+        383
       ],
       "outputs": [
-        380,
-        381,
-        382,
-        383,
-        384
+        385,
+        386,
+        387,
+        388,
+        389
       ],
       "layer": 21
     },
@@ -11197,7 +11572,7 @@
         }
       },
       "inputs": [
-        380
+        385
       ],
       "outputs": [],
       "layer": 21
@@ -11224,7 +11599,7 @@
       },
       "inputs": [],
       "outputs": [
-        385
+        390
       ],
       "layer": 21
     },
@@ -11235,20 +11610,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 21
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        380,
-        381,
-        382,
-        383,
-        384
+        385,
+        386,
+        387,
+        388,
+        389
       ],
       "outputs": [],
       "layer": 21,
       "dest": [
-        385
+        390
       ]
     },
     {
@@ -11258,20 +11639,25 @@
           "state": {
             "store": "RecurrentState",
             "layer": 21
-          }
+          },
+          "params": [
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        380,
-        381,
-        382,
-        383,
-        384
+        385,
+        386,
+        387,
+        388,
+        389
       ],
       "outputs": [],
       "layer": 21,
       "dest": [
-        385
+        390
       ]
     },
     {
@@ -11281,20 +11667,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 21
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        380,
-        381,
-        382,
-        383,
-        384
+        385,
+        386,
+        387,
+        388,
+        389
       ],
       "outputs": [],
       "layer": 21,
       "dest": [
-        385
+        390
       ]
     },
     {
@@ -11305,7 +11697,7 @@
         }
       },
       "inputs": [
-        380
+        385
       ],
       "outputs": [],
       "layer": 21
@@ -11317,11 +11709,11 @@
         }
       },
       "inputs": [
-        385,
-        376
+        390,
+        381
       ],
       "outputs": [
-        386
+        391
       ],
       "layer": 21
     },
@@ -11333,28 +11725,28 @@
         }
       },
       "inputs": [
-        386,
-        373
+        391,
+        378
       ],
       "outputs": [
-        387
+        392
       ],
       "layer": 21
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.21.mlp_norm"
           ]
         }
       },
       "inputs": [
-        387
+        392
       ],
       "outputs": [
-        388
+        393
       ],
       "layer": 21
     },
@@ -11366,10 +11758,10 @@
         }
       },
       "inputs": [
-        388
+        393
       ],
       "outputs": [
-        389
+        394
       ],
       "layer": 21
     },
@@ -11380,10 +11772,10 @@
         }
       },
       "inputs": [
-        389
+        394
       ],
       "outputs": [
-        390
+        395
       ],
       "layer": 21
     },
@@ -11395,28 +11787,28 @@
         }
       },
       "inputs": [
-        390,
-        387
+        395,
+        392
       ],
       "outputs": [
-        391
+        396
       ],
       "layer": 21
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.22.attn_norm"
           ]
         }
       },
       "inputs": [
-        391
+        396
       ],
       "outputs": [
-        392
+        397
       ],
       "layer": 22
     },
@@ -11428,10 +11820,10 @@
         }
       },
       "inputs": [
-        392
+        397
       ],
       "outputs": [
-        393
+        398
       ],
       "layer": 22
     },
@@ -11443,10 +11835,10 @@
         }
       },
       "inputs": [
-        392
+        397
       ],
       "outputs": [
-        394
+        399
       ],
       "layer": 22
     },
@@ -11458,10 +11850,10 @@
         }
       },
       "inputs": [
-        392
+        397
       ],
       "outputs": [
-        395
+        400
       ],
       "layer": 22
     },
@@ -11473,10 +11865,10 @@
         }
       },
       "inputs": [
-        392
+        397
       ],
       "outputs": [
-        396
+        401
       ],
       "layer": 22
     },
@@ -11490,14 +11882,18 @@
           "state": {
             "store": "RecurrentState",
             "layer": 22
-          }
+          },
+          "params": [
+            6144,
+            4
+          ]
         }
       },
       "inputs": [
-        393
+        398
       ],
       "outputs": [
-        397
+        402
       ],
       "layer": 22
     },
@@ -11509,16 +11905,16 @@
         }
       },
       "inputs": [
-        397,
-        395,
-        396
+        402,
+        400,
+        401
       ],
       "outputs": [
-        398,
-        399,
-        400,
-        401,
-        402
+        403,
+        404,
+        405,
+        406,
+        407
       ],
       "layer": 22
     },
@@ -11530,7 +11926,7 @@
         }
       },
       "inputs": [
-        398
+        403
       ],
       "outputs": [],
       "layer": 22
@@ -11557,7 +11953,7 @@
       },
       "inputs": [],
       "outputs": [
-        403
+        408
       ],
       "layer": 22
     },
@@ -11568,20 +11964,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 22
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        398,
-        399,
-        400,
-        401,
-        402
+        403,
+        404,
+        405,
+        406,
+        407
       ],
       "outputs": [],
       "layer": 22,
       "dest": [
-        403
+        408
       ]
     },
     {
@@ -11591,20 +11993,25 @@
           "state": {
             "store": "RecurrentState",
             "layer": 22
-          }
+          },
+          "params": [
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        398,
-        399,
-        400,
-        401,
-        402
+        403,
+        404,
+        405,
+        406,
+        407
       ],
       "outputs": [],
       "layer": 22,
       "dest": [
-        403
+        408
       ]
     },
     {
@@ -11614,20 +12021,26 @@
           "state": {
             "store": "RecurrentState",
             "layer": 22
-          }
+          },
+          "params": [
+            16,
+            16,
+            128,
+            128
+          ]
         }
       },
       "inputs": [
-        398,
-        399,
-        400,
-        401,
-        402
+        403,
+        404,
+        405,
+        406,
+        407
       ],
       "outputs": [],
       "layer": 22,
       "dest": [
-        403
+        408
       ]
     },
     {
@@ -11638,7 +12051,7 @@
         }
       },
       "inputs": [
-        398
+        403
       ],
       "outputs": [],
       "layer": 22
@@ -11650,11 +12063,11 @@
         }
       },
       "inputs": [
-        403,
-        394
+        408,
+        399
       ],
       "outputs": [
-        404
+        409
       ],
       "layer": 22
     },
@@ -11666,28 +12079,28 @@
         }
       },
       "inputs": [
-        404,
-        391
+        409,
+        396
       ],
       "outputs": [
-        405
+        410
       ],
       "layer": 22
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.22.mlp_norm"
           ]
         }
       },
       "inputs": [
-        405
+        410
       ],
       "outputs": [
-        406
+        411
       ],
       "layer": 22
     },
@@ -11699,10 +12112,10 @@
         }
       },
       "inputs": [
-        406
+        411
       ],
       "outputs": [
-        407
+        412
       ],
       "layer": 22
     },
@@ -11713,10 +12126,10 @@
         }
       },
       "inputs": [
-        407
+        412
       ],
       "outputs": [
-        408
+        413
       ],
       "layer": 22
     },
@@ -11728,28 +12141,28 @@
         }
       },
       "inputs": [
-        408,
-        405
+        413,
+        410
       ],
       "outputs": [
-        409
+        414
       ],
       "layer": 22
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.23.attn_norm"
           ]
         }
       },
       "inputs": [
-        409
+        414
       ],
       "outputs": [
-        410
+        415
       ],
       "layer": 23
     },
@@ -11761,10 +12174,10 @@
         }
       },
       "inputs": [
-        410
+        415
       ],
       "outputs": [
-        411
+        416
       ],
       "layer": 23
     },
@@ -11776,10 +12189,10 @@
         }
       },
       "inputs": [
-        410
+        415
       ],
       "outputs": [
-        412
+        417
       ],
       "layer": 23
     },
@@ -11791,10 +12204,10 @@
         }
       },
       "inputs": [
-        410
+        415
       ],
       "outputs": [
-        413
+        418
       ],
       "layer": 23
     },
@@ -11806,11 +12219,11 @@
         }
       },
       "inputs": [
-        411
+        416
       ],
       "outputs": [
-        414,
-        415
+        419,
+        420
       ],
       "layer": 23
     },
@@ -11818,15 +12231,14 @@
       "kind": {
         "RmsnormPerHead": {
           "weight": "layer.23.q_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
+          "head_dim": 256
         }
       },
       "inputs": [
-        414
+        419
       ],
       "outputs": [
-        416
+        421
       ],
       "layer": 23
     },
@@ -11834,15 +12246,14 @@
       "kind": {
         "RmsnormPerHead": {
           "weight": "layer.23.k_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
+          "head_dim": 256
         }
       },
       "inputs": [
-        412
+        417
       ],
       "outputs": [
-        417
+        422
       ],
       "layer": 23
     },
@@ -11856,12 +12267,12 @@
         }
       },
       "inputs": [
-        416,
-        417
+        421,
+        422
       ],
       "outputs": [
-        418,
-        419
+        423,
+        424
       ],
       "layer": 23
     },
@@ -11873,7 +12284,7 @@
         }
       },
       "inputs": [
-        418
+        423
       ],
       "outputs": [],
       "layer": 23
@@ -11905,8 +12316,8 @@
         }
       },
       "inputs": [
-        419,
-        413
+        424,
+        418
       ],
       "outputs": [],
       "layer": 23
@@ -11922,8 +12333,8 @@
         }
       },
       "inputs": [
-        419,
-        413
+        424,
+        418
       ],
       "outputs": [],
       "layer": 23
@@ -11939,7 +12350,9 @@
         }
       },
       "inputs": [],
-      "outputs": [],
+      "outputs": [
+        425
+      ],
       "layer": null
     },
     {
@@ -11957,21 +12370,22 @@
         }
       },
       "inputs": [
-        418
+        423,
+        425
       ],
       "outputs": [
-        420
+        426
       ],
       "layer": 23
     },
     {
       "kind": "SigmoidGateMul",
       "inputs": [
-        420,
-        415
+        426,
+        420
       ],
       "outputs": [
-        421
+        427
       ],
       "layer": 23
     },
@@ -11983,7 +12397,7 @@
         }
       },
       "inputs": [
-        418
+        423
       ],
       "outputs": [],
       "layer": 23
@@ -11996,28 +12410,28 @@
         }
       },
       "inputs": [
-        421,
-        409
+        427,
+        414
       ],
       "outputs": [
-        422
+        428
       ],
       "layer": 23
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.23.mlp_norm"
           ]
         }
       },
       "inputs": [
-        422
+        428
       ],
       "outputs": [
-        423
+        429
       ],
       "layer": 23
     },
@@ -12029,10 +12443,10 @@
         }
       },
       "inputs": [
-        423
+        429
       ],
       "outputs": [
-        424
+        430
       ],
       "layer": 23
     },
@@ -12043,10 +12457,10 @@
         }
       },
       "inputs": [
-        424
+        430
       ],
       "outputs": [
-        425
+        431
       ],
       "layer": 23
     },
@@ -12058,28 +12472,28 @@
         }
       },
       "inputs": [
-        425,
-        422
+        431,
+        428
       ],
       "outputs": [
-        426
+        432
       ],
       "layer": 23
     },
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "final_norm"
           ]
         }
       },
       "inputs": [
-        426
+        432
       ],
       "outputs": [
-        427
+        433
       ],
       "layer": null
     },
@@ -12090,10 +12504,10 @@
         }
       },
       "inputs": [
-        427
+        433
       ],
       "outputs": [
-        428
+        434
       ],
       "layer": null
     }
@@ -12171,7 +12585,7 @@
       "layer": 4,
       "op": 86,
       "values": [
-        78
+        79
       ]
     },
     {
@@ -12179,7 +12593,7 @@
       "layer": 4,
       "op": 91,
       "values": [
-        78
+        79
       ]
     },
     {
@@ -12187,7 +12601,7 @@
       "layer": 5,
       "op": 105,
       "values": [
-        96
+        97
       ]
     },
     {
@@ -12195,7 +12609,7 @@
       "layer": 5,
       "op": 110,
       "values": [
-        96
+        97
       ]
     },
     {
@@ -12203,7 +12617,7 @@
       "layer": 6,
       "op": 124,
       "values": [
-        114
+        115
       ]
     },
     {
@@ -12211,7 +12625,7 @@
       "layer": 6,
       "op": 129,
       "values": [
-        114
+        115
       ]
     },
     {
@@ -12219,7 +12633,7 @@
       "layer": 7,
       "op": 144,
       "values": [
-        134
+        135
       ]
     },
     {
@@ -12227,7 +12641,7 @@
       "layer": 7,
       "op": 151,
       "values": [
-        134
+        135
       ]
     },
     {
@@ -12235,7 +12649,7 @@
       "layer": 8,
       "op": 164,
       "values": [
-        149
+        151
       ]
     },
     {
@@ -12243,7 +12657,7 @@
       "layer": 8,
       "op": 169,
       "values": [
-        149
+        151
       ]
     },
     {
@@ -12251,7 +12665,7 @@
       "layer": 9,
       "op": 183,
       "values": [
-        167
+        169
       ]
     },
     {
@@ -12259,7 +12673,7 @@
       "layer": 9,
       "op": 188,
       "values": [
-        167
+        169
       ]
     },
     {
@@ -12267,7 +12681,7 @@
       "layer": 10,
       "op": 202,
       "values": [
-        185
+        187
       ]
     },
     {
@@ -12275,7 +12689,7 @@
       "layer": 10,
       "op": 207,
       "values": [
-        185
+        187
       ]
     },
     {
@@ -12283,7 +12697,7 @@
       "layer": 11,
       "op": 222,
       "values": [
-        205
+        207
       ]
     },
     {
@@ -12291,7 +12705,7 @@
       "layer": 11,
       "op": 229,
       "values": [
-        205
+        207
       ]
     },
     {
@@ -12299,7 +12713,7 @@
       "layer": 12,
       "op": 242,
       "values": [
-        220
+        223
       ]
     },
     {
@@ -12307,7 +12721,7 @@
       "layer": 12,
       "op": 247,
       "values": [
-        220
+        223
       ]
     },
     {
@@ -12315,7 +12729,7 @@
       "layer": 13,
       "op": 261,
       "values": [
-        238
+        241
       ]
     },
     {
@@ -12323,7 +12737,7 @@
       "layer": 13,
       "op": 266,
       "values": [
-        238
+        241
       ]
     },
     {
@@ -12331,7 +12745,7 @@
       "layer": 14,
       "op": 280,
       "values": [
-        256
+        259
       ]
     },
     {
@@ -12339,7 +12753,7 @@
       "layer": 14,
       "op": 285,
       "values": [
-        256
+        259
       ]
     },
     {
@@ -12347,7 +12761,7 @@
       "layer": 15,
       "op": 300,
       "values": [
-        276
+        279
       ]
     },
     {
@@ -12355,7 +12769,7 @@
       "layer": 15,
       "op": 307,
       "values": [
-        276
+        279
       ]
     },
     {
@@ -12363,7 +12777,7 @@
       "layer": 16,
       "op": 320,
       "values": [
-        291
+        295
       ]
     },
     {
@@ -12371,7 +12785,7 @@
       "layer": 16,
       "op": 325,
       "values": [
-        291
+        295
       ]
     },
     {
@@ -12379,7 +12793,7 @@
       "layer": 17,
       "op": 339,
       "values": [
-        309
+        313
       ]
     },
     {
@@ -12387,7 +12801,7 @@
       "layer": 17,
       "op": 344,
       "values": [
-        309
+        313
       ]
     },
     {
@@ -12395,7 +12809,7 @@
       "layer": 18,
       "op": 358,
       "values": [
-        327
+        331
       ]
     },
     {
@@ -12403,7 +12817,7 @@
       "layer": 18,
       "op": 363,
       "values": [
-        327
+        331
       ]
     },
     {
@@ -12411,7 +12825,7 @@
       "layer": 19,
       "op": 378,
       "values": [
-        347
+        351
       ]
     },
     {
@@ -12419,7 +12833,7 @@
       "layer": 19,
       "op": 385,
       "values": [
-        347
+        351
       ]
     },
     {
@@ -12427,7 +12841,7 @@
       "layer": 20,
       "op": 398,
       "values": [
-        362
+        367
       ]
     },
     {
@@ -12435,7 +12849,7 @@
       "layer": 20,
       "op": 403,
       "values": [
-        362
+        367
       ]
     },
     {
@@ -12443,7 +12857,7 @@
       "layer": 21,
       "op": 417,
       "values": [
-        380
+        385
       ]
     },
     {
@@ -12451,7 +12865,7 @@
       "layer": 21,
       "op": 422,
       "values": [
-        380
+        385
       ]
     },
     {
@@ -12459,7 +12873,7 @@
       "layer": 22,
       "op": 436,
       "values": [
-        398
+        403
       ]
     },
     {
@@ -12467,7 +12881,7 @@
       "layer": 22,
       "op": 441,
       "values": [
-        398
+        403
       ]
     },
     {
@@ -12475,7 +12889,7 @@
       "layer": 23,
       "op": 456,
       "values": [
-        418
+        423
       ]
     },
     {
@@ -12483,13 +12897,13 @@
       "layer": 23,
       "op": 463,
       "values": [
-        418
+        423
       ]
     },
     {
       "seam": "out",
       "values": [
-        428
+        434
       ]
     }
   ]

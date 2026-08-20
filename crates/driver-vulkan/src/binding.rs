@@ -206,6 +206,10 @@ impl std::fmt::Display for Unbindable {
                 if *values { "value" } else { "key" }
             ),
             Self::NoDriverResource(what) => write!(f, "the driver holds no {what:?} table"),
+            Self::NotOnThisPlane { key } => write!(
+                f,
+                "the raise `{key}` is a host aggregate and no Vulkan plane binds one"
+            ),
             Self::Unaddressable(why) => write!(f, "{why}"),
         }
     }
@@ -278,6 +282,17 @@ pub enum Unbindable {
         /// Which table.
         FireTable,
     ),
+    /// The plan places a raise and no shader plane binds one.
+    ///
+    /// Not "not yet": a raise is a HOST aggregate a routine body reads to fill
+    /// the block a kernel takes, and this plane's bodies read their parameters
+    /// out of a push range or a storage block. Nothing here has one to hold,
+    /// so a lowering that reached this arm states an operand for a backend
+    /// that cannot have it -- a trace built for the wrong plane.
+    NotOnThisPlane {
+        /// The word the raise was declared under.
+        key: String,
+    },
     /// The device cannot address the offset or extent this operand needs.
     ///
     /// Carries what [`Bound::within`] said, so an alignment failure and a
@@ -305,7 +320,10 @@ pub fn extent(arg: &Arg, launch: &Launch) -> Option<u64> {
                     .saturating_mul(u64::from(*bytes)),
             )
         }
-        Arg::Named { .. } | Arg::Weight(_) => None,
+        // NO RECTANGLE TO MEASURE. A raise is a host aggregate the body reads
+        // whole; it has no rows, no width and no element size, which is why it
+        // is its own `Arg` and not a `Named` with zeros in it.
+        Arg::Named { .. } | Arg::Weight(_) | Arg::Raised { .. } => None,
     }
 }
 
@@ -342,6 +360,7 @@ pub fn resolve<'a, R: Resolve>(
             }
             Bound::within(arena.buffer, at64, extent, min_offset).map_err(Unbindable::Unaddressable)
         }
+        Arg::Raised { key, .. } => Err(Unbindable::NotOnThisPlane { key: key.clone() }),
         Arg::Named { value, .. } => resolver
             .named(*value)
             .map(Bound::whole)
@@ -544,6 +563,67 @@ pub fn params(
 ) -> Result<Params, Misplaced> {
     let stated = &lowered.params[launch.params.start as usize..launch.params.end as usize];
     params_from(stated, declared)
+}
+
+/// Place a routine's scalars into the push block its module declares, MEMBER
+/// by member rather than word by word.
+///
+/// [`params_from`] cannot do this. It zips a run of `u32` against
+/// [`crate::spirv::Declared::push_offsets`] and writes four bytes at each,
+/// which reads every member as one 32-bit word -- true of every scalar a
+/// LOWERING states, and false of a routine that asks for a 64-bit stride.
+/// `kv_append`'s block is `{ int head_dim; PIE_STRIDE k_head_stride;
+/// PIE_STRIDE k_seq_stride; }`, three members at offsets 0, 8 and 16, and the
+/// words that fill it are six: the head width, a padding word, and two halves
+/// each. Six against three is `Misplaced::Count`, and had the counts happened
+/// to agree the writer would still have put four bytes where eight go and
+/// stopped the range four bytes short of the last member.
+///
+/// So the routine plane places by VALUE, which is the thing that knows its own
+/// width. It agrees with `params_from` exactly wherever every member is one
+/// word, which is every module this tree ships today -- the 64-bit strides
+/// belong to the contiguous KV path, which no text in the tree launches, which
+/// is why a block that could not be filled at all went unnoticed.
+///
+/// `None` when the count does not match, which hands the caller back to
+/// [`params_from`] and its search for a parameter BUFFER of the right size.
+pub(crate) fn push_from(
+    values: &[kernels_vulkan::routine::ArgValue],
+    declared: &crate::spirv::Declared,
+) -> Option<Params> {
+    use kernels_vulkan::routine::ArgValue;
+
+    let scalars: Vec<&ArgValue> = values
+        .iter()
+        .filter(|v| !matches!(v, ArgValue::Buffer { .. }))
+        .collect();
+    if scalars.is_empty() || scalars.len() != declared.push_offsets.len() {
+        return None;
+    }
+    let width = |v: &ArgValue| if matches!(v, ArgValue::Usize(_)) { 8 } else { 4 };
+    // From the block's own extent, not from the count: a member sitting past
+    // a gap needs the gap inside the pushed range or the range does not cover
+    // it, and `vkCmdPushConstants` takes a size.
+    let end = scalars
+        .iter()
+        .zip(&declared.push_offsets)
+        .map(|(v, o)| *o as usize + width(v))
+        .max()
+        .unwrap_or(0);
+    let mut bytes = vec![0u8; end];
+    for (v, o) in scalars.iter().zip(&declared.push_offsets) {
+        let at = *o as usize;
+        match **v {
+            ArgValue::I32(x) => bytes[at..at + 4].copy_from_slice(&x.to_le_bytes()),
+            ArgValue::U32(x) => bytes[at..at + 4].copy_from_slice(&x.to_le_bytes()),
+            ArgValue::F32(x) => bytes[at..at + 4].copy_from_slice(&x.to_le_bytes()),
+            ArgValue::Usize(x) => {
+                bytes[at..at + 8].copy_from_slice(&(x as u64).to_le_bytes());
+            }
+            ArgValue::Buffer { .. } => unreachable!("filtered above"),
+        }
+    }
+    Some(Params::Push(bytes))
 }
 
 pub(crate) fn params_from(
@@ -924,6 +1004,8 @@ mod tests {
         Lowered {
             launches: Vec::new(),
             kernels: Vec::new(),
+            preps: Vec::new(),
+            arg_rows: Vec::new(),
             rectangles: 0,
             arena_bytes: 0,
             value_offset: Vec::new(),

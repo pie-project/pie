@@ -3,9 +3,7 @@
 
 use kernels_macros::routine;
 use crate::routine::{Asks, Bind, Ctx, Fire, In, Out, Tensor, bf16, keys};
-use kernels::KernelSig;
 use kernels::routine::Refusal;
-
 
 // This family's `kernel!` row was NOT filled, and that was never an
 // oversight: this backend's channel-plane interpreter does not dispatch
@@ -20,11 +18,6 @@ use kernels::routine::Refusal;
 //
 // The routine below is crossed anyway, for the same reason the row existed:
 // it states what the shader tree CONTAINS, not what this driver fires.
-
-/// The entrypoints this family's routines spell, now that its rows are gone.
-///
-/// See [`crate::RETIRED`].
-pub static ENTRYPOINTS: &[&str] = &["copy_logits_bf16"];
 
 /// Stage logits rows GPU-side, one dispatch for every row a fire needs.
 ///

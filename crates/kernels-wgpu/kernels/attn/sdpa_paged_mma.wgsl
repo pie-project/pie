@@ -83,12 +83,29 @@ var<workgroup> k_tile: array<vec4<f32>, PIE_KT * PIE_DIM4>;
 var<workgroup> v_tile: array<vec2<f32>, PIE_KT * PIE_DIM2>;
 // The segment's queries, staged once.
 //
-// The score is a 64-term inner product that all 32 x-lanes of a row compute
-// IDENTICALLY -- there is no lane to spread it over, since each lane owns an
-// output pair and needs the whole score. Read from global that is 64 bf16
-// unpacks per lane per key, which for a 512-token prefill is where this kernel
-// spent most of its remaining time. Staged, it is a workgroup broadcast.
+// The score is a 64-term inner product that every x-lane of a row needs whole,
+// since each of them owns an output pair rather than a piece of the score.
+// Read from global that was 64 bf16 unpacks per lane per key, which for a
+// 512-token prefill is where this kernel spent most of its remaining time.
+// Staged, it is a workgroup broadcast.
 var<workgroup> q_tile: array<vec4<f32>, 8u * PIE_DIM4>;
+// THE TILE'S SCORES, ONE PER (ROW, KEY), COMPUTED ONCE.
+//
+// Each x-lane needing the whole score is not the same thing as each x-lane
+// COMPUTING it, and this kernel used to do the second: all 32 of a row's
+// lanes ran the same 64-term product over the same two staged tiles, so the
+// workgroup retired 32 scores' worth of arithmetic per score. Against the
+// value accumulation -- which really is per lane, one output pair each -- the
+// query-key product was thirty-two thirty-thirds of the inner loop's work and
+// one thirty-third of its result.
+//
+// A segment is at most 8 rows and a tile is PIE_KT keys, so the whole score
+// rectangle is 128 numbers: fewer than the workgroup has lanes, computed by
+// one flat pass and read by everyone after a barrier. The arithmetic inside
+// the pass is the SAME four statements in the same order the per-lane loop
+// used, because the parity walk against `kernels-metal` and `kernels-vulkan`
+// compares the numbers and not the schedule.
+var<workgroup> s_tile: array<f32, 8 * PIE_KT>;
 
 // The bf16 half-index unpack, per buffer. `pie_load_bf16(&queries, i)` is the
 // shared answer and cannot be CALLED: its `ptr<storage, array<u32>, read>`
@@ -297,24 +314,37 @@ fn main(
             // The fill must be complete before anybody reads it.
             workgroupBarrier();
 
+            // One lane per (row, key) of the tile, and 128 of the 256 have one.
+            // Keys past `cnt` are staged as zero and their scores are never
+            // read, so this pass carries no bound of its own and stays
+            // workgroup-uniform -- which is what lets the barrier behind it be
+            // reached by everybody.
+            for (var e = flat; e < 8u * u32(PIE_KT); e = e + 256u) {
+                let j = e / u32(PIE_KT);
+                let kk = e - j * u32(PIE_KT);
+                var score = 0.0;
+                for (var d4 = 0u; d4 < PIE_DIM4; d4 = d4 + 1u) {
+                    // Scale per term, where the sibling backends put it: a
+                    // parity walk compares numbers and hoisting it changes
+                    // the rounding. The four terms stay separate statements
+                    // for the same reason -- this is the scalar loop with
+                    // its loads batched, not a dot product.
+                    let qv = q_tile[j * PIE_DIM4 + d4];
+                    let kv = k_tile[kk * PIE_DIM4 + d4];
+                    score = score + params.scale * qv.x * kv.x;
+                    score = score + params.scale * qv.y * kv.y;
+                    score = score + params.scale * qv.z * kv.z;
+                    score = score + params.scale * qv.w * kv.w;
+                }
+                s_tile[e] = score;
+            }
+            workgroupBarrier();
+
             if (mine) {
                 for (var kk = 0; kk < cnt; kk = kk + 1) {
                     let kp = base + kk;
                     if (!keeps(row, kp, q_pos, start)) { continue; }
-                    var score = 0.0;
-                    for (var d4 = 0u; d4 < PIE_DIM4; d4 = d4 + 1u) {
-                        // Scale per term, where the sibling backends put it: a
-                        // parity walk compares numbers and hoisting it changes
-                        // the rounding. The four terms stay separate statements
-                        // for the same reason -- this is the scalar loop with
-                        // its loads batched, not a dot product.
-                        let qv = q_tile[ly * PIE_DIM4 + d4];
-                        let kv = k_tile[u32(kk) * PIE_DIM4 + d4];
-                        score = score + params.scale * qv.x * kv.x;
-                        score = score + params.scale * qv.y * kv.y;
-                        score = score + params.scale * qv.z * kv.z;
-                        score = score + params.scale * qv.w * kv.w;
-                    }
+                    let score = s_tile[ly * u32(PIE_KT) + u32(kk)];
                     let step = pie_sdpa_online_update(score, max_score, sum_exp);
                     max_score = step.max_score;
                     sum_exp = step.sum_exp;

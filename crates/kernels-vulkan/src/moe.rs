@@ -16,99 +16,9 @@
 //! group is meant to fail BY NAME. The two statements disagreed for as long
 //! as both were prose; the shader settles it.
 
-
 use kernels_macros::routine;
 use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, Out, Tensor, bf16, elementwise_rows, keys};
-use kernels::KernelSig;
 use kernels::routine::Refusal;
-
-
-/// The entrypoints this family's crossed routines spell, now that their
-/// rows are gone. See [`crate::RETIRED`].
-pub static ENTRYPOINTS: &[&str] = &[
-    "combine_sorted",
-    "route_gather",
-    "route_sort",
-    "mxfp4_qmm_t_routed_bias_bfloat16_bm_16_bn_16",
-    "mxfp4_qmm_t_routed_bias_bfloat16_bm_16_bn_32",
-    "mxfp4_qmm_t_routed_bias_bfloat16_bm_16_bn_64",
-    "mxfp4_qmm_t_routed_bias_bfloat16_bm_32_bn_16",
-    "mxfp4_qmm_t_routed_bias_bfloat16_bm_32_bn_32",
-    "mxfp4_qmm_t_routed_bias_bfloat16_bm_32_bn_64",
-    "mxfp4_qmm_t_routed_bias_bfloat16_bm_64_bn_16",
-    "mxfp4_qmm_t_routed_bias_bfloat16_bm_64_bn_32",
-    "mxfp4_qmm_t_routed_bias_bfloat16_bm_64_bn_64",
-    "mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_16_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_16_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_16_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_32_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_32_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_32_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_64_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_64_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_4_bm_64_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_16_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_16_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_16_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_32_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_32_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_32_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_64_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_64_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_32_b_8_bm_64_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_16_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_16_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_32_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_32_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_64_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_64_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_16_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_16_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_16_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_32_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_32_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_32_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_64_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_64_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_64_b_8_bm_64_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_16_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_16_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_16_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_32_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_32_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_32_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_64_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_64_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_4_bm_64_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_16_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_16_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_16_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_32_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_32_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_32_bn_64",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_64_bn_16",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_64_bn_32",
-    "affine_qmm_t_routed_bfloat16_gs_128_b_8_bm_64_bn_64",
-    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_16_bn_16",
-    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_16_bn_64",
-    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_32_bn_16",
-    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_32_bn_64",
-    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_64_bn_16",
-    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_64_bn_64",
-    "affine_qmv_routed_bfloat16_gs_64_b_4",
-    "affine_qmv_routed_bias_bfloat16_gs_64_b_4",
-    "router_topk_bfloat16",
-    "router_topk_scaled_bfloat16",
-    "shared_expert_combine",
-    "shared_expert_combine_strided",
-];
 
 /// The workgroup a routed matmul tile walks with, on both axes.
 ///
@@ -343,10 +253,24 @@ const MXFP4_QMM: &[&str] = &[
 /// row of logits through groupshared memory and then writes the k picks from
 /// lane 0, so a row is a workgroup and not a lane; x is the workgroup itself.
 ///
-/// `per_expert_scale` is bound and not read. The binding is declared outside
-/// the `PIE_SCALED` guard, so the descriptor exists in both modules and a set
-/// one entry short is a slot holding whatever it last held rather than an
-/// error. [`router_topk_scaled`] is the symbol that reads it.
+/// `per_expert_scale` is declared and not read. The binding sits outside the
+/// `PIE_SCALED` guard so the descriptor exists in both modules; slangc deletes
+/// it from the unscaled one for being unread, which is why this body may drop
+/// the operand rather than bind a slot it never dereferences.
+/// [`router_topk_scaled`] is the symbol that reads it.
+///
+/// FOUR MARKS WHERE `RouterParams` WAS A STORAGE BLOCK. The four are the
+/// struct's four fields in the struct's order, which is the statement's order,
+/// and `moe/route.slang`'s router arm takes them as the four members of
+/// its push block — sixteen bytes, against a guaranteed floor of 128.
+///
+/// That the signature can NAME them is the point.
+/// `driver-metal/tests/packed_params_cover_the_struct.rs` exists because a text
+/// stated two words where the shader reads four, and on this plane it would have
+/// been quieter still: `robustBufferAccess` is on, so a read past a short block
+/// returns ZERO, and a missing `logits_pitch` is not garbage but a plausible
+/// number no layer and no assertion would object to. A mark cannot be short —
+/// the run is indexed by position and a statement carrying no such word refuses.
 ///
 /// # Errors
 ///
@@ -356,17 +280,39 @@ pub fn router_topk(
     ctx: &Ctx<'_>,
     logits: In<Tensor<bf16>>,
     expert_ids: Out<Tensor<i32>>,
-    expert_weights: Out<Tensor<bf16>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
+    expert_weights: Out<Tensor<bf16>>,
+    // `RouterParams`'s four fields, in its order. `logits_pitch` of zero means
+    // the pitch IS `n_experts`, and `softmax_over_all` picks the softmax's
+    // DENOMINATOR: zero over the k selected logits, nonzero over every expert.
+    n_experts: Const<u32>,
+    experts_per_token: Const<u32>,
+    softmax_over_all: Const<u32>,
+    logits_pitch: Const<u32>) -> Result<(), Refusal> {
     let _per_expert_scale = ctx.absent()?;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
         Fire::at(crate::routine::module_path("router_topk_bfloat16", ctx.best()), "router_topk_bfloat16").apply(router_grid(rows)?),
-        &[logits.arg(), expert_ids.arg(), expert_weights.arg(), params],
+        &[
+            logits.arg(),
+            expert_ids.arg(),
+            expert_weights.arg(),
+            // THE SCALARS LAST, and the order is the push block's: `words`
+            // packs what a body passed in the order it passed it, and
+            // `Device::dispatch` refuses a run whose length is not exactly the
+            // reflected range — so a member added or dropped is loud, and a
+            // member reordered is not.
+            n_experts.arg(),
+            experts_per_token.arg(),
+            softmax_over_all.arg(),
+            logits_pitch.arg(),
+        ],
     )
 }
 
 /// Top-k with a per-expert rescale, indexed by the EXPERT and not by the pick.
+///
+/// The same four marks as [`router_topk`], in the same order, because it is the
+/// same statement shape with one weight added.
 ///
 /// # Errors
 ///
@@ -377,8 +323,14 @@ pub fn router_topk_scaled(
     logits: In<Tensor<bf16>>,
     expert_ids: Out<Tensor<i32>>,
     expert_weights: Out<Tensor<bf16>>,
-    per_expert_scale: Const<Tensor<bf16>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
+    per_expert_scale: Const<Tensor<bf16>>,
+    // `RouterParams`'s four fields, in its order. A weight `Const` claims the
+    // WEIGHT run and a scalar one the params run, so the tensor above takes no
+    // slot from these four: `n_experts` is still word 0.
+    n_experts: Const<u32>,
+    experts_per_token: Const<u32>,
+    softmax_over_all: Const<u32>,
+    logits_pitch: Const<u32>) -> Result<(), Refusal> {
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
         Fire::at(crate::routine::module_path("router_topk_scaled_bfloat16", ctx.best()), "router_topk_scaled_bfloat16").apply(router_grid(rows)?),
@@ -386,8 +338,14 @@ pub fn router_topk_scaled(
             logits.arg(),
             expert_ids.arg(),
             expert_weights.arg(),
-            params,
+            // ONE BINDING LOWER THAN IT WAS: the block sat between the weights
+            // and this, and a descriptor set is written densely from the
+            // buffers the body passed.
             per_expert_scale.arg(),
+            n_experts.arg(),
+            experts_per_token.arg(),
+            softmax_over_all.arg(),
+            logits_pitch.arg(),
         ],
     )
 }
@@ -420,6 +378,12 @@ const SORT_LANES: u32 = 1024;
 /// rewriting the permutation the others are reading, and `InterlockedAdd` is
 /// scoped to the workgroup so nothing would even serialise it.
 ///
+/// SEVEN MARKS WHERE `MoeRouteParams` WAS A STORAGE BLOCK, and [`route_gather`]
+/// takes the same seven in the same order. That sharing is the struct's own
+/// point carried forward: `model-dsl` states one seven-word run for both
+/// statements, so the padding this kernel writes and the bounds the gather reads
+/// cannot disagree. Twenty-eight bytes of push, the widest in `moe/route.slang`.
+///
 /// # Errors
 ///
 /// Only what the encoder refuses; the grid is a constant.
@@ -430,8 +394,19 @@ pub fn route_sort(
     perm: Out<Tensor<i32>>,
     row_expert: Out<Tensor<i32>>,
     tile_expert: Out<Tensor<i32>>,
-    inv: Out<Tensor<i32>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
+    inv: Out<Tensor<i32>>,
+    // `MoeRouteParams`'s seven fields, in its order. `n` is the number of
+    // (row, slot) PAIRS and `padded` is the permutation's length, `n` rounded up
+    // so every expert's span is a whole number of `tile_rows` tiles; the two are
+    // different numbers and this kernel reads both, so swapping the marks would
+    // clear a permutation shorter than it fills.
+    n: Const<u32>,
+    n_experts: Const<u32>,
+    experts_per_token: Const<u32>,
+    tile_rows: Const<u32>,
+    padded: Const<u32>,
+    width: Const<u32>,
+    x_pitch: Const<u32>) -> Result<(), Refusal> {
     ctx.fire(
         Fire::at(crate::routine::module_path("route_sort", ctx.best()), "route_sort").apply([SORT_LANES, 1, 1]),
         &[
@@ -439,8 +414,16 @@ pub fn route_sort(
             perm.arg(),
             row_expert.arg(),
             tile_expert.arg(),
-            params,
+            // ONE BINDING LOWER THAN IT WAS: the block sat between
+            // `tile_expert` and this.
             inv.arg(),
+            n.arg(),
+            n_experts.arg(),
+            experts_per_token.arg(),
+            tile_rows.arg(),
+            padded.arg(),
+            width.arg(),
+            x_pitch.arg(),
         ],
     )
 }
@@ -453,6 +436,15 @@ pub fn route_sort(
 /// tokens instead would leave the slack holding whatever the arena held, and
 /// the routed matmul would then multiply it by real weights.
 ///
+/// [`route_sort`]'s SEVEN MARKS, all of them, and this kernel reads four. `n`,
+/// `n_experts` and `tile_rows` are the sort's alone and are carried here anyway
+/// — one `MoeRouteParams` layout serves both statements, so `padded` is stated
+/// once and read by the kernel that pads and the kernel that is bounded by the
+/// padding. An unread member of a push block survives `-O2`
+/// (`quant/qmm_t.slang` has carried two since its cast entrypoints were split),
+/// so the reflected range is the full twenty-eight bytes and all seven are
+/// passed.
+///
 /// # Errors
 ///
 /// See [`crate::routine::elementwise_rows`].
@@ -461,13 +453,36 @@ pub fn route_gather(
     ctx: &Ctx<'_>,
     x: In<Tensor<bf16>>,
     out: Out<Tensor<bf16>>,
-    perm: In<Tensor<i32>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
-    let width = x.width;
-    let padded = ctx.ask::<i32, keys::Rows>()?;
+    perm: In<Tensor<i32>>,
+    // `MoeRouteParams`'s seven fields, in its order — [`route_sort`]'s exactly.
+    n: Const<u32>,
+    n_experts: Const<u32>,
+    experts_per_token: Const<u32>,
+    tile_rows: Const<u32>,
+    padded: Const<u32>,
+    width: Const<u32>,
+    x_pitch: Const<u32>) -> Result<(), Refusal> {
+    // THE OPERAND'S OWN RECTANGLE, and not the `width` mark beside it. The two
+    // are the same number for every text this tree writes; they are not the same
+    // FACT. `x.width` is what the arena allocated and is what the grid must
+    // cover, while the mark is what the statement said and is what the shader
+    // strides by — a disagreement is a fact about the plan, not about this fire.
+    let x_width = x.width;
+    let padded_rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("route_gather", ctx.best()), "route_gather").apply(elementwise_rows(width, padded)?),
-        &[x.arg(), out.arg(), perm.arg(), params],
+        Fire::at(crate::routine::module_path("route_gather", ctx.best()), "route_gather").apply(elementwise_rows(x_width, padded_rows)?),
+        &[
+            x.arg(),
+            out.arg(),
+            perm.arg(),
+            n.arg(),
+            n_experts.arg(),
+            experts_per_token.arg(),
+            tile_rows.arg(),
+            padded.arg(),
+            width.arg(),
+            x_pitch.arg(),
+        ],
     )
 }
 
@@ -476,6 +491,12 @@ pub fn route_gather(
 /// The row extent is the TOKEN count here and not `padded`: the inverse map
 /// is indexed by token, and a row past the tokens would read `inv` off the
 /// end of an allocation that is only as long as the tokens reach.
+///
+/// THREE MARKS WHERE `ExpertCombineParams` WAS A STORAGE BLOCK, in its order —
+/// twelve bytes of push. `out_pitch` of zero means `width`: the mixture's output
+/// lands in whatever layout the caller's activations are in, packed for a
+/// batched decode and a uniform scratch stride apart for a prefill, and a host
+/// with nothing to say writes 0 rather than restating the width.
 ///
 /// # Errors
 ///
@@ -486,13 +507,28 @@ pub fn combine_sorted(
     y: In<Tensor<bf16>>,
     expert_weights: In<Tensor<bf16>>,
     out: Out<Tensor<bf16>>,
-    inv: In<Tensor<i32>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
-    let width = y.width;
+    inv: In<Tensor<i32>>,
+    // `ExpertCombineParams`'s three fields, in its order.
+    width: Const<u32>,
+    experts_per_token: Const<u32>,
+    out_pitch: Const<u32>) -> Result<(), Refusal> {
+    // The OPERAND's rectangle, which is what the grid covers — see
+    // [`route_gather`] for why that is not the `width` mark beside it.
+    let y_width = y.width;
     let tokens = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("combine_sorted", ctx.best()), "combine_sorted").apply(elementwise_rows(width, tokens)?),
-        &[y.arg(), expert_weights.arg(), out.arg(), params, inv.arg()],
+        Fire::at(crate::routine::module_path("combine_sorted", ctx.best()), "combine_sorted").apply(elementwise_rows(y_width, tokens)?),
+        &[
+            y.arg(),
+            expert_weights.arg(),
+            out.arg(),
+            // ONE BINDING LOWER THAN IT WAS: the block sat between `out` and
+            // this.
+            inv.arg(),
+            width.arg(),
+            experts_per_token.arg(),
+            out_pitch.arg(),
+        ],
     )
 }
 
@@ -886,7 +922,6 @@ pub fn mxfp4_qmm_t_routed_bias(
     )
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -913,6 +948,13 @@ mod tests {
     /// inspects the exact bound list, and `ctx.absent()` where the generic
     /// buffer catch-all would hide which slot the body deliberately bound as
     /// absent.
+    ///
+    /// NOTHING IN THIS FILE FORWARDS A PARAMS BLOCK ANY MORE. The four routing
+    /// bodies took one -- `RouterParams`, `MoeRouteParams` twice and
+    /// `ExpertCombineParams`, each a struct `route.slang` read by field -- and
+    /// their fields are `Const<u32>` marks now, so the tests below hand the
+    /// numbers over themselves and what a test states is what the shader reads.
+    /// The `Params` arm stays in `resolve` for whatever migrates next.
     struct Seen {
         calls: RefCell<Vec<Call>>,
         rows: Cell<i32>,
@@ -1043,6 +1085,16 @@ mod tests {
             Out::new(Tensor::<i32>::new(2)),
             Out::new(Tensor::<i32>::new(3)),
             Out::new(Tensor::<i32>::new(5)),
+            // `MoeRouteParams`: n, n_experts, experts_per_token, tile_rows,
+            // padded, width, x_pitch -- seven words, twenty-eight bytes of
+            // push, stated here rather than staged into a storage block.
+            Const::new(32),
+            Const::new(60),
+            Const::new(4),
+            Const::new(16),
+            Const::new(64),
+            Const::new(2048),
+            Const::new(2048),
         )
         .unwrap();
         assert_eq!(one(&seen).1, [1024, 1, 1]);
@@ -1054,6 +1106,14 @@ mod tests {
             In::new(Tensor::<bf16>::new(0)),
             Out::new(Tensor::<i32>::new(1)),
             Out::new(Tensor::<bf16>::new(2)),
+            // `RouterParams`: n_experts, experts_per_token, softmax_over_all,
+            // logits_pitch. The grid is 1024 lanes whatever the count -- unlike
+            // metal's, whose threadgroup IS the expert count -- so these four
+            // reach the shader and not the launch.
+            Const::new(60),
+            Const::new(4),
+            Const::new(0),
+            Const::new(0),
         )
         .unwrap();
         assert_eq!(one(&seen).1, [1024, 7, 1]);
@@ -1077,6 +1137,15 @@ mod tests {
             In { ptr: Tensor::<bf16>::new(0), rows: 96, width: 64 },
             Out { ptr: Tensor::<bf16>::new(1), rows: 96, width: 64 },
             In::new(Tensor::<i32>::new(2)),
+            // The SORT'S seven words, which this statement carries whole --
+            // three of them for the sort's benefit and not this kernel's.
+            Const::new(24),
+            Const::new(60),
+            Const::new(4),
+            Const::new(16),
+            Const::new(96),
+            Const::new(64),
+            Const::new(64),
         )
         .unwrap();
         assert_eq!(one(&seen).1, [64, 96, 1]);
@@ -1089,6 +1158,10 @@ mod tests {
             In::new(Tensor::<bf16>::new(1)),
             Out { ptr: Tensor::<bf16>::new(2), rows: 24, width: 64 },
             In::new(Tensor::<i32>::new(4)),
+            // `ExpertCombineParams`: width, experts_per_token, out_pitch.
+            Const::new(64),
+            Const::new(4),
+            Const::new(0),
         )
         .unwrap();
         assert_eq!(one(&seen).1, [64, 24, 1]);

@@ -7,7 +7,6 @@
 
 
 #include "common/bf16.slang"
-#include "ssm/gdn_params.slang"
 
 #if defined(PIE_RECURRENT) && !defined(PIE_SCAN)
 #define PIE_NUMTHREADS [numthreads(32, 4, 1)]
@@ -21,10 +20,7 @@ PIE_BUFFER_RW(1, core_out);
 [[vk::binding(2)]] StructuredBuffer<float> pre_q;
 [[vk::binding(3)]] StructuredBuffer<float> pre_k;
 [[vk::binding(4)]] StructuredBuffer<float> pre_gate;
-PIE_PARAMS(5, GdnCoreParams, p);
-[[vk::binding(6)]] StructuredBuffer<uint> slot_ids;
-struct Push { int row_pitch; int n_scan; };
-[[vk::push_constant]] ConstantBuffer<Push> pc;
+[[vk::binding(5)]] StructuredBuffer<uint> slot_ids;
 #else
 PIE_BUFFER_RO(0, mixed);
 [[vk::binding(1)]] StructuredBuffer<float> conv_state;
@@ -37,9 +33,8 @@ PIE_BUFFER_RO(5, conv_b);
 [[vk::binding(7)]] StructuredBuffer<float> pre_k;
 [[vk::binding(8)]] StructuredBuffer<float> pre_gate;
 [[vk::binding(9)]] RWStructuredBuffer<float> new_conv_state;
-PIE_PARAMS(10, GdnCoreParams, p);
 #if defined(PIE_SLOTTED)
-[[vk::binding(11)]] StructuredBuffer<uint> slot_ids;
+[[vk::binding(10)]] StructuredBuffer<uint> slot_ids;
 #endif
 #else
 PIE_BUFFER_RO(2, conv_w);
@@ -52,16 +47,64 @@ PIE_BUFFER_RO(7, b_gate);
 [[vk::binding(9)]] RWStructuredBuffer<float> pre_k;
 [[vk::binding(10)]] RWStructuredBuffer<float> pre_gate;
 [[vk::binding(11)]] RWStructuredBuffer<float> new_conv_state;
-PIE_PARAMS(12, GdnCoreParams, p);
 #if defined(PIE_SLOTTED) || defined(PIE_PREFILL)
-[[vk::binding(13)]] StructuredBuffer<uint> slot_ids;
+[[vk::binding(12)]] StructuredBuffer<uint> slot_ids;
 #endif
-#if defined(PIE_PREFILL)
-struct Push { int row_pitch; int n_scan; };
+#endif
+#endif
+
+// THE GEOMETRY IS IN THE PUSH BLOCK, AND THERE IS ONLY ONE BLOCK NOW.
+//
+// Three arms of this file read `GdnCoreParams` off a storage binding --
+// `PIE_PARAMS(5, ...)` under `PIE_SCAN`, `PIE_PARAMS(10, ...)` under
+// `PIE_RECURRENT`, `PIE_PARAMS(12, ...)` otherwise -- out of
+// `ssm/gdn_params.slang`, which was Metal's `gdn_params.h` ported field for
+// field and said so: the order was the launch contract because the HOST filled
+// the same struct for every backend. Three copies of one layout, checked
+// nowhere, and a storage block for forty-four live bytes cost this plane a
+// descriptor, a staging slot and the sentinel `Holds::params_block` mints for a
+// buffer with no address. The two prefill arms then ALSO declared a push block
+// for `row_pitch` and `n_scan`, so one dispatch carried a descriptor AND a
+// range for what is one run of scalars.
+//
+// The routine names all eleven as `Const<i32>`/`Const<f32>` marks now, so the
+// contract is a SIGNATURE, the host fills nothing, and everything this file
+// reads arrives in ONE push range: words 0..10 of the same statement run the
+// struct was staged from, followed on the prefill arms by `row_pitch` and
+// `n_scan` because that is the order the body passes them and
+// `driver-vulkan::encode::words` packs in that order.
+//
+// THE SIZE IS INSIDE THE GUARANTEE, which is what makes this legal rather than
+// merely tidier. `Device::max_push` is `maxPushConstantsSize` and only 128
+// bytes are guaranteed: eleven four-byte fields is 44, and the two prefill
+// entrypoints that carry `row_pitch`/`n_scan` reach 52. The range the pipeline
+// is built against is reflected out of the SPIR-V and `Device::dispatch`
+// refuses a run whose length is not exactly that range, so a block that
+// drifted from the body's list is a `Fault::PushRange` and not a shader
+// reading a neighbour's number.
+//
+// `row_pitch` describes the IN-PROJECTION and nothing else: every fp32 scratch
+// row is packed at its OWN width, and a shared pitch has to clear the widest of
+// them. It is declared under `PIE_SCAN` as well, where it is never read -- the
+// body passes it, so the block's layout has to carry it.
+struct Push {
+    int Dk;
+    int Dv;
+    int Hk;
+    int Hv;
+    int conv_dim;
+    int Kc;
+    int q_off;
+    int k_off;
+    int v_off;
+    float eps;
+    float inv_sqrt_dk;
+#if defined(PIE_SCAN) || defined(PIE_PREFILL)
+    int row_pitch;
+    int n_scan;
+#endif
+};
 [[vk::push_constant]] ConstantBuffer<Push> pc;
-#endif
-#endif
-#endif
 
 groupshared float sh_reduce[4 * 32];
 
@@ -106,17 +149,17 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID, uint3 tid : 
     int dv_base = (int(group.y) * ROWS + (int(local.x) / LANES)) * VROWS;
     int dk_idx = int(local.x) % LANES;
     int slot = int(slot_ids[0]);
-    int n_per_t = p.Dk / LANES;
+    int n_per_t = pc.Dk / LANES;
     int pitch_f = pc.row_pitch / 2;
     bool row_lead = dk_idx == 0;
-    bool active_group = dv_base < p.Dv;
-    int vn = active_group ? min(VROWS, p.Dv - dv_base) : 0;
+    bool active_group = dv_base < pc.Dv;
+    int vn = active_group ? min(VROWS, pc.Dv - dv_base) : 0;
 
     float st[8][32];
-    uint state_base = uint(((slot * p.Hv + hv_idx) * p.Dv + dv_base) * p.Dk);
+    uint state_base = uint(((slot * pc.Hv + hv_idx) * pc.Dv + dv_base) * pc.Dk);
     for (int v = 0; v < VROWS; ++v)
         for (int i = 0; i < 32; ++i)
-            st[v][i] = (v < vn && i < n_per_t) ? rstate[state_base + uint(v * p.Dk + n_per_t * dk_idx + i)] : 0.0;
+            st[v][i] = (v < vn && i < n_per_t) ? rstate[state_base + uint(v * pc.Dk + n_per_t * dk_idx + i)] : 0.0;
 
     for (int t = 0; t < pc.n_scan; ++t) {
         int row_t = t * pc.row_pitch;
@@ -125,8 +168,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID, uint3 tid : 
         float k[32];
         for (int i = 0; i < 32; ++i) {
             int d = n_per_t * dk_idx + i;
-            q[i] = i < n_per_t ? pre_q[row_f + hv_idx * p.Dk + d] : 0.0;
-            k[i] = i < n_per_t ? pre_k[row_f + hv_idx * p.Dk + d] : 0.0;
+            q[i] = i < n_per_t ? pre_q[row_f + hv_idx * pc.Dk + d] : 0.0;
+            k[i] = i < n_per_t ? pre_k[row_f + hv_idx * pc.Dk + d] : 0.0;
         }
         float ga = pre_gate[row_f + 2 * hv_idx + 0];
         float gb = pre_gate[row_f + 2 * hv_idx + 1];
@@ -137,52 +180,52 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID, uint3 tid : 
             kv[v] = lane_sum(v < vn ? acc : 0.0, local.x);
         }
         for (int v = 0; v < VROWS; ++v) {
-            float vv = (v < vn) ? pre_gate[row_f + 2 * p.Hv + hv_idx * p.Dv + dv_base + v] : 0.0;
+            float vv = (v < vn) ? pre_gate[row_f + 2 * pc.Hv + hv_idx * pc.Dv + dv_base + v] : 0.0;
             float delta = (vv - kv[v]) * gb;
             float outv = 0.0;
             for (int i = 0; i < 32; ++i) if (i < n_per_t) { st[v][i] += k[i] * delta; outv += st[v][i] * q[i]; }
             outv = lane_sum(v < vn ? outv : 0.0, local.x);
-            if (v < vn && row_lead) core_out[row_t + hv_idx * p.Dv + dv_base + v] = PIE_STORE(outv);
+            if (v < vn && row_lead) core_out[row_t + hv_idx * pc.Dv + dv_base + v] = PIE_STORE(outv);
         }
     }
     for (int v = 0; v < VROWS; ++v)
         for (int i = 0; i < 32; ++i)
-            if (v < vn && i < n_per_t) rstate[state_base + uint(v * p.Dk + n_per_t * dk_idx + i)] = st[v][i];
+            if (v < vn && i < n_per_t) rstate[state_base + uint(v * pc.Dk + n_per_t * dk_idx + i)] = st[v][i];
 }
 
 #else
 
 float convsilu_token(int slot, int b_idx, int c) {
     float acc = PIE_LOAD(conv_b[c]);
-    for (int j = 0; j < p.Kc - 1; ++j)
-        acc += conv_state[(slot * p.Kc + (j + 1)) * p.conv_dim + c] * PIE_LOAD(conv_w[c * p.Kc + j]);
-    acc += PIE_LOAD(mixed[b_idx * p.conv_dim + c]) * PIE_LOAD(conv_w[c * p.Kc + (p.Kc - 1)]);
+    for (int j = 0; j < pc.Kc - 1; ++j)
+        acc += conv_state[(slot * pc.Kc + (j + 1)) * pc.conv_dim + c] * PIE_LOAD(conv_w[c * pc.Kc + j]);
+    acc += PIE_LOAD(mixed[b_idx * pc.conv_dim + c]) * PIE_LOAD(conv_w[c * pc.Kc + (pc.Kc - 1)]);
     return silu(acc);
 }
 
 void write_conv_token(int slot, int b_idx, int c) {
-    for (int j = 0; j < p.Kc - 1; ++j)
-        new_conv_state[(slot * p.Kc + j) * p.conv_dim + c] = conv_state[(slot * p.Kc + (j + 1)) * p.conv_dim + c];
-    new_conv_state[(slot * p.Kc + (p.Kc - 1)) * p.conv_dim + c] = PIE_LOAD(mixed[b_idx * p.conv_dim + c]);
+    for (int j = 0; j < pc.Kc - 1; ++j)
+        new_conv_state[(slot * pc.Kc + j) * pc.conv_dim + c] = conv_state[(slot * pc.Kc + (j + 1)) * pc.conv_dim + c];
+    new_conv_state[(slot * pc.Kc + (pc.Kc - 1)) * pc.conv_dim + c] = PIE_LOAD(mixed[b_idx * pc.conv_dim + c]);
 }
 
 #if defined(PIE_PREFILL)
 float tap(int slot, int t, int j, int c) {
-    int idx = t - (p.Kc - 1) + j;
+    int idx = t - (pc.Kc - 1) + j;
     return idx >= 0 ? PIE_LOAD(mixed[idx * pc.row_pitch + c])
-                    : conv_state[(slot * p.Kc + p.Kc + idx) * p.conv_dim + c];
+                    : conv_state[(slot * pc.Kc + pc.Kc + idx) * pc.conv_dim + c];
 }
 float convsilu_prefill(int slot, int t, int c) {
     float acc = PIE_LOAD(conv_b[c]);
-    for (int j = 0; j < p.Kc - 1; ++j) acc += tap(slot, t, j, c) * PIE_LOAD(conv_w[c * p.Kc + j]);
-    acc += PIE_LOAD(mixed[t * pc.row_pitch + c]) * PIE_LOAD(conv_w[c * p.Kc + (p.Kc - 1)]);
+    for (int j = 0; j < pc.Kc - 1; ++j) acc += tap(slot, t, j, c) * PIE_LOAD(conv_w[c * pc.Kc + j]);
+    acc += PIE_LOAD(mixed[t * pc.row_pitch + c]) * PIE_LOAD(conv_w[c * pc.Kc + (pc.Kc - 1)]);
     return silu(acc);
 }
 void write_conv_prefill(int slot, int t, int c) {
-    for (int j = 0; j < p.Kc; ++j) {
-        int idx = t - (p.Kc - 1) + j;
-        new_conv_state[(slot * p.Kc + j) * p.conv_dim + c] =
-            idx >= 0 ? PIE_LOAD(mixed[idx * pc.row_pitch + c]) : conv_state[(slot * p.Kc + p.Kc + idx) * p.conv_dim + c];
+    for (int j = 0; j < pc.Kc; ++j) {
+        int idx = t - (pc.Kc - 1) + j;
+        new_conv_state[(slot * pc.Kc + j) * pc.conv_dim + c] =
+            idx >= 0 ? PIE_LOAD(mixed[idx * pc.row_pitch + c]) : conv_state[(slot * pc.Kc + pc.Kc + idx) * pc.conv_dim + c];
     }
 }
 #endif
@@ -191,11 +234,11 @@ PIE_NUMTHREADS
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID, uint3 tid : SV_DispatchThreadID) {
 #if defined(PIE_RECURRENT)
     int n = int(group.z);
-    int b_idx = n / p.Hv;
-    int hv_idx = n % p.Hv;
+    int b_idx = n / pc.Hv;
+    int hv_idx = n % pc.Hv;
     int dk_idx = int(local.x);
     int dv_idx = int(tid.y);
-    int n_per_t = p.Dk / 32;
+    int n_per_t = pc.Dk / 32;
     // The workgroup is 4 deep on y and Metal's `dispatchThreads` grid y is `Dv` exactly,
     // so any `Dv` not a multiple of 4 launches lanes with no value channel to
     // own. Every GDN checkpoint the tree has seen states `Dv = 128`, which is
@@ -208,15 +251,15 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID, uint3 tid : 
     // undefined and, on some drivers, a hang rather than a wrong number.
     // The loads are harmless: they read a neighbouring head, and the
     // arithmetic they feed is thrown away.
-    bool mine = dv_idx < p.Dv;
+    bool mine = dv_idx < pc.Dv;
 #if defined(PIE_SLOTTED)
     int slot = int(slot_ids[b_idx]);
 #else
     int slot = b_idx;
 #endif
-    float vval = convsilu_token(slot, b_idx, p.v_off + hv_idx * p.Dv + dv_idx);
-    uint state_base = uint(((slot * p.Hv + hv_idx) * p.Dv + dv_idx) * p.Dk);
-    uint pk_base = uint(n * p.Dk);
+    float vval = convsilu_token(slot, b_idx, pc.v_off + hv_idx * pc.Dv + dv_idx);
+    uint state_base = uint(((slot * pc.Hv + hv_idx) * pc.Dv + dv_idx) * pc.Dk);
+    uint pk_base = uint(n * pc.Dk);
     float kv = 0.0;
     float st[8];
     float q[8];
@@ -238,30 +281,30 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID, uint3 tid : 
         if (mine) rstate[state_base + uint(d)] = st[i];
     }
     outv = row_sum32(outv, local.x, local.y);
-    if (dk_idx == 0 && mine) core_out[(b_idx * p.Hv + hv_idx) * p.Dv + dv_idx] = PIE_STORE(outv);
-    if (mine) write_conv_token(slot, b_idx, p.v_off + hv_idx * p.Dv + dv_idx);
+    if (dk_idx == 0 && mine) core_out[(b_idx * pc.Hv + hv_idx) * pc.Dv + dv_idx] = PIE_STORE(outv);
+    if (mine) write_conv_token(slot, b_idx, pc.v_off + hv_idx * pc.Dv + dv_idx);
 #elif defined(PIE_PREFILL)
-    int n = int(group.z), t = n / p.Hv, hv_idx = n % p.Hv;
-    int rep = p.Hv / p.Hk, hk_idx = hv_idx / rep;
+    int n = int(group.z), t = n / pc.Hv, hv_idx = n % pc.Hv;
+    int rep = pc.Hv / pc.Hk, hk_idx = hv_idx / rep;
     bool hk_first = (hv_idx % rep) == 0;
     int slot = int(slot_ids[0]);
     int dk_idx = int(local.x);
-    int n_per_t = p.Dk / 32;
+    int n_per_t = pc.Dk / 32;
     int pitch_f = pc.row_pitch / 2;
     float qraw[8], kraw[8], qsq = 0.0, ksq = 0.0;
     for (int i = 0; i < n_per_t; ++i) {
         int d = n_per_t * dk_idx + i;
-        qraw[i] = convsilu_prefill(slot, t, p.q_off + hk_idx * p.Dk + d);
-        kraw[i] = convsilu_prefill(slot, t, p.k_off + hk_idx * p.Dk + d);
+        qraw[i] = convsilu_prefill(slot, t, pc.q_off + hk_idx * pc.Dk + d);
+        kraw[i] = convsilu_prefill(slot, t, pc.k_off + hk_idx * pc.Dk + d);
         qsq += qraw[i] * qraw[i]; ksq += kraw[i] * kraw[i];
     }
-    float qinv = p.inv_sqrt_dk / sqrt(row_sum32(qsq, local.x, local.y) + p.eps);
-    float kinv = 1.0 / sqrt(row_sum32(ksq, local.x, local.y) + p.eps);
+    float qinv = pc.inv_sqrt_dk / sqrt(row_sum32(qsq, local.x, local.y) + pc.eps);
+    float kinv = 1.0 / sqrt(row_sum32(ksq, local.x, local.y) + pc.eps);
     int row_f = t * pitch_f;
     for (int i = 0; i < n_per_t; ++i) {
         int d = n_per_t * dk_idx + i;
-        pre_q[row_f + hv_idx * p.Dk + d] = qraw[i] * qinv;
-        pre_k[row_f + hv_idx * p.Dk + d] = kraw[i] * kinv;
+        pre_q[row_f + hv_idx * pc.Dk + d] = qraw[i] * qinv;
+        pre_k[row_f + hv_idx * pc.Dk + d] = kraw[i] * kinv;
     }
     if (dk_idx == 0) {
         int row_t = t * pc.row_pitch;
@@ -270,23 +313,23 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID, uint3 tid : 
         pre_gate[row_f + 2 * hv_idx + 0] = exp(-exp(A_log[hv_idx]) * sp);
         pre_gate[row_f + 2 * hv_idx + 1] = 1.0 / (1.0 + exp(-PIE_LOAD(b_gate[row_t + hv_idx])));
     }
-    for (int dv = dk_idx; dv < p.Dv; dv += 32)
-        pre_gate[row_f + 2 * p.Hv + hv_idx * p.Dv + dv] = convsilu_prefill(slot, t, p.v_off + hv_idx * p.Dv + dv);
+    for (int dv = dk_idx; dv < pc.Dv; dv += 32)
+        pre_gate[row_f + 2 * pc.Hv + hv_idx * pc.Dv + dv] = convsilu_prefill(slot, t, pc.v_off + hv_idx * pc.Dv + dv);
     if (t != pc.n_scan - 1) return;
     for (int i = 0; i < n_per_t; ++i) {
         int d = n_per_t * dk_idx + i;
-        if (hk_first) { write_conv_prefill(slot, t, p.q_off + hk_idx * p.Dk + d); write_conv_prefill(slot, t, p.k_off + hk_idx * p.Dk + d); }
+        if (hk_first) { write_conv_prefill(slot, t, pc.q_off + hk_idx * pc.Dk + d); write_conv_prefill(slot, t, pc.k_off + hk_idx * pc.Dk + d); }
     }
-    for (int dv = dk_idx; dv < p.Dv; dv += 32) write_conv_prefill(slot, t, p.v_off + hv_idx * p.Dv + dv);
+    for (int dv = dk_idx; dv < pc.Dv; dv += 32) write_conv_prefill(slot, t, pc.v_off + hv_idx * pc.Dv + dv);
 #else
     int n = int(group.z);
-    int b_idx = n / p.Hv;
-    int hv_idx = n % p.Hv;
-    int rep = p.Hv / p.Hk;
+    int b_idx = n / pc.Hv;
+    int hv_idx = n % pc.Hv;
+    int rep = pc.Hv / pc.Hk;
     int hk_idx = hv_idx / rep;
     bool hk_first = (hv_idx % rep) == 0;
     int dk_idx = int(local.x);
-    int n_per_t = p.Dk / 32;
+    int n_per_t = pc.Dk / 32;
 #if defined(PIE_SLOTTED)
     int slot = int(slot_ids[b_idx]);
 #else
@@ -295,28 +338,28 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID, uint3 tid : 
     float qraw[8]; float kraw[8]; float qsq = 0.0; float ksq = 0.0;
     for (int i = 0; i < n_per_t; ++i) {
         int d = n_per_t * dk_idx + i;
-        qraw[i] = convsilu_token(slot, b_idx, p.q_off + hk_idx * p.Dk + d);
-        kraw[i] = convsilu_token(slot, b_idx, p.k_off + hk_idx * p.Dk + d);
+        qraw[i] = convsilu_token(slot, b_idx, pc.q_off + hk_idx * pc.Dk + d);
+        kraw[i] = convsilu_token(slot, b_idx, pc.k_off + hk_idx * pc.Dk + d);
         qsq += qraw[i] * qraw[i]; ksq += kraw[i] * kraw[i];
     }
-    float qinv = p.inv_sqrt_dk / sqrt(row_sum32(qsq, local.x, local.y) + p.eps);
-    float kinv = 1.0 / sqrt(row_sum32(ksq, local.x, local.y) + p.eps);
-    uint pk_base = uint(n * p.Dk);
+    float qinv = pc.inv_sqrt_dk / sqrt(row_sum32(qsq, local.x, local.y) + pc.eps);
+    float kinv = 1.0 / sqrt(row_sum32(ksq, local.x, local.y) + pc.eps);
+    uint pk_base = uint(n * pc.Dk);
     for (int i = 0; i < n_per_t; ++i) {
         int d = n_per_t * dk_idx + i;
         pre_q[pk_base + uint(d)] = qraw[i] * qinv;
         pre_k[pk_base + uint(d)] = kraw[i] * kinv;
     }
     if (dk_idx == 0) {
-        float ad = PIE_LOAD(a_gate[b_idx * p.Hv + hv_idx]) + PIE_LOAD(dt_bias[hv_idx]);
+        float ad = PIE_LOAD(a_gate[b_idx * pc.Hv + hv_idx]) + PIE_LOAD(dt_bias[hv_idx]);
         float sp = max(ad, 0.0) + log(1.0 + exp(-abs(ad)));
         pre_gate[2 * n + 0] = exp(-exp(A_log[hv_idx]) * sp);
-        pre_gate[2 * n + 1] = 1.0 / (1.0 + exp(-PIE_LOAD(b_gate[b_idx * p.Hv + hv_idx])));
+        pre_gate[2 * n + 1] = 1.0 / (1.0 + exp(-PIE_LOAD(b_gate[b_idx * pc.Hv + hv_idx])));
     }
     if (hk_first) for (int i = 0; i < n_per_t; ++i) {
         int d = n_per_t * dk_idx + i;
-        write_conv_token(slot, b_idx, p.q_off + hk_idx * p.Dk + d);
-        write_conv_token(slot, b_idx, p.k_off + hk_idx * p.Dk + d);
+        write_conv_token(slot, b_idx, pc.q_off + hk_idx * pc.Dk + d);
+        write_conv_token(slot, b_idx, pc.k_off + hk_idx * pc.Dk + d);
     }
 #endif
 }

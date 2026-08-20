@@ -354,30 +354,28 @@ impl Serving<'_> {
                 slots: pool.shape().slots,
             });
         }
-        // EVERY ROW SAMPLES, and this is a workaround with a name.
+        // THE ROWS THE FRAME SAYS SAMPLE, and no longer every row.
         //
-        // A frame's seriation marks only the rows a request reads out, so a
-        // prefill of four tokens would lower to `n_requests = 1` and an arena
-        // sized for ONE row of logits. The texts spell their epilogue as plain
-        // `OpKind::Launch` ops rather than `OpKind::LmHead`, so
-        // `Lowerer::epilogue` never runs and the generic path emits the head
-        // over the whole token window: `rows * vocab` written into an arena
-        // holding `1 * vocab`, which `binding::extent` refuses.
+        // This forced `samples: true` on all of them, for a reason that was
+        // real: the texts spell their epilogue as plain `OpKind::Launch` ops
+        // rather than `OpKind::LmHead`, so `Lowerer::epilogue` never runs and
+        // the generic path emits the gather over `0..n_requests` while its
+        // INPUT spans the whole token stream. `binding::extent` measured every
+        // operand by the launch's rectangle, so that input bound one row, WGSL
+        // clamped the rest to zero, and the head projected zeros.
         //
-        // The cost is paid knowingly — the lm head runs over every token of a
-        // prefill — and it stops being needed the day the shell names its
-        // epilogue. Narrowing the statement is not enough on its own:
-        // `binding::extent` measures an `Arg::Arena` as the rectangle the
-        // launch WRITES, and a gather's input spans the stream while its
-        // output is one row per sampled row. With the launch narrowed, the
-        // gather binds one row, WGSL bounds-clamps the out-of-range read to
-        // zero, and the head projects zeros into an argmax of the last index.
-        // `Arg::Arena` carries no row count, so an operand whose row space is
-        // not the launch's cannot yet say so.
-        let mut rows = frame.seriation();
-        for row in &mut rows {
-            row.samples = true;
-        }
+        // `Lowered::arg_rows` is the missing statement -- each operand's own
+        // row count, beside the launch's -- and `binding::bind` widens a
+        // binding to it. The gather reads the stream again, and the head runs
+        // over the REQUESTS: a 512-token prefill's readout falls from 512
+        // distributions to one, which is 316.9 ms of lm head and a 296.8 MB
+        // readback that nobody wanted.
+        //
+        // What this costs instead is a remap. `Step::readout_of` and
+        // `Step::readouts_of` named FIRE rows, and the logits are now one row
+        // per SAMPLED row, so both are put through `frame.sampling_indices`
+        // below.
+        let rows = frame.seriation();
         // One row is a decode, more than one is a prefill -- including a BATCH
         // of one-token turns, since the row count is what the kernel choice
         // depends on.
@@ -406,22 +404,10 @@ impl Serving<'_> {
             .map_err(Unstepped::Uncovered)?;
 
         held.pool.stage(device, &frame).map_err(Unstepped::Failed)?;
-        // AND THE TABLE MUST SAY THE SAME THING THE LOWERING WAS TOLD.
-        //
-        // `Pool::stage` writes `SamplingIndices` from the frame, which names
-        // only the rows a request reads out, while the lowering above was told
-        // every row samples -- so `row_gather` would read four entries of a
-        // one-entry binding. WGSL bounds-checks against the BOUND range, so
-        // the rows past the end read as ZERO: a plausible tensor, and a model
-        // that says something.
-        let identity: Vec<u32> = (0..frame.rows() as u32).collect();
-        held.pool
-            .state(
-                device,
-                crate::binding::FireTable::SamplingIndices,
-                &identity,
-            )
-            .map_err(Unstepped::Failed)?;
+        // The table and the lowering say the same thing again: `Pool::stage`
+        // writes `SamplingIndices` from the frame, and the frame's seriation
+        // above is what the lowering was handed. The identity table that used
+        // to be written over it belonged to the every-row workaround.
         // The tokens, put where the FRAME says each row is rather than in the
         // order the turns arrived. A step that wrote them in turn order would
         // feed every conversation somebody else's token whenever the seriation
@@ -460,8 +446,8 @@ impl Serving<'_> {
         // is what `driver-vulkan`'s explicit `device.free(arena)` on both sides
         // of the `?` is standing in for. Nothing here can leak it, and nothing
         // here can free it early either -- the read below still names it.
-        let fired = ran.map_err(Unstepped::Unfired)?;
-        let logits = logits(device, &arena, low).map_err(Unstepped::Unread)?;
+        let (fired, readout) = ran.map_err(Unstepped::Unfired)?;
+        let logits = logits(device, &arena, low, &readout).map_err(Unstepped::Unread)?;
         // AFTER the fire and before the arena is dropped, which is the only
         // window it exists in.
         let kept = if self.keep_arena {
@@ -477,7 +463,10 @@ impl Serving<'_> {
             fired,
             rows: frame.rows(),
             positions: frame.positions.clone(),
-            readout_of: last_row_of(tokens.len(), &frame.request_of_token),
+            readout_of: last_row_of(tokens.len(), &frame.request_of_token)
+                .into_iter()
+                .map(|row| logit_row_of(&frame, row))
+                .collect(),
             readouts_of: readouts_of(tokens.len(), &frame),
             pipelines: pipelines.built(),
         })
@@ -501,17 +490,35 @@ fn readouts_of(turns: usize, frame: &Frame) -> Vec<Vec<usize>> {
                 frame.sampling_indptr.get(t),
                 frame.sampling_indptr.get(t + 1),
             ) {
-                (Some(&lo), Some(&hi)) if hi >= lo => frame
-                    .sampling_indices
-                    .get(lo as usize..hi as usize)
-                    .unwrap_or(&[])
-                    .iter()
-                    .map(|&row| row as usize)
+                // The CSR POSITIONS and not the row values they hold: the
+                // gather compacts the stream into one output row per sampled
+                // row, in `sampling_indices` order, so position `j` of that
+                // list is logit row `j`.
+                (Some(&lo), Some(&hi)) if hi >= lo => (lo as usize..hi as usize)
+                    .filter(|&j| j < frame.sampling_indices.len())
                     .collect(),
                 _ => Vec::new(),
             }
         })
         .collect()
+}
+
+/// Which LOGIT row a fire row's distribution landed in.
+///
+/// The epilogue gather compacts the stream into one row per sampled row, in
+/// `sampling_indices` order, so a fire row's distribution is at that row's
+/// POSITION in the list. A row the frame does not sample has no distribution
+/// and gets [`NO_ROW`], which `frames::serve` already refuses by name.
+#[must_use]
+fn logit_row_of(frame: &Frame, row: usize) -> usize {
+    if row == NO_ROW {
+        return NO_ROW;
+    }
+    frame
+        .sampling_indices
+        .iter()
+        .position(|&at| at as usize == row)
+        .unwrap_or(NO_ROW)
 }
 
 /// A row index no fire has: what a turn that contributed no rows gets, so

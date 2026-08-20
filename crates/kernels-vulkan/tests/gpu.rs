@@ -1171,20 +1171,27 @@ fn the_device_reports_which_tiers_it_can_load() {
     );
 }
 
-/// `row_gather_bfloat16`, which is the ABI question this crate got wrong.
+/// `row_gather_bfloat16`, which is the ABI question this crate got wrong twice.
 ///
-/// The row states `count: Ty::InPacked` -- a value the driver must supply that
-/// gets no slot of its own, because it is the second FIELD of the params struct
-/// buffer 3 already binds. `bindings()` used to fold it into the push block,
-/// Metal's rule, which would have pushed a word no shader reads and left
-/// `p.count` holding whatever was in the buffer.
+/// # The question, and both of its old answers
 ///
-/// So this test writes the params struct the way `Binding::Packed` says to --
-/// `{width, count}` in buffer 3, nothing pushed -- and checks the rows come out
-/// gathered. Under the old reading the shader would have read a garbage count
-/// and the dispatch would have written the wrong number of rows.
+/// The row stated `count: Ty::InPacked` -- a value the driver must supply that
+/// got no slot of its own, because it was the second FIELD of the params struct
+/// buffer 3 bound. `bindings()` first folded it into the push block, Metal's
+/// rule, which would have pushed a word no shader read and left `p.count`
+/// holding whatever was in the buffer. This test then wrote the struct the way
+/// `Binding::Packed` said to -- `{width, count}` in buffer 3, nothing pushed.
+///
+/// Both readings are gone. `width` is a `Const<u32>` mark and `count` is the
+/// request count the body asks the fire for, so the pair is an ordinary
+/// eight-byte PUSH range built in the order the body passes them -- which is
+/// the first answer, arrived at honestly, after the thing that made it wrong
+/// (a struct the push block could not also be) stopped existing.
+///
+/// What the dispatch proves is unchanged: the rows come out gathered, and a
+/// count read from the wrong field would write the wrong number of them.
 #[test]
-fn row_gather_reads_its_count_from_the_packed_struct() {
+fn row_gather_reads_its_width_then_its_count_from_the_push_block() {
     let gpu = gpu!();
 
     let width = 4usize;
@@ -1196,18 +1203,19 @@ fn row_gather_reads_its_count_from_the_packed_struct() {
         bf16_bytes(&input),
         vec![0u8; pick.len() * width * 2],
         pick.iter().flat_map(|r| r.to_le_bytes()).collect(),
-        // RowGatherParams { width, count } -- the count rides HERE.
-        [width as u32, pick.len() as u32]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect(),
     ];
+    // `{width, count}` -- the same two words in the same order the struct held
+    // them, in the push range now.
+    let push: Vec<u8> = [width as u32, pick.len() as u32]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
 
     let out = gpu.dispatch(
         "row_gather_bfloat16",
         Capability::Baseline,
         &operands,
-        &[],
+        &push,
         [width.div_ceil(16) as u32, pick.len().div_ceil(16) as u32, 1],
     );
 
@@ -3304,19 +3312,31 @@ fn shared_expert_combine_gates_by_row_not_by_element() {
     );
 }
 
-/// The four small elementwise kernels whose only scalar arrives in a BUFFER.
+/// The four small elementwise kernels, and the four different ways they are
+/// handed the one number each of them needs.
 ///
 /// These have almost no arithmetic, which is the reason to run them: what can
-/// go wrong is the params struct, and a struct read at the wrong offset gives
-/// a plausible number rather than a fault. `logit_softcap` and `ple_combine`
-/// both put a `float` first and a `uint` second, so a shader that read them in
-/// the other order would get a denormal-ish garbage scale, and `layer_scalar`
-/// takes its multiplier from element zero of a buffer rather than from a
-/// struct at all — three different ways to pass one number, all in this group.
+/// go wrong is where the scalar came from, and a number read from the wrong
+/// place is a plausible number rather than a fault.
 ///
-/// The counts in the structs are deliberately set WRONG here, to `0`. They are
-/// documented as ABI parity fields that must not act as bounds, and a shader
-/// that used one as a bound would write nothing at all.
+/// - `residual_add` needs none at all.
+/// - `layer_scalar` takes its multiplier from element zero of a BUFFER, because
+///   which layer is running is the fire's business and not the statement's.
+/// - `logit_softcap` states its cap as a `Const<f32>` mark, so the cap is the
+///   one field of a four-byte PUSH block.
+/// - `ple_combine` states `inv_sqrt2` as a `Const<f32>` mark, so its scale is a
+///   four-byte push range too.
+///
+/// Both of the last two used to carry a second word — `PleCombineParams`' count
+/// and `SoftcapParams`' — that no shader read, and this test deliberately set
+/// each one WRONG, to `0`, because they were documented as ABI parity fields
+/// that must not act as bounds and a shader using one as a bound would write
+/// nothing at all.
+///
+/// Neither dead word exists now: the marks replaced the structs, and a block of
+/// one live word has nothing left to poison. What the poisoned fields guarded —
+/// that no lane is bounded by a stated count — is still guarded by `n` being
+/// ragged, which is the property that would catch it either way.
 #[test]
 fn the_small_elementwise_kernels_read_their_scalars_from_the_right_place() {
     let gpu = gpu!();
@@ -3339,6 +3359,9 @@ fn the_small_elementwise_kernels_read_their_scalars_from_the_right_place() {
     let want: Vec<f32> = xq.iter().zip(&yq).map(|(a, b)| a + b).collect();
     assert_close(&bf16_read(&out[2]), &want, "residual_add_bfloat16");
 
+    // Three buffers and no block: `LayerScalarParams` held one dead word --
+    // the hidden width, which the grid already is -- and is deleted on all
+    // three planes.
     let scalar = -0.375f32;
     let out = gpu.dispatch(
         "layer_scalar_mul_bfloat16",
@@ -3347,7 +3370,6 @@ fn the_small_elementwise_kernels_read_their_scalars_from_the_right_place() {
             bf16_bytes(&x),
             bf16_bytes(&[scalar]),
             vec![0u8; n * 2],
-            0u32.to_le_bytes().to_vec(),
         ],
         &[],
         groups,
@@ -3357,28 +3379,26 @@ fn the_small_elementwise_kernels_read_their_scalars_from_the_right_place() {
     assert_close(&bf16_read(&out[2]), &want, "layer_scalar_mul_bfloat16");
 
     // The cap is small enough that the inputs above run well past it in both
-    // directions, so the tanh is saturated and a missing cap would show.
+    // directions, so the tanh is saturated and a missing cap would show. It
+    // rides the PUSH block now rather than a storage struct -- four bytes,
+    // packed from the routine's `cap: Const<f32>` mark.
     let cap = 3.0f32;
-    let mut params = cap.to_le_bytes().to_vec();
-    params.extend_from_slice(&0u32.to_le_bytes());
     let out = gpu.dispatch(
         "logit_softcap_bfloat16",
         Capability::Baseline,
-        &[bf16_bytes(&x), vec![0u8; n * 2], params],
-        &[],
+        &[bf16_bytes(&x), vec![0u8; n * 2]],
+        &cap.to_le_bytes(),
         groups,
     );
     let want: Vec<f32> = xq.iter().map(|a| cap * (a / cap).tanh()).collect();
     assert_close(&bf16_read(&out[1]), &want, "logit_softcap_bfloat16");
 
     let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
-    let mut params = inv_sqrt2.to_le_bytes().to_vec();
-    params.extend_from_slice(&0u32.to_le_bytes());
     let out = gpu.dispatch(
         "ple_combine_bfloat16",
         Capability::Baseline,
-        &[bf16_bytes(&x), bf16_bytes(&y), vec![0u8; n * 2], params],
-        &[],
+        &[bf16_bytes(&x), bf16_bytes(&y), vec![0u8; n * 2]],
+        &inv_sqrt2.to_le_bytes(),
         groups,
     );
     let want: Vec<f32> = xq
@@ -3410,14 +3430,17 @@ fn vnorm_normalizes_each_row_by_its_own_rms() {
         }
     }
 
-    let mut params = eps.to_le_bytes().to_vec();
-    params.extend_from_slice(&(axis as u32).to_le_bytes());
-    let operands = vec![bf16_bytes(&x), vec![0u8; rows * axis * 2], params];
+    // Both scalars are STATED now -- `eps: Const<f32>`, `axis_size: Const<i32>`
+    // -- so they ride an eight-byte push range where they were a `VNormParams`
+    // storage struct the routine forwarded whole and could not name.
+    let mut push = eps.to_le_bytes().to_vec();
+    push.extend_from_slice(&(axis as u32).to_le_bytes());
+    let operands = vec![bf16_bytes(&x), vec![0u8; rows * axis * 2]];
     let out = gpu.dispatch(
         "vnorm_single_row_bfloat16",
         Capability::Baseline,
         &operands,
-        &[],
+        &push,
         [rows as u32, 1, 1],
     );
 
@@ -3439,11 +3462,16 @@ fn vnorm_normalizes_each_row_by_its_own_rms() {
 /// `split_qkv_bf16` — one packed row cut into three.
 ///
 /// The three destinations have DIFFERENT widths and the two boundaries are
-/// computed from the same pair of struct fields, so reading them swapped, or
+/// computed from the same pair of scalars, so reading them swapped, or
 /// forgetting to subtract the preceding width, lands inside a neighbour rather
 /// than out of bounds. The widths below are unequal and not multiples of the
 /// 256-wide workgroup, which also puts the rounded x tail one row away from
 /// falling through into the next — the case the shader's own comment names.
+///
+/// The pair arrives as a PUSH BLOCK. It was a fifth storage operand holding
+/// `SplitQkvParams` until the two widths became `Const<u32>` marks; the bytes
+/// are the same two words in the same order, so the only change here is which
+/// argument of `dispatch` they are handed to.
 #[test]
 fn split_qkv_cuts_at_both_boundaries() {
     let gpu = gpu!();
@@ -3454,20 +3482,21 @@ fn split_qkv_cuts_at_both_boundaries() {
         .map(|i| ((i % 61) as f32 - 30.0) / 7.0)
         .collect();
 
-    let mut params = (q_width as u32).to_le_bytes().to_vec();
-    params.extend_from_slice(&(kv_width as u32).to_le_bytes());
+    // `q_width` at word 0 and `kv_width` at word 1, which is the order the
+    // marks are declared in and therefore the order `Push` is laid out in.
+    let mut widths = (q_width as u32).to_le_bytes().to_vec();
+    widths.extend_from_slice(&(kv_width as u32).to_le_bytes());
     let operands = vec![
         bf16_bytes(&packed),
         vec![0u8; rows * q_width * 2],
         vec![0u8; rows * kv_width * 2],
         vec![0u8; rows * kv_width * 2],
-        params,
     ];
     let out = gpu.dispatch(
         "split_qkv_bf16",
         Capability::Baseline,
         &operands,
-        &[],
+        &widths,
         [packed_width.div_ceil(256) as u32, rows as u32, 1],
     );
 
@@ -4529,14 +4558,15 @@ fn gated_rms_normalizes_an_axis_wider_than_its_workgroup() {
             .collect();
         let w: Vec<f32> = (0..v_d).map(|i| 0.5 + (i % 13) as f32 / 20.0).collect();
 
-        let mut params = eps.to_le_bytes().to_vec();
-        params.extend_from_slice(&(v_d as u32).to_le_bytes());
+        // `eps` and `vd` are marks now, so the pair is an eight-byte push
+        // range rather than a `GatedRmsParams` storage struct at binding 4.
+        let mut push = eps.to_le_bytes().to_vec();
+        push.extend_from_slice(&(v_d as u32).to_le_bytes());
         let operands = vec![
             bf16_bytes(&x),
             bf16_bytes(&z),
             bf16_bytes(&w),
             vec![0u8; heads * v_d * 2],
-            params,
         ];
         // `gated_rms`'s grid is `(1, V_h, 1)` with the row base built from
         // `gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y`.
@@ -4544,7 +4574,7 @@ fn gated_rms_normalizes_an_axis_wider_than_its_workgroup() {
             "gated_rms_bfloat16",
             Capability::Baseline,
             &operands,
-            &[],
+            &push,
             [1, heads as u32, 1],
         );
 
@@ -4637,11 +4667,12 @@ fn every_module_this_device_claims_it_can_load_builds_a_pipeline() {
         // path a crossed entrypoint takes in production too, where a driver
         // reflects the module and takes the maximum of that and what the
         // routine states.
-        assert!(
-            kernels_vulkan::retired().contains(&name.as_str()),
-            "`{name}` is not a retired entrypoint and there is no table left \
-             for it to come from, which entrypoints.rs covers"
-        );
+        // `retired().contains(&name)` STOOD HERE, asserting that a name with no
+        // row was one of the names whose row had gone. Both sides came to be
+        // read off the same shader tree -- every family has crossed, so "the
+        // retired entrypoints" and "the entrypoints" were one set under two
+        // names -- and `retired()` is deleted with the hand-written list it
+        // flattened. The assert could only pass, and it did so for all 496.
         let (buffers, push) = (0u32, 0usize);
 
         // An UNSTATED row cannot supply the layout, and the first version of

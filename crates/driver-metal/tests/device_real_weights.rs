@@ -168,6 +168,61 @@ fn snapshot() -> Option<PathBuf> {
     std::env::var_os("PIE_METAL_SMOKE_CHECKPOINT").map(PathBuf::from)
 }
 
+/// State that this gate checked nothing, and why.
+///
+/// # Every skip in this file goes through here, and that is the point
+///
+/// There are twenty-odd of them and five reasons: no checkpoint named, no
+/// Metal 4 device, no measurement taken for this checkpoint, this device
+/// cannot hold this checkpoint, and this checkpoint does not have the feature
+/// the gate is about. All five are honest — a gate that cannot run should not
+/// PASS, and asserting a llama reference against gemma reports the rig as a
+/// driver defect — and all five print to stderr and let the harness say `ok`.
+///
+/// Which is fine when a human reads the stderr and fatal when nobody does.
+/// `cargo test` reports "19 passed" for a run in which nineteen gates printed
+/// SKIP and compared nothing, and that report is indistinguishable from the
+/// one where a real device ran the whole suite. The elapsed time is the only
+/// tell, and it is not in the summary.
+///
+/// So `PIE_METAL_NO_SKIP` turns every one of them into a failure. It is opt-in
+/// rather than the default because the default has to stay green on a Linux
+/// box with no Metal at all — that is what `#[ignore]` and the SKIPs are for —
+/// and because the reasons are genuinely different in kind: only the runner
+/// knows whether "no measurement for this checkpoint" is a gap it accepts.
+/// What it buys is a run that CANNOT lie about having checked something:
+/// point it at a checkpoint on a machine with a device, and either every gate
+/// compares something or the suite is red.
+///
+/// Measured on this machine before it existed: the whole target on
+/// `Qwen3.6-35B-A3B-4bit` (19 GB, the largest checkpoint here) reports 19
+/// passed and skips nothing for the device, so the staging ceiling this was
+/// written against does not bite at that size today. "Today" and "at that
+/// size" are exactly the qualifications that make the flag worth having.
+fn skipped(why: &str) {
+    assert!(
+        std::env::var_os("PIE_METAL_NO_SKIP").is_none(),
+        "SKIP under PIE_METAL_NO_SKIP: {why}"
+    );
+    eprintln!("SKIP: {why}");
+}
+
+/// State that this gate's PREMISE does not hold for this checkpoint.
+///
+/// The other half of the split, and the reason [`skipped`] can be made fatal
+/// at all. Some gates come in exclusive pairs — a checkpoint either rescales
+/// its rope ladder or it does not, and the two gates that check the two lanes
+/// cannot both run against one snapshot. No runner setup fixes that, so
+/// failing on it under `PIE_METAL_NO_SKIP` would make the flag permanently
+/// red and therefore useless.
+///
+/// The distinction is whose gap it is. A [`skipped`] gate could have run:
+/// point at a checkpoint, run on a device with room, take the measurement.
+/// One of these could not, and saying so is a different sentence.
+fn inapplicable(why: &str) {
+    eprintln!("SKIP: {why}");
+}
+
 /// Two bf16 ulps at `v`, which is what "a tolerance about the FORMAT" means
 /// once the readout is not llama's.
 ///
@@ -565,12 +620,12 @@ fn reference_for(snapshot: &Path) -> Option<&'static Reference> {
     let path = snapshot.to_string_lossy();
     let found = REFERENCES.iter().find(|r| path.contains(r.model));
     if found.is_none() {
-        eprintln!(
-            "SKIP: no MLX reference has been measured for `{}`. Taking one is \
+        skipped(&format!(
+            "no MLX reference has been measured for `{}`. Taking one is \
              a `mlx_lm` load, one forward over `[[bos]]`, and a row in \
              `REFERENCES`.",
             snapshot.display()
-        );
+        ));
     }
     found
 }
@@ -591,15 +646,35 @@ fn reference_for(snapshot: &Path) -> Option<&'static Reference> {
 /// "12 passed" about a checkpoint it never compared is the same lie in the
 /// other direction. Taking the reference for a second checkpoint is a
 /// half-hour of `mlx_lm` and a second table beside the first.
+///
+/// # Why this is [`inapplicable`] and not [`skipped`]
+///
+/// Under `PIE_METAL_NO_SKIP` it would otherwise be the one gate that cannot
+/// be made to run: the numbers below it are five ranks and a span of ONE
+/// checkpoint's distribution, and the flag would demand they be taken again
+/// for whichever checkpoint the runner has.
+///
+/// It would be the wrong demand, because the thing this gate exists to hold
+/// — the M>1 lane, `affine_qmm_t` and the row gather and rope at a position
+/// that rotates — IS held on every checkpoint already. Every row of
+/// `GENERATIONS` is a sentence, so the first fire of
+/// `a_generation_agrees_with_mlx_token_for_token` is a multi-token prefill
+/// whose argmax is compared against MLX, on all six. What is llama-only here
+/// is the RESOLUTION: five ranks in order and the distribution's span, which
+/// no generation gate reads. That is a stronger claim about one checkpoint
+/// rather than a missing claim about the others.
 fn reference_taken_on(snapshot: &Path, model: &str) -> bool {
     let taken = snapshot.to_string_lossy().contains(model);
     if !taken {
-        eprintln!(
-            "SKIP: the reference in this test was measured on `{model}` and \
+        inapplicable(&format!(
+            "the reference in this test was measured on `{model}` and \
              PIE_METAL_SMOKE_CHECKPOINT is `{}`. Comparing a different \
-             checkpoint against it would report the rig as a driver defect.",
+             checkpoint against it would report the rig as a driver defect. \
+             The M>1 lane is held on this checkpoint by \
+             `a_generation_agrees_with_mlx_token_for_token`, whose prompt is \
+             a sentence and whose first fire is therefore a prefill.",
             snapshot.display()
-        );
+        ));
     }
     taken
 }
@@ -716,12 +791,12 @@ fn generation_reference(snapshot: &Path) -> Option<&'static Generation> {
         .filter(|g| path.contains(g.model))
         .max_by_key(|g| g.model.len());
     if found.is_none() {
-        eprintln!(
-            "SKIP: no MLX generation has been measured for `{}`. Taking one \
+        skipped(&format!(
+            "no MLX generation has been measured for `{}`. Taking one \
              is an `mlx_lm` load, four argmax steps over the growing prefix, \
              and a row in `GENERATIONS`.",
             snapshot.display()
-        );
+        ));
     }
     found
 }
@@ -838,11 +913,11 @@ fn served(
             what: "weight arena",
             message,
         }) => {
-            eprintln!(
-                "SKIP: THIS DEVICE cannot hold `{}` -- not a driver defect \
+            skipped(&format!(
+                "THIS DEVICE cannot hold `{}` -- not a driver defect \
                  and not a missing measurement. {message}",
                 snapshot.display(),
-            );
+            ));
             return None;
         }
         Err(e) => panic!("the checkpoint loads: {e:?}"),
@@ -1428,11 +1503,11 @@ fn stage_tables(
 #[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn a_real_checkpoints_weights_produce_finite_varied_activations() {
     let Some(snapshot) = snapshot() else {
-        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        skipped("set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
     };
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");
@@ -1977,11 +2052,11 @@ fn the_prefill_lane_too() {
 
 fn bisect(class: FireClass) {
     let Some(snapshot) = snapshot() else {
-        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        skipped("set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
     };
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");
@@ -2355,11 +2430,11 @@ fn the_first_statement_that_writes_a_nan_says_which_one_it_is() {
 fn locate_first_nan(class: FireClass, step: &Step<'_>) {
     eprintln!("---- {class:?} ----");
     let Some(snapshot) = snapshot() else {
-        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        skipped("set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
     };
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");
@@ -2860,14 +2935,14 @@ fn locate_first_nan(class: FireClass, step: &Step<'_>) {
 #[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn one_token_at_position_zero_agrees_with_mlx() {
     let Some(snapshot) = snapshot() else {
-        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        skipped("set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
     };
     let Some(reference) = reference_for(&snapshot) else {
         return;
     };
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");
@@ -3046,7 +3121,7 @@ fn one_token_at_position_zero_agrees_with_mlx() {
         // MLX's own top two are inside an ulp of each other. There is no
         // ranking to hold this driver to, and the per-token logits below are
         // the whole of what can be asked.
-        eprintln!("SKIP the set: MLX's top two are closer than bf16 resolves");
+        inapplicable("the set: MLX's top two are closer than bf16 resolves");
     }
     let mut want_set: Vec<usize> = reference.top[..depth].iter().map(|(t, _)| *t).collect();
     let mut got_set: Vec<usize> = order[..depth].to_vec();
@@ -3205,7 +3280,7 @@ fn one_token_at_position_zero_agrees_with_mlx() {
 #[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn a_two_token_prefill_agrees_with_mlx() {
     let Some(snapshot) = snapshot() else {
-        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        skipped("set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
     };
     // The reference below is llama-3.2-1B-Instruct-4bit's, taken by hand.
@@ -3213,7 +3288,7 @@ fn a_two_token_prefill_agrees_with_mlx() {
         return;
     }
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");
@@ -3380,11 +3455,11 @@ fn a_two_token_prefill_agrees_with_mlx() {
 #[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn a_prefill_rotates_its_second_row() {
     let Some(snapshot) = snapshot() else {
-        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        skipped("set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
     };
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");
@@ -3446,9 +3521,9 @@ fn a_prefill_rotates_its_second_row() {
     // the same number one seam earlier and no longer a second opinion about
     // the checkpoint that could disagree with the text's.
     if dg.rope_rescale.is_none() {
-        eprintln!(
-            "SKIP: this checkpoint does not rescale its ladder, so the BASE \
-             lane is the one it takes -- see the twin below."
+        inapplicable(
+            "this checkpoint does not rescale its ladder, so the BASE \
+             lane is the one it takes -- see the twin below.",
         );
         return;
     }
@@ -3541,11 +3616,11 @@ fn a_prefill_rotates_its_second_row() {
 #[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn a_prefill_rotates_its_second_row_on_the_base_ladder() {
     let Some(snapshot) = snapshot() else {
-        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        skipped("set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
     };
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");
@@ -3579,9 +3654,9 @@ fn a_prefill_rotates_its_second_row_on_the_base_ladder() {
     // gate's doc for why the lane is the snapshot's to choose and not this
     // test's to force.
     if dg.rope_rescale.is_some() {
-        eprintln!(
-            "SKIP: this checkpoint rescales its ladder, so the FREQS \
-             lane is the one it takes -- see the twin above."
+        inapplicable(
+            "this checkpoint rescales its ladder, so the FREQS \
+             lane is the one it takes -- see the twin above.",
         );
         return;
     }
@@ -3786,14 +3861,14 @@ fn stage_prefill(
 #[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn a_generation_agrees_with_mlx_token_for_token() {
     let Some(snapshot) = snapshot() else {
-        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        skipped("set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
     };
     let Some(reference) = generation_reference(&snapshot) else {
         return;
     };
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");
@@ -3990,11 +4065,11 @@ fn a_generation_agrees_with_mlx_token_for_token() {
 #[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
     let Some(snapshot) = snapshot() else {
-        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        skipped("set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
     };
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");
@@ -4476,11 +4551,11 @@ fn prefill_logits_on(
 #[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn a_request_prefills_the_same_way_beside_another_one() {
     let Some(snapshot) = snapshot() else {
-        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        skipped("set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
     };
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");
@@ -4607,11 +4682,11 @@ fn a_request_prefills_the_same_way_beside_another_one() {
 #[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn the_batched_gemm_answers_what_the_matvec_answers() {
     let Some(snapshot) = snapshot() else {
-        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        skipped("set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
     };
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");
@@ -4816,6 +4891,61 @@ fn the_batched_gemm_answers_what_the_matvec_answers() {
     // catalogue and nowhere near where a broken one does: when the tile was
     // derived rather than read off the name, the worst pair was 14 against a
     // span of 6, which is 230%.
+    //
+    // # AND ON gemma-4-26b-a4b THE TWO ARMS ARE NOT ONE PRODUCT
+    //
+    // Measured on this machine, row 63: 13.6% before the region-table fix
+    // that let a prefill take the tiled attention kernel, 9.4% after it. Row
+    // 1 stays inside the bound on both sides, and so does every other
+    // checkpoint here -- gpt-oss-20b, qwen3.6-27B, qwen3.6-35B-A3B and
+    // gemma-4-31b all pass this gate under `PIE_METAL_NO_SKIP`.
+    //
+    // This comment used to propose a ROUTING FLIP and say, correctly, that a
+    // flip is checkable and that until someone checked it 9.4% was an
+    // observation and not an explanation. It has been checked --
+    // `a_tie_at_the_last_expert_is_where_the_two_spellings_part` below is the
+    // check -- and it is a flip: the two arms select a different eighth
+    // expert at LAYER 1, out of scores that agree to 7.3e-4 of their span,
+    // and the two experts they swap read EXACTLY EQUAL in the GEMM's own
+    // scores. A tie at rank eight of a hundred and twenty-eight, broken by
+    // whichever way the summation order fell.
+    //
+    // So the premise of everything below fails on this checkpoint, and it
+    // fails for a reason no runner setup fixes: past layer 1 these are two
+    // different products and no tolerance calibrated on rounding describes
+    // the gap. That is `inapplicable` and not `skipped`, and the difference
+    // is the whole of why the two exist.
+    //
+    // What is NOT given up by saying so: the flip gate measures the two
+    // spellings' router scores at every router up to the flip, which is this
+    // GEMM read one layer in, before gemma-4 amplifies anything -- a bound of
+    // 1% where the derived-tile defect this gate was written for lands a
+    // quarter of the answer. The projection is still measured on this
+    // checkpoint. It is measured somewhere the measurement means something.
+    let routing = first_routing_divergence(
+        &context,
+        &compiler,
+        &mut pipelines,
+        &loaded,
+        row,
+        &dg,
+        &step,
+        (&observed, &unbatched),
+        &[1, 63],
+    );
+    if let Some(flip) = routing.first_flip {
+        inapplicable(&format!(
+            "the two spellings select different experts from router {} (layer \
+             {}) on, at row {} -- {:?} against {:?} -- so past that layer they \
+             are not one matrix product spelled twice and their logits are not \
+             comparable. \
+             `a_tie_at_the_last_expert_is_where_the_two_spellings_part` is what \
+             measures the projection on this checkpoint.",
+            flip.router, flip.layer, flip.row, flip.gemm, flip.matvec
+        ));
+        return;
+    }
+
     const REL_RMS: f32 = 0.04;
     let rel_rms = |x: &[f32], y: &[f32]| -> f32 {
         let n = x.len() as f64;
@@ -4917,11 +5047,11 @@ fn the_batched_gemm_answers_what_the_matvec_answers() {
 #[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn an_elastic_pool_answers_exactly_as_a_fixed_one_does() {
     let Some(snapshot) = snapshot() else {
-        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        skipped("set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
     };
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");
@@ -5088,11 +5218,11 @@ fn an_elastic_pool_answers_exactly_as_a_fixed_one_does() {
 #[ignore = "needs a real checkpoint and a device, and times a fire"]
 fn attention_is_a_minority_of_a_long_prefill() {
     let Some(snapshot) = snapshot() else {
-        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        skipped("set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
     };
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");
@@ -5258,8 +5388,8 @@ fn attention_is_a_minority_of_a_long_prefill() {
     // reader to ignore the colour. The gate is out of scope for this row; it
     // is not failing on it.
     if share * DECODE_OVER_WIRED < 0.40 {
-        eprintln!(
-            "SKIP: this checkpoint cannot tell the two attention kernels \
+        inapplicable(&format!(
+            "this checkpoint cannot tell the two attention kernels \
              apart: at {:.0}% of a {longest:.0}-token prefill, attention \
              would still be under the 40% threshold at {DECODE_OVER_WIRED}x \
              the cost. Its per-token work swamps the quadratic term -- run \
@@ -5267,7 +5397,7 @@ fn attention_is_a_minority_of_a_long_prefill() {
              wired mma kernel against 47% on the decode kernel it replaces) \
              where the threshold sits between the two states.",
             share * 100.0
-        );
+        ));
         return;
     }
     assert!(
@@ -5293,11 +5423,11 @@ fn attention_is_a_minority_of_a_long_prefill() {
 #[ignore = "a measurement, not a gate"]
 fn where_a_long_prefill_spends_its_time() {
     let Some(snapshot) = snapshot() else {
-        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        skipped("set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
     };
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");
@@ -5548,11 +5678,11 @@ fn where_a_long_prefill_spends_its_time() {
 #[ignore = "needs a checkpoint and a device"]
 fn what_a_decode_costs_at_length() {
     let Some(snapshot) = snapshot() else {
-        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        skipped("set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
     };
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let replay = std::env::var("PIE_METAL_DECODE_REPLAY").is_ok_and(|v| !v.is_empty());
@@ -5868,11 +5998,11 @@ fn what_a_decode_costs_at_length() {
 #[ignore = "needs a checkpoint and a device"]
 fn tier_one_prefill_then_decode() {
     let Some(snapshot) = snapshot() else {
-        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        skipped("set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
     };
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let env = |name: &str, fallback: u32| -> u32 {
@@ -6333,11 +6463,11 @@ fn tier_one_prefill_then_decode() {
 #[ignore = "needs a checkpoint and a device"]
 fn where_a_decode_spends_its_time() {
     let Some(snapshot) = snapshot() else {
-        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        skipped("set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
     };
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");
@@ -6543,11 +6673,11 @@ fn the_first_statement_that_does_not_repeat_says_which_one_it_is() {
 fn locate_first_divergence(class: FireClass, step: &Step<'_>) {
     eprintln!("---- {class:?} ----");
     let Some(snapshot) = snapshot() else {
-        eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        skipped("set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
     };
     let Ok(context) = Context::new() else {
-        eprintln!("SKIP: no Metal 4 device");
+        skipped("no Metal 4 device");
         return;
     };
     let compiler = Compiler::new(&context).expect("a compiler");
@@ -6736,4 +6866,432 @@ fn locate_first_divergence(class: FireClass, step: &Step<'_>) {
         "statement {} of {total} (`{symbol}`) does not repeat",
         hi - 1
     );
+}
+
+/// What a walk of both spellings' routers found.
+struct Routing {
+    /// How many routers the fire has at all. Zero is a checkpoint with no
+    /// mixture, and a different sentence from "they agreed".
+    routers: usize,
+    /// The widest relative-RMS disagreement between the two spellings' router
+    /// SCORES at any router visited. This is the projection's own error, read
+    /// where it is still the projection's: a quarter-written tile is a quarter
+    /// of the answer at layer zero and cannot hide behind a later layer.
+    worst_scores: f32,
+    first_flip: Option<Flip>,
+}
+
+/// What the two spellings of one matrix product chose, at the first router
+/// where they chose differently.
+struct Flip {
+    /// Which router in the fire, counted over routers and not over statements.
+    router: usize,
+    layer: u16,
+    row: usize,
+    gemm: Vec<i32>,
+    matvec: Vec<i32>,
+    /// That row's router logits, one per expert, from each side. The scores
+    /// the selection was made FROM, which is where a flip is either a tie or
+    /// a defect.
+    gemm_logits: Vec<f32>,
+    matvec_logits: Vec<f32>,
+}
+
+/// Walk both spellings' routers in order and stop at the first one that picks
+/// a different set of experts, running the fire as a PREFIX at each step.
+///
+/// # Why a prefix and not one read of the finished arena
+///
+/// The arena is reused. Thirty routers write their `expert_ids` into slots the
+/// allocator hands back out, so reading the retired arena reports the LAST
+/// layer's bytes at every layer's offset -- the first version of this said
+/// "sixty flips over thirty routers" and every line of it was one layer's
+/// answer printed thirty times. Cutting the dispatch list at statement `n`
+/// and reading then is the only way to see a value while it is still live,
+/// and it is the shape `locate_first_divergence` already uses for the same
+/// reason.
+///
+/// Answers a [`Routing`]: how many routers the fire has at all, so a caller
+/// can tell a checkpoint with no mixture from one that agrees, and the worst
+/// disagreement between the SCORES along the way -- which is the projection
+/// measured before thirty layers have had a chance to amplify it.
+#[allow(clippy::too_many_arguments)]
+fn first_routing_divergence(
+    context: &Context,
+    compiler: &Compiler,
+    pipelines: &mut Pipelines,
+    loaded: &driver_metal::weights::load::Loaded,
+    row: &'static dyn model::catalog::Variant,
+    dg: &driver_metal::batch::DecodeGeometry,
+    step: &Step<'_>,
+    spellings: (&MetalBinding, &MetalBinding),
+    rows: &[usize],
+) -> Routing {
+    let (gemm, matvec) = spellings;
+    let shape = pool_shape(dg, 16);
+    let freqs = driver_metal::model::rope::table(dg);
+    let staged = stage_prefill_fleet(context, step, shape.page_size, &freqs);
+    let named = HashMap::new();
+
+    let mut prefix_arena = |binding: &MetalBinding,
+                            lowered: &model_compiler::lower::Lowered,
+                            n: usize|
+     -> Vec<u8> {
+        let rs = Slabs::of(context, row);
+        let slabs = |l: u16, w: &'static str| rs.as_ref()?.at(l, w);
+        let pool = Pool::allocate(context, shape).expect("a pool");
+        let arena = Allocation::new(
+            context,
+            (lowered.arena_bytes as u64).max(1),
+            "routing divergence arena",
+        )
+        .expect("an arena");
+        // SAFETY: freshly allocated. Zeroed so a slot no statement in the
+        // prefix wrote compares equal between the two spellings.
+        unsafe { arena.zero(0, arena.len()).expect("it zeroes") };
+        let pages = |layer: u16, values: bool| {
+            pool.layer(u32::from(layer)).map(|l| Slice {
+                address: if values {
+                    l.v.gpu_address()
+                } else {
+                    l.k.gpu_address()
+                },
+                bytes: shape.layer_bytes_at(u32::from(layer)),
+            })
+        };
+        let mut live = Live {
+            store: Store::new(Names::mlx(), &loaded.tensors, &named),
+            tables: &staged,
+            shape,
+            pages: &pages,
+            slabs: Some(&slabs),
+        };
+        let dispatches = driver_metal::lowering::dispatch::plan(
+            lowered,
+            driver_metal::lowering::executor::Frame {
+                arena: Slice {
+                    address: arena.gpu_address(),
+                    bytes: arena.len(),
+                },
+            },
+            dispatch_geometry(dg, binding),
+            &mut live,
+        )
+        .expect("the fire plans");
+        let prefix = &dispatches[..n.min(dispatches.len())];
+        let prepared =
+            driver_metal::fire::run::prepare(context, lowered, prefix).expect("the prefix prepares");
+        pipelines
+            .ensure(context, compiler, prefix)
+            .expect("the pipelines compile");
+        let mut stepper = driver_metal::device::Stepper::new(context).expect("a stepper");
+        stepper
+            .run(|encoder| {
+                driver_metal::bind::encode::encode(
+                    encoder,
+                    &prepared.table,
+                    &pipelines,
+                    &prepared.params,
+                    prefix,
+                )
+            })
+            .expect("the prefix runs");
+        // SAFETY: the command buffer retired.
+        unsafe {
+            core::slice::from_raw_parts(
+                arena.contents().as_ptr().cast_const().cast::<u8>(),
+                arena.len() as usize,
+            )
+        }
+        .to_vec()
+    };
+
+    /// Every router in one lowering: which statement it is, which layer, and
+    /// the two arena spans that hold the scores it read and the ids it wrote.
+    ///
+    /// `router_topk`'s operands are `logits`, `expert_ids`, `expert_weights`,
+    /// so the first two `Arena` arguments are exactly those -- and reading
+    /// them off the argument list rather than off a remembered offset is what
+    /// keeps this pointing at the right words when the signature moves again.
+    fn routers(
+        l: &model_compiler::lower::Lowered,
+    ) -> Vec<(usize, u16, (usize, usize), (usize, usize))> {
+        l.launches
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| l.kernels[x.kernel as usize].contains("router_topk"))
+            .map(|(i, x)| {
+                let arena: Vec<(usize, usize, usize)> = l.args
+                    [x.args.start as usize..x.args.end as usize]
+                    .iter()
+                    .filter_map(|g| match g {
+                        model_compiler::lower::Arg::Arena { at, width, bytes } => {
+                            Some((*at, *width as usize, *bytes as usize))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let (scores_at, n_experts, _) = arena[0];
+                let (ids_at, per_token, _) = arena[1];
+                (
+                    i,
+                    x.layers.start,
+                    (scores_at, n_experts),
+                    (per_token, ids_at),
+                )
+            })
+            .collect()
+    }
+
+    let mut worst = 0.0f32;
+    let a = lower_step(&text(row, FireClass::Prefill, gemm), step).expect("the step lowers");
+    let b = lower_step(&text(row, FireClass::Prefill, matvec), step).expect("the step lowers");
+    let ra = routers(&a);
+    let rb = routers(&b);
+    assert_eq!(
+        ra.len(),
+        rb.len(),
+        "the two spellings differ in one fact and it is not the mixture"
+    );
+
+    for (k, ((ia, layer, (scores_a, n_experts), ids_a), (ib, _, (scores_b, _), ids_b))) in
+        ra.iter().zip(&rb).enumerate()
+    {
+        let (per_token, ids_a) = *ids_a;
+        let (_, ids_b) = *ids_b;
+        let seen_a = prefix_arena(gemm, &a, ia + 1);
+        let seen_b = prefix_arena(matvec, &b, ib + 1);
+        let ids = |buf: &[u8], at: usize, r: usize| -> Vec<i32> {
+            buf[at + r * per_token * 4..at + (r + 1) * per_token * 4]
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        let scores = |buf: &[u8], at: usize, r: usize| -> Vec<f32> {
+            buf[at + r * n_experts * 2..at + (r + 1) * n_experts * 2]
+                .chunks_exact(2)
+                .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
+                .collect()
+        };
+        for probe in rows {
+            let (x, y) = (ids(&seen_a, ids_a, *probe), ids(&seen_b, ids_b, *probe));
+            let (sx, sy) = (
+                scores(&seen_a, *scores_a, *probe),
+                scores(&seen_b, *scores_b, *probe),
+            );
+            let n = sx.len() as f64;
+            let d: f64 = sx
+                .iter()
+                .zip(&sy)
+                .map(|(p, q)| f64::from(*p - *q).powi(2))
+                .sum();
+            let span = sx.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            worst = worst.max((d / n).sqrt() as f32 / span.max(f32::MIN_POSITIVE));
+            if x != y {
+                return Routing {
+                    routers: ra.len(),
+                    worst_scores: worst,
+                    first_flip: Some(Flip {
+                        router: k,
+                        layer: *layer,
+                        row: *probe,
+                        gemm: x,
+                        matvec: y,
+                        gemm_logits: sx,
+                        matvec_logits: sy,
+                    }),
+                };
+            }
+        }
+    }
+    Routing {
+        routers: ra.len(),
+        worst_scores: worst,
+        first_flip: None,
+    }
+}
+
+/// **A tie at the last expert is where the two spellings stop being one product.**
+///
+/// The gate above measures the batched GEMM against the matvec at the LOGITS,
+/// and on gemma-4-26b-a4b that comparison read 9.4% of the span at row 63
+/// against a 4% bound. The comment there proposed a routing flip, said so was
+/// an observation and not an explanation, and asked for someone to check it.
+/// This is the check, and it holds.
+///
+/// # What it found
+///
+/// The two spellings pick different experts, and they start at LAYER 1 --
+/// not at row 63 after thirty layers of accumulation, but at row 1 of the
+/// second layer. Layer 0 agrees. Measured:
+///
+///     gemm    [1, 86, 38, 18, 30, 78, 52, 61]
+///     matvec  [1, 86, 18, 38, 30, 78, 52, 90]
+///
+/// Seven of eight are the same experts; two of those seven are the same PAIR
+/// in the other order; and the eighth is 61 against 90. The scores those were
+/// selected from agree to 7.3e-4 of their span in RMS, which is bf16 rounding
+/// and not a broken product -- and in the GEMM's own scores expert 61 and
+/// expert 90 both read 1.8359375, EXACTLY equal, while in the matvec's 90 is
+/// 1.84375, one bf16 ulp above. Eight-of-a-hundred-and-twenty-eight selection
+/// with a tie at rank eight, broken by whichever way the summation order fell.
+///
+/// So the answer to the 9.4% is: past layer 1 the two arms are not one matrix
+/// product spelled twice, they are two different products, and a tolerance
+/// calibrated on rounding does not describe the gap between them. That is the
+/// same argument the top-five check above already makes about a tie at the
+/// LOGITS -- "three logits inside one ulp have no order to disagree about" --
+/// one layer deeper and about a selection rather than a ranking.
+///
+/// # Why this gate rather than a wider bound
+///
+/// A wider bound would accept a broken projection at gemma-4's amplification.
+/// This does not: it measures the two spellings' router scores at every
+/// router up to the flip, which is the GEMM read BEFORE anything amplifies
+/// it, and it demands that whatever the two arms swapped was a tie in each
+/// arm's own scores. A quarter-written tile misses by 230% at layer zero and
+/// swaps experts that are nowhere near each other. Both halves of that are
+/// assertions here.
+#[test]
+#[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
+fn a_tie_at_the_last_expert_is_where_the_two_spellings_part() {
+    let Some(snapshot) = snapshot() else {
+        skipped("set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
+        return;
+    };
+    let Ok(context) = Context::new() else {
+        skipped("no Metal 4 device");
+        return;
+    };
+    let compiler = Compiler::new(&context).expect("a compiler");
+    let mut pipelines = Pipelines::new(kernels_dir());
+    let Some((row, dg, loaded)) = served(&context, &snapshot) else {
+        return;
+    };
+    let observed = observed(&dg, &loaded);
+    if !observed.qmm_multi_batch {
+        inapplicable("this checkpoint states `qmm_multi_batch: false`, so there is one spelling");
+        return;
+    }
+    let unbatched = MetalBinding {
+        qmm_multi_batch: false,
+        ..observed
+    };
+    // The gate above's fire, token for token, so what this explains is what
+    // that measures and not a nearby thing.
+    let tokens: Vec<u32> = (0..64u32).map(|i| 1000 + i * 37).collect();
+    let step = Step {
+        token_ids: &tokens,
+        qo_indptr: &[0, 64],
+        sampling_indices: &[1, 63],
+        sampling_indptr: &[0, 2],
+        ..Step::default()
+    };
+    let found = first_routing_divergence(
+        &context,
+        &compiler,
+        &mut pipelines,
+        &loaded,
+        row,
+        &dg,
+        &step,
+        (&observed, &unbatched),
+        &[1, 63],
+    );
+    if found.routers == 0 {
+        inapplicable("this checkpoint has no mixture, so there is no routing to flip");
+        return;
+    }
+    // THE PROJECTION ITSELF, read at the router that flipped and every one
+    // before it. Rounding between two summation orders through one layer of
+    // bf16, and nothing a broken tile can reach: the derived-tile defect that
+    // this whole gate exists for put 14 against a span of 6 at the logits and
+    // is a QUARTER of the answer here.
+    const SCORES: f32 = 0.01;
+    assert!(
+        found.worst_scores <= SCORES,
+        "the two spellings' router scores disagree by {:.3e} of their span in \
+         RMS, past {SCORES}. That is the projection measured before anything \
+         amplifies it, so this is the GEMM and not the stack's sensitivity.",
+        found.worst_scores
+    );
+    let Some(flip) = found.first_flip else {
+        eprintln!(
+            "all {} routers pick the same experts in both spellings; the \
+             scores agree to {:.3e}",
+            found.routers, found.worst_scores
+        );
+        return;
+    };
+    eprintln!(
+        "the first flip is router {} (layer {}), row {}:\n  gemm   {:?}\n  matvec {:?}\n  scores agree to {:.3e}",
+        flip.router, flip.layer, flip.row, flip.gemm, flip.matvec, found.worst_scores
+    );
+
+    // WHAT WAS SWAPPED FOR WHAT. An expert one arm selected and the other did
+    // not has to be within a tie of one the other selected and this one did
+    // not -- in EACH arm's own scores, because a tie is a property of the
+    // numbers the selection read and not of the two arms together.
+    let only = |x: &[i32], y: &[i32]| -> Vec<i32> {
+        x.iter().filter(|e| !y.contains(e)).copied().collect()
+    };
+    let (dropped, gained) = (
+        only(&flip.gemm, &flip.matvec),
+        only(&flip.matvec, &flip.gemm),
+    );
+    assert_eq!(
+        dropped.len(),
+        gained.len(),
+        "both arms select the same number of experts, so a set difference is \
+         a swap: {dropped:?} for {gained:?}"
+    );
+    for out in &dropped {
+        for into in &gained {
+            let (o, i) = (*out as usize, *into as usize);
+            // HOW FAR APART the two experts are, in each arm's own scores --
+            // and how far apart the two arms are about each of those experts.
+            // A selection cannot be asked to order two scores by less than
+            // the amount the thing producing them disagrees with itself, so
+            // the second number is the resolution of the first.
+            //
+            // This was a flat two-ulp bound and gpt-oss-20b refused it: 0.484
+            // against 0.498, three and a half ulps apart, out of an mxfp4
+            // projection whose two spellings disagree by 6.2e-3 of the span
+            // where gemma-4's bf16 one disagrees by 7.3e-4. A tolerance about
+            // the FORMAT is the wrong tolerance for a question about the
+            // ARITHMETIC: the exchanged pair sat well inside what the two arms
+            // could resolve, and calling that a defect would have made the
+            // gate say "broken" about the checkpoint that passes the logits
+            // comparison downstream at 0.27%.
+            let uncertainty = (flip.gemm_logits[o] - flip.matvec_logits[o]).abs()
+                + (flip.gemm_logits[i] - flip.matvec_logits[i]).abs();
+            let floor = bf16_slack(
+                flip.gemm_logits[o]
+                    .abs()
+                    .max(flip.gemm_logits[i].abs()),
+            );
+            let resolution = uncertainty.max(floor);
+            for (arm, scores) in [
+                ("the GEMM", &flip.gemm_logits),
+                ("the matvec", &flip.matvec_logits),
+            ] {
+                let (p, q) = (scores[o], scores[i]);
+                eprintln!(
+                    "  {arm}: expert {out} {p}, expert {into} {q}; apart by \
+                     {}, resolvable to {resolution}",
+                    (p - q).abs()
+                );
+                assert!(
+                    (p - q).abs() <= resolution,
+                    "{arm} scores expert {out} at {p} and expert {into} at \
+                     {q} -- apart by {}, which is further than the {resolution} \
+                     the two spellings can resolve. So they did not swap a \
+                     tie: they selected from scores that genuinely disagree, \
+                     and that is a defect in the projection rather than a coin \
+                     broken two ways.",
+                    (p - q).abs()
+                );
+            }
+        }
+    }
 }

@@ -5,40 +5,25 @@
 //! host-computed table, which is what llama-3.1's wavelength ramp needs.
 
 use kernels_macros::routine;
-use kernels::KernelSig;
-
-/// EMPTY: this family's rows have been RETIRED.
-///
-/// `refactor-bigplan.md` §7 Stage 3. Seven kernels, and the rotation is IN
-/// PLACE — one `Buf` and no `Buf` beside it — so the statement's single
-/// widthed operand is an OUTPUT and an arm asking `input(0)` would refuse
-/// every rotation in the tree.
-pub static KERNELS: &[KernelSig] = &[];
-
-/// The entrypoints this family's routines spell, now that its rows are gone.
-///
-/// See [`crate::sample::ENTRYPOINTS`].
-pub static ENTRYPOINTS: &[&str] = &[
-    "neox_decode_bfloat16",
-    "neox_freqs_decode_bfloat16",
-    "neox_freqs_mb_bfloat16",
-    "neox_mb_bfloat16",
-    "neox_prop_decode_bfloat16",
-    "neox_prop_mb_bfloat16",
-    "neox_strided_bfloat16",
-];
 
 use crate::routine::{Asks, Bind, Const, Ctx, Fire, InOut, Tensor, bf16, keys};
 use kernels::routine::Refusal;
 
-/// One invocation per `(pair, head, row)`.
+/// One workgroup per `(NEOX_LANES words, head, row)`.
 ///
-/// `rope/neox.wgsl` is `@workgroup_size(1)`, so the lanes a [`Fire`] states
-/// ARE the workgroups — which is why this returns the same three numbers
-/// `kernels-vulkan::rope::rope_grid` does, where they are workgroups
-/// outright. x is the PAIR: a rotation moves two channels at once, so a
-/// `rotary` of 128 is 64 lanes and a grid built on the channel count would
-/// rotate the first half twice and the second half not at all.
+/// The x axis used to be one workgroup per rotated PAIR, because the shader
+/// read the pair count off `num_workgroups.x` and a wider workgroup would
+/// have made that count the rounded-up one. It reads the rotary width out of
+/// its uniform block now, so x is free to be divided.
+///
+/// It is divided TWICE. An invocation owns a whole four-byte word — two bf16
+/// channels — so it covers two pairs, and the old grid launched a workgroup
+/// per pair with half of them returning at the guard. So the useful extent is
+/// half the pair count, and the workgroups are that over [`NEOX_LANES`]. The
+/// shader's `if (i0 >= pairs)` still covers whatever the two round-ups add.
+///
+/// y and z are untouched: the shader still reads the head count off
+/// `num_workgroups.y`, which stays exact because that axis is not widened.
 ///
 /// # Errors
 ///
@@ -48,6 +33,12 @@ use kernels::routine::Refusal;
 /// rounded: an odd `rotary` leaves one channel unrotated and a ragged width
 /// gives the last head fewer channels than the first, and neither shows up as
 /// anything but slightly wrong text.
+/// The x-axis workgroup width `rope/neox.wgsl` declares.
+///
+/// One Apple simdgroup, and a whole subgroup on every other backend this
+/// tree runs on. Must match the shader's `PIE_LANES`.
+const NEOX_LANES: u32 = 32;
+
 fn rope_grid(rotary: i32, width: i32, head_dim: i32, rows: i32) -> Result<[u32; 3], Refusal> {
     if rotary <= 0 {
         return Err(Refusal::Empty { what: "rotary" });
@@ -70,8 +61,11 @@ fn rope_grid(rotary: i32, width: i32, head_dim: i32, rows: i32) -> Result<[u32; 
             at: i64::from(width),
         });
     }
+    // The shader's `pairs`: half the rotary width, since a rotation moves two
+    // channels at once.
+    let pairs = rotary.unsigned_abs() / 2;
     Ok([
-        rotary.unsigned_abs() / 2,
+        pairs.div_ceil(2).div_ceil(NEOX_LANES),
         width.unsigned_abs() / head_dim.unsigned_abs(),
         rows.unsigned_abs(),
     ])
@@ -99,7 +93,14 @@ pub fn neox_decode(
     let width = x.width;
     ctx.fire(
         Fire::at("rope/neox.wgsl", "neox_decode_bfloat16").apply(rope_grid(*rotary, width, *head_dim, 1)?),
-        &[x.arg(), position.arg(), scale.arg(), base.arg(), head_dim.arg()],
+        &[
+            x.arg(),
+            position.arg(),
+            scale.arg(),
+            base.arg(),
+            head_dim.arg(),
+            rotary.arg(),
+        ],
     )
 }
 
@@ -121,7 +122,14 @@ pub fn neox_mb(
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
         Fire::at("rope/neox.wgsl", "neox_mb_bfloat16").apply(rope_grid(*rotary, width, *head_dim, rows)?),
-        &[x.arg(), position.arg(), scale.arg(), base.arg(), head_dim.arg()],
+        &[
+            x.arg(),
+            position.arg(),
+            scale.arg(),
+            base.arg(),
+            head_dim.arg(),
+            rotary.arg(),
+        ],
     )
 }
 
@@ -160,6 +168,7 @@ pub fn neox_freqs_decode(
             inv_freq.arg(),
             head_dim.arg(),
             mscale.arg(),
+            rotary.arg(),
         ],
     )
 }
@@ -196,6 +205,7 @@ pub fn neox_freqs_mb(
             inv_freq.arg(),
             head_dim.arg(),
             mscale.arg(),
+            rotary.arg(),
         ],
     )
 }
@@ -221,7 +231,14 @@ pub fn neox_prop_decode(
     let width = x.width;
     ctx.fire(
         Fire::at("rope/neox.wgsl", "neox_prop_decode_bfloat16").apply(rope_grid(*rotary, width, *head_dim, 1)?),
-        &[x.arg(), position.arg(), scale.arg(), base.arg(), head_dim.arg()],
+        &[
+            x.arg(),
+            position.arg(),
+            scale.arg(),
+            base.arg(),
+            head_dim.arg(),
+            rotary.arg(),
+        ],
     )
 }
 
@@ -243,7 +260,14 @@ pub fn neox_prop_mb(
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
         Fire::at("rope/neox.wgsl", "neox_prop_mb_bfloat16").apply(rope_grid(*rotary, width, *head_dim, rows)?),
-        &[x.arg(), position.arg(), scale.arg(), base.arg(), head_dim.arg()],
+        &[
+            x.arg(),
+            position.arg(),
+            scale.arg(),
+            base.arg(),
+            head_dim.arg(),
+            rotary.arg(),
+        ],
     )
 }
 
@@ -278,6 +302,7 @@ pub fn neox_strided(
             base.arg(),
             head_dim.arg(),
             row_pitch.arg(),
+            rotary.arg(),
         ],
     )
 }

@@ -170,12 +170,20 @@ const POINTS: [(i32, i32); 6] = [(32, 4), (32, 8), (64, 4), (64, 8), (128, 4), (
 fn recipe(name: &str) -> Option<Vec<Vec<ArgValue>>> {
     let one = |v: Vec<ArgValue>| Some(vec![v]);
     match name {
-        // proj, token, out -- `params`, `width` and `rows` are all asked for
-        // or read off a buffer's own shape now.
-        "ple_combine" => one(vec![b(0), b(1), b(2)]),
-        // input, out -- every scalar this body once took as a parameter
-        // (`rows`, `params`, `count`, `width`, `row_count`) is asked for now.
-        "row_gather" => one(vec![b(0), b(1)]),
+        // proj, token, out, inv_sqrt2 -- the join's scale was the first field
+        // of the `PleCombineParams` block this body forwarded and is a
+        // `Const<f32>` mark now, reading the same word 0 of the same statement
+        // run. The struct's other word was dead and is simply gone. `width`
+        // and `rows` are still read off a buffer's own shape and asked for.
+        "ple_combine" => one(vec![b(0), b(1), b(2), ArgValue::F32(core::f32::consts::FRAC_1_SQRT_2)]),
+        // input, out, width -- the row pitch was `RowGatherParams`'s first
+        // field and is a `Const<u32>` mark now; `U32` and not `I32` because
+        // `Arg::unpack` for a `Const<u32>` takes the unsigned carrier and
+        // refuses the signed one. The request count that used to be the
+        // struct's second field is not on the signature at all: it is the
+        // FIRE's, so the body asks for it and passes it after the width.
+        // `rows` and `row_count` are asked for as before.
+        "row_gather" => one(vec![b(0), b(1), ArgValue::U32(1024)]),
         // logits, next_token, params, eos_flag -- `params` here is an
         // ordinary buffer parameter (a `Tensor<bf16>`), not the staged scalar
         // block; `rows` moved to an ask.
@@ -186,26 +194,65 @@ fn recipe(name: &str) -> Option<Vec<Vec<ArgValue>>> {
 
         // ---- norm, the first LIVE family crossed here ----
         //
-        // x, w, out -- `width`, `axis` and `rows` are all asked for; none of
-        // the three is a signature parameter any more.
-        "rms_single_row" => one(vec![b(0), b(1), b(2), ArgValue::F32(1e-5), ArgValue::I32(1024)]),
-        // x, w, out -- `row_pitch`/`rows` asked.
-        "rms_strided_row" => one(vec![b(0), b(1), b(2), ArgValue::F32(1e-5), ArgValue::I32(512)]),
-        // x, w, out -- `row_pitch`/`heads`/`rows` asked.
-        "rms_strided_head_row" => one(vec![b(0), b(1), b(2), ArgValue::F32(1e-5), ArgValue::I32(512)]),
-        // x, w, out, r -- `width`/`axis`/`rows` asked.
-        "rms_residual" => one(vec![b(0), b(1), b(2), b(3)]),
-        // x, w, out, r, s -- `width`/`axis`/`rows` asked.
-        "rms_residual_scaled" => one(vec![b(0), b(1), b(2), b(3), b(4)]),
+        // Every `rms_*` list below carries `RmsParams`'s FIVE fields, in the
+        // struct's order, where it used to carry two or none: `eps`,
+        // `axis_size`, `w_stride`, `plus_one`, `gain`. The last three were
+        // read out of a staged struct by the shader and named nowhere in
+        // Rust, so no recipe could state them; they are marks now and a
+        // recipe that dropped one would be an arity failure in `fired`. The
+        // `U32` spellings are not decorative -- `Arg::unpack` for a
+        // `Const<u32>` takes the unsigned carrier and refuses `I32`, the same
+        // rule `row_gather`'s `width` above follows.
+        //
+        // A stride of one channel, no gemma `+1`, and a unit gain is the
+        // ordinary llama-shaped norm; `per_axis` and `per_row` read none of
+        // the three, so the values only have to be plausible.
+        //
+        // x, w, out, eps, axis, w_stride, plus_one, gain -- `width` comes off
+        // `x`'s own rectangle and `rows` is asked for.
+        "rms_single_row" => one(vec![
+            b(0), b(1), b(2),
+            ArgValue::F32(1e-5), ArgValue::I32(1024),
+            ArgValue::U32(1), ArgValue::U32(0), ArgValue::F32(1.0),
+        ]),
+        // Same five, and the pitch is `x.width` rather than an argument.
+        "rms_strided_row" => one(vec![
+            b(0), b(1), b(2),
+            ArgValue::F32(1e-5), ArgValue::I32(512),
+            ArgValue::U32(1), ArgValue::U32(0), ArgValue::F32(1.0),
+        ]),
+        // Same again; the head count is `x.width / axis`, so 1024 over 512 is
+        // two norms a row.
+        "rms_strided_head_row" => one(vec![
+            b(0), b(1), b(2),
+            ArgValue::F32(1e-5), ArgValue::I32(512),
+            ArgValue::U32(1), ArgValue::U32(0), ArgValue::F32(1.0),
+        ]),
+        // x, w, out, r, then the five. The residual is declared BEFORE the
+        // scalars and fired after them -- the signature is the statement's
+        // order and the fire array is the shader's, where a conditional
+        // binding comes last.
+        "rms_residual" => one(vec![
+            b(0), b(1), b(2), b(3),
+            ArgValue::F32(1e-5), ArgValue::I32(1024),
+            ArgValue::U32(1), ArgValue::U32(0), ArgValue::F32(1.0),
+        ]),
+        // x, w, out, r, s, then the five. `s` is the per-layer embedding
+        // scale, a one-element buffer, and is not the `gain` word beside it.
+        "rms_residual_scaled" => one(vec![
+            b(0), b(1), b(2), b(3), b(4),
+            ArgValue::F32(1e-5), ArgValue::I32(1024),
+            ArgValue::U32(1), ArgValue::U32(0), ArgValue::F32(1.0),
+        ]),
         // x, out -- `width`/`axis`/`rows` asked.
-        "vnorm_single_row" => one(vec![b(0), b(1)]),
+        "vnorm_single_row" => one(vec![b(0), b(1), ArgValue::F32(1e-5), ArgValue::I32(1024)]),
         // x, z, w, out, heads -- `rows` asked.
         // x, z, w, out -- `vd`/`heads`/`rows` asked. The head count left the
         // run: this body forwards `ctx.params()` as a STRUCT, so no slot in it
         // is a mark's to take.
-        "gated_rms" => one(vec![b(0), b(1), b(2), b(3)]),
+        "gated_rms" => one(vec![b(0), b(1), b(2), b(3), ArgValue::F32(1e-5), ArgValue::I32(128)]),
         // x, z, w, out -- `row_pitch`/`heads`/`rows` asked, same reason.
-        "gated_rms_strided" => one(vec![b(0), b(1), b(2), b(3)]),
+        "gated_rms_strided" => one(vec![b(0), b(1), b(2), b(3), ArgValue::F32(1e-5), ArgValue::I32(128)]),
         // x, scalar, out -- `width`/`rows` asked.
         "layer_scalar_mul" => one(vec![b(0), b(1), b(2)]),
         // x, residual, out -- `width`/`rows` asked.
@@ -221,14 +268,77 @@ fn recipe(name: &str) -> Option<Vec<Vec<ArgValue>>> {
         // logits, expert_ids, expert_weights -- `rows` asked;
         // `router_topk_scaled` also takes a fourth `Const` buffer,
         // `per_expert_scale`, that the plain form does not.
-        "router_topk" => one(vec![b(0), b(1), b(2)]),
-        "router_topk_scaled" => one(vec![b(0), b(1), b(2), b(3)]),
-        // expert_ids, perm, row_expert, tile_expert, inv -- `params` asked.
-        "route_sort" => one(vec![b(0), b(1), b(2), b(3), b(4)]),
-        // x, out, perm -- `params`/`width`/`padded` asked.
-        "route_gather" => one(vec![b(0), b(1), b(2)]),
-        // y, expert_weights, out, inv -- `params`/`width`/`tokens` asked.
-        "combine_sorted" => one(vec![b(0), b(1), b(2), b(3)]),
+        // AND THE FOUR MARKS EACH ROUTER TAKES. `RouterParams` was one buffer
+        // and is `n_experts`, `experts_per_token`, `softmax_over_all` and
+        // `logits_pitch` now, in its order. `logits_pitch` of 0 means the
+        // pitch IS `n_experts`, which is the case a router reading a whole
+        // activation is in, and `softmax_over_all` of 0 is the norm-topk-prob
+        // behaviour every family here ships with.
+        "router_topk" => one(vec![
+            b(0),
+            b(1),
+            b(2),
+            ArgValue::U32(4),
+            ArgValue::U32(2),
+            ArgValue::U32(0),
+            ArgValue::U32(0),
+        ]),
+        "router_topk_scaled" => one(vec![
+            b(0),
+            b(1),
+            b(2),
+            b(3),
+            ArgValue::U32(4),
+            ArgValue::U32(2),
+            ArgValue::U32(0),
+            ArgValue::U32(0),
+        ]),
+        // expert_ids, perm, row_expert, tile_expert, inv, and
+        // `MoeRouteParams`' SEVEN fields, which were one buffer.
+        //
+        // `n` is the number of (row, slot) PAIRS -- four rows at two slots --
+        // and `padded` is the permutation's length, `n` rounded up so every
+        // expert's span is a whole number of `tile_rows` tiles: four experts
+        // at sixteen rows each. The two are different numbers and the kernel
+        // reads both, so they are stated as different numbers here.
+        "route_sort" => one(vec![
+            b(0),
+            b(1),
+            b(2),
+            b(3),
+            b(4),
+            ArgValue::U32(8),
+            ArgValue::U32(4),
+            ArgValue::U32(2),
+            ArgValue::U32(16),
+            ArgValue::U32(64),
+            ArgValue::U32(128),
+            ArgValue::U32(128),
+        ]),
+        // x, out, perm -- and the SAME seven, of which this kernel reads
+        // four. One layout serves both statements; see `route_gather`'s doc.
+        "route_gather" => one(vec![
+            b(0),
+            b(1),
+            b(2),
+            ArgValue::U32(8),
+            ArgValue::U32(4),
+            ArgValue::U32(2),
+            ArgValue::U32(16),
+            ArgValue::U32(64),
+            ArgValue::U32(128),
+            ArgValue::U32(128),
+        ]),
+        // y, expert_weights, out, inv, and `ExpertCombineParams`' three.
+        "combine_sorted" => one(vec![
+            b(0),
+            b(1),
+            b(2),
+            b(3),
+            ArgValue::U32(128),
+            ArgValue::U32(2),
+            ArgValue::U32(128),
+        ]),
         // routed, shared, gate, out -- `width`/`rows` asked.
         "shared_expert_combine" => one(vec![b(0), b(1), b(2), b(3)]),
         // ... `row_pitch`/`width`/`rows` asked; still the same four buffers.
@@ -304,7 +414,35 @@ fn recipe(name: &str) -> Option<Vec<Vec<ArgValue>>> {
         //
         // gate, up, out -- every one of these now asks for `width`/`rows`;
         // none keeps a `params` buffer or a scalar on its signature.
-        "geglu_tanh" | "geglu_tanh_strided" | "gptoss_swiglu" => one(vec![b(0), b(1), b(2)]),
+        "geglu_tanh" => one(vec![b(0), b(1), b(2)]),
+        // AND THE STRIDED TWIN TAKES FIVE MORE. `GegluStridedParams` was one
+        // buffer holding `{width, rows, gate_pitch, up_pitch, out_pitch}` and
+        // is five `Const<u32>` marks now, so the recipe that shared this arm
+        // with the dense form supplied three arguments against a signature of
+        // eight. The three pitches are deliberately DIFFERENT: a body that
+        // read one of them for another would give the same answer for every
+        // equal-pitch fixture and only differ here.
+        "geglu_tanh_strided" => one(vec![
+            b(0),
+            b(1),
+            b(2),
+            ArgValue::U32(64),
+            ArgValue::U32(4),
+            ArgValue::U32(128),
+            ArgValue::U32(192),
+            ArgValue::U32(64),
+        ]),
+        // `_stated_elements` is word 0 and dead -- the body names it to reach
+        // `limit` at word 1 and does not pass it on -- but a recipe supplies
+        // the SIGNATURE, so it is here. The two clamps are gpt-oss's own.
+        "gptoss_swiglu" => one(vec![
+            b(0),
+            b(1),
+            b(2),
+            ArgValue::U32(0),
+            ArgValue::F32(7.0),
+            ArgValue::F32(1.702),
+        ]),
         "silu_mul" => one(vec![b(0), b(1), b(2)]),
         "silu_mul_strided" => one(vec![b(0), b(1), b(2)]),
 
@@ -421,7 +559,9 @@ fn attn(name: &str) -> Option<Vec<Vec<ArgValue>>> {
     /// `head_dim: Const<i32>` too (`head_grid` refuses a non-positive one),
     /// so they sweep a real width the same as the attentions; `split_qkv_
     /// bf16`, `gate` and `logit_softcap` take none at all, and get one dummy
-    /// entry each so the loop below still runs once.
+    /// entry each so the loop below still runs once. `split_qkv_bf16` takes
+    /// two scalars all the same -- the widths it cuts at -- but neither is a
+    /// head width, so neither belongs on this axis.
     const HEADS: &[(&str, &[i32])] = &[
         ("sdpa_paged_decode", &[64, 128, 256, 512]),
         ("sdpa_paged_decode_sink", &[64]),
@@ -447,8 +587,21 @@ fn attn(name: &str) -> Option<Vec<Vec<ArgValue>>> {
     for &head_dim in heads {
         let hd = ArgValue::I32(head_dim);
         let args = match name {
-            // packed, q, k, v -- no scalar at all.
-            "split_qkv_bf16" => vec![b(0), b(1), b(2), b(3)],
+            // packed, q, k, v, q_width, kv_width -- the two widths were
+            // `SplitQkvParams`'s fields and are `Const<u32>` marks now, in the
+            // struct's order because it was the statement's. `U32` and not
+            // `I32`: `Arg::unpack` for a `Const<u32>` takes the unsigned
+            // carrier and refuses the signed one, which is the same reading
+            // `bind::number` gives the driver. 300 and 100 are unequal, so a
+            // body that took one width for the other cuts visibly wrong.
+            "split_qkv_bf16" => vec![
+                b(0),
+                b(1),
+                b(2),
+                b(3),
+                ArgValue::U32(300),
+                ArgValue::U32(100),
+            ],
             // attn, gate -- no scalar at all.
             // attn, gate, row_stride -- the pitch was `Param<0>` at HEAD.
             "gate" => vec![b(0), b(1), ArgValue::I32(4096)],
@@ -459,8 +612,9 @@ fn attn(name: &str) -> Option<Vec<Vec<ArgValue>>> {
             // k_new, v_new, head_dim, n_kv_heads -- `page_size` is asked for
             // now (see `sdpa_paged_decode`'s identical comment, below).
             "kv_append_paged" => vec![b(0), b(1), hd, ArgValue::I32(2)],
-            // logits, out -- no scalar at all.
-            "logit_softcap" => vec![b(0), b(1)],
+            // logits, out, cap -- the cap was `SoftcapParams`' first field and
+            // is a `Const<f32>` mark now; the struct's second word was dead.
+            "logit_softcap" => vec![b(0), b(1), ArgValue::F32(30.0)],
             // queries, out, n_kv_heads, scale, window, head_dim, q_heads --
             // `page_size` is a fact only the fire can answer (a property of
             // the allocation, not of the model text) and is asked for from
@@ -730,45 +884,74 @@ fn quant(name: &str) -> Option<Vec<Vec<ArgValue>>> {
 /// that a generic default would not have found.
 fn ssm(name: &str) -> Option<Vec<Vec<ArgValue>>> {
     let one = |v: Vec<ArgValue>| Some(vec![v]);
+    // THE ELEVEN GEOMETRY SCALARS, WHICH WERE ONE `GdnCoreParams` BUFFER.
+    //
+    // Every recipe below ended at its buffers because the geometry rode a
+    // block the body bound as a slot. The block is gone and the eleven fields
+    // are `Const` marks, so a recipe that stops at the buffers supplies eight
+    // arguments against a signature of nineteen.
+    //
+    // The numbers are `kernels-metal`'s own GDN fixture, field for field, and
+    // deliberately so: the two backends state one geometry and a fixture that
+    // invented its own would be comparing this port against nothing. `q_off`,
+    // `k_off` and `v_off` are the packed in-projection's three spans, so they
+    // are 0, `k_heads * k_dim` and twice it, and `conv_dim` is the whole of
+    // it -- a set a reader can check rather than a set that merely fits.
+    let k_dim = 128i32;
+    let k_heads = 1i32;
+    let v_heads = 4i32;
+    let v_dim = 8i32;
+    let geometry = || {
+        vec![
+            ArgValue::I32(k_dim),
+            ArgValue::I32(v_dim),
+            ArgValue::I32(k_heads),
+            ArgValue::I32(v_heads),
+            ArgValue::I32(2 * k_heads * k_dim + v_heads * v_dim),
+            ArgValue::I32(4),
+            ArgValue::I32(0),
+            ArgValue::I32(k_heads * k_dim),
+            ArgValue::I32(2 * k_heads * k_dim),
+            ArgValue::F32(1e-6),
+            ArgValue::F32(0.088_388_35),
+        ]
+    };
+    let with = |mut buffers: Vec<ArgValue>, tail: Vec<ArgValue>| {
+        buffers.extend(geometry());
+        buffers.extend(tail);
+        buffers
+    };
     match name {
         // mixed, core_out, conv_w, conv_b, a_log, dt_bias, a_gate, b_gate,
         // v_heads, v_dim -- `rows` moved to an ask.
-        "gdn_core" | "gdn_core_slotted" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            b(3),
-            b(4),
-            b(5),
-            b(6),
-            b(7),
-        ]),
+        "gdn_core" | "gdn_core_slotted" => one(with(
+            vec![b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7)],
+            Vec::new(),
+        )),
         // mixed, conv_w, conv_b, a_log, dt_bias, a_gate, b_gate, pre_q,
         // pre_k, pre_gate, v_heads -- `rows` (and, for the prefill,
         // `row_pitch`/`n_scan`) moved to asks.
-        "gdn_prep" | "gdn_prep_slotted" | "gdn_prep_prefill" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            b(3),
-            b(4),
-            b(5),
-            b(6),
-            b(7),
-            b(8),
-            b(9),
-        ]),
+        "gdn_prep" | "gdn_prep_slotted" | "gdn_prep_prefill" => one(with(
+            vec![
+                b(0),
+                b(1),
+                b(2),
+                b(3),
+                b(4),
+                b(5),
+                b(6),
+                b(7),
+                b(8),
+                b(9),
+            ],
+            Vec::new(),
+        )),
         // mixed, core_out, conv_w, conv_b, pre_q, pre_k, pre_gate, v_heads,
         // v_dim -- `rows` moved to an ask.
-        "gdn_core_recurrent" | "gdn_core_recurrent_slotted" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            b(3),
-            b(4),
-            b(5),
-            b(6),
-        ]),
+        "gdn_core_recurrent" | "gdn_core_recurrent_slotted" => one(with(
+            vec![b(0), b(1), b(2), b(3), b(4), b(5), b(6)],
+            Vec::new(),
+        )),
         // pad, core_out, pre_q, pre_k, pre_gate, dv, hv -- `pad` is `mixed`'s
         // slot, which this scan does not read (the mark is still there
         // because the slot is a POSITION, and without it `pre_q` would bind
@@ -776,13 +959,14 @@ fn ssm(name: &str) -> Option<Vec<Vec<ArgValue>>> {
         // `n_scan`/`lanes`/`vrows` all moved to asks, so only the two
         // channel counts `scan_point`'s grid math still needs directly are
         // left on the signature besides the five buffers.
-        "gdn_core_recurrent_prefill" => one(vec![
-            b(0),
-            b(1),
-            b(2),
-            b(3),
-            b(4),
-        ]),
+        // AND THE SCAN TAKES TWO MORE AFTER THE GEOMETRY: `lanes` and
+        // `vrows`, at 32 and 4, which is the one pair its `SCAN` table
+        // compiles. They were `keys::Lanes`/`keys::Vrows` asks and are marks
+        // again, so `Seen::resolve`'s answer no longer reaches them.
+        "gdn_core_recurrent_prefill" => one(with(
+            vec![b(0), b(1), b(2), b(3), b(4)],
+            vec![ArgValue::I32(32), ArgValue::I32(4)],
+        )),
         _ => None,
     }
 }

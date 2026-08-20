@@ -358,16 +358,20 @@ fn a_row_norm_computes_what_a_host_reference_computes() {
 
     let xb = bf16_bytes(&x);
     let wb = bf16_bytes(&w);
+    // THREE BUFFERS AND A PUSH RANGE. `RmsParams` was a storage struct at
+    // binding 3 until the binder rows retired; the same five words are a
+    // `[[vk::push_constant]]` block now, so the bytes this test already
+    // builds go to `Device::run`'s push argument and the module declares one
+    // descriptor fewer. Same ABI, same order, a different carrier.
     let bufs = [
         device.buffer(&xb).expect("x"),
         device.buffer(&wb).expect("w"),
         device.buffer(&vec![0u8; axis * 2]).expect("out"),
-        device.buffer(&params).expect("params"),
     ];
 
     let code = module(entrypoint);
     let pipeline = cache
-        .get(&device, entrypoint, code, 0, 0, Capability::Baseline)
+        .get(&device, entrypoint, code, 20, 0, Capability::Baseline)
         .expect("the pipeline builds");
 
     // The grid this crate computes, from the module this crate loaded. One
@@ -382,7 +386,9 @@ fn a_row_norm_computes_what_a_host_reference_computes() {
     assert_eq!(groups, [1, 1, 1], "one workgroup for one row of one axis");
 
     let bound: Vec<Bound<'_>> = bufs.iter().map(Bound::whole).collect();
-    device.run(pipeline, &bound, &[], groups).expect("dispatch");
+    device
+        .run(pipeline, &bound, &params, groups)
+        .expect("dispatch");
 
     let got = bf16_read(&device.read(&bufs[2]).expect("read back"));
 
@@ -444,7 +450,7 @@ fn a_grid_one_workgroup_short_leaves_the_tail_as_it_found_it() {
     // Built once, up front: the cache hands out a borrow, so a closure that
     // both builds and dispatches would hold it across two calls.
     let pipeline = cache
-        .get(&device, entrypoint, code, 0, 0, Capability::Baseline)
+        .get(&device, entrypoint, code, 20, 0, Capability::Baseline)
         .expect("the pipeline builds");
     let whole = groups_for(entrypoint, Rule::Rms, dims, pipeline).expect("a geometry");
     assert_eq!(whole, [4, 1, 1], "one workgroup per row");
@@ -454,10 +460,11 @@ fn a_grid_one_workgroup_short_leaves_the_tail_as_it_found_it() {
             device.buffer(&bf16_bytes(&x)).expect("x"),
             device.buffer(&bf16_bytes(&w)).expect("w"),
             device.buffer(&vec![0u8; axis * rows * 2]).expect("out"),
-            device.buffer(&params).expect("params"),
         ];
         let bound: Vec<Bound<'_>> = bufs.iter().map(Bound::whole).collect();
-        device.run(pipeline, &bound, &[], groups).expect("dispatch");
+        device
+            .run(pipeline, &bound, &params, groups)
+            .expect("dispatch");
         let out = bf16_read(&device.read(&bufs[2]).expect("read back"));
         for b in bufs {
             device.free(b);
@@ -555,35 +562,46 @@ fn a_call_that_does_not_match_the_module_is_refused() {
     let entrypoint = "rms_single_row_bfloat16";
     let code = module(entrypoint);
     let pipeline = cache
-        .get(&device, entrypoint, code, 0, 0, Capability::Baseline)
+        .get(&device, entrypoint, code, 20, 0, Capability::Baseline)
         .expect("the pipeline builds");
 
     let b = device.buffer(&[0u8; 64]).expect("a buffer");
+    // The block this module's push range holds: five words, and the range
+    // check refuses any other length. It is built here rather than filled
+    // with a plausible number, because two of the three calls below have to
+    // get PAST the push check to reach the thing they are about.
+    let block = [0u8; 20];
+
     let one = [Bound::whole(&b)];
     assert!(
         matches!(
-            device.run(pipeline, &one, &[], [1, 1, 1]),
+            device.run(pipeline, &one, &block, [1, 1, 1]),
             Err(Failed::Bindings { .. })
         ),
-        "one buffer under a four-binding module should be refused"
+        "one buffer under a three-binding module should be refused"
     );
 
-    let four = [
-        Bound::whole(&b),
-        Bound::whole(&b),
-        Bound::whole(&b),
-        Bound::whole(&b),
-    ];
+    let three = [Bound::whole(&b), Bound::whole(&b), Bound::whole(&b)];
+    // BOTH DIRECTIONS, and the short one is the dangerous one: a range the
+    // shader reads past leaves it holding whatever the previous dispatch
+    // pushed, which is a plausible number rather than a fault.
     assert!(
         matches!(
-            device.run(pipeline, &four, &[1, 2, 3, 4], [1, 1, 1]),
+            device.run(pipeline, &three, &[1, 2, 3, 4], [1, 1, 1]),
             Err(Failed::Push { .. })
         ),
-        "four push bytes against a zero-byte range should be refused"
+        "four push bytes against a twenty-byte range should be refused"
     );
     assert!(
         matches!(
-            device.run(pipeline, &four, &[], [1, 0, 1]),
+            device.run(pipeline, &three, &[0u8; 24], [1, 1, 1]),
+            Err(Failed::Push { .. })
+        ),
+        "twenty-four push bytes against a twenty-byte range should be refused"
+    );
+    assert!(
+        matches!(
+            device.run(pipeline, &three, &block, [1, 0, 1]),
             Err(Failed::Vulkan(_))
         ),
         "a dispatch of no workgroups should be refused"
@@ -622,7 +640,7 @@ fn a_grid_past_what_this_device_dispatches_is_refused_and_one_at_the_limit_is_no
     let entrypoint = "rms_single_row_bfloat16";
     let code = module(entrypoint);
     let pipeline = cache
-        .get(&device, entrypoint, code, 0, 0, Capability::Baseline)
+        .get(&device, entrypoint, code, 20, 0, Capability::Baseline)
         .expect("the pipeline builds");
 
     let axis = 256usize;
@@ -638,13 +656,7 @@ fn a_grid_past_what_this_device_dispatches_is_refused_and_one_at_the_limit_is_no
     let xb = device.buffer(&bf16_bytes(&x)).expect("x");
     let wb = device.buffer(&bf16_bytes(&w)).expect("w");
     let ob = device.buffer(&vec![0u8; axis * 4 * 2]).expect("out");
-    let pb = device.buffer(&params).expect("params");
-    let bound = [
-        Bound::whole(&xb),
-        Bound::whole(&wb),
-        Bound::whole(&ob),
-        Bound::whole(&pb),
-    ];
+    let bound = [Bound::whole(&xb), Bound::whole(&wb), Bound::whole(&ob)];
 
     // Every axis, because they are three different limits and a check that
     // compared them all against the first would pass on a card whose x is
@@ -657,7 +669,7 @@ fn a_grid_past_what_this_device_dispatches_is_refused_and_one_at_the_limit_is_no
         };
         let mut groups = [1u32; 3];
         groups[axis_of] = past;
-        let refused = device.run(pipeline, &bound, &[], groups);
+        let refused = device.run(pipeline, &bound, &params, groups);
         assert!(
             matches!(
                 refused,
@@ -676,10 +688,10 @@ fn a_grid_past_what_this_device_dispatches_is_refused_and_one_at_the_limit_is_no
     // dispatch is one it will really run.
     let at = limits[1].min(65_535);
     device
-        .run(pipeline, &bound, &[], [1, at, 1])
+        .run(pipeline, &bound, &params, [1, at, 1])
         .expect("a grid of exactly the limit is legal and must not be refused");
 
-    for b in [xb, wb, ob, pb] {
+    for b in [xb, wb, ob] {
         device.free(b);
     }
     cache.clear(&device);
@@ -1171,7 +1183,6 @@ fn an_operand_at_an_offset_in_one_arena_is_addressed_from_that_offset() {
             row_bytes,
         )
         .expect("the output row"),
-        Bound::at(&device, &buffer, p_at, params.len() as u64).expect("the parameters"),
     ];
     assert!(
         bound[0].offset() != 0 && bound[2].offset() != 0,
@@ -1180,7 +1191,7 @@ fn an_operand_at_an_offset_in_one_arena_is_addressed_from_that_offset() {
 
     let code = module(entrypoint);
     let pipeline = cache
-        .get(&device, entrypoint, code, 0, 0, Capability::Baseline)
+        .get(&device, entrypoint, code, 20, 0, Capability::Baseline)
         .expect("the pipeline builds");
     let dims = Dims {
         rows: 1,
@@ -1189,7 +1200,13 @@ fn an_operand_at_an_offset_in_one_arena_is_addressed_from_that_offset() {
         ..Dims::default()
     };
     let groups = groups_for(entrypoint, Rule::Rms, dims, pipeline).expect("a geometry");
-    device.run(pipeline, &bound, &[], groups).expect("dispatch");
+    // The scalars ride a push range now, not a fourth descriptor. The arena
+    // still HOLDS them at `p_at`, because the point of this test is that the
+    // three operand ranges are addressed from their own offsets and a layout
+    // with nothing after the output would put the last one at the end.
+    device
+        .run(pipeline, &bound, &params, groups)
+        .expect("dispatch");
 
     let back = device.read(&buffer).expect("read the arena back");
     let got = bf16_read(&back[out_at as usize..(out_at + row_bytes * 3) as usize]);
@@ -1358,12 +1375,11 @@ fn an_operand_overrunning_its_range_is_discarded_rather_than_given_to_its_neighb
         Bound::at(&device, &buffer, x_at, row_bytes).expect("x"),
         Bound::at(&device, &buffer, w_at, row_bytes).expect("w"),
         Bound::at(&device, &buffer, out_at, half).expect("half an output row"),
-        Bound::at(&device, &buffer, p_at, params.len() as u64).expect("params"),
     ];
 
     let code = module(entrypoint);
     let pipeline = cache
-        .get(&device, entrypoint, code, 0, 0, Capability::Baseline)
+        .get(&device, entrypoint, code, 20, 0, Capability::Baseline)
         .expect("the pipeline builds");
     let dims = Dims {
         rows: 1,
@@ -1372,7 +1388,9 @@ fn an_operand_overrunning_its_range_is_discarded_rather_than_given_to_its_neighb
         ..Dims::default()
     };
     let groups = groups_for(entrypoint, Rule::Rms, dims, pipeline).expect("a geometry");
-    device.run(pipeline, &bound, &[], groups).expect("dispatch");
+    device
+        .run(pipeline, &bound, &params, groups)
+        .expect("dispatch");
 
     let back = device.read(&buffer).expect("read the arena back");
     let wrote = bf16_read(&back[out_at as usize..(out_at + half) as usize]);
@@ -1392,7 +1410,7 @@ fn an_operand_overrunning_its_range_is_discarded_rather_than_given_to_its_neighb
     device.free(buffer);
 }
 
-/// A parameter block one word short is refused, because the device will not
+/// A parameter run one word short is refused, because the device will not
 /// object and the answer will look fine.
 ///
 /// This is the defect `driver-metal` was found carrying in two kernels: a
@@ -1408,6 +1426,16 @@ fn an_operand_overrunning_its_range_is_discarded_rather_than_given_to_its_neighb
 /// it. That is the measurement this refusal exists for: the layer catches
 /// illegal usage, and a range that is legal but too small for what the shader
 /// reads is not illegal. Nothing but this check is looking.
+///
+/// THE CARRIER MOVED AND THE DEFECT DID NOT. `RmsParams` was a storage struct
+/// at binding 3 when this was written, and the short range was a `Bound::at`
+/// of sixteen bytes over a twenty-byte block. The five words are a push range
+/// now, so the short run is a sixteen-byte slice, and the refusal is
+/// `Failed::Push` rather than `Failed::Block`. What a short push leaves the
+/// shader reading is WORSE than what a short storage range left it reading:
+/// `robustBufferAccess` zeroed the words past a descriptor, and push memory is
+/// simply whatever the last dispatch on this command buffer wrote there, which
+/// is a plausible number rather than a visible zero.
 #[test]
 fn a_parameter_block_short_of_what_the_shader_reads_is_refused() {
     let device = gpu!();
@@ -1433,19 +1461,19 @@ fn a_parameter_block_short_of_what_the_shader_reads_is_refused() {
 
     let code = module(entrypoint);
     let pipeline = cache
-        .get(&device, entrypoint, code, 0, 0, Capability::Baseline)
+        .get(&device, entrypoint, code, 20, 0, Capability::Baseline)
         .expect("the pipeline builds");
     assert_eq!(
-        pipeline.declared().block_bytes.get(3),
-        Some(&Some(20)),
-        "binding 3 is the parameter block and this crate reads it as 20 bytes"
+        pipeline.push(),
+        20,
+        "the module's push range is the five-word block this test is built \
+         around"
     );
 
     let bufs = [
         device.buffer(&bf16_bytes(&x)).expect("x"),
         device.buffer(&bf16_bytes(&w)).expect("w"),
         device.buffer(&vec![0u8; row_bytes as usize]).expect("out"),
-        device.buffer(&params).expect("params"),
     ];
     let dims = Dims {
         rows: 1,
@@ -1458,23 +1486,17 @@ fn a_parameter_block_short_of_what_the_shader_reads_is_refused() {
     // What the device does when the range is short, established before the
     // refusal is claimed to be worth having. `gain` is dropped, reads zero,
     // and the whole row comes back zero -- with no error from any call.
-    let short = [
-        Bound::whole(&bufs[0]),
-        Bound::whole(&bufs[1]),
-        Bound::whole(&bufs[2]),
-        Bound::at(&device, &bufs[3], 0, 16).expect("sixteen bytes is a legal range"),
-    ];
-    match device.run(pipeline, &short, &[], groups) {
+    let short: Vec<Bound<'_>> = bufs.iter().map(Bound::whole).collect();
+    match device.run(pipeline, &short, &params[..16], groups) {
         Err(refused) => assert!(
             matches!(
                 refused,
-                Failed::Short {
-                    binding: 3,
-                    needs: 20,
+                Failed::Push {
+                    range: 20,
                     given: 16
                 }
             ),
-            "the short block must be refused for being SHORT, and was refused \
+            "the short run must be refused for being SHORT, and was refused \
              for {refused}"
         ),
         // Reached only with the refusal removed, which is how the control is
@@ -1496,7 +1518,7 @@ fn a_parameter_block_short_of_what_the_shader_reads_is_refused() {
     // blanket.
     let full: Vec<Bound<'_>> = bufs.iter().map(Bound::whole).collect();
     device
-        .run(pipeline, &full, &[], groups)
+        .run(pipeline, &full, &params, groups)
         .expect("the whole block is accepted");
     let got = bf16_read(&device.read(&bufs[2]).expect("read back"));
     assert!(
@@ -2256,8 +2278,11 @@ fn a_norm_a_real_plan_states_computes_what_a_host_reference_computes() {
     let xq = bf16_read(&bytes(x));
     let wq = bf16_read(&bytes(w));
 
-    let driver_vulkan::binding::Params::Block { bytes: block, .. } = &d.params else {
-        panic!("this module reads its scalars from a buffer");
+    // A PUSH RANGE, not a fourth descriptor. The five words are the same five
+    // in the same order -- `RmsParams` field for field -- and only the carrier
+    // moved, so the reads below are unchanged.
+    let driver_vulkan::binding::Params::Push(block) = &d.params else {
+        panic!("this module does not push its scalars: {:?}", d.params);
     };
     // The plan's own scalars, read back rather than invented: `eps` is the
     // first word and the axis the second, and a reference that assumed either
@@ -2266,9 +2291,7 @@ fn a_norm_a_real_plan_states_computes_what_a_host_reference_computes() {
     let axis = u32::from_le_bytes(block[4..8].try_into().unwrap()) as usize;
     assert_eq!(xq.len(), axis, "the plan's input is one row of the axis");
 
-    let params = device.buffer(block).expect("the block allocates");
-    let mut buffers = d.buffers.clone();
-    buffers.insert(d.block_at.expect("a block slot"), Bound::whole(&params));
+    let buffers = d.buffers.clone();
 
     let mut cache = Pipelines::new();
     // The module the ROUTINE named, which need not be the plan's symbol.
@@ -2278,13 +2301,13 @@ fn a_norm_a_real_plan_states_computes_what_a_host_reference_computes() {
             &device,
             &d.symbol,
             fired,
-            0,
+            block.len() as u32,
             buffers.len() as u32,
             Capability::Baseline,
         )
         .expect("the pipeline builds");
     device
-        .run(pipeline, &buffers, &[], d.groups)
+        .run(pipeline, &buffers, block, d.groups)
         .expect("dispatch");
 
     let got = bf16_read(&bytes(out));
@@ -2308,7 +2331,7 @@ fn a_norm_a_real_plan_states_computes_what_a_host_reference_computes() {
     );
 
     cache.clear(&device);
-    for b in [arena_buffer, params] {
+    for b in [arena_buffer] {
         device.free(b);
     }
     weights.close(&device);
@@ -2351,7 +2374,7 @@ fn a_chain_recorded_once_says_what_the_chain_submitted_one_at_a_time_says() {
     let code = module(entrypoint);
     let mut cache = Pipelines::new();
     let pipeline = cache
-        .get(&device, entrypoint, code, 0, 0, Capability::Baseline)
+        .get(&device, entrypoint, code, 20, 0, Capability::Baseline)
         .expect("the pipeline builds");
     let groups = groups_for(
         entrypoint,
@@ -2372,7 +2395,6 @@ fn a_chain_recorded_once_says_what_the_chain_submitted_one_at_a_time_says() {
     let mut initial = bf16_bytes(&x);
     initial.resize((links + 1) * axis * 2, 0);
     let wb = device.buffer(&bf16_bytes(&w)).expect("w");
-    let pb = device.buffer(&params).expect("params");
 
     let run_chain = |chained: bool| -> Vec<f32> {
         let rows = device.buffer(&initial).expect("rows");
@@ -2382,7 +2404,6 @@ fn a_chain_recorded_once_says_what_the_chain_submitted_one_at_a_time_says() {
                     Bound::at(&device, &rows, i as u64 * stride, stride).expect("in"),
                     Bound::whole(&wb),
                     Bound::at(&device, &rows, (i as u64 + 1) * stride, stride).expect("out"),
-                    Bound::whole(&pb),
                 ]
             })
             .collect();
@@ -2397,14 +2418,16 @@ fn a_chain_recorded_once_says_what_the_chain_submitted_one_at_a_time_says() {
                     // every pair gets a barrier. This test is about the
                     // chain, and a chain is what the coarse reading records.
                     writes: &[],
-                    push: &[],
+                    push: &params,
                     groups,
                 })
                 .collect();
             device.run_all(&run).expect("the chain records and submits");
         } else {
             for b in &sets {
-                device.run(pipeline, b, &[], groups).expect("dispatch");
+                device
+                    .run(pipeline, b, &params, groups)
+                    .expect("dispatch");
             }
         }
         let out = device.read(&rows).expect("read back");
@@ -2431,7 +2454,6 @@ fn a_chain_recorded_once_says_what_the_chain_submitted_one_at_a_time_says() {
 
     cache.clear(&device);
     device.free(wb);
-    device.free(pb);
 }
 
 /// Fires of different sizes, one after another, all say what one fire says.
@@ -2477,7 +2499,7 @@ fn fires_of_different_sizes_in_a_row_reuse_the_scratch_and_still_agree() {
     let code = module(entrypoint);
     let mut cache = Pipelines::new();
     let pipeline = cache
-        .get(&device, entrypoint, code, 0, 0, Capability::Baseline)
+        .get(&device, entrypoint, code, 20, 0, Capability::Baseline)
         .expect("the pipeline builds");
     let groups = groups_for(
         entrypoint,
@@ -2494,7 +2516,6 @@ fn fires_of_different_sizes_in_a_row_reuse_the_scratch_and_still_agree() {
 
     let stride = (axis * 2) as u64;
     let wb = device.buffer(&bf16_bytes(&w)).expect("w");
-    let pb = device.buffer(&params).expect("params");
     let deepest = 64usize;
     let mut initial = bf16_bytes(&x);
     initial.resize((deepest + 1) * axis * 2, 0);
@@ -2507,7 +2528,6 @@ fn fires_of_different_sizes_in_a_row_reuse_the_scratch_and_still_agree() {
                     Bound::at(&device, &rows, i as u64 * stride, stride).expect("in"),
                     Bound::whole(&wb),
                     Bound::at(&device, &rows, (i as u64 + 1) * stride, stride).expect("out"),
-                    Bound::whole(&pb),
                 ]
             })
             .collect();
@@ -2518,7 +2538,7 @@ fn fires_of_different_sizes_in_a_row_reuse_the_scratch_and_still_agree() {
                 pipeline,
                 buffers: b,
                 writes: &[],
-                push: &[],
+                push: &params,
                 groups,
             })
             .collect();
@@ -2574,7 +2594,6 @@ fn fires_of_different_sizes_in_a_row_reuse_the_scratch_and_still_agree() {
 
     cache.clear(&device);
     device.free(wb);
-    device.free(pb);
 }
 
 /// Every rectangle one real plan states, recorded into one command buffer and
@@ -2996,28 +3015,36 @@ fn whole_plan(
             tiered: fired.tiered,
         }
     );
-    // One device allocation for all of them. `blocks` is what this fire used
-    // to ask the device for, one buffer each -- 114 of them in a qwen3 decode
-    // and over a thousand in a prefill of the 30B mixture -- at a measured
-    // 260 microseconds apiece, against a `maxMemoryAllocationCount` that is
-    // 4096 on a good many cards. A fire is free to state more rectangles than
-    // that, so this was a ceiling and not only a cost.
+    // NO SCALAR BLOCKS AT ALL, AND SO NO ALLOCATION. `blocks` is what this
+    // fire used to ask the device for, one buffer each -- 114 of them in a
+    // qwen3 decode and over a thousand in a prefill of the 30B mixture -- at a
+    // measured 260 microseconds apiece, against a `maxMemoryAllocationCount`
+    // that is 4096 on a good many cards. A fire is free to state more
+    // rectangles than that, so it was a ceiling and not only a cost. Staging
+    // them into ONE buffer is what this assertion was written to hold.
     //
-    // Stated as a comparison against `blocks` rather than as a constant so it
-    // says the same thing for every text and both fire classes here, and with
-    // a floor so that a lowering which stopped stating blocks could not make
-    // it vacuously true.
-    assert!(
-        fired.blocks > 20,
-        "{name}: only {} rectangles state a scalar block, so the count below \
-         proves little",
+    // There is nothing left to stage. `binding::params` reaches its
+    // parameter-buffer arm only when the stated run and the module's push
+    // block disagree on COUNT while agreeing on total bytes -- a mismatch the
+    // 173 hand-written binder rows could produce and a DERIVED run cannot,
+    // because a routine's run is the block its own signature declares. So
+    // every rectangle in all six texts pushes, and a whole fire allocates
+    // nothing.
+    //
+    // Both numbers are pinned, and the zero is the stronger claim of the two:
+    // one allocation was the ceiling this was written against, and none is
+    // below it. A `blocks` that moved off zero is the buffer arm coming back,
+    // which is legal and would have to be a diff here.
+    assert_eq!(
+        fired.blocks, 0,
+        "{name}: {} rectangles staged a scalar block, so a derived run and its \
+         module's push block stopped agreeing on how many words there are",
         fired.blocks
     );
     assert_eq!(
         device.allocations() - before,
-        1,
-        "{name}: a fire of {} scalar blocks made more than one allocation",
-        fired.blocks
+        0,
+        "{name}: a fire staging no scalar blocks still allocated"
     );
     // And one module read per distinct symbol, not one per rectangle. The
     // plan states hundreds of rectangles over a handful of symbols, and
@@ -5179,10 +5206,15 @@ fn the_rows_the_frame_reads_out_are_the_rows_the_gather_moves() {
     // The scalars, from the driver's own binding rather than from this test.
     // Both of them: the width the plan states and the count the DRIVER
     // supplies, in one buffer, which is the whole point of `Binding::Packed`.
-    let driver_vulkan::binding::Params::Block { bytes: block, .. } = &d.params else {
-        panic!("`row_gather` reads its scalars from a buffer, not from push");
+    // A PUSH BLOCK NOW. `row_gather_params.slang` is gone: `width` is a mark
+    // reading the statement's word 0 and the count is the routine's own, so
+    // the two words that were a storage struct are a push range with the same
+    // fields in the same order. Which field each landed in is still the
+    // question, and it is still answerable here.
+    let driver_vulkan::binding::Params::Push(block) = &d.params else {
+        panic!("`row_gather` does not push its scalars: {:?}", d.params);
     };
-    assert_eq!(block.len(), 8, "`RowGatherParams` is two four-byte fields");
+    assert_eq!(block.len(), 8, "the gather's block is two four-byte fields");
     let width = u32::from_le_bytes(block[0..4].try_into().unwrap()) as usize;
     let count = u32::from_le_bytes(block[4..8].try_into().unwrap()) as usize;
     // Which FIELD each landed in, not just that both are present. Swapping
@@ -5197,20 +5229,23 @@ fn the_rows_the_frame_reads_out_are_the_rows_the_gather_moves() {
         width > count,
         "the width is the first field, and a model's hidden size is not four"
     );
-    // Nothing rode a push word. The module declares no push block at all, so a
-    // count that went there would be dropped in silence.
+    // BOTH WORDS REACH THE SHADER, asked of the module rather than of this
+    // file. The inverse of what stood here: it used to check that the module
+    // declares NO push constants, so that a scalar sent there would be known
+    // to be lost. The two are the same question either side of the carrier
+    // move, and the module's own answer is the one worth having.
     let declared = {
         let words = driver_vulkan::spirv::words(&store[d.symbol.as_ref()]).expect("whole words");
         driver_vulkan::spirv::declared(&words).expect("well formed")
     };
-    assert!(
-        declared.push_offsets.is_empty(),
-        "`row_gather` declares no push constants, so a scalar sent there is lost"
+    assert_eq!(
+        declared.push_offsets,
+        vec![0, 4],
+        "`row_gather` reads two push words, so a block of any other shape \
+         leaves one of them holding the last dispatch's"
     );
 
-    let params = device.buffer(block).expect("the block allocates");
-    let mut buffers = d.buffers.clone();
-    buffers.insert(d.block_at.expect("a block slot"), Bound::whole(&params));
+    let buffers = d.buffers.clone();
 
     // Which slot got the table, checked before the dispatch. The rows operand
     // is the third, and it is the only one that is neither the arena nor the
@@ -5236,13 +5271,13 @@ fn the_rows_the_frame_reads_out_are_the_rows_the_gather_moves() {
             &device,
             &d.symbol,
             fired,
-            0,
+            block.len() as u32,
             buffers.len() as u32,
             Capability::Baseline,
         )
         .expect("the pipeline builds");
     device
-        .run(pipeline, &buffers, &[], d.groups)
+        .run(pipeline, &buffers, block, d.groups)
         .expect("dispatch");
 
     let bytes = |b: Bound<'_>| {
@@ -5283,7 +5318,7 @@ fn the_rows_the_frame_reads_out_are_the_rows_the_gather_moves() {
     }
 
     cache.clear(&device);
-    for b in [arena_buffer, params] {
+    for b in [arena_buffer] {
         device.free(b);
     }
     pool.close(&device);
@@ -5464,8 +5499,18 @@ fn a_fire_that_cannot_run_says_which_launch() {
     assert_eq!(fired.dispatches, low.launches.len());
 
     // Two refusals deep in the plan and one whole fire, and the device is
-    // holding what it held before them PLUS the fire's scalar block, which
-    // the pipeline cache now keeps for the next fire instead of freeing.
+    // holding EXACTLY what it held before them.
+    //
+    // THIS NUMBER HAS MOVED TWICE, IN THE SAME DIRECTION BOTH TIMES, AND THE
+    // SECOND MOVE IS THE INTERESTING ONE. It read `held + 1` until the day
+    // the binder stopped writing its parameter rows by hand: a routine's run
+    // is now the block its own signature declares, so `binding::params_from`
+    // cannot reach the parameter-BUFFER arm, every scalar in this plan lands
+    // in a push range, and a fire that stages no block asks
+    // `Pipelines::block` for nothing. `tests/arena.rs` states the same fact
+    // from the other side -- `blocked == 0` over every text this backend
+    // serves -- and this line is the device-side witness for it: zero
+    // allocations, not one kept.
     //
     // THIS LINE USED TO READ `held` AND IT CHANGED WITH THE THING IT WATCHES.
     // `fire` allocated a block buffer per fire and freed it before returning,
@@ -5487,15 +5532,20 @@ fn a_fire_that_cannot_run_says_which_launch() {
     // to be revisited when that moves.
     assert_eq!(
         device.live_buffers(),
-        held + 1,
-        "a fire and two refusals left something other than the kept block behind"
+        held,
+        "a fire and two refusals left a buffer behind, and a plan whose scalars \
+         are all push constants should have taken none"
     );
 
+    // Still asked, and still not redundant: it is the pair that is pinned,
+    // so a fire that goes back to staging a block and a cache that then keeps
+    // it fails the line above while this one stays green, and a cache that
+    // keeps it and never frees it fails this one.
     cache.clear(&device);
     assert_eq!(
         device.live_buffers(),
         held,
-        "the pipeline cache kept the fire's block buffer and did not give it back"
+        "the pipeline cache kept a buffer the fire never took"
     );
     device.free(arena_buffer);
     store.close(&device);
@@ -7275,7 +7325,7 @@ fn shelled(
     real: &'static std::collections::BTreeMap<String, Vec<u8>>,
     pages: u32,
 ) -> driver_vulkan::shell::Shell {
-    shelled_at_tile(model, real, pages, None, true)
+    shelled_at_tile(model, real, pages, None, None)
 }
 
 /// [`shelled`], with the GEMM's instantiation point overridden.
@@ -7299,7 +7349,7 @@ fn shelled_at_tile(
     real: &'static std::collections::BTreeMap<String, Vec<u8>>,
     pages: u32,
     tile: Option<(u32, u32)>,
-    tiered: bool,
+    ceiling: Option<kernels_vulkan::Capability>,
 ) -> driver_vulkan::shell::Shell {
     use driver_vulkan::shell::{Deployment, Shell, Text};
     use model::shared::llama_like::forward::facts::LlamaLikeMetalFacts;
@@ -7345,28 +7395,14 @@ fn shelled_at_tile(
 
     let deployment = Deployment {
         pages,
+        ceiling,
         ..Deployment::default()
     };
-    // `tiered` true is the PRODUCTION path and takes it literally: `Shell::open`
-    // serves from the embedded table, which is what a server does, so the
-    // ordinary case here exercises the ordinary case there.
-    //
-    // `tiered` false narrows the store instead, dropping every `<symbol>.<tag>`
-    // key. That is how a caller asks for the scalar answer on a device that
-    // would otherwise load a tiered module, and nothing else can express it:
-    // the tier comes from the DEVICE, and a store cannot be asked to pretend
-    // the hardware is smaller than it is.
-    let mut shell = if tiered {
-        Shell::open(text, deployment)
-    } else {
-        let baseline: std::collections::BTreeMap<String, Vec<u8>> = kernels_vulkan::MODULES
-            .iter()
-            .filter(|(stem, _)| !stem.contains('.'))
-            .map(|(stem, code)| ((*stem).to_string(), code.to_vec()))
-            .collect();
-        Shell::open_with(text, deployment, Box::new(baseline))
-    }
-    .unwrap_or_else(|e| panic!("the shell: {e}"));
+    // This is the PRODUCTION path either way: `Shell::open` serves from the
+    // embedded table, which is what a server does, so the ordinary case here
+    // exercises the ordinary case there. The only thing a caller moves is the
+    // ceiling.
+    let mut shell = Shell::open(text, deployment).unwrap_or_else(|e| panic!("the shell: {e}"));
     for (name, bytes) in real {
         shell.hold(name, bytes).expect("a weight");
     }
@@ -10998,8 +11034,8 @@ fn the_cooperative_matrix_gemm_answers_what_the_baseline_one_does() {
         "the GEMM arm needs a whole number of tiles"
     );
 
-    let answer = |tile: u32, tiered: bool| {
-        let mut shell = shelled_at_tile(&REALS[0], real, 256, Some((tile, 32)), tiered);
+    let answer = |tile: u32, ceiling: Option<kernels_vulkan::Capability>| {
+        let mut shell = shelled_at_tile(&REALS[0], real, 256, Some((tile, 32)), ceiling);
         let step = shell
             .step(&[driver_vulkan::turns::Turn {
                 who: 1,
@@ -11020,8 +11056,8 @@ fn the_cooperative_matrix_gemm_answers_what_the_baseline_one_does() {
     // measurement says they should widen it to. 64 rows is a whole number of
     // either.
     for tile in [32u32, 64] {
-        let (scalar, scalar_tiered) = answer(tile, false);
-        let (matrix, matrix_tiered) = answer(tile, true);
+        let (scalar, scalar_tiered) = answer(tile, Some(kernels_vulkan::Capability::Baseline));
+        let (matrix, matrix_tiered) = answer(tile, None);
 
         // DIRECTLY, before comparing any numbers.
         //
@@ -11087,19 +11123,31 @@ fn the_cooperative_matrix_gemm_answers_what_the_baseline_one_does() {
     }
 }
 
-/// At the tile the shared model code actually states, the two module stores
-/// answer identically -- because at a row tile of 16 there is no
-/// cooperative-matrix module to reach.
+/// At a row tile of 16, a ceiling of fp16 and no ceiling at all answer
+/// identically -- because at that tile there is no cooperative-matrix module
+/// to reach.
 ///
 /// The control for the test above, and it is worth as much as that test is.
 /// A difference between two runs proves nothing unless the same comparison
-/// can also come out equal: if the store-stripping harness were simply
-/// perturbing something -- a different allocation order, a different pipeline
-/// cache shape -- it would perturb this run too.
+/// can also come out equal: if the ceiling harness were simply perturbing
+/// something -- a different allocation order, a different pipeline cache
+/// shape -- it would perturb this run too.
+///
+/// THE CEILING HERE IS FP16 AND NOT BASELINE, and the distinction is the
+/// whole control. It used to be baseline, which was the same thing back when
+/// the only tiered modules in the tree were cooperative-matrix ones. It is
+/// not the same thing now: `qmm_t.slang` stamps every `*_fp16_precast_*`
+/// entrypoint at `@fp16`, including at a row tile of 16, so a baseline
+/// ceiling here drops REAL float16 arithmetic in favour of the
+/// fp16-storage/fp32-math baseline and the two runs differ by about the
+/// rounding the test above measures. That is a true difference and not a
+/// harness artefact, but it is the wrong difference for a control, which has
+/// to hold everything except the cooperative-matrix build fixed.
 ///
 /// It also pins the claim `serve.rs` makes about the tier walk from the other
 /// side. `Capability::PREFERENCE` is walked from the device's tier DOWN, and
-/// on this GPU that walk starts at `Coopmat` for every symbol in the plan.
+/// on this GPU that walk starts at `Coopmat` for every symbol in the plan, or
+/// at whatever lower ceiling the deployment states.
 /// The 146 cooperative-matrix modules in the tree are all `affine_qmm_t*` and
 /// `sdpa_paged_mma*`, and `quant/qmm_t.slang` deliberately compiles none at a
 /// row tile of 16 -- its header explains that a 16-row tile does not amortise
@@ -11131,8 +11179,8 @@ fn at_the_default_tile_the_tier_has_nothing_to_reach() {
         prompt.push(PERIOD[prompt.len() % PERIOD.len()]);
     }
 
-    let answer = |tiered: bool| {
-        let mut shell = shelled_at_tile(&REALS[0], real, 256, Some((16, 32)), tiered);
+    let answer = |ceiling: Option<kernels_vulkan::Capability>| {
+        let mut shell = shelled_at_tile(&REALS[0], real, 256, Some((16, 32)), ceiling);
         let step = shell
             .step(&[driver_vulkan::turns::Turn {
                 who: 1,
@@ -11146,13 +11194,13 @@ fn at_the_default_tile_the_tier_has_nothing_to_reach() {
     };
 
     assert_eq!(
-        answer(false),
-        answer(true),
-        "stripping the tiered modules changed the answer at a tile of 16, \
+        answer(Some(kernels_vulkan::Capability::Fp16)),
+        answer(None),
+        "capping the ceiling at fp16 changed the answer at a tile of 16, \
          where no cooperative-matrix module is compiled. Either `qmm_t.slang` \
-         gained a bm_16 build -- in which case the test above should move to \
-         it -- or the harness perturbs something other than the tier, which \
-         would make that test's difference unattributable"
+         gained a bm_16 coopmat build -- in which case the test above should \
+         move to it -- or the harness perturbs something other than the tier, \
+         which would make that test's difference unattributable"
     );
 }
 

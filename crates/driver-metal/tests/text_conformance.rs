@@ -1102,12 +1102,32 @@ fn balanced(bytes: &[u8], start: usize) -> Option<usize> {
     None
 }
 
-/// A comma-separated list, split where the commas are not inside anything.
+/// A comma-separated list, split where the commas are not inside anything —
+/// and a `//` comment is "inside something".
+///
+/// COMMENTS COUNTED AS ARGUMENTS. This walked the characters of a parameter
+/// list or a dispatch list and split on every top-level comma, and a comma in
+/// the PROSE beside an argument is a top-level comma. `moe::router_topk`
+/// dispatches eight values and its list carries two explanatory comments with
+/// one comma each, so this read ten -- and the shader declares eight, so the
+/// conformance gate failed a routine that agrees with its shader down to the
+/// slot. The house style puts the argument FOR an argument next to it, which
+/// makes this the common case rather than the odd one.
 fn split_top(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut depth = 0i32;
     let mut cur = String::new();
-    for c in text.chars() {
+    let mut comment = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if comment {
+            comment = c != '\n';
+            continue;
+        }
+        if c == '/' && chars.peek() == Some(&'/') {
+            comment = true;
+            continue;
+        }
         match c {
             '<' | '(' | '[' | '{' => depth += 1,
             '>' | ')' | ']' | '}' => depth -= 1,
@@ -1600,7 +1620,13 @@ const DELIBERATE: &[(&str, usize, &str)] = &[
     ("sdpa_paged_tiled", 16, "sinks"),
     ("sdpa_paged_mma", 16, "sinks"),
     ("affine_qmv_routed", 7, "bias"),
-    ("router_topk", 4, "per_expert_scale"),
+    // SLOT 3, NOT 4. `RouterParams` was buffer 3 and `per_expert_scale` was
+    // 4; the struct was unwound into one `const constant uint&` per field at
+    // ascending indices AFTER the operands, so the scale moved down into the
+    // index the block vacated. `moe/route.metal` says so at its declaration.
+    // An excuse that keeps the old index points at `n_experts`, which is a
+    // slot the unscaled instantiation very much does fill.
+    ("router_topk", 3, "per_expert_scale"),
     // The one hole that is a property of a CODEC rather than of a sibling
     // instantiation. `biases` is the affine zero-point plane, and MXFP4 has
     // none: its scales are E8M0 block exponents with nothing to subtract.

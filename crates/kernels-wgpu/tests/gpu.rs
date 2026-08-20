@@ -2169,11 +2169,15 @@ fn a_perturbed_reference_is_refused_by_the_same_check() {
     refuses_a_perturbed_reference(&want, &want, "the shared control");
 }
 
-/// `RmsParams` as `norm/rms.wgsl` declares it: five words at binding 3.
+/// The five words the rms family states, in the order its marks declare them.
 ///
-/// A STORAGE block and not the `@group(1)` uniform, which is what the row means
-/// by `params: Buf` — a struct is a struct, and moving it into the uniform
-/// would be changing the kernel's ABI from the test.
+/// This was `RmsParams`, a STORAGE struct at binding 3 — what the row meant by
+/// `params: Buf`, and the doc here used to say that moving it into the uniform
+/// would be changing the kernel's ABI from the test. The ROUTINE moved it: the
+/// five fields are `eps, axis, w_stride, plus_one, gain` marks now, so the same
+/// five words in the same order are what `driver-wgpu` packs into the
+/// `@group(1)` block, and this helper is handed to `dispatch`'s `uniform`
+/// argument rather than to `storage`.
 fn rms_params(eps: f32, axis: u32, w_stride: u32, plus_one: u32, gain: f32) -> Vec<u8> {
     let mut out = Vec::with_capacity(20);
     out.extend_from_slice(&eps.to_bits().to_le_bytes());
@@ -2233,21 +2237,17 @@ fn a_norm_is_its_closed_form_at_both_of_its_folds() {
 
     for (plus_one, gain, w_stride) in [(0u32, 1.0f32, 1usize), (1, 1.5, 2)] {
         let out = sentinelled(gpu, n / 2);
-        let params = storage(
-            gpu,
-            &rms_params(eps, WIDTH, w_stride as u32, plus_one, gain),
-        );
         // `LaunchRule::Rms` is one workgroup per axis, and the axis is the row.
         //
-        // `rms_single_row` asks the fire for `params` rather than declaring
-        // it, so `run`'s signature-derived count (`x`, `w`, `out`)
-        // undercounts by one; only `out` is written.
+        // `rms_single_row` STATES all five scalars now, so `run`'s
+        // signature-derived count (`x`, `w`, `out`) is the whole buffer list
+        // and the words ride the uniform. Only `out` is written.
         dispatch(
             gpu,
             name,
-            &[&x, &w, &out, &params],
-            &[false, false, true, false],
-            &[],
+            &[&x, &w, &out],
+            &[false, false, true],
+            &rms_params(eps, WIDTH, w_stride as u32, plus_one, gain),
             [ROWS, 1, 1],
         );
 
@@ -2310,21 +2310,37 @@ fn a_residual_add_is_the_sum_of_what_it_was_given() {
     refuses_a_perturbed_reference(&got, &want, "the whole tensor");
 }
 
-/// D6. `row_gather_bfloat16` — the `Binding::Packed` row, on hardware.
+/// D6. `row_gather_bfloat16` — the width and the count, in that order, on
+/// hardware.
 ///
-/// `count` is `Ty::InPacked`: the row states it, and it takes NEITHER a
-/// storage binding nor a uniform field, because it is the second FIELD of the
-/// `RowGatherParams` struct binding 3 already carries. `layout/row_gather.wgsl`
-/// declares no `@group(1)` at all and this test hands it none.
+/// # What this used to be, and why the claim inverted
 ///
-/// What makes the dispatch prove the rule rather than restate it: the index
-/// list is FOURTEEN long and `count` is ELEVEN, and the output has room for
-/// all fourteen. A `count` read from anywhere else — an unwritten uniform, a
+/// `count` was `Ty::InPacked`: the row stated it and it took NEITHER a storage
+/// binding nor a uniform field, because it was the second FIELD of the
+/// `RowGatherParams` struct that binding 3 already carried.
+/// `layout/row_gather.wgsl` declared no `@group(1)` at all and this test
+/// asserted exactly that.
+///
+/// Both halves of the run are ordinary scalars now — `width` is a
+/// `Const<u32>` mark the statement states, `count` is the request count the
+/// body asks the fire for — and `driver-wgpu::lowering::routine::bind` packs
+/// them into the `@group(1)` block in the order the body passes them. So the
+/// assertion below is the opposite of the one it replaced: the module DOES
+/// declare a uniform block, and what matters is that `width` is its first
+/// field and `count` its second. Getting that order wrong is the failure this
+/// kernel is prone to, and it survives the migration unchanged.
+///
+/// # What makes the dispatch prove the rule rather than restate it
+///
+/// The index list is FOURTEEN long and `count` is ELEVEN, and the output has
+/// room for all fourteen. A `count` read from the wrong field — the width, a
 /// stale word — bounds the gather by the wrong number, and the three trailing
 /// rows stop holding their sentinel. Zero could not tell that story: it is
-/// what the buffer was born with.
+/// what the buffer was born with. Eleven and forty-four are also distinct
+/// enough that a transposed pair gathers a wildly wrong number of rows rather
+/// than a plausibly wrong one.
 #[test]
-fn a_packed_operand_bounds_the_gather_it_rides_in() {
+fn the_row_gathers_width_and_count_reach_it_in_that_order() {
     let Some((gpu, _held)) = adapter() else {
         return;
     };
@@ -2341,35 +2357,34 @@ fn a_packed_operand_bounds_the_gather_it_rides_in() {
     let (input, input_seen) = bf16s(gpu, &spread(source_rows * width, 55));
     let rows = u32s(gpu, &indices);
     let out = sentinelled(gpu, indices.len() * pitch);
-    // `[width, count]` — the statement states the width and the driver appends
-    // the count, which is exactly the struct.
-    let params = storage(
-        gpu,
-        &[(width as u32).to_le_bytes(), (count as u32).to_le_bytes()].concat(),
-    );
+    // `[width, count]` — the statement states the width, the body asks the
+    // fire for the count, and `bind` packs them in that order. Same two words
+    // in the same order the struct held them; a uniform block rather than a
+    // storage descriptor.
+    let block = [(width as u32).to_le_bytes(), (count as u32).to_le_bytes()].concat();
 
-    // `layout` has retired, so there is no row to ask. The claim it made —
-    // this kernel's only scalar is PACKED into the storage struct, so the
-    // module declares no uniform block — is the SHADER's and is asked of the
-    // shader directly.
+    // `layout` has retired, so there is no row to ask. The claim is the
+    // SHADER's and is asked of the shader directly — and it is now the
+    // opposite claim: the block exists, so the module declares one.
     assert!(
-        !kernels_wgpu::entrypoint_source(name, kernels_wgpu::Capability::Baseline)
+        kernels_wgpu::entrypoint_source(name, kernels_wgpu::Capability::Baseline)
             .expect("a source")
             .contains("var<uniform>"),
-        "this kernel's only scalar is packed, so it declares no uniform block",
+        "both of this kernel's scalars are marks now, so they arrive in a \
+         uniform block the module must declare",
     );
 
     // `ElementwiseRows`, in WORDS on x because one invocation moves one word.
     //
-    // `row_gather` asks the fire for `rows` (the index table) and `params`
-    // rather than declaring them, so `run`'s signature-derived count
-    // (`input`, `out`) undercounts by two; only `out` is written.
+    // `row_gather` asks the fire for `rows` (the index table) rather than
+    // declaring it, so `run`'s signature-derived count (`input`, `out`)
+    // undercounts by one; only `out` is written.
     dispatch(
         gpu,
         name,
-        &[&input, &out, &rows, &params],
-        &[false, true, false, false],
-        &[],
+        &[&input, &out, &rows],
+        &[false, true, false],
+        &block,
         [over(pitch as u32, 16), over(count as u32, 16), 1],
     );
 
@@ -2391,9 +2406,9 @@ fn a_packed_operand_bounds_the_gather_it_rides_in() {
                 got[at * width + c].to_bits(),
                 f32::from_bits((SENTINEL & 0xffff) << 16).to_bits(),
                 "row {at} is past `count` = {count} and was written anyway, at \
-                 column {c}. `count` is the packed field of `RowGatherParams`, \
-                 so a gather that read it from a uniform block or from a stale \
-                 word bounds itself by garbage",
+                 column {c}. `count` is the SECOND field of the uniform block \
+                 and `width` is the first, so a gather that read the fields in \
+                 the other order bounds itself by {width} rather than {count}",
             );
         }
     }
@@ -2520,43 +2535,37 @@ fn each_gated_activation_answers_to_its_own_closed_form() {
     );
     let silu_got = unpack(&read(gpu, &silu), n);
 
-    // `GegluParams { unused: u32 }` — bound and never read, exactly as Metal's
-    // is, because the row states `params: Buf` and the bind group layout a
-    // shell builds from the row is the same on all three backends.
+    // THREE BUFFERS AND NOTHING ELSE. `GegluParams { unused: u32 }` was bound
+    // and never read — exactly as Metal's was — because the row said
+    // `params: Buf` and the bind group layout a shell built from the row was
+    // the same on all three backends. The row is retired and the field was
+    // dead, so the struct became nothing rather than a mark: this is the only
+    // gated activation with no block at all, which is the shape `silu_mul`
+    // above has had from the start.
     let geglu = sentinelled(gpu, n / 2);
-    let geglu_params = storage(gpu, &0u32.to_le_bytes());
-    // `geglu_tanh` asks the fire for `params` rather than declaring it, so
-    // `run`'s signature-derived count (`gate`, `up`, `geglu`) undercounts by
-    // one; only `geglu` is written.
     dispatch(
         gpu,
         "geglu_tanh_bfloat16",
-        &[&gate_buf, &up_buf, &geglu, &geglu_params],
-        &[false, false, true, false],
+        &[&gate_buf, &up_buf, &geglu],
+        &[false, false, true],
         &[],
         [words, 1, 1],
     );
     let geglu_got = unpack(&read(gpu, &geglu), n);
 
-    // `GptOssSwiGluParams { unused: u32, limit: f32, alpha: f32 }`.
+    // TWO WORDS, WHERE `GptOssSwiGluParams` HAD THREE. Its leading `unused`
+    // was the same dead per-row element count `GegluParams` held, kept only so
+    // `limit` and `alpha` stayed at their offsets. A uniform packed from the
+    // marks the body PASSES needs no such filler, and `gptoss_swiglu` declares
+    // the slot-holder for word 0 without passing it — so the dead word stops
+    // at the host and the block here is `{ limit, alpha }`.
     let gptoss = sentinelled(gpu, n / 2);
-    let gptoss_params = storage(
-        gpu,
-        &[
-            0u32.to_le_bytes(),
-            limit.to_bits().to_le_bytes(),
-            alpha.to_bits().to_le_bytes(),
-        ]
-        .concat(),
-    );
-    // Same shape as `geglu_tanh` above: `gptoss_swiglu` also asks for
-    // `params`, so `run` undercounts by one here too.
     dispatch(
         gpu,
         "gptoss_swiglu_bfloat16",
-        &[&gate_buf, &up_buf, &gptoss, &gptoss_params],
-        &[false, false, true, false],
-        &[],
+        &[&gate_buf, &up_buf, &gptoss],
+        &[false, false, true],
+        &[limit.to_bits().to_le_bytes(), alpha.to_bits().to_le_bytes()].concat(),
         [words, 1, 1],
     );
     let gptoss_got = unpack(&read(gpu, &gptoss), n);
@@ -2743,6 +2752,7 @@ fn a_rope_rotates_against_the_tensor_it_is_overwriting() {
         .f32("scale", scale)
         .f32("base", base)
         .i32("head_dim", head_dim as i32)
+        .i32("rotary", 2 * pairs as i32)
         .done();
     // `neox_decode` asks the fire for `position` rather than declaring it, so
     // `run`'s signature-derived count undercounts by one buffer; `dispatch`
@@ -2754,7 +2764,7 @@ fn a_rope_rotates_against_the_tensor_it_is_overwriting() {
         &[&x, &position],
         &[true, false],
         &block,
-        [pairs as u32, heads as u32, 1],
+        [(pairs as u32).div_ceil(2).div_ceil(32), heads as u32, 1],
     );
 
     let got = unpack(&read(gpu, &x), n);
@@ -2815,6 +2825,7 @@ fn a_proportional_rope_turns_only_its_own_slice() {
         .f32("scale", scale)
         .f32("base", base)
         .i32("head_dim", head_dim as i32)
+        .i32("rotary", 2 * pairs as i32)
         .done();
     // Same undercount as `neox_decode`: `position` is asked for, not
     // declared. `x` (`InOut`) is written, `position` is read.
@@ -2824,7 +2835,7 @@ fn a_proportional_rope_turns_only_its_own_slice() {
         &[&x, &position],
         &[true, false],
         &block,
-        [pairs as u32, heads as u32, 1],
+        [(pairs as u32).div_ceil(2).div_ceil(32), heads as u32, 1],
     );
 
     let got = unpack(&read(gpu, &x), n);
@@ -2938,7 +2949,7 @@ fn a_quantised_matvec_agrees_at_two_quantization_points() {
             entrypoint,
             &[&w, &scale_buf, &bias_buf, &x, &y],
             &block,
-            [n_vec as u32, over(n_out as u32, 8), 1],
+            [over(n_vec as u32, 4), over(n_out as u32, 8), 1],
         );
 
         let mut want = Vec::with_capacity(n_vec * n_out);
@@ -3682,10 +3693,7 @@ fn a_router_chooses_exactly_and_weights_approximately() {
     let (logits, logits_seen) = bf16s(gpu, &spread(rows * pitch, 901));
     let expert_ids = i32s(gpu, &vec![-7i32; rows * k]);
     let expert_weights = sentinelled(gpu, (rows * k).div_ceil(2));
-    let params = storage(
-        gpu,
-        &router_params(n_experts as u32, k as u32, 1, pitch as u32),
-    );
+    let block = router_params(n_experts as u32, k as u32, 1, pitch as u32);
     // Bound and unread by the unscaled arm; a row's bind group does not change
     // with a `//#if`.
     let (per_expert_scale, _) = bf16s(gpu, &positives(n_experts, 907));
@@ -3694,24 +3702,18 @@ fn a_router_chooses_exactly_and_weights_approximately() {
     // once missing next door, and at `grid.y = 1` a mixture prefill routed row
     // 0 and left every other row's ids whatever the previous layer wrote.
     //
-    // `router_topk` asks the fire for `params` (the staged block) rather
-    // than declaring it, and `per_expert_scale` is a deliberately absent
+    // `router_topk` STATES `RouterParams`' four words as marks, so the block
+    // is gone from the bind group and `per_expert_scale` moved down into the
+    // slot it held — binding 3, where it was 4. It is a deliberately absent
     // buffer this unscaled arm never reads but which still occupies a real
-    // bind group slot; `run`'s signature-derived count (three declared
-    // buffers) would undercount by two. `expert_ids` and `expert_weights`
-    // are the only written buffers.
+    // slot, so `run`'s signature-derived count still undercounts by one.
+    // `expert_ids` and `expert_weights` are the only written buffers.
     dispatch(
         gpu,
         "router_topk_bfloat16",
-        &[
-            &logits,
-            &expert_ids,
-            &expert_weights,
-            &params,
-            &per_expert_scale,
-        ],
-        &[false, true, true, false, false],
-        &[],
+        &[&logits, &expert_ids, &expert_weights, &per_expert_scale],
+        &[false, true, true, false],
+        &block,
         [1, rows as u32, 1],
     );
 
@@ -3811,34 +3813,31 @@ fn a_route_sort_gives_every_pair_one_slot_in_its_own_span() {
     let row_expert = i32s(gpu, &vec![-7i32; padded]);
     let tile_expert = i32s(gpu, &vec![-7i32; tiles]);
     let inv = i32s(gpu, &vec![-7i32; n]);
-    let params = storage(
-        gpu,
-        &route_params(
-            n as u32,
-            n_experts as u32,
-            k as u32,
-            tile as u32,
-            padded as u32,
-            13,
-            17,
-        ),
+    let block = route_params(
+        n as u32,
+        n_experts as u32,
+        k as u32,
+        tile as u32,
+        padded as u32,
+        13,
+        17,
     );
 
     // `LaunchRule::RouterSort`: ONE workgroup for the whole routing, whatever
     // the row count. N copies of this would each clear and rewrite the
     // permutation the others are reading.
     //
-    // `route_sort` asks the fire for `params` rather than declaring it, so
-    // `run`'s signature-derived count (`expert_ids`, `perm`, `row_expert`,
-    // `tile_expert`, `inv`) undercounts by one; `perm`, `row_expert`,
-    // `tile_expert` and `inv` are all written, and `expert_ids` and `params`
-    // are read.
+    // `route_sort` states `MoeRouteParams`' seven words as marks, so nothing
+    // lands between `tile_expert` and `inv` any more: `inv` moved down to
+    // binding 4, where it was 5, and the buffer list is `run`'s
+    // signature-derived sequence exactly. `perm`, `row_expert`, `tile_expert`
+    // and `inv` are written; `expert_ids` is read.
     dispatch(
         gpu,
         "route_sort",
-        &[&expert_ids, &perm, &row_expert, &tile_expert, &params, &inv],
-        &[false, true, true, true, false, true],
-        &[],
+        &[&expert_ids, &perm, &row_expert, &tile_expert, &inv],
+        &[false, true, true, true, true],
+        &block,
         [1, 1, 1],
     );
 
@@ -3973,28 +3972,27 @@ fn a_route_gather_compacts_by_its_permutation() {
     let (x, x_seen) = bf16s(gpu, &spread(source_rows * x_pitch, 1001));
     let out = sentinelled(gpu, (padded * width).div_ceil(2));
     let perm = i32s(gpu, &perm_values);
-    let params = storage(
-        gpu,
-        &route_params(
-            (source_rows * k) as u32,
-            7,
-            k as u32,
-            3,
-            padded as u32,
-            width as u32,
-            x_pitch as u32,
-        ),
+    let block = route_params(
+        (source_rows * k) as u32,
+        7,
+        k as u32,
+        3,
+        padded as u32,
+        width as u32,
+        x_pitch as u32,
     );
 
-    // `route_gather` asks the fire for `params` rather than declaring it, so
-    // `run`'s signature-derived count (`x`, `out`, `perm`) undercounts by
-    // one; only `out` is written.
+    // `route_gather` states all seven of `MoeRouteParams`' words though it
+    // reads four: `model-dsl` states ONE run for both this and `route_sort`,
+    // so `padded` cannot disagree between the kernel that pads and the kernel
+    // bounded by the padding. The block was the last binding, so nothing
+    // renumbered here. Only `out` is written.
     dispatch(
         gpu,
         "route_gather",
-        &[&x, &out, &perm, &params],
-        &[false, true, false, false],
-        &[],
+        &[&x, &out, &perm],
+        &[false, true, false],
+        &block,
         [over(width as u32, 16), over(padded as u32, 16), 1],
     );
 
@@ -4097,26 +4095,22 @@ fn a_combine_reads_back_through_the_inverse_permutation() {
     let (weights, weight_seen) = bf16s(gpu, &positives(rows * k, 1103));
     let out = sentinelled(gpu, (rows * out_pitch).div_ceil(2));
     let inv = i32s(gpu, &inv_values);
-    // `ExpertCombineParams { width, experts_per_token, out_pitch }`.
-    let params = storage(
-        gpu,
-        &[width as u32, k as u32, out_pitch as u32]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect::<Vec<u8>>(),
-    );
+    // The three words `ExpertCombineParams` held, in the same order.
+    let block: Vec<u8> = [width as u32, k as u32, out_pitch as u32]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
 
-    // `combine_sorted` asks the fire for `params` from a staged block rather
-    // than declaring it as an operand, and it lands BETWEEN `out` and `inv`
-    // in fire order — not appended at the end — so `run`'s signature-derived
-    // sequence would both undercount and misplace it. `out` is the only
-    // written buffer; `y`, `weights`, `params` and `inv` are all read.
+    // `combine_sorted` states `ExpertCombineParams`' three words as marks, so
+    // nothing lands between `out` and `inv` any more: `inv` moved down to
+    // binding 3, where it was 4, and the buffer list is `run`'s
+    // signature-derived sequence exactly. `out` is the only written buffer.
     dispatch(
         gpu,
         "combine_sorted",
-        &[&y, &weights, &out, &params, &inv],
-        &[false, false, true, false, false],
-        &[],
+        &[&y, &weights, &out, &inv],
+        &[false, false, true, false],
+        &block,
         [over(width as u32, 16), over(rows as u32, 16), 1],
     );
 
@@ -4782,7 +4776,7 @@ fn a_quantised_matvec_folds_its_residual_at_binding_five() {
             &entrypoint,
             &[&w, &scales, &biases, &x, &y, &residual],
             &block,
-            [n_vec as u32, over(n_out as u32, 8), 1],
+            [over(n_vec as u32, 4), over(n_out as u32, 8), 1],
         );
 
         let mut plain = Vec::with_capacity(n_vec * n_out);
@@ -5203,10 +5197,7 @@ fn a_scaled_router_weights_by_the_expert_and_not_by_the_slot() {
     let rows = 5usize;
 
     let (logits, logits_seen) = bf16s(gpu, &spread(rows * pitch, 1801));
-    let params = storage(
-        gpu,
-        &router_params(n_experts as u32, k as u32, 1, pitch as u32),
-    );
+    let block = router_params(n_experts as u32, k as u32, 1, pitch as u32);
     // Far from one, and far from each other, so a scale read at the wrong
     // index is not a small error.
     let scale_values: Vec<f32> = (0..n_experts).map(|e| 0.25 + 0.5 * (e as f32)).collect();
@@ -5216,24 +5207,19 @@ fn a_scaled_router_weights_by_the_expert_and_not_by_the_slot() {
     for entrypoint in ["router_topk_bfloat16", "router_topk_scaled_bfloat16"] {
         let expert_ids = i32s(gpu, &vec![-7i32; rows * k]);
         let expert_weights = sentinelled(gpu, (rows * k).div_ceil(2));
-        // Both `router_topk` and `router_topk_scaled` ask the fire for
-        // `params`; `per_expert_scale` is either a deliberately absent hole
-        // (the plain form) or a real `Const` (the scaled form) at the same
-        // binding either way. `run`'s signature-derived count would
-        // undercount both arms. `expert_ids` and `expert_weights` are the
-        // only written buffers.
+        // Both arms state `RouterParams`' four words as marks now, so both
+        // bind three buffers and one uniform. `per_expert_scale` is either a
+        // deliberately absent hole (the plain form) or a real `Const` (the
+        // scaled form) at binding 3 either way — a `Const<Tensor<_>>` claims
+        // the WEIGHT run, so it costs no param slot and `n_experts` is slot 0
+        // in both. `expert_ids` and `expert_weights` are the only written
+        // buffers.
         dispatch(
             gpu,
             entrypoint,
-            &[
-                &logits,
-                &expert_ids,
-                &expert_weights,
-                &params,
-                &per_expert_scale,
-            ],
-            &[false, true, true, false, false],
-            &[],
+            &[&logits, &expert_ids, &expert_weights, &per_expert_scale],
+            &[false, true, true, false],
+            &block,
             [1, rows as u32, 1],
         );
         answers.push((
@@ -5440,10 +5426,13 @@ fn a_strided_shared_expert_combine_reads_its_gate_a_full_pitch_apart() {
 /// equal counts cannot see it, because then every stride in the kernel is the
 /// same number.
 ///
-/// The two widths ride in `SplitQkvParams`, a STORAGE struct at binding 4:
-/// the routine takes `params` as a buffer, so there is no `@group(1)` here at
-/// all and this test hands it none — which is why it builds its bytes itself
-/// rather than through [`Block`], whose parse would find no block to read.
+/// The two widths are `Const<u32>` MARKS, so they ride the `@group(1)` uniform
+/// block this file now declares. They used to be a `SplitQkvParams` STORAGE
+/// struct at binding 4 — the routine took `params` as a buffer, so there was
+/// no `@group(1)` at all and this test handed it none, building the struct's
+/// bytes itself. The bytes are the same two words in the same order; what
+/// changed is which group they arrive on, so they go to `dispatch`'s `uniform`
+/// argument and the buffer list is the four tensors and nothing else.
 ///
 /// The x extent is in channel PAIRS — 54 of them over a 256-wide workgroup —
 /// so plain division dispatches nothing at all.
@@ -5468,28 +5457,29 @@ fn a_qkv_split_gives_each_projection_its_own_width() {
     let q = sentinelled(gpu, (rows * q_width).div_ceil(2));
     let k = sentinelled(gpu, (rows * kv_width).div_ceil(2));
     let v = sentinelled(gpu, (rows * kv_width).div_ceil(2));
-    let params = storage(
-        gpu,
-        &[
-            (q_width as u32).to_le_bytes(),
-            (kv_width as u32).to_le_bytes(),
-        ]
-        .concat(),
-    );
+    // `q_width` at word 0 and `kv_width` at word 1, which is the order the
+    // marks are declared in and therefore the order the block is packed in.
+    // Swapped, this test still dispatches and every projection is cut in the
+    // wrong place — which is the whole reason the two widths here are unequal.
+    let widths = [
+        (q_width as u32).to_le_bytes(),
+        (kv_width as u32).to_le_bytes(),
+    ]
+    .concat();
 
     // `LaunchRule::SplitPacked` is `[in_width, rows, 1]` in ELEMENTS; this body
     // owns a pair, so half that many lanes do the work and the rest exit at the
     // guard. Dispatched at the minimum, where an undershoot is visible.
     //
-    // `split_qkv_bf16` asks the fire for `params` rather than declaring it,
-    // so `run`'s signature-derived count (`packed`, `q`, `k`, `v`)
-    // undercounts by one; `q`, `k` and `v` are all written.
+    // Four buffers and no fifth: the widths are a `@group(1)` uniform now, so
+    // `run`'s signature-derived count (`packed`, `q`, `k`, `v`) is exactly
+    // what the module declares on `@group(0)`. `q`, `k` and `v` are written.
     dispatch(
         gpu,
         "split_qkv_bf16",
-        &[&packed, &q, &k, &v, &params],
-        &[false, true, true, true, false],
-        &[],
+        &[&packed, &q, &k, &v],
+        &[false, true, true, true],
+        &widths,
         [over(packed_width.div_ceil(2) as u32, 256), rows as u32, 1],
     );
 
@@ -5549,12 +5539,17 @@ fn a_qkv_split_gives_each_projection_its_own_width() {
 /// and one large enough that `x / cap` is 2.4e37 — where the answer must be
 /// exactly the cap and not a NaN.
 ///
-/// `SoftcapParams` is a STORAGE struct at binding 2 and its second field is
-/// bound-and-unread, exactly as `GegluParams::unused` is. So it is filled with
-/// a number that would be catastrophic as a bound — 3, against 5980 elements —
-/// and every element is still required to be right. A future edit that started
-/// reading it fails here rather than returning a tensor whose first three
-/// elements are capped.
+/// The cap is the one field of the `@group(1)` uniform block, packed from the
+/// routine's `cap: Const<f32>` mark. It was a `SoftcapParams` STORAGE struct at
+/// binding 2 whose second field was bound-and-unread — exactly as
+/// `GegluParams::unused` was — and this test used to fill that field with a
+/// number that would be catastrophic as a bound (3, against 5980 elements) so
+/// that an edit which started reading it failed here rather than returning a
+/// tensor whose first three elements were capped.
+///
+/// There is no second field to poison now: the block is four bytes and holds
+/// only the cap. The guard the dead field bought is kept by the elements
+/// below, which are the ones a stated bound would have truncated.
 #[test]
 fn a_logit_softcap_saturates_at_its_cap() {
     let Some((gpu, _held)) = adapter() else {
@@ -5589,22 +5584,17 @@ fn a_logit_softcap_saturates_at_its_cap() {
     values[12] = 4096.0;
     let (logits, logits_seen) = bf16s(gpu, &values);
     let out = sentinelled(gpu, n / 2);
-    // `cap`, then a field the body does not read — filled with a number that
-    // would be a catastrophic bound.
-    let params = storage(
-        gpu,
-        &[cap.to_bits().to_le_bytes(), 3u32.to_le_bytes()].concat(),
-    );
 
-    // `logit_softcap` asks the fire for `params` (the staged cap block)
-    // rather than declaring it, so `run`'s signature-derived count
-    // (`logits`, `out`) undercounts by one; only `out` is written.
+    // `logit_softcap` STATES the cap now — `cap: Const<f32>` — so the two
+    // buffers here are the whole of its `@group(0)` and the cap rides the
+    // uniform. `run`'s signature-derived count agrees with the list for the
+    // first time; only `out` is written.
     dispatch(
         gpu,
         "logit_softcap_bfloat16",
-        &[&logits, &out, &params],
-        &[false, true, false],
-        &[],
+        &[&logits, &out],
+        &[false, true],
+        &cap.to_bits().to_le_bytes(),
         [over(n as u32 / 2, 256), 1, 1],
     );
 
@@ -5678,20 +5668,20 @@ fn a_ple_combine_rounds_once_and_at_the_end() {
     let (proj, proj_seen) = bf16s(gpu, &spread(n, 2201));
     let (token, token_seen) = bf16s(gpu, &spread(n, 2203));
     let out = sentinelled(gpu, n / 2);
-    let params = storage(
-        gpu,
-        &[inv_sqrt2.to_bits().to_le_bytes(), 3u32.to_le_bytes()].concat(),
-    );
 
-    // `ple_combine` asks the fire for `params` rather than declaring it, so
-    // `run`'s signature-derived count (`proj`, `token`, `out`) undercounts
-    // by one; only `out` is written.
+    // `ple_combine` STATES its scale now — `inv_sqrt2: Const<f32>` — so the
+    // three buffers are the whole of its `@group(0)` and the scale is the one
+    // field of the `@group(1)` block. `PleCombineParams`' second word was a
+    // per-row element count nothing read, and it is deleted rather than
+    // poisoned: there is no dead field left to fill with a catastrophic bound.
+    // `run`'s signature-derived count agrees with the list; only `out` is
+    // written.
     dispatch(
         gpu,
         "ple_combine_bfloat16",
-        &[&proj, &token, &out, &params],
-        &[false, false, true, false],
-        &[],
+        &[&proj, &token, &out],
+        &[false, false, true],
+        &inv_sqrt2.to_bits().to_le_bytes(),
         [over(n as u32 / 2, 256), 1, 1],
     );
 
@@ -5742,11 +5732,18 @@ fn a_ple_combine_rounds_once_and_at_the_end() {
 /// buffer is -2.75, so a body that took the word's HIGH half — the other
 /// obvious half-index slip — is wrong by a sign as well as a magnitude.
 ///
-/// `LayerScalarParams.hidden` is bound and not read, and that is the Metal
+/// `LayerScalarParams.hidden` was bound and not read, and that was the Metal
 /// port's finding kept rather than tidied away: the field is ONE ROW's width
 /// while `LaunchRule::Elementwise` dispatches `width * rows`, so reading it as
 /// a bound returned every row after the first holding whatever the arena had.
-/// It is filled with 7 here.
+/// This test filled it with 7 so that an edit which started reading it left
+/// everything past element 7 untouched and failed here.
+///
+/// The struct is gone from all three planes now — a storage binding for one
+/// dead word — and `layer_scalar_mul` states no mark in its place, so the
+/// dispatch below binds three buffers and no block at all. The guard survives
+/// as the length assertion at the end, which is the same claim without a
+/// binding to carry it.
 #[test]
 fn a_layer_scalar_multiply_reads_its_scale_from_the_buffer() {
     let Some((gpu, _held)) = adapter() else {
@@ -5761,16 +5758,15 @@ fn a_layer_scalar_multiply_reads_its_scale_from_the_buffer() {
     );
     let (scalar, scalar_seen) = bf16s(gpu, &[scale, -2.75]);
     let out = sentinelled(gpu, n / 2);
-    let params = storage(gpu, &7u32.to_le_bytes());
 
-    // `layer_scalar_mul` asks the fire for `params` (the staged, unread
-    // `hidden` field), so `run`'s signature-derived count (`x`, `scalar`,
-    // `out`) undercounts by one; only `out` is written.
+    // Three buffers and no block: the staged, unread `hidden` field is gone
+    // from the module, so `run`'s signature-derived count (`x`, `scalar`,
+    // `out`) is the list. Only `out` is written.
     dispatch(
         gpu,
         "layer_scalar_mul_bfloat16",
-        &[&x, &scalar, &out, &params],
-        &[false, false, true, false],
+        &[&x, &scalar, &out],
+        &[false, false, true],
         &[],
         [over(n as u32 / 2, 256), 1, 1],
     );
@@ -5787,12 +5783,15 @@ fn a_layer_scalar_multiply_reads_its_scale_from_the_buffer() {
     let high_half: Vec<f32> = x_seen.iter().map(|v| rounded(v * scalar_seen[1])).collect();
     agrees(&got, &high_half, "the layer scaled by the word's high half")
         .expect_err("`pie_bf16_at(scalar[0], 0u)` is the LOW half of word zero");
-    // And every element past the unread `hidden` = 7 is right, which the
-    // comparison above already covers and this names.
+    // And every element is right, which the comparison above already covers
+    // and this names. The number 7 is what the deleted `hidden` field used to
+    // be filled with: a per-ROW width read as a bound on a `width * rows`
+    // dispatch would have left everything after element 7 untouched, and the
+    // length is still the thing that would have caught it.
     assert!(
         n > 7 && got.len() == n,
-        "the unread field is 7 against {n} elements, so a body that read it as \
-         a bound would leave everything after element 7 untouched",
+        "a body bounded by one row's width rather than by the grid would leave \
+         everything after element 7 of {n} untouched",
     );
 }
 
@@ -5831,23 +5830,22 @@ fn a_vector_norm_reduces_over_its_axis_and_not_over_its_row() {
 
     let (x, x_seen) = bf16s(gpu, &spread(n, 2401));
     let out = sentinelled(gpu, n / 2);
-    let params = storage(
-        gpu,
-        &[eps.to_bits().to_le_bytes(), (axis as u32).to_le_bytes()].concat(),
-    );
 
     // `LaunchRule::Rms` is one workgroup per AXIS, not per row: `width / axis`
     // axes to a row and `rows` rows.
     let axes = (width / axis) * rows;
-    // `vnorm_single_row` asks the fire for `params` rather than declaring
-    // it, so `run`'s signature-derived count (`x`, `out`) undercounts by
-    // one; only `out` is written.
+    // `vnorm_single_row` STATES both scalars now — `eps: Const<f32>` and
+    // `axis_size: Const<i32>` — where it used to forward a `VNormParams`
+    // storage block it could not name. So the two buffers are the whole of its
+    // `@group(0)`, the pair rides the `@group(1)` uniform in that order, and
+    // `run`'s signature-derived count agrees with the list. Only `out` is
+    // written.
     dispatch(
         gpu,
         "vnorm_single_row_bfloat16",
-        &[&x, &out, &params],
-        &[false, true, false],
-        &[],
+        &[&x, &out],
+        &[false, true],
+        &[eps.to_bits().to_le_bytes(), (axis as u32).to_le_bytes()].concat(),
         [axes as u32, 1, 1],
     );
 
@@ -6114,10 +6112,13 @@ fn a_batched_rope_gives_every_row_its_own_position() {
         .f32("scale", scale)
         .f32("base", base)
         .i32("head_dim", head_dim as i32)
+        .i32("rotary", 2 * pairs as i32)
         .done();
-    // `LaunchRule::Rope` is `[rotary / 2, heads, rows]`, and the module is
-    // `@workgroup_size(1)` so the grid is EXACT — the body reads
-    // `num_workgroups.x` as the pair count it strides each partner by.
+    // `rope_grid` divides `LaunchRule::Rope`'s `rotary / 2` by two -- an
+    // invocation owns a whole word, so it covers two pairs -- and then by the
+    // module's 32-wide x workgroup. The pair count the body strides each
+    // partner by comes off the BLOCK now, not `num_workgroups.x`, which is
+    // what makes the two round-ups above safe.
     //
     // `neox_mb` asks the fire for `position` rather than declaring it, so
     // `run`'s signature-derived count undercounts by one buffer; `x` is
@@ -6128,7 +6129,7 @@ fn a_batched_rope_gives_every_row_its_own_position() {
         &[&x, &position],
         &[true, false],
         &block,
-        [pairs as u32, heads as u32, rows as u32],
+        [(pairs as u32).div_ceil(2).div_ceil(32), heads as u32, rows as u32],
     );
 
     let shape = Neox {
@@ -6206,6 +6207,7 @@ fn a_frequency_table_rope_reads_a_reordered_block() {
             .f32("scale", scale)
             .i32("head_dim", head_dim as i32)
             .f32("mscale", mscale)
+            .i32("rotary", 2 * pairs as i32)
             .done();
         // Both entrypoints ask the fire for `position` and `inv_freq` rather
         // than declaring them, so `run`'s signature-derived count
@@ -6217,7 +6219,7 @@ fn a_frequency_table_rope_reads_a_reordered_block() {
             &[&x, &position, &inv_freq],
             &[true, false, false],
             &block,
-            [pairs as u32, heads as u32, rows as u32],
+            [(pairs as u32).div_ceil(2).div_ceil(32), heads as u32, rows as u32],
         );
 
         let shape = Neox {
@@ -6255,16 +6257,20 @@ fn a_frequency_table_rope_reads_a_reordered_block() {
     }
 }
 
-/// D40. `rms_residual` and `rms_residual_scaled` — the fold, and the buffer
-/// that arrives AFTER the params struct.
+/// D40. `rms_residual` and `rms_residual_scaled` — the fold, and the buffers
+/// that moved DOWN when the params struct stopped being one.
 ///
-/// The residual is `@binding(4)` and the per-layer gain `@binding(5)`, both
-/// after `params` at 3, because the row's operand order is
-/// `x, w, out, params, r[, s]` and the buffer run is dense in that order. This
-/// is the shape `.wiki/new-driver/vulkan.md` §3 names: "a residual buffer that
-/// sits at descriptor five because the two scalars before it moved to push
-/// constants". Here there are no scalars at all — every one of this row's
-/// operands is a buffer — so the numbering is the row's and Metal's is not.
+/// The residual was `@binding(4)` and the per-layer gain `@binding(5)`, both
+/// after `params` at 3, because the row's operand order was
+/// `x, w, out, params, r[, s]` and the buffer run is dense in that order. That
+/// was the one place in this sweep where deleting the block left a HOLE rather
+/// than trimming a tail: `r` is 3 now and `s` is 4.
+///
+/// The doc here used to add that "there are no scalars at all — every one of
+/// this row's operands is a buffer", which was the whole reason the numbering
+/// was the row's and not Metal's. There are five scalars now, and they are the
+/// same five `RmsParams` carried; what changed is that a struct became a
+/// signature.
 ///
 /// The epilogue is `(gain * (x * inv) + r) * post`, with ONE bf16 round on the
 /// store, so the residual is added in float and the scaled form's per-layer
@@ -6283,32 +6289,32 @@ fn a_norm_folds_its_residual_and_its_layer_gain() {
     // 1.0, so dropping it is visible.
     let post = 1.25f32;
     let (s, s_seen) = bf16s(gpu, &[post, -3.5]);
-    let params = storage(gpu, &rms_params(eps, WIDTH, 1, 0, 1.0));
+    let block = rms_params(eps, WIDTH, 1, 0, 1.0);
 
     let plain = sentinelled(gpu, n / 2);
-    // `rms_residual` asks the fire for `params` rather than declaring it —
-    // it lands at position 3, between the declared `out` and `r` — so
-    // `run`'s signature-derived sequence would both undercount and misplace
-    // it. Only `out` (`plain`) is written.
+    // `rms_residual` states its five scalars, so nothing lands between `out`
+    // and `r` any more and the buffer list is `run`'s signature-derived
+    // sequence exactly. Only `out` (`plain`) is written.
     dispatch(
         gpu,
         "rms_residual_bfloat16",
-        &[&x, &w, &plain, &params, &r],
-        &[false, false, true, false, false],
-        &[],
+        &[&x, &w, &plain, &r],
+        &[false, false, true, false],
+        &block,
         [ROWS, 1, 1],
     );
     let got_plain = unpack(&read(gpu, &plain), n);
 
     let scaled = sentinelled(gpu, n / 2);
     // Same shape as `rms_residual`, with the scaled variant's extra `s`
-    // trailing after `r`. Only `out` (`scaled`) is written.
+    // trailing after `r` — at binding 4, where it used to be 5. Only `out`
+    // (`scaled`) is written.
     dispatch(
         gpu,
         "rms_residual_scaled_bfloat16",
-        &[&x, &w, &scaled, &params, &r, &s],
-        &[false, false, true, false, false, false],
-        &[],
+        &[&x, &w, &scaled, &r, &s],
+        &[false, false, true, false, false],
+        &block,
         [ROWS, 1, 1],
     );
     let got_scaled = unpack(&read(gpu, &scaled), n);
@@ -6440,15 +6446,14 @@ fn a_strided_geglu_reads_three_different_pitches() {
         let (gate, gate_seen) = bf16s(gpu, &spread(rows * gate_pitch, 2901));
         let (up, up_seen) = bf16s(gpu, &spread(rows * up_pitch, 2903));
         let out = sentinelled(gpu, (rows * out_pitch).div_ceil(2));
-        // `GegluStridedParams { width, rows, gate_pitch, up_pitch, out_pitch }`,
-        // a STORAGE struct at binding 3 — the row states `params: Buf`.
-        let params = storage(
-            gpu,
-            &[width, rows, gate_pitch, up_pitch, out_pitch]
-                .iter()
-                .flat_map(|v| u32::try_from(*v).expect("fits").to_le_bytes())
-                .collect::<Vec<u8>>(),
-        );
+        // The five words `GegluStridedParams` held, in the same order, as the
+        // `@group(1)` uniform block `geglu_tanh_strided` now states as marks.
+        // They were a STORAGE struct at binding 3 while the row said
+        // `params: Buf`.
+        let block = [width, rows, gate_pitch, up_pitch, out_pitch]
+            .iter()
+            .flat_map(|v| u32::try_from(*v).expect("fits").to_le_bytes())
+            .collect::<Vec<u8>>();
 
         // The body is `@workgroup_size(256)` and `gid.x` is a flat ELEMENT index
         // over `rows * width`, which is exactly what this row's stated
@@ -6461,15 +6466,15 @@ fn a_strided_geglu_reads_three_different_pitches() {
         // measured under a launch its table does not state is a kernel measured
         // under a launch nothing will give it, and this file said so about itself
         // for as long as the body disagreed with the row.
-        // `geglu_tanh_strided` asks the fire for `params` rather than
-        // declaring it, so `run`'s signature-derived count (`gate`, `up`,
-        // `out`) undercounts by one; only `out` is written.
+        // `geglu_tanh_strided` STATES all five now, so `run`'s
+        // signature-derived count (`gate`, `up`, `out`) is the buffer list and
+        // the words ride the uniform. Only `out` is written.
         dispatch(
             gpu,
             "geglu_tanh_strided_bfloat16",
-            &[&gate, &up, &out, &params],
-            &[false, false, true, false],
-            &[],
+            &[&gate, &up, &out],
+            &[false, false, true],
+            &block,
             [over((width * rows) as u32, 256), 1, 1],
         );
 
@@ -7245,6 +7250,9 @@ fn every_stated_row_is_dispatched_or_named() {
     // nothing reads exactly like a filter that passes**, which is the sentence
     // the removing commit wrote about `driver-cuda` and is equally true here.
     // Asserted rather than assumed — the count below is the same as it was.
+    // Hoisted: `entrypoints()` hands back an owned copy of all 481 names, and
+    // asking inside the filter asked once per routine.
+    let census = kernels_wgpu::entrypoints();
     let mut stated: Vec<&str> = kernels_wgpu::routines()
         .into_iter()
         .map(|r| r.name)
@@ -7256,8 +7264,13 @@ fn every_stated_row_is_dispatched_or_named() {
         // The two dark families are dispatched by no test here and
         // never were: their rows stated no operands, so `COVERAGE`
         // never claimed them, and losing the row does not change that.
+        //
+        // Against the CENSUS, which `retired()` used to be a second name for:
+        // every family has crossed, so "the entrypoints whose row is gone" and
+        // "the entrypoints there are" were the same set, and the census is the
+        // one of the two still written down.
         .filter(|n| {
-            kernels_wgpu::retired().iter().any(|e| {
+            census.iter().any(|e| {
                 e.split('_')
                     .collect::<Vec<_>>()
                     .windows(n.split('_').count())
@@ -7359,11 +7372,12 @@ fn every_stated_row_is_dispatched_or_named() {
         "sdpa_vector_decode_sink",
         "silu_mul_strided",
     ];
+    let census = kernels_wgpu::entrypoints();
     let mut reachable: Vec<&str> = kernels_wgpu::routines()
         .into_iter()
         .map(|r| r.name)
         .filter(|n| !kernels_wgpu::KERNELS.iter().any(|row| row.name == *n))
-        .filter(|n| kernels_wgpu::retired().iter().any(|e| e.starts_with(*n)))
+        .filter(|n| census.iter().any(|e| e.starts_with(*n)))
         .filter(|n| !is_claimed(n))
         .filter(|n| *n != "argmax_logits" && *n != "copy_logits_bf16")
         .collect();
@@ -7970,6 +7984,16 @@ fn how_long_a_decodes_kernels_take() {
         (3072, 1024, "gate/up"),
         (1024, 3072, "down   "),
         (6144, 3072, "big    "),
+        // Llama-3.2-1B's own decode shapes, which is what the wgpu backend
+        // serves on this machine. Printed with the bandwidth they imply,
+        // because the question a decode asks of this kernel is not "how long"
+        // but "what fraction of the machine's memory" -- an M4 Pro moves
+        // 273 GB/s and a projection this quantised is nothing but a read.
+        (512, 2048, "l1b k/v"),
+        (2048, 2048, "l1b q/o"),
+        (8192, 2048, "l1b g/u"),
+        (2048, 8192, "l1b down"),
+        (128_256, 2048, "l1b head"),
     ] {
         let plane = Affine::new(
             64,
@@ -7994,7 +8018,15 @@ fn how_long_a_decodes_kernels_take() {
             &block,
             [1, over(u32::try_from(out_rows).expect("fits"), 8), 1],
         );
-        println!("affine_qmv_fast   {what}  {out_rows:5}x{k:<5} {ms:>8.3} ms/dispatch");
+        // Bytes a correct run must read: the packed plane, plus one scale and
+        // one bias per group of `PIE_GROUP` codes, both bf16.
+        let bytes = out_rows * k / 2 + 2 * 2 * (out_rows * k / 64);
+        let gbs = bytes as f64 / (ms * 1.0e6);
+        println!(
+            "affine_qmv_fast   {what}  {out_rows:5}x{k:<5} {ms:>8.3} ms/dispatch  \
+             {gbs:>6.1} GB/s  wgs={}",
+            over(u32::try_from(out_rows).expect("fits"), 8)
+        );
     }
 }
 
@@ -9084,4 +9116,76 @@ fn gdn_core_at(gpu: &Gpu, rows: usize) {
         state / (runs[0] / 1e3) / 1e9,
         runs[0] / rows as f64,
     );
+}
+
+/// D10b. `affine_qmv_fast` over a BATCH, at the shapes a real prefill has.
+///
+/// `qmv.wgsl`'s `PIE_MT` gives one workgroup four activation rows against the
+/// eight output columns whose packed weights it already read, which is what
+/// took the lm head's 67 GiB of weight traffic down to 17. Everything about
+/// that tiling is invisible to a one-row fire, so D10's five vectors at K=448
+/// -- one pass of the K sweep, one workgroup per vector under the old extent
+/// -- could not have seen any of it.
+///
+/// What this adds, and why each one is a real failure mode rather than a
+/// sweep for its own sake:
+///
+/// * **A ragged batch.** 1, 2, 3, 5 rows all leave the last workgroup holding
+///   fewer than four, and the rows it does NOT have must be neither read (the
+///   activation is past the end of `x`) nor written (the output row is past
+///   the end of `y`). `n_vec = 1` is the decode shape, which takes the
+///   one-row body through the same entrypoint.
+/// * **A multi-pass K sweep.** K=2048 is four passes of `PIE_QMV_VPT * 32`,
+///   so the four row accumulators and the `vec4` of activation sums have to
+///   survive the loop rather than merely be initialised inside it. D10's
+///   K=448 fits in ONE pass and proves nothing about that.
+/// * **The lm head's own width.** 128256 columns is 16032 workgroups on y
+///   beside 1 on x, and the row index rides x -- the axis a batch grows. It
+///   is also where `wbase = rows * (n / cpw)` is largest.
+#[test]
+fn a_quantised_matvec_agrees_over_a_batch_of_activation_rows() {
+    let Some((gpu, _held)) = adapter() else {
+        return;
+    };
+    let (group, bits, k) = (64usize, 4u32, 2048usize);
+    let entrypoint = "affine_qmv_fast_bfloat16_gs_64_b_4";
+    for n_vec in [1usize, 2, 3, 5, 8] {
+        for n_out in [13usize, 2048, 128256] {
+            let plane = Affine::new(group, bits, n_out, k, 0x1234 ^ bits ^ group as u32);
+            let vpt = plane.qmv_vpt();
+            let w = storage(gpu, &plane.words());
+            let (scale_buf, _) = bf16s(gpu, &plane.scales);
+            let (bias_buf, _) = bf16s(gpu, &plane.biases);
+            let (x, x_seen) = bf16s(gpu, &spread(n_vec * k, 41 + bits));
+            let y = sentinelled(gpu, (n_vec * n_out).div_ceil(2));
+            let block = Block::of(entrypoint)
+                .i32("in_vec_size", i32::try_from(k).expect("fits"))
+                .i32("out_vec_size", i32::try_from(n_out).expect("fits"))
+                .done();
+            // FOUR ROWS TO A WORKGROUP on x, which is `quarters()` on the
+            // launcher's side and `Rule::Qmv`'s `div_ceil(4)` on the driver's.
+            run(
+                gpu,
+                entrypoint,
+                &[&w, &scale_buf, &bias_buf, &x, &y],
+                &block,
+                [over(n_vec as u32, 4), over(n_out as u32, 8), 1],
+            );
+            let mut want = Vec::with_capacity(n_vec * n_out);
+            for vec_ in 0..n_vec {
+                for row in 0..n_out {
+                    want.push(rounded(qmv_lane_sum(
+                        &x_seen[vec_ * k..(vec_ + 1) * k],
+                        |at| plane.value(row, at),
+                        k,
+                        vpt,
+                    )));
+                }
+            }
+            let got = unpack(&read(gpu, &y), n_vec * n_out);
+            if let Err(why) = agrees(&got, &want, entrypoint) {
+                panic!("{n_vec} vectors of {n_out} columns: {why}");
+            }
+        }
+    }
 }

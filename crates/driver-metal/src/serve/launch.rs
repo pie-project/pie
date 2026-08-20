@@ -710,13 +710,20 @@ fn run_programs(
         let inputs = match logits {
             None => crate::channel::PassInputs::none(),
             Some((values, rows, vocab)) => {
-                let (start, end) = member_rows(&step.program_row_indptr, member, *rows)
+                let sampling = Sampling {
+                    qo_indptr: &step.plan.qo_indptr,
+                    indices: &step.plan.sampling_indices,
+                    indptr: &step.plan.sampling_indptr,
+                };
+                let (start, end) = member_rows(&step.program_row_indptr, &sampling, member, *rows)
                     .ok_or_else(|| Error::Unserved {
                         what: "launch",
                         message: format!(
                             "member {member} is not described by the {}-entry attribution CSR \
-                             over the {rows} read-out row(s) this fire produced",
-                            step.program_row_indptr.len()
+                             over the {} wire request(s) whose {rows} read-out row(s) this fire \
+                             produced",
+                            step.program_row_indptr.len(),
+                            step.plan.qo_indptr.len().saturating_sub(1)
                         ),
                     })?;
                 let span = (end - start) as usize * *vocab as usize;
@@ -791,8 +798,28 @@ fn read_logits(
 /// Which rows of a fire's read-out belong to batch member `member`.
 ///
 /// `program_row_indptr` is the frame's own attribution CSR — member `p` owns
-/// wire request rows `[indptr[p], indptr[p+1])` — and an ABSENT one is the
+/// WIRE REQUEST rows `[indptr[p], indptr[p+1])` — and an ABSENT one is the
 /// single-member case, where the whole read-out is that member's.
+///
+/// # The CSR counts requests and the read-out counts sampled rows
+///
+/// Those are two numberings, and this function used to spend the first as if
+/// it were the second: `[indptr[p], indptr[p+1])` was sliced straight out of
+/// the logits. Today they agree, because every request a fire serves reads
+/// exactly one row — its last — and one request is therefore one read-out
+/// row. Nothing in the frame *says* that. A speculative verifier names one
+/// read-out row per drafted token (`sampling_indices` is exactly that list),
+/// and the moment one appears the two numberings come apart at the FIRST
+/// member that follows it: request 2 is read-out row 4, and the untranslated
+/// read hands the member rows 2..3, which are another conversation's drafts.
+/// Real distributions of the right width, no fault, no stall — the same shape
+/// of silence the `(0, rows)` fallback used to have, one batch member over.
+///
+/// So the request span is translated through [`Sampling`], which counts what
+/// each request actually contributes to the read-out under the same rule
+/// `model_compiler::lower::Readouts::samples` used to build it. `driver-wgpu`
+/// resolves the identical question through `Step::readouts_of` in
+/// `frames.rs`, and Metal had no equivalent at all.
 ///
 /// # Why a CSR that does not describe this member is `None`
 ///
@@ -818,47 +845,229 @@ fn read_logits(
 /// already refused that a line later, by measuring the slice against the
 /// values the fire produced — the check is here as well so that both ways of
 /// being undescribed are one answer rather than two.
-fn member_rows(program_row_indptr: &[u32], member: usize, rows: u32) -> Option<(u32, u32)> {
+fn member_rows(
+    program_row_indptr: &[u32],
+    sampling: &Sampling<'_>,
+    member: usize,
+    rows: u32,
+) -> Option<(u32, u32)> {
     if program_row_indptr.len() < 2 {
         return Some((0, rows));
     }
-    match (
-        program_row_indptr.get(member),
-        program_row_indptr.get(member + 1),
-    ) {
-        (Some(&s), Some(&e)) if e >= s && e <= rows => Some((s, e)),
-        _ => None,
+    let (&from, &to) = (
+        program_row_indptr.get(member)?,
+        program_row_indptr.get(member + 1)?,
+    );
+    if to < from {
+        return None;
+    }
+    let (start, end) = sampling.read_out(from, to)?;
+    (end <= rows).then_some((start, end))
+}
+
+/// The read-out table a fire was lowered with, read back the same way.
+///
+/// # Why this recounts rather than trusting a length
+///
+/// The count a member needs is "how many read-out rows did requests
+/// `0..r` contribute", and there is no array carrying it: `sampling_indptr`
+/// segments `sampling_indices`, which is not the same list. A request that
+/// names NO row still reads one — its own last, which is what a decode means
+/// — and a request with no tokens at all reads none. Naming the same row
+/// twice is one row, because the read-out is built from a per-row `samples`
+/// bitmap and a bit set twice is set once.
+///
+/// All three rules live in `Readouts::samples`, and they are mirrored here
+/// rather than approximated, because the number this produces indexes into
+/// the values that function's answer laid out. Approximating it is not a
+/// smaller answer, it is a different member's rows.
+struct Sampling<'a> {
+    /// Request → token row CSR for the fire.
+    qo_indptr: &'a [u32],
+    /// Rows read, each numbered inside its own request.
+    indices: &'a [u32],
+    /// Request → readout CSR over [`Self::indices`], empty when none are
+    /// named.
+    indptr: &'a [u32],
+}
+
+impl Sampling<'_> {
+    /// The read-out rows contributed by wire requests `[from, to)`.
+    ///
+    /// `None` when a request in that span is not described by `qo_indptr` at
+    /// all, which is a frame whose tables were built for a different fire.
+    fn read_out(&self, from: u32, to: u32) -> Option<(u32, u32)> {
+        let mut start = 0u32;
+        let mut end = 0u32;
+        for r in 0..to as usize {
+            let n = self.rows_of(r)?;
+            if r < from as usize {
+                start = start.checked_add(n)?;
+            }
+            end = end.checked_add(n)?;
+        }
+        Some((start, end))
+    }
+
+    /// How many read-out rows request `r` contributes.
+    fn rows_of(&self, r: usize) -> Option<u32> {
+        let (&lo, &hi) = (self.qo_indptr.get(r)?, self.qo_indptr.get(r + 1)?);
+        if hi <= lo {
+            // A request with no token rows has no last row to read.
+            return Some(0);
+        }
+        let named = self.named(r);
+        if named.is_empty() {
+            return Some(1);
+        }
+        let mut rows: Vec<u32> = named.to_vec();
+        rows.sort_unstable();
+        rows.dedup();
+        u32::try_from(rows.len()).ok()
+    }
+
+    /// The rows request `r` names, in its own numbering.
+    ///
+    /// Lenient exactly where `Readouts::of` is: this reports what the fire
+    /// DID, and the fire already ran.
+    fn named(&self, r: usize) -> &[u32] {
+        if self.indices.is_empty() {
+            return &[];
+        }
+        let (Some(&lo), Some(&hi)) = (self.indptr.get(r), self.indptr.get(r + 1)) else {
+            return &[];
+        };
+        if hi < lo {
+            return &[];
+        }
+        self.indices.get(lo as usize..hi as usize).unwrap_or(&[])
     }
 }
 
 #[cfg(test)]
 mod readout_rows {
-    use super::member_rows;
+    use super::{Sampling, member_rows};
+
+    /// A decode: every request one token row, every one reading it.
+    fn decodes(requests: u32) -> Vec<u32> {
+        (0..=requests).collect()
+    }
+
+    /// The read-out table of a fire whose requests name no row of their own,
+    /// which is what a decode and an ordinary prefill both submit.
+    fn plain<'a>(qo_indptr: &'a [u32]) -> Sampling<'a> {
+        Sampling {
+            qo_indptr,
+            indices: &[],
+            indptr: &[],
+        }
+    }
 
     /// Three requests batched into one fire, one read-out row each.
     #[test]
     fn each_member_of_a_batched_frame_reads_its_own_row() {
+        let qo = decodes(3);
+        let s = plain(&qo);
         let indptr = [0, 1, 2, 3];
-        assert_eq!(member_rows(&indptr, 0, 3), Some((0, 1)));
-        assert_eq!(member_rows(&indptr, 1, 3), Some((1, 2)));
-        assert_eq!(member_rows(&indptr, 2, 3), Some((2, 3)));
+        assert_eq!(member_rows(&indptr, &s, 0, 3), Some((0, 1)));
+        assert_eq!(member_rows(&indptr, &s, 1, 3), Some((1, 2)));
+        assert_eq!(member_rows(&indptr, &s, 2, 3), Some((2, 3)));
     }
 
-    /// A member may own several rows — a speculative fire reads out more than
-    /// one row per request — and the span is the CSR's, not one row.
+    /// A member may own several REQUESTS, and the span is all of their rows.
     #[test]
-    fn a_member_that_owns_several_rows_gets_all_of_them() {
+    fn a_member_that_owns_several_requests_gets_all_of_their_rows() {
+        let qo = decodes(5);
+        let s = plain(&qo);
         let indptr = [0, 4, 5];
-        assert_eq!(member_rows(&indptr, 0, 5), Some((0, 4)));
-        assert_eq!(member_rows(&indptr, 1, 5), Some((4, 5)));
+        assert_eq!(member_rows(&indptr, &s, 0, 5), Some((0, 4)));
+        assert_eq!(member_rows(&indptr, &s, 1, 5), Some((4, 5)));
+    }
+
+    /// A PREFILL'S REQUEST IS MANY TOKEN ROWS AND ONE READ-OUT ROW.
+    ///
+    /// The attribution CSR counts requests, so nothing here moves when the
+    /// requests get wider: two prefills of four and three tokens are still
+    /// read-out rows 0 and 1. This is the case that made the untranslated
+    /// read look correct for as long as it did.
+    #[test]
+    fn a_prefills_width_does_not_reach_the_readout() {
+        let qo = [0, 4, 7];
+        let s = plain(&qo);
+        let indptr = [0, 1, 2];
+        assert_eq!(member_rows(&indptr, &s, 0, 2), Some((0, 1)));
+        assert_eq!(member_rows(&indptr, &s, 1, 2), Some((1, 2)));
+    }
+
+    /// A SPECULATIVE MEMBER MOVES EVERY MEMBER AFTER IT, AND THE UNTRANSLATED
+    /// READ HANDED THEM SOMEBODY ELSE'S DRAFTS.
+    ///
+    /// Request 0 verifies three drafted tokens and names three rows of its
+    /// own span; requests 1 and 2 are ordinary decodes. The read-out is five
+    /// rows — `0..3` are request 0's, row 3 is request 1's, row 4 is request
+    /// 2's — while the attribution CSR still says `[0, 1, 2, 3]`, because it
+    /// counts requests.
+    ///
+    /// Spending those entries as read-out rows gives member 1 row 1 and
+    /// member 2 row 2, which are request 0's SECOND and THIRD drafts. Both
+    /// are real distributions of the right width over the right vocabulary,
+    /// so the interpreter samples them, commits them, and two conversations
+    /// continue with a third one's tokens. Nothing faults; the frame is
+    /// green. Only the transcripts show it, which is the same failure mode
+    /// as the `(0, rows)` fallback and one batch member further along.
+    #[test]
+    fn a_speculative_member_does_not_shift_the_members_after_it() {
+        let qo = [0, 3, 4, 5];
+        let s = Sampling {
+            qo_indptr: &qo,
+            indices: &[0, 1, 2],
+            indptr: &[0, 3, 3, 3],
+        };
+        let indptr = [0, 1, 2, 3];
+        assert_eq!(member_rows(&indptr, &s, 0, 5), Some((0, 3)));
+        assert_eq!(member_rows(&indptr, &s, 1, 5), Some((3, 4)));
+        assert_eq!(member_rows(&indptr, &s, 2, 5), Some((4, 5)));
+        // What the untranslated read answered, stated so a regression is
+        // named rather than merely unequal.
+        assert_ne!(member_rows(&indptr, &s, 1, 5), Some((1, 2)));
+        assert_ne!(member_rows(&indptr, &s, 2, 5), Some((2, 3)));
+    }
+
+    /// A row named twice is one read-out row, because the read-out is built
+    /// from a per-row bitmap and a bit set twice is set once.
+    #[test]
+    fn a_row_named_twice_is_counted_once() {
+        let qo = [0, 3, 4];
+        let s = Sampling {
+            qo_indptr: &qo,
+            indices: &[2, 2, 0],
+            indptr: &[0, 3, 3],
+        };
+        let indptr = [0, 1, 2];
+        assert_eq!(member_rows(&indptr, &s, 0, 3), Some((0, 2)));
+        assert_eq!(member_rows(&indptr, &s, 1, 3), Some((2, 3)));
+    }
+
+    /// A request with no token rows contributes no read-out row: it has no
+    /// last row to read, and `Readouts::samples` skips it for that reason.
+    #[test]
+    fn a_request_with_no_rows_contributes_none() {
+        let qo = [0, 1, 1, 2];
+        let s = plain(&qo);
+        let indptr = [0, 1, 2, 3];
+        assert_eq!(member_rows(&indptr, &s, 0, 2), Some((0, 1)));
+        assert_eq!(member_rows(&indptr, &s, 1, 2), Some((1, 1)));
+        assert_eq!(member_rows(&indptr, &s, 2, 2), Some((1, 2)));
     }
 
     /// No attribution CSR is the single-member case, and the whole read-out
     /// is that member's — the behaviour every frame used to get.
     #[test]
     fn an_absent_csr_gives_the_whole_readout_to_the_one_member() {
-        assert_eq!(member_rows(&[], 0, 7), Some((0, 7)));
-        assert_eq!(member_rows(&[0], 0, 7), Some((0, 7)));
+        let qo = decodes(7);
+        let s = plain(&qo);
+        assert_eq!(member_rows(&[], &s, 0, 7), Some((0, 7)));
+        assert_eq!(member_rows(&[0], &s, 0, 7), Some((0, 7)));
     }
 
     /// A CSR THAT DOES NOT DESCRIBE THIS MEMBER IS REFUSED, NOT ANSWERED
@@ -883,18 +1092,31 @@ mod readout_rows {
     /// where the lenient answer cost tokens.
     #[test]
     fn a_member_the_csr_does_not_place_is_refused_rather_than_given_row_zero() {
+        let qo = decodes(3);
+        let s = plain(&qo);
         // Three members' worth of roster, a table that places two of them.
         let short = [0, 1, 2];
-        let first = member_rows(&short, 0, 3).expect("member 0 is placed");
-        assert!(member_rows(&short, 2, 3).is_none());
-        assert_ne!(member_rows(&short, 2, 3), Some(first));
+        let first = member_rows(&short, &s, 0, 3).expect("member 0 is placed");
+        assert!(member_rows(&short, &s, 2, 3).is_none());
+        assert_ne!(member_rows(&short, &s, 2, 3), Some(first));
 
         // Present, long enough, and inverted at this member.
-        assert!(member_rows(&[0, 2, 1], 1, 3).is_none());
+        assert!(member_rows(&[0, 2, 1], &s, 1, 3).is_none());
 
         // Present and reaching past the read-out the fire produced: the span
         // would run off the end of the values, which is the same claim the
         // slice check in `run_programs` makes a line later.
-        assert!(member_rows(&[0, 1, 9], 1, 3).is_none());
+        assert!(member_rows(&[0, 1, 9], &s, 1, 3).is_none());
+    }
+
+    /// A CSR naming a request the fire does not have is refused, and it is
+    /// the `qo_indptr` that says so — the read-out row count alone cannot,
+    /// because a request past the end contributes nothing to it and the span
+    /// would come back empty and in bounds.
+    #[test]
+    fn a_request_the_fire_does_not_have_is_refused() {
+        let qo = decodes(2);
+        let s = plain(&qo);
+        assert!(member_rows(&[0, 1, 5], &s, 1, 2).is_none());
     }
 }

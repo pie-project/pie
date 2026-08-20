@@ -69,6 +69,16 @@ fn lowered(
     let rows: Vec<Row> = vec![
         Row {
             samples: true,
+            // WHAT MAKES A PREFILL A PREFILL. Sixty-four rows is not the
+            // question the attention text asks: `GuardPred::WindowOne` asks
+            // whether every row is a ONE-TOKEN query window, because a batch
+            // of sixty-four sequences each advancing by a token is a batched
+            // decode and not a small prefill, and it takes the decode pair.
+            // Left false here the "Prefill/64" fixture was the former, so no
+            // walk in this file ever reached `sdpa_paged_tiled` or
+            // `sdpa_paged_mma_sink` -- the two prefill symbols the census
+            // below still describes.
+            multi_token: class != FireClass::Decode,
             ..Row::default()
         };
         rows
@@ -318,7 +328,18 @@ const REACHES: &[(&str, Reaches)] = &[
     // no 4-bit row does -- and it reaches its module exactly the way its
     // 4-bit sibling does, because the bit width lives inside the shader and
     // not in the calling convention.
-    ("affine_qmm_t_bfloat16_gs_64_b_8_bm_32_bn_32", Reaches::Push),
+    // AND THE PLAN NOW SAYS MORE THAN THE MODULE ASKS. Four stated scalars
+    // against a two-word block, every descriptor accounted for: the tiled
+    // GEMM's shader reads `k` and `n` and nothing else, and the statement
+    // still carries the run the retired KERNEL ROW wanted. The routine reads
+    // what it needs off `ctx.param` and the operands' own rectangles, so the
+    // extra words are inert -- but the PLAN-ordered `binding::params` cannot
+    // place a run longer than the block, which is why this symbol also shows
+    // up in `every_launchs_scalars_land_where_its_module_reads_them`.
+    (
+        "affine_qmm_t_bfloat16_gs_64_b_8_bm_32_bn_32",
+        Reaches::PlanOverstates(0),
+    ),
     ("affine_qmv_fast_bfloat16_gs_64_b_8", Reaches::Push),
     (
         "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
@@ -347,35 +368,65 @@ const REACHES: &[(&str, Reaches)] = &[
     // word the statement does not state, which is what puts this row here
     // and not in `Push`; the ROW COUNT the arm also supplies is not counted,
     // because it steers the grid and never reaches the push block.
+    //
+    // THREE now, not one. `k` and `n` were the statement's while a KERNEL ROW
+    // stated them; the routine takes both off the operands it already
+    // holds -- `k` is the half output's width and `n` its row count -- so the
+    // one word the plan still carries is the pitch, and three of the four
+    // are derived.
     (
         "cast_qmm_input_strided_bfloat16_to_float16",
-        Reaches::RowDerives(1),
+        Reaches::RowDerives(3),
     ),
     ("residual_add_bfloat16", Reaches::Push),
     ("silu_mul_bfloat16", Reaches::Push),
-    ("combine_sorted", Reaches::Buffer),
-    ("gptoss_swiglu_bfloat16", Reaches::Buffer),
-    ("rms_single_row_bfloat16", Reaches::Buffer),
+    // PUSH NOW, WHERE THESE SIX SAID BUFFER. Nothing about the shaders
+    // moved: a params BLOCK and a push RUN are the same words in the same
+    // order, and which one a launch uses is decided by whether the plan's
+    // stated run is the module's whole block. The 173 hand-written binder
+    // rows that used to state these runs are gone -- the routine column
+    // derives them now -- and a derived run is exactly the block its own
+    // signature declares, so the driver stopped needing a buffer to hold the
+    // remainder. `gptoss_swiglu_bfloat16` is the one that did not land here:
+    // its statement carries an operand the module declines, which is a
+    // surplus rather than a shortfall and has its own bucket.
+    ("combine_sorted", Reaches::Push),
+    ("gptoss_swiglu_bfloat16", Reaches::PlanOverstates(0)),
+    ("rms_single_row_bfloat16", Reaches::Push),
     // The pair of the line above, and it arrived by a text learning to say
     // it rather than by this backend gaining anything. A post-norm landing
     // used to be `rms_single_row` followed by `residual_add`, and every one
     // of those norms was read by exactly one add: `norm::rms_residual` is
     // that pair in one dispatch, and this crate had built it, armed it and
     // never been asked for it. It reaches the same way its unfused half does.
-    ("rms_residual_bfloat16", Reaches::Buffer),
-    ("route_gather", Reaches::Buffer),
-    ("route_sort", Reaches::Buffer),
-    ("router_topk_bfloat16", Reaches::Buffer),
+    ("rms_residual_bfloat16", Reaches::Push),
+    ("route_gather", Reaches::Push),
+    ("route_sort", Reaches::Push),
+    ("router_topk_bfloat16", Reaches::Push),
     // Seven slots, one hole, six real bindings -- and six operands stated.
     // It was DriverSupplies(1) until the hole was measured, which is the whole
     // argument for measuring holes.
-    ("affine_qmv_routed_bfloat16_gs_64_b_4", Reaches::Push),
+    //
+    // NOT `Push` any more, and the two missing words are the argument for the
+    // whole marks refactor: `moe::qmv_routed` takes `in_vec_size` and
+    // `out_vec_size` off `x.width` and `y.width`, which the `In`/`Out` marks
+    // carry, rather than off a run a builder had to state a second time. The
+    // statement keeps the mixture's three strides, which are geometry no
+    // operand knows.
+    (
+        "affine_qmv_routed_bfloat16_gs_64_b_4",
+        Reaches::RowDerives(2),
+    ),
     // The same routed shape one plane heavier. `dsl::metal::routed_qmv` sends
     // an MXFP4 expert bank here rather than to the unbiased symbol, because
     // that bank publishes one additive term per output row beside its packed
     // weight; the module reads it at a slot of its own, and the statement
     // names it, so the reach is still complete.
-    ("mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4", Reaches::Push),
+    // The same two vector widths derived from the same two marks; see above.
+    (
+        "mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4",
+        Reaches::RowDerives(2),
+    ),
     // The TILED forms of the two routed matvecs above, which arrived when
     // upstream wired `routed_qmm`. A mixture of experts used to take the
     // matvec whatever its rectangle, so a prefill of many tokens fired one
@@ -411,7 +462,11 @@ const REACHES: &[(&str, Reaches)] = &[
     // `rope.rs` is where both come from, because a rescaling is a fact about
     // the deployment rather than about the architecture the text states.
     ("neox_freqs_mb_bfloat16", Reaches::DriverSupplies(2)),
-    ("row_gather_bfloat16", Reaches::DriverSupplies(2)),
+    // ONE, not two. The second word this row was short of was the one the
+    // retired binder row failed to state; the derived run states it, and what
+    // is left is the single number the ARM supplies off the operands' own
+    // rectangles.
+    ("row_gather_bfloat16", Reaches::DriverSupplies(1)),
     // Twelve slots and six holes -- two of them Metal's ring-ABI placeholders
     // at 10 and 11, kept on purpose. Four real bindings the plan does not
     // name: the paged KV cache and its page table.
@@ -920,9 +975,21 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
         }
     }
 
-    // Both shapes have to actually occur, or a rule that never fires is
-    // passing for the same reason an absent one would.
-    assert!(pushed > 0 && blocked > 0, "push={pushed} block={blocked}");
+    // ONE SHAPE OCCURS NOW, and the other is pinned at zero rather than
+    // dropped. `params_from` reaches the buffer arm only when the stated run
+    // and the module's push block disagree on COUNT while agreeing on bytes
+    // -- a mismatch the 173 hand-written binder rows could produce and a
+    // DERIVED run cannot, because a routine's run is the block its own
+    // signature declares. So the block path is unreachable from these six
+    // texts, which is a fact worth stating: `blocked` moving off zero means
+    // a run and a block came apart again.
+    assert!(pushed > 0, "push={pushed} block={blocked}");
+    assert_eq!(
+        blocked, 0,
+        "a launch placed its scalars in a parameter buffer, so a derived run \
+         and its module's push block stopped agreeing on how many words there \
+         are"
+    );
     // Six, not eight -- and the two that fall out are the useful part.
     //
     // `affine_qmv_routed` states five scalars and its module's push block
@@ -946,11 +1013,32 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
         // read it and `binding::scalars` is what reads it, so this symbol
         // fires today; the five below still owe a Vulkan executor a resource.
         "add_bias_bfloat16",
+        // THE FIVE QUANTISED FORMS, which are here because the marks moved a
+        // number out of the statement and not because anything is short. Two
+        // routed matvecs take their vector widths off `x.width` and `y.width`;
+        // `embed_gather_mb_4bit` takes its row count the same way; and the two
+        // tiled GEMMs state a run longer than their block, left over from the
+        // KERNEL ROW that wanted it. Either direction is a count the
+        // PLAN-ordered `binding::params` cannot match, which is what this set
+        // measures -- and in every case `encode::Encoder` places the routine's
+        // own run instead and the numbers reach the shader. `tests/device.rs`
+        // and the gpu gates are where that is confirmed on a card.
+        "affine_qmm_t_bfloat16_gs_64_b_8_bm_32_bn_32",
+        "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_32_bn_64",
+        "affine_qmv_routed_bfloat16_gs_64_b_4",
+        "embed_gather_mb_4bit_bfloat16_gs_64_b_4",
+        "mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4",
         // Not a resource but two NUMBERS, which is why it sits in this list
         // and not among the paged rows below: the strided cast's push block
         // has a `count` word its own walk never reads and a row count the
         // statement has no reason to carry. See its row in `REACHES`.
         "cast_qmm_input_strided_bfloat16_to_float16",
+        // An OPERAND surplus rather than a scalar one, and it reaches this
+        // set through the same door: the plan states a slot the gated SwiGLU
+        // declines, so the plan-ordered run is one longer than the block and
+        // `binding::params` refuses the count. Its `REACHES` row says
+        // `PlanOverstates(0)` for the same reason.
+        "gptoss_swiglu_bfloat16",
         "kv_append_paged_bfloat16",
         "neox_mb_bfloat16",
         "neox_freqs_mb_bfloat16",
@@ -976,13 +1064,23 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
         owed, want,
         "a different set of launches has scalars this crate cannot place"
     );
-    // Every one of them is also short of descriptors, EXCEPT the one that is
-    // short of a derived number instead. The reverse does not hold, which is
-    // the finding above.
+    // And every refusal above is EXPLAINED by the census: the plan and the
+    // module disagree about the scalar count in one of the three ways that
+    // census names. Short of descriptors, short of numbers the routine
+    // derives, or -- the direction the marks added -- carrying a run LONGER
+    // than the block, left over from the kernel row that wanted it. What
+    // cannot appear here is `Reaches::Push` or `Reaches::Buffer`: those are
+    // the complete forms, and a complete form that could not be placed would
+    // mean this crate had lost a number rather than moved one.
     for symbol in &owed {
         assert!(
             REACHES.iter().any(|(n, r)| n == symbol
-                && matches!(r, Reaches::DriverSupplies(_) | Reaches::RowDerives(_))),
+                && matches!(
+                    r,
+                    Reaches::DriverSupplies(_)
+                        | Reaches::RowDerives(_)
+                        | Reaches::PlanOverstates(_)
+                )),
             "`{symbol}` has scalars this crate cannot place and yet its module \
              binds nothing the plan does not name, which leaves the refusal \
              unexplained"
@@ -1395,18 +1493,20 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
         "the refusals and the successes do not account for every rectangle"
     );
 
-    // Both halves of the parameter split are exercised: 5056 dispatches push
-    // their scalars and 1720 carry a block in a buffer slot. That BOTH occur
-    // is the invariant -- a change that routed everything one way would leave
-    // the other half untested while this test still passed -- and the exact
-    // counts are pinned so a shift in the split shows as a diff here.
+    // THE SPLIT COLLAPSED, and the counts say so rather than the test
+    // quietly measuring one half. 6776 dispatches push their scalars and none
+    // carries a block in a buffer slot: 5056 + 1720 is 6776, so every launch
+    // that used to take the buffer arm now pushes, and nothing else moved.
     //
-    // 5056, where it was 4448: the 608 staging casts the precast lowering
-    // added all push. A four-word block fits the guaranteed 128 bytes with
-    // room to spare, so the cast never reaches the buffer path and the
-    // blocked count below does not move with it.
-    assert_eq!(pushed, 5056, "{pushed} pushed");
-    assert_eq!(blocked, 1720, "{blocked} blocked");
+    // Why: `params_from` takes the buffer arm only when the stated run and
+    // the module's push block disagree on COUNT while agreeing on total
+    // bytes. That is a mismatch the retired hand-written binder rows could
+    // produce -- 173 of them, each stating a run by hand -- and a DERIVED run
+    // cannot, because a routine's run is the block its own signature
+    // declares. The arm is still there and still right; these six texts no
+    // longer reach it.
+    assert_eq!(pushed, 6776, "{pushed} pushed");
+    assert_eq!(blocked, 0, "{blocked} blocked");
 
     // ---- What retired with the table -------------------------------------
     //
@@ -1452,15 +1552,23 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     assert_eq!(pool_numbers, 704, "pool_numbers={pool_numbers}");
 
     // How many launches `plan_routine` REFUSED when handed a geometry of
-    // ZEROS -- the head-shaped ones, whose arms read `f.head_dim` and cannot
-    // proceed at zero. The rest plan fine because their dimensions come from
-    // the lowering rather than the geometry, so the zeros never reach them,
-    // and they are right to. 352 is the count of paged appends and attentions
-    // across the six texts whose grid is head-shaped; under the table path a
-    // head-shaped ROW replaced the zeros before a rule saw them and the same
-    // 352 refused, so the number is unchanged while the mechanism moved from
-    // row to arm.
-    assert_eq!(refused_hollow, 352, "refused_hollow={refused_hollow}");
+    // ZEROS. NONE, where 352 refused before the marks, and the zero is the
+    // stronger answer rather than a weaker one.
+    //
+    // Those 352 were the paged appends and attentions, whose arms read
+    // `f.head_dim` off the geometry and could not proceed at zero. The head
+    // shape is not the driver's to know: it is the STATEMENT's, and
+    // `kv_append_paged`, `sdpa_paged_decode` and the tiled forms all take it
+    // as a `Const<i32>` mark now, out of the run the lowering carries. So a
+    // hollow geometry no longer reaches any of them, exactly the way it never
+    // reached the launches whose dimensions came from the lowering all along.
+    //
+    // Which means the assertion inside the `Ok` arm above -- that no plan
+    // built from a geometry of zeros contains an empty grid -- now covers all
+    // 352 instead of skipping them, and it holds. That is the finding this
+    // number exists to carry: the nastiest input a caller can hand this seam
+    // is not refused any more because it is no longer an input to it.
+    assert_eq!(refused_hollow, 0, "refused_hollow={refused_hollow}");
 
     // The total work these plans dispatch, as a single number.
     //
@@ -1500,7 +1608,21 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     // where the row's stated extent rounded differently. Both are the same
     // rectangles reaching the same shaders; the arm's `div_ceil` is the
     // authority now, so this is its number and not the row's.
-    assert_eq!(workgroups, 36_474_730, "workgroups={workgroups}");
+    //
+    // 38_045_962, where it was 36_474_730 while the prefill fixture was a
+    // batched decode. Sixty-four rows is not what makes a prefill: the
+    // attention text asks `GuardPred::WindowOne`, and rows that each advance
+    // by a single token take the decode pair however many of them there are.
+    // With `multi_token` stated the six prefills reach `sdpa_paged_tiled` and
+    // `sdpa_paged_mma_sink` instead, whose grids are a 32-row query TILE over
+    // the head axis rather than one workgroup per query row.
+    //
+    // It went UP, which is the right direction and is not a regression: the
+    // tiled kernels stage a shared key run and do more total work per token
+    // to spend far less time doing it -- 3.9x on the dense checkpoint, by the
+    // measurement in `dsl::metal`'s own note. Workgroups are not seconds, and
+    // this is the assertion that most invites reading them as if they were.
+    assert_eq!(workgroups, 38_045_962, "workgroups={workgroups}");
 
     // One dispatch per launch: no routine in these six texts fans a single
     // rectangle out to more than one `Dispatch`, so the two counts agree.
@@ -1670,8 +1792,19 @@ fn every_pool_number_reaches_the_shader_through_the_arm_that_names_it() {
     use driver_vulkan::hold::{Facts, Handles};
     use driver_vulkan::binding::{FireNumber, FireTable, Resolve};
     use driver_vulkan::device::{Bound, Buffer};
-    use kernels_vulkan::routine::ArgValue;
     use model_ir::trace::ValueId;
+
+    if !kernels_vulkan::embedded() {
+        eprintln!("no modules: build with `--features native` and `slangc` on PATH");
+        return;
+    }
+    // The body composes a module path and the encoder reads that module's
+    // binding layout to decide where the scalars go, so the built modules
+    // have to be here -- the same lookup production does, minus the device.
+    let reflect = driver_vulkan::serve::Reflection::new(
+        &driver_vulkan::serve::Embedded,
+        kernels_vulkan::Capability::Baseline,
+    );
 
     // Distinct and recognisable, so a swap fails as loudly as a drop.
     const PAGE: u32 = 0x0011_1111;
@@ -1707,32 +1840,62 @@ fn every_pool_number_reaches_the_shader_through_the_arm_that_names_it() {
         }
     }
 
-    /// The scalar words the binder handed the shader, in order, discarding
-    /// the buffer handles. The strides ride as `Usize` and the page size as an
-    /// `I32`, and either way it is the low 32 bits that reach the push block.
-    /// One routine's operands, bound the way a real fire binds them.
+    /// Every scalar word one routine put in the shader's block, in order.
     ///
-    /// Named by its stem rather than by a function, because the arm that used
-    /// to be that function no longer exists: what places these scalars now is
-    /// the routine's own column plus this driver's `named`, and the point of
-    /// this walk is that the pair still puts the right number in the right
-    /// slot.
-    fn bound(stem: &str, o: &mut Handles<'_, '_>, f: Facts) -> Vec<ArgValue> {
+    /// THE WHOLE SEAM, NOT HALF OF IT. `bind` places only what the STATEMENT
+    /// carries, and the pool's three numbers are not that: `page_size` and
+    /// the two strides are `ctx.ask` calls inside the routine BODY, answered
+    /// by `Handles` while the body runs and laid into the block by `Encoder`.
+    /// This walk stopped at `bind` while the arms still existed, and after
+    /// the marks it saw the two `Const` words and nothing else -- the check
+    /// passed on a run that could not contain what it was looking for. So it
+    /// runs the body, exactly the way `serve::plan_routine` does, and reads
+    /// the block the encoder actually built.
+    ///
+    /// The strides ride as `Usize` and the page size as an `I32`, and either
+    /// way it is the low 32 bits that reach the block, so both come back as
+    /// words here.
+    fn fired<'a, R: driver_vulkan::encode::Reflect>(
+        stem: &str,
+        reflect: &R,
+        args: &'a [Bound<'a>],
+        widths: &'a [i32],
+        ins: &'a [usize],
+        outs: &'a [usize],
+        weights: &'a [usize],
+        params: &'a [Option<u32>],
+        pool: &'a dyn Resolve,
+        f: Facts,
+    ) -> Vec<u32> {
         let r = driver_vulkan::hold::routine_for(stem)
             .unwrap_or_else(|| panic!("nothing serves `{stem}`"));
-        driver_vulkan::bind::bind(r.args, r.sources, o, f)
-            .unwrap_or_else(|e| panic!("`{stem}` places its scalars: {e:?}"))
-    }
-
-    fn scalars(values: &[ArgValue]) -> Vec<u32> {
-        values
-            .iter()
-            .filter_map(|v| match *v {
-                ArgValue::I32(x) => Some(x as u32),
-                ArgValue::U32(x) => Some(x),
-                ArgValue::Usize(x) => Some(x as u32),
-                ArgValue::F32(_) | ArgValue::Buffer { .. } => None,
-            })
+        let handles = std::cell::RefCell::new(Handles::new(
+            args, widths, ins, outs, weights, params, pool,
+        ));
+        let values = driver_vulkan::bind::bind(r.args, r.sources, &mut handles.borrow_mut(), f)
+            .unwrap_or_else(|e| panic!("`{stem}` places its scalars: {e:?}"));
+        // The body may still ASK, which MINTS a handle, so the vectors the
+        // encoder reads have to be taken after the binder's borrow ends and
+        // the encoder has to answer through the same cell.
+        let taken = handles.borrow().bound().to_vec();
+        let staged = handles.borrow().staged();
+        let encoder =
+            driver_vulkan::encode::Encoder::new(reflect, &taken, &staged, 0).answering(&handles, f);
+        (r.body)(&encoder, &values).unwrap_or_else(|e| panic!("`{stem}` fires: {e:?}"));
+        let fires = encoder.finish();
+        let one = fires
+            .first()
+            .unwrap_or_else(|| panic!("`{stem}` fired no rectangle"));
+        let bytes = match one.params {
+            driver_vulkan::binding::Params::Push(ref b) => b.clone(),
+            driver_vulkan::binding::Params::Block { ref bytes, .. } => bytes.clone(),
+            driver_vulkan::binding::Params::None => {
+                panic!("`{stem}` fired with no scalar block at all")
+            }
+        };
+        bytes
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
             .collect()
     }
 
@@ -1742,10 +1905,19 @@ fn every_pool_number_reaches_the_shader_through_the_arm_that_names_it() {
     // none.
     let buf = Buffer::placeholder(1 << 20);
     let args = [Bound::whole(&buf), Bound::whole(&buf)];
+    // One width per argument, which is what `Handles` indexes. Neither append
+    // reads one -- this run is about the SCALARS the binder hands the shader
+    // -- so the numbers only have to be there.
+    let widths = [0i32, 0];
     let ins = [0usize, 1];
     let outs: [usize; 0] = [];
     let weights: [usize; 0] = [];
-    let params: [Option<u32>; 0] = [];
+    // The two `Const` words both appends carry, in mark order: the head width
+    // and the head count. A `Const` reads `params` by its place among the
+    // SCALAR marks, so an empty run is `Refusal::Absent` before either routine
+    // reaches the numbers this walk is about. They match `facts` below because
+    // `head_grid` multiplies them and a zero there is an empty grid.
+    let params = [Some(128u32), Some(2u32)];
     let pool = Pool(Buffer::placeholder(1 << 20));
 
     let facts = Facts {
@@ -1769,9 +1941,19 @@ fn every_pool_number_reaches_the_shader_through_the_arm_that_names_it() {
     // The paged append names `KvPageSize` and nothing else. Its answer must
     // reach the run, or the paged decodes it feeds read the cache at the
     // wrong page pitch -- silently, because nothing is out of bounds.
-    let mut handles = Handles::new(&args, &ins, &outs, &weights, &params, &pool);
-    let paged = bound("kv_append_paged", &mut handles, facts);
-    let run = scalars(&paged);
+    let paged = fired(
+        "kv_append_paged",
+        &reflect,
+        &args,
+        &widths,
+        &ins,
+        &outs,
+        &weights,
+        &params,
+        &pool,
+        facts,
+    );
+    let run = paged.clone();
     assert!(
         run.contains(&PAGE),
         "`kv_append_paged` names `KvPageSize` and the driver's answer is not \
@@ -1783,9 +1965,18 @@ fn every_pool_number_reaches_the_shader_through_the_arm_that_names_it() {
     // which is the defect with the most plausible output -- attention
     // striding by heads where it should stride by positions, reading real
     // numbers from the wrong rows.
-    let mut handles = Handles::new(&args, &ins, &outs, &weights, &params, &pool);
-    let contiguous = bound("kv_append", &mut handles, facts);
-    let run = scalars(&contiguous);
+    let run = fired(
+        "kv_append",
+        &reflect,
+        &args,
+        &widths,
+        &ins,
+        &outs,
+        &weights,
+        &params,
+        &pool,
+        facts,
+    );
     let head_at = run
         .iter()
         .position(|w| *w == HEAD)
@@ -1805,10 +1996,13 @@ fn every_pool_number_reaches_the_shader_through_the_arm_that_names_it() {
     // resolver answering one number for all three, or a `named` arm reaching
     // for the wrong `FireNumber`, moves one of these and fails above.
     for (name, present) in [
-        ("KvPageSize", scalars(&paged).contains(&PAGE)),
+        ("KvPageSize", paged.contains(&PAGE)),
         ("KvHeadStride", run.contains(&HEAD)),
         ("KvSeqStride", run.contains(&SEQ)),
     ] {
         assert!(present, "`{name}` reached no shader through the binder");
     }
 }
+
+
+

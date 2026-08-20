@@ -38,16 +38,42 @@ PIE_BUFFER_RO(0, gate);
 PIE_BUFFER_RO(1, up);
 PIE_BUFFER_RW(2, out_);
 
-struct GegluParams { uint unused; };
-struct GegluStridedParams { uint width; uint rows; uint gate_pitch; uint up_pitch; uint out_pitch; };
-struct GptOssSwiGluParams { uint unused; float limit; float alpha; };
 
-#if defined(PIE_GEGLU)
-PIE_PARAMS(3, GegluParams, p);
-#elif defined(PIE_GEGLU_STRIDED)
-PIE_PARAMS(3, GegluStridedParams, p);
+
+// THE DENSE GEGLU STATES NO PARAMS BLOCK, so this chain opens on the strided
+// arm and `PIE_GEGLU` reaches `main` with buffers 0..2 and nothing else.
+//
+// `struct GegluParams { uint unused; }` and its `PIE_PARAMS(3, ...)` stood
+// here. The field was a per-row element count read as a bound, which is the
+// defect the comment above `past_the_end` records: the dispatch covers
+// `width * rows` and a per-row number cannot bound it, so the bound went and
+// the field stayed behind holding nothing. The BLOCK outlived the field only
+// because the row said `params: Buf` and every backend built its bind layout
+// from the row.
+//
+// On this plane it was already a fiction. `slangc` emits no binding
+// decoration for a global the entrypoint never reads, so `PIE_GEGLU`'s module
+// has never had a descriptor at 3 -- `mlp::geglu_tanh` was calling
+// `ctx.params()` for a sentinel (`hold::params_block`) it then dropped on the
+// floor. Deleting the declaration makes the SOURCE say what the compiled
+// module has said all along.
+//
+// The two arms below carried theirs in a storage struct for the same reason and
+// no longer do. Five pitches and gpt-oss's `limit`/`alpha` ARE numbers no grid
+// supplies and are genuinely read, so unlike `GegluParams` they became `Const`
+// marks rather than nothing -- and twenty bytes and eight bytes are both push
+// ranges on every device this targets, well inside the 128 the limit
+// guarantees.
+//
+// `GptOssSwiGluParams` opened with a dead per-row element count, held only so
+// `limit` and `alpha` kept their offsets. A push block packed from the marks
+// the BODY passes needs no such filler, so the dead word stops at the host.
+#if defined(PIE_GEGLU_STRIDED)
+struct Push { uint width; uint rows; uint gate_pitch; uint up_pitch; uint out_pitch; };
+[[vk::push_constant]] ConstantBuffer<Push> pc;
 #elif defined(PIE_GPTOSS)
-PIE_PARAMS(3, GptOssSwiGluParams, p);
+struct Push { float limit; float alpha; };
+[[vk::push_constant]] ConstantBuffer<Push> pc;
 #endif
 
 #if defined(PIE_SILU_STRIDED)
@@ -67,10 +93,12 @@ float gelu_tanh(float x) {
 }
 
 // Metal launches these with `dispatchThreads`, an EXACT thread count, which is
-// why `GegluParams::unused` is unused and why `silu_mul` takes no params at
-// all -- there is no tail to guard on that backend. `vkCmdDispatch` takes
-// WORKGROUPS, so the real extent here is always `256 * ceil(n / 256)` and any
-// width that is not a multiple of 256 leaves up to 255 threads past the end.
+// why `GegluParams::unused` was unused -- and, in the end, why that struct and
+// its binding are gone and the dense GeGLU takes no params at all, the shape
+// `silu_mul` has had from the start. There is no tail to guard on that
+// backend. `vkCmdDispatch` takes WORKGROUPS, so the real extent here is always
+// `256 * ceil(n / 256)` and any width that is not a multiple of 256 leaves up
+// to 255 threads past the end.
 // These bodies write unconditionally, so that tail is an out-of-range STORE,
 // not a wasted read.
 //
@@ -100,12 +128,12 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // 32-bit word holding two values and the ragged edge needs a
     // compare-exchange.
     uint n = tid.x;
-    if (n >= p.rows * p.width) return;
-    uint m = n / p.width;
-    uint k = n % p.width;
-    uint gi = m * p.gate_pitch + k;
-    uint ui = m * p.up_pitch + k;
-    uint oi = m * p.out_pitch + k;
+    if (n >= pc.rows * pc.width) return;
+    uint m = n / pc.width;
+    uint k = n % pc.width;
+    uint gi = m * pc.gate_pitch + k;
+    uint ui = m * pc.up_pitch + k;
+    uint oi = m * pc.out_pitch + k;
     out_[oi] = PIE_STORE(gelu_tanh(PIE_LOAD(gate[gi])) * PIE_LOAD(up[ui]));
 #elif defined(PIE_GEGLU)
     uint gid = tid.x;
@@ -114,9 +142,9 @@ void main(uint3 tid : SV_DispatchThreadID) {
 #elif defined(PIE_GPTOSS)
     uint gid = tid.x;
     if (past_the_end(gid)) return;
-    float g = min(PIE_LOAD(gate[gid]), p.limit);
-    float u = clamp(PIE_LOAD(up[gid]), -p.limit, p.limit);
-    float sig = 1.0 / (1.0 + exp(-p.alpha * g));
+    float g = min(PIE_LOAD(gate[gid]), pc.limit);
+    float u = clamp(PIE_LOAD(up[gid]), -pc.limit, pc.limit);
+    float sig = 1.0 / (1.0 + exp(-pc.alpha * g));
     out_[gid] = PIE_STORE((g * sig) * (u + 1.0));
 #else
     #if defined(PIE_SILU_STRIDED)

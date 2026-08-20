@@ -8,9 +8,26 @@ license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 publish = false
 
-# NO `build` key and no build script. `build.rs` generated the carried header
-# set by walking the device tree; `src/source.rs` now lists it, so there is
-# nothing left to generate and the crate has one less compile stage.
+# A `build.rs` AGAIN, and it is the one that was here before `384aaeed0`.
+#
+# That commit folded `kernels-cuda-new` in and checked the carried header set
+# into `src/source.rs` as 187 hand-written lines, for "one less compile stage".
+# The script it deleted had already argued the other way, about this exact
+# list, and the argument did not stop being true:
+#
+#   "A checked-in output with a test that regenerates and diffs it was the
+#    other candidate and it loses on one property: a stale file still COMPILES.
+#    Generated into `OUT_DIR`, it cannot be stale by construction. That property
+#    is what the carried set needs most -- it names the `.cuh` files the JIT
+#    carries, and a stale list is a failure at first fire on a machine with a
+#    GPU, which is the run-time failure generation exists to convert into a
+#    build-time one."
+#
+# What came back is narrower than what left. The old script also emitted a
+# typed call surface per row and pulled fourteen modules in by `#[path]` to
+# read them; this one walks two directories and reads `#include` lines, depends
+# on nothing, and needs no toolkit -- which is what keeps the `links` note
+# below true.
 
 [lib]
 name = "kernels_cuda"

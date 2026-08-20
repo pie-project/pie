@@ -14,6 +14,7 @@ pub mod routine;
 // The facts a launcher can name, as types rather than as words. One fact,
 // one type, one spelling of it in the whole tree.
 pub mod keys;
+pub mod raises;
 
 // The shader backends' operand vocabulary, written once: closed and identical
 // in metal, vulkan and wgpu, generic over `shader::ShaderValue`. Not CUDA's.
@@ -535,6 +536,21 @@ pub enum Ty {
     /// reads. POD (three `u32`s), so Rust mirrors it and the array crosses
     /// as `*const StructuredMaskParams`.
     StructuredMasks,
+    /// ONE OBJECT THE FIRE RAISED, by reference — `crate::raises::Struct<T>`.
+    ///
+    /// The generic kind the three plan-cache tags above are special cases of.
+    /// Those were minted for the C++ shim, where the type was INCOMPLETE
+    /// (`struct DecodePlanCache;` and nothing more) and a row could carry only
+    /// a handle. This one names no C++ spelling at all, because a raised
+    /// object never reaches a `__global__`: it is a HOST aggregate a body
+    /// reads to fill the block a kernel does take.
+    ///
+    /// Which is also why it is not `ArgValue::Bytes`. `.wiki/kilimanjaro.md`'s
+    /// D1 refuses an aggregate argument on the ground that it trades a typed
+    /// reference for a byte blob whose layout nothing checks. This keeps the
+    /// typed reference — the carrier is `*const T::Value`, one Rust
+    /// declaration with no second one to agree with.
+    Raised,
 }
 
 /// What a statement supplies for one argument of a [`Ty`].
@@ -606,6 +622,10 @@ impl Ty {
             Ty::HopperPrefillPlan => "const ::pie::attn::HopperPrefillPlan&",
             Ty::YarnOriginalParams => "const ::pie::attn::YarnOriginalParams*",
             Ty::StructuredMasks => "const ::pie::attn::StructuredMaskParams*",
+            // NOTHING, and the emptiness is the claim: a raised object is the
+            // host's and reaches no `__global__`, so there is no declaration for
+            // a spelling to be checked against.
+            Ty::Raised => "",
         }
     }
 
@@ -671,6 +691,11 @@ impl Ty {
             Ty::HopperPrefillPlan => "*const HopperPrefillPlan",
             Ty::YarnOriginalParams => "*const YarnOriginalParams",
             Ty::StructuredMasks => "*const StructuredMaskParams",
+            // As the plan caches, and for a nearer reason: the honest type is a
+            // pointer to the PLANE's own aggregate, which this crate has no
+            // dependency with which to name. It appears in no generated
+            // declaration, so nothing reads this.
+            Ty::Raised => "*const ::core::ffi::c_void",
         }
     }
 
@@ -742,6 +767,12 @@ impl Ty {
             | Ty::HopperPrefillPlan
             | Ty::YarnOriginalParams
             | Ty::StructuredMasks => Binds::Nothing,
+            // `Reads` AND NOT `Nothing`, which is the whole point of the kind.
+            // The three plan-cache tags answer `Nothing` because the DRIVER
+            // hands those over and no statement names one. A raise is an
+            // operand: the statement places it, positionally, like an
+            // activation -- see `.wiki/designs/design-struct.md`.
+            Ty::Raised => Binds::Reads,
         }
     }
 
@@ -865,7 +896,7 @@ pub enum Kind {
     /// statement carries the number instead.
     ParamF32,
     /// The staged parameter BLOCK: every scalar the statement carries, laid
-    /// out as one struct and bound as one buffer.
+    /// out end to end and bound as one buffer.
     ///
     /// A shader plane stages this where CUDA passes scalars individually,
     /// which is why the kind exists here and nowhere in the CUDA rows. There
@@ -1013,6 +1044,28 @@ pub struct KernelSig {
     /// Not a Metal-only idea: CUDA writes the same product into FILENAMES and
     /// cannot state it, each of those being separately authored.
     pub axes: &'static [Axis],
+    /// No trace may state this symbol: it is a body another routine calls.
+    ///
+    /// See [`routine::Routine::internal`] for why the source column cannot
+    /// carry this and what admitting such a symbol would fire.
+    pub internal: bool,
+    /// The facts this routine's BODY asks the environment for.
+    ///
+    /// See [`routine::Routine::asked`]. This is the half of a routine's needs
+    /// that [`Self::sources`] structurally cannot show, and a driver that
+    /// cannot answer one of these must refuse the row at LOAD rather than let
+    /// a fire reach the `ask` and die there.
+    pub asked: &'static [&'static str],
+    /// This statement may not be JOINED into another.
+    ///
+    /// See [`routine::Routine::no_join`]: a precondition is a row fact because
+    /// every [`Source`] fills a slot and this one requires two to be empty.
+    pub no_join: bool,
+    /// The DRIVER fires this by a typed call, not the operand column.
+    ///
+    /// See [`routine::Routine::driver`], including for why the column's shape
+    /// cannot be read for this.
+    pub driver: bool,
 }
 
 // `lacks` IS NOT SURPLUS -- ITS READER IS MISSING. Zero readers, fourteen
@@ -1134,6 +1187,10 @@ mod tests {
         sources: &[],
         derived: &[],
         axes: &[],
+        internal: false,
+        asked: &[],
+        no_join: false,
+        driver: false,
     };
 
     static TABLE: &[KernelSig] = &[

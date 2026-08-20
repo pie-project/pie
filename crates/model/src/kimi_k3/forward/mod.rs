@@ -225,6 +225,18 @@ pub fn kimi_k3_cuda(facts: &KimiK3Facts, class: FireClass) -> ForwardPlan {
                             layer: l,
                         },
                         &rs,
+                        // KDA's conv walks ONE projection at a time, so its
+                        // channel count is that projection's width and not a
+                        // fused `conv_dim`. The recurrence numbers are unused
+                        // by this launch and stated zero rather than guessed.
+                        dsl::cuda::GdnShape {
+                            k_heads: 0,
+                            v_heads: kd.value_heads,
+                            k_dim: 0,
+                            v_dim: 0,
+                            conv_dim: kd.value_heads,
+                            conv_k: kd.conv_kernel,
+                        },
                     )
                 };
                 let q = conv(&q, "kda_q_conv");

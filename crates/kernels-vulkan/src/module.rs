@@ -42,6 +42,16 @@ use crate::Capability;
 
 include!(concat!(env!("OUT_DIR"), "/modules.rs"));
 
+// `CENSUS`: every entrypoint the tree's `// pie:instantiate` lines declare,
+// sorted and deduped across tiers.
+//
+// Written UNCONDITIONALLY, where `MODULES` above is empty without `native`.
+// The two are not the same list and the difference is the point: `MODULES` is
+// what this build COMPILED and `CENSUS` is what the tree DECLARES, so a
+// portable build has the second and not the first. `crate::entrypoints()` is
+// the reader.
+include!(concat!(env!("OUT_DIR"), "/census.rs"));
+
 /// The module compiled under this exact stem.
 ///
 /// The stem is [`Capability::module`] minus its `.spv`. A caller that has an

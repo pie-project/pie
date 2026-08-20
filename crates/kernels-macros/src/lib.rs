@@ -179,7 +179,10 @@ pub fn routine(attr: TokenStream, item: TokenStream) -> TokenStream {
     // SYNTAX and hangs on the marker type this attribute also emits. So the
     // attribute, which has both in hand, attaches it -- and `Stated::derived`
     // downstream is what tells `arity_problem` which operands are optional.
-    let with_column = quote!(.derived(<#base as ::kernels::Derivation>::DERIVED));
+    let with_column = quote!(
+        .derived(<#base as ::kernels::Derivation>::DERIVED)
+        .asking(<#base as ::kernels::Derivation>::ASKED)
+    );
     // The module the `fn` is written in, unless the attribute says otherwise.
     // See `Spec::namespace` for the one file that says otherwise and why.
     let ns = match &spec.namespace {
@@ -395,8 +398,10 @@ impl syn::parse::Parse for Args {
         // the case is what tells them apart: `whole` is a fact, `bf16` is a
         // type. Rust's own convention does the work, and a mistake either way
         // is a name that does not resolve rather than a silent reading.
-        const FACTS: [&str; 4] =
-            ["whole", "depth_prefix_plan", "uncolumned", "untraced"];
+        const FACTS: [&str; 7] = [
+            "whole", "depth_prefix_plan", "uncolumned", "untraced", "no_join",
+            "internal", "driver",
+        ];
         Ok(Self(
             named
                 .into_iter()

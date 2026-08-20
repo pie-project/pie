@@ -59,8 +59,28 @@ impl TraceBuilder {
         self.layer = layer;
     }
 
+    /// The logical shape of a TENSOR value.
+    ///
+    /// # Panics
+    ///
+    /// When `id` is a raise. A raise has no rectangle, and the empty shape
+    /// stored beside it would flow into a caller as a zero-width tensor rather
+    /// than as the mistake it is — so this refuses where the field cannot.
+    /// `close_guard` panics for the same class of reason: a malformed trace is
+    /// the builder's caller's bug, not a fire's.
     pub fn value_shape(&self, id: ValueId) -> Shape {
-        self.values[id as usize].shape.clone()
+        let v = &self.values[id as usize];
+        assert!(
+            !v.is_raised(),
+            "value_shape on value {id}, which is the raise {:?} and not a tensor",
+            v.raised.as_deref().unwrap_or_default()
+        );
+        v.shape.clone()
+    }
+
+    /// Whether `id` is a raise rather than a tensor. See [`ValueInfo::raised`].
+    pub fn is_raised(&self, id: ValueId) -> bool {
+        self.values[id as usize].is_raised()
     }
 
     /// Open a [`OpKind::Guard`] chain and return the op index that
@@ -146,14 +166,33 @@ impl TraceBuilder {
         self.push(OpKind::HookSite { stage, layer }, vec![q], vec![]);
     }
 
-    /// Record that this fire needs a host-side preparation raised.
+    /// Record that this fire needs a host-side preparation raised, and return
+    /// the value it publishes.
     ///
-    /// No inputs and no outputs: what a prep reads is the fire's own page
-    /// geometry, which is not an SSA value, and what it publishes the backend
-    /// holds by name. It is stated once per fire rather than per layer —
-    /// a schedule is a property of the batch.
-    pub fn push_prep(&mut self, prep: PrepKind) {
-        self.push(OpKind::Prep { prep }, vec![], vec![]);
+    /// No inputs: what a prep reads is the fire's own page geometry, which is
+    /// not an SSA value. It is stated once per fire rather than per layer — a
+    /// schedule is a property of the batch.
+    ///
+    /// **One output, and it used to have none.** What the prep publishes was
+    /// held by the backend under a name and recovered by the statements that
+    /// execute it — from a family string, and for decode from a guess. The
+    /// value is that edge, written down. See [`OpKind::Prep`].
+    ///
+    /// Built here rather than through `push`, which mints TENSOR outputs from
+    /// shapes. The `dest` is empty for the reason `push` would also leave it
+    /// empty: an op that produces a value of its own does not write an
+    /// enclosing region's buffer.
+    pub fn push_prep(&mut self, prep: PrepKind) -> ValueId {
+        let raised = self.values.len() as ValueId;
+        self.values.push(ValueInfo::raise(prep.key()));
+        self.ops.push(Op {
+            kind: OpKind::Prep { prep },
+            inputs: Vec::new(),
+            outputs: vec![raised],
+            layer: self.layer,
+            dest: Vec::new(),
+        });
+        raised
     }
 
     /// Record that the text stated a seam.
@@ -215,11 +254,14 @@ impl TraceBuilder {
         true
     }
 
+    /// Mint one TENSOR value. A raise is minted by [`Self::push_prep`], which
+    /// is the only op that publishes one.
     fn value(&mut self, shape: Shape, dtype: DType) -> ValueId {
         self.values.push(ValueInfo {
             shape,
             dtype,
             dyn_axis: None,
+            raised: None,
         });
         (self.values.len() - 1) as ValueId
     }
@@ -764,5 +806,100 @@ impl TraceBuilder {
             problems.join("\n  ")
         );
         plan
+    }
+}
+
+#[cfg(test)]
+mod raises {
+    use super::*;
+
+    /// A prep publishes one value, and the op names it.
+    ///
+    /// The edge this design exists to create: before, `outputs` was empty and
+    /// the statements that execute what a prep raised had to find it by other
+    /// means. See [`OpKind::Prep`].
+    #[test]
+    fn a_prep_publishes_the_object_it_raises() {
+        let mut b = TraceBuilder::new("fixture.cuda");
+        let plan = b.push_prep(PrepKind::PrefillAttention { head_dim: 128 });
+
+        let plan_op = b.ops.last().expect("the prep was recorded");
+        assert!(matches!(plan_op.kind, OpKind::Prep { .. }));
+        assert_eq!(plan_op.outputs, vec![plan], "the op names what it raised");
+        assert!(plan_op.inputs.is_empty(), "a prep reads no SSA value");
+        assert!(b.is_raised(plan));
+    }
+
+    /// The word comes from `raise!` and is not spelled twice.
+    ///
+    /// Asserted against `kernels-cuda`'s declaration rather than a literal, so
+    /// a drift between the two crates fails HERE rather than at a fire, where
+    /// it would surface as `Refusal::Unstated` on a key nothing answers.
+    #[test]
+    fn the_key_is_the_one_the_declaration_wrote() {
+        use kernels::raises::Raise;
+
+        let mut b = TraceBuilder::new("fixture.cuda");
+        let prefill = b.push_prep(PrepKind::PrefillAttention { head_dim: 128 });
+        let decode = b.push_prep(PrepKind::DecodeAttention {
+            head_dim: 128,
+            full_attention: true,
+        });
+
+        let plan = b.finish();
+        assert_eq!(
+            plan.values[prefill as usize].raised.as_deref(),
+            Some(kernels_cuda::raises::Fa2Prefill::KEY)
+        );
+        assert_eq!(
+            plan.values[decode as usize].raised.as_deref(),
+            Some(kernels_cuda::raises::Fa2Decode::KEY)
+        );
+    }
+
+    /// A raise survives the wire, which is what a trace is on disk.
+    #[test]
+    fn a_raise_round_trips_through_the_serialized_plan() {
+        let mut b = TraceBuilder::new("fixture.cuda");
+        let plan = b.push_prep(PrepKind::PrefillAttention { head_dim: 128 });
+        let tensor = b.embed("tok_embeddings", 1024);
+
+        let before = b.finish();
+        let json = serde_json::to_string(&before).expect("a plan serializes");
+        let after: ForwardPlan = serde_json::from_str(&json).expect("and comes back");
+
+        assert_eq!(before, after);
+        assert!(after.values[plan as usize].is_raised());
+        assert_eq!(
+            after.values[plan as usize].raised.as_deref(),
+            Some(PrepKind::PrefillAttention { head_dim: 128 }.key())
+        );
+        // AND THE FIELD IS ABSENT ON A TENSOR, not `null`: `skip_serializing_if`
+        // is what keeps a golden plan's every other value byte-identical to
+        // what it was before this field existed.
+        assert!(!after.values[tensor as usize].is_raised());
+        assert!(!json.contains("\"raised\":null"));
+    }
+
+    /// `value_shape` refuses a raise rather than handing back the empty shape.
+    #[test]
+    #[should_panic(expected = "which is the raise")]
+    fn a_raise_has_no_shape_to_ask_for() {
+        let mut b = TraceBuilder::new("fixture.cuda");
+        let plan = b.push_prep(PrepKind::PrefillAttention { head_dim: 128 });
+        let _ = b.value_shape(plan);
+    }
+
+    /// And an ordinary value still answers, which is the other half.
+    #[test]
+    fn a_tensor_still_has_one() {
+        let mut b = TraceBuilder::new("fixture.cuda");
+        let _ = b.push_prep(PrepKind::PrefillAttention { head_dim: 128 });
+        let x = b.embed("tok_embeddings", 1024);
+        assert_eq!(
+            b.value_shape(x),
+            Shape(vec![Dim::Tokens, Dim::Const(1024)]),
+            "the raise minted before it did not disturb this"
+        );
     }
 }

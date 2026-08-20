@@ -385,7 +385,7 @@ pub fn fire<R: Resolve<Buffer = Buffer>, M: Modules>(
     modules: &M,
     lowered: &Lowered,
     what: Fire<'_, R>,
-) -> Result<Fired, Unfired> {
+) -> Result<(Fired, Vec<u8>), Unfired> {
     let Fire {
         arena,
         resolver,
@@ -528,7 +528,30 @@ pub fn fire<R: Resolve<Buffer = Buffer>, M: Modules>(
         planned.push((symbol.to_owned(), at_tier, source, d));
     }
 
-    record(device, pipelines, &planned, &blocks, one_at_a_time)
+    // THE ANSWER, ASKED FOR WITH THE WORK. `Lowered::readout` states where the
+    // distributions land, and it states it BEFORE the fire -- so the copy can
+    // ride the fire's own command buffer instead of costing a second queue
+    // round trip, which measured 0.67 ms of a 11.8 ms decoded token. A range
+    // that does not fit the arena the lowering sized is deliberately NOT asked
+    // for: `logits` is where that is checked and named, and it falls back to
+    // its own `read_at` for the refusal.
+    let asked = lowered
+        .readout
+        .filter(|exit| {
+            matches!(exit.bytes, 2 | 4)
+                && exit
+                    .at
+                    .saturating_add(exit.rows as usize * exit.vocab as usize * exit.bytes as usize)
+                    <= lowered.arena_bytes
+        })
+        .map(|exit| {
+            (
+                arena.buffer,
+                exit.at as u64,
+                u64::from(exit.rows) * u64::from(exit.vocab) * u64::from(exit.bytes),
+            )
+        });
+    record(device, pipelines, &planned, &blocks, one_at_a_time, asked)
 }
 
 /// Build every pipeline, record every dispatch, submit once and wait.
@@ -602,7 +625,11 @@ fn record(
     )],
     blocks: &[Option<Buffer>],
     one_at_a_time: bool,
-) -> Result<Fired, Unfired> {
+    // The range to copy out in the fire's OWN command buffer, as
+    // `(buffer, offset, length)`. See `fire` for why it is asked for here
+    // rather than read afterwards.
+    asked: Option<(&Buffer, u64, u64)>,
+) -> Result<(Fired, Vec<u8>), Unfired> {
     // Pass two: every distinct module gets a pipeline, so that pass three can
     // hold a reference to all of them at once.
     let mut buffers = Vec::with_capacity(planned.len());
@@ -677,24 +704,31 @@ fn record(
             shadowed += ran.shadowed;
             submissions += ran.buffers;
         }
-        return Ok(Fired {
-            dispatches: run.len(),
-            submissions,
-            shadowed,
-        });
+        // One submission per launch already, so there is no fire-wide command
+        // buffer to fold the readout copy into; the caller reads for itself.
+        return Ok((
+            Fired {
+                dispatches: run.len(),
+                submissions,
+                shadowed,
+            },
+            Vec::new(),
+        ));
     }
-    let ran = device.run_all(&run).map_err(|(stage, why)| match stage {
-        crate::device::Stage::Launch(at) => Unfired::Refused { at, why },
-        crate::device::Stage::Submission { of } => Unfired::Undelivered { of, why },
-    })?;
-    Ok(Fired {
+    let (ran, read) = device
+        .run_all_reading(&run, asked)
+        .map_err(|(stage, why)| match stage {
+            crate::device::Stage::Launch(at) => Unfired::Refused { at, why },
+            crate::device::Stage::Submission { of } => Unfired::Undelivered { of, why },
+        })?;
+    Ok((Fired {
         dispatches: run.len(),
         // COUNTED, not assumed. This was `1` for as long as the field existed
         // and the queue was getting 735 for a real decode -- see
         // `crate::device::Ran`.
         submissions: ran.buffers,
         shadowed: ran.shadowed,
-    })
+    }, read))
 }
 
 /// A fire's distributions, off the arena and widened.
@@ -819,7 +853,12 @@ impl std::error::Error for Unread {}
 ///
 /// [`Unread`], with the readback's own failure carried through
 /// [`Unread::Refused`] rather than flattened into a range error.
-pub fn logits(device: &Device, arena: &Buffer, lowered: &Lowered) -> Result<Logits, Unread> {
+pub fn logits(
+    device: &Device,
+    arena: &Buffer,
+    lowered: &Lowered,
+    already: &[u8],
+) -> Result<Logits, Unread> {
     let exit = lowered.readout.ok_or(Unread::NoExit)?;
     let rows = exit.rows as usize;
     let vocab = exit.vocab as usize;
@@ -837,9 +876,18 @@ pub fn logits(device: &Device, arena: &Buffer, lowered: &Lowered) -> Result<Logi
     if !matches!(exit.bytes, 2 | 4) {
         return Err(Unread::Width(exit.bytes));
     }
-    let bytes = device
-        .read_at(arena, exit.at as u64, extent as u64)
-        .map_err(Unread::Refused)?;
+    // What the fire already copied out, where it did. `Fired::readout` is the
+    // same range read one submission earlier; an empty one means the fire had
+    // no command buffer to fold it into, and then this reads for itself.
+    let read;
+    let bytes: &[u8] = if already.len() == extent {
+        already
+    } else {
+        read = device
+            .read_at(arena, exit.at as u64, extent as u64)
+            .map_err(Unread::Refused)?;
+        &read
+    };
     let values = match exit.bytes {
         2 => bytes
             .chunks_exact(2)

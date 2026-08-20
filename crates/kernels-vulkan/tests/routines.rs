@@ -5,12 +5,20 @@
 //! a body can be wrong in ways its own family test is looking straight past.
 //!
 //! One of them was wrong exactly this way while being written.
-//! `mlp::gptoss_swiglu` takes a `params` buffer, states it in its signature,
-//! is compared against its row by `kernels/tests/shader_backends_agree.rs` --
+//! `mlp::gptoss_swiglu` TOOK a `params` buffer, stated it in its signature,
+//! was compared against its row by `kernels/tests/shader_backends_agree.rs` --
 //! and bound only its first three arguments. Every check in the tree passed:
 //! the signature was right, the row agreed with it, the entrypoint existed.
 //! The kernel would have been dispatched against a descriptor set one short of
 //! what its layout declares, which on this backend is not an error.
+//!
+//! That buffer is gone -- the routine binds three descriptors and pushes its
+//! two floats, and the only trace left of the block is the dead
+//! `_stated_elements` mark leading its scalars, which `driver-wgpu`'s arena
+//! table names `BlockDeclines(1)` on the other plane. The anecdote is in the
+//! past tense and stays: the SHAPE of the mistake is not about a params block,
+//! it is about a signature and a bind list disagreeing where nothing in the
+//! tree compares them, and that is still true of every routine below.
 
 use std::cell::RefCell;
 
@@ -33,42 +41,32 @@ impl Encode for Seen {
         Ok(())
     }
 
-    /// Answers generically, by [`kernels::Ty`] alone, with two deliberate
-    /// exceptions.
+    /// Answers generically, by [`kernels::Ty`] alone.
     ///
     /// None of this file's tests reads the VALUE an asked fact resolves to --
     /// only order, arity, entrypoint names and buffer counts -- so a probe
     /// that answers honestly by TYPE, ignoring which specific fact was named,
-    /// is enough for every routine but one. `ssm::gdn_core_recurrent_prefill`
-    /// turns two asked scalars into a compiled-shape LOOKUP (`scan_point`)
-    /// rather than a bare forward: only nine `(LANES, VROWS)` pairs are
-    /// compiled, and a generic default for each would almost certainly name
-    /// none of them, faulting inside `vkCreateComputePipelines` rather than
-    /// erring at compile time. `(32, 4)` is one of the nine, so answering it
-    /// unconditionally keeps this routine's body running whole -- at the cost
-    /// of the eight other compiled shapes, which `SWEEP` covered when `lanes`
-    /// and `vrows` were the positional pair it overrode and cannot reach now
-    /// that both are asked from inside the body instead of read off the
-    /// argument list.
+    /// is enough for every routine here.
+    ///
+    /// FOUR EXCEPTIONS STOOD HERE and two are gone. `(32, 4)` for
+    /// `Named("lanes")`/`Named("vrows")`, and the same pair again as words 11
+    /// and 12 of a forwarded params run, existed because
+    /// `ssm::gdn_core_recurrent_prefill` turns its tiling into a compiled-shape
+    /// LOOKUP (`scan_point`) rather than a bare forward: only nine
+    /// `(LANES, VROWS)` pairs are compiled, and a generic default would almost
+    /// certainly name none of them, faulting inside
+    /// `vkCreateComputePipelines` rather than erring at compile time. Both
+    /// spellings answered ONE of the nine and left the other eight unreached.
+    ///
+    /// The pair is a positional `Const` mark again, so `SWEEP` overrides it on
+    /// the argument list and covers all nine -- which is why answering it here
+    /// is not merely unnecessary but wrong: a probe that resolved the tiling
+    /// would silently outrank the sweep's point and run every one of the nine
+    /// at the same shape.
     fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
         use kernels::{Source as Src, Ty as T};
-        // THE SAME TWO NUMBERS BY THE OTHER ROUTE. The tiling was
-        // `Source::Named("lanes")` while the body asked for it as a fact; it
-        // is the statement's eleventh and twelfth WORDS now -- HEAD's
-        // `Param<11>`/`Param<12>` -- because the run this body forwards is the
-        // shader's struct and no `Const` mark can name a word inside it.
-        if let Src::Slot(kernels::Kind::Param, n) = source {
-            return Ok(ArgValue::I32(match n {
-                11 => 32,
-                12 => 4,
-                _ => 4096,
-            }));
-        }
-        if source == Src::Named("lanes") {
-            return Ok(ArgValue::I32(32));
-        }
-        if source == Src::Named("vrows") {
-            return Ok(ArgValue::I32(4));
+        if let Src::Slot(kernels::Kind::Param, _) = source {
+            return Ok(ArgValue::I32(4096));
         }
         // A PITCH MUST NOT BE NARROWER THAN THE ROW IT STRIDES OVER, and the
         // fixtures above hand every operand a 1024-wide rectangle. The
@@ -262,11 +260,14 @@ const SWEEP: &[Swept] = &[
     ("embed_gather_mb_4bit", &[4, 5], affine),
     ("embed_gather_scaled_4bit", &[5, 6], affine),
     ("embed_gather_scaled_mb_4bit", &[5, 6], affine),
-    // `gdn_core_recurrent_prefill` used to be swept here on `(lanes, vrows)`
-    // at positions 9 and 10 -- both gone from the signature now that the body
-    // asks for them, so there is no argument position left to override, and
-    // `Seen::resolve`'s two `Source::Named` exceptions answer a single
-    // compiled point (32, 4) in their place instead. See that doc comment.
+    // AND BACK, at 16 and 17. The row above said the pair was "gone from the
+    // signature now that the body asks for them"; both are `Const` marks
+    // again, and a mark's slot is its POSITION among the scalar marks -- five
+    // buffers, then `GdnShape::params`' eleven, then these two. Sweeping is
+    // the only way to reach the other eight compiled shapes, and this backend
+    // is the one where naming an uncompiled module faults inside
+    // `vkCreateComputePipelines` rather than failing to link.
+    ("gdn_core_recurrent_prefill", &[16, 17], gdn_scan),
     ("mxfp4_qmm_t_routed_bias", &[7, 8], tiles),
     ("qmm_t", &[5, 6, 7, 8], routed_qmm),
     ("qmm_t_bias", &[6, 7, 8, 9], routed_qmm),
@@ -298,6 +299,32 @@ const SWEEP: &[Swept] = &[
     ("sdpa_vector_decode", &[3], vector_dims),
     ("sdpa_vector_decode_swa", &[4], swa_dims),
 ];
+
+/// The nine `(LANES, VROWS)` pairs the prefill scan is compiled for.
+///
+/// Written out rather than multiplied, and `ssm::SCAN` is the reason: the
+/// tiling axis is a LIST of nine points and not a product of lane widths and
+/// row counts. `(32, 1)` and `(4, 2)` read as obvious members of a
+/// three-by-four grid and neither is compiled, so a sweep that multiplied the
+/// axes out would name six modules that do not exist -- and on this backend
+/// that is a fault inside `vkCreateComputePipelines`, with the validation
+/// layer silent, not a link error.
+fn gdn_scan() -> Vec<Vec<i32>> {
+    [
+        (16, 1),
+        (16, 2),
+        (16, 4),
+        (32, 2),
+        (32, 4),
+        (32, 8),
+        (4, 1),
+        (8, 1),
+        (8, 2),
+    ]
+    .iter()
+    .map(|(l, v)| vec![*l, *v])
+    .collect()
+}
 
 /// The four head widths, each at one split and at eight.
 ///

@@ -1,20 +1,35 @@
 //! A packed scalar slot binds the address of a STRUCT, and the struct's
-//! size is the shader's fact.
+//! size is the shader's fact — so this file held every packed run against
+//! the struct it is read as. **There are none left in a model text.**
 //!
 //! `ParamSlot::packed` means "this slot is a pointer to a struct holding
 //! every remaining scalar", and `Params::new` sizes the run from
-//! `dispatch.params.len()` — the count the TEXT states. The shader states
-//! its own: `moe/params.h::RouterParams` is four `unsigned int`, and
-//! `route.metal` reads `p.softmax_over_all` at byte 8 and `p.logits_pitch`
-//! at byte 12 in the body BOTH its instantiations share.
+//! `dispatch.params.len()` — the count the TEXT states. The shader stated
+//! its own, and the two were never held together: `moe/params.h::RouterParams`
+//! was four `unsigned int` and the text stated two, so `route.metal` read
+//! `p.softmax_over_all` at byte 8 and `p.logits_pitch` at byte 12 out of
+//! whatever the NEXT dispatch staged there — a routing that softmaxes over
+//! ALL experts because a neighbouring statement's first word happened to be
+//! nonzero, and a logits stride taken from its second. Both produce weights,
+//! neither faults. That is what this file was written to catch.
 //!
-//! Those two numbers are the same quantity as `DecodeGeometry::norm_topk_prob`
-//! and the logits row stride. If the text states two scalars and the shader
-//! reads four, the run is eight bytes, the next dispatch's scalars begin at
-//! byte eight of the same slab, and the router reads them as its own
-//! trailing fields — a routing that softmaxes over ALL experts because the
-//! next statement's first scalar happened to be nonzero, and a logits stride
-//! taken from its second. Both produce weights, neither faults.
+//! It is not caught here any more, because it can no longer happen. The
+//! convention was unwound (`kernels-metal/kernels/moe/route.metal`, and the
+//! same for `norm`, `layout`, `mlp` and `attn`): every field is a
+//! `const constant uint&` of its own now, one mark per field, at ascending
+//! buffer indices after the operands. A text that states fewer fields than
+//! the shader declares leaves an argument slot UNBOUND, which faults rather
+//! than reading a neighbour — the silent failure mode is gone by
+//! construction rather than by measurement.
+//!
+//! So this file's table is empty by FACT and not by omission, and what
+//! remains is a trip-wire: a dispatch that binds a packed slot again is a
+//! return to the convention, and it fails here until someone transcribes the
+//! shader's word count beside it. The one surviving `ctx.params()` caller is
+//! `kernels-metal::ptir::copy_logits_bf16`, whose block is a `const device
+//! PtirLogitsCopyParams*` ARRAY indexed by `tid.y` rather than one statement's
+//! scalar run; it is fired by the sampler and not by a model text, so no
+//! lowering reachable from here binds it.
 //!
 //! This measures the slab, not the argument: it stages a real lowered fire's
 //! scalars and reads back the bytes at the address each dispatch binds.
@@ -117,41 +132,20 @@ fn planned<'a>(low: &'a Lowered, f: &LlamaLikeFacts) -> Vec<Dispatch<'a>> {
 }
 
 /// The `unsigned int` count of every packed struct the shader tree defines,
-/// keyed by the symbol that takes it.
+/// keyed by the symbol that takes it — and the tree defines none.
 ///
-/// Transcribed from the headers rather than parsed, and that is the point:
-/// this table is the SHADER's statement, held against what the text says.
-/// A struct that grows a field and a text that does not is exactly the
-/// drift this file exists to catch, and it shows up here as a mismatch
-/// rather than as weights that sum to the wrong number.
-const PACKED_STRUCT_WORDS: &[(&str, usize)] = &[
-    // `attn/split_qkv.metal::SplitQkvParams`
-    ("split_qkv_bf16", 2),
-    // `attn/logit_softcap.metal::SoftcapParams`
-    ("logit_softcap_bfloat16", 2),
-    // `layout/ple_combine.metal::PleCombineParams`
-    ("ple_combine_bfloat16", 2),
-    // `layout/row_gather_params.h::RowGatherParams`
-    ("row_gather_bfloat16", 2),
-    // `mlp/gated.metal`'s three
-    ("geglu_tanh_bfloat16", 1),
-    ("geglu_tanh_strided_bfloat16", 5),
-    ("gptoss_swiglu_bfloat16", 3),
-    // `moe/params.h`'s four
-    ("combine_sorted", 3),
-    ("route_gather", 7),
-    ("route_sort", 7),
-    ("router_topk_bfloat16", 4),
-    ("router_topk_scaled_bfloat16", 4),
-    // `norm/layer_scalar.metal::LayerScalarParams`
-    ("layer_scalar_mul_bfloat16", 1),
-    // `norm/rms_params.h::RmsParams`
-    ("rms_residual_bfloat16", 5),
-    ("rms_residual_scaled_bfloat16", 5),
-    ("rms_single_row_bfloat16", 5),
-    // `norm/rms_params.h::VNormParams`
-    ("vnorm_single_row_bfloat16", 2),
-];
+/// It held eighteen symbols: `split_qkv_bf16` and `logit_softcap_bfloat16`,
+/// `ple_combine_bfloat16` and `row_gather_bfloat16`, the three of
+/// `mlp/gated.metal`, `moe/params.h`'s five, `layer_scalar_mul_bfloat16`, the
+/// four of `norm/rms_params.h`, and `vnorm_single_row_bfloat16`. Each of
+/// those headers is gone and each of those rows now takes its fields one
+/// `const constant uint&` at a time, so there is nothing left to transcribe.
+///
+/// Transcribed from the headers rather than parsed, and that is still the
+/// point: this table is the SHADER's statement, held against what the text
+/// says. An entry re-appearing here means the packed convention came back,
+/// and it has to come back with its word count.
+const PACKED_STRUCT_WORDS: &[(&str, usize)] = &[];
 
 #[test]
 fn a_packed_slot_stages_every_word_its_shader_struct_reads() {
@@ -195,10 +189,18 @@ fn a_packed_slot_stages_every_word_its_shader_struct_reads() {
         "a packed slot binds the address of a struct and the shader reads the whole struct:\n{}",
         short.iter().cloned().collect::<Vec<_>>().join("\n")
     );
-    assert!(
-        seen > 0,
-        "no dispatch in either routed class bound a packed struct — the fixture stopped \
-         being routed and this test measures nothing"
+    // NO `seen > 0`. Zero is the answer this file now expects, and the
+    // count is kept because it is the number the emptiness is read from:
+    // `unlisted` is what fires when it stops being zero. A guard demanding
+    // a packed dispatch would fail on a tree that correctly has none, and
+    // that the fixture still lowers something routed is
+    // `the_fixture_is_routed`'s question, not this one's.
+    assert_eq!(
+        seen,
+        0,
+        "a dispatch bound a packed struct AND the table names its word count, so the \
+         packed convention is back and `PACKED_STRUCT_WORDS` should say so in its text \
+         as well as in its rows"
     );
 }
 

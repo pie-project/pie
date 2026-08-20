@@ -36,7 +36,6 @@
 // carrying it across is a deliberate divergence, not an oversight.
 
 //#include "common/bf16.inc.wgsl"
-//#include "ssm/gdn_params.inc.wgsl"
 
 @group(0) @binding(0) var<storage, read_write> mixed: array<u32>;
 @group(0) @binding(1) var<storage, read_write> conv_state: array<f32>;
@@ -57,10 +56,56 @@
 // workgroup that shifted its own taps would race every other workgroup reading
 // the same slot's earlier taps.
 @group(0) @binding(10) var<storage, read_write> new_conv_state: array<f32>;
-@group(0) @binding(11) var<storage, read_write> p: GdnCoreParams;
 //#if defined(PIE_SLOTTED)
-@group(0) @binding(12) var<storage, read_write> slot_ids: array<u32>;
+@group(0) @binding(11) var<storage, read_write> slot_ids: array<u32>;
 //#endif
+
+// THE GEOMETRY IS ELEVEN MARKS, NOT A STRUCT ON `@group(0)`.
+//
+// This was `@group(0) @binding(11) var<storage, read_write> p: GdnCoreParams`,
+// with the struct itself in a shared `ssm/gdn_params.inc.wgsl` whose header
+// said, correctly for the arrangement it described, that the field ORDER was
+// the contract across three planes: `gdn_params.h` on Metal, `gdn_params.slang`
+// on Vulkan and that include here were the same eleven fields in the same
+// order, and a field moved in one read the wrong number in the others with
+// nothing to say so. It rode a storage binding rather than the `@group(1)`
+// uniform because every GDN row stated it as a BUFFER operand -- a pointer to
+// where the host had already assembled the numbers -- and not as a list of
+// scalars.
+//
+// The routine names all eleven as `Const` marks now, so the contract is a
+// SIGNATURE rather than three copies of a struct: `driver-wgpu::lowering::
+// routine::bind` packs the marks into the `@group(1)` block in the order the
+// body passes them, and those are the same eleven words of the same
+// `Lowered::params` run the struct was staged from, reached by index instead
+// of by field. The order below is still `model-dsl`'s `GdnShape::params`,
+// because that is the statement's order and the marks are positional in it.
+//
+// `Dk` and `Dv` are the key and value head dimensions and are NOT the same
+// number in a GDN checkpoint (128 and 128 in the ones the tree has seen, which
+// is exactly why swapping them would go unnoticed until one that differs
+// arrives). `Hk` and `Hv` likewise: `Hv / Hk` is the group-query replication
+// factor, and the conv-state writeback is done once per KEY head, by the first
+// value head of each group.
+struct Params {
+    Dk: i32,
+    Dv: i32,
+    Hk: i32,
+    Hv: i32,
+    // The channel count of the fused qkv conv input: `Hk*Dk + Hk*Dk + Hv*Dv`
+    // plus whatever the projection carries beside it, which is why the three
+    // offsets below are stated rather than derived.
+    conv_dim: i32,
+    // The causal conv width. `Kc - 1` past taps come from the conv state and
+    // the last one is the current token.
+    Kc: i32,
+    q_off: i32,
+    k_off: i32,
+    v_off: i32,
+    eps: f32,
+    inv_sqrt_dk: f32,
+}
+@group(1) @binding(0) var<uniform> params: Params;
 
 var<workgroup> sh_reduce: array<f32, 128>;
 
@@ -144,24 +189,24 @@ fn row_sum32(lx: u32, ly: u32, v: f32) -> f32 {
 // and the last from this token's mixed projection.
 fn convsilu(slot: i32, b_idx: i32, c: i32) -> f32 {
     var acc = load_conv_b(c);
-    for (var j = 0; j < p.Kc - 1; j = j + 1) {
+    for (var j = 0; j < params.Kc - 1; j = j + 1) {
         // Tap `j` of the state is at `j + 1`: the state holds the last `Kc - 1`
         // tokens oldest-first, and slot 0 is the one about to fall off.
-        acc = acc + conv_state[(slot * p.Kc + (j + 1)) * p.conv_dim + c]
-                  * load_conv_w(c * p.Kc + j);
+        acc = acc + conv_state[(slot * params.Kc + (j + 1)) * params.conv_dim + c]
+                  * load_conv_w(c * params.Kc + j);
     }
-    acc = acc + load_mixed(b_idx * p.conv_dim + c) * load_conv_w(c * p.Kc + (p.Kc - 1));
+    acc = acc + load_mixed(b_idx * params.conv_dim + c) * load_conv_w(c * params.Kc + (params.Kc - 1));
     return silu(acc);
 }
 
 // Shift this channel's window by one and append the current token.
 fn write_conv(slot: i32, b_idx: i32, c: i32) {
-    for (var j = 0; j < p.Kc - 1; j = j + 1) {
-        new_conv_state[(slot * p.Kc + j) * p.conv_dim + c] =
-            conv_state[(slot * p.Kc + (j + 1)) * p.conv_dim + c];
+    for (var j = 0; j < params.Kc - 1; j = j + 1) {
+        new_conv_state[(slot * params.Kc + j) * params.conv_dim + c] =
+            conv_state[(slot * params.Kc + (j + 1)) * params.conv_dim + c];
     }
-    new_conv_state[(slot * p.Kc + (p.Kc - 1)) * p.conv_dim + c] =
-        load_mixed(b_idx * p.conv_dim + c);
+    new_conv_state[(slot * params.Kc + (params.Kc - 1)) * params.conv_dim + c] =
+        load_mixed(b_idx * params.conv_dim + c);
 }
 
 @compute @workgroup_size(32, 4)
@@ -169,19 +214,19 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         @builtin(global_invocation_id) gid: vec3<u32>,
         @builtin(workgroup_id) wid: vec3<u32>) {
     let n = i32(wid.z);
-    let b_idx = n / p.Hv;
-    let hv_idx = n % p.Hv;
+    let b_idx = n / params.Hv;
+    let hv_idx = n % params.Hv;
     // Group-query: `rep` value heads share one key head, and only the FIRST of
     // them may write the shared q/k conv state back -- otherwise `rep`
     // workgroups write the same channels and the last one wins by luck.
-    let rep = p.Hv / p.Hk;
+    let rep = params.Hv / params.Hk;
     let hk_idx = hv_idx / rep;
     let hk_first = (hv_idx % rep) == 0;
     let dk_idx = i32(lid.x);
     let dv_idx = i32(gid.y);
-    let n_per_t = p.Dk / 32;
+    let n_per_t = params.Dk / 32;
     // See the header: the store guard, not an early return.
-    let mine = dv_idx < p.Dv;
+    let mine = dv_idx < params.Dv;
 //#if defined(PIE_SLOTTED)
     // The paged path: the row's state lives wherever the allocator put it, and
     // `b_idx` is only where the row is in THIS batch.
@@ -199,25 +244,25 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     var ksq = 0.0;
     for (var i = 0; i < n_per_t; i = i + 1) {
         let d = n_per_t * dk_idx + i;
-        qraw[i] = convsilu(slot, b_idx, p.q_off + hk_idx * p.Dk + d);
-        kraw[i] = convsilu(slot, b_idx, p.k_off + hk_idx * p.Dk + d);
+        qraw[i] = convsilu(slot, b_idx, params.q_off + hk_idx * params.Dk + d);
+        kraw[i] = convsilu(slot, b_idx, params.k_off + hk_idx * params.Dk + d);
         qsq = qsq + qraw[i] * qraw[i];
         ksq = ksq + kraw[i] * kraw[i];
     }
     // The q normalisation folds in `1/sqrt(Dk)`; the k one does not, because
     // the scale belongs to the query side of the product exactly once.
-    let qinv = p.inv_sqrt_dk / sqrt(row_sum32(lid.x, lid.y, qsq) + p.eps);
-    let kinv = 1.0 / sqrt(row_sum32(lid.x, lid.y, ksq) + p.eps);
+    let qinv = params.inv_sqrt_dk / sqrt(row_sum32(lid.x, lid.y, qsq) + params.eps);
+    let kinv = 1.0 / sqrt(row_sum32(lid.x, lid.y, ksq) + params.eps);
 
-    let vval = convsilu(slot, b_idx, p.v_off + hv_idx * p.Dv + dv_idx);
-    let ad = load_a_gate(b_idx * p.Hv + hv_idx) + load_dt_bias(hv_idx);
+    let vval = convsilu(slot, b_idx, params.v_off + hv_idx * params.Dv + dv_idx);
+    let ad = load_a_gate(b_idx * params.Hv + hv_idx) + load_dt_bias(hv_idx);
     // softplus, in the form that does not overflow: `max(x,0) + log1p(e^-|x|)`
     // rather than `log(1 + e^x)`, whose exponential is infinite by x = 89.
     let sp = max(ad, 0.0) + log(1.0 + exp(-abs(ad)));
     let decay = exp(-exp(A_log[hv_idx]) * sp);
-    let beta = 1.0 / (1.0 + exp(-load_b_gate(b_idx * p.Hv + hv_idx)));
+    let beta = 1.0 / (1.0 + exp(-load_b_gate(b_idx * params.Hv + hv_idx)));
 
-    let state_base = ((slot * p.Hv + hv_idx) * p.Dv + dv_idx) * p.Dk;
+    let state_base = ((slot * params.Hv + hv_idx) * params.Dv + dv_idx) * params.Dk;
     var st: array<f32, 8>;
     var kv = 0.0;
     for (var i = 0; i < n_per_t; i = i + 1) {
@@ -241,7 +286,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     }
     outv = row_sum32(lid.x, lid.y, outv);
     if (dk_idx == 0 && mine) {
-        store_core_out((b_idx * p.Hv + hv_idx) * p.Dv + dv_idx, outv);
+        store_core_out((b_idx * params.Hv + hv_idx) * params.Dv + dv_idx, outv);
     }
 
     // The q/k conv writeback is one workgroup's job per key head: `dv_idx == 0`
@@ -250,12 +295,12 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     if (dv_idx == 0 && hk_first) {
         for (var i = 0; i < n_per_t; i = i + 1) {
             let d = n_per_t * dk_idx + i;
-            write_conv(slot, b_idx, p.q_off + hk_idx * p.Dk + d);
-            write_conv(slot, b_idx, p.k_off + hk_idx * p.Dk + d);
+            write_conv(slot, b_idx, params.q_off + hk_idx * params.Dk + d);
+            write_conv(slot, b_idx, params.k_off + hk_idx * params.Dk + d);
         }
     }
     if (mine) {
-        write_conv(slot, b_idx, p.v_off + hv_idx * p.Dv + dv_idx);
+        write_conv(slot, b_idx, params.v_off + hv_idx * params.Dv + dv_idx);
     }
 }
 

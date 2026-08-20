@@ -71,15 +71,35 @@ fn the_split_puts_every_channel_where_its_width_says() {
             bound(v.gpu_address()),
         ],
         params: params.to_vec(),
-        // The row places its params at buffer 4, after the four operands, and
-        // as one packed struct — two `u32`s, so four bytes at offset zero.
-        param_slots: vec![driver_metal::lowering::dispatch::ParamSlot {
-            slot: 4,
-            at: 0,
-            bytes: 4,
-            packed: true,
-            value: Some(0),
-        }],
+        // ONE SLOT PER WIDTH, at buffers 4 and 5 after the four operands.
+        //
+        // This staged ONE PACKED SLOT at buffer 4 -- the address of a two-word
+        // run, read as `SplitQkvParams`. The shader stopped taking that struct
+        // and takes `const constant uint& q_width [[buffer(4)]]` and
+        // `kv_width [[buffer(5)]]` instead, and this fixture kept binding the
+        // old shape: buffer 4 held the address of the run, whose first word IS
+        // `q_width`, so the q half came out right and hid the rest, while
+        // buffer 5 was never bound at all. `kv_width` then read as zero, every
+        // channel past `q_width` fell into the `v` arm at a zero row pitch,
+        // and `k` was left as allocated -- which is the 0.0-against-8.0 this
+        // read back. A hand-built dispatch is a transcription of the shader's
+        // signature, and this is the drift that costs.
+        param_slots: vec![
+            driver_metal::lowering::dispatch::ParamSlot {
+                slot: 4,
+                at: 0,
+                bytes: 4,
+                packed: false,
+                value: Some(0),
+            },
+            driver_metal::lowering::dispatch::ParamSlot {
+                slot: 5,
+                at: 4,
+                bytes: 4,
+                packed: false,
+                value: Some(1),
+            },
+        ],
         layers: 0..1,
         op: 0,
     };

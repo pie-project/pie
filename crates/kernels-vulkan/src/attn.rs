@@ -11,52 +11,8 @@
 
 use kernels_macros::routine;
 use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, InOut, Out, Tensor, Usize, bf16, elementwise, elementwise_rows, keys};
-use kernels::KernelSig;
 use kernels::BindMut;
 use kernels::routine::Refusal;
-
-
-/// The entrypoints this family's crossed routines spell, now that their
-/// rows are gone. See [`crate::RETIRED`].
-pub static ENTRYPOINTS: &[&str] = &[
-    "split_qkv_bf16",
-    "gate_bfloat16",
-    "kv_append_bfloat16",
-    "kv_append_paged_bfloat16",
-    "logit_softcap_bfloat16",
-    "q_gate_split_bfloat16",
-    "sdpa_paged_decode_bfloat16_d_64",
-    "sdpa_paged_decode_bfloat16_d_128",
-    "sdpa_paged_decode_bfloat16_d_256",
-    "sdpa_paged_decode_bfloat16_d_512",
-    "sdpa_paged_decode_bfloat16_d_64_p32",
-    "sdpa_paged_decode_bfloat16_d_128_p32",
-    "sdpa_paged_decode_bfloat16_d_64_p32_sg8",
-    "sdpa_paged_decode_sink_bfloat16_d_64",
-    "sdpa_paged_decode_split_bfloat16_d_64",
-    "sdpa_paged_decode_split_bfloat16_d_128",
-    "sdpa_paged_decode_split_bfloat16_d_256",
-    "sdpa_paged_decode_split_bfloat16_d_512",
-    "sdpa_paged_decode_combine_bfloat16_d_64",
-    "sdpa_paged_decode_combine_bfloat16_d_128",
-    "sdpa_paged_decode_combine_bfloat16_d_256",
-    "sdpa_paged_decode_combine_bfloat16_d_512",
-    "sdpa_paged_decode_combine_sink_bfloat16_d_64",
-    "sdpa_paged_mma_bfloat16_d_64",
-    "sdpa_paged_mma_sink_bfloat16_d_64",
-    "sdpa_paged_tiled_bfloat16_d_64",
-    "sdpa_paged_tiled_bfloat16_d_128",
-    "sdpa_paged_tiled_bfloat16_d_256",
-    "sdpa_paged_tiled_bfloat16_d_512",
-    "sdpa_paged_tiled_sink_bfloat16_d_64",
-    "sdpa_paged_tiled_strided_bfloat16_d_256",
-    "sdpa_vector_decode_bfloat16_d_64",
-    "sdpa_vector_decode_bfloat16_d_128",
-    "sdpa_vector_decode_bfloat16_d_256",
-    "sdpa_vector_decode_sink_bfloat16_d_64",
-    "sdpa_vector_decode_swa_bfloat16_d_256",
-    "sdpa_vector_decode_swa_bfloat16_d_512",
-];
 
 /// The four head widths this tree compiles attention for.
 ///
@@ -356,15 +312,22 @@ fn head_grid(head_dim: i32, heads: i32, depth: i32) -> Result<[u32; 3], Refusal>
     ])
 }
 
-/// One packed row cut into three, at two boundaries the caller does not state.
+/// One packed row cut into three, at two boundaries the statement states.
 ///
-/// `q_width` and `kv_width` ride in `params` rather than in the push block --
-/// the shader reads them out of a `SplitQkvParams` struct -- so this signature
-/// cannot check them and does not pretend to. What it does state is
-/// `packed_width`, which is `q_width + 2 * kv_width` and is the extent the
-/// grid needs; the shader recomputes the same sum from its own copy and
+/// `q_width` and `kv_width` used to ride in `params` -- the shader read them
+/// out of a `SplitQkvParams` struct -- so this signature could not name either
+/// one and this paragraph said so. They are MARKS now, which is the same two
+/// words of the same statement run reached by index instead of by field, and
+/// the routine names them in the order the struct laid them out.
+///
+/// What the extent still comes from is `packed_width`, taken off the operand
+/// rather than summed from the pair: it is `q_width + 2 * kv_width` and it is
+/// what the grid needs. The shader recomputes that sum from the marks and
 /// guards on it, so a `packed_width` that disagreed would leave a tail of the
-/// row uncopied rather than write out of bounds.
+/// row uncopied rather than write out of bounds. The two are not checked
+/// against each other here, because the operand's width is the rectangle the
+/// arena allocated and the marks are what the text said -- a disagreement is a
+/// fact about the plan, not about this fire.
 ///
 /// # Errors
 ///
@@ -375,13 +338,24 @@ pub fn split_qkv_bf16(
     packed: In<Tensor<bf16>>,
     q: Out<Tensor<bf16>>,
     k: Out<Tensor<bf16>>,
-    v: Out<Tensor<bf16>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
+    v: Out<Tensor<bf16>>,
+    // THE TWO BOUNDARIES, WHICH WERE `SplitQkvParams`'s two fields. They rode
+    // a staged block because the row named `params: Buf`, and the cost was
+    // that no signature could name either width -- so this doc said, truly,
+    // that it could not check them. Both are `Const<u32>` marks now, at words
+    // 0 and 1 of the same statement run the struct was staged from, IN THE
+    // STRUCT'S ORDER because it is the statement's: `q_width` first and
+    // `kv_width` second. Swapping the two would cut both boundaries inside a
+    // neighbouring projection rather than refuse, which is why the order is
+    // written down here rather than left to the reader to infer from the
+    // shader.
+    q_width: Const<u32>,
+    kv_width: Const<u32>) -> Result<(), Refusal> {
     let packed_width = packed.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
         Fire::at(crate::routine::module_path("split_qkv_bf16", ctx.best()), "split_qkv_bf16").apply(elementwise_rows(packed_width, rows)?),
-        &[packed.arg(), q.arg(), k.arg(), v.arg(), params],
+        &[packed.arg(), q.arg(), k.arg(), v.arg(), q_width.arg(), kv_width.arg()],
     )
 }
 
@@ -571,8 +545,12 @@ pub fn kv_append_paged(
 
 /// gemma's final logit softcap: `cap * tanh(x / cap)`.
 ///
-/// The cap rides in `params` with a trailing word nothing reads, so the only
-/// extent this body states is the element count.
+/// The cap is the only scalar this kernel reads, so it is a MARK rather than a
+/// struct: `attn/logit_softcap.slang` takes it as the one field of its push
+/// block. It used to ride a `SoftcapParams { cap, unused }` storage buffer --
+/// Metal's layout, ported whole -- whose second word existed only to hold the
+/// struct's size, and whose descriptor this plane had to mint a sentinel for.
+/// Word 0 of the statement's run is the same number either way.
 ///
 /// # Errors
 ///
@@ -581,8 +559,8 @@ pub fn kv_append_paged(
 pub fn logit_softcap(
     ctx: &Ctx<'_>,
     logits: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
+    out: Out<Tensor<bf16>>,
+    cap: Const<f32>) -> Result<(), Refusal> {
     // THE ELEMENT COUNT, DERIVED RATHER THAN ASKED. HEAD spelled it
     // `Reckoned<Times<Say<Width>, Say<Rows>>>` -- a product of two facts,
     // not a fact -- and the migration turned it into `keys::Elements`,
@@ -591,7 +569,7 @@ pub fn logit_softcap(
     let n = out.rows.saturating_mul(out.width);
     ctx.fire(
         Fire::at(crate::routine::module_path("logit_softcap_bfloat16", ctx.best()), "logit_softcap_bfloat16").apply(elementwise(n, 1)?),
-        &[logits.arg(), out.arg(), params],
+        &[logits.arg(), out.arg(), cap.arg()],
     )
 }
 
@@ -1470,7 +1448,6 @@ pub fn sdpa_vector_decode_sink(
     )
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1506,7 +1483,6 @@ mod tests {
         attn_partials: Cell<u32>,
         kv_write_page: Cell<u32>,
         kv_write_offset: Cell<u32>,
-        params_handle: Cell<u32>,
         /// THE STATEMENT\'S SCALAR RUN, for a body that reads a word by
         /// index. Empty means "4096 at every slot", which is a plausible
         /// stride for the rows these tests build; a case that means a
@@ -1543,7 +1519,6 @@ mod tests {
                 attn_partials: Cell::new(9),
                 kv_write_page: Cell::new(10),
                 kv_write_offset: Cell::new(11),
-                params_handle: Cell::new(900),
                 words: RefCell::default(),
             }
         }
@@ -1625,19 +1600,34 @@ mod tests {
             if source == <keys::KvWriteOffset as Fact>::SOURCE {
                 return Ok(ArgValue::Buffer { handle: self.kv_write_offset.get(), writes: false, rows: 0, width: 0 });
             }
-            // THE STATEMENT'S OWN SCALARS, which a body reads by index when its
-            // params run is a struct and no `Const` mark can name a word inside
-            // it -- see `Asks::param`. The probe answers a number that is
-            // plausible for every reader: a stride wide enough for the rows
-            // these tests build, and a positive tiling.
+            // THE STATEMENT'S OWN SCALARS, reached either by a body reading a
+            // word by index -- `Asks::param`, where the params run is still a
+            // struct -- or by a `Const` mark that names one. The probe answers
+            // a number that is plausible for every reader: a stride wide
+            // enough for the rows these tests build, and a positive tiling.
+            //
+            // THE CARRIER IS READ, NOT ASSUMED. It answered `ArgValue::I32`
+            // for every slot while every scalar mark in this file was a
+            // `Const<i32>`; `split_qkv_bf16`'s two widths are `Const<u32>`,
+            // and `Arg::unpack` for that mark takes `ArgValue::U32` and
+            // refuses an `I32` -- so a probe that answered one shape for both
+            // would refuse the body under test while the driver, which goes
+            // through `bind::number`, binds it happily.
             if let kernels::Source::Slot(kernels::Kind::Param, n) = source {
-                return Ok(ArgValue::I32(
-                    self.words.borrow().get(usize::from(n)).copied().unwrap_or(4096),
-                ));
+                let word = self.words.borrow().get(usize::from(n)).copied().unwrap_or(4096);
+                return Ok(match ty {
+                    kernels::Ty::U32 => ArgValue::U32(word.cast_unsigned()),
+                    _ => ArgValue::I32(word),
+                });
             }
-            if source == kernels::Source::Slot(kernels::Kind::Params, 0) {
-                return Ok(ArgValue::Buffer { handle: self.params_handle.get(), writes: false, rows: 0, width: 0 });
-            }
+            // NO ARM FOR `Slot(Kind::Params, 0)`, and no `params_handle` cell
+            // behind one. This probe answered the whole staged block with a
+            // sentinel handle because `split_qkv_bf16` was the one body in
+            // this family that asked for it; its two widths are `Const<u32>`
+            // marks now, so nothing here reaches for a block and an arm that
+            // stayed would describe a channel no routine in this file uses.
+            // The `Ty::Buf` fallback below already covers a buffer this probe
+            // has no name for.
             if matches!(ty, kernels::Ty::Buf) {
                 return Ok(ArgValue::Buffer { handle: 900, writes: false, rows: 0, width: 0 });
             }

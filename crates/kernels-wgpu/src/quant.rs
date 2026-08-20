@@ -11,331 +11,6 @@
 //! than stamped, so they are five kernels and get five rows.
 
 use kernels_macros::routine;
-use kernels::KernelSig;
-
-/// EMPTY: this family's rows have been RETIRED.
-///
-/// `refactor-bigplan.md` §7 Stage 3. The three transcode encoders were the
-/// last to go and they could not go until their BODIES were fixed: each took a
-/// `_params: Buf` it had no way to use and forwarded no scalars at all, so the
-/// `@group(1)` block its shader reads would have arrived empty and the loop
-/// over groups would have run zero times and reported success.
-pub static KERNELS: &[KernelSig] = &[];
-/// The entrypoints of this family's routines whose ROWS have been RETIRED.
-///
-/// `refactor-bigplan.md` §7 Stage 3. Not every kernel here has crossed its
-/// arm — this family still states rows for the ones that have not — so this
-/// is the retired SUBSET rather than the whole family, and
-/// `a_retired_familys_stated_entrypoints_are_what_its_bodies_fire` compares
-/// it against the bodies that fire them.
-///
-/// See [`crate::sample::ENTRYPOINTS`] for why a retired row's entrypoints
-/// have to be stated at all.
-pub static ENTRYPOINTS: &[&str] = &[
-    "affine_encode_u4_bf16",
-    "affine_encode_u4_f32",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_16_bn_16",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_16_bn_32",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_16_bn_64",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_32_bn_16",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_32_bn_32",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_32_bn_64",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_64_bn_16",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_64_bn_32",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_64_bn_64",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_16_bn_16",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_16_bn_32",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_16_bn_64",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_32_bn_16",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_32_bn_32",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_32_bn_64",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_64_bn_16",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_64_bn_32",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_64_bn_64",
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_16_bn_16",
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_16_bn_32",
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_16_bn_64",
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_32_bn_16",
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_32_bn_32",
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_32_bn_64",
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_64_bn_16",
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_64_bn_32",
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_64_bn_64",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_16_bn_16",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_16_bn_32",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_16_bn_64",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_32_bn_16",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_32_bn_32",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_32_bn_64",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_64_bn_16",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_64_bn_32",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_64_bn_64",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_16_bn_16",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_16_bn_64",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_16",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_64",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_16",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_16_bn_16",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_16_bn_32",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_16_bn_64",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_32_bn_16",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_32_bn_32",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_32_bn_64",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_64_bn_16",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_64_bn_32",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_64_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_16_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_16_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_16_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_32_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_32_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_32_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_64_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_64_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_64_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_16_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_16_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_16_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_32_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_32_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_32_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_64_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_64_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_64_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_16_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_16_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_16_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_32_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_32_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_32_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_64_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_64_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_64_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_16_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_16_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_16_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_32_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_32_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_32_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_64_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_64_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_64_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_16_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_16_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_32_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_32_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_64_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_64_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_16_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_16_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_16_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_32_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_32_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_32_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_64_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_64_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_64_bn_64",
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_16",
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_64",
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_16",
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_64",
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_16",
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_64",
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_16",
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_64",
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_16",
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_64",
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_16",
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_16_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_16_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_16_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_32_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_32_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_32_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_64_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_64_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_64_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_16_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_16_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_16_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_32_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_32_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_32_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_64_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_64_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_64_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_16_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_16_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_16_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_32_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_32_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_32_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_64_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_64_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_64_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_16_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_16_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_16_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_32_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_32_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_32_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_64_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_64_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_64_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_16_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_16_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_32_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_32_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_64_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_64_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_16_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_16_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_16_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_32_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_32_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_32_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_64_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_64_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_64_bn_64",
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_16",
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_64",
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_16",
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_64",
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_16",
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_64",
-    "affine_qmm_t_splitk_bfloat16_gs_128_b_4_bm_16_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_128_b_4_bm_32_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_128_b_4_bm_64_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_128_b_8_bm_16_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_128_b_8_bm_32_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_128_b_8_bm_64_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_32_b_4_bm_16_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_32_b_4_bm_32_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_32_b_4_bm_64_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_32_b_8_bm_16_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_32_b_8_bm_32_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_32_b_8_bm_64_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_64_b_8_bm_16_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_64_b_8_bm_32_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_64_b_8_bm_64_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_4_bm_16_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_4_bm_32_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_4_bm_64_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_8_bm_16_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_8_bm_32_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_8_bm_64_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_4_bm_16_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_4_bm_32_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_4_bm_64_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_8_bm_16_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_8_bm_32_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_8_bm_64_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_8_bm_16_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_8_bm_32_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_8_bm_64_bn_32",
-    "affine_qmm_t_splitk_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_splitk_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_splitk_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_splitk_fp16_precast_f32_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_splitk_fp16_precast_f32_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_splitk_fp16_precast_f32_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_128_b_4_bm_16_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_128_b_4_bm_32_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_128_b_4_bm_64_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_128_b_8_bm_16_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_128_b_8_bm_32_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_128_b_8_bm_64_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_32_b_4_bm_16_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_32_b_4_bm_32_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_32_b_4_bm_64_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_32_b_8_bm_16_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_32_b_8_bm_32_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_32_b_8_bm_64_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_64_b_8_bm_16_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_64_b_8_bm_32_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_64_b_8_bm_64_bn_32",
-    "affine_qmm_t_strided_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_strided_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_strided_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_strided_fp16_precast_residual_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_strided_fp16_precast_residual_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_strided_fp16_precast_residual_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_128_b_4_bm_16_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_128_b_4_bm_32_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_128_b_4_bm_64_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_128_b_8_bm_16_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_128_b_8_bm_32_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_128_b_8_bm_64_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_32_b_4_bm_16_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_32_b_4_bm_32_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_32_b_4_bm_64_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_32_b_8_bm_16_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_32_b_8_bm_32_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_32_b_8_bm_64_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_64_b_8_bm_16_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_64_b_8_bm_32_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_64_b_8_bm_64_bn_32",
-    "affine_qmv_fast_bfloat16_gs_128_b_4",
-    "affine_qmv_fast_bfloat16_gs_128_b_8",
-    "affine_qmv_fast_bfloat16_gs_32_b_4",
-    "affine_qmv_fast_bfloat16_gs_32_b_8",
-    "affine_qmv_fast_bfloat16_gs_64_b_4",
-    "affine_qmv_fast_bfloat16_gs_64_b_8",
-    "affine_qmv_fast_residual_bfloat16_gs_128_b_4",
-    "affine_qmv_fast_residual_bfloat16_gs_128_b_8",
-    "affine_qmv_fast_residual_bfloat16_gs_32_b_4",
-    "affine_qmv_fast_residual_bfloat16_gs_32_b_8",
-    "affine_qmv_fast_residual_bfloat16_gs_64_b_4",
-    "affine_qmv_fast_residual_bfloat16_gs_64_b_8",
-    "affine_qmv_tail_bfloat16_gs_64_b_4",
-    "affine_qmv_tail_bfloat16_gs_64_b_8",
-    "affine_qmv_tail_bias_bfloat16_gs_64_b_4",
-    "affine_qmv_tail_bias_bfloat16_gs_64_b_8",
-    "affine_qmv_wide_strided_bfloat16_gs_64_b_4_v_4_kl_8",
-    "affine_qmv_wide_strided_bfloat16_gs_64_b_8_v_4_kl_8",
-    "cast_qmm_input_bfloat16_to_float16",
-    "cast_qmm_input_strided_bfloat16_to_float16",
-    "qmm_splitk_reduce_bfloat16",
-    "qmm_splitk_reduce_f32_bfloat16",
-    "mxfp4_dequant_bf16",
-];
 
 use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, Out, Tensor, bf16, elementwise, elementwise_rows, f16, keys};
 use kernels::routine::Refusal;
@@ -669,6 +344,14 @@ static QMM_T_STRIDED_FP16_PRECAST_RESIDUAL: [&str; 3] = [
     "affine_qmm_t_strided_fp16_precast_residual_bfloat16_gs_64_b_4_bm_64_bn_32",
 ];
 
+/// How many entrypoints a matvec table holds per row-count arm.
+///
+/// The tables below are TWO tables end to end -- the one-row body first, the
+/// `PIE_MT4` four-row body second -- because the reader that says which
+/// entrypoints this crate can fire only understands a lookup into a table of
+/// literals. A pair of tables chosen by an `if` is the same fact and it cannot
+/// see it.
+
 /// `affine_qmv_fast`, indexed by `codec_point`.
 static QMV_FAST: [&str; 6] = [
     "affine_qmv_fast_bfloat16_gs_32_b_4",
@@ -836,7 +519,14 @@ fn qmm_grid(n: i32, bn: i32, m: i32, bm: i32, split_k: i32) -> Result<[u32; 3], 
 /// # Errors
 ///
 /// [`Refusal::Empty`] for an empty extent, [`Refusal::Grid`] on overflow.
-/// The x extent of the wide forms: four batch vectors to a group.
+/// The x extent every `quant/qmv.wgsl` form takes: four batch vectors to a
+/// group.
+///
+/// It was the WIDE form's alone until `PIE_MT` gave the reducing form the same
+/// shape. The reducing form's workgroup owns eight output columns and reads
+/// their weights over the whole of K, so one activation row to a workgroup
+/// read the whole packed matrix once per token -- 67 GiB for a 512-token
+/// prefill of a 1B head, which is what the lm head's 617 ms was.
 ///
 /// Rounded up, and left non-positive as it came, so that `qmv_grid` stays
 /// the one place that refuses an empty batch.
@@ -1776,7 +1466,7 @@ pub fn qmv_fast(
     let out_vec_size = y.width;
     let vecs = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("quant/qmv.wgsl", QMV_FAST[codec_point(*group, *bits)?]).apply(qmv_grid(vecs, out_vec_size)?),
+        Fire::at("quant/qmv.wgsl", QMV_FAST[codec_point(*group, *bits)?]).apply(qmv_grid(quarters(vecs), out_vec_size)?),
         &[
             w.arg(),
             scales.arg(),
@@ -1812,7 +1502,7 @@ pub fn qmv_fast_residual(
     let out_vec_size = y.width;
     let vecs = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("quant/qmv.wgsl", QMV_FAST_RESIDUAL[codec_point(*group, *bits)?]).apply(qmv_grid(vecs, out_vec_size)?),
+        Fire::at("quant/qmv.wgsl", QMV_FAST_RESIDUAL[codec_point(*group, *bits)?]).apply(qmv_grid(quarters(vecs), out_vec_size)?),
         &[
             w.arg(),
             scales.arg(),
@@ -1848,7 +1538,7 @@ pub fn qmv_tail(
     let out_vec_size = y.width;
     let vecs = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("quant/qmv.wgsl", QMV_TAIL[bits_point(*bits)?]).apply(qmv_grid(vecs, out_vec_size)?),
+        Fire::at("quant/qmv.wgsl", QMV_TAIL[bits_point(*bits)?]).apply(qmv_grid(quarters(vecs), out_vec_size)?),
         &[
             w.arg(),
             scales.arg(),
@@ -1881,7 +1571,7 @@ pub fn qmv_tail_bias(
     let out_vec_size = y.width;
     let vecs = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("quant/qmv.wgsl", QMV_TAIL_BIAS[bits_point(*bits)?]).apply(qmv_grid(vecs, out_vec_size)?),
+        Fire::at("quant/qmv.wgsl", QMV_TAIL_BIAS[bits_point(*bits)?]).apply(qmv_grid(quarters(vecs), out_vec_size)?),
         &[
             w.arg(),
             scales.arg(),
@@ -2165,7 +1855,6 @@ pub fn mxfp4_dequant_bf16(
         ],
     )
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -544,6 +544,21 @@ fn again(
 }
 
 /// [`fire`], gathering what it planned when `capture`.
+/// The tier an artifact name states.
+///
+/// `kernels_vulkan::Capability::module` builds these: baseline is UNSUFFIXED
+/// (`<entrypoint>.spv`) so a reader that has never heard of tiers still finds
+/// it, and every other tier inserts its tag (`<entrypoint>.coopmat.spv`).
+/// This reads that back. `None` means the name is not one of ours at all --
+/// an unsuffixed name is `Some(Baseline)`, not `None`.
+fn tag_of(file: &str) -> Option<Capability> {
+    let stem = file.strip_suffix(".spv")?;
+    match stem.rsplit_once('.') {
+        Some((_, tag)) => Capability::from_tag(tag),
+        None => Some(Capability::Baseline),
+    }
+}
+
 fn plan_and_fire<R: Resolve, M: Modules>(
     device: &Device,
     pipelines: &mut Pipelines,
@@ -805,14 +820,30 @@ fn plan_and_fire<R: Resolve, M: Modules>(
                 // Counted off the reflection's keys, beside `parsed` and for the same
                 // reason: those are the entrypoints that were really dispatched, which
                 // a routine composes and the plan's symbol need not name.
+                //
+                // READ OFF THE NAME, not walked again. A key here is an ARTIFACT --
+                // `<entrypoint>.spv` or `<entrypoint>.<tag>.spv` -- because that is
+                // what `Reflect::of` is handed and what it caches under. Asking
+                // `Modules::resolved` about one was asking a SYMBOL question with a
+                // FILE, so `contains_key("foo.coopmat.spv")` and
+                // `contains_key("foo.coopmat.spv.coopmat")` both missed and the count
+                // was structurally zero on every device and every model. It went that
+                // way silently the day a body began naming its own module, which is
+                // the second time this number has gone blind in the same place.
+                //
+                // The name is the answer. `kernels_vulkan::module::path` already
+                // stepped down from the device's ceiling to what the build compiled
+                // and wrote the tag into the string; a tier read back out of it cannot
+                // disagree with the module that was actually loaded, which is exactly
+                // what a second walk could do. Keys whose value is `None` are files
+                // nothing could parse and did not run, so they are not counted.
                 tiered: reflection
                     .seen
                     .borrow()
-                    .keys()
-                    .filter(|e| {
-                        modules
-                            .resolved(e, tier)
-                            .is_some_and(|c| c != Capability::Baseline)
+                    .iter()
+                    .filter(|(file, made)| {
+                        made.is_some()
+                            && tag_of(file).is_some_and(|c| c != Capability::Baseline)
                     })
                     .count(),
                 ..f
@@ -1532,7 +1563,10 @@ pub fn plan_routine<'a, R: Resolve, M: Modules>(
         .filter_map(|a| match a {
             model_compiler::lower::Arg::Arena { width, .. }
             | model_compiler::lower::Arg::Named { width, .. } => Some(*width),
-            model_compiler::lower::Arg::Weight(_) => None,
+            // A raise contributes no width; see `Arg::Raised`.
+            model_compiler::lower::Arg::Weight(_) | model_compiler::lower::Arg::Raised { .. } => {
+                None
+            }
         })
         .collect();
     // The same numbers, kept PER ARGUMENT rather than compacted, because
@@ -1546,7 +1580,7 @@ pub fn plan_routine<'a, R: Resolve, M: Modules>(
         .map(|a| match a {
             model_compiler::lower::Arg::Arena { width, .. }
             | model_compiler::lower::Arg::Named { width, .. } => (*width).cast_signed(),
-            model_compiler::lower::Arg::Weight(_) => 0,
+            model_compiler::lower::Arg::Weight(_) | model_compiler::lower::Arg::Raised { .. } => 0,
         })
         .collect();
     let (group, bits) = spelled.map_or((0, 0), |s| (s.group, s.bits));

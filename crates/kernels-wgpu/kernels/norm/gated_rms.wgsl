@@ -36,8 +36,8 @@
 // taken over the first 256 channels and the rest of the head keeps whatever the
 // arena held. `kernels-vulkan` records exactly that bug (`.wiki/new-driver/
 // vulkan.md` §9); `v_d` is 128 on every GDN checkpoint the tree has seen, which
-// is why nothing caught it, but the row states `vd` as a runtime scalar and so
-// promises to honour it.
+// is why nothing caught it, but the statement states `vd` as a runtime scalar
+// and so promises to honour it.
 //
 // Both loops here therefore walk the axis in strides of the workgroup width,
 // and the guards sit on the STORES rather than on an early return: the sum
@@ -46,9 +46,35 @@
 //
 // The buffers are the sibling kernels' order -- the Metal signature was the
 // only written description of the call when this was ported, and
-// `norm::gated_rms`'s own signature is one now -- and
-// the strided form's `row_pitch` is the one field of the uniform block, where
-// Vulkan puts it in a push block WebGPU does not have.
+// `norm::gated_rms`'s own signature is one now.
+//
+// ## One block, where there were two
+//
+// The scalars used to reach this shader by two roads at once, and it was the
+// only kernel in `norm/` that did. `eps` and `vd` were `GatedRmsParams` on a
+// `@group(0)` storage binding -- MLX's Metal layout, ported through
+// `norm/rms_params.h` -- staged from the statement's run whole, while the
+// strided form's `row_pitch` was a `Const` the BODY passed and therefore a
+// `@group(1)` uniform of its own. `driver-wgpu::lowering::routine::bind` has a
+// branch for exactly that pair, written for `ssm/gdn_prep.wgsl`: when a module
+// declares a uniform block BESIDE the storage one, the body's scalars go to
+// the uniform and the statement's run to the storage pointer, because
+// appending them to the run would leave the uniform empty and
+// `Device::check_bindable` refuses that by name.
+//
+// With `eps: Const<f32>` and `vd: Const<i32>` stated as marks the two roads
+// become one. They are words 0 and 1 of the SAME statement run the struct was
+// staged from, reached by index instead of by field, so nothing about WHICH
+// numbers arrive has changed -- what changes is that they arrive the way
+// `row_pitch` already did, and the storage binding is gone. This kernel no
+// longer takes that branch: `bind` finds no `Placed::Params`, packs all of the
+// body's scalars end to end and hands them over as the one block below.
+//
+// The field order IS the body's argument order, and the two variants differ in
+// nothing else: `gated_rms` passes `eps, vd` and `gated_rms_strided` passes
+// `eps, vd, row_pitch`, the pitch LAST because a stride folded in ahead of the
+// pair would renumber what the two forms share. Vulkan puts the same three in
+// a push block WebGPU does not have.
 
 //#include "common/bf16.inc.wgsl"
 //#include "common/reduce.inc.wgsl"
@@ -56,23 +82,30 @@
 // One name for the attribute below and for the width `pie_inv_rms` folds.
 const PIE_LANES = 256u;
 
-struct GatedRmsParams {
-    eps: f32,
-    vd: u32,
-}
-
 @group(0) @binding(0) var<storage, read_write> x: array<u32>;
 @group(0) @binding(1) var<storage, read_write> z: array<u32>;
 @group(0) @binding(2) var<storage, read_write> w: array<u32>;
 // Atomic for the odd-`vd` edge alone -- `store_half` says why -- and the host
 // binds the same read_write storage buffer of 4-byte words either way.
 @group(0) @binding(3) var<storage, read_write> out_: array<atomic<u32>>;
-@group(0) @binding(4) var<storage, read_write> params: GatedRmsParams;
 
+// The shared prefix is written out once per arm rather than shared between
+// them, because a WGSL struct cannot be extended: the strided form's pitch is
+// a THIRD FIELD and not a second block, for the reason the header gives at
+// length.
 //#if defined(PIE_STRIDED)
-struct Strided { row_pitch: i32 }
-@group(1) @binding(0) var<uniform> strided: Strided;
+struct Params {
+    eps: f32,
+    vd: u32,
+    row_pitch: i32,
+}
+//#else
+struct Params {
+    eps: f32,
+    vd: u32,
+}
 //#endif
+@group(1) @binding(0) var<uniform> params: Params;
 
 // The half-index split, one reader per binding. `pie_bf16_at` takes a WORD
 // rather than the buffer because core WGSL allows a pointer parameter only in
@@ -138,7 +171,7 @@ fn main(
 //#if defined(PIE_STRIDED)
     // `.z` is the token and `.y` the value head, and the token's pitch is a
     // scalar because a prefill's heads are packed inside a wider row.
-    let base = wg.z * u32(strided.row_pitch) + wg.y * vd;
+    let base = wg.z * u32(params.row_pitch) + wg.y * vd;
 //#else
     // Densely packed: the head's index is the grid's own row-major fold, which
     // is why this arm needs `num_workgroups` and the strided one does not.

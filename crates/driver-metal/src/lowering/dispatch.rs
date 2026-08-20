@@ -408,7 +408,8 @@ fn widths<'a>(lowered: &'a Lowered, launch: &Launch) -> impl DoubleEndedIterator
         .iter()
         .filter_map(|arg| match arg {
             Arg::Arena { width, .. } | Arg::Named { width, .. } => Some(*width),
-            Arg::Weight(_) => None,
+            // A raise has no row width to contribute; see `Arg::Raised`.
+            Arg::Weight(_) | Arg::Raised { .. } => None,
         })
 }
 
@@ -837,6 +838,8 @@ mod tests {
     /// One launch of `symbol` over `rows`, with the args given.
     fn one(symbol: &str, rows: u32, args: Vec<Arg>) -> Lowered {
         Lowered {
+            // A hand-built lowering states no per-argument rows; zero is "no opinion".
+            arg_rows: Vec::new(),
             // One request: these fixtures state one row.
             n_requests: 1,
             // A dispatch fixture is one launch, not a whole fire, so it has no

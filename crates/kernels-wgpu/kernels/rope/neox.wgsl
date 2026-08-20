@@ -17,49 +17,40 @@
 // `inv_freq` is buffer 3 and `head_dim` is 4 -- is how a rotation reads the
 // frequency table's address as its head width.
 //
-// ## Why the workgroup is ONE invocation
+// ## Why the workgroup was ONE invocation, and is not any more
 //
-// The body reads two numbers off the GRID: the rotated pair count (`grid.x`)
-// and the head count (`grid.y`). The first is a STRIDE -- the partner of
-// channel `i` is channel `i + pairs` -- so it has to be exact. A wider
-// workgroup would make the host round the launch up to a multiple of it, and
-// `num_workgroups.x * width` would then overstate the rotary half by whatever
-// the round-up added: every pair would rotate against the wrong partner, in a
-// tensor that has already been overwritten. One invocation per workgroup makes
-// `dispatch_workgroups(pairs, heads, rows)` reproduce `LaunchRule::Rope`'s grid
-// exactly, which is the same choice `kernels-vulkan` makes for the same reason.
+// The body used to read two numbers off the GRID: the rotated pair count
+// (`num_workgroups.x`) and the head count (`num_workgroups.y`). The first is
+// a STRIDE -- the partner of channel `i` is channel `i + pairs` -- so it has
+// to be EXACT, and a wider workgroup makes the host round the launch up to a
+// multiple of it. Every pair would then rotate against the wrong partner, in
+// a tensor that has already been overwritten. So the workgroup was one
+// invocation, which made `dispatch_workgroups(pairs, heads, rows)` reproduce
+// `LaunchRule::Rope`'s grid exactly.
 //
-// ## What that choice costs, which nobody had weighed
-//
-// The paragraph above is right about the hazard and silent about the price.
+// The price of that was never small and had been measured on both backends.
 // `kernels-vulkan: fuse the per-head RMS norm with the NEOX rotation` weighed
-// it on the sibling and found the same shape: *"`neox.slang` is
-// `[numthreads(1, 1, 1)]`, so a 512-token prefill dispatches 524288 one-thread
-// workgroups -- widening that grid alone would recover most of the 270 us with
-// no fusion."*
+// the sibling: *"`neox.slang` is `[numthreads(1, 1, 1)]`, so a 512-token
+// prefill dispatches 524288 one-thread workgroups -- widening that grid alone
+// would recover most of the 270 us with no fusion."* On an M4 with
+// Llama-3.2-1B this file was 32 launches of a 1024-workgroup grid per decoded
+// token, at an occupancy of one lane in thirty-two, and `driver-wgpu`'s
+// `which_kernels_a_prefill_spends_its_gpu_time_in` counted 56 `neox_mb`
+// rectangles in a prefill fire of 564 -- one launch in ten.
 //
-// That number is this backend's too, because it is a property of the model and
-// not of the language. qwen3-0.6B rotates a whole 128-wide head over 16 query
-// heads, so a 512-row prefill is `64 pairs * 16 heads * 512 rows` = **524,288
-// workgroups of one thread each**, and `driver-wgpu`'s
-// `which_kernels_a_prefill_spends_its_gpu_time_in` counts 56 `neox_mb`
-// rectangles in a fire that has 564 -- one launch in ten, at an occupancy of
-// 1/64th of a subgroup.
+// ## The way out was already in the signature
 //
-// ## The way out is already in the signature
+// The hazard was only that `pairs` came off the grid. It did not have to:
+// every row of `rope::neox` ALREADY TOOK `rotary: Const<i32>` and then did
+// not forward it. It is forwarded now, as the LAST field of every one of the
+// three blocks below, and `pairs` is read from it. The x axis is therefore
+// free, and `rope_grid` divides it twice: by two, because an invocation owns
+// a whole four-byte WORD and so covers two pairs -- the old grid launched a
+// workgroup per pair and half of them returned at the guard -- and then by
+// the workgroup width. The `if (i0 >= pairs) { return; }` that was already
+// here covers both round-ups.
 //
-// The hazard is only that `pairs` is read off `num_workgroups`. It does not
-// have to be: `rope::neox_mb` ALREADY TAKES `rotary: ParamOr<3,
-// keys::RotaryWidth, i32>` and then does not forward it -- the dispatch passes
-// `[x, position, scale, base, head_dim]` and stops. Adding it to the block and
-// reading `pairs` from `params` instead of `grid.x` frees the x axis to be
-// widened by any factor, with the existing `if (i0 >= pairs) { return; }`
-// already covering the round-up the paragraph above is afraid of.
-//
-// Not done here. It touches seven instantiations, the block layout every caller
-// builds, and the partial-rotary arm gemma-4 needs, and the sibling's version
-// of this work landed with two purpose-written correctness tests beside it.
-// Recorded rather than attempted, with the count that says what it is worth.
+// y and z are untouched, so `num_workgroups.y` is still an exact head count.
 //
 // ## In place, and two bf16 to a word
 //
@@ -103,14 +94,14 @@
 //#endif
 
 //#if defined(PIE_FREQS)
-struct Params { scale: f32, head_dim: i32, mscale: f32 }
+struct Params { scale: f32, head_dim: i32, mscale: f32, rotary: i32 }
 //#elif defined(PIE_STRIDED)
 // A prefill's scratch rows are a uniform `row_pitch` apart -- the widest tensor
 // in the layout -- which is wider than the packed `n_head * head_dim` stride
 // the batched form derives, so the packed one walks into the next row.
-struct Params { scale: f32, base: f32, head_dim: i32, row_pitch: i32 }
+struct Params { scale: f32, base: f32, head_dim: i32, row_pitch: i32, rotary: i32 }
 //#else
-struct Params { scale: f32, base: f32, head_dim: i32 }
+struct Params { scale: f32, base: f32, head_dim: i32, rotary: i32 }
 //#endif
 @group(1) @binding(0) var<uniform> params: Params;
 
@@ -148,23 +139,31 @@ fn pie_rotate(x1: f32, x2: f32, theta: f32, gain: f32) -> vec2<f32> {
     return vec2<f32>(gain * (x1 * c - x2 * s), gain * (x1 * s + x2 * c));
 }
 
-@compute @workgroup_size(1)
+// One Apple simdgroup on the axis that was a workgroup per pair. Must match
+// `kernels_wgpu::rope::NEOX_LANES`, which is what divides the grid by it.
+const PIE_LANES = 32u;
+
+@compute @workgroup_size(PIE_LANES)
 fn main(
-    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(global_invocation_id) gid: vec3<u32>,
     @builtin(num_workgroups) grid: vec3<u32>,
 ) {
     // This invocation owns rotary channels `2t` and `2t+1`, which is one word.
-    let t = wg.x;
-    let h = wg.y;
+    let t = gid.x;
+    // y and z are one invocation wide, so these are still the workgroup's.
+    let h = gid.y;
 //#if defined(PIE_DECODE)
     // One token, so one position, and the grid has no row axis to read.
     let row = 0u;
 //#else
-    let row = wg.z;
+    let row = gid.z;
 //#endif
 
-    // EXACT, because the workgroup is one invocation. See the header.
-    let pairs = grid.x;
+    // OFF THE BLOCK, not the grid: the x axis is rounded up to a whole
+    // workgroup and to a whole word, so `num_workgroups.x` no longer states
+    // this. `grid.y` still does state the head count -- that axis is one
+    // invocation wide and is not rounded.
+    let pairs = u32(params.rotary) >> 1u;
     let n_head = grid.y;
     let head_dim = u32(params.head_dim);
 

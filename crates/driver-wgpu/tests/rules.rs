@@ -483,6 +483,12 @@ fn the_first_ported_routine_asks_for_the_grid_its_row_asked_for() {
             kernels::routine::In { ptr: Tensor::new(0), rows: 1, width: w },
             kernels::routine::In { ptr: Tensor::new(1), rows: 1, width: w },
             kernels::routine::Out { ptr: Tensor::new(2), rows: 1, width: w },
+            // THE SCALE IS A MARK NOW. It reaches no grid -- this test asserts
+            // the lane rule and nothing else -- so the value is the honest one
+            // rather than a placeholder: `layout/ple_combine.wgsl` divides the
+            // projection by root two, and `kernels-vulkan`'s twin of this test
+            // states the same constant.
+            kernels::Const::new(core::f32::consts::FRAC_1_SQRT_2),
         )
         .expect("the body dispatches");
         let lanes = to.seen.borrow().expect("it dispatched once");

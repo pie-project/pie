@@ -2,10 +2,16 @@
 //
 // A statement and not a mode -- a deployment without one names nothing here,
 // rather than passing an infinite cap and paying for a `tanh` that is the
-// identity. The row's third operand is a `Buf`, so the cap arrives as a STRUCT
-// a storage buffer binds and this file declares no `@group(1)`; the old
-// per-row vocabulary bound stays unused, because the elementwise launch already
-// is the whole extent.
+// identity.
+//
+// THE CAP IS A MARK, NOT A STRUCT. It used to arrive as `SoftcapParams { cap,
+// unused }` on a `@group(0)` storage binding -- MLX's ABI, carried here
+// through Metal and Vulkan -- with a second word nothing read, held only so
+// the struct kept its size. The routine states `cap: Const<f32>` now and
+// `driver-wgpu::lowering::routine::bind` packs it into the `@group(1)` block,
+// which is the same word of the same `Lowered::params` run reached by its
+// index instead of by a struct field. The old per-row vocabulary bound stays
+// gone, because the elementwise launch already is the whole extent.
 
 //#include "common/bf16.inc.wgsl"
 //#include "common/math.inc.wgsl"
@@ -13,8 +19,8 @@
 @group(0) @binding(0) var<storage, read_write> logits: array<u32>;
 @group(0) @binding(1) var<storage, read_write> out_: array<u32>;
 
-struct SoftcapParams { cap: f32, unused: u32 }
-@group(0) @binding(2) var<storage, read_write> params: SoftcapParams;
+struct Params { cap: f32 }
+@group(1) @binding(0) var<uniform> params: Params;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {

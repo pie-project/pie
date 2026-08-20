@@ -4096,7 +4096,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.0.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -4258,7 +4258,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.0.mlp_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -4318,7 +4318,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.1.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -4480,7 +4480,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.1.mlp_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -4540,7 +4540,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.2.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -4702,7 +4702,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.2.mlp_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -4762,7 +4762,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.3.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -4838,8 +4838,7 @@
       "kind": {
         "RmsnormPerHead": {
           "weight": "layer.3.q_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
+          "head_dim": 256
         }
       },
       "inputs": [
@@ -4854,8 +4853,7 @@
       "kind": {
         "RmsnormPerHead": {
           "weight": "layer.3.k_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
+          "head_dim": 256
         }
       },
       "inputs": [
@@ -4941,7 +4939,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.3.mlp_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -5001,7 +4999,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.4.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -5163,7 +5161,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.4.mlp_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -5223,7 +5221,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.5.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -5385,7 +5383,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.5.mlp_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -5445,7 +5443,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.6.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -5607,7 +5605,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.6.mlp_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -5667,7 +5665,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.7.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -5743,8 +5741,7 @@
       "kind": {
         "RmsnormPerHead": {
           "weight": "layer.7.q_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
+          "head_dim": 256
         }
       },
       "inputs": [
@@ -5759,8 +5756,7 @@
       "kind": {
         "RmsnormPerHead": {
           "weight": "layer.7.k_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
+          "head_dim": 256
         }
       },
       "inputs": [
@@ -5846,7 +5842,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.7.mlp_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -5906,7 +5902,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.8.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -6068,7 +6064,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.8.mlp_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -6128,7 +6124,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.9.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -6290,7 +6286,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.9.mlp_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -6350,7 +6346,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.10.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -6512,7 +6508,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.10.mlp_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -6572,7 +6568,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.11.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -6648,8 +6644,7 @@
       "kind": {
         "RmsnormPerHead": {
           "weight": "layer.11.q_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
+          "head_dim": 256
         }
       },
       "inputs": [
@@ -6664,8 +6659,7 @@
       "kind": {
         "RmsnormPerHead": {
           "weight": "layer.11.k_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
+          "head_dim": 256
         }
       },
       "inputs": [
@@ -6751,7 +6745,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.11.mlp_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -6811,7 +6805,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.12.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -6973,7 +6967,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.12.mlp_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -7033,7 +7027,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.13.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -7195,7 +7189,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.13.mlp_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -7255,7 +7249,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.14.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -7417,7 +7411,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.14.mlp_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -7477,7 +7471,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.15.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -7553,8 +7547,7 @@
       "kind": {
         "RmsnormPerHead": {
           "weight": "layer.15.q_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
+          "head_dim": 256
         }
       },
       "inputs": [
@@ -7569,8 +7562,7 @@
       "kind": {
         "RmsnormPerHead": {
           "weight": "layer.15.k_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
+          "head_dim": 256
         }
       },
       "inputs": [
@@ -7656,7 +7648,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.15.mlp_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -7716,7 +7708,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.16.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -7878,7 +7870,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.16.mlp_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -7938,7 +7930,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.17.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -8100,7 +8092,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.17.mlp_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -8160,7 +8152,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.18.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -8322,7 +8314,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.18.mlp_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -8382,7 +8374,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.19.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -8458,8 +8450,7 @@
       "kind": {
         "RmsnormPerHead": {
           "weight": "layer.19.q_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
+          "head_dim": 256
         }
       },
       "inputs": [
@@ -8474,8 +8465,7 @@
       "kind": {
         "RmsnormPerHead": {
           "weight": "layer.19.k_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
+          "head_dim": 256
         }
       },
       "inputs": [
@@ -8561,7 +8551,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.19.mlp_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -8621,7 +8611,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.20.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -8783,7 +8773,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.20.mlp_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -8843,7 +8833,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.21.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -9005,7 +8995,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.21.mlp_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -9065,7 +9055,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.22.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -9227,7 +9217,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.22.mlp_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -9287,7 +9277,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.23.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -9363,8 +9353,7 @@
       "kind": {
         "RmsnormPerHead": {
           "weight": "layer.23.q_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
+          "head_dim": 256
         }
       },
       "inputs": [
@@ -9379,8 +9368,7 @@
       "kind": {
         "RmsnormPerHead": {
           "weight": "layer.23.k_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
+          "head_dim": 256
         }
       },
       "inputs": [
@@ -9466,7 +9454,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.23.mlp_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -9526,7 +9514,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "final_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [

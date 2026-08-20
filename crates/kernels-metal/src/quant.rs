@@ -2960,12 +2960,16 @@ pub fn encode_u4_bf16(
     input: In<Tensor<bf16>>,
     codes: Out<Tensor<u32>>,
     scales: Out<Tensor<bf16>>,
-    biases: Out<Tensor<bf16>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
+    biases: Out<Tensor<bf16>>,
+    // THE GROUP SIZE, WHICH THE STATEMENT STATES. `EncodeParams`' other field
+    // is the group COUNT, which is `keys::Rows` and therefore the body's --
+    // so the run is derived-then-stated, the same shape `layout/row_gather`
+    // has, and `quant/transcode.wgsl` already read it this way.
+    group_size: Const<i32>) -> Result<(), Refusal> {
     let groups = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
         Fire::at(TRANSCODE_FILE, "affine_encode_u4_bf16").apply(Grid::of(elementwise(groups, 1)?, [GROUP_X, 1, 1])),
-        &[input.arg(), codes.arg(), scales.arg(), biases.arg(), params],
+        &[input.arg(), codes.arg(), scales.arg(), biases.arg(), groups.arg(), group_size.arg()],
     )
 }
 
@@ -2984,12 +2988,13 @@ pub fn encode_u4_f32(
     input: In<Tensor<bf16>>,
     codes: Out<Tensor<u32>>,
     scales: Out<Tensor<bf16>>,
-    biases: Out<Tensor<bf16>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
+    biases: Out<Tensor<bf16>>,
+    // See [`encode_u4_bf16`]: the count is the body's and the size is stated.
+    group_size: Const<i32>) -> Result<(), Refusal> {
     let groups = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
         Fire::at(TRANSCODE_FILE, "affine_encode_u4_f32").apply(Grid::of(elementwise(groups, 1)?, [GROUP_X, 1, 1])),
-        &[input.arg(), codes.arg(), scales.arg(), biases.arg(), params],
+        &[input.arg(), codes.arg(), scales.arg(), biases.arg(), groups.arg(), group_size.arg()],
     )
 }
 
@@ -3006,12 +3011,14 @@ pub fn mxfp4_dequant_bf16(
     ctx: &Ctx<'_>,
     payload: In<Tensor<u8>>,
     exponents: In<Tensor<u8>>,
-    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
+    out: Out<Tensor<bf16>>,
+    // See [`encode_u4_bf16`]: `DequantParams`' block COUNT is `keys::Rows` and
+    // the block SIZE is what the statement states.
+    block_size: Const<i32>) -> Result<(), Refusal> {
     let blocks = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
         Fire::at(TRANSCODE_FILE, "mxfp4_dequant_bf16").apply(Grid::of(elementwise(blocks, 1)?, [GROUP_X, 1, 1])),
-        &[payload.arg(), exponents.arg(), out.arg(), params],
+        &[payload.arg(), exponents.arg(), out.arg(), blocks.arg(), block_size.arg()],
     )
 }
 
@@ -3405,7 +3412,8 @@ mod tests {
             In::new(Tensor::<bf16>::new(1)),
             Out::new(Tensor::<u32>::new(2)),
             Out::new(Tensor::<bf16>::new(3)),
-            Out::new(Tensor::<bf16>::new(4)))
+            Out::new(Tensor::<bf16>::new(4)),
+            Const::new(64))
         .expect("a launch");
         let calls = seen.calls.borrow();
         let (fire, args) = &calls[0];

@@ -1,11 +1,16 @@
 // The fused QKV projection, split back into three tensors.
 //
-// The row states five buffers and no scalars: `params` is a `Buf`, so the two
-// widths are a STRUCT the driver fills rather than fields of a uniform block,
-// and this file declares no `@group(1)` at all. Read the row through
-// `kernels_wgpu::bindings` and `kernels_wgpu::uniform_size` rather than
-// counting: the numbers below are the row's, not Metal's. The deleted
-// `dump_layout` example only printed that answer.
+// THE TWO WIDTHS ARE MARKS, NOT A STRUCT. They used to arrive as
+// `SplitQkvParams { q_width, kv_width }` on a fifth `@group(0)` storage
+// binding -- MLX's buffer-4 layout, carried here through Metal and Vulkan --
+// so the row stated five buffers and no scalars and this file declared no
+// `@group(1)` at all. The routine states `q_width: Const<u32>` and
+// `kv_width: Const<u32>` now and `driver-wgpu::lowering::routine::bind` packs
+// the pair into the `@group(1)` block, which is words 0 and 1 of the same
+// `Lowered::params` run the struct was staged from, reached by index instead
+// of by field. THE ORDER IS THE STRUCT'S ORDER, because it is the statement's:
+// `q_width` is word 0 and `kv_width` is word 1, and swapping the two marks
+// would cut both boundaries in the wrong place rather than refuse.
 
 //#include "common/bf16.inc.wgsl"
 
@@ -14,8 +19,8 @@
 @group(0) @binding(2) var<storage, read_write> k: array<u32>;
 @group(0) @binding(3) var<storage, read_write> v: array<u32>;
 
-struct SplitQkvParams { q_width: u32, kv_width: u32 }
-@group(0) @binding(4) var<storage, read_write> params: SplitQkvParams;
+struct Params { q_width: u32, kv_width: u32 }
+@group(1) @binding(0) var<uniform> params: Params;
 
 // The bf16 half-index unpack. `pie_load_bf16(&packed, i)` is the shared answer
 // and cannot be CALLED: its `ptr<storage, array<u32>, read>` parameter is

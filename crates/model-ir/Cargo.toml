@@ -35,3 +35,10 @@ serde = { version = "1.0", features = ["derive"] }
 kernels = { path = "../kernels" }
 kernels-cuda = { path = "../kernels-cuda", default-features = false }
 kernels-metal = { path = "../kernels-metal", default-features = false }
+
+# The round-trip half of `trace::builder`'s tests: a raise is a FIELD on
+# `ValueInfo` with `skip_serializing_if`, so "it survives the wire" is a claim
+# only a real (de)serialization can make. `model` already round-trips a
+# `ForwardPlan` through this same crate in its own tests.
+[dev-dependencies]
+serde_json = "1.0"

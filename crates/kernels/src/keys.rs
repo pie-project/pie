@@ -544,76 +544,21 @@ fact!(/// Which rows of the fire's rectangle the plan actually serves.
 // naming them exposes nothing a fire did not bake. (`.wiki/kilimanjaro.md` §4
 // says model-constant; bucket is the accurate word.)
 
-fact!(/// Which request each scheduled CTA serves.
-    Fa2DecodeRequestIndices = "fa2.decode.request_indices" => Source::Named("fa2.decode.request_indices") => *const i32);
 
-fact!(/// Which KV tile each scheduled CTA serves.
-    Fa2DecodeKvTileIndices = "fa2.decode.kv_tile_indices" => Source::Named("fa2.decode.kv_tile_indices") => *const i32);
 
-fact!(/// Where each request's output rows begin.
-    Fa2DecodeOIndptr = "fa2.decode.o_indptr" => Source::Named("fa2.decode.o_indptr") => *const i32);
 
-fact!(/// How many KV entries one chunk covers, device-side.
-    Fa2DecodeKvChunkSize = "fa2.decode.kv_chunk_size" => Source::Named("fa2.decode.kv_chunk_size") => *const i32);
 
-fact!(/// Which scheduled blocks a graph replay may run.
-    ///
-    /// NULL IS THE ANSWER, not an absence: the planner carves this only under
-    /// `split_kv && enable_cuda_graph`, and a plan that carved neither has no
-    /// mask for the kernel to consult.
-    ///
-    /// `u8` and not `bool` for [`RowValid`]'s reason.
-    Fa2DecodeBlockValidMask = "fa2.decode.block_valid_mask" => Source::Named("fa2.decode.block_valid_mask") => *const u8);
 
-fact!(/// The split-KV partial OUTPUT scratch, carved from the float workspace.
-    ///
-    /// Null when the plan did not split. See [`Fa2DecodeSplitKv`].
-    Fa2DecodeTmpV = "fa2.decode.tmp_v" => Source::Named("fa2.decode.tmp_v") => *mut f32);
 
-fact!(/// The split-KV partial LSE scratch. [`Fa2DecodeTmpV`]'s pair.
-    Fa2DecodeTmpS = "fa2.decode.tmp_s" => Source::Named("fa2.decode.tmp_s") => *mut f32);
 
-fact!(/// How many CTAs the schedule launches.
-    ///
-    /// `max_grid_size / gdy` when the plan split, the request count when it
-    /// did not (`plan/decode.rs:95-107`) -- head geometry and the bucket,
-    /// never the fire's contents.
-    Fa2DecodePaddedBatch = "fa2.decode.padded_batch" => Source::Named("fa2.decode.padded_batch") => i32);
 
-fact!(/// Whether the schedule splits one request's KV across CTAs.
-    ///
-    /// The discriminator for the fold: false means the kernel wrote the
-    /// caller's `o` directly and there is nothing to merge.
-    Fa2DecodeSplitKv = "fa2.decode.split_kv" => Source::Named("fa2.decode.split_kv") => bool);
 
-fact!(/// How many requests the PLAN was built over.
-    ///
-    /// NOT [`RequestCount`]. That is the fire's; this is the count the
-    /// schedule's vectors were sized at, and a plan raised for one bucket
-    /// and read under another differs in exactly this number.
-    Fa2DecodeRequests = "fa2.decode.requests" => Source::Named("fa2.decode.requests") => i32);
 
-fact!(/// The query head count the plan was built at. See [`Fa2DecodeRequests`].
-    Fa2DecodeNumQHeads = "fa2.decode.num_q_heads" => Source::Named("fa2.decode.num_q_heads") => i32);
 
-fact!(/// The KV head count the plan was built at.
-    Fa2DecodeNumKvHeads = "fa2.decode.num_kv_heads" => Source::Named("fa2.decode.num_kv_heads") => i32);
 
-fact!(/// The head width the plan was built at.
-    Fa2DecodeHeadDim = "fa2.decode.head_dim" => Source::Named("fa2.decode.head_dim") => i32);
 
-fact!(/// The page size the plan was built at.
-    Fa2DecodePageSize = "fa2.decode.page_size" => Source::Named("fa2.decode.page_size") => i32);
 
-fact!(/// Whether the cache the plan addresses is HND rather than NHD.
-    Fa2DecodeHndLayout = "fa2.decode.hnd_layout" => Source::Named("fa2.decode.hnd_layout") => bool);
 
-fact!(/// Whether the plan's variant attends the whole context.
-    ///
-    /// Picks the launcher's arm, and `window_left` is an ARGUMENT that the
-    /// body reads alongside it -- the two together are what `decode_arm`
-    /// switches on.
-    Fa2DecodeFullAttention = "fa2.decode.full_attention" => Source::Named("fa2.decode.full_attention") => bool);
 
 // ── The fa2 prefill plan, unfolded ──
 //
@@ -622,93 +567,123 @@ fact!(/// Whether the plan's variant attends the whole context.
 // against. The six with no `fa2.decode.` twin are what a prefill schedule has
 // and a decode one does not.
 
-fact!(/// Which request each scheduled CTA serves.
-    Fa2PrefillRequestIndices = "fa2.prefill.request_indices" => Source::Named("fa2.prefill.request_indices") => *const i32);
 
-fact!(/// Which QO tile each scheduled CTA serves. No decode twin: a decode
-    /// step has one query row per request.
-    Fa2PrefillQoTileIndices = "fa2.prefill.qo_tile_indices" => Source::Named("fa2.prefill.qo_tile_indices") => *const i32);
 
-fact!(/// Which KV tile each scheduled CTA serves.
-    Fa2PrefillKvTileIndices = "fa2.prefill.kv_tile_indices" => Source::Named("fa2.prefill.kv_tile_indices") => *const i32);
 
-fact!(/// Where each merged ROW's partials start, `[total_rows + 1]`.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ── The plan descriptor's H2D, which a launcher must make before it fires ──
+//
+// `arms/fa2.rs` held eight arms alive on this copy, and the reason was never
+// that a `Source` could not name the bytes. It was that the copy is WORK: the
+// arm ran it between resolving the operands and launching, so a column that
+// bound every argument still left something undone. These are the copy's
+// operands, and the LAUNCHER makes it -- which keeps the copy inside the graph
+// capture where a replay re-runs it, exactly where the arm had it.
+//
+// **The source address is PINNED and fixed for the process.** That is what
+// makes a captured node correct: `plan::upload_int_plan`'s contract is that
+// the host buffer is `PinnedBytes`, updated in place each fire, so *"the
+// address a captured node bakes is the address the next fire writes into"*.
+// An address that moved would replay a stale schedule and say nothing.
+//
+// SPLIT BY FAMILY, like the sixteen decode leaves and the twenty-two prefill
+// ones above, and for a harder reason than symmetry: `AttnCtx` holds TWO
+// workspace carves and a plan writes its schedule into the one it was raised
+// against. One key pair would have to guess which, and a prefill descriptor
+// landing in the decode carve clobbers it with no fault and no wrong address.
+
+
+
+
+
+
+
+// ── What a launcher that plans its OWN fire needs ──────────────────────────
+//
+// The planless prefill is the one FA2 launcher whose plan does not exist when
+// it is called: `arms/fa2.rs`'s `fa2_prefill_planless` walked the HOST CSRs,
+// called `plan::plan_prefill` and mutated the cache, and only then launched.
+// That is why its `prefill_plan` parameter is `#[unbound]` -- nothing publishes
+// the aggregate before the fire, so no column could ever answer for it.
+//
+// These four are what the planning READS, and naming them is what lets the
+// planning move into the launcher: the cache to fill, the two host CSRs to
+// walk, and how many requests they describe. Everything else the planner takes
+// -- the layer's geometry, the workspace's two byte counts, the window -- is
+// already a fact this driver answers.
+//
+// HOST addresses, all three pointers. Nothing checks that and nothing can; see
+// [`KvPageIndices`] for why a declared pointee here is documentation.
+
+fact!(/// The prefill plan CACHE, for a launcher that fills it itself.
     ///
-    /// Null when the plan did not split. Prefill folds by row where decode
-    /// folds by request, which is why this exists and
-    /// [`Fa2PrefillOIndptr`] is not reused for it.
-    Fa2PrefillMergeIndptr = "fa2.prefill.merge_indptr" => Source::Named("fa2.prefill.merge_indptr") => *const i32);
+    /// `*mut u8` because the shape is `kernels-cuda`'s own and the driver
+    /// holds it only as a boxed allocation it hands back by address. A
+    /// launcher that takes this is claiming exclusive use of it for the
+    /// launch, which a fire grants by dispatching one statement at a time.
+    Fa2PrefillPlanCache = "fa2.prefill.plan_cache" => Source::Named("fa2.prefill.plan_cache") => *mut u8);
 
-fact!(/// Where each request's output rows begin.
-    Fa2PrefillOIndptr = "fa2.prefill.o_indptr" => Source::Named("fa2.prefill.o_indptr") => *const i32);
+fact!(/// The HOST query-offset CSR the planner walks, `requests + 1` entries.
+    QoIndptrHost = "qo_indptr_h" => Source::Named("qo_indptr_h") => *const u32);
 
-fact!(/// How many KV entries one chunk covers, device-side.
-    Fa2PrefillKvChunkSize = "fa2.prefill.kv_chunk_size" => Source::Named("fa2.prefill.kv_chunk_size") => *const i32);
+fact!(/// The HOST KV-page CSR the planner walks. [`QoIndptrHost`]'s pair, and
+    /// its last entry is the batch's page count.
+    KvPageIndptrHost = "kv_page_indptr_h" => Source::Named("kv_page_indptr_h") => *const u32);
 
-fact!(/// Which scheduled blocks a graph replay may run.
+fact!(/// How many requests this fire serves, which is both CSRs' length minus
+    /// one.
     ///
-    /// Null is the answer, as [`Fa2DecodeBlockValidMask`]'s, and `u8` for the
-    /// same reason.
-    Fa2PrefillBlockValidMask = "fa2.prefill.block_valid_mask" => Source::Named("fa2.prefill.block_valid_mask") => *const u8);
+    /// NOT [`Rows`]: a prefill request covers many rows, and the planner
+    /// wants the request count where the launch geometry wants the row count.
+    FireRequests = "fire.requests" => Source::Named("fire.requests") => i32);
 
-fact!(/// The split-KV partial OUTPUT scratch, carved from the float workspace.
+// ── The two ragged sinks a CAPTURING or MASKED attention reads ─────────────
+//
+// Four bare `*mut f32` / `*const i32` parameters on three FA2 launchers, which
+// is what kept those three `#[routine(untraced)]`: a bare pointer is not a
+// mark, so the row carried no source column at all. The arms filled them off
+// `AttnCtx` directly. These are that, said as facts -- which is what lets the
+// three carry columns and stop being the last uncolumned rows a text names.
+//
+// NULL IS AN ANSWER on all four. A capture that captures nothing and a mask
+// that masks nothing are both legitimate; the launchers' own tests decide,
+// exactly as they did when an arm handed the null over.
+
+fact!(/// Where a capturing attention writes its pre-softmax logits.
+    AttnScoreOut = "attn.score_out" => Source::Named("attn.score_out") => *mut f32);
+
+fact!(/// The score sink's CSR: where each request's scores begin.
+    AttnScoreIndptr = "attn.score_indptr" => Source::Named("attn.score_indptr") => *const i32);
+
+fact!(/// The custom attention mask, one byte per (query, key) the CSR pairs.
+    AttnMask = "attn.mask" => Source::Named("attn.mask") => *const u8);
+
+fact!(/// The custom mask's CSR. [`AttnMask`]'s pair.
+    AttnMaskIndptr = "attn.mask_indptr" => Source::Named("attn.mask_indptr") => *const i32);
+
+fact!(/// How wide a window the score capture records.
     ///
-    /// Null when the plan did not split. See [`Fa2PrefillSplitKv`].
-    Fa2PrefillTmpV = "fa2.prefill.tmp_v" => Source::Named("fa2.prefill.tmp_v") => *mut f32);
-
-fact!(/// The split-KV partial LSE scratch. [`Fa2PrefillTmpV`]'s pair.
-    Fa2PrefillTmpS = "fa2.prefill.tmp_s" => Source::Named("fa2.prefill.tmp_s") => *mut f32);
-
-fact!(/// How many CTAs the schedule launches.
-    Fa2PrefillPaddedBatch = "fa2.prefill.padded_batch" => Source::Named("fa2.prefill.padded_batch") => i32);
-
-fact!(/// Whether the schedule splits one request's KV across CTAs.
-    Fa2PrefillSplitKv = "fa2.prefill.split_kv" => Source::Named("fa2.prefill.split_kv") => bool);
-
-fact!(/// How many QO rows the schedule covers.
-    ///
-    /// `max_total_num_rows`, which the fold folds. The neighbouring field in
-    /// the block is `total_num_rows`, a DEVICE pointer left null on both
-    /// sides here; the names differ by two characters and the types by eight
-    /// bytes.
-    Fa2PrefillTotalRows = "fa2.prefill.total_rows" => Source::Named("fa2.prefill.total_rows") => i32);
-
-fact!(/// The `CTA_TILE_Q` the plan was split against, which names the root.
-    ///
-    /// Read back, never recomputed: a fire that chose its own would index a
-    /// work list built for a different tile.
-    Fa2PrefillCtaTileQ = "fa2.prefill.cta_tile_q" => Source::Named("fa2.prefill.cta_tile_q") => u32);
-
-fact!(/// How many requests the PLAN was built over. See [`Fa2DecodeRequests`].
-    Fa2PrefillRequests = "fa2.prefill.requests" => Source::Named("fa2.prefill.requests") => i32);
-
-fact!(/// The query head count the plan was built at.
-    Fa2PrefillNumQHeads = "fa2.prefill.num_q_heads" => Source::Named("fa2.prefill.num_q_heads") => i32);
-
-fact!(/// The KV head count the plan was built at.
-    Fa2PrefillNumKvHeads = "fa2.prefill.num_kv_heads" => Source::Named("fa2.prefill.num_kv_heads") => i32);
-
-fact!(/// The head width the plan was built at.
-    Fa2PrefillHeadDim = "fa2.prefill.head_dim" => Source::Named("fa2.prefill.head_dim") => i32);
-
-fact!(/// The page size the plan was built at.
-    Fa2PrefillPageSize = "fa2.prefill.page_size" => Source::Named("fa2.prefill.page_size") => i32);
-
-fact!(/// The window the plan was SPLIT against, `-1` for full attention.
-    ///
-    /// NOT [`WindowLeft`]. That is the statement's; this is the one planning
-    /// fixed, because the split was sized against it.
-    Fa2PrefillWindowLeft = "fa2.prefill.window_left" => Source::Named("fa2.prefill.window_left") => i32);
-
-fact!(/// Whether the cache the plan addresses is HND rather than NHD.
-    Fa2PrefillHndLayout = "fa2.prefill.hnd_layout" => Source::Named("fa2.prefill.hnd_layout") => bool);
-
-fact!(/// Whether the plan's variant attends the whole context.
-    Fa2PrefillFullAttention = "fa2.prefill.full_attention" => Source::Named("fa2.prefill.full_attention") => bool);
-
-fact!(/// Whether the mask is causal. With [`Fa2PrefillFullAttention`] and the
-    /// soft cap, this picks the launcher's arm.
-    Fa2PrefillCausalMask = "fa2.prefill.causal_mask" => Source::Named("fa2.prefill.causal_mask") => bool);
+    /// The fire's, not the statement's: a capture sink is sized when the fire
+    /// carves it, which is before any statement is bound.
+    AttnScoreWindow = "attn.score_window" => Source::Named("attn.score_window") => u32);
 
 // ── Answered off `cx.kv_layer()`, `cx.plan()` and `cx.weight_suffixed()` ──
 
@@ -783,6 +758,31 @@ fact!(/// The `_bias` plane beside a named weight.
 
 fact!(/// The `_scales` plane beside a named weight.
     WeightScales = "weight._scales" => Source::Named("weight._scales") => *const u8);
+
+// ── The PER-EXPERT pointer arrays a routed decode indexes ──────────────────
+//
+// A bank and an array of pointers INTO that bank are two different addresses,
+// and binding the first where the second belongs reads eight bytes of packed
+// weight data as an address. `arms/quant.rs` said so at the parameter it was
+// filling by hand -- *"`cx.weight(0)` is the bank's own base, and the kernel's
+// first act is `packed_ptrs[expert]`"* -- and that hand-filling was the whole
+// of what kept two arms alive.
+//
+// The distinction cannot come from the weight CHAIN, which is why these are
+// keys: `Const<Tensor<E>>` derives `Or(Named("weight"), Slot(Weight, 0))`, and
+// both halves of that chain answer the bank.
+
+fact!(/// The `_ptrs` array beside a named weight: one device pointer per
+    /// expert, into the bank.
+    ///
+    /// `serve::load::build_moe_expert_ptrs` builds one per plane at load, so
+    /// its absence means the bank's byte count did not divide by the row's
+    /// expert count.
+    WeightExpertPtrs = "weight._ptrs" => Source::Named("weight._ptrs") => *const u8);
+
+fact!(/// The `_scales_ptrs` array beside a named weight. [`WeightExpertPtrs`]'s
+    /// pair, over the scales plane rather than the packed one.
+    WeightExpertScalePtrs = "weight._scales_ptrs" => Source::Named("weight._scales_ptrs") => *const u8);
 
 fact!(/// The `_up_bias` plane — a fused gate/up pair's second half.
     WeightUpBias = "weight._up_bias" => Source::Named("weight._up_bias") => *const u8);
@@ -917,7 +917,7 @@ fact!(/// The statement's zeroth scalar, read as a float.
 // / `Says` type-level arithmetic were six types and five markers between them;
 // each is one line here, and `Env<T, K>` reads all of them.
 
-fact!(/// Every scalar the statement carries, staged as one struct and bound
+fact!(/// Every scalar the statement carries, staged end to end and bound
     /// as one buffer — what `Block<Buf>` used to spell.
     ///
     /// A NAME AND NOT A SHAPE: the block is the params CHANNEL, which is why

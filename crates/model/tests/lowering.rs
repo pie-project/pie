@@ -1057,6 +1057,16 @@ fn every_launch_carries_operands_that_match_the_arena() {
                     "a Named operand must be one the arena declined"
                 ),
                 Arg::Weight(n) => assert!(!n.is_empty()),
+                // A raise is NAMED for the same reason a seam value is: the
+                // backend holds it and the arena declined it.
+                Arg::Raised { value: v, key } => {
+                    assert!(!key.is_empty(), "a raise states the word it was declared by");
+                    assert_eq!(
+                        buffers.offset[*v as usize],
+                        Buffers::NAMED,
+                        "a raise must be one the arena declined"
+                    );
+                }
             }
         }
     }
@@ -1158,7 +1168,7 @@ fn the_buffer_table_crosses_and_agrees_with_the_operands() {
                     );
                     checked += 1;
                 }
-                Arg::Weight(_) => {}
+                Arg::Weight(_) | Arg::Raised { .. } => {}
             }
         }
     }
@@ -1228,6 +1238,7 @@ fn the_epilogue_binds_one_ops_two_operands_to_the_launches() {
                             Arg::Arena { width, .. } => format!("arena/{width}"),
                             Arg::Named { width, .. } => format!("named/{width}"),
                             Arg::Weight(w) => format!("weight/{w}"),
+                            Arg::Raised { key, .. } => format!("raised/{key}"),
                         })
                         .collect(),
                 )
@@ -1491,8 +1502,17 @@ const GDN_FRAGMENT_NOT_IN_METAL: &[&str] = &[
     // did -- and gains it HERE because neither twin is in `KERNELS_METAL`,
     // which is the property this list is about.
     "gemm::act_x_w_acc",
+    // `rmsnorm_bf16` AND NOT `rmsnorm_gemma_bf16`. `semantic()` picks between
+    // the two off `variant.is_plain()`, and `Qwen35GdnFacts::qwen3_5_0_8b`
+    // said `Gemma` on the authority of `qwen3_5_forward.cpp` launching the
+    // gemma symbol -- then corrected itself to `Plain`, because the two
+    // Qwen3.6 checkpoints and `mlx_lm`'s `nn.RMSNorm` for the whole family
+    // both say plain and no 0.8B is staged here to check the C++ against.
+    // The fixture moved and this record did not, which is the drift a ledger
+    // exists to make loud. NEITHER symbol is one Metal states, so the
+    // property this list is about did not change with it.
+    "norm::rmsnorm_bf16",
     "norm::rmsnorm_gated_fp32_in_bf16",
-    "norm::rmsnorm_gemma_bf16",
     "ssm::qwen_gdn_post_conv_prep_bf16",
 ];
 

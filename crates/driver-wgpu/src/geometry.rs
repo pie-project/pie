@@ -452,7 +452,14 @@ pub fn lanes(rule: Rule, dims: Dims, module: Module) -> Result<[u32; 3], Ungeome
         // groups, so no threads ran, its buffer kept the zeros it was
         // allocated with, and every routed token was combined under
         // `sigmoid(0) = 0.5` instead of its own gate.
-        Rule::Qmv => [module.local.at(0) * rows, dims.width.div_ceil(4), 1],
+        // FOUR ROWS TO A WORKGROUP on x, which `driver-vulkan`'s same arm
+        // does not do. `quant/qmv.wgsl`'s `PIE_MT` gives one workgroup four
+        // activation rows against the eight output columns whose weights it
+        // already read, so the extent is the quartered row count -- and
+        // `kernels-wgpu::quant::qmv_grid` is handed `quarters(vecs)` for the
+        // same reason. The Slang module has no such tiling; changing this arm
+        // there would ask for a quarter of the workgroups its shader needs.
+        Rule::Qmv => [module.local.at(0) * rows.div_ceil(4), dims.width.div_ceil(4), 1],
         Rule::Qmm => {
             // The tile comes from the MODULE. Choosing one here would be
             // choosing a decomposition the compiled shader does not have.

@@ -230,123 +230,72 @@ pub static WGPU_ROUTINES: [::kernels::routine::Routine<Plane>];
 /// The slice under the name `#[routine]` registers into.
 pub use WGPU_ROUTINES as ROUTINES;
 
-/// The family tables, concatenated.
+/// EMPTY. Every family has retired its rows.
 ///
-/// A `const fn` fold rather than a `Vec`, so the whole table stays a `&'static`
-/// the compiler can read at load with no allocation — the same shape both
-/// siblings use for the same reason.
-pub static KERNELS: &[KernelSig] = &CONCAT;
-
-
-const FAMILIES: &[&[KernelSig]] = &[
-    attn::KERNELS,
-    layout::KERNELS,
-    mlp::KERNELS,
-    moe::KERNELS,
-    norm::KERNELS,
-    ptir::KERNELS,
-    quant::KERNELS,
-    rope::KERNELS,
-    sample::KERNELS,
-    ssm::KERNELS,
-];
-
-const fn total() -> usize {
-    let mut n = 0;
-    let mut i = 0;
-    while i < FAMILIES.len() {
-        n += FAMILIES[i].len();
-        i += 1;
-    }
-    n
-}
-
-const N: usize = total();
-
-const EMPTY: KernelSig = KernelSig {
-    name: "",
-    symbol: "",
-    whole: false,
-    depth_prefix_plan: false,
-    args: &[],
-    sources: &[],
-    derived: &[],
-    axes: &[],
-};
-
-const fn copy_sig(k: &KernelSig) -> KernelSig {
-    KernelSig {
-        name: k.name,
-        symbol: k.symbol,
-        whole: k.whole,
-        sources: k.sources,
-        derived: k.derived,
-        depth_prefix_plan: k.depth_prefix_plan,
-        args: k.args,
-        axes: k.axes,
-    }
-}
-
-// `static` and not `const`: `KERNELS` borrows it, so a `const` would be
-// materialised at each use site, and this one is thousands of rows.
-static CONCAT: [KernelSig; N] = {
-    let mut out = [EMPTY; N];
-    let mut at = 0;
-    let mut f = 0;
-    while f < FAMILIES.len() {
-        let family = FAMILIES[f];
-        let mut i = 0;
-        while i < family.len() {
-            out[at] = copy_sig(&family[i]);
-            at += 1;
-            i += 1;
-        }
-        f += 1;
-    }
-    out
-};
-
-/// Every entrypoint the table names, sorted.
+/// It is a `&[]` written here rather than ten empty slices folded together:
+/// this was a `FAMILIES` list, a `total()`/`N` const fold, an `EMPTY` filler,
+/// a field-by-field `copy_sig` because `KernelSig` is not `Copy` in a const
+/// context, and a const-evaluated loop that laid the ten end to end so the
+/// whole hundred stayed a `&'static` the compiler could read at load with no
+/// allocation. The last row leaving made all of it a machine for
+/// concatenating nothing — and a machine three columns wide, because every
+/// field added to `KernelSig` had to be threaded through the filler and the
+/// copy to keep it compiling.
 ///
-/// One for one, the set of variants the `// pie:instantiate` directives in
-/// `kernels/` declare.
+/// The NAME stays, for the reason both siblings give at their own copy of this
+/// line: `kernels/tests/shader_backends_agree.rs` reads all three backends
+/// through it, and an empty table and an absent one are the same shape to that
+/// gate but not the same fact. This backend was the LAST with rows, so
+/// `refactor-bigplan.md` §7 Stage 5 — deleting `KernelSig` itself — is now
+/// unblocked on every plane.
+pub static KERNELS: &[KernelSig] = &[];
+
+/// Every entrypoint this backend can dispatch, sorted.
+///
+/// READ OFF THE SHADER TREE, which is the only place a variant is declared: a
+/// `// pie:instantiate` line beside the body it stamps. Nothing in Rust states
+/// the set any more and nothing should — a second statement is a second thing
+/// to keep in step, and this one was kept in step by a test rather than by
+/// construction.
+///
+/// It USED TO be `KERNELS`'s axis product plus a hand-written `RETIRED` list of
+/// the names whose rows had gone. That list existed because retiring a row
+/// deleted the generator of its entrypoints while leaving the shader in the
+/// tree and a routine still firing it, so a sweep keyed on this function would
+/// have read a family that crossed SUCCESSFULLY as a family whose shaders had
+/// vanished, and stopped covering it in silence. Reading the tree answers the
+/// same worry at the source: a shader that is here is in the census, and one
+/// that is not cannot be.
+///
+/// `.wiki/kernel-x/refactor-bigplan.md` §7 Stage 4 is what this completes.
+///
+/// # Panics
+///
+/// If a shader's directives do not parse — which `build.rs` already refused,
+/// so it is a tree that changed under a stale rlib rather than a reachable
+/// state.
 #[must_use]
 pub fn entrypoints() -> Vec<String> {
-    let mut out: Vec<String> = KERNELS.iter().flat_map(KernelSig::entrypoints).collect();
-    out.extend(
-        RETIRED
-            .iter()
-            .flat_map(|family| family.iter().map(|n| (*n).to_owned())),
-    );
-    out.sort();
-    out
+    // PARSED ONCE. `driver_wgpu::Shell::admit` asks this on every open and
+    // `Device`'s binding census walks it, so the walk over thirty-seven
+    // shaders is paid at the first question and not at each one.
+    static CENSUS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    CENSUS
+        .get_or_init(|| {
+            let mut out: Vec<String> = source::declared()
+                .into_iter()
+                .map(|(_, variant)| variant.entrypoint)
+                .collect();
+            out.sort();
+            // A TIER IS NOT A NAME. `@fp16` declares another compile of an
+            // entrypoint that already exists at baseline, so the tiers collapse
+            // into the baselines rather than extending the census — which is
+            // what `every_tier_has_a_baseline_beneath_it` holds up.
+            out.dedup();
+            out
+        })
+        .clone()
 }
-
-/// The entrypoints of the families whose `kernel!` rows have been RETIRED.
-///
-/// The crossing moves who NAMES an entrypoint, not whether it exists: the
-/// shader is still in the tree, `Embedded` still holds it, and the driver
-/// still dispatches it — through `driver-wgpu/src/lowering/arm.rs` rather
-/// than through a row. So the name has to be stated somewhere, or every sweep
-/// keyed on [`entrypoints()`] would read a family that crossed SUCCESSFULLY
-/// as a family whose shaders had vanished, and stop covering it in silence.
-///
-/// This list shrinks to nothing in the other direction: when the last family
-/// crosses, `KERNELS` is empty and this is the whole census. That is
-/// `.wiki/kernel-x/refactor-bigplan.md` §7 Stage 4, and it is why this is a
-/// list of families rather than one flat slice.
-const RETIRED: &[&[&str]] = &[
-    sample::ENTRYPOINTS,
-    ptir::ENTRYPOINTS,
-    mlp::ENTRYPOINTS,
-    norm::ENTRYPOINTS,
-    layout::ENTRYPOINTS,
-    rope::ENTRYPOINTS,
-    quant::ENTRYPOINTS,
-    moe::ENTRYPOINTS,
-    ssm::ENTRYPOINTS,
-    attn::ENTRYPOINTS,
-];
 
 /// The rows that have been retired, by the name their `kernel!` call had.
 ///
@@ -461,12 +410,6 @@ pub fn retired_rows() -> &'static [&'static str] {
     ]
 }
 
-/// Every entrypoint whose row is gone and whose routine now answers for it.
-#[must_use]
-pub fn retired() -> Vec<&'static str> {
-    RETIRED.iter().flat_map(|f| f.iter().copied()).collect()
-}
-
 /// Every routine this backend has crossed.
 ///
 /// The families that have crossed, flattened. One line per family in
@@ -520,10 +463,17 @@ pub enum Binding {
     /// this backend and Vulkan split the two runs, so folding it into the
     /// uniform block would push a word no shader reads and leave the struct
     /// field unwritten — the defect this variant exists to make
-    /// unrepresentable. `layout/row_gather` is the row that has it: it declares
-    /// no uniform block at all while the row states `count`, because `count` is
-    /// the second field of the `RowGatherParams` struct that a storage buffer
-    /// already binds.
+    /// unrepresentable. `layout/row_gather` was the row that had it: it
+    /// declared no uniform block at all while the row stated `count`, because
+    /// `count` was the second field of the `RowGatherParams` struct that a
+    /// storage buffer already bound.
+    ///
+    /// NO ROW HAS IT ANY MORE, and the routine that replaced that one does not
+    /// either. `layout::row_gather` states its row pitch as a `Const<u32>` mark
+    /// and passes the derived request count straight after it, so its
+    /// `@group(1)` block is `{ width, count }` and BOTH words are read. The
+    /// defect this variant guards against was a block that would otherwise be
+    /// empty; a block whose every word the shader reads is not that case.
     Packed,
 }
 
@@ -615,10 +565,14 @@ mod tests {
     // example, and inventing a synthetic row to keep the sentence would be
     // asserting that this file can build a struct, not that the table does.
     //
-    // The claim lives on the routine side now: `layout::row_gather` passes
-    // `InPacked(count)` as a scalar and
-    // `driver-wgpu::lowering::routine::bind` appends it to the storage
-    // block's run rather than giving it a binding.
+    // And the claim has since gone from the routine side too, because the
+    // struct it was about has. `layout::row_gather` used to pass
+    // `InPacked(count)` as a scalar for `driver-wgpu::lowering::routine::bind`
+    // to append to the storage block's run; it states `width` as a `Const<u32>`
+    // mark now and passes the count after it, so `bind` packs the two into the
+    // `@group(1)` uniform in the body's order and `layout/row_gather.wgsl`
+    // declares `struct Params { width: u32, count: u32 }` where it declared a
+    // storage struct and no uniform at all.
     //
     // RETIRED: THE TABLE IS EMPTY, so there is no unstated row to pick.
     //

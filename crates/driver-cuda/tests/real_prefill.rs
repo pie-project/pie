@@ -432,7 +432,7 @@ fn ab(spec: &Spec) {
                     // the arena this frame was built from.
                     (unsafe { arena.as_ptr().cast_const().cast::<u8>().add(*at) }, *width)
                 }
-                Arg::Weight(_) => continue,
+                Arg::Weight(_) | Arg::Raised { .. } => continue,
             };
             let n = tokens * width as usize;
             let bytes = n * 2;

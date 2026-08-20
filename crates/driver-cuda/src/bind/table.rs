@@ -440,172 +440,25 @@ fn as_declared(t: Option<kernels::Ty>, v: ArgValue) -> ArgValue {
     }
 }
 
-/// The FA2 decode plan's leaves, resolved against the fire's workspace. A
-/// plan's ADDRESSES are constant per bucket, so this moves what
-/// `make_decode_params` computes host-side and exposes nothing new. One
-/// struct rather than sixteen `Cx` queries.
-#[derive(Clone, Copy)]
-pub(crate) struct Fa2DecodeLeaves {
-    pub request_indices: *const i32,
-    pub kv_tile_indices: *const i32,
-    pub o_indptr: *const i32,
-    pub kv_chunk_size: *const i32,
-    pub block_valid_mask: *const u8,
-    pub tmp_v: *mut f32,
-    pub tmp_s: *mut f32,
-    pub padded_batch: i32,
-    pub split_kv: bool,
-    pub requests: i32,
-    pub num_q_heads: i32,
-    pub num_kv_heads: i32,
-    pub head_dim: i32,
-    pub page_size: i32,
-    pub hnd_layout: bool,
-    pub full_attention: bool,
-}
 
-/// [`Fa2DecodeLeaves`], read off the plan this fire raised. Refuses for no
-/// attention context, no decode plan, or one that did not plan.
-pub(crate) fn fa2_decode_leaves(cx: &Cx<'_>) -> Result<Fa2DecodeLeaves, Refusal> {
-    use kernels_cuda::attn::fa2::plan::DecodePlanCache;
 
-    let a = cx.attn_ctx()?;
-    let layer = u32::try_from(cx.layer()).unwrap_or(0);
-    let raised = super::attn_plan(a, cx.spec(), layer, "decode");
-    if raised.is_null() {
-        return Err(Refusal::Unstated { what: "the plan this fire did not raise" });
-    }
-    // SAFETY: `bind::DecodePlan::as_ptr` is this pointer's only producer and
-    // hands out its own boxed cache, non-null above; the borrow ends here.
-    let cache = unsafe { &*raised.cast_const().cast::<DecodePlanCache>() };
-    if !cache.valid {
-        return Err(Refusal::Unstated { what: "a planned FA2 decode" });
-    }
-    let w = cx.attn_workspace()?;
-    let info = &cache.plan_info;
-    let int_base = (w.int_buffer as u64).saturating_add(cache.int_base_bytes as u64);
-    let float_base = w.float_buffer as u64;
-    // `params.rs`'s `offset_ptr` exactly: a NEGATIVE offset is the base.
-    let at = |base: u64, off: i64| -> u64 {
-        if off < 0 { base } else { base.saturating_add(off as u64) }
-    };
-    let split = info.split_kv;
-    let masked = split && info.enable_cuda_graph;
-    Ok(Fa2DecodeLeaves {
-        request_indices: at(int_base, info.request_indices_offset) as *const i32,
-        kv_tile_indices: at(int_base, info.kv_tile_indices_offset) as *const i32,
-        o_indptr: at(int_base, info.o_indptr_offset) as *const i32,
-        kv_chunk_size: at(int_base, info.kv_chunk_size_ptr_offset) as *const i32,
-        block_valid_mask: if masked {
-            at(int_base, info.block_valid_mask_offset) as *const u8
-        } else {
-            core::ptr::null()
-        },
-        tmp_v: if split { at(float_base, info.v_offset) as *mut f32 } else { core::ptr::null_mut() },
-        tmp_s: if split { at(float_base, info.s_offset) as *mut f32 } else { core::ptr::null_mut() },
-        padded_batch: i32::try_from(info.padded_batch_size).unwrap_or(i32::MAX),
-        split_kv: split,
-        requests: cache.num_requests,
-        num_q_heads: cache.num_q_heads,
-        num_kv_heads: cache.num_kv_heads,
-        head_dim: cache.head_dim,
-        page_size: cache.page_size,
-        hnd_layout: cache.hnd_layout,
-        full_attention: cache.full_attention_variant,
-    })
-}
 
-/// The FA2 PREFILL plan's leaves, resolved against the fire's PREFILL carve.
-/// [`Fa2DecodeLeaves`]' licence at the other family; the carve is what cannot
-/// be copied, a decode base handing a prefill launcher the wrong work lists.
-#[derive(Clone, Copy)]
-pub(crate) struct Fa2PrefillLeaves {
-    pub request_indices: *const i32,
-    pub qo_tile_indices: *const i32,
-    pub kv_tile_indices: *const i32,
-    pub merge_indptr: *const i32,
-    pub o_indptr: *const i32,
-    pub kv_chunk_size: *const i32,
-    pub block_valid_mask: *const u8,
-    pub tmp_v: *mut f32,
-    pub tmp_s: *mut f32,
-    pub padded_batch: i32,
-    pub split_kv: bool,
-    pub total_rows: i32,
-    pub cta_tile_q: u32,
-    pub requests: i32,
-    pub num_q_heads: i32,
-    pub num_kv_heads: i32,
-    pub head_dim: i32,
-    pub page_size: i32,
-    pub window_left: i32,
-    pub hnd_layout: bool,
-    pub full_attention: bool,
-    pub causal_mask: bool,
-}
 
-/// [`Fa2PrefillLeaves`], read off the plan this fire raised, or a refusal.
-pub(crate) fn fa2_prefill_leaves(cx: &Cx<'_>) -> Result<Fa2PrefillLeaves, Refusal> {
-    use kernels_cuda::attn::fa2::plan::PrefillPlanCache;
-
-    let a = cx.attn_ctx()?;
-    let layer = u32::try_from(cx.layer()).unwrap_or(0);
-    let raised = super::attn_plan(a, cx.spec(), layer, "prefill");
-    if raised.is_null() {
-        return Err(Refusal::Unstated { what: "the plan this fire did not raise" });
+/// One half of a [`Source::Times`] or a [`Source::Over`], as a number.
+///
+/// The arithmetic sources compose — a factor may itself be a chain or another
+/// product — so this is [`operand`] again with the answer narrowed. A POINTER
+/// is not a factor: it refuses by the parameter's name rather than being cast
+/// to one, because an address multiplied by a width is a grid nothing checks.
+fn count(o: &mut Handles<'_>, f: Facts<'_>, d: &Derived, source: Source) -> Result<i32, Refusal> {
+    let too_wide = || Refusal::Unstated { what: "a factor that fits an `i32`" };
+    match operand(o, f, d, Some(source))? {
+        ArgValue::I32(n) => Ok(n),
+        ArgValue::U32(n) => i32::try_from(n).map_err(|_| too_wide()),
+        ArgValue::Usize(n) => i32::try_from(n).map_err(|_| too_wide()),
+        ArgValue::I64(n) => i32::try_from(n).map_err(|_| too_wide()),
+        _ => Err(Refusal::Unstated { what: d.name }),
     }
-    // SAFETY: `bind::PrefillPlan::as_ptr` is this pointer's only producer and
-    // hands out its own boxed cache, non-null above; the borrow ends here.
-    let cache = unsafe { &*raised.cast_const().cast::<PrefillPlanCache>() };
-    if !cache.valid {
-        return Err(Refusal::Unstated { what: "a planned FA2 prefill" });
-    }
-    if cache.use_sm90 {
-        return Err(Refusal::Unstated { what: "an FA2 prefill this lattice launches" });
-    }
-    let w = cx.attn_prefill_workspace()?;
-    let info = &cache.plan_info;
-    // Zero for prefill and added anyway: the descriptor was uploaded here.
-    let int_base = (w.int_buffer as u64).saturating_add(cache.int_base_bytes as u64);
-    let float_base = w.float_buffer as u64;
-    let at = |base: u64, off: i64| -> u64 {
-        if off < 0 { base } else { base.saturating_add(off as u64) }
-    };
-    let split = info.split_kv;
-    let masked = split && info.enable_cuda_graph;
-    Ok(Fa2PrefillLeaves {
-        request_indices: at(int_base, info.request_indices_offset) as *const i32,
-        qo_tile_indices: at(int_base, info.qo_tile_indices_offset) as *const i32,
-        kv_tile_indices: at(int_base, info.kv_tile_indices_offset) as *const i32,
-        // Carved on the split path only, where `make_prefill_params` reads it.
-        merge_indptr: if split {
-            at(int_base, info.merge_indptr_offset) as *const i32
-        } else {
-            core::ptr::null()
-        },
-        o_indptr: at(int_base, info.o_indptr_offset) as *const i32,
-        kv_chunk_size: at(int_base, info.kv_chunk_size_ptr_offset) as *const i32,
-        block_valid_mask: if masked {
-            at(int_base, info.block_valid_mask_offset) as *const u8
-        } else {
-            core::ptr::null()
-        },
-        tmp_v: if split { at(float_base, info.v_offset) as *mut f32 } else { core::ptr::null_mut() },
-        tmp_s: if split { at(float_base, info.s_offset) as *mut f32 } else { core::ptr::null_mut() },
-        padded_batch: i32::try_from(info.padded_batch_size).unwrap_or(i32::MAX),
-        split_kv: split,
-        total_rows: i32::try_from(info.total_num_rows).unwrap_or(i32::MAX),
-        cta_tile_q: cache.cta_tile_q,
-        requests: cache.num_requests,
-        num_q_heads: cache.num_q_heads,
-        num_kv_heads: cache.num_kv_heads,
-        head_dim: cache.head_dim,
-        page_size: cache.page_size,
-        window_left: cache.window_left,
-        hnd_layout: cache.hnd_layout,
-        full_attention: cache.full_attention_variant,
-        causal_mask: cache.causal_mask,
-    })
 }
 
 /// One operand, from where its [`Source`] says it comes.
@@ -695,6 +548,59 @@ fn operand(
                 Some(stated) => Ok(ArgValue::U32(stated)),
                 None => operand(o, f, d, Some(*fallback)),
             }
+        }
+        // THE SLOT CHAIN: a statement's own operand first, a fact after.
+        //
+        // `arms/fa2.rs`'s `o_or` written as a source. That function read
+        // `cx.arg_out(0)` and fell back on the guard's arena slot when the
+        // text declined to declare a result, and it was called from six arms;
+        // `Or(Slot(Out, 0), Named(AttnOOut))` is the same chain said once, at
+        // the parameter, where the routine's own signature can carry it.
+        //
+        // Safe for the reason the two chains above are, and the reason must be
+        // checked rather than assumed: every `Handles` accessor refuses BEFORE
+        // it mutates `taken`, so a discarded first half numbers no handle and
+        // the fallback's is the only one that lands. An accessor that minted
+        // first would shift every handle after it.
+        //
+        // AFTER the `Param` arm and not before: that one reads the wire run
+        // and treats a stated zero as absent, which this must not do -- slot
+        // zero is a real operand.
+        Some(Source::Or(&Source::Slot(kind, n), fallback)) => {
+            match operand(o, f, d, Some(Source::Slot(kind, n))) {
+                Ok(v) => Ok(v),
+                Err(_) => operand(o, f, d, Some(*fallback)),
+            }
+        }
+        // A CHAIN WHOSE FIRST HALF IS ITSELF COMPOSITE, which the three arms
+        // above cannot spell as patterns. Recursion answers it and the same
+        // minting rule holds, because it is the accessors' and not this
+        // function's.
+        Some(Source::Or(first, fallback)) => match operand(o, f, d, Some(*first)) {
+            Ok(v) => Ok(v),
+            Err(_) => operand(o, f, d, Some(*fallback)),
+        },
+
+        // ARITHMETIC ON WHAT IS KNOWN. Both halves are themselves sources,
+        // because a factor may be a chain: `rms_strided_head_row` wants a row's
+        // width over one head's length, and a statement may carry the head
+        // length where the fire answers when it does not.
+        //
+        // `kernels::bind` carries these two for the shader planes and has
+        // since before this file had either. Their absence here was not a
+        // refusal by design -- the catch-all below said `Unstated` with the
+        // parameter's name, which reads as *"nothing states it"* about a
+        // parameter whose source is fully stated and merely unresolved.
+        Some(Source::Times(a, b)) => {
+            let (x, y) = (count(o, f, d, *a)?, count(o, f, d, *b)?);
+            Ok(ArgValue::I32(x.saturating_mul(y)))
+        }
+        Some(Source::Over(a, b)) => {
+            let divisor = count(o, f, d, *b)?;
+            if divisor == 0 {
+                return Err(Refusal::Empty { what: "a divisor" });
+            }
+            Ok(ArgValue::I32(count(o, f, d, *a)? / divisor))
         }
 
         // Extents the statement carries. Not arithmetic -- a width is read.
@@ -966,6 +872,26 @@ fn operand(
             .weight_suffixed("_scales")
             .map(ArgValue::Ptr)
             .ok_or(Refusal::Unstated { what: "the statement's scales weight" }),
+        // THE ARRAY, NOT THE BANK. `arms/quant.rs` filled these two by hand
+        // and said why: the kernel's first act is `packed_ptrs[expert]`, and
+        // the weight chain answers the bank's own base for both of its halves.
+        Some(Source::Named(<keys::WeightExpertPtrs as keys::Fact>::KEY)) => f
+            .cx
+            .weight_suffixed("_ptrs")
+            .map(ArgValue::Ptr)
+            .ok_or(Refusal::Unstated {
+                what: "a per-expert pointer array for this bank; \
+                       `serve::load::build_moe_expert_ptrs` builds one per plane at load, \
+                       so its absence means the bank's byte count did not divide by the \
+                       row's `n_experts`",
+            }),
+        Some(Source::Named(<keys::WeightExpertScalePtrs as keys::Fact>::KEY)) => f
+            .cx
+            .weight_suffixed("_scales_ptrs")
+            .map(ArgValue::Ptr)
+            .ok_or(Refusal::Unstated {
+                what: "a per-expert scale pointer array for this bank; see `_ptrs`",
+            }),
         Some(Source::Named(<keys::WeightUpBias as keys::Fact>::KEY)) => f
             .cx
             .weight_suffixed("_up_bias")
@@ -981,122 +907,57 @@ fn operand(
         Some(Source::Slot(Kind::ParamF32, n)) => f.cx.param_f32(n as usize).map(ArgValue::F32),
 
         // THE FA2 DECODE PLAN, LEAF BY LEAF. See [`fa2_decode_leaves`].
-        Some(Source::Named(<keys::Fa2DecodeRequestIndices as keys::Fact>::KEY)) => {
-            fa2_decode_leaves(f.cx).map(|l| ptr(l.request_indices))
+        //
+        // WHAT A LAUNCHER THAT PLANS ITS OWN FIRE READS.
+        //
+        // Not leaves: a leaf is read OFF a plan and these are read to BUILD
+        // one, so they come straight off the attention context rather than
+        // through `fa2_prefill_leaves` -- which would refuse, the plan it
+        // reads not being valid until the launcher has filled it.
+        Some(Source::Named(<keys::Fa2PrefillPlanCache as keys::Fact>::KEY)) => {
+            let a = f.cx.attn_ctx()?;
+            let layer = u32::try_from(f.cx.layer()).unwrap_or(0);
+            let raised = super::attn_plan(a);
+            if raised.is_null() {
+                return Err(Refusal::Unstated { what: "a prefill plan cache to fill" });
+            }
+            Ok(ArgValue::Ptr(raised))
         }
-        Some(Source::Named(<keys::Fa2DecodeKvTileIndices as keys::Fact>::KEY)) => {
-            fa2_decode_leaves(f.cx).map(|l| ptr(l.kv_tile_indices))
+        Some(Source::Named(<keys::QoIndptrHost as keys::Fact>::KEY)) => {
+            let a = f.cx.attn_ctx()?;
+            if a.qo_indptr_h.is_null() {
+                return Err(Refusal::Absent { what: "the host QO indptr the planner walks" });
+            }
+            Ok(anyptr(a.qo_indptr_h))
         }
-        Some(Source::Named(<keys::Fa2DecodeOIndptr as keys::Fact>::KEY)) => {
-            fa2_decode_leaves(f.cx).map(|l| ptr(l.o_indptr))
+        Some(Source::Named(<keys::KvPageIndptrHost as keys::Fact>::KEY)) => {
+            let a = f.cx.attn_ctx()?;
+            if a.kv_page_indptr_h.is_null() {
+                return Err(Refusal::Absent { what: "the host KV page indptr the planner walks" });
+            }
+            Ok(anyptr(a.kv_page_indptr_h))
         }
-        Some(Source::Named(<keys::Fa2DecodeKvChunkSize as keys::Fact>::KEY)) => {
-            fa2_decode_leaves(f.cx).map(|l| ptr(l.kv_chunk_size))
+        Some(Source::Named(<keys::FireRequests as keys::Fact>::KEY)) => {
+            f.requests().map(ArgValue::I32)
         }
-        Some(Source::Named(<keys::Fa2DecodeBlockValidMask as keys::Fact>::KEY)) => {
-            fa2_decode_leaves(f.cx).map(|l| anyptr(l.block_valid_mask))
+        // THE TWO RAGGED SINKS, and NULL is an answer for all four: a capture
+        // that captures nothing and a mask that masks nothing are legitimate,
+        // and the launcher's own test is what decides. An `Absent` refusal
+        // here would refuse the ordinary case.
+        Some(Source::Named(<keys::AttnScoreOut as keys::Fact>::KEY)) => {
+            f.cx.attn_ctx().map(|a| anyptr(a.score_out.cast_const()))
         }
-        Some(Source::Named(<keys::Fa2DecodeTmpV as keys::Fact>::KEY)) => {
-            fa2_decode_leaves(f.cx).map(|l| anyptr(l.tmp_v.cast_const()))
+        Some(Source::Named(<keys::AttnScoreIndptr as keys::Fact>::KEY)) => {
+            f.cx.attn_ctx().map(|a| ptr(a.score_indptr_d))
         }
-        Some(Source::Named(<keys::Fa2DecodeTmpS as keys::Fact>::KEY)) => {
-            fa2_decode_leaves(f.cx).map(|l| anyptr(l.tmp_s.cast_const()))
+        Some(Source::Named(<keys::AttnMask as keys::Fact>::KEY)) => {
+            f.cx.attn_ctx().map(|a| anyptr(a.mask_d))
         }
-        Some(Source::Named(<keys::Fa2DecodePaddedBatch as keys::Fact>::KEY)) => {
-            fa2_decode_leaves(f.cx).map(|l| ArgValue::I32(l.padded_batch))
+        Some(Source::Named(<keys::AttnMaskIndptr as keys::Fact>::KEY)) => {
+            f.cx.attn_ctx().map(|a| ptr(a.mask_indptr_d))
         }
-        Some(Source::Named(<keys::Fa2DecodeSplitKv as keys::Fact>::KEY)) => {
-            fa2_decode_leaves(f.cx).map(|l| ArgValue::Bool(l.split_kv))
-        }
-        Some(Source::Named(<keys::Fa2DecodeRequests as keys::Fact>::KEY)) => {
-            fa2_decode_leaves(f.cx).map(|l| ArgValue::I32(l.requests))
-        }
-        Some(Source::Named(<keys::Fa2DecodeNumQHeads as keys::Fact>::KEY)) => {
-            fa2_decode_leaves(f.cx).map(|l| ArgValue::I32(l.num_q_heads))
-        }
-        Some(Source::Named(<keys::Fa2DecodeNumKvHeads as keys::Fact>::KEY)) => {
-            fa2_decode_leaves(f.cx).map(|l| ArgValue::I32(l.num_kv_heads))
-        }
-        Some(Source::Named(<keys::Fa2DecodeHeadDim as keys::Fact>::KEY)) => {
-            fa2_decode_leaves(f.cx).map(|l| ArgValue::I32(l.head_dim))
-        }
-        Some(Source::Named(<keys::Fa2DecodePageSize as keys::Fact>::KEY)) => {
-            fa2_decode_leaves(f.cx).map(|l| ArgValue::I32(l.page_size))
-        }
-        Some(Source::Named(<keys::Fa2DecodeHndLayout as keys::Fact>::KEY)) => {
-            fa2_decode_leaves(f.cx).map(|l| ArgValue::Bool(l.hnd_layout))
-        }
-        Some(Source::Named(<keys::Fa2DecodeFullAttention as keys::Fact>::KEY)) => {
-            fa2_decode_leaves(f.cx).map(|l| ArgValue::Bool(l.full_attention))
-        }
-
-        // AND THE PREFILL PLAN, against ITS carve: a decode base overwrites it.
-        Some(Source::Named(<keys::Fa2PrefillRequestIndices as keys::Fact>::KEY)) => {
-            fa2_prefill_leaves(f.cx).map(|l| ptr(l.request_indices))
-        }
-        Some(Source::Named(<keys::Fa2PrefillQoTileIndices as keys::Fact>::KEY)) => {
-            fa2_prefill_leaves(f.cx).map(|l| ptr(l.qo_tile_indices))
-        }
-        Some(Source::Named(<keys::Fa2PrefillKvTileIndices as keys::Fact>::KEY)) => {
-            fa2_prefill_leaves(f.cx).map(|l| ptr(l.kv_tile_indices))
-        }
-        Some(Source::Named(<keys::Fa2PrefillMergeIndptr as keys::Fact>::KEY)) => {
-            fa2_prefill_leaves(f.cx).map(|l| ptr(l.merge_indptr))
-        }
-        Some(Source::Named(<keys::Fa2PrefillOIndptr as keys::Fact>::KEY)) => {
-            fa2_prefill_leaves(f.cx).map(|l| ptr(l.o_indptr))
-        }
-        Some(Source::Named(<keys::Fa2PrefillKvChunkSize as keys::Fact>::KEY)) => {
-            fa2_prefill_leaves(f.cx).map(|l| ptr(l.kv_chunk_size))
-        }
-        Some(Source::Named(<keys::Fa2PrefillBlockValidMask as keys::Fact>::KEY)) => {
-            fa2_prefill_leaves(f.cx).map(|l| anyptr(l.block_valid_mask))
-        }
-        Some(Source::Named(<keys::Fa2PrefillTmpV as keys::Fact>::KEY)) => {
-            fa2_prefill_leaves(f.cx).map(|l| anyptr(l.tmp_v.cast_const()))
-        }
-        Some(Source::Named(<keys::Fa2PrefillTmpS as keys::Fact>::KEY)) => {
-            fa2_prefill_leaves(f.cx).map(|l| anyptr(l.tmp_s.cast_const()))
-        }
-        Some(Source::Named(<keys::Fa2PrefillPaddedBatch as keys::Fact>::KEY)) => {
-            fa2_prefill_leaves(f.cx).map(|l| ArgValue::I32(l.padded_batch))
-        }
-        Some(Source::Named(<keys::Fa2PrefillSplitKv as keys::Fact>::KEY)) => {
-            fa2_prefill_leaves(f.cx).map(|l| ArgValue::Bool(l.split_kv))
-        }
-        Some(Source::Named(<keys::Fa2PrefillTotalRows as keys::Fact>::KEY)) => {
-            fa2_prefill_leaves(f.cx).map(|l| ArgValue::I32(l.total_rows))
-        }
-        Some(Source::Named(<keys::Fa2PrefillCtaTileQ as keys::Fact>::KEY)) => {
-            fa2_prefill_leaves(f.cx).map(|l| ArgValue::U32(l.cta_tile_q))
-        }
-        Some(Source::Named(<keys::Fa2PrefillRequests as keys::Fact>::KEY)) => {
-            fa2_prefill_leaves(f.cx).map(|l| ArgValue::I32(l.requests))
-        }
-        Some(Source::Named(<keys::Fa2PrefillNumQHeads as keys::Fact>::KEY)) => {
-            fa2_prefill_leaves(f.cx).map(|l| ArgValue::I32(l.num_q_heads))
-        }
-        Some(Source::Named(<keys::Fa2PrefillNumKvHeads as keys::Fact>::KEY)) => {
-            fa2_prefill_leaves(f.cx).map(|l| ArgValue::I32(l.num_kv_heads))
-        }
-        Some(Source::Named(<keys::Fa2PrefillHeadDim as keys::Fact>::KEY)) => {
-            fa2_prefill_leaves(f.cx).map(|l| ArgValue::I32(l.head_dim))
-        }
-        Some(Source::Named(<keys::Fa2PrefillPageSize as keys::Fact>::KEY)) => {
-            fa2_prefill_leaves(f.cx).map(|l| ArgValue::I32(l.page_size))
-        }
-        // The PLAN's window, not `keys::WindowLeft`'s: the split was sized on it.
-        Some(Source::Named(<keys::Fa2PrefillWindowLeft as keys::Fact>::KEY)) => {
-            fa2_prefill_leaves(f.cx).map(|l| ArgValue::I32(l.window_left))
-        }
-        Some(Source::Named(<keys::Fa2PrefillHndLayout as keys::Fact>::KEY)) => {
-            fa2_prefill_leaves(f.cx).map(|l| ArgValue::Bool(l.hnd_layout))
-        }
-        Some(Source::Named(<keys::Fa2PrefillFullAttention as keys::Fact>::KEY)) => {
-            fa2_prefill_leaves(f.cx).map(|l| ArgValue::Bool(l.full_attention))
-        }
-        Some(Source::Named(<keys::Fa2PrefillCausalMask as keys::Fact>::KEY)) => {
-            fa2_prefill_leaves(f.cx).map(|l| ArgValue::Bool(l.causal_mask))
+        Some(Source::Named(<keys::AttnScoreWindow as keys::Fact>::KEY)) => {
+            f.cx.attn_ctx().map(|a| ArgValue::U32(a.score_window))
         }
 
         // A LITERAL NEEDS NEITHER `Handles` NOR `Facts`, and is not a default:
@@ -1149,7 +1010,7 @@ pub unsafe fn dispatch(
     // from the routine that is about to run rather than from the name the
     // text happened to spell.
     let symbol = match spec.route {
-        crate::bind::arms::Route::Bound(entry) => entry.symbol,
+        crate::bind::route::Route::Bound(routed) => routed,
         _ => bound.kernel,
     };
     // `None`, NOT a refusal, for a row with no column: `None` means "take the
@@ -1157,6 +1018,20 @@ pub unsafe fn dispatch(
     let row = kernels_cuda::routine(symbol)?;
     if row.derived.is_empty() {
         return None;
+    }
+    // THE PRECONDITION, BEFORE THE OPERANDS. `arms/fa2.rs`'s `no_join_extras`
+    // stood at the top of eight arms and was the reason six of them could not
+    // become columns: a `Source` FILLS a slot and this requires two to be
+    // empty, so no vocabulary of sources could ever spell it.
+    //
+    // It runs first for the reason the arms ran it first. A join changes the
+    // ARITHMETIC and not the operands, so every address below binds correctly
+    // and the launch computes the wrong thing -- the one failure a refusal
+    // cannot catch after the fact.
+    if row.no_join && (!spec.aux.is_empty() || spec.per_head_dim.is_some()) {
+        return Some(Err(Refusal::Unstated {
+            what: "a dispatch without an aux value or a per-head reading",
+        }));
     }
     let args = operands(&mut handles, Facts::at(cx), row.derived, row.sources, row.args);
     let args = match args {
@@ -1326,7 +1201,7 @@ impl kernels::routine::Answers<kernels_cuda::jit::Cuda> for Answering<'_> {
 /// A family crosses by pointing its `ARMS` row here and deleting the
 /// hand-written one; `route` still answers `Route::Bound`, so `unfireable`
 /// still accounts for the symbol at load. NOT `arm: None`, which is
-/// [`Bound::driver`](super::arms::Bound::driver) and means the opposite.
+/// a `#[routine(driver)]` row and means the opposite.
 ///
 /// # Errors
 ///
@@ -1594,23 +1469,22 @@ mod tests {
     }
 
     /// The crossed symbols are counted, and the count moves on purpose. A
-    /// symbol is crossed when its `Bound` row names [`derived_arm`]; crossing
-    /// one changes how a real fire is planned, so the number is asserted.
+    /// symbol is crossed when [`route`](super::route::route) sends it to the
+    /// derived column; crossing one changes how a real fire is planned, so the
+    /// number is asserted.
+    ///
+    /// IT ASKS `route` AND NOT A ROW, which is the whole of what changed here.
+    /// Crossing used to mean *"a `Bound` row names `derived_arm`"* and there
+    /// were 129 such rows; the routine's own column says the same thing, so
+    /// the rows are gone and this asks the question they answered.
     #[test]
     fn the_crossed_symbols_are_counted_and_the_count_moves_on_purpose() {
-        let crossed = |symbol: &str| {
-            super::super::arms::bound(symbol)
-                .and_then(|b| b.arm)
-                .is_some_and(|a| {
-                    // Through `*const ()`: the direct cast trips a lint.
-                    a as *const () == derived_arm as *const ()
-                })
-        };
+        use super::super::route::{Route, route};
+        let crossed = |symbol: &str| matches!(route(symbol), Route::Bound(_));
 
         // One per crossed family, so a family losing its crossing fails by
-        // name. TWELVE OF THE THIRTEEN ARM FAMILIES ARE HERE, which is all of
-        // them but `fa2` — see the negative block below for why that one is
-        // absent rather than forgotten.
+        // name. ALL of them now, including `fa2` — see the negative block
+        // below for what is left out and why.
         assert!(crossed("rope::rope_bf16"));
         assert!(crossed("layout::embed_bf16"));
         assert!(crossed("sample::lm_head_gemv_argmax_int8"));
@@ -1626,45 +1500,61 @@ mod tests {
         assert!(crossed("attn::attention_xqa_decode_bf16_prepared"));
         assert!(crossed("gemm::act_x_wt_bf16_out_fp32"));
         assert!(crossed("dist::all_reduce_bf16"));
+        // AND FA2's EIGHT, which the negative block used to hold. Their arms
+        // are gone: the upload and the widening are the launchers' own calls,
+        // `no_join` is a row fact, and `o_or`/`lse_slab` are a slot chain and
+        // an asked key. One line for the pair that had the most left to move.
+        assert!(crossed("attn::dispatch_attention_flashinfer_decode"));
+        assert!(crossed("attn::attention_flashinfer_prefill"));
 
-        // A `layout` routine the table shape cannot express. DECLARED and not
-        // crossed, which is the case this line is for: it has a `ROUTINES` row
-        // and no `Bound` row at all, so `route` answers `Route::Rows`.
+        // A `layout` routine no text states. DECLARED and not crossed, which
+        // is the case this line is for: `#[routine(internal)]` says a trace
+        // may not name it, so `route` answers `Unknown` rather than binding a
+        // body other routines call.
         assert!(!crossed("layout::copy_if_valid_slot"));
-        // THE TWO FAMILIES WHOSE ARMS STILL CALL THEIR `fn` DIRECTLY. `fa2`'s
-        // eight are the ones that never cross — its header names four blockers
-        // and none is a fact. `quant` keeps ONE, and not for an extent: the
-        // two `Env`s carrying `mxfp4_moe_gate_up_decode_bf16`'s bias planes
-        // name no key, and an export shipping neither must bind NULL rather
-        // than refuse.
-        assert!(!crossed("attn::dispatch_attention_flashinfer_decode"));
-        assert!(!crossed("quant::mxfp4_moe_gate_up_decode_bf16"));
+        // AND THE LAST TWO HAND-WRITTEN ARMS IN THIS DRIVER, which crossed
+        // when what they knew became a key. `Const<Tensor<u8>>` derived the
+        // weight chain for `packed_ptrs` and both halves of that chain answer
+        // the BANK -- while the kernel's first act is `packed_ptrs[expert]`.
+        // `keys::WeightExpertPtrs` says the array, and its `PerExpert` wrapper
+        // (a driver deciding `keys::WeightScales` meant the scale ARRAY) went
+        // with it.
+        assert!(crossed("quant::mxfp4_moe_gate_up_decode_bf16"));
+        assert!(crossed("quant::mxfp4_moe_down_decode_bf16"));
+        // A DRIVER OP, declared so `check_plan` can measure a text against it
+        // and fired by `bind::dispatch`'s own match.
+        assert!(!crossed("gemm::lora_qkv_correction"));
         // AND THE SYMBOL THAT WAS BLOCKED ON ONE MISSING ANSWER: its second
         // output is `Out<1, f16>` now rather than an optional argument.
         assert!(crossed("norm::rmsnorm_bf16_with_fp16"));
         // And a name no backend has.
         assert!(!crossed("not_a_kernel"));
 
-        // Reproducible without running this test, which matters under a
-        // check-only regime: `crossed` is exactly the `Bound::derived` rows.
-        // There are 129 of them and the routine registry declares every one,
-        // so the two counts coincide today — they need not, and a
-        // `Bound::derived` naming a symbol nothing declares would be invisible
-        // here while still answering `Route::Bound` at load.
+        // The count. It is derived from the same registry `route` reads, so it
+        // cannot drift from a row list any more -- there is no row list. What
+        // it still catches is a signature change: a parameter losing its
+        // source takes its symbol out of this count and into `Route::Unbound`,
+        // which is a real change to what a model can fire.
         //
-        // 127 until three rows crossed, each blocked on ONE parameter nothing
-        // supplied: `gemm::act_x_wt_bias_bf16` on a `beta` its two twins state
-        // by SYMBOL, `norm::rmsnorm_residual_add_scale_rmsnorm_bf16` on a
-        // residual scale its statement carries now, and
-        // `norm::rmsnorm_gated_fp32_in_bf16` on a head width `keys::GdnVDim`
-        // always answered. All three were declared, pinned, goldened and
-        // unfireable, one per family: gpt-oss, gemma-4, qwen3.5. And one
-        // crossed the OTHER way: `quant::mxfp4_moe_down_decode_bf16` went back
-        // to refusing, because `compute-sanitizer` showed its kernel indexing
-        // a per-expert pointer array nothing in this tree builds.
+        // 129 -> 140, and the eleven are accounted for. FA2's eight crossed
+        // when their arms went. The three capture/custom launchers were
+        // `#[routine(untraced)]` -- two sink pointers, a mask pair and an
+        // `#[unbound]` window between them -- and the planless pair carried an
+        // `#[unbound] plan`; those five are inside the eight. The other three
+        // are `attn::write_kv_explicit_bf16_devwin`, `gemm::grouped_act_x_wt_bf16`
+        // and `moe::gather_moe_aligned_inputs_bf16`, which a text states and
+        // which never had a row at all: `Route::Rows` covered for them, and it
+        // is gone.
+        //
+        // 140 -> 143 with the table itself: `quant`'s two MXFP4 arms crossed
+        // when `keys::WeightExpertPtrs` said what they knew, and
+        // `mlp::swiglu_clamp_bf16` crossed because its refusal was stale --
+        // the prose said *"the join's foreign operands"* and the pair form
+        // (`deepseek_v4.rs`'s `swiglu_clamp_pair`) states gate and up as two
+        // ordinary operands, which is what its column reads.
         let n = kernels_cuda::sigs().iter().filter(|s| crossed(s.symbol)).count();
         assert_eq!(
-            n, 129,
+            n, 143,
             "{n} declared symbols are crossed onto the derived column. \
              Crossing one changes how a real fire is planned, so the count \
              moves only on purpose."

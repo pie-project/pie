@@ -66,6 +66,36 @@ pub struct Deployment {
     /// The stand-in buffer's size, which bounds the largest scalar block a
     /// fire can stage.
     pub seam: u64,
+    /// The highest tier this deployment may load, or `None` for whatever the
+    /// device offers.
+    ///
+    /// A ceiling can only lower: a deployment that asks for
+    /// [`Capability::Coopmat`] on a card without the extension still gets the
+    /// best tier the DEVICE reports, because a module the driver cannot load
+    /// is not a choice.
+    ///
+    /// # Why this is a deployment field and not a narrowed store
+    ///
+    /// It used to be the store. [`Shell::open_with`] exists because the tier
+    /// tests wanted to compare one device against itself, and the only knob
+    /// they had was to hand the shell a module table with every `<symbol>.<tag>`
+    /// key removed. That worked for exactly as long as the DRIVER chose the
+    /// tier: it walked [`Capability::PREFERENCE`] down from the device's
+    /// ceiling until the store had a module, so removing the tiered ones made
+    /// it land on the baseline.
+    ///
+    /// A body names its own artifact now, and
+    /// [`kernels_vulkan::module_path`] does that walk against the crate's
+    /// module TABLE -- which is complete, and knows nothing of what store the
+    /// shell was handed. So a narrowed store no longer moves the answer; it
+    /// makes the body ask for `affine_qmm_t_..._fp16_precast_....coopmat.spv`,
+    /// the narrowed store does not have it, and the fire refuses `Undeclared`
+    /// instead of quietly running the baseline. The tier tests failed exactly
+    /// that way, on the FIRST of the two runs they meant to compare.
+    ///
+    /// The ceiling is where the decision actually lives, so it is what a
+    /// caller has to be able to state.
+    pub ceiling: Option<Capability>,
 }
 
 impl Default for Deployment {
@@ -82,6 +112,7 @@ impl Default for Deployment {
             theta: 1_000_000.0,
             rescale: None,
             seam: 1 << 22,
+            ceiling: None,
         }
     }
 }
@@ -471,12 +502,27 @@ impl Shell {
             arenas: crate::turns::Arenas::default(),
             plans: crate::replay::Plans::new(),
             text,
-            // Best first, and a device always reports at least `Baseline`.
-            tier: device
-                .tiers()
-                .first()
-                .copied()
-                .unwrap_or(Capability::Baseline),
+            // Best first, and a device always reports at least `Baseline`. A
+            // stated ceiling walks down from itself to the first tier this
+            // device actually loads, so asking for more than the hardware has
+            // is not an error, it is just not a lowering.
+            tier: deployment.ceiling.map_or_else(
+                || {
+                    device
+                        .tiers()
+                        .first()
+                        .copied()
+                        .unwrap_or(Capability::Baseline)
+                },
+                |want| {
+                    Capability::PREFERENCE
+                        .iter()
+                        .skip_while(|&&c| c != want)
+                        .find(|c| device.tiers().contains(c))
+                        .copied()
+                        .unwrap_or(Capability::Baseline)
+                },
+            ),
             device,
         })
     }

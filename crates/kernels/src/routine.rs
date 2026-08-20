@@ -478,10 +478,10 @@ pub trait Asks<B: Backend>: Answers<B> {
     ///
     /// # Why a body ever reaches past its own marks
     ///
-    /// Because a routine that forwards [`Self::params`] as a STRUCT has no
+    /// Because a routine that forwards [`Self::params`] as a BLOCK has no
     /// slots to spare. Its params run is the shader's own layout — read by
     /// field, not by position — so a `Const<i32>` derived onto slot 0 reads
-    /// that struct's first word, and there is no mark that can name the
+    /// that block's first word, and there is no mark that can name the
     /// eleventh. `Param<11, i32>` said exactly this before the marks, and
     /// `gdn_core_recurrent_prefill`'s tiling is where it still has to be said:
     /// the body picks its compiled point from two words the SHADER also reads.
@@ -489,7 +489,7 @@ pub trait Asks<B: Backend>: Answers<B> {
     /// **Not a general escape hatch.** A number a routine can take as a
     /// `Const` should be one — the mark is what makes the arity checkable, and
     /// `check_plan` counts marks. This is for the case where the same run
-    /// serves two readers and the other one is a struct.
+    /// serves two readers and the other one is a block.
     ///
     /// # Errors
     ///
@@ -2635,6 +2635,53 @@ pub struct Routine<B: Backend> {
     /// said"*, not *"there is nothing to say"*. Exactly one row means it —
     /// `attn::qkv_decode_fused_dispatch`, which says so with `uncolumned`.
     pub derived: &'static [Derived],
+    /// No trace may state this symbol: it is a body another routine calls.
+    ///
+    /// NOT `untraced`, which is a different fact wearing a similar word.
+    /// `#[routine(untraced)]` says *"no source column, and a string dispatch
+    /// must refuse"* — the eight FA2 launchers say it today and a trace names
+    /// every one of them. This says *"the trace vocabulary does not contain
+    /// this name"*, which no column can show either way.
+    ///
+    /// What it is for: `gemm::act_x_wt_bf16` takes `beta` as a parameter and
+    /// `gemm::act_x_w` is the forwarder that pins it at `0.0`. Both carry full
+    /// columns, so a resolver deriving membership from the column alone admits
+    /// the body — same operands, same buffers, a `beta` off the statement
+    /// instead of the symbol, and nothing downstream to notice. Thirty-one
+    /// routines are in that position.
+    pub internal: bool,
+    /// The facts this routine's BODY asks the environment for.
+    ///
+    /// Not parameters: `ctx.ask::<f32, keys::RmsEps>()` is a call, so it has no
+    /// entry in [`Self::sources`] to be `None` and a reader walking the column
+    /// cannot see it. `#[routine]` scans the turbofishes and lists them here,
+    /// which is what lets a driver answer *"can I supply everything this
+    /// routine will ask for"* before a fire rather than during one.
+    ///
+    /// It MISSES a fact asked inside a helper — a syntactic guarantee where the
+    /// parameter run has a type-system one, accepted deliberately.
+    pub asked: &'static [&'static str],
+    /// This routine refuses a statement the driver JOINED into another.
+    ///
+    /// See [`Self::no_join`](Routine::no_join) for why a precondition is a row
+    /// fact rather than a [`crate::Source`].
+    pub no_join: bool,
+    /// The DRIVER fires this by a typed call, not the operand column.
+    ///
+    /// A text may name it -- that is what separates this from
+    /// [`Self::internal`] -- and what runs it is the driver's own dispatch,
+    /// because the body needs something a query-only binder must not hand out:
+    /// a cuBLAS handle, a fire-scoped state pointer, a resolver-owned aux slot.
+    ///
+    /// **Not derivable from the column's shape, which is why it is stated.**
+    /// The eight rows that said this in a table ranged from no column at all
+    /// (`comm::all_reduce_bf16`) through a deliberately empty source run
+    /// (`gemm::lora_qkv_correction`) to a column that resolves at every
+    /// position (`moe::moe_grouped_gemm_bf16`) -- and that last one is the
+    /// case that matters: a driver op and a routine share the name, so a
+    /// resolver reading only the column would bind the operands correctly and
+    /// run a different implementation.
+    pub driver: bool,
 }
 
 /// The first path segment after the crate root, out of a `module_path!()`.
@@ -2751,6 +2798,40 @@ impl<B: Backend> Routine<B> {
         self
     }
 
+    /// This routine, marked as refusing a statement the driver JOINED.
+    ///
+    /// A precondition and not a source, which is why it is a row fact: every
+    /// [`crate::Source`] FILLS a slot, and this requires two to be empty. The
+    /// FA2 dispatches are the audience -- an aux value or a per-head reading
+    /// changes the arithmetic rather than the operands, so a join binds right
+    /// and computes wrong, and `arms/fa2.rs`'s `no_join_extras` was that check
+    /// written eight times inside the arms it kept alive.
+    #[must_use]
+    pub const fn no_join(mut self) -> Self {
+        self.no_join = true;
+        self
+    }
+
+    /// This routine, marked as outside the trace vocabulary.
+    ///
+    /// A body other routines call, not a symbol a text may state. See
+    /// [`Self::internal`](Routine::internal) for the pair that made it
+    /// necessary.
+    #[must_use]
+    pub const fn internal(mut self) -> Self {
+        self.internal = true;
+        self
+    }
+
+    /// This routine, marked as fired by the driver rather than by its column.
+    ///
+    /// See [`Self::driver`](Routine::driver).
+    #[must_use]
+    pub const fn driver(mut self) -> Self {
+        self.driver = true;
+        self
+    }
+
     /// This routine, with `#[routine]`'s operand column attached.
     ///
     /// Kept as a builder because `kernels::routine!` is backend-agnostic and
@@ -2781,6 +2862,16 @@ impl<B: Backend> Routine<B> {
     #[must_use]
     pub const fn stating(mut self, sources: &'static [Option<crate::Source>]) -> Self {
         self.sources = sources;
+        self
+    }
+
+    /// This routine, with the facts its body asks for listed.
+    ///
+    /// `#[routine]` is the only caller: the list is scanned off the body's
+    /// turbofishes and arrives on the same marker the derived column does.
+    #[must_use]
+    pub const fn asking(mut self, asked: &'static [&'static str]) -> Self {
+        self.asked = asked;
         self
     }
 }
@@ -2925,6 +3016,10 @@ macro_rules! untraced {
             whole: false,
             depth_prefix_plan: false,
             derived: &[],
+            internal: false,
+            asked: &[],
+            no_join: false,
+            driver: false,
         }
         $(.$fact($($value)?))*
     }};
@@ -2956,6 +3051,10 @@ macro_rules! untraced {
             whole: false,
             depth_prefix_plan: false,
             derived: &[],
+            internal: false,
+            asked: &[],
+            no_join: false,
+            driver: false,
         }
         $(.$fact($($value)?))*
     }};
@@ -3005,6 +3104,10 @@ macro_rules! routine {
             whole: false,
             depth_prefix_plan: false,
             derived: &[],
+            internal: false,
+            asked: &[],
+            no_join: false,
+            driver: false,
         }
         $(.$fact($($value)?))*
     }};
@@ -3028,6 +3131,10 @@ macro_rules! routine {
             whole: false,
             depth_prefix_plan: false,
             derived: &[],
+            internal: false,
+            asked: &[],
+            no_join: false,
+            driver: false,
         }
         $(.$fact($($value)?))*
     }};
@@ -3052,6 +3159,10 @@ macro_rules! routine {
             whole: false,
             depth_prefix_plan: false,
             derived: &[],
+            internal: false,
+            asked: &[],
+            no_join: false,
+            driver: false,
         }
         $(.$fact($($value)?))*
     }};

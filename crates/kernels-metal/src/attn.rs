@@ -251,7 +251,13 @@ const GATE_FILE: &str = "attn/gate.metal";
 ///
 /// Three results, which is what makes the argument order load-bearing: a
 /// statement writing three states them all after its inputs, and the shader
-/// declares `packed, q, k, v` before its params block.
+/// declares `packed, q, k, v` before the two widths.
+///
+/// The widths used to be one `SplitQkvParams` block at buffer 4, so this
+/// signature could name neither. They are `Const<u32>` marks now and
+/// `attn/split_qkv.metal` takes them as buffers 4 and 5 -- one `setBytes`
+/// each where it bound a staged block -- at words 0 and 1 of the same
+/// statement run, in the order the struct laid them out.
 ///
 /// # Errors
 ///
@@ -262,13 +268,24 @@ pub fn split_qkv_bf16(
     packed: In<Tensor<bf16>>,
     q: Out<Tensor<bf16>>,
     k: Out<Tensor<bf16>>,
-    v: Out<Tensor<bf16>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
+    v: Out<Tensor<bf16>>,
+    // THE TWO BOUNDARIES, WHICH WERE `SplitQkvParams`'s two fields. They rode
+    // a staged block because the row named `params: Buf`, and the cost was
+    // that no signature could name either width -- so this doc said, truly,
+    // that it could not check them. Both are `Const<u32>` marks now, at words
+    // 0 and 1 of the same statement run the struct was staged from, IN THE
+    // STRUCT'S ORDER because it is the statement's: `q_width` first and
+    // `kv_width` second. Swapping the two would cut both boundaries inside a
+    // neighbouring projection rather than refuse, which is why the order is
+    // written down here rather than left to the reader to infer from the
+    // shader.
+    q_width: Const<u32>,
+    kv_width: Const<u32>) -> Result<(), Refusal> {
     let packed_width = packed.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
         Fire::at(SPLIT_FILE, "split_qkv_bf16").apply(Grid::of(elementwise_rows(packed_width, rows)?, [GROUP_X, 1, 1])),
-        &[packed.arg(), q.arg(), k.arg(), v.arg(), params],
+        &[packed.arg(), q.arg(), k.arg(), v.arg(), q_width.arg(), kv_width.arg()],
     )
 }
 
@@ -462,8 +479,12 @@ pub fn kv_append_paged(
 pub fn logit_softcap(
     ctx: &Ctx<'_>,
     logits: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
+    out: Out<Tensor<bf16>>,
+    // THE CAP, WHICH WAS `SoftcapParams`'s first field. The struct's other
+    // word was dead -- a per-row vocabulary bound an elementwise grid made
+    // meaningless -- so with the cap stated as a mark there is nothing left
+    // for a block to carry. `logit_softcap.metal` takes it as buffer 2.
+    cap: Const<f32>) -> Result<(), Refusal> {
     // THE ELEMENT COUNT, DERIVED RATHER THAN ASKED. HEAD spelled it
     // `Reckoned<Times<Say<Width>, Say<Rows>>>` -- a product of two facts,
     // not a fact -- and the migration turned it into `keys::Elements`,
@@ -472,7 +493,7 @@ pub fn logit_softcap(
     let n = out.rows.saturating_mul(out.width);
     ctx.fire(
         Fire::at(SOFTCAP_FILE, "logit_softcap_bfloat16").apply(Grid::of(elementwise(n, 1)?, [GROUP_X, 1, 1])),
-        &[logits.arg(), out.arg(), params],
+        &[logits.arg(), out.arg(), cap.arg()],
     )
 }
 
@@ -1214,9 +1235,17 @@ mod tests {
     /// token count, or a tile count. `gate`'s `row_stride` is separate from
     /// all of that. None of `split_qkv_bf16`, `q_gate_split`,
     /// `logit_softcap` or the three `_sink` forms is fired by a test in this
-    /// module, so their own facts (`params`, `QgRowStride`, `OutRowStride`,
-    /// `Elements`) have no Cell here -- adding one nothing exercises would be
-    /// a guess this probe cannot stand behind.
+    /// module, so nothing here answers for them -- adding a Cell nothing
+    /// exercises would be a guess this probe cannot stand behind.
+    ///
+    /// What those four would have wanted has been SHRINKING rather than
+    /// growing, which is why no Cell was ever owed: `split_qkv_bf16` asked
+    /// for the whole staged block until its two widths became `Const<u32>`
+    /// marks, `logit_softcap` asked for it until its cap became a
+    /// `Const<f32>`, and `q_gate_split`'s two pitches were `keys::QgRowStride`
+    /// and `keys::OutRowStride` until they became marks too. A mark is the
+    /// CALLER'S to supply, so a test that fires one of these bodies states
+    /// the number in the call and asks this probe for nothing.
     struct Seen {
         calls: RefCell<Vec<Call>>,
         page_size: Cell<i32>,
@@ -1274,15 +1303,25 @@ mod tests {
     }
 
     impl Encode for Seen {
-        fn resolve(&self, _ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
+        fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
             use kernels::keys::Fact;
             // THE STATEMENT'S OWN SCALARS, read by index where the params run
             // is the shader's struct and no `Const` mark can name a word in it
             // -- see `Asks::param`. A stride wide enough for the rows these
             // cases build.
+            //
+            // THE CARRIER IS READ, NOT ASSUMED. This answered `ArgValue::I32`
+            // for every slot while every scalar in this file was an `i32`;
+            // `split_qkv_bf16`'s two widths are `Const<u32>` now, and
+            // `Arg::unpack` for that mark takes `ArgValue::U32` and refuses an
+            // `I32` -- so one shape for both would refuse a body under test
+            // that the driver, which goes through `bind::number`, binds.
             if let kernels::Source::Slot(kernels::Kind::Param, n) = source {
                 let _ = n;
-                return Ok(ArgValue::I32(4096));
+                return Ok(match ty {
+                    kernels::Ty::U32 => ArgValue::U32(4096),
+                    _ => ArgValue::I32(4096),
+                });
             }
             if source == <keys::KvPageSize as Fact>::SOURCE {
                 return Ok(ArgValue::I32(self.page_size.get()));

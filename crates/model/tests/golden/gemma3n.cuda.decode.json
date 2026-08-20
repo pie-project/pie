@@ -230,481 +230,9 @@
       "dtype": "BF16"
     },
     {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 8192
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 8192
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 8192
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 8192
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 4
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 4
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 4
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 4
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        {
-          "Const": 4
-        },
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 256
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 256
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 256
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 4
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 4
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 4
-        },
-        {
-          "Const": 4
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        {
-          "Const": 4
-        },
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 64
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 512
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 512
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 512
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 512
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 512
-        }
-      ],
-      "dtype": "BF16"
+      "shape": [],
+      "dtype": "I32",
+      "raised": "fa2.decode"
     },
     {
       "shape": [
@@ -1184,6 +712,493 @@
       "dtype": "BF16"
     },
     {
+      "shape": [],
+      "dtype": "I32",
+      "raised": "fa2.decode"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 8192
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 8192
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 8192
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 8192
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        {
+          "Const": 4
+        },
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 256
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 256
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 256
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        {
+          "Const": 4
+        },
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [],
+      "dtype": "I32",
+      "raised": "fa2.decode"
+    },
+    {
       "shape": [
         "Tokens",
         {
@@ -1661,472 +1676,9 @@
       "dtype": "BF16"
     },
     {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 8192
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 8192
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 8192
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 4
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 4
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 4
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 4
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        {
-          "Const": 4
-        },
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 256
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 256
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 256
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 4
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 4
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 16
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 4
-        },
-        {
-          "Const": 4
-        }
-      ],
-      "dtype": "F32"
-    },
-    {
-      "shape": [
-        {
-          "Const": 4
-        },
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 64
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 512
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 512
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 512
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 512
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 2048
-        }
-      ],
-      "dtype": "BF16"
-    },
-    {
-      "shape": [
-        "Tokens",
-        {
-          "Const": 512
-        }
-      ],
-      "dtype": "BF16"
+      "shape": [],
+      "dtype": "I32",
+      "raised": "fa2.decode"
     },
     {
       "shape": [
@@ -2595,6 +2147,484 @@
         }
       ],
       "dtype": "BF16"
+    },
+    {
+      "shape": [],
+      "dtype": "I32",
+      "raised": "fa2.decode"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 8192
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 8192
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 8192
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        {
+          "Const": 4
+        },
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 256
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 256
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 256
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4
+        },
+        {
+          "Const": 4
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        {
+          "Const": 4
+        },
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 64
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [],
+      "dtype": "I32",
+      "raised": "fa2.decode"
     },
     {
       "shape": [
@@ -3310,7 +3340,9 @@
         }
       },
       "inputs": [],
-      "outputs": [],
+      "outputs": [
+        23
+      ],
       "layer": null
     },
     {
@@ -3324,10 +3356,11 @@
         }
       },
       "inputs": [
-        21
+        21,
+        23
       ],
       "outputs": [
-        23
+        24
       ],
       "layer": 0
     },
@@ -3339,7 +3372,7 @@
         }
       },
       "inputs": [
-        23
+        24
       ],
       "outputs": [],
       "layer": 0
@@ -3352,10 +3385,10 @@
         }
       },
       "inputs": [
-        23
+        24
       ],
       "outputs": [
-        24
+        25
       ],
       "layer": 0
     },
@@ -3369,10 +3402,10 @@
         }
       },
       "inputs": [
-        24
+        25
       ],
       "outputs": [
-        25
+        26
       ],
       "layer": 0
     },
@@ -3384,10 +3417,10 @@
       },
       "inputs": [
         10,
-        25
+        26
       ],
       "outputs": [
-        26
+        27
       ],
       "layer": null
     },
@@ -3398,11 +3431,11 @@
         }
       },
       "inputs": [
-        26,
+        27,
         14
       ],
       "outputs": [
-        27
+        28
       ],
       "layer": null
     },
@@ -3416,10 +3449,10 @@
         }
       },
       "inputs": [
-        27
+        28
       ],
       "outputs": [
-        28
+        29
       ],
       "layer": null
     },
@@ -3433,10 +3466,10 @@
         }
       },
       "inputs": [
-        28
+        29
       ],
       "outputs": [
-        29
+        30
       ],
       "layer": 0
     },
@@ -3448,22 +3481,7 @@
         }
       },
       "inputs": [
-        29
-      ],
-      "outputs": [
         30
-      ],
-      "layer": 0
-    },
-    {
-      "kind": {
-        "Matmul": {
-          "weight": "layer.0.up_proj",
-          "beta_one": false
-        }
-      },
-      "inputs": [
-        29
       ],
       "outputs": [
         31
@@ -3472,11 +3490,9 @@
     },
     {
       "kind": {
-        "Launch": {
-          "kernel": "mlp::gaussian_topk_bf16",
-          "params": [
-            1070762640
-          ]
+        "Matmul": {
+          "weight": "layer.0.up_proj",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -3490,15 +3506,32 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "mlp::geglu_tanh_bf16"
+          "kernel": "mlp::gaussian_topk_bf16",
+          "params": [
+            1070762640
+          ]
         }
       },
       "inputs": [
-        32,
         31
       ],
       "outputs": [
         33
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "mlp::geglu_tanh_bf16"
+        }
+      },
+      "inputs": [
+        33,
+        32
+      ],
+      "outputs": [
+        34
       ],
       "layer": 0
     },
@@ -3510,10 +3543,10 @@
         }
       },
       "inputs": [
-        33
+        34
       ],
       "outputs": [
-        34
+        35
       ],
       "layer": 0
     },
@@ -3527,10 +3560,10 @@
         }
       },
       "inputs": [
-        34
+        35
       ],
       "outputs": [
-        35
+        36
       ],
       "layer": 0
     },
@@ -3541,11 +3574,11 @@
         }
       },
       "inputs": [
-        28,
-        35
+        29,
+        36
       ],
       "outputs": [
-        36
+        37
       ],
       "layer": null
     },
@@ -3559,10 +3592,10 @@
         }
       },
       "inputs": [
-        36
+        37
       ],
       "outputs": [
-        37
+        38
       ],
       "layer": 0
     },
@@ -3576,10 +3609,10 @@
         }
       },
       "inputs": [
-        37
+        38
       ],
       "outputs": [
-        38
+        39
       ],
       "layer": 0
     },
@@ -3591,10 +3624,10 @@
         }
       },
       "inputs": [
-        38
+        39
       ],
       "outputs": [
-        39
+        40
       ],
       "layer": 0
     },
@@ -3605,10 +3638,10 @@
         }
       },
       "inputs": [
-        39
+        40
       ],
       "outputs": [
-        40
+        41
       ],
       "layer": 0
     },
@@ -3620,10 +3653,10 @@
         }
       },
       "inputs": [
-        40
+        41
       ],
       "outputs": [
-        41
+        42
       ],
       "layer": 0
     },
@@ -3634,10 +3667,10 @@
         }
       },
       "inputs": [
-        41
+        42
       ],
       "outputs": [
-        42
+        43
       ],
       "layer": 0
     },
@@ -3649,11 +3682,11 @@
       },
       "inputs": [
         9,
-        36,
-        42
+        37,
+        43
       ],
       "outputs": [
-        43
+        44
       ],
       "layer": null
     },
@@ -3665,7 +3698,7 @@
       },
       "inputs": [],
       "outputs": [
-        44
+        45
       ],
       "layer": null
     },
@@ -3680,18 +3713,18 @@
         11
       ],
       "outputs": [
-        45
+        46
       ],
       "layer": 0
     },
     {
       "kind": "SigmoidGateMul",
       "inputs": [
-        44,
-        45
+        45,
+        46
       ],
       "outputs": [
-        46
+        47
       ],
       "layer": null
     },
@@ -3703,10 +3736,10 @@
         }
       },
       "inputs": [
-        46
+        47
       ],
       "outputs": [
-        47
+        48
       ],
       "layer": 0
     },
@@ -3717,10 +3750,10 @@
         }
       },
       "inputs": [
-        43
+        44
       ],
       "outputs": [
-        48
+        49
       ],
       "layer": null
     },
@@ -3731,11 +3764,11 @@
         }
       },
       "inputs": [
-        48,
-        47
+        49,
+        48
       ],
       "outputs": [
-        49
+        50
       ],
       "layer": null
     },
@@ -3746,10 +3779,10 @@
         }
       },
       "inputs": [
-        43
+        44
       ],
       "outputs": [
-        50
+        51
       ],
       "layer": null
     },
@@ -3760,11 +3793,11 @@
         }
       },
       "inputs": [
-        50,
-        47
+        51,
+        48
       ],
       "outputs": [
-        51
+        52
       ],
       "layer": null
     },
@@ -3775,10 +3808,10 @@
         }
       },
       "inputs": [
-        43
+        44
       ],
       "outputs": [
-        52
+        53
       ],
       "layer": null
     },
@@ -3789,11 +3822,11 @@
         }
       },
       "inputs": [
-        52,
-        47
+        53,
+        48
       ],
       "outputs": [
-        53
+        54
       ],
       "layer": null
     },
@@ -3804,10 +3837,10 @@
         }
       },
       "inputs": [
-        43
+        44
       ],
       "outputs": [
-        54
+        55
       ],
       "layer": null
     },
@@ -3821,10 +3854,10 @@
         }
       },
       "inputs": [
-        54
+        55
       ],
       "outputs": [
-        55
+        56
       ],
       "layer": 1
     },
@@ -3838,10 +3871,10 @@
         }
       },
       "inputs": [
-        55
+        56
       ],
       "outputs": [
-        56
+        57
       ],
       "layer": 1
     },
@@ -3853,10 +3886,10 @@
         }
       },
       "inputs": [
-        56
+        57
       ],
       "outputs": [
-        57
+        58
       ],
       "layer": 1
     },
@@ -3867,10 +3900,10 @@
         }
       },
       "inputs": [
-        57
+        58
       ],
       "outputs": [
-        58
+        59
       ],
       "layer": 1
     },
@@ -3882,10 +3915,10 @@
         }
       },
       "inputs": [
-        58
+        59
       ],
       "outputs": [
-        59
+        60
       ],
       "layer": 1
     },
@@ -3896,10 +3929,10 @@
         }
       },
       "inputs": [
-        59
+        60
       ],
       "outputs": [
-        60
+        61
       ],
       "layer": 1
     },
@@ -3910,11 +3943,11 @@
         }
       },
       "inputs": [
-        43,
-        60
+        44,
+        61
       ],
       "outputs": [
-        61
+        62
       ],
       "layer": null
     },
@@ -3925,10 +3958,10 @@
         }
       },
       "inputs": [
-        61
+        62
       ],
       "outputs": [
-        62
+        63
       ],
       "layer": null
     },
@@ -3942,10 +3975,10 @@
         }
       },
       "inputs": [
-        62
+        63
       ],
       "outputs": [
-        63
+        64
       ],
       "layer": 1
     },
@@ -3957,10 +3990,10 @@
         }
       },
       "inputs": [
-        63
+        64
       ],
       "outputs": [
-        64
+        65
       ],
       "layer": 1
     },
@@ -3972,10 +4005,10 @@
         }
       },
       "inputs": [
-        64
+        65
       ],
       "outputs": [
-        65
+        66
       ],
       "layer": 1
     },
@@ -3989,10 +4022,10 @@
         }
       },
       "inputs": [
-        65
+        66
       ],
       "outputs": [
-        66
+        67
       ],
       "layer": 1
     },
@@ -4004,10 +4037,10 @@
         }
       },
       "inputs": [
-        63
+        64
       ],
       "outputs": [
-        67
+        68
       ],
       "layer": 1
     },
@@ -4019,10 +4052,10 @@
         }
       },
       "inputs": [
-        63
+        64
       ],
       "outputs": [
-        68
+        69
       ],
       "layer": 1
     },
@@ -4034,23 +4067,7 @@
         }
       },
       "inputs": [
-        63
-      ],
-      "outputs": [
-        69
-      ],
-      "layer": 1
-    },
-    {
-      "kind": {
-        "RmsnormPerHead": {
-          "weight": "layer.1.q_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
-        }
-      },
-      "inputs": [
-        67
+        64
       ],
       "outputs": [
         70
@@ -4060,7 +4077,7 @@
     {
       "kind": {
         "RmsnormPerHead": {
-          "weight": "layer.1.k_norm",
+          "weight": "layer.1.q_norm",
           "head_dim": 256,
           "variant": "Gemma"
         }
@@ -4075,8 +4092,10 @@
     },
     {
       "kind": {
-        "Launch": {
-          "kernel": "norm::rmsnorm_no_scale_bf16"
+        "RmsnormPerHead": {
+          "weight": "layer.1.k_norm",
+          "head_dim": 256,
+          "variant": "Gemma"
         }
       },
       "inputs": [
@@ -4084,6 +4103,20 @@
       ],
       "outputs": [
         72
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_no_scale_bf16"
+        }
+      },
+      "inputs": [
+        70
+      ],
+      "outputs": [
+        73
       ],
       "layer": 1
     },
@@ -4099,12 +4132,12 @@
         }
       },
       "inputs": [
-        70,
-        71
+        71,
+        72
       ],
       "outputs": [
-        73,
-        74
+        74,
+        75
       ],
       "layer": 1
     },
@@ -4119,8 +4152,8 @@
         }
       },
       "inputs": [
-        74,
-        72
+        75,
+        73
       ],
       "outputs": [],
       "layer": 1
@@ -4133,7 +4166,7 @@
         }
       },
       "inputs": [
-        73
+        74
       ],
       "outputs": [],
       "layer": 1
@@ -4150,7 +4183,9 @@
         }
       },
       "inputs": [],
-      "outputs": [],
+      "outputs": [
+        76
+      ],
       "layer": null
     },
     {
@@ -4164,10 +4199,11 @@
         }
       },
       "inputs": [
-        73
+        74,
+        76
       ],
       "outputs": [
-        75
+        77
       ],
       "layer": 1
     },
@@ -4179,7 +4215,7 @@
         }
       },
       "inputs": [
-        75
+        77
       ],
       "outputs": [],
       "layer": 1
@@ -4192,10 +4228,10 @@
         }
       },
       "inputs": [
-        75
+        77
       ],
       "outputs": [
-        76
+        78
       ],
       "layer": 1
     },
@@ -4209,10 +4245,10 @@
         }
       },
       "inputs": [
-        76
+        78
       ],
       "outputs": [
-        77
+        79
       ],
       "layer": 1
     },
@@ -4223,11 +4259,11 @@
         }
       },
       "inputs": [
-        62,
-        77
+        63,
+        79
       ],
       "outputs": [
-        78
+        80
       ],
       "layer": null
     },
@@ -4238,11 +4274,11 @@
         }
       },
       "inputs": [
-        78,
-        66
+        80,
+        67
       ],
       "outputs": [
-        79
+        81
       ],
       "layer": null
     },
@@ -4256,10 +4292,10 @@
         }
       },
       "inputs": [
-        79
+        81
       ],
       "outputs": [
-        80
+        82
       ],
       "layer": null
     },
@@ -4273,10 +4309,10 @@
         }
       },
       "inputs": [
-        80
+        82
       ],
       "outputs": [
-        81
+        83
       ],
       "layer": 1
     },
@@ -4288,10 +4324,10 @@
         }
       },
       "inputs": [
-        81
+        83
       ],
       "outputs": [
-        82
+        84
       ],
       "layer": 1
     },
@@ -4303,10 +4339,10 @@
         }
       },
       "inputs": [
-        81
+        83
       ],
       "outputs": [
-        83
+        85
       ],
       "layer": 1
     },
@@ -4320,10 +4356,10 @@
         }
       },
       "inputs": [
-        82
+        84
       ],
       "outputs": [
-        84
+        86
       ],
       "layer": 1
     },
@@ -4334,11 +4370,11 @@
         }
       },
       "inputs": [
-        84,
-        83
+        86,
+        85
       ],
       "outputs": [
-        85
+        87
       ],
       "layer": 1
     },
@@ -4350,10 +4386,10 @@
         }
       },
       "inputs": [
-        85
+        87
       ],
       "outputs": [
-        86
+        88
       ],
       "layer": 1
     },
@@ -4367,10 +4403,10 @@
         }
       },
       "inputs": [
-        86
+        88
       ],
       "outputs": [
-        87
+        89
       ],
       "layer": 1
     },
@@ -4381,11 +4417,11 @@
         }
       },
       "inputs": [
-        80,
-        87
+        82,
+        89
       ],
       "outputs": [
-        88
+        90
       ],
       "layer": null
     },
@@ -4399,10 +4435,10 @@
         }
       },
       "inputs": [
-        88
+        90
       ],
       "outputs": [
-        89
+        91
       ],
       "layer": 1
     },
@@ -4416,10 +4452,10 @@
         }
       },
       "inputs": [
-        89
+        91
       ],
       "outputs": [
-        90
+        92
       ],
       "layer": 1
     },
@@ -4431,10 +4467,10 @@
         }
       },
       "inputs": [
-        90
+        92
       ],
       "outputs": [
-        91
+        93
       ],
       "layer": 1
     },
@@ -4445,10 +4481,10 @@
         }
       },
       "inputs": [
-        91
+        93
       ],
       "outputs": [
-        92
+        94
       ],
       "layer": 1
     },
@@ -4460,10 +4496,10 @@
         }
       },
       "inputs": [
-        92
+        94
       ],
       "outputs": [
-        93
+        95
       ],
       "layer": 1
     },
@@ -4474,10 +4510,10 @@
         }
       },
       "inputs": [
-        93
+        95
       ],
       "outputs": [
-        94
+        96
       ],
       "layer": 1
     },
@@ -4488,12 +4524,12 @@
         }
       },
       "inputs": [
-        61,
-        88,
-        94
+        62,
+        90,
+        96
       ],
       "outputs": [
-        95
+        97
       ],
       "layer": null
     },
@@ -4505,7 +4541,7 @@
       },
       "inputs": [],
       "outputs": [
-        96
+        98
       ],
       "layer": null
     },
@@ -4517,21 +4553,21 @@
         }
       },
       "inputs": [
-        63
+        64
       ],
       "outputs": [
-        97
+        99
       ],
       "layer": 1
     },
     {
       "kind": "SigmoidGateMul",
       "inputs": [
-        96,
-        97
+        98,
+        99
       ],
       "outputs": [
-        98
+        100
       ],
       "layer": null
     },
@@ -4543,10 +4579,10 @@
         }
       },
       "inputs": [
-        98
+        100
       ],
       "outputs": [
-        99
+        101
       ],
       "layer": 1
     },
@@ -4557,36 +4593,7 @@
         }
       },
       "inputs": [
-        95
-      ],
-      "outputs": [
-        100
-      ],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "norm::residual_add_bf16"
-        }
-      },
-      "inputs": [
-        100,
-        99
-      ],
-      "outputs": [
-        101
-      ],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Select": {
-          "index": 2
-        }
-      },
-      "inputs": [
-        95
+        97
       ],
       "outputs": [
         102
@@ -4601,7 +4608,7 @@
       },
       "inputs": [
         102,
-        99
+        101
       ],
       "outputs": [
         103
@@ -4611,11 +4618,11 @@
     {
       "kind": {
         "Select": {
-          "index": 3
+          "index": 2
         }
       },
       "inputs": [
-        95
+        97
       ],
       "outputs": [
         104
@@ -4630,10 +4637,39 @@
       },
       "inputs": [
         104,
-        99
+        101
       ],
       "outputs": [
         105
+      ],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Select": {
+          "index": 3
+        }
+      },
+      "inputs": [
+        97
+      ],
+      "outputs": [
+        106
+      ],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::residual_add_bf16"
+        }
+      },
+      "inputs": [
+        106,
+        101
+      ],
+      "outputs": [
+        107
       ],
       "layer": null
     },
@@ -4644,10 +4680,10 @@
         }
       },
       "inputs": [
-        95
+        97
       ],
       "outputs": [
-        106
+        108
       ],
       "layer": null
     },
@@ -4661,10 +4697,10 @@
         }
       },
       "inputs": [
-        106
+        108
       ],
       "outputs": [
-        107
+        109
       ],
       "layer": 2
     },
@@ -4678,10 +4714,10 @@
         }
       },
       "inputs": [
-        107
+        109
       ],
       "outputs": [
-        108
+        110
       ],
       "layer": 2
     },
@@ -4693,10 +4729,10 @@
         }
       },
       "inputs": [
-        108
+        110
       ],
       "outputs": [
-        109
+        111
       ],
       "layer": 2
     },
@@ -4707,10 +4743,10 @@
         }
       },
       "inputs": [
-        109
+        111
       ],
       "outputs": [
-        110
+        112
       ],
       "layer": 2
     },
@@ -4722,10 +4758,10 @@
         }
       },
       "inputs": [
-        110
+        112
       ],
       "outputs": [
-        111
+        113
       ],
       "layer": 2
     },
@@ -4736,10 +4772,10 @@
         }
       },
       "inputs": [
-        111
+        113
       ],
       "outputs": [
-        112
+        114
       ],
       "layer": 2
     },
@@ -4750,11 +4786,11 @@
         }
       },
       "inputs": [
-        95,
-        112
+        97,
+        114
       ],
       "outputs": [
-        113
+        115
       ],
       "layer": null
     },
@@ -4765,10 +4801,10 @@
         }
       },
       "inputs": [
-        113
+        115
       ],
       "outputs": [
-        114
+        116
       ],
       "layer": null
     },
@@ -4782,10 +4818,10 @@
         }
       },
       "inputs": [
-        114
+        116
       ],
       "outputs": [
-        115
+        117
       ],
       "layer": 2
     },
@@ -4797,10 +4833,10 @@
         }
       },
       "inputs": [
-        115
+        117
       ],
       "outputs": [
-        116
+        118
       ],
       "layer": 2
     },
@@ -4812,10 +4848,10 @@
         }
       },
       "inputs": [
-        116
+        118
       ],
       "outputs": [
-        117
+        119
       ],
       "layer": 2
     },
@@ -4829,10 +4865,10 @@
         }
       },
       "inputs": [
-        117
+        119
       ],
       "outputs": [
-        118
+        120
       ],
       "layer": 2
     },
@@ -4844,10 +4880,10 @@
         }
       },
       "inputs": [
-        115
+        117
       ],
       "outputs": [
-        119
+        121
       ],
       "layer": 2
     },
@@ -4859,10 +4895,10 @@
         }
       },
       "inputs": [
-        115
+        117
       ],
       "outputs": [
-        120
+        122
       ],
       "layer": 2
     },
@@ -4874,10 +4910,10 @@
         }
       },
       "inputs": [
-        115
+        117
       ],
       "outputs": [
-        121
+        123
       ],
       "layer": 2
     },
@@ -4890,10 +4926,10 @@
         }
       },
       "inputs": [
-        119
+        121
       ],
       "outputs": [
-        122
+        124
       ],
       "layer": 2
     },
@@ -4906,10 +4942,10 @@
         }
       },
       "inputs": [
-        120
+        122
       ],
       "outputs": [
-        123
+        125
       ],
       "layer": 2
     },
@@ -4920,10 +4956,10 @@
         }
       },
       "inputs": [
-        121
+        123
       ],
       "outputs": [
-        124
+        126
       ],
       "layer": 2
     },
@@ -4939,12 +4975,12 @@
         }
       },
       "inputs": [
-        122,
-        123
+        124,
+        125
       ],
       "outputs": [
-        125,
-        126
+        127,
+        128
       ],
       "layer": 2
     },
@@ -4959,8 +4995,8 @@
         }
       },
       "inputs": [
-        126,
-        124
+        128,
+        126
       ],
       "outputs": [],
       "layer": 2
@@ -4973,7 +5009,7 @@
         }
       },
       "inputs": [
-        125
+        127
       ],
       "outputs": [],
       "layer": 2
@@ -4990,7 +5026,9 @@
         }
       },
       "inputs": [],
-      "outputs": [],
+      "outputs": [
+        129
+      ],
       "layer": null
     },
     {
@@ -5004,10 +5042,11 @@
         }
       },
       "inputs": [
-        125
+        127,
+        129
       ],
       "outputs": [
-        127
+        130
       ],
       "layer": 2
     },
@@ -5019,7 +5058,7 @@
         }
       },
       "inputs": [
-        127
+        130
       ],
       "outputs": [],
       "layer": 2
@@ -5032,10 +5071,10 @@
         }
       },
       "inputs": [
-        127
+        130
       ],
       "outputs": [
-        128
+        131
       ],
       "layer": 2
     },
@@ -5049,10 +5088,10 @@
         }
       },
       "inputs": [
-        128
+        131
       ],
       "outputs": [
-        129
+        132
       ],
       "layer": 2
     },
@@ -5063,11 +5102,11 @@
         }
       },
       "inputs": [
-        114,
-        129
+        116,
+        132
       ],
       "outputs": [
-        130
+        133
       ],
       "layer": null
     },
@@ -5078,11 +5117,11 @@
         }
       },
       "inputs": [
-        130,
-        118
+        133,
+        120
       ],
       "outputs": [
-        131
+        134
       ],
       "layer": null
     },
@@ -5096,10 +5135,10 @@
         }
       },
       "inputs": [
-        131
+        134
       ],
       "outputs": [
-        132
+        135
       ],
       "layer": null
     },
@@ -5113,10 +5152,10 @@
         }
       },
       "inputs": [
-        132
+        135
       ],
       "outputs": [
-        133
+        136
       ],
       "layer": 2
     },
@@ -5128,10 +5167,10 @@
         }
       },
       "inputs": [
-        133
+        136
       ],
       "outputs": [
-        134
+        137
       ],
       "layer": 2
     },
@@ -5143,10 +5182,10 @@
         }
       },
       "inputs": [
-        133
+        136
       ],
       "outputs": [
-        135
+        138
       ],
       "layer": 2
     },
@@ -5160,10 +5199,10 @@
         }
       },
       "inputs": [
-        134
+        137
       ],
       "outputs": [
-        136
+        139
       ],
       "layer": 2
     },
@@ -5174,11 +5213,11 @@
         }
       },
       "inputs": [
-        136,
-        135
+        139,
+        138
       ],
       "outputs": [
-        137
+        140
       ],
       "layer": 2
     },
@@ -5190,10 +5229,10 @@
         }
       },
       "inputs": [
-        137
+        140
       ],
       "outputs": [
-        138
+        141
       ],
       "layer": 2
     },
@@ -5207,10 +5246,10 @@
         }
       },
       "inputs": [
-        138
+        141
       ],
       "outputs": [
-        139
+        142
       ],
       "layer": 2
     },
@@ -5221,11 +5260,11 @@
         }
       },
       "inputs": [
-        132,
-        139
+        135,
+        142
       ],
       "outputs": [
-        140
+        143
       ],
       "layer": null
     },
@@ -5239,10 +5278,10 @@
         }
       },
       "inputs": [
-        140
+        143
       ],
       "outputs": [
-        141
+        144
       ],
       "layer": 2
     },
@@ -5256,10 +5295,10 @@
         }
       },
       "inputs": [
-        141
+        144
       ],
       "outputs": [
-        142
+        145
       ],
       "layer": 2
     },
@@ -5271,10 +5310,10 @@
         }
       },
       "inputs": [
-        142
+        145
       ],
       "outputs": [
-        143
+        146
       ],
       "layer": 2
     },
@@ -5285,10 +5324,10 @@
         }
       },
       "inputs": [
-        143
+        146
       ],
       "outputs": [
-        144
+        147
       ],
       "layer": 2
     },
@@ -5300,10 +5339,10 @@
         }
       },
       "inputs": [
-        144
+        147
       ],
       "outputs": [
-        145
+        148
       ],
       "layer": 2
     },
@@ -5314,10 +5353,10 @@
         }
       },
       "inputs": [
-        145
+        148
       ],
       "outputs": [
-        146
+        149
       ],
       "layer": 2
     },
@@ -5328,12 +5367,12 @@
         }
       },
       "inputs": [
-        113,
-        140,
-        146
+        115,
+        143,
+        149
       ],
       "outputs": [
-        147
+        150
       ],
       "layer": null
     },
@@ -5345,7 +5384,7 @@
       },
       "inputs": [],
       "outputs": [
-        148
+        151
       ],
       "layer": null
     },
@@ -5357,21 +5396,21 @@
         }
       },
       "inputs": [
-        115
+        117
       ],
       "outputs": [
-        149
+        152
       ],
       "layer": 2
     },
     {
       "kind": "SigmoidGateMul",
       "inputs": [
-        148,
-        149
+        151,
+        152
       ],
       "outputs": [
-        150
+        153
       ],
       "layer": null
     },
@@ -5383,10 +5422,10 @@
         }
       },
       "inputs": [
-        150
+        153
       ],
       "outputs": [
-        151
+        154
       ],
       "layer": 2
     },
@@ -5397,10 +5436,10 @@
         }
       },
       "inputs": [
-        147
+        150
       ],
       "outputs": [
-        152
+        155
       ],
       "layer": null
     },
@@ -5411,11 +5450,11 @@
         }
       },
       "inputs": [
-        152,
-        151
+        155,
+        154
       ],
       "outputs": [
-        153
+        156
       ],
       "layer": null
     },
@@ -5426,10 +5465,10 @@
         }
       },
       "inputs": [
-        147
+        150
       ],
       "outputs": [
-        154
+        157
       ],
       "layer": null
     },
@@ -5440,11 +5479,11 @@
         }
       },
       "inputs": [
-        154,
-        151
+        157,
+        154
       ],
       "outputs": [
-        155
+        158
       ],
       "layer": null
     },
@@ -5455,10 +5494,10 @@
         }
       },
       "inputs": [
-        147
+        150
       ],
       "outputs": [
-        156
+        159
       ],
       "layer": null
     },
@@ -5469,11 +5508,11 @@
         }
       },
       "inputs": [
-        156,
-        151
+        159,
+        154
       ],
       "outputs": [
-        157
+        160
       ],
       "layer": null
     },
@@ -5484,10 +5523,10 @@
         }
       },
       "inputs": [
-        147
+        150
       ],
       "outputs": [
-        158
+        161
       ],
       "layer": null
     },
@@ -5501,10 +5540,10 @@
         }
       },
       "inputs": [
-        158
+        161
       ],
       "outputs": [
-        159
+        162
       ],
       "layer": 3
     },
@@ -5518,10 +5557,10 @@
         }
       },
       "inputs": [
-        159
+        162
       ],
       "outputs": [
-        160
+        163
       ],
       "layer": 3
     },
@@ -5533,10 +5572,10 @@
         }
       },
       "inputs": [
-        160
+        163
       ],
       "outputs": [
-        161
+        164
       ],
       "layer": 3
     },
@@ -5547,10 +5586,10 @@
         }
       },
       "inputs": [
-        161
+        164
       ],
       "outputs": [
-        162
+        165
       ],
       "layer": 3
     },
@@ -5562,10 +5601,10 @@
         }
       },
       "inputs": [
-        162
+        165
       ],
       "outputs": [
-        163
+        166
       ],
       "layer": 3
     },
@@ -5576,10 +5615,10 @@
         }
       },
       "inputs": [
-        163
+        166
       ],
       "outputs": [
-        164
+        167
       ],
       "layer": 3
     },
@@ -5590,11 +5629,11 @@
         }
       },
       "inputs": [
-        147,
-        164
+        150,
+        167
       ],
       "outputs": [
-        165
+        168
       ],
       "layer": null
     },
@@ -5605,10 +5644,10 @@
         }
       },
       "inputs": [
-        165
+        168
       ],
       "outputs": [
-        166
+        169
       ],
       "layer": null
     },
@@ -5618,53 +5657,6 @@
           "kernel": "norm::rmsnorm_gemma_bf16",
           "weights": [
             "layer.3.attn_norm"
-          ]
-        }
-      },
-      "inputs": [
-        166
-      ],
-      "outputs": [
-        167
-      ],
-      "layer": 3
-    },
-    {
-      "kind": {
-        "Matmul": {
-          "weight": "layer.3.laurel_left",
-          "beta_one": false
-        }
-      },
-      "inputs": [
-        167
-      ],
-      "outputs": [
-        168
-      ],
-      "layer": 3
-    },
-    {
-      "kind": {
-        "Matmul": {
-          "weight": "layer.3.laurel_right",
-          "beta_one": false
-        }
-      },
-      "inputs": [
-        168
-      ],
-      "outputs": [
-        169
-      ],
-      "layer": 3
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
-          "weights": [
-            "layer.3.laurel_post_norm"
           ]
         }
       },
@@ -5679,15 +5671,62 @@
     {
       "kind": {
         "Matmul": {
+          "weight": "layer.3.laurel_left",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        170
+      ],
+      "outputs": [
+        171
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.3.laurel_right",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        171
+      ],
+      "outputs": [
+        172
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.3.laurel_post_norm"
+          ]
+        }
+      },
+      "inputs": [
+        172
+      ],
+      "outputs": [
+        173
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Matmul": {
           "weight": "layer.3.q_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        167
+        170
       ],
       "outputs": [
-        171
+        174
       ],
       "layer": 3
     },
@@ -5699,10 +5738,10 @@
         }
       },
       "inputs": [
-        167
+        170
       ],
       "outputs": [
-        172
+        175
       ],
       "layer": 3
     },
@@ -5714,10 +5753,10 @@
         }
       },
       "inputs": [
-        167
+        170
       ],
       "outputs": [
-        173
+        176
       ],
       "layer": 3
     },
@@ -5730,10 +5769,10 @@
         }
       },
       "inputs": [
-        171
+        174
       ],
       "outputs": [
-        174
+        177
       ],
       "layer": 3
     },
@@ -5746,10 +5785,10 @@
         }
       },
       "inputs": [
-        172
+        175
       ],
       "outputs": [
-        175
+        178
       ],
       "layer": 3
     },
@@ -5760,10 +5799,10 @@
         }
       },
       "inputs": [
-        173
+        176
       ],
       "outputs": [
-        176
+        179
       ],
       "layer": 3
     },
@@ -5779,12 +5818,12 @@
         }
       },
       "inputs": [
-        174,
-        175
-      ],
-      "outputs": [
         177,
         178
+      ],
+      "outputs": [
+        180,
+        181
       ],
       "layer": 3
     },
@@ -5799,8 +5838,8 @@
         }
       },
       "inputs": [
-        178,
-        176
+        181,
+        179
       ],
       "outputs": [],
       "layer": 3
@@ -5813,7 +5852,7 @@
         }
       },
       "inputs": [
-        177
+        180
       ],
       "outputs": [],
       "layer": 3
@@ -5830,7 +5869,9 @@
         }
       },
       "inputs": [],
-      "outputs": [],
+      "outputs": [
+        182
+      ],
       "layer": null
     },
     {
@@ -5844,10 +5885,11 @@
         }
       },
       "inputs": [
-        177
+        180,
+        182
       ],
       "outputs": [
-        179
+        183
       ],
       "layer": 3
     },
@@ -5859,7 +5901,7 @@
         }
       },
       "inputs": [
-        179
+        183
       ],
       "outputs": [],
       "layer": 3
@@ -5872,10 +5914,10 @@
         }
       },
       "inputs": [
-        179
+        183
       ],
       "outputs": [
-        180
+        184
       ],
       "layer": 3
     },
@@ -5889,10 +5931,10 @@
         }
       },
       "inputs": [
-        180
+        184
       ],
       "outputs": [
-        181
+        185
       ],
       "layer": 3
     },
@@ -5903,11 +5945,11 @@
         }
       },
       "inputs": [
-        166,
-        181
+        169,
+        185
       ],
       "outputs": [
-        182
+        186
       ],
       "layer": null
     },
@@ -5918,11 +5960,11 @@
         }
       },
       "inputs": [
-        182,
-        170
+        186,
+        173
       ],
       "outputs": [
-        183
+        187
       ],
       "layer": null
     },
@@ -5936,10 +5978,10 @@
         }
       },
       "inputs": [
-        183
+        187
       ],
       "outputs": [
-        184
+        188
       ],
       "layer": null
     },
@@ -5953,10 +5995,10 @@
         }
       },
       "inputs": [
-        184
+        188
       ],
       "outputs": [
-        185
+        189
       ],
       "layer": 3
     },
@@ -5968,10 +6010,10 @@
         }
       },
       "inputs": [
-        185
+        189
       ],
       "outputs": [
-        186
+        190
       ],
       "layer": 3
     },
@@ -5983,10 +6025,10 @@
         }
       },
       "inputs": [
-        185
+        189
       ],
       "outputs": [
-        187
+        191
       ],
       "layer": 3
     },
@@ -5997,11 +6039,11 @@
         }
       },
       "inputs": [
-        186,
-        187
+        190,
+        191
       ],
       "outputs": [
-        188
+        192
       ],
       "layer": 3
     },
@@ -6013,10 +6055,10 @@
         }
       },
       "inputs": [
-        188
+        192
       ],
       "outputs": [
-        189
+        193
       ],
       "layer": 3
     },
@@ -6030,10 +6072,10 @@
         }
       },
       "inputs": [
-        189
+        193
       ],
       "outputs": [
-        190
+        194
       ],
       "layer": 3
     },
@@ -6044,11 +6086,11 @@
         }
       },
       "inputs": [
-        184,
-        190
+        188,
+        194
       ],
       "outputs": [
-        191
+        195
       ],
       "layer": null
     },
@@ -6062,10 +6104,10 @@
         }
       },
       "inputs": [
-        191
+        195
       ],
       "outputs": [
-        192
+        196
       ],
       "layer": 3
     },
@@ -6079,10 +6121,10 @@
         }
       },
       "inputs": [
-        192
+        196
       ],
       "outputs": [
-        193
+        197
       ],
       "layer": 3
     },
@@ -6094,10 +6136,10 @@
         }
       },
       "inputs": [
-        193
+        197
       ],
       "outputs": [
-        194
+        198
       ],
       "layer": 3
     },
@@ -6108,10 +6150,10 @@
         }
       },
       "inputs": [
-        194
+        198
       ],
       "outputs": [
-        195
+        199
       ],
       "layer": 3
     },
@@ -6123,10 +6165,10 @@
         }
       },
       "inputs": [
-        195
+        199
       ],
       "outputs": [
-        196
+        200
       ],
       "layer": 3
     },
@@ -6137,10 +6179,10 @@
         }
       },
       "inputs": [
-        196
+        200
       ],
       "outputs": [
-        197
+        201
       ],
       "layer": 3
     },
@@ -6151,12 +6193,12 @@
         }
       },
       "inputs": [
-        165,
-        191,
-        197
+        168,
+        195,
+        201
       ],
       "outputs": [
-        198
+        202
       ],
       "layer": null
     },
@@ -6168,7 +6210,7 @@
       },
       "inputs": [],
       "outputs": [
-        199
+        203
       ],
       "layer": null
     },
@@ -6180,21 +6222,21 @@
         }
       },
       "inputs": [
-        167
+        170
       ],
       "outputs": [
-        200
+        204
       ],
       "layer": 3
     },
     {
       "kind": "SigmoidGateMul",
       "inputs": [
-        199,
-        200
+        203,
+        204
       ],
       "outputs": [
-        201
+        205
       ],
       "layer": null
     },
@@ -6206,10 +6248,10 @@
         }
       },
       "inputs": [
-        201
+        205
       ],
       "outputs": [
-        202
+        206
       ],
       "layer": 3
     },
@@ -6220,65 +6262,7 @@
         }
       },
       "inputs": [
-        198
-      ],
-      "outputs": [
-        203
-      ],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "norm::residual_add_bf16"
-        }
-      },
-      "inputs": [
-        203,
         202
-      ],
-      "outputs": [
-        204
-      ],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Select": {
-          "index": 2
-        }
-      },
-      "inputs": [
-        198
-      ],
-      "outputs": [
-        205
-      ],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "norm::residual_add_bf16"
-        }
-      },
-      "inputs": [
-        205,
-        202
-      ],
-      "outputs": [
-        206
-      ],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Select": {
-          "index": 3
-        }
-      },
-      "inputs": [
-        198
       ],
       "outputs": [
         207
@@ -6293,10 +6277,68 @@
       },
       "inputs": [
         207,
-        202
+        206
       ],
       "outputs": [
         208
+      ],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Select": {
+          "index": 2
+        }
+      },
+      "inputs": [
+        202
+      ],
+      "outputs": [
+        209
+      ],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::residual_add_bf16"
+        }
+      },
+      "inputs": [
+        209,
+        206
+      ],
+      "outputs": [
+        210
+      ],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Select": {
+          "index": 3
+        }
+      },
+      "inputs": [
+        202
+      ],
+      "outputs": [
+        211
+      ],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::residual_add_bf16"
+        }
+      },
+      "inputs": [
+        211,
+        206
+      ],
+      "outputs": [
+        212
       ],
       "layer": null
     },
@@ -6307,10 +6349,10 @@
         }
       },
       "inputs": [
-        198
+        202
       ],
       "outputs": [
-        209
+        213
       ],
       "layer": null
     },
@@ -6324,10 +6366,10 @@
         }
       },
       "inputs": [
-        209
+        213
       ],
       "outputs": [
-        210
+        214
       ],
       "layer": 4
     },
@@ -6341,10 +6383,10 @@
         }
       },
       "inputs": [
-        210
+        214
       ],
       "outputs": [
-        211
+        215
       ],
       "layer": 4
     },
@@ -6356,10 +6398,10 @@
         }
       },
       "inputs": [
-        211
+        215
       ],
       "outputs": [
-        212
+        216
       ],
       "layer": 4
     },
@@ -6370,10 +6412,10 @@
         }
       },
       "inputs": [
-        212
+        216
       ],
       "outputs": [
-        213
+        217
       ],
       "layer": 4
     },
@@ -6385,10 +6427,10 @@
         }
       },
       "inputs": [
-        213
+        217
       ],
       "outputs": [
-        214
+        218
       ],
       "layer": 4
     },
@@ -6399,10 +6441,10 @@
         }
       },
       "inputs": [
-        214
+        218
       ],
       "outputs": [
-        215
+        219
       ],
       "layer": 4
     },
@@ -6413,11 +6455,11 @@
         }
       },
       "inputs": [
-        198,
-        215
+        202,
+        219
       ],
       "outputs": [
-        216
+        220
       ],
       "layer": null
     },
@@ -6428,10 +6470,10 @@
         }
       },
       "inputs": [
-        216
+        220
       ],
       "outputs": [
-        217
+        221
       ],
       "layer": null
     },
@@ -6445,10 +6487,10 @@
         }
       },
       "inputs": [
-        217
+        221
       ],
       "outputs": [
-        218
+        222
       ],
       "layer": 4
     },
@@ -6460,10 +6502,10 @@
         }
       },
       "inputs": [
-        218
+        222
       ],
       "outputs": [
-        219
+        223
       ],
       "layer": 4
     },
@@ -6475,10 +6517,10 @@
         }
       },
       "inputs": [
-        219
+        223
       ],
       "outputs": [
-        220
+        224
       ],
       "layer": 4
     },
@@ -6492,10 +6534,10 @@
         }
       },
       "inputs": [
-        220
+        224
       ],
       "outputs": [
-        221
+        225
       ],
       "layer": 4
     },
@@ -6507,10 +6549,10 @@
         }
       },
       "inputs": [
-        218
+        222
       ],
       "outputs": [
-        222
+        226
       ],
       "layer": 4
     },
@@ -6522,10 +6564,10 @@
         }
       },
       "inputs": [
-        218
+        222
       ],
       "outputs": [
-        223
+        227
       ],
       "layer": 4
     },
@@ -6537,10 +6579,10 @@
         }
       },
       "inputs": [
-        218
+        222
       ],
       "outputs": [
-        224
+        228
       ],
       "layer": 4
     },
@@ -6553,10 +6595,10 @@
         }
       },
       "inputs": [
-        222
+        226
       ],
       "outputs": [
-        225
+        229
       ],
       "layer": 4
     },
@@ -6569,10 +6611,10 @@
         }
       },
       "inputs": [
-        223
+        227
       ],
       "outputs": [
-        226
+        230
       ],
       "layer": 4
     },
@@ -6583,10 +6625,10 @@
         }
       },
       "inputs": [
-        224
+        228
       ],
       "outputs": [
-        227
+        231
       ],
       "layer": 4
     },
@@ -6602,12 +6644,12 @@
         }
       },
       "inputs": [
-        225,
-        226
+        229,
+        230
       ],
       "outputs": [
-        228,
-        229
+        232,
+        233
       ],
       "layer": 4
     },
@@ -6622,8 +6664,8 @@
         }
       },
       "inputs": [
-        229,
-        227
+        233,
+        231
       ],
       "outputs": [],
       "layer": 4
@@ -6636,7 +6678,7 @@
         }
       },
       "inputs": [
-        228
+        232
       ],
       "outputs": [],
       "layer": 4
@@ -6653,7 +6695,9 @@
         }
       },
       "inputs": [],
-      "outputs": [],
+      "outputs": [
+        234
+      ],
       "layer": null
     },
     {
@@ -6667,10 +6711,11 @@
         }
       },
       "inputs": [
-        228
+        232,
+        234
       ],
       "outputs": [
-        230
+        235
       ],
       "layer": 4
     },
@@ -6682,7 +6727,7 @@
         }
       },
       "inputs": [
-        230
+        235
       ],
       "outputs": [],
       "layer": 4
@@ -6695,10 +6740,10 @@
         }
       },
       "inputs": [
-        230
+        235
       ],
       "outputs": [
-        231
+        236
       ],
       "layer": 4
     },
@@ -6712,10 +6757,10 @@
         }
       },
       "inputs": [
-        231
+        236
       ],
       "outputs": [
-        232
+        237
       ],
       "layer": 4
     },
@@ -6726,11 +6771,11 @@
         }
       },
       "inputs": [
-        217,
-        232
+        221,
+        237
       ],
       "outputs": [
-        233
+        238
       ],
       "layer": null
     },
@@ -6741,11 +6786,11 @@
         }
       },
       "inputs": [
-        233,
-        221
+        238,
+        225
       ],
       "outputs": [
-        234
+        239
       ],
       "layer": null
     },
@@ -6759,10 +6804,10 @@
         }
       },
       "inputs": [
-        234
+        239
       ],
       "outputs": [
-        235
+        240
       ],
       "layer": null
     },
@@ -6776,10 +6821,10 @@
         }
       },
       "inputs": [
-        235
+        240
       ],
       "outputs": [
-        236
+        241
       ],
       "layer": 4
     },
@@ -6791,10 +6836,10 @@
         }
       },
       "inputs": [
-        236
+        241
       ],
       "outputs": [
-        237
+        242
       ],
       "layer": 4
     },
@@ -6806,10 +6851,10 @@
         }
       },
       "inputs": [
-        236
+        241
       ],
       "outputs": [
-        238
+        243
       ],
       "layer": 4
     },
@@ -6820,11 +6865,11 @@
         }
       },
       "inputs": [
-        237,
-        238
+        242,
+        243
       ],
       "outputs": [
-        239
+        244
       ],
       "layer": 4
     },
@@ -6836,10 +6881,10 @@
         }
       },
       "inputs": [
-        239
+        244
       ],
       "outputs": [
-        240
+        245
       ],
       "layer": 4
     },
@@ -6853,10 +6898,10 @@
         }
       },
       "inputs": [
-        240
+        245
       ],
       "outputs": [
-        241
+        246
       ],
       "layer": 4
     },
@@ -6867,11 +6912,11 @@
         }
       },
       "inputs": [
-        235,
-        241
+        240,
+        246
       ],
       "outputs": [
-        242
+        247
       ],
       "layer": null
     },
@@ -6885,10 +6930,10 @@
         }
       },
       "inputs": [
-        242
+        247
       ],
       "outputs": [
-        243
+        248
       ],
       "layer": 4
     },
@@ -6902,10 +6947,10 @@
         }
       },
       "inputs": [
-        243
+        248
       ],
       "outputs": [
-        244
+        249
       ],
       "layer": 4
     },
@@ -6917,10 +6962,10 @@
         }
       },
       "inputs": [
-        244
+        249
       ],
       "outputs": [
-        245
+        250
       ],
       "layer": 4
     },
@@ -6931,10 +6976,10 @@
         }
       },
       "inputs": [
-        245
+        250
       ],
       "outputs": [
-        246
+        251
       ],
       "layer": 4
     },
@@ -6946,10 +6991,10 @@
         }
       },
       "inputs": [
-        246
+        251
       ],
       "outputs": [
-        247
+        252
       ],
       "layer": 4
     },
@@ -6960,10 +7005,10 @@
         }
       },
       "inputs": [
-        247
+        252
       ],
       "outputs": [
-        248
+        253
       ],
       "layer": 4
     },
@@ -6974,12 +7019,12 @@
         }
       },
       "inputs": [
-        216,
-        242,
-        248
+        220,
+        247,
+        253
       ],
       "outputs": [
-        249
+        254
       ],
       "layer": null
     },
@@ -6991,7 +7036,7 @@
       },
       "inputs": [],
       "outputs": [
-        250
+        255
       ],
       "layer": null
     },
@@ -7003,21 +7048,21 @@
         }
       },
       "inputs": [
-        218
+        222
       ],
       "outputs": [
-        251
+        256
       ],
       "layer": 4
     },
     {
       "kind": "SigmoidGateMul",
       "inputs": [
-        250,
-        251
+        255,
+        256
       ],
       "outputs": [
-        252
+        257
       ],
       "layer": null
     },
@@ -7029,10 +7074,10 @@
         }
       },
       "inputs": [
-        252
+        257
       ],
       "outputs": [
-        253
+        258
       ],
       "layer": 4
     },
@@ -7043,10 +7088,10 @@
         }
       },
       "inputs": [
-        249
+        254
       ],
       "outputs": [
-        254
+        259
       ],
       "layer": null
     },
@@ -7057,11 +7102,11 @@
         }
       },
       "inputs": [
-        254,
-        253
+        259,
+        258
       ],
       "outputs": [
-        255
+        260
       ],
       "layer": null
     },
@@ -7072,10 +7117,10 @@
         }
       },
       "inputs": [
-        249
+        254
       ],
       "outputs": [
-        256
+        261
       ],
       "layer": null
     },
@@ -7086,11 +7131,11 @@
         }
       },
       "inputs": [
-        256,
-        253
+        261,
+        258
       ],
       "outputs": [
-        257
+        262
       ],
       "layer": null
     },
@@ -7101,10 +7146,10 @@
         }
       },
       "inputs": [
-        249
+        254
       ],
       "outputs": [
-        258
+        263
       ],
       "layer": null
     },
@@ -7115,11 +7160,11 @@
         }
       },
       "inputs": [
-        258,
-        253
+        263,
+        258
       ],
       "outputs": [
-        259
+        264
       ],
       "layer": null
     },
@@ -7130,10 +7175,10 @@
         }
       },
       "inputs": [
-        249
+        254
       ],
       "outputs": [
-        260
+        265
       ],
       "layer": null
     },
@@ -7147,10 +7192,10 @@
         }
       },
       "inputs": [
-        260
+        265
       ],
       "outputs": [
-        261
+        266
       ],
       "layer": 5
     },
@@ -7164,10 +7209,10 @@
         }
       },
       "inputs": [
-        261
+        266
       ],
       "outputs": [
-        262
+        267
       ],
       "layer": 5
     },
@@ -7179,10 +7224,10 @@
         }
       },
       "inputs": [
-        262
+        267
       ],
       "outputs": [
-        263
+        268
       ],
       "layer": 5
     },
@@ -7193,10 +7238,10 @@
         }
       },
       "inputs": [
-        263
+        268
       ],
       "outputs": [
-        264
+        269
       ],
       "layer": 5
     },
@@ -7208,10 +7253,10 @@
         }
       },
       "inputs": [
-        264
+        269
       ],
       "outputs": [
-        265
+        270
       ],
       "layer": 5
     },
@@ -7222,10 +7267,10 @@
         }
       },
       "inputs": [
-        265
+        270
       ],
       "outputs": [
-        266
+        271
       ],
       "layer": 5
     },
@@ -7236,11 +7281,11 @@
         }
       },
       "inputs": [
-        249,
-        266
+        254,
+        271
       ],
       "outputs": [
-        267
+        272
       ],
       "layer": null
     },
@@ -7251,10 +7296,10 @@
         }
       },
       "inputs": [
-        267
+        272
       ],
       "outputs": [
-        268
+        273
       ],
       "layer": null
     },
@@ -7268,10 +7313,10 @@
         }
       },
       "inputs": [
-        268
+        273
       ],
       "outputs": [
-        269
+        274
       ],
       "layer": 5
     },
@@ -7283,10 +7328,10 @@
         }
       },
       "inputs": [
-        269
+        274
       ],
       "outputs": [
-        270
+        275
       ],
       "layer": 5
     },
@@ -7298,10 +7343,10 @@
         }
       },
       "inputs": [
-        270
+        275
       ],
       "outputs": [
-        271
+        276
       ],
       "layer": 5
     },
@@ -7315,10 +7360,10 @@
         }
       },
       "inputs": [
-        271
+        276
       ],
       "outputs": [
-        272
+        277
       ],
       "layer": 5
     },
@@ -7330,10 +7375,10 @@
         }
       },
       "inputs": [
-        269
+        274
       ],
       "outputs": [
-        273
+        278
       ],
       "layer": 5
     },
@@ -7345,10 +7390,10 @@
         }
       },
       "inputs": [
-        269
+        274
       ],
       "outputs": [
-        274
+        279
       ],
       "layer": 5
     },
@@ -7360,10 +7405,10 @@
         }
       },
       "inputs": [
-        269
+        274
       ],
       "outputs": [
-        275
+        280
       ],
       "layer": 5
     },
@@ -7376,10 +7421,10 @@
         }
       },
       "inputs": [
-        273
+        278
       ],
       "outputs": [
-        276
+        281
       ],
       "layer": 5
     },
@@ -7392,10 +7437,10 @@
         }
       },
       "inputs": [
-        274
+        279
       ],
       "outputs": [
-        277
+        282
       ],
       "layer": 5
     },
@@ -7406,10 +7451,10 @@
         }
       },
       "inputs": [
-        275
+        280
       ],
       "outputs": [
-        278
+        283
       ],
       "layer": 5
     },
@@ -7425,12 +7470,12 @@
         }
       },
       "inputs": [
-        276,
-        277
+        281,
+        282
       ],
       "outputs": [
-        279,
-        280
+        284,
+        285
       ],
       "layer": 5
     },
@@ -7445,8 +7490,8 @@
         }
       },
       "inputs": [
-        280,
-        278
+        285,
+        283
       ],
       "outputs": [],
       "layer": 5
@@ -7459,7 +7504,7 @@
         }
       },
       "inputs": [
-        279
+        284
       ],
       "outputs": [],
       "layer": 5
@@ -7476,7 +7521,9 @@
         }
       },
       "inputs": [],
-      "outputs": [],
+      "outputs": [
+        286
+      ],
       "layer": null
     },
     {
@@ -7490,10 +7537,11 @@
         }
       },
       "inputs": [
-        279
+        284,
+        286
       ],
       "outputs": [
-        281
+        287
       ],
       "layer": 5
     },
@@ -7505,7 +7553,7 @@
         }
       },
       "inputs": [
-        281
+        287
       ],
       "outputs": [],
       "layer": 5
@@ -7514,102 +7562,6 @@
       "kind": {
         "Matmul": {
           "weight": "layer.5.o_proj",
-          "beta_one": false
-        }
-      },
-      "inputs": [
-        281
-      ],
-      "outputs": [
-        282
-      ],
-      "layer": 5
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
-          "weights": [
-            "layer.5.post_attn_norm"
-          ]
-        }
-      },
-      "inputs": [
-        282
-      ],
-      "outputs": [
-        283
-      ],
-      "layer": 5
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "norm::residual_add_bf16"
-        }
-      },
-      "inputs": [
-        268,
-        283
-      ],
-      "outputs": [
-        284
-      ],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "norm::residual_add_bf16"
-        }
-      },
-      "inputs": [
-        284,
-        272
-      ],
-      "outputs": [
-        285
-      ],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "norm::scalar_mul_bf16",
-          "weights": [
-            "scale.layer.5.laurel_scale"
-          ]
-        }
-      },
-      "inputs": [
-        285
-      ],
-      "outputs": [
-        286
-      ],
-      "layer": null
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
-          "weights": [
-            "layer.5.mlp_norm"
-          ]
-        }
-      },
-      "inputs": [
-        286
-      ],
-      "outputs": [
-        287
-      ],
-      "layer": 5
-    },
-    {
-      "kind": {
-        "Matmul": {
-          "weight": "layer.5.gate_proj",
           "beta_one": false
         }
       },
@@ -7623,16 +7575,112 @@
     },
     {
       "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.5.post_attn_norm"
+          ]
+        }
+      },
+      "inputs": [
+        288
+      ],
+      "outputs": [
+        289
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::residual_add_bf16"
+        }
+      },
+      "inputs": [
+        273,
+        289
+      ],
+      "outputs": [
+        290
+      ],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::residual_add_bf16"
+        }
+      },
+      "inputs": [
+        290,
+        277
+      ],
+      "outputs": [
+        291
+      ],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::scalar_mul_bf16",
+          "weights": [
+            "scale.layer.5.laurel_scale"
+          ]
+        }
+      },
+      "inputs": [
+        291
+      ],
+      "outputs": [
+        292
+      ],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::rmsnorm_gemma_bf16",
+          "weights": [
+            "layer.5.mlp_norm"
+          ]
+        }
+      },
+      "inputs": [
+        292
+      ],
+      "outputs": [
+        293
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.5.gate_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        293
+      ],
+      "outputs": [
+        294
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.5.up_proj",
           "beta_one": false
         }
       },
       "inputs": [
-        287
+        293
       ],
       "outputs": [
-        289
+        295
       ],
       "layer": 5
     },
@@ -7643,11 +7691,11 @@
         }
       },
       "inputs": [
-        288,
-        289
+        294,
+        295
       ],
       "outputs": [
-        290
+        296
       ],
       "layer": 5
     },
@@ -7659,10 +7707,10 @@
         }
       },
       "inputs": [
-        290
+        296
       ],
       "outputs": [
-        291
+        297
       ],
       "layer": 5
     },
@@ -7676,10 +7724,10 @@
         }
       },
       "inputs": [
-        291
+        297
       ],
       "outputs": [
-        292
+        298
       ],
       "layer": 5
     },
@@ -7690,11 +7738,11 @@
         }
       },
       "inputs": [
-        286,
-        292
+        292,
+        298
       ],
       "outputs": [
-        293
+        299
       ],
       "layer": null
     },
@@ -7708,10 +7756,10 @@
         }
       },
       "inputs": [
-        293
+        299
       ],
       "outputs": [
-        294
+        300
       ],
       "layer": 5
     },
@@ -7725,10 +7773,10 @@
         }
       },
       "inputs": [
-        294
+        300
       ],
       "outputs": [
-        295
+        301
       ],
       "layer": 5
     },
@@ -7740,10 +7788,10 @@
         }
       },
       "inputs": [
-        295
+        301
       ],
       "outputs": [
-        296
+        302
       ],
       "layer": 5
     },
@@ -7754,10 +7802,10 @@
         }
       },
       "inputs": [
-        296
+        302
       ],
       "outputs": [
-        297
+        303
       ],
       "layer": 5
     },
@@ -7769,10 +7817,10 @@
         }
       },
       "inputs": [
-        297
+        303
       ],
       "outputs": [
-        298
+        304
       ],
       "layer": 5
     },
@@ -7783,10 +7831,10 @@
         }
       },
       "inputs": [
-        298
+        304
       ],
       "outputs": [
-        299
+        305
       ],
       "layer": 5
     },
@@ -7797,12 +7845,12 @@
         }
       },
       "inputs": [
-        267,
-        293,
-        299
+        272,
+        299,
+        305
       ],
       "outputs": [
-        300
+        306
       ],
       "layer": null
     },
@@ -7814,7 +7862,7 @@
       },
       "inputs": [],
       "outputs": [
-        301
+        307
       ],
       "layer": null
     },
@@ -7826,21 +7874,21 @@
         }
       },
       "inputs": [
-        269
+        274
       ],
       "outputs": [
-        302
+        308
       ],
       "layer": 5
     },
     {
       "kind": "SigmoidGateMul",
       "inputs": [
-        301,
-        302
+        307,
+        308
       ],
       "outputs": [
-        303
+        309
       ],
       "layer": null
     },
@@ -7852,10 +7900,10 @@
         }
       },
       "inputs": [
-        303
+        309
       ],
       "outputs": [
-        304
+        310
       ],
       "layer": 5
     },
@@ -7866,10 +7914,10 @@
         }
       },
       "inputs": [
-        300
+        306
       ],
       "outputs": [
-        305
+        311
       ],
       "layer": null
     },
@@ -7880,11 +7928,11 @@
         }
       },
       "inputs": [
-        305,
-        304
+        311,
+        310
       ],
       "outputs": [
-        306
+        312
       ],
       "layer": null
     },
@@ -7895,10 +7943,10 @@
         }
       },
       "inputs": [
-        300
+        306
       ],
       "outputs": [
-        307
+        313
       ],
       "layer": null
     },
@@ -7909,11 +7957,11 @@
         }
       },
       "inputs": [
-        307,
-        304
+        313,
+        310
       ],
       "outputs": [
-        308
+        314
       ],
       "layer": null
     },
@@ -7924,10 +7972,10 @@
         }
       },
       "inputs": [
-        300
+        306
       ],
       "outputs": [
-        309
+        315
       ],
       "layer": null
     },
@@ -7938,11 +7986,11 @@
         }
       },
       "inputs": [
-        309,
-        304
+        315,
+        310
       ],
       "outputs": [
-        310
+        316
       ],
       "layer": null
     },
@@ -7953,10 +8001,10 @@
         }
       },
       "inputs": [
-        300
+        306
       ],
       "outputs": [
-        311
+        317
       ],
       "layer": null
     },
@@ -7967,10 +8015,10 @@
         }
       },
       "inputs": [
-        311
+        317
       ],
       "outputs": [
-        312
+        318
       ],
       "layer": null
     },
@@ -7981,10 +8029,10 @@
         }
       },
       "inputs": [
-        300
+        306
       ],
       "outputs": [
-        313
+        319
       ],
       "layer": null
     },
@@ -7995,11 +8043,11 @@
         }
       },
       "inputs": [
-        313,
-        312
+        319,
+        318
       ],
       "outputs": [
-        314
+        320
       ],
       "layer": null
     },
@@ -8013,10 +8061,10 @@
         }
       },
       "inputs": [
-        314
+        320
       ],
       "outputs": [
-        315
+        321
       ],
       "layer": null
     },
@@ -8027,10 +8075,10 @@
         }
       },
       "inputs": [
-        315
+        321
       ],
       "outputs": [
-        316
+        322
       ],
       "layer": null
     },
@@ -8041,10 +8089,10 @@
         }
       },
       "inputs": [
-        316
+        322
       ],
       "outputs": [
-        317
+        323
       ],
       "layer": null
     }
@@ -8066,7 +8114,7 @@
       "layer": 0,
       "op": 26,
       "values": [
-        23
+        24
       ]
     },
     {
@@ -8074,7 +8122,7 @@
       "layer": 1,
       "op": 78,
       "values": [
-        73
+        74
       ]
     },
     {
@@ -8082,7 +8130,7 @@
       "layer": 1,
       "op": 81,
       "values": [
-        75
+        77
       ]
     },
     {
@@ -8090,7 +8138,7 @@
       "layer": 2,
       "op": 133,
       "values": [
-        125
+        127
       ]
     },
     {
@@ -8098,7 +8146,7 @@
       "layer": 2,
       "op": 136,
       "values": [
-        127
+        130
       ]
     },
     {
@@ -8106,7 +8154,7 @@
       "layer": 3,
       "op": 188,
       "values": [
-        177
+        180
       ]
     },
     {
@@ -8114,7 +8162,7 @@
       "layer": 3,
       "op": 191,
       "values": [
-        179
+        183
       ]
     },
     {
@@ -8122,7 +8170,7 @@
       "layer": 4,
       "op": 242,
       "values": [
-        228
+        232
       ]
     },
     {
@@ -8130,7 +8178,7 @@
       "layer": 4,
       "op": 245,
       "values": [
-        230
+        235
       ]
     },
     {
@@ -8138,7 +8186,7 @@
       "layer": 5,
       "op": 296,
       "values": [
-        279
+        284
       ]
     },
     {
@@ -8146,13 +8194,13 @@
       "layer": 5,
       "op": 299,
       "values": [
-        281
+        287
       ]
     },
     {
       "seam": "out",
       "values": [
-        317
+        323
       ]
     }
   ]

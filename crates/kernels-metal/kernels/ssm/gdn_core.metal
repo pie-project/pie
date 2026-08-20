@@ -20,7 +20,9 @@
 //
 // Port notes (per decode_abi invariants):
 //   * Geometry (Dk/Dv/Hk/Hv/conv_dim/Kc/offsets/eps/inv_sqrt_dk) is STATIC model
-//     geometry -> constant GdnCoreParams& buffer, NOT per-token IO (I1 safe).
+//     geometry -> eleven `const constant&` scalars, NOT per-token IO (I1 safe).
+//     It was one `constant GdnCoreParams&` buffer; see the note below the
+//     includes for why that struct is gone.
 //   * recurrent_state is consumed/produced NATIVE [R,Hv,Vd,Dk] (prong-1, no
 //     swapaxes) and rebound in-place to the same heap slot (I4): each (req,v-head,
 //     v-dim) row is owned by exactly one threadgroup, so read-then-write is race-free.
@@ -42,7 +44,32 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#include "gdn_params.h"
+// THE GEOMETRY IS ELEVEN SCALARS, NOT ONE `constant GdnCoreParams&`.
+//
+// Every entrypoint in this file took `constant GdnCoreParams& p` at one buffer,
+// out of a shared `ssm/gdn_params.h` whose header called itself the *"shared
+// host/shader ABI for every GDN core variant"* -- and it was: `gdn_params.slang`
+// on Vulkan and `gdn_params.inc.wgsl` on wgpu were the same eleven fields in the
+// same order, three copies of one layout that nothing compared, and a host
+// assembled the struct for all three.
+//
+// The routines name all eleven as `Const<i32>`/`Const<f32>` marks now, so the
+// contract is a SIGNATURE and there is no struct left to keep in step. Each
+// scalar is its own `setBytes` at its own buffer index, and the words it
+// carries are words 0..10 of the same statement run the struct was staged
+// from, in `model-dsl`'s `GdnShape::params` order -- the struct's order,
+// because that was always the statement's.
+//
+// The scalars come AFTER every buffer, which is the one place the numbering
+// moved: `slot_ids` was declared past `p` and now sits where `p` did. That
+// keeps this plane's buffer indices equal to the other two planes' binding
+// numbers, and it keeps the two entrypoints of a slotted pair numbering their
+// buffers the same way they always did.
+//
+// The shared `METAL_FUNC` helpers below take the eleven BY VALUE. A helper is
+// not an entrypoint, so nothing about its parameter list is an ABI; passing
+// the scalars rather than a struct is what lets the struct be gone rather than
+// merely unbound.
 
 // T  = core_out dtype (bf16/half/float); recurrent state is always fp32.
 // ── M>1 slot-indexed state seam (delta's GDN bridge, ckpt 030) ───────────────
@@ -51,7 +78,7 @@ using namespace metal;
 // (mixed/core_out/a_gate/b_gate) stay token-major b_idx. `SLOTTED` selects:
 //   false  →  slot = b_idx  (the sealed M=1 path; slot_ids never read → byte-identical 264).
 //   true   →  slot = slot_ids[b_idx]  (S>1; state slabs sized max_slots, delta owns host side).
-// Both slab strides derive from GdnCoreParams (Hv/Dv/Dk/Kc/CDIM) — slot_ids alone suffices.
+// Both slab strides derive from the geometry scalars (Hv/Dv/Dk/Kc/CDIM) — slot_ids alone suffices.
 template <typename T, bool SLOTTED>
 METAL_FUNC void gdn_core_body(
     const device T*     mixed,          // [N, conv_dim]  this token's in-proj mixed_qkv
@@ -65,27 +92,30 @@ METAL_FUNC void gdn_core_body(
     const device T*     a_gate,         // [N, Hv]
     const device T*     b_gate,         // [N, Hv]
     device float*       new_conv_state, // [max_slots, Kc, conv_dim]  shifted history (ping-pong)
-    constant GdnCoreParams& p,
     const device uint*  slot_ids,       // [N]  rs_slot per token row (read only when SLOTTED)
+    int Dk, int Dv, int Hk, int Hv, int conv_dim, int Kc,
+    int q_off, int k_off, int v_off, float eps, float inv_sqrt_dk,
     threadgroup float*  sh_q,           // [Dk]  shared normalized+prescaled q (tg-allocated by wrapper)
     threadgroup float*  sh_k,           // [Dk]  shared normalized k
     threadgroup float*  sh_decay,       // [1]   shared per-head decay
     threadgroup float*  sh_beta,        // [1]   shared per-head beta
     uint3 tpig, uint3 tpit, uint simd_lane) {
-  const int Dk = p.Dk, Dv = p.Dv, Hv = p.Hv, CDIM = p.conv_dim, Kc = p.Kc;
+  // `CDIM` is `conv_dim` under the shorter name the addressing below reads
+  // with; the other ten geometry numbers ARE the parameters now, where they
+  // used to be copied off `p` here.
+  const int CDIM = conv_dim;
   const int n        = int(tpig.z);          // 0 .. N*Hv-1
   const int b_idx    = n / Hv;               // token row (activation index)
   const int hv_idx   = n % Hv;
   // The key head this value head reads, and whether it is the first of its
   // group. `rep` is 1 on every checkpoint whose Hk equals Hv, which makes both
   // of these the identity and keeps that path byte-identical.
-  const int rep      = Hv / p.Hk;
+  const int rep      = Hv / Hk;
   const int hk_idx   = hv_idx / rep;
   const bool hk_first = (hv_idx % rep) == 0;
   const int dk_idx   = int(tpit.x);          // 0..31
   const int dv_idx   = int(tpig.y);          // 0..Vd-1
   const int n_per_t  = Dk / 32;              // 4
-  const int q_off = p.q_off, k_off = p.k_off, v_off = p.v_off;
   // STATE slab index: remapped to the request's persistent slot when SLOTTED.
   const int slot = SLOTTED ? int(slot_ids[b_idx]) : b_idx;
 
@@ -119,8 +149,8 @@ METAL_FUNC void gdn_core_body(
     float qsq = 0.0f, ksq = 0.0f;
     for (int i = 0; i < n_per_t; ++i) { qsq += qraw[i] * qraw[i]; ksq += kraw[i] * kraw[i]; }
     qsq = simd_sum(qsq); ksq = simd_sum(ksq);
-    float qinv = p.inv_sqrt_dk / sqrt(qsq + p.eps);   // q also pre-scaled 1/sqrt(Dk)
-    float kinv = 1.0f / sqrt(ksq + p.eps);
+    float qinv = inv_sqrt_dk / sqrt(qsq + eps);   // q also pre-scaled 1/sqrt(Dk)
+    float kinv = 1.0f / sqrt(ksq + eps);
     for (int i = 0; i < n_per_t; ++i) {
       int d = n_per_t * dk_idx + i;
       sh_q[d] = qraw[i] * qinv;
@@ -182,7 +212,8 @@ METAL_FUNC void gdn_core_body(
   wb(v_off + hv_idx * Dv + dv_idx);
 }
 
-// ── M=1 sealed entry: 12 buffers, NO slot_ids — byte-identical PSO (264 holds). ──
+// ── M=1 sealed entry: 11 buffers then 11 scalars, NO slot_ids — byte-identical
+// PSO (264 holds). It was 12 buffers while the eleventh was `GdnCoreParams`. ──
 template <typename T>
 [[kernel]] void gdn_core(
     const device T*     mixed          [[buffer(0)]],
@@ -196,18 +227,30 @@ template <typename T>
     const device T*     a_gate         [[buffer(8)]],
     const device T*     b_gate         [[buffer(9)]],
     device float*       new_conv_state [[buffer(10)]],
-    constant GdnCoreParams& p          [[buffer(11)]],
+    const constant int& Dk           [[buffer(11)]],
+    const constant int& Dv           [[buffer(12)]],
+    const constant int& Hk           [[buffer(13)]],
+    const constant int& Hv           [[buffer(14)]],
+    const constant int& conv_dim     [[buffer(15)]],
+    const constant int& Kc           [[buffer(16)]],
+    const constant int& q_off        [[buffer(17)]],
+    const constant int& k_off        [[buffer(18)]],
+    const constant int& v_off        [[buffer(19)]],
+    const constant float& eps          [[buffer(20)]],
+    const constant float& inv_sqrt_dk  [[buffer(21)]],
     uint3 tpig                         [[thread_position_in_grid]],
     uint3 tpit                         [[thread_position_in_threadgroup]],
     uint  simd_lane                    [[thread_index_in_simdgroup]]) {
   threadgroup float sh_q[256], sh_k[256], sh_decay[1], sh_beta[1];
   gdn_core_body<T, false>(mixed, conv_state, rstate, core_out, conv_w, conv_b,
-                          A_log, dt_bias, a_gate, b_gate, new_conv_state, p,
+                          A_log, dt_bias, a_gate, b_gate, new_conv_state,
                           (const device uint*)nullptr,
+                          Dk, Dv, Hk, Hv, conv_dim, Kc, q_off, k_off, v_off, eps, inv_sqrt_dk,
                           sh_q, sh_k, sh_decay, sh_beta, tpig, tpit, simd_lane);
 }
 
-// ── M>1 slotted entry: +slot_ids[buffer(12)] (alpha GdnCore::SlotIds=12). ──
+// ── M>1 slotted entry: +slot_ids, which is buffer 11 now and was 12 while the
+// params struct sat in front of it (alpha GdnCore::SlotIds=12). ──
 template <typename T>
 [[kernel]] void gdn_core_slotted(
     const device T*     mixed          [[buffer(0)]],
@@ -221,32 +264,51 @@ template <typename T>
     const device T*     a_gate         [[buffer(8)]],
     const device T*     b_gate         [[buffer(9)]],
     device float*       new_conv_state [[buffer(10)]],
-    constant GdnCoreParams& p          [[buffer(11)]],
-    const device uint*  slot_ids       [[buffer(12)]],
+    const device uint*  slot_ids       [[buffer(11)]],
+    const constant int& Dk           [[buffer(12)]],
+    const constant int& Dv           [[buffer(13)]],
+    const constant int& Hk           [[buffer(14)]],
+    const constant int& Hv           [[buffer(15)]],
+    const constant int& conv_dim     [[buffer(16)]],
+    const constant int& Kc           [[buffer(17)]],
+    const constant int& q_off        [[buffer(18)]],
+    const constant int& k_off        [[buffer(19)]],
+    const constant int& v_off        [[buffer(20)]],
+    const constant float& eps          [[buffer(21)]],
+    const constant float& inv_sqrt_dk  [[buffer(22)]],
     uint3 tpig                         [[thread_position_in_grid]],
     uint3 tpit                         [[thread_position_in_threadgroup]],
     uint  simd_lane                    [[thread_index_in_simdgroup]]) {
   threadgroup float sh_q[256], sh_k[256], sh_decay[1], sh_beta[1];
   gdn_core_body<T, true>(mixed, conv_state, rstate, core_out, conv_w, conv_b,
-                         A_log, dt_bias, a_gate, b_gate, new_conv_state, p,
+                         A_log, dt_bias, a_gate, b_gate, new_conv_state,
                          slot_ids,
+                         Dk, Dv, Hk, Hv, conv_dim, Kc, q_off, k_off, v_off, eps, inv_sqrt_dk,
                          sh_q, sh_k, sh_decay, sh_beta, tpig, tpit, simd_lane);
 }
 
-#define instantiate_gdn_core(name, itype)                                  \
-  template [[host_name("gdn_core_" #name)]] [[kernel]] void                \
-  gdn_core<itype>(                                                         \
-      const device itype*, const device float*, device float*,             \
-      device itype*, const device itype*, const device itype*,             \
-      const device float*, const device itype*, const device itype*,       \
-      const device itype*, device float*,                                  \
-      constant GdnCoreParams&, uint3, uint3, uint);                        \
-  template [[host_name("gdn_core_slotted_" #name)]] [[kernel]] void        \
-  gdn_core_slotted<itype>(                                                 \
-      const device itype*, const device float*, device float*,             \
-      device itype*, const device itype*, const device itype*,             \
-      const device float*, const device itype*, const device itype*,       \
-      const device itype*, device float*,                                  \
-      constant GdnCoreParams&, const device uint*, uint3, uint3, uint);
+#define instantiate_gdn_core(name, itype)                            \
+  template [[host_name("gdn_core_" #name)]] [[kernel]] void          \
+  gdn_core<itype>(                                                   \
+      const device itype*, const device float*, device float*,       \
+      device itype*, const device itype*, const device itype*,       \
+      const device float*, const device itype*, const device itype*, \
+      const device itype*, device float*,                            \
+      const constant int&, const constant int&, const constant int&, \
+      const constant int&, const constant int&, const constant int&, \
+      const constant int&, const constant int&, const constant int&, \
+      const constant float&, const constant float&,                  \
+      uint3, uint3, uint);                                           \
+  template [[host_name("gdn_core_slotted_" #name)]] [[kernel]] void  \
+  gdn_core_slotted<itype>(                                           \
+      const device itype*, const device float*, device float*,       \
+      device itype*, const device itype*, const device itype*,       \
+      const device float*, const device itype*, const device itype*, \
+      const device itype*, device float*, const device uint*,        \
+      const constant int&, const constant int&, const constant int&, \
+      const constant int&, const constant int&, const constant int&, \
+      const constant int&, const constant int&, const constant int&, \
+      const constant float&, const constant float&,                  \
+      uint3, uint3, uint);
 
 instantiate_gdn_core(bfloat16, bfloat)

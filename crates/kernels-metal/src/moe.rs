@@ -345,11 +345,17 @@ pub static ENTRYPOINTS: &[(&str, &str)] = &[
 /// reduction slot holding whatever it held last -- an expert that was never
 /// scored competing against the ones that were. Clamped to the kernel's
 /// 1024-lane ceiling first, which is the same answer as clamping after.
-fn router_lanes(n_experts: i32) -> Result<u32, Refusal> {
-    if n_experts <= 0 {
+///
+/// TAKES A `u32` BECAUSE ITS CALLERS NOW READ A MARK. This took an `i32`
+/// while the count came from `ctx.ask::<i32, keys::NumExperts>()`; the three
+/// routing bodies take `n_experts` as a `Const<u32>` out of their own params
+/// run instead, so the negative half of the domain is gone and only zero is
+/// left to refuse.
+fn router_lanes(n_experts: u32) -> Result<u32, Refusal> {
+    if n_experts == 0 {
         return Err(Refusal::Empty { what: "n_experts" });
     }
-    Ok(n_experts.unsigned_abs().min(1024).div_ceil(32) * 32)
+    Ok(n_experts.min(1024).div_ceil(32) * 32)
 }
 
 /// `LaunchRule::RouteRows`: the row's own width on x, the rows on y.
@@ -640,6 +646,21 @@ const MXFP4_QMM: &[&str] = &[
 /// to hold an address whether or not this instantiation dereferences it;
 /// [`router_topk_scaled`] is the symbol that means it.
 ///
+/// FOUR MARKS WHERE `RouterParams` WAS ONE BUFFER. The four are the struct's
+/// four fields in the struct's order, which is the statement's order, and
+/// `moe/route.metal` takes them as four `const constant uint&` at buffers 4
+/// through 7 — one `setBytes` each where it bound one address.
+///
+/// AND THE EXPERT COUNT IS NO LONGER ASKED. This read
+/// `ctx.ask::<i32, keys::NumExperts>()` for the threadgroup width, with a note
+/// saying why it had to: the params run was a STRUCT the shader read by field,
+/// so no `Const` could name a word inside it and the grid had to get the count
+/// from the driver instead. It gets it from word 0 now, which is the word the
+/// shader reads as `n_experts`. That is not a tidying — a grid sized from a
+/// driver fact and a body strided by a statement's word are two numbers that
+/// can disagree, and this is the kernel where disagreeing means scoring a
+/// different set of experts than it selects from.
+///
 /// # Errors
 ///
 /// See [`router_lanes`], and [`Refusal::Empty`] for an empty row count.
@@ -648,17 +669,17 @@ pub fn router_topk(
     ctx: &Ctx<'_>,
     logits: In<Tensor<bf16>>,
     expert_ids: Out<Tensor<i32>>,
-    expert_weights: Out<Tensor<bf16>>) -> Result<(), Refusal> {
-    // BACK TO AN ASK, BECAUSE THIS ROUTINE'S PARAMS RUN IS A STRUCT.
-    // The body forwards `ctx.params()` whole -- the shader reads fields,
-    // not a scalar run -- so slot 0 is the struct's first field and a
-    // `Const` derived onto it reads that field's bits. HEAD spelled these
-    // `Ask<..>` for exactly this reason, and the drivers still answer them.
-    let n_experts = ctx.ask::<i32, keys::NumExperts>()?;
-    let params = ctx.params()?;
+    expert_weights: Out<Tensor<bf16>>,
+    // `RouterParams`'s four fields, in its order. `logits_pitch` of zero means
+    // the pitch IS `n_experts`, and `softmax_over_all` picks the softmax's
+    // DENOMINATOR: zero over the k selected logits, nonzero over every expert.
+    n_experts: Const<u32>,
+    experts_per_token: Const<u32>,
+    softmax_over_all: Const<u32>,
+    logits_pitch: Const<u32>) -> Result<(), Refusal> {
     let per_expert_scale = ctx.absent()?;
     let rows = ctx.ask::<i32, keys::Rows>()?;
-    let w = router_lanes(n_experts)?;
+    let w = router_lanes(*n_experts)?;
     if rows <= 0 {
         return Err(Refusal::Empty { what: "rows" });
     }
@@ -668,14 +689,26 @@ pub fn router_topk(
             logits.arg(),
             expert_ids.arg(),
             expert_weights.arg(),
-            params,
+            // ONE SLOT LOWER THAN IT WAS: the block sat between the weights and
+            // this, and a metal argument's buffer index is its position in the
+            // list the body fired.
             per_expert_scale,
+            // AND THE SCALARS LAST, which is what puts them at ascending
+            // indices after every real operand.
+            n_experts.arg(),
+            experts_per_token.arg(),
+            softmax_over_all.arg(),
+            logits_pitch.arg(),
         ],
     )
 }
 
 /// [`router_topk`] with a per-expert rescale, indexed by the EXPERT and not by
 /// the pick.
+///
+/// The same four marks, in the same order, and the same expert count for the
+/// threadgroup width — see [`router_topk`] for why it comes off word 0 rather
+/// than off an ask.
 ///
 /// # Errors
 ///
@@ -686,16 +719,16 @@ pub fn router_topk_scaled(
     logits: In<Tensor<bf16>>,
     expert_ids: Out<Tensor<i32>>,
     expert_weights: Out<Tensor<bf16>>,
-    per_expert_scale: Const<Tensor<bf16>>) -> Result<(), Refusal> {
-    // BACK TO AN ASK, BECAUSE THIS ROUTINE'S PARAMS RUN IS A STRUCT.
-    // The body forwards `ctx.params()` whole -- the shader reads fields,
-    // not a scalar run -- so slot 0 is the struct's first field and a
-    // `Const` derived onto it reads that field's bits. HEAD spelled these
-    // `Ask<..>` for exactly this reason, and the drivers still answer them.
-    let n_experts = ctx.ask::<i32, keys::NumExperts>()?;
-    let params = ctx.params()?;
+    per_expert_scale: Const<Tensor<bf16>>,
+    // `RouterParams`'s four fields, in its order. A weight `Const` claims the
+    // WEIGHT run and a scalar one the params run, so the tensor above takes no
+    // slot from these four: `n_experts` is still word 0.
+    n_experts: Const<u32>,
+    experts_per_token: Const<u32>,
+    softmax_over_all: Const<u32>,
+    logits_pitch: Const<u32>) -> Result<(), Refusal> {
     let rows = ctx.ask::<i32, keys::Rows>()?;
-    let w = router_lanes(n_experts)?;
+    let w = router_lanes(*n_experts)?;
     if rows <= 0 {
         return Err(Refusal::Empty { what: "rows" });
     }
@@ -705,8 +738,11 @@ pub fn router_topk_scaled(
             logits.arg(),
             expert_ids.arg(),
             expert_weights.arg(),
-            params,
             per_expert_scale.arg(),
+            n_experts.arg(),
+            experts_per_token.arg(),
+            softmax_over_all.arg(),
+            logits_pitch.arg(),
         ],
     )
 }
@@ -725,6 +761,15 @@ pub fn router_topk_scaled(
 /// back. A caller that passed fewer would leave the combine reading whatever
 /// the arena held.
 ///
+/// SEVEN MARKS WHERE `MoeRouteParams` WAS ONE BUFFER, and [`route_gather`]
+/// takes the same seven in the same order. That sharing is the struct's own
+/// point carried forward: `model-dsl` states one seven-word run for both
+/// statements, so the padding this kernel writes and the bounds the gather reads
+/// cannot disagree.
+///
+/// The threadgroup width comes off `n_experts`, which is word 1 here rather than
+/// word 0 — see [`router_topk`] for why it is a mark and no longer an ask.
+///
 /// # Errors
 ///
 /// See [`router_lanes`].
@@ -735,15 +780,20 @@ pub fn route_sort(
     perm: Out<Tensor<i32>>,
     row_expert: Out<Tensor<i32>>,
     tile_expert: Out<Tensor<i32>>,
-    inv: Out<Tensor<i32>>) -> Result<(), Refusal> {
-    // BACK TO AN ASK, BECAUSE THIS ROUTINE'S PARAMS RUN IS A STRUCT.
-    // The body forwards `ctx.params()` whole -- the shader reads fields,
-    // not a scalar run -- so slot 0 is the struct's first field and a
-    // `Const` derived onto it reads that field's bits. HEAD spelled these
-    // `Ask<..>` for exactly this reason, and the drivers still answer them.
-    let n_experts = ctx.ask::<i32, keys::NumExperts>()?;
-    let params = ctx.params()?;
-    let w = router_lanes(n_experts)?;
+    inv: Out<Tensor<i32>>,
+    // `MoeRouteParams`'s seven fields, in its order. `n` is the number of
+    // (row, slot) PAIRS and `padded` is the permutation's length, `n` rounded up
+    // so every expert's span is a whole number of `tile_rows` tiles; the two are
+    // different numbers and this kernel reads both, so swapping the marks would
+    // clear a permutation shorter than it fills.
+    n: Const<u32>,
+    n_experts: Const<u32>,
+    experts_per_token: Const<u32>,
+    tile_rows: Const<u32>,
+    padded: Const<u32>,
+    width: Const<u32>,
+    x_pitch: Const<u32>) -> Result<(), Refusal> {
+    let w = router_lanes(*n_experts)?;
     ctx.fire(
         Fire::at(ROUTE_FILE, "route_sort").apply(Grid::of([w, 1, 1], [w, 1, 1])),
         &[
@@ -751,8 +801,16 @@ pub fn route_sort(
             perm.arg(),
             row_expert.arg(),
             tile_expert.arg(),
-            params,
+            // ONE SLOT LOWER THAN IT WAS: the block sat between `tile_expert`
+            // and this.
             inv.arg(),
+            n.arg(),
+            n_experts.arg(),
+            experts_per_token.arg(),
+            tile_rows.arg(),
+            padded.arg(),
+            width.arg(),
+            x_pitch.arg(),
         ],
     )
 }
@@ -764,6 +822,13 @@ pub fn route_sort(
 /// decides. Handed the fire's token count the gather ran over a quarter of its
 /// own output at `top_k = 4` and left the rest whatever the arena held.
 ///
+/// [`route_sort`]'s SEVEN MARKS, all of them, and this kernel reads four. `n`,
+/// `n_experts` and `tile_rows` are the sort's alone and are carried here anyway
+/// — one `MoeRouteParams` layout serves both statements, so `padded` is stated
+/// once and read by the kernel that pads and the kernel that is bounded by the
+/// padding. A gather with its own shorter block would be a second place for that
+/// number to be stated and a second place for it to be wrong.
+///
 /// # Errors
 ///
 /// See [`route_rows`].
@@ -772,14 +837,37 @@ pub fn route_gather(
     ctx: &Ctx<'_>,
     x: In<Tensor<bf16>>,
     out: Out<Tensor<bf16>>,
-    perm: In<Tensor<i32>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
-    let width = x.width;
-    let padded = ctx.ask::<i32, keys::Rows>()?;
-    let (lanes, group) = route_rows(width, padded)?;
+    perm: In<Tensor<i32>>,
+    // `MoeRouteParams`'s seven fields, in its order — [`route_sort`]'s exactly.
+    n: Const<u32>,
+    n_experts: Const<u32>,
+    experts_per_token: Const<u32>,
+    tile_rows: Const<u32>,
+    padded: Const<u32>,
+    width: Const<u32>,
+    x_pitch: Const<u32>) -> Result<(), Refusal> {
+    // THE OPERAND'S OWN RECTANGLE, and not the `width` mark beside it. The two
+    // are the same number for every text this tree writes; they are not the same
+    // FACT. `x.width` is what the arena allocated and is what the grid must
+    // cover, while the mark is what the statement said and is what the shader
+    // strides by — a disagreement is a fact about the plan, not about this fire.
+    let x_width = x.width;
+    let padded_rows = ctx.ask::<i32, keys::Rows>()?;
+    let (lanes, group) = route_rows(x_width, padded_rows)?;
     ctx.fire(
         Fire::at(ROUTE_FILE, "route_gather").apply(Grid::of(lanes, group)),
-        &[x.arg(), out.arg(), perm.arg(), params],
+        &[
+            x.arg(),
+            out.arg(),
+            perm.arg(),
+            n.arg(),
+            n_experts.arg(),
+            experts_per_token.arg(),
+            tile_rows.arg(),
+            padded.arg(),
+            width.arg(),
+            x_pitch.arg(),
+        ],
     )
 }
 
@@ -788,6 +876,12 @@ pub fn route_gather(
 /// Its rows ARE the fire's, unlike [`route_gather`]'s, and the two share a
 /// launch rule -- which is why both state their extent instead of letting the
 /// rule pick one for them.
+///
+/// THREE MARKS WHERE `ExpertCombineParams` WAS ONE BUFFER, in its order.
+/// `out_pitch` of zero means `width`: the mixture's output lands in whatever
+/// layout the caller's activations are in, packed for a batched decode and a
+/// uniform scratch stride apart for a prefill, and a host with nothing to say
+/// writes 0 rather than restating the width.
 ///
 /// # Errors
 ///
@@ -798,14 +892,28 @@ pub fn combine_sorted(
     y: In<Tensor<bf16>>,
     expert_weights: In<Tensor<bf16>>,
     out: Out<Tensor<bf16>>,
-    inv: In<Tensor<i32>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
-    let width = y.width;
+    inv: In<Tensor<i32>>,
+    // `ExpertCombineParams`'s three fields, in its order.
+    width: Const<u32>,
+    experts_per_token: Const<u32>,
+    out_pitch: Const<u32>) -> Result<(), Refusal> {
+    // The OPERAND's rectangle, which is what the grid covers — see
+    // [`route_gather`] for why that is not the `width` mark beside it.
+    let y_width = y.width;
     let tokens = ctx.ask::<i32, keys::Rows>()?;
-    let (lanes, group) = route_rows(width, tokens)?;
+    let (lanes, group) = route_rows(y_width, tokens)?;
     ctx.fire(
         Fire::at(ROUTE_FILE, "combine_sorted").apply(Grid::of(lanes, group)),
-        &[y.arg(), expert_weights.arg(), out.arg(), params, inv.arg()],
+        &[
+            y.arg(),
+            expert_weights.arg(),
+            out.arg(),
+            // ONE SLOT LOWER THAN IT WAS: the block sat between `out` and this.
+            inv.arg(),
+            width.arg(),
+            experts_per_token.arg(),
+            out_pitch.arg(),
+        ],
     )
 }
 
@@ -1246,13 +1354,21 @@ mod tests {
     type Call = (Fire, Vec<ArgValue>);
 
     /// An `Encode` that remembers what it was asked to do, and answers the
-    /// three facts this file's TESTED bodies ask for: the staged scalar
-    /// block every one of them but `qmm_t_routed`/`mxfp4_qmm_t_routed_bias`
-    /// takes with `ctx.params()`, `router_topk`'s unread per-expert scale
-    /// with `ctx.absent()`, and `Rows` -- which `router_topk`, the gather,
-    /// the combine and both routed GEMMs all ask under that one name whether
-    /// the caller thinks of it as a row count, a padded stack, or a fire's
-    /// own token count.
+    /// two facts this file's TESTED bodies still ask for: `router_topk`'s
+    /// unread per-expert scale with `ctx.absent()`, and `Rows` -- which
+    /// `router_topk`, the gather, the combine and both routed GEMMs all ask
+    /// under that one name whether the caller thinks of it as a row count, a
+    /// padded stack, or a fire's own token count.
+    ///
+    /// IT NO LONGER ANSWERS AN EXPERT COUNT, AND NO LONGER STAGES A BLOCK.
+    /// The four routing bodies used to take `ctx.params()` -- one buffer for
+    /// the whole struct `route.metal` read by field -- and, because no `Const`
+    /// could name a word inside such a run, to ask `keys::NumExperts` for the
+    /// threadgroup width beside it. Both are marks now, so both arrive as
+    /// ordinary arguments the tests below hand over themselves, and what a
+    /// test states is what the shader reads. The `Params` and `NumExperts`
+    /// arms stay in `resolve` for the bodies in this file that have not
+    /// migrated.
     struct Seen {
         calls: RefCell<Vec<Call>>,
         params_handle: Cell<u32>,
@@ -1298,8 +1414,10 @@ mod tests {
             if source == kernels::Source::Lit(kernels::Lit::Null) {
                 return Ok(ArgValue::Buffer(self.absent_handle.get()));
             }
-            // The geometry these bodies read now that their params run is a
-            // STRUCT and no slot in it is theirs to take.
+            // No body in this file asks for this any more -- the routing
+            // three read the count off their own params run, as word 0 of
+            // `RouterParams` and word 1 of `MoeRouteParams`. Kept so that a
+            // body that has not migrated is answered rather than refused.
             if source == <keys::NumExperts as Fact>::SOURCE {
                 return Ok(ArgValue::I32(self.n_experts.get()));
             }
@@ -1522,7 +1640,14 @@ mod tests {
             &seen,
             In::new(Tensor::<bf16>::new(1)),
             Out::new(Tensor::<i32>::new(2)),
-            Out::new(Tensor::<bf16>::new(3)))
+            Out::new(Tensor::<bf16>::new(3)),
+            // `RouterParams`, stated here rather than staged: the width the
+            // assertion below checks is now the SAME number the shader reads
+            // as `n_experts`, which is the whole reason the ask went.
+            Const::new(60),
+            Const::new(4),
+            Const::new(0),
+            Const::new(0))
         .expect("a launch");
         let calls = seen.calls.borrow();
         let (fire, args) = &calls[0];
@@ -1530,8 +1655,9 @@ mod tests {
         assert_eq!(fire.lanes, [64, 7, 1], "and a threadgroup per row");
         assert_eq!(
             args.len(),
-            5,
-            "the unscaled form still binds the scale slot"
+            8,
+            "four buffers -- the unscaled form still binds the scale slot -- \
+             and then `RouterParams`' four words, one argument each"
         );
         assert_eq!(router_lanes(1024), Ok(1024));
         assert_eq!(router_lanes(2048), Ok(1024), "clamped to the kernel's cap");
@@ -1551,7 +1677,17 @@ mod tests {
             Out::new(Tensor::<i32>::new(2)),
             Out::new(Tensor::<i32>::new(3)),
             Out::new(Tensor::<i32>::new(4)),
-            Out::new(Tensor::<i32>::new(6)))
+            Out::new(Tensor::<i32>::new(6)),
+            // `MoeRouteParams`: n, n_experts, experts_per_token, tile_rows,
+            // padded, width, x_pitch. The expert count is word 1 here and it
+            // is what sizes the threadgroup.
+            Const::new(32),
+            Const::new(60),
+            Const::new(4),
+            Const::new(16),
+            Const::new(64),
+            Const::new(2048),
+            Const::new(2048))
         .expect("a launch");
         let calls = seen.calls.borrow();
         let (fire, args) = &calls[0];
@@ -1559,7 +1695,11 @@ mod tests {
             fire.lanes, fire.group,
             "one threadgroup, and it is the grid"
         );
-        assert_eq!(args.len(), 6, "five outputs and the params block");
+        assert_eq!(
+            args.len(),
+            12,
+            "five operands and `MoeRouteParams`' seven words"
+        );
     }
 
     /// The gather's extent is the SORTED STACK's and the combine's is the
@@ -1575,7 +1715,16 @@ mod tests {
             &seen,
             In { ptr: Tensor::<bf16>::new(1), rows: 0, width: 2048 },
             Out::new(Tensor::<bf16>::new(2)),
-            In::new(Tensor::<i32>::new(3)))
+            In::new(Tensor::<i32>::new(3)),
+            // The SORT'S seven words, which this statement carries whole --
+            // three of them for the sort's benefit and not this kernel's.
+            Const::new(32),
+            Const::new(60),
+            Const::new(4),
+            Const::new(16),
+            Const::new(64),
+            Const::new(2048),
+            Const::new(2048))
         .expect("a launch");
         seen.rows.set(16);
         combine_sorted(
@@ -1583,7 +1732,11 @@ mod tests {
             In { ptr: Tensor::<bf16>::new(1), rows: 0, width: 2048 },
             In::new(Tensor::<bf16>::new(2)),
             Out::new(Tensor::<bf16>::new(3)),
-            In::new(Tensor::<i32>::new(5)))
+            In::new(Tensor::<i32>::new(5)),
+            // `ExpertCombineParams`: width, experts_per_token, out_pitch.
+            Const::new(2048),
+            Const::new(4),
+            Const::new(0))
         .expect("a launch");
         let calls = seen.calls.borrow();
         assert_eq!(calls[0].0.lanes, [2048, 64, 1], "the padded stack");

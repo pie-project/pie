@@ -400,7 +400,7 @@ pub const fn supported(m: i32, n: i32, k: i32) -> Result<(), Refusal> {
 ///
 /// The four pointers must be device allocations of the shapes above, live on
 /// `stream` until the launch completes.
-#[routine(bf16)]
+#[routine(bf16, driver)]
 pub fn moe_grouped_gemm<T>(
     ctx: &Ctx<'_>,
     a: In<Tensor<T>>,
@@ -593,7 +593,7 @@ pub fn transpose_expert_scales_u8(
 /// The six pointer arrays are device arrays of at least `max_blocks`
 /// pointers each; `shared_gate_up_base`/`shared_down_base` may be null (the
 /// rewrite above is what makes that safe).
-#[routine(whole, untraced)]
+#[routine(whole, untraced, driver)]
 pub fn build_moe_ptrs_aligned_bf16(
     ctx: &Ctx<'_>,
     // Driver-dispatched: `operand()` never validates this against the
@@ -955,7 +955,7 @@ pub fn token_batched_weighted_sum_add<T>(
 ///
 /// `out` and `src` each address `n` live elements and may alias exactly
 /// (`in_place: &[(0, 0)]`); `out` is read as well as written.
-#[routine(bf16)]
+#[routine(bf16, internal)]
 pub fn scalar_weighted_add<T>(
     ctx: &Ctx<'_>,
     out: Out<Tensor<T>>,

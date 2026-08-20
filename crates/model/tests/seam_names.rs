@@ -214,7 +214,7 @@ fn stems(plan: &ForwardPlan) -> BTreeSet<String> {
             Arg::Weight(name) if !name.is_empty() && !name.starts_with("scale.") => {
                 Some(normalise(name))
             }
-            Arg::Weight(_) | Arg::Named { .. } | Arg::Arena { .. } => None,
+            Arg::Weight(_) | Arg::Named { .. } | Arg::Arena { .. } | Arg::Raised { .. } => None,
         })
         .collect()
 }

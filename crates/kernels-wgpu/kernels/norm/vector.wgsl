@@ -1,17 +1,34 @@
 // Weightless RMSNorm: `out = x / rms(x)`.
 //
 // gemma's value norm, and the absence of a GAIN is the whole difference from
-// `norm/rms.wgsl` -- there is no weight buffer, so the row's three operands are
-// `x`, `out` and the params struct, and the norm weight's binding is simply not
-// there. The arithmetic is `norm/rms.wgsl`'s with `gain_at` deleted: fp32
-// accumulate, one workgroup per row, one bf16 round on the store.
+// `norm/rms.wgsl` -- there is no weight buffer, so the two storage bindings are
+// `x` and `out` and the norm weight's is simply not there. The arithmetic is
+// `norm/rms.wgsl`'s with `gain_at` deleted: fp32 accumulate, one workgroup per
+// row, one bf16 round on the store.
 //
-// The row states `grid_param = Some(1)` -- `VNormParams.axis_size` -- because
-// this kernel gives workgroup `x` the span `x * axis_size` and so needs one
-// workgroup per AXIS. A value norm's axis is the HEAD and its row is every
-// head, so a launch that took the fire's width for the axis would reduce the
-// whole row as one, which is not a coarser normalization but a different number
-// in every channel.
+// ## The two scalars are MARKS, not a struct
+//
+// They arrived as `VNormParams { eps, axis_size }` on a `@group(0)` storage
+// binding -- MLX's Metal layout, ported here through `norm/rms_params.h` and
+// its Slang twin -- so `norm::vnorm_single_row` forwarded `ctx.params()` whole
+// and no signature could name either number. It states `eps: Const<f32>` and
+// `axis_size: Const<i32>` now, which is words 0 and 1 of the SAME statement
+// run reached by index instead of by struct field, and
+// `driver-wgpu::lowering::routine::bind` packs them into the `@group(1)` block
+// below in the order the BODY passes them. The struct's field order is that
+// order, because the struct's field order was the statement's.
+//
+// `axis_size` is stated as `u32` here and marked `Const<i32>` there, exactly
+// as `norm/rms.wgsl`'s `RmsParams.axis_size` is against
+// `rms_strided_head_row`'s `axis`. The run is a `Vec<u32>` and the BITS are
+// the value; what the mark's Rust type decides is what the BODY may do with
+// the number, and a body sizing a launch wants a signed extent it can refuse.
+//
+// `axis_size` is why the launch is one workgroup per AXIS and not one per row:
+// this kernel gives workgroup `x` the span `x * axis_size`. A value norm's
+// axis is the HEAD and its row is every head, so a launch that took the fire's
+// width for the axis would reduce the whole row as one, which is not a coarser
+// normalization but a different number in every channel.
 
 //#include "common/bf16.inc.wgsl"
 //#include "common/reduce.inc.wgsl"
@@ -20,16 +37,21 @@
 // body that declared 256 and reduced over 128 would norm by half a row.
 const PIE_LANES = 256u;
 
-struct VNormParams {
-    eps: f32,
-    axis_size: u32,
-}
-
 @group(0) @binding(0) var<storage, read_write> x: array<u32>;
 // Atomic for the odd-`axis_size` edge alone; `store_half` says why, and the
 // host binds the same read_write storage buffer either way.
 @group(0) @binding(1) var<storage, read_write> out_: array<atomic<u32>>;
-@group(0) @binding(2) var<storage, read_write> params: VNormParams;
+
+// The fields are the body's argument order, which is the statement's run
+// order: `eps` at word 0 and `axis_size` at word 1, exactly where
+// `VNormParams` had them. A block whose fields were transposed would divide
+// every channel by a head dimension read as a float and span the row by an
+// epsilon read as a count -- both finite, neither refused.
+struct Params {
+    eps: f32,
+    axis_size: u32,
+}
+@group(1) @binding(0) var<uniform> params: Params;
 
 // The half-index split. A word and an index, not a pointer and an index: core
 // WGSL allows a pointer parameter only in the `function`, `private` and

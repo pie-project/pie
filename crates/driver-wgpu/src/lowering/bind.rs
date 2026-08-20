@@ -516,7 +516,15 @@ mod tests {
         // answered one, and every routine that reached for one refused
         // `Unstated`. `kernels/tests/every_plane_is_answered.rs` is what
         // stops the next one being minted.
-        const UNHEARD: usize = 125;
+        // 125 -> 98 AS THE PACKED PARAMETER BLOCKS CAME APART. Twenty-seven
+        // more went the way the line above describes: a struct that carried
+        // N fields behind one `params` binding became N marks the statement
+        // states, and a mark is a word the DSL passes rather than a fact a
+        // binder answers. The direction is the migration's, and the half of
+        // this test BELOW is still what says so -- it binds every routine
+        // `kernels_wgpu::routines()` carries, so a fact that stopped being
+        // answered refuses there by name instead of quietly landing here.
+        const UNHEARD: usize = 98;
         println!("facts minted but not heard by this binder: {}", unheard.len());
         for one in &unheard {
             println!("  {one}");

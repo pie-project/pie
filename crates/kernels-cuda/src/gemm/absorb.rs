@@ -124,7 +124,7 @@ unsafe fn absorb(
 /// `kv_b_proj` the whole `heads * (qk_nope_dim + v_head_dim) * kv_lora_rank`
 /// bank, and `q_latent` `tokens * heads * kv_lora_rank` writable elements —
 /// all live across the launch, which is asynchronous on the handle's stream.
-#[routine]
+#[routine(driver)]
 pub fn mla_absorb_q_to_latent_bf16(
     ctx: &Ctx<'_>,
     // `bind/mod.rs`'s `mla_absorb` passes `b.args[0]`, which is input zero of
@@ -211,7 +211,7 @@ pub fn mla_absorb_q_to_latent_bf16(
 ///
 /// As [`mla_absorb_q_to_latent_bf16`]'s, with `attn_latent` in place of
 /// `q_nope` and `attn_v` (`tokens * heads * v_head_dim`) as the output.
-#[routine]
+#[routine(driver)]
 pub fn mla_absorb_latent_to_v_bf16(
     ctx: &Ctx<'_>,
     // As [`mla_absorb_q_to_latent_bf16`]'s `q_nope`: `bind/mod.rs` runs both

@@ -133,7 +133,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.0.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -209,8 +209,7 @@
       "kind": {
         "RmsnormPerHead": {
           "weight": "layer.0.q_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
+          "head_dim": 256
         }
       },
       "inputs": [
@@ -225,8 +224,7 @@
       "kind": {
         "RmsnormPerHead": {
           "weight": "layer.0.k_norm",
-          "head_dim": 256,
-          "variant": "Gemma"
+          "head_dim": 256
         }
       },
       "inputs": [

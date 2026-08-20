@@ -96,8 +96,13 @@ pub struct Facts {
 /// skipped one would point every handle after it at the wrong buffer.
 #[derive(Clone, Debug)]
 pub enum Asked {
-    /// An operand the statement carries.
-    Operand(Arg),
+    /// An operand the statement carries, and WHICH of the statement's it is.
+    ///
+    /// The index is what lets a caller read `Lowered::arg_rows` beside it: an
+    /// operand's own row space is not always the launch's rectangle, and the
+    /// body asks in its own order rather than the statement's, so the index
+    /// cannot be recovered from the ask list's position.
+    Operand(usize, Arg),
     /// The packed scalar run.
     Params,
     /// A buffer the FIRE holds — the rope frequencies, the sampling indices.
@@ -401,7 +406,8 @@ impl<'a> Handles<'a> {
         let at = at.ok_or(Refusal::Empty { what })?;
         let width = match self.args.get(at).ok_or(Refusal::Empty { what })? {
             Arg::Arena { width, .. } | Arg::Named { width, .. } => *width,
-            Arg::Weight(_) => 0,
+            // As a weight: neither states a rectangle this launch measures.
+            Arg::Weight(_) | Arg::Raised { .. } => 0,
         };
         i32::try_from(width).map_err(|_| Refusal::Wide {
             what: "an operand's row width",
@@ -603,7 +609,7 @@ impl<'a> Handles<'a> {
         self.taken
             .iter()
             .filter_map(|a| match a {
-                Asked::Operand(arg) => Some(arg.clone()),
+                Asked::Operand(_, arg) => Some(arg.clone()),
                 Asked::Params
                 | Asked::Table(_)
                 | Asked::Kv { .. }
@@ -621,7 +627,7 @@ impl<'a> Handles<'a> {
 
     fn take(&mut self, at: usize) -> ArgValue {
         let handle = u32::try_from(self.taken.len()).expect("a small operand count");
-        self.taken.push(Asked::Operand(self.args[at].clone()));
+        self.taken.push(Asked::Operand(at, self.args[at].clone()));
         ArgValue::Buffer(handle)
     }
 }

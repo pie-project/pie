@@ -52,10 +52,10 @@ impl Workspace {
     }
 }
 
-/// A finished plan: the struct the kernel reads, and the bytes to put under it.
+/// A finished plan: the params block the kernel reads, and the bytes to put under it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plan<I> {
-    /// The struct the device kernel reads. Its layout is the contract; see
+    /// The params block the device kernel reads. Its layout is the contract; see
     pub info: I,
     /// Exactly the bytes upstream would have copied H2D: the int workspace
     pub int_upload: Vec<u8>,

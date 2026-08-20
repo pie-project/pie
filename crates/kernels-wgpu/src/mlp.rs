@@ -5,39 +5,8 @@
 //! term, and its own first line says so.
 
 use kernels_macros::routine;
-use kernels::KernelSig;
 
-/// EMPTY: this family's rows have been RETIRED.
-///
-/// `refactor-bigplan.md` §7 Stage 3. `mlp` was the first LIVE family to lose
-/// its rows on this backend, and — one kernel later — the last family in the
-/// crate to hold one. `silu_mul_strided` stayed because every backend had
-/// inherited metal's finding that its entrypoint leaves a buffer slot empty
-/// and so cannot take a positional argument list. That is true of MSL's flat
-/// argument table and not of `gated.wgsl`, which numbers its three buffers
-/// densely and gives the pitch a uniform of its own. Reading this backend's
-/// own shader is what emptied the table.
-///
-/// Originally: `mlp` is the first LIVE family to lose its rows — every gated MLP names `silu_mul`, and the three
-/// activations beside it are what gemma and gpt-oss run — so unlike `sample`
-/// and `ptir` the crossing had to be MEASURED rather than argued.
-/// `driver-wgpu`'s `every_launchs_scalars_land_where_its_module_reads_them`
-/// derives every field of every rectangle twice, by the row and by the arm,
-/// and compares.
-pub static KERNELS: &[KernelSig] = &[];
-
-/// The entrypoints this family's routines spell, now that its rows are gone.
-///
-/// See [`crate::sample::ENTRYPOINTS`].
-pub static ENTRYPOINTS: &[&str] = &[
-    "geglu_tanh_bfloat16",
-    "geglu_tanh_strided_bfloat16",
-    "gptoss_swiglu_bfloat16",
-    "silu_mul_bfloat16",
-    "silu_mul_strided_bfloat16",
-];
-
-use crate::routine::{Asks, Bind, Ctx, Fire, In, Out, Tensor, bf16, elementwise, elementwise_rows, keys};
+use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, Out, Tensor, bf16, elementwise, elementwise_rows, keys};
 use kernels::routine::Refusal;
 
 /// `out = silu(gate) * up`, elementwise over the FFN intermediate.
@@ -69,14 +38,24 @@ pub fn silu_mul(
 /// which — the three are not interchangeable and swapping them produces a
 /// model that runs and is wrong.
 ///
-/// **`params` is FORWARDED here, and `kernels-vulkan` takes it as `_params`
-/// and drops it.** That is not a disagreement: `slangc` emits no binding for
-/// a global its variant never reads, so vulkan's module has no slot to fill,
-/// while WGSL declares its bindings in the source and `driver-wgpu` builds
-/// the bind group layout from those declarations. A body that skipped it here
-/// would shift every buffer after it. `kernels-wgpu`'s
+/// **Three buffers and no params block**, which on this plane took a shader
+/// edit rather than a body edit. `gated.wgsl` declared `struct GegluParams {
+/// unused: u32 }` at `@group(0) @binding(3)` under `PIE_GEGLU` and this body
+/// forwarded `ctx.params()` into it. The forwarding was never about the
+/// SCALAR — the struct's one field was a per-row element count nothing read,
+/// and the grid is the extent — it was about the SLOT: WGSL declares its
+/// bindings in the source, `driver-wgpu` builds an explicit bind group layout
+/// from those declarations, and a body that skipped a declared slot would
+/// shift every buffer after it. So `kernels-vulkan` could take the same
+/// operand as `_params` and drop it, because `slangc` emits no binding for a
+/// global its variant never reads, and this crate could not.
+///
+/// Deleting the DECLARATION settles it in the same direction on all three
+/// planes: the module now declares three `@group(0)` bindings and this body
+/// binds three buffers. `kernels-wgpu`'s
 /// `every_routine_binds_a_buffer_for_every_binding_its_module_declares` is
-/// what holds that, and `refactor-bigplan.md` §8c is the argument.
+/// what holds those two numbers together, and `refactor-bigplan.md` §8c is
+/// the argument.
 ///
 /// # Errors
 ///
@@ -87,20 +66,26 @@ pub fn geglu_tanh(
     gate: In<Tensor<bf16>>,
     up: In<Tensor<bf16>>,
     out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
     let width = gate.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
         Fire::at("mlp/gated.wgsl", "geglu_tanh_bfloat16").apply(elementwise(width, rows)?),
-        &[gate.arg(), up.arg(), out.arg(), params],
+        &[gate.arg(), up.arg(), out.arg()],
     )
 }
 
 /// [`geglu_tanh`] over rows that are not contiguous.
 ///
 /// gemma's PLE reads a narrow gate out of a wide buffer, so each of the three
-/// operands states its own pitch — which is what `params` carries, and why
-/// this one reads it where the dense form does not.
+/// operands states its own pitch — which is why this one states scalars where
+/// the dense form states none.
+///
+/// All five are marks. `width` and `rows` are the launch's rectangle and this
+/// body knows them independently, which is not a duplication this signature
+/// introduced: `GegluStridedParams` already held both, the shader read the
+/// staged words, and the grid came from the body. Both still do — the words
+/// now reach the shader through the `@group(1)` block rather than a storage
+/// descriptor.
 ///
 /// # Errors
 ///
@@ -110,13 +95,26 @@ pub fn geglu_tanh_strided(
     ctx: &Ctx<'_>,
     gate: In<Tensor<bf16>>,
     up: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
+    out: Out<Tensor<bf16>>,
+    stated_width: Const<u32>,
+    stated_rows: Const<u32>,
+    gate_pitch: Const<u32>,
+    up_pitch: Const<u32>,
+    out_pitch: Const<u32>) -> Result<(), Refusal> {
     let width = gate.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
         Fire::at("mlp/gated.wgsl", "geglu_tanh_strided_bfloat16").apply(elementwise(width, rows)?),
-        &[gate.arg(), up.arg(), out.arg(), params],
+        &[
+            gate.arg(),
+            up.arg(),
+            out.arg(),
+            stated_width.arg(),
+            stated_rows.arg(),
+            gate_pitch.arg(),
+            up_pitch.arg(),
+            out_pitch.arg(),
+        ],
     )
 }
 
@@ -126,6 +124,19 @@ pub fn geglu_tanh_strided(
 /// carries a `+1`. [`silu_mul`] cannot serve it, so it is a symbol a text
 /// names rather than a flag.
 ///
+/// # Why a mark is declared and not passed
+///
+/// `GptOssSwiGluParams` opened with a per-row element count nothing read —
+/// dead the way `GegluParams`' one field was dead, and it outlived that struct
+/// only because `limit` and `alpha` beside it are live. `Const` slots are the
+/// statement's run counted in declaration order, so reaching `limit` at word 1
+/// means naming word 0, and `_stated_elements` is that name. It is NOT passed:
+/// the block the shader reads is packed from what this body hands `ctx.fire`,
+/// so the dead word stops at the host instead of riding to the GPU as it did
+/// inside the struct. The holder goes when the DSL stops stating the word.
+///
+/// `norm::rms_single_row` holds a slot the same way and for the same reason.
+///
 /// # Errors
 ///
 /// [`kernels::shader::elementwise`]'s.
@@ -134,13 +145,15 @@ pub fn gptoss_swiglu(
     ctx: &Ctx<'_>,
     gate: In<Tensor<bf16>>,
     up: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
+    out: Out<Tensor<bf16>>,
+    _stated_elements: Const<u32>,
+    limit: Const<f32>,
+    alpha: Const<f32>) -> Result<(), Refusal> {
     let width = gate.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
         Fire::at("mlp/gated.wgsl", "gptoss_swiglu_bfloat16").apply(elementwise(width, rows)?),
-        &[gate.arg(), up.arg(), out.arg(), params],
+        &[gate.arg(), up.arg(), out.arg(), limit.arg(), alpha.arg()],
     )
 }
 

@@ -403,7 +403,9 @@ fn a_matmul_operand_has_a_row_width_a_driver_can_derive() {
                 for a in &out.args[l.args.start as usize..l.args.end as usize] {
                     let width = match a {
                         Arg::Arena { width, .. } | Arg::Named { width, .. } => *width,
-                        Arg::Weight(_) => continue,
+                        // A raise states no rectangle, so it is not a widthless
+                        // OPERAND -- it is not an operand this census measures.
+                        Arg::Weight(_) | Arg::Raised { .. } => continue,
                     };
                     if width > 0 {
                         continue;
@@ -1185,6 +1187,7 @@ fn what_the_epilogue_hands_each_of_its_rectangles() {
                         bytes,
                     } => format!("named(v{value})/w{width}/b{bytes}"),
                     Arg::Weight(w) => format!("weight({w})"),
+                    Arg::Raised { value, key } => format!("raised(v{value})/{key}"),
                 })
                 .collect();
             println!("{name:12} {class:?} op {} -> {peers:?}", l.op);

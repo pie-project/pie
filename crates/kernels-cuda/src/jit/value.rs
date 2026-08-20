@@ -57,7 +57,7 @@ pub enum ArgValue {
         /// Elements per row. Zero where the statement gave none.
         width: i32,
     },
-    /// A by-value aggregate — a struct the kernel takes whole.
+    /// A by-value aggregate the kernel takes whole.
     ///
     /// # Safety
     ///

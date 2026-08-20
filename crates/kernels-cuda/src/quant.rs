@@ -656,10 +656,19 @@ pub fn mxfp4_moe_gate_up_decode_bf16(
     // the index run where the activation belongs, and compiles.
     topk_idx: In<Tensor<i32>>,
     act: In<Tensor<f16>>,
-    // The one bank the statement names. `Const<Tensor<_>>` derives the chain
-    // `Or(Named("weight"), Slot(Weight, 0))` — the named bank first and the
-    // positional one after.
-    packed_ptrs: Const<Tensor<u8>>,
+    // THE BANK THE STATEMENT NAMES, AND THE LAUNCH DOES NOT READ IT.
+    //
+    // It is here because the statement PLACES it -- gpt-oss's builder writes
+    // `weight:` and `model-ir`'s arity check counts what a statement places
+    // against what a routine reads, so dropping the parameter makes the two
+    // disagree about every position after the first.
+    //
+    // What the kernel indexes is a per-expert ARRAY built from this bank's
+    // NAME at load, and no mark can spell that: `Const<Tensor<u8>>` derives
+    // `Or(Named("weight"), Slot(Weight, 0))` and both halves answer the bank's
+    // own base. `arms/quant.rs` bound the array by hand for exactly that
+    // reason; the body asks `keys::WeightExpertPtrs` for it now.
+    _packed_bank: Const<Tensor<u8>>,
     // `gate_out.width` is the fanned-out result row that `per_route` divides.
     gate_out: Out<Tensor<bf16>>,
     up_out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
@@ -668,6 +677,13 @@ pub fn mxfp4_moe_gate_up_decode_bf16(
     // PROMISES the statement carries the number at its slot in the params
     // run; where nothing states one the promise is broken at the fire, not
     // at the type. See `.wiki/migration.md` §11.20.
+    // ASKED, NOT A PARAMETER, and the macro is right to insist: this is a
+    // fact only THIS FIRE can answer. `Const<Tensor<u8>>` stood here and
+    // derived the weight chain, both halves of which answer the BANK's base
+    // -- while the kernel's first act is `packed_ptrs[expert]`, so the bank
+    // would be read as an address and eight bytes of packed weight data
+    // dereferenced. `arms/quant.rs` filled it by hand for exactly that reason.
+    let packed_ptrs = ctx.ask::<*const u8, keys::WeightExpertPtrs>()?;
     let glu_limit = ctx.ask::<f32, keys::GluLimit>()?;
     let glu_alpha = ctx.ask::<f32, keys::GluAlpha>()?;
 
@@ -683,7 +699,11 @@ pub fn mxfp4_moe_gate_up_decode_bf16(
     // Whether either bias plane exists is a property of which gpt-oss export
     // loaded; no CUDA statement observes the tensor inventory, so an absent
     // plane binds null instead of refusing.
-    let scale_ptrs = ctx.ask::<*const u8, keys::WeightScales>()?;
+    // THE ARRAY, NOT THE PLANE. `arms/quant.rs`'s `PerExpert` wrapper
+    // intercepted this key and answered the per-expert array instead, which
+    // is a driver deciding that a key means something other than what it
+    // says. The key says it itself now.
+    let scale_ptrs = ctx.ask::<*const u8, keys::WeightExpertScalePtrs>()?;
     let gate_bias_ptrs = ctx.absent()?;
     let up_bias_ptrs = ctx.absent()?;
     let top_k = topk_idx.width;
@@ -729,13 +749,21 @@ pub fn mxfp4_moe_down_decode_bf16(
     // bank the statement names.
     topk_idx: In<Tensor<i32>>,
     act: In<Tensor<f16>>,
-    packed_ptrs: Const<Tensor<u8>>,
+    // The bank the statement places, unread. See the twin above.
+    _packed_bank: Const<Tensor<u8>>,
     out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
     // The `_scales` and `_bias` planes of the one stated bank, asked for as
     // its twin asks — see [`mxfp4_moe_gate_up_decode_bf16`]. `keys::WeightBias`,
     // not `keys::NamedWeight2` (`spec.weight2`, a different fact this driver
     // has); every gpt-oss export publishes `{down}_bias`.
-    let scale_ptrs = ctx.ask::<*const u8, keys::WeightScales>()?;
+    // The per-expert array, as its twin: see there for why the weight chain
+    // cannot spell this.
+    let packed_ptrs = ctx.ask::<*const u8, keys::WeightExpertPtrs>()?;
+    // THE ARRAYS, NOT THE PLANES. `arms/quant.rs`'s `PerExpert` wrapper
+    // intercepted `WeightScales`/`WeightBias` and answered the per-expert
+    // arrays instead -- a driver deciding that a key means something other
+    // than what it says. The keys say it themselves now.
+    let scale_ptrs = ctx.ask::<*const u8, keys::WeightExpertScalePtrs>()?;
     let bias_ptrs = ctx.ask::<*const u8, keys::WeightBias>()?;
     // `top_k` off `topk_idx`, not `act` — this family states
     // `vec![experts.id, x.id]`, so the index run is operand zero.
@@ -887,21 +915,29 @@ const _: () = {
     assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(scale_rows::<bf16>)[0], Some(kernels::Source::Alias(0, 0))));
     assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(scale_rows::<bf16>)[1], Some(kernels::Source::Slot(kernels::Kind::In, 1))));
 
-    // SIX, NOT TEN: the bank's `_scales`/`_gate_bias`/`_up_bias` planes are
-    // asked for in the body, not placed by the statement. `[0]` is the INDEX
-    // run and `[1]` the activation — this family states `vec![experts.id,
-    // x.id]`, so the order of these two lines is the binding.
+    // FIVE, AND `[2]` IS NOT WHAT IT LOOKS LIKE. `packed_ptrs` was
+    // `Const<Tensor<u8>>` at `[2]`, deriving the weight chain
+    // `Or(Named("weight"), Slot(Weight, 0))` -- and BOTH halves of that chain
+    // answer the BANK's own base, while the kernel's first act is
+    // `packed_ptrs[expert]`. So the column bound an address that is eight
+    // bytes of packed MXFP4 weight data read as a pointer, and `arms/quant.rs`
+    // existed to bind the per-expert array by hand instead.
+    //
+    // It is `keys::WeightExpertPtrs` now, asked for in the body, because a
+    // fact only this fire can answer is not a parameter. That is the whole of
+    // what the last two hand-written arms in this driver knew.
     assert!(<mxfp4_moe_gate_up_decode_bf16 as ::kernels::Derivation>::DERIVED.len() == 5);
     assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(mxfp4_moe_gate_up_decode_bf16)[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
     assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(mxfp4_moe_gate_up_decode_bf16)[1], Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    // THE BANK, WHICH THE LAUNCH DOES NOT READ. It is bound because the
+    // statement places it; what the kernel indexes is the per-expert array,
+    // and `keys::WeightExpertPtrs` is the only thing that can name that.
     assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(mxfp4_moe_gate_up_decode_bf16)[2], Some(kernels::Source::Or(kernels::Source::Named(_), kernels::Source::Slot(kernels::Kind::Weight, 0)))));
     assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(mxfp4_moe_gate_up_decode_bf16)[3], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    // The two GLU constants are ASKED for now, so nothing follows the second
-    // result in this column.
     assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(mxfp4_moe_gate_up_decode_bf16)[4], Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
 
-    // The down leg's mirror, four marks: index, activation, the one bank and
-    // the result. Its `_scales` and `_bias` planes are asked for too.
+    // The down leg's mirror, three marks: index, activation and the result.
+    // Its bank pointer array, `_scales_ptrs` and `_bias` are all asked for.
     assert!(<mxfp4_moe_down_decode_bf16 as ::kernels::Derivation>::DERIVED.len() == 4);
     assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(mxfp4_moe_down_decode_bf16)[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
     assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(mxfp4_moe_down_decode_bf16)[1], Some(kernels::Source::Slot(kernels::Kind::In, 1))));

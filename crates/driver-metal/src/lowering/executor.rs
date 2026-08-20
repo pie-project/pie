@@ -237,6 +237,16 @@ pub enum BindRefusal {
         /// What the frame actually holds.
         arena_bytes: u64,
     },
+    /// The plan places a raise and no shader plane binds one.
+    ///
+    /// See `driver-wgpu`'s twin: a raise is a HOST aggregate a routine body
+    /// reads to fill the block a kernel takes, and this plane's bodies read
+    /// their parameters out of a buffer. A lowering that reached this arm was
+    /// built for another plane.
+    NotOnThisPlane {
+        /// The raise, by the word its `raise!` declared.
+        key: String,
+    },
     /// The trace names a weight the resolver does not hold.
     UnknownWeight(String),
     /// The trace names a seam value the resolver does not bind.
@@ -301,6 +311,9 @@ pub fn resolve_arg<S: Resolver>(
     resolver: &mut S,
 ) -> Result<BoundArg, BindRefusal> {
     Ok(match arg {
+        Arg::Raised { key, .. } => {
+            return Err(BindRefusal::NotOnThisPlane { key: key.clone() });
+        }
         Arg::Arena { at, width, bytes: stride } => {
             let at64 = *at as u64;
             let bytes = frame.arena.bytes;

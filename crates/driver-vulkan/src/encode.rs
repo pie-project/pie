@@ -374,9 +374,17 @@ impl<R: Reflect> Encode for Encoder<'_, '_, R> {
             }
             (crate::binding::Params::Block { at, bytes }, Some(at))
         } else {
-            let params = params_from(&words(args), declared).map_err(|_| Refusal::Device {
-                why: "the module has no room for the scalars this routine states",
-            })?;
+            // By VALUE first, because a routine may hand over a 64-bit
+            // stride and only the value knows it is two words wide. The word
+            // run is still what the parameter-BUFFER search wants: a block is
+            // a std430 struct, so its image is the padded run and not the
+            // members placed at reflected offsets.
+            let params = match crate::binding::push_from(args, declared) {
+                Some(placed) => placed,
+                None => params_from(&words(args), declared).map_err(|_| Refusal::Device {
+                    why: "the module has no room for the scalars this routine states",
+                })?,
+            };
             let at = match params {
                 crate::binding::Params::Block { at, .. } => Some(at),
                 crate::binding::Params::Push(_) | crate::binding::Params::None => None,
@@ -410,7 +418,6 @@ impl<R: Reflect> Encode for Encoder<'_, '_, R> {
 mod tests {
     use super::*;
     use crate::device::Buffer;
-    use kernels_vulkan::routine::{Buf, BufMut, Env, In, Out};
 
     /// A `Declared` this test can state without a SPIR-V module.
     fn declared(bindings: u32, push: &[u32]) -> Declared {
@@ -434,7 +441,10 @@ mod tests {
     }
 
     impl Reflect for One {
-        fn of(&self, entrypoint: &str) -> Option<(Module, Rc<Declared>)> {
+        // The ARTIFACT is ignored and the ENTRYPOINT is what has to match.
+        // A body composes both -- a file per tier, a point inside it -- and
+        // this fixture holds one module, so the point is the whole question.
+        fn of(&self, _file: &str, entrypoint: &str) -> Option<(Module, Rc<Declared>)> {
             (entrypoint == self.entrypoint).then(|| {
                 (
                     Module::named(entrypoint, self.local),
@@ -442,6 +452,90 @@ mod tests {
                 )
             })
         }
+
+        fn best(&self) -> Capability {
+            Capability::Baseline
+        }
+    }
+
+    /// A resolver that answers everything with one placeholder.
+    ///
+    /// `argmax_logits` asks for its ROW COUNT and nothing else, and a row
+    /// count is a `Facts` field rather than a resource, so nothing below ever
+    /// reaches these. They are here because `Handles` takes a resolver and a
+    /// body that grew an ask would otherwise fail in a way that read as a
+    /// fixture bug.
+    struct Anything(Buffer);
+    impl crate::binding::Resolve for Anything {
+        fn weight(&self, _: &str) -> Option<&Buffer> {
+            Some(&self.0)
+        }
+        fn named(&self, _: model_ir::trace::ValueId) -> Option<&Buffer> {
+            Some(&self.0)
+        }
+        fn kv(&self, _: u16, _: bool) -> Option<&Buffer> {
+            Some(&self.0)
+        }
+        fn table(&self, _: crate::binding::FireTable) -> Option<&Buffer> {
+            Some(&self.0)
+        }
+        fn number(&self, _: crate::binding::FireNumber) -> Option<u32> {
+            Some(0)
+        }
+    }
+
+    /// What one run of `argmax_logits` came to, in owned pieces.
+    ///
+    /// Owned because a `Dispatch` borrows the buffers it was bound from, and
+    /// the helper below owns those: the four fields here are everything these
+    /// tests ask about and none of them borrows.
+    struct Ran {
+        result: Result<(), Refusal>,
+        fired: Vec<(String, [u32; 3], u32, Vec<bool>)>,
+    }
+
+    /// Bind `argmax_logits`'s operands, run its BODY, and report what it fired.
+    ///
+    /// The whole seam, because a routine is no longer a function a test can
+    /// call with four marked buffers: it takes a `Ctx` and reads its row count
+    /// through it, so there has to be a binder and a `Facts` behind the
+    /// encoder for the body to reach anything at all. This is
+    /// `serve::plan_routine` with the device taken out.
+    fn run(reflect: &impl Reflect, rows: u32, op: u32) -> Ran {
+        let routine = kernels_vulkan::routines()
+            .into_iter()
+            .find(|r| r.name == "argmax_logits")
+            .expect("the crate serves `argmax_logits`");
+        let bufs: Vec<Buffer> = (0..4).map(|_| Buffer::placeholder(64)).collect();
+        let args: Vec<Bound<'_>> = bufs.iter().map(Bound::whole).collect();
+        let widths = [1024i32; 4];
+        let ins = [0usize, 2];
+        let outs = [1usize, 3];
+        let weights: [usize; 0] = [];
+        let params: [Option<u32>; 0] = [];
+        let anything = Anything(Buffer::placeholder(64));
+        let handles = RefCell::new(crate::hold::Handles::new(
+            &args, &widths, &ins, &outs, &weights, &params, &anything,
+        ));
+        let facts = crate::hold::Facts {
+            rows,
+            width: 1024,
+            in_width: 1024,
+            ..Default::default()
+        };
+        let values =
+            crate::bind::bind(routine.args, routine.sources, &mut handles.borrow_mut(), facts)
+                .expect("the four operands bind");
+        let taken = handles.borrow().bound().to_vec();
+        let staged = handles.borrow().staged();
+        let enc = Encoder::new(reflect, &taken, &staged, op).answering(&handles, facts);
+        let result = (routine.body)(&enc, &values);
+        let fired = enc
+            .finish()
+            .into_iter()
+            .map(|d| (d.symbol.into_owned(), d.groups, d.op, d.writes))
+            .collect();
+        Ran { result, fired }
     }
 
     /// The grid is the body's LANES divided by the module's own workgroup
@@ -460,30 +554,18 @@ mod tests {
             local: [256, 1, 1],
             declared: Rc::new(declared(4, &[])),
         };
-        let bufs: Vec<Buffer> = (0..4).map(|_| Buffer::placeholder(64)).collect();
-        let bounds: Vec<Bound<'_>> = bufs.iter().map(Bound::whole).collect();
+        let ran = run(&one, 5, 7);
+        ran.result.expect("five rows is a launch");
 
-        let enc = Encoder::new(&one, &bounds, &[], 7);
-        kernels_vulkan::sample::argmax_logits(
-            &enc,
-            In::new(Buf(0)),
-            Out::new(BufMut(1)),
-            In::new(Buf(2)),
-            Out::new(BufMut(3)),
-            Env::new(5),
-        )
-        .expect("five rows is a launch");
-
-        let out = enc.finish();
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].symbol, "argmax_logits_bfloat16");
+        assert_eq!(ran.fired.len(), 1);
+        assert_eq!(ran.fired[0].0, "argmax_logits_bfloat16");
         assert_eq!(
-            out[0].groups,
+            ran.fired[0].1,
             [4, 5, 1],
             "1024 lanes over a 256-wide workgroup is 4, and one group per row on y"
         );
         assert_eq!(
-            out[0].op, 7,
+            ran.fired[0].2, 7,
             "the refusal points at the statement, not the fn"
         );
     }
@@ -503,22 +585,11 @@ mod tests {
             local: [1024, 1, 1],
             declared: Rc::new(declared(4, &[])),
         };
-        let bufs: Vec<Buffer> = (0..4).map(|_| Buffer::placeholder(64)).collect();
-        let bounds: Vec<Bound<'_>> = bufs.iter().map(Bound::whole).collect();
-
-        let enc = Encoder::new(&one, &bounds, &[], 0);
-        kernels_vulkan::sample::argmax_logits(
-            &enc,
-            In::new(Buf(0)),
-            Out::new(BufMut(1)),
-            In::new(Buf(2)),
-            Out::new(BufMut(3)),
-            Env::new(1),
-        )
-        .expect("one row is a launch");
+        let ran = run(&one, 1, 0);
+        ran.result.expect("one row is a launch");
 
         assert_eq!(
-            enc.finish()[0].writes,
+            ran.fired[0].3,
             vec![false, true, false, true],
             "logits and params are read, next_token and eos_flag are written"
         );
@@ -532,22 +603,9 @@ mod tests {
             local: [1, 1, 1],
             declared: Rc::new(declared(4, &[])),
         };
-        let bufs: Vec<Buffer> = (0..4).map(|_| Buffer::placeholder(64)).collect();
-        let bounds: Vec<Bound<'_>> = bufs.iter().map(Bound::whole).collect();
-
-        let enc = Encoder::new(&one, &bounds, &[], 0);
-        assert_eq!(
-            kernels_vulkan::sample::argmax_logits(
-                &enc,
-                In::new(Buf(0)),
-                Out::new(BufMut(1)),
-                In::new(Buf(2)),
-                Out::new(BufMut(3)),
-                Env::new(1)
-            ),
-            Err(Refusal::Undeclared)
-        );
-        assert!(enc.finish().is_empty());
+        let ran = run(&one, 1, 0);
+        assert_eq!(ran.result, Err(Refusal::Undeclared));
+        assert!(ran.fired.is_empty());
     }
 
     /// A body that states more buffers than the module binds is refused here,
@@ -559,21 +617,8 @@ mod tests {
             local: [1, 1, 1],
             declared: Rc::new(declared(6, &[])),
         };
-        let bufs: Vec<Buffer> = (0..4).map(|_| Buffer::placeholder(64)).collect();
-        let bounds: Vec<Bound<'_>> = bufs.iter().map(Bound::whole).collect();
-
-        let enc = Encoder::new(&one, &bounds, &[], 0);
-        assert_eq!(
-            kernels_vulkan::sample::argmax_logits(
-                &enc,
-                In::new(Buf(0)),
-                Out::new(BufMut(1)),
-                In::new(Buf(2)),
-                Out::new(BufMut(3)),
-                Env::new(1)
-            ),
-            Err(Refusal::Arity { want: 6, got: 4 })
-        );
+        let ran = run(&one, 1, 0);
+        assert_eq!(ran.result, Err(Refusal::Arity { want: 6, got: 4 }));
     }
 
     /// A `usize` becomes two words, low first.
@@ -588,7 +633,9 @@ mod tests {
             words(&[
                 ArgValue::Buffer {
                     handle: 3,
-                    writes: true
+                    writes: true,
+                    rows: 1,
+                    width: 1,
                 },
                 ArgValue::I32(-1),
                 ArgValue::F32(1.0),

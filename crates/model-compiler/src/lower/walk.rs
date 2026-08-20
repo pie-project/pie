@@ -30,6 +30,7 @@ pub fn lower_with(
         structural: Vec::new(),
         preps: Vec::new(),
         args: Vec::new(),
+        arg_rows: Vec::new(),
         params: Vec::new(),
         buffers: Buffers::assign(plan, rows),
         value_owner: alias_owners(plan),
@@ -85,6 +86,7 @@ pub fn lower_with(
         epilogue_norm,
         n_requests,
         args: out.args,
+        arg_rows: out.arg_rows,
         params: out.params,
         structural: out.structural,
         preps: out.preps,
@@ -109,6 +111,7 @@ struct Lowerer<'a> {
     preps: Vec<Prep>,
     /// The operand slots emitted so far.
     args: Vec<Arg>,
+    arg_rows: Vec<u32>,
     params: Vec<u32>,
     /// Arena offsets for operands as they are emitted.
     buffers: Buffers,
@@ -240,7 +243,15 @@ impl Lowerer<'_> {
                         // no row window: an empty rectangle would drop the
                         // schedule the launches below are planned against.
                         Semantic::Prep(kind) => {
-                            self.preps.push(Prep { at_op: i as u32, kind });
+                            // `outputs[0]` or nothing: a prep publishes exactly
+                            // one value, and a trace whose prep publishes none
+                            // is one built before this existed.
+                            let Some(&value) = op.outputs.first() else {
+                                return Err(Uncovered::UnknownBackend(format!(
+                                    "a prep at op {i} that publishes no value"
+                                )));
+                            };
+                            self.preps.push(Prep { at_op: i as u32, kind, value });
                         }
                         Semantic::Structural => {
                             // Structural sites use the same depth window as launches.
@@ -355,12 +366,14 @@ impl Lowerer<'_> {
                 (0, Some(a)) => self.args.push(a),
                 _ => self.args.push(self.slot(v)),
             }
+            self.arg_rows.push(self.value_rows(v));
         }
         for (i, &v) in outs.iter().enumerate() {
             match (i, out_override.clone()) {
                 (0, Some(a)) => self.args.push(a),
                 _ => self.args.push(self.slot(v)),
             }
+            self.arg_rows.push(self.value_rows(v));
         }
         let first_param = self.params.len() as u32;
         if let OpKind::Launch {
@@ -372,6 +385,7 @@ impl Lowerer<'_> {
         {
             for name in weights {
                 self.args.push(Arg::Weight(name.clone()));
+                self.arg_rows.push(0);
             }
             self.params.extend_from_slice(params);
             for (i, shape) in param_extents {
@@ -413,6 +427,28 @@ impl Lowerer<'_> {
             cond: self.cond,
         });
         Ok(())
+    }
+
+    /// One value's OWN row count, which is not always the launch's.
+    ///
+    /// The same three cases [`Self::rectangle_rows`] answers, asked of any
+    /// operand rather than only the first output and without the "the launch
+    /// covers the whole window" precondition -- an operand's row space is a
+    /// property of the value, and a partial window does not shrink it.
+    fn value_rows(&self, v: ValueId) -> u32 {
+        let n = u32::try_from(self.rows.len()).unwrap_or(u32::MAX);
+        let Some(info) = self.plan.values.get(v as usize) else {
+            return 0;
+        };
+        match info.shape.0.first() {
+            Some(Dim::Requests) => self.buffers.n_requests,
+            Some(Dim::Tokens) => n,
+            Some(&Dim::MoeAlignedRoutes { top_k, experts, block }) => {
+                Dim::moe_aligned_rows(n, top_k, experts, block)
+            }
+            Some(Dim::Const(v)) => *v,
+            _ => 0,
+        }
     }
 
     /// Rows are in the written value's row space, not always the token stream.
@@ -467,6 +503,18 @@ impl Lowerer<'_> {
 
     /// Named values are emitted under their alias owner; arena aliases already share an offset.
     fn slot(&self, v: ValueId) -> Arg {
+        // A RAISE IS NOT A RECTANGLE, so it is answered before anything
+        // measures one. `row_width` would fold an empty shape to 1 and
+        // `dtype_bytes` would read the arbitrary dtype stored beside it --
+        // two numbers that mean nothing, on an argument that has no rows.
+        if let Some(key) = self
+            .plan
+            .values
+            .get(v as usize)
+            .and_then(|info| info.raised.as_deref())
+        {
+            return Arg::Raised { value: v, key: key.to_string() };
+        }
         let width = self.row_width(v);
         let bytes = self
             .plan

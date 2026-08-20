@@ -21,6 +21,13 @@ pub struct Prep {
     pub at_op: u32,
     /// What to raise.
     pub kind: model_ir::trace::PrepKind,
+    /// The value it publishes — `Op::outputs[0]`.
+    ///
+    /// Carried here so a driver raising plans can answer BY VALUE. The key
+    /// alone cannot: two prefill schedules at different head dims are two
+    /// objects and one word, so a resolver keyed on the string can only ever
+    /// hand back whichever was raised last. This is what a statement names.
+    pub value: model_ir::trace::ValueId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +47,19 @@ pub enum Arg {
         bytes: u32,
     },
     Weight(String),
+    /// ONE OBJECT THE FIRE RAISED, by the word its `raise!` declared.
+    ///
+    /// Not [`Arg::Named`], though both are "the backend binds this". A named
+    /// value is a TENSOR the backend holds — it has a row width and an element
+    /// width, and both are on that variant because a launch measures its
+    /// rectangle in them. A raise has neither: it is a host aggregate a body
+    /// reads to fill the block a kernel takes, and the only thing the binder
+    /// needs to resolve it is which raise it is.
+    ///
+    /// Carries the KEY and not just the value id, so the driver's arm matches
+    /// on the same string `kernels-cuda`'s `raise!` wrote rather than
+    /// re-deriving it from the op that produced the value.
+    Raised { value: ValueId, key: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +143,20 @@ pub struct Lowered {
     pub epilogue_gather: usize,
     pub epilogue_norm: usize,
     pub args: Vec<Arg>,
+    /// Each arg's OWN row count, parallel to [`Self::args`].
+    ///
+    /// A launch's rectangle is not always its operands' row space. The one
+    /// that proves it is the epilogue gather: it reads the whole token stream
+    /// and writes one row per SAMPLED row, so the launch covers `n_requests`
+    /// rows while its input spans `n_tokens`. A backend that measures every
+    /// operand by `launch.rows` binds that input one row long, and a shader
+    /// bounds-clamps the rest to zero -- a plausible tensor, and the reason
+    /// `driver-wgpu` and `driver-vulkan` both force `samples: true` on every
+    /// row and pay a prefill's lm head over every token.
+    ///
+    /// Zero means "no opinion": a weight, a raise, or a value with no rows.
+    /// A backend is free to ignore this and keep measuring by the launch.
+    pub arg_rows: Vec<u32>,
     pub structural: Vec<Site>,
     /// Host preparations this fire needs raised before its launches run, in
     /// stated order.

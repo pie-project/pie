@@ -22,60 +22,25 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-/// Every entrypoint the shader tree instantiates, from the directives.
-///
-/// A `@tier` variant is another compile of an entrypoint that already exists at
-/// baseline — same name, different defines — so only the baseline lines name
-/// the set. `every_tier_has_a_baseline_beneath_it` is what holds that claim up.
-fn from_the_shaders() -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    for (_, text) in shader_sources() {
-        for line in text.lines() {
-            let Some(rest) = line
-                .trim_start()
-                .strip_prefix("//")
-                .map(str::trim_start)
-                .and_then(|r| r.strip_prefix("pie:instantiate"))
-            else {
-                continue;
-            };
-            let mut words = rest.split_whitespace();
-            let Some(name) = words.next() else { continue };
-            match words.next().and_then(|w| w.strip_prefix('@')) {
-                Some(tier) if tier != "baseline" => continue,
-                _ => {
-                    out.insert(name.to_string());
-                }
-            }
-        }
-    }
-    out
-}
+// `from_the_shaders` STOOD HERE, walking the `pie:instantiate` lines to build
+// the tree's half of the comparison below. `build.rs` does that walk now and
+// writes the answer into the crate, so this was the same parse written twice
+// and the two tests that called it are retired below.
 
-#[test]
-fn the_table_names_exactly_what_the_shaders_instantiate() {
-    let shaders = from_the_shaders();
-    let table: BTreeSet<String> = kernels_vulkan::entrypoints().into_iter().collect();
-
-    let undeclared: Vec<_> = shaders.difference(&table).collect();
-    assert!(
-        undeclared.is_empty(),
-        "{} entrypoints exist in kernels/ that no row declares. A new \
-         instantiation needs a row, or a point on an existing row's axis:\n{:#?}",
-        undeclared.len(),
-        undeclared
-    );
-
-    let phantom: Vec<_> = table.difference(&shaders).collect();
-    assert!(
-        phantom.is_empty(),
-        "{} entrypoints are declared that no shader instantiates. An axis whose \
-         product over-generates is the usual cause — see `sdpa_paged_decode`, \
-         which lists its tails for exactly this reason:\n{:#?}",
-        phantom.len(),
-        phantom
-    );
-}
+// `the_table_names_exactly_what_the_shaders_instantiate` STOOD HERE. It held
+// invariant (1) as a set equality: the directives against
+// `kernels_vulkan::entrypoints()`, in both directions, so a shader nobody
+// declared and a declaration no shader backed each failed by name.
+//
+// `entrypoints()` READS THE DIRECTIVES now -- `build.rs` writes the census from
+// the same parse it compiles from, replacing the hand-written `RETIRED` list of
+// the same names. So both sides of the equality are one source and it held by
+// construction. It did not go false, it went TAUTOLOGICAL, which is the §7
+// shape this file keeps naming: a check does not fail when its subject
+// retires, it stops saying anything and passes while doing so.
+//
+// The half that was ever independent is the ROUTINE bodies against the tree,
+// and it lives in `tests/routines.rs` where the bodies are.
 
 // `no_two_rows_claim_the_same_entrypoint` STOOD HERE. Two rows claiming one
 // entrypoint would have made `sig_in` order-dependent, and the set comparison
@@ -227,29 +192,18 @@ fn every_tier_has_a_baseline_beneath_it() {
     }
 }
 
-/// A tier never invents an entrypoint the table does not name.
-#[test]
-fn no_tier_names_an_unknown_entrypoint() {
-    let known: BTreeSet<String> = kernels_vulkan::entrypoints().into_iter().collect();
-    for (file, text) in shader_sources() {
-        for line in text.lines() {
-            let Some(rest) = line
-                .trim_start()
-                .strip_prefix("//")
-                .map(str::trim_start)
-                .and_then(|r| r.strip_prefix("pie:instantiate"))
-            else {
-                continue;
-            };
-            let mut words = rest.split_whitespace();
-            let Some(name) = words.next() else { continue };
-            assert!(
-                known.contains(name),
-                "{file}: `{name}` is instantiated but the table does not name it",
-            );
-        }
-    }
-}
+// `no_tier_names_an_unknown_entrypoint` STOOD HERE, walking every
+// `pie:instantiate` line -- tiered ones included -- and requiring the census to
+// carry the name, with the FILE in the failure message where the set comparison
+// above could only give a name.
+//
+// Same reason as above: the census IS those lines. Every instantiated variant
+// is one it names, because naming them is what it does.
+//
+// The claim underneath it is `every_tier_has_a_baseline_beneath_it`, above, and
+// that one is real: a tier must have a BASELINE beside it, which is what a
+// device with no optional features depends on and what no reading of the census
+// alone can supply.
 
 /// Baseline is unsuffixed, so a driver that has never heard of a tier finds the
 /// right module knowing only the entrypoint name.

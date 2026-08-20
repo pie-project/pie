@@ -296,7 +296,7 @@ pub fn rmsnorm_strided_bf16_at(
 /// # Safety
 ///
 /// [`rmsnorm_strided_bf16`]'s, unchanged.
-#[routine]
+#[routine(internal)]
 pub fn unstrided_bf16(
     ctx: &Ctx<'_>,
     x: In<Tensor<bf16>>,
@@ -910,7 +910,7 @@ pub fn tanh<T>(ctx: &Ctx<'_>, x: InOut<Tensor<T>>) -> Result<(), Refusal> {
 /// # Safety
 ///
 /// [`tanh`]'s, with `x` addressing fp16.
-#[routine]
+#[routine(internal)]
 pub fn tanh_f16(ctx: &Ctx<'_>, x: InOut<Tensor<f16>>) -> Result<(), Refusal> {
     let rect = x.all("the rectangle's row width")?;
     let n = rect.elements();
@@ -940,7 +940,7 @@ pub fn residual_add<T>(ctx: &Ctx<'_>, y: InOut<Tensor<T>>, x: In<Tensor<T>>) -> 
 /// # Safety
 ///
 /// [`residual_add`]'s, with both pointers addressing fp16.
-#[routine]
+#[routine(internal)]
 pub fn residual_add_f16(
     ctx: &Ctx<'_>,
     y: InOut<Tensor<f16>>,

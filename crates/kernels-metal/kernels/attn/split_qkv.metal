@@ -12,14 +12,24 @@
 // QKV split is and binds three offsets on its own account.
 //
 // THE WIDTHS ARE OPERANDS, NOT LITERALS. `q_width` and `kv_width` arrive as
-// dispatch constants because the TEXT states them (`OpKind::Launch::params`).
-// Baking them in is the defect `_d_256` was: a literal that fits one
-// checkpoint and reads past the end of every head on the next.
+// dispatch constants because the TEXT states them. Baking them in is the
+// defect `_d_256` was: a literal that fits one checkpoint and reads past the
+// end of every head on the next.
 //
-// They arrive as ONE struct at one buffer, which is the tree's convention --
-// `moe/route.metal` takes `constant RouterParams&` and so on. A statement's
-// params in stated order ARE the struct, so the driver binds the address of
-// the run it staged and the layout follows from the order.
+// THEY ARE TWO SCALARS, NOT ONE STRUCT. This took `constant SplitQkvParams& p
+// [[buffer(4)]]` holding `{ q_width, kv_width }` -- MLX's layout, and the
+// shape `kernels-vulkan` and `kernels-wgpu` then copied from here. The
+// argument for it was that a statement's params in stated order ARE the
+// struct, so the driver could bind the address of the run it staged and let
+// the layout follow from the order; the cost was that no signature could name
+// either width, so nothing between the text and the shader could say which
+// word was which. With both stated as `Const<u32>` marks the routine names
+// them, metal binds each as its own `setBytes` at buffers 4 and 5, and words
+// 0 and 1 of the statement's run are the same two numbers they always were.
+//
+// The ORDER is still the statement's and still load-bearing: read swapped,
+// both boundaries below land inside a neighbouring projection rather than out
+// of bounds, so nothing faults and every head is wrong.
 //
 // Launch: dispatchThreads grid=(q_width + 2*kv_width, rows, 1), tg=(256, 1, 1)
 // — `LaunchRule::ElementwiseRows`, one thread per packed element.
@@ -27,22 +37,15 @@
 #include <metal_stdlib>
 using namespace metal;
 
-/// The two widths, in the order the statement states them.
-struct SplitQkvParams {
-  unsigned int q_width;
-  unsigned int kv_width;
-};
-
 template <typename T>
 [[kernel]] void split_qkv(
     const device T* packed [[buffer(0)]],   // [rows, q_width + 2*kv_width]
     device T* q            [[buffer(1)]],   // [rows, q_width]
     device T* k            [[buffer(2)]],   // [rows, kv_width]
     device T* v            [[buffer(3)]],   // [rows, kv_width]
-    const constant SplitQkvParams& p [[buffer(4)]],
+    const constant uint& q_width  [[buffer(4)]],
+    const constant uint& kv_width [[buffer(5)]],
     uint2 tid [[thread_position_in_grid]]) {
-  const uint q_width = p.q_width;
-  const uint kv_width = p.kv_width;
   const uint packed_width = q_width + 2u * kv_width;
   const uint c = tid.x;
   // The grid is rounded up to whole threadgroups, so the tail runs over the
@@ -65,6 +68,6 @@ template <typename T>
   template [[host_name("split_qkv_" #name)]]                                \
   [[kernel]] void split_qkv<itype>(                                         \
       const device itype*, device itype*, device itype*, device itype*,     \
-      const constant SplitQkvParams&, uint2);
+      const constant uint&, const constant uint&, uint2);
 
 instantiate_split_qkv(bf16, bfloat)

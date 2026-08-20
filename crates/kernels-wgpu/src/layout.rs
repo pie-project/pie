@@ -9,47 +9,6 @@
 // reason, at a ceiling of 24.
 
 use kernels_macros::routine;
-use kernels::KernelSig;
-
-/// EMPTY: this family's rows have been RETIRED.
-///
-/// `refactor-bigplan.md` §7 Stage 3. Six kernels over 26 entrypoints — the
-/// four quantized embedding gathers carry a two-axis product (`gs` x `b`) and
-/// are the reason this backend's affine point had to be readable from the
-/// SYMBOL rather than from a launch fact.
-pub static KERNELS: &[KernelSig] = &[];
-
-/// The entrypoints this family's routines spell, now that its rows are gone.
-///
-/// See [`crate::sample::ENTRYPOINTS`].
-pub static ENTRYPOINTS: &[&str] = &[
-    "embed_gather_4bit_bfloat16_gs_128_b_4",
-    "embed_gather_4bit_bfloat16_gs_128_b_8",
-    "embed_gather_4bit_bfloat16_gs_32_b_4",
-    "embed_gather_4bit_bfloat16_gs_32_b_8",
-    "embed_gather_4bit_bfloat16_gs_64_b_4",
-    "embed_gather_4bit_bfloat16_gs_64_b_8",
-    "embed_gather_mb_4bit_bfloat16_gs_128_b_4",
-    "embed_gather_mb_4bit_bfloat16_gs_128_b_8",
-    "embed_gather_mb_4bit_bfloat16_gs_32_b_4",
-    "embed_gather_mb_4bit_bfloat16_gs_32_b_8",
-    "embed_gather_mb_4bit_bfloat16_gs_64_b_4",
-    "embed_gather_mb_4bit_bfloat16_gs_64_b_8",
-    "embed_gather_scaled_4bit_bfloat16_gs_128_b_4",
-    "embed_gather_scaled_4bit_bfloat16_gs_128_b_8",
-    "embed_gather_scaled_4bit_bfloat16_gs_32_b_4",
-    "embed_gather_scaled_4bit_bfloat16_gs_32_b_8",
-    "embed_gather_scaled_4bit_bfloat16_gs_64_b_4",
-    "embed_gather_scaled_4bit_bfloat16_gs_64_b_8",
-    "embed_gather_scaled_mb_4bit_bfloat16_gs_128_b_4",
-    "embed_gather_scaled_mb_4bit_bfloat16_gs_128_b_8",
-    "embed_gather_scaled_mb_4bit_bfloat16_gs_32_b_4",
-    "embed_gather_scaled_mb_4bit_bfloat16_gs_32_b_8",
-    "embed_gather_scaled_mb_4bit_bfloat16_gs_64_b_4",
-    "embed_gather_scaled_mb_4bit_bfloat16_gs_64_b_8",
-    "ple_combine_bfloat16",
-    "row_gather_bfloat16",
-];
 
 // ── The routine shape ────────────────────────────────────────────────
 //
@@ -62,7 +21,7 @@ pub static ENTRYPOINTS: &[&str] = &[
 // statements of one fact is what this refactor is against, so the row goes
 // when the family does, and not one commit later.
 
-use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, InPacked, Out, Tensor, bf16, keys};
+use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, Out, Tensor, bf16, keys};
 use kernels::routine::Refusal;
 use kernels::shader::{elementwise, elementwise_rows};
 
@@ -70,8 +29,16 @@ use kernels::shader::{elementwise, elementwise_rows};
 /// `[n_layers, ple_dim]` block at once.
 ///
 /// The scale is `1/sqrt(2)` and it is the JOIN's, not a deployment's -- two
-/// streams averaged in the root-mean-square sense -- so it rides the packed
-/// `PleCombineParams` buffer rather than an argument.
+/// streams averaged in the root-mean-square sense -- so it is the one scalar
+/// this kernel reads, and it is a MARK rather than a struct:
+/// `layout/ple_combine.wgsl` takes it as the one field of its `@group(1)`
+/// uniform block. It used to ride a `PleCombineParams { inv_sqrt2, n }` storage
+/// buffer -- Metal's layout, ported twice -- whose second word was dead: `n`
+/// was one ROW's element count and the elementwise grid is `width * rows`, so
+/// it could not bound the dispatch it was written for, and the field stayed
+/// only to hold the struct's size. Word 0 of the statement's run is the same
+/// number either way; the mark reaches it by index instead of by field, and
+/// with no struct left there is nothing for `n` to hold the size of.
 ///
 /// # The two arguments that were not operands
 ///
@@ -90,8 +57,12 @@ pub fn ple_combine(
     ctx: &Ctx<'_>,
     proj: In<Tensor<bf16>>,
     token: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
+    out: Out<Tensor<bf16>>,
+    // THE JOIN'S SCALE, which was `PleCombineParams`'s first field. The
+    // struct's other word -- a per-row element count bounding a whole-tensor
+    // grid -- was dead, so with the scale stated as a mark there is nothing
+    // left for a block to carry.
+    inv_sqrt2: Const<f32>) -> Result<(), Refusal> {
     let width = proj.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     if width <= 0 {
@@ -106,7 +77,7 @@ pub fn ple_combine(
     let lanes = width.unsigned_abs() * rows.unsigned_abs();
     ctx.fire(
         Fire::at("layout/ple_combine.wgsl", "ple_combine_bfloat16").apply([lanes, 1, 1]),
-        &[proj.arg(), token.arg(), out.arg(), params],
+        &[proj.arg(), token.arg(), out.arg(), inv_sqrt2.arg()],
     )
 }
 
@@ -311,11 +282,26 @@ pub fn embed_gather_scaled_mb_4bit(
 /// The readout's gather: one distribution per REQUEST out of one row per
 /// TOKEN.
 ///
-/// `count` is [`InPacked`]: it is the second FIELD of the `RowGatherParams`
-/// struct that buffer 3 binds, not a uniform-block scalar and not a buffer of
-/// its own. The type is what says so; under `kernel!` the same fact was an
-/// operand's `Ty::InPacked` and the shader's struct, and only one of the two
-/// was checked.
+/// # Two words, one block, and the order is the body's
+///
+/// `count` used to be [`crate::routine::InPacked`]: the second FIELD of the `RowGatherParams`
+/// struct that buffer 3 bound, neither a uniform-block scalar nor a buffer of
+/// its own, written by the driver while it filled that buffer. The type was
+/// what said so; under `kernel!` the same fact was an operand's `Ty::InPacked`
+/// and the shader's struct, and only one of the two was ever checked.
+///
+/// There is no struct now. `width` is the statement's word 0 read through a
+/// `Const<u32>` mark, and the request count -- which is the FIRE's and not the
+/// statement's, so it is asked for rather than marked -- is an ordinary scalar
+/// this body passes straight after it. `driver-wgpu::lowering::routine::bind`
+/// packs body-passed scalars into the `@group(1)` uniform block in the order
+/// the body passed them, so `[width, count]` lands with the layout the struct
+/// had, field for field, and `layout/row_gather.wgsl` reads
+/// `params.width`/`params.count` off the uniform where it read them off the
+/// storage block. The old worry -- that folding `count` into a uniform would
+/// push a word no shader read and leave `params.count` holding whatever the
+/// params buffer contained -- was about a block that was otherwise EMPTY, and
+/// this one is not: both its words are read.
 ///
 /// # Errors
 ///
@@ -324,19 +310,22 @@ pub fn embed_gather_scaled_mb_4bit(
 pub fn row_gather(
     ctx: &Ctx<'_>,
     input: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    out: Out<Tensor<bf16>>,
+    // THE ROW PITCH, which was `RowGatherParams`'s first field and is the only
+    // word of the two the STATEMENT carries. The count below is the fire's.
+    width: Const<u32>) -> Result<(), Refusal> {
     let rows = ctx.ask::<Tensor<u32>, keys::SamplingIndices>()?;
-    let params = ctx.params()?;
-    let count = ctx.ask::<InPacked, keys::RequestCount>()?;
-    let width = input.width;
+    // A `u32` and no longer an `InPacked`: there is no struct for it to be a
+    // field of, so it is a scalar like any other and takes its place in the
+    // block by the position the body gives it.
+    let count = ctx.ask::<u32, keys::RequestCount>()?;
     let row_count = ctx.ask::<i32, keys::Rows>()?;
-    let lanes = elementwise_rows(width, row_count)?;
+    let lanes = elementwise_rows(input.width, row_count)?;
     ctx.fire(
         Fire::at("layout/row_gather.wgsl", "row_gather_bfloat16").apply(lanes),
-        &[input.arg(), out.arg(), rows.arg(), params, count.arg()],
+        &[input.arg(), out.arg(), rows.arg(), width.arg(), count.arg()],
     )
 }
-
 
 #[cfg(test)]
 mod ported {
@@ -356,10 +345,15 @@ mod ported {
     /// because `an_empty_block_is_refused_rather_than_launched_as_nothing`
     /// needs a ZERO there while every other test in this module needs a real
     /// row count -- and `rows` is asked for from inside the body now, not a
-    /// positional argument a caller can vary directly. `ctx.params()` answers
-    /// a fixed handle rather than a fresh one, so
-    /// `the_body_asks_for_the_elementwise_grid`'s exact dispatched list stays
-    /// legible as four small, distinct numbers.
+    /// positional argument a caller can vary directly.
+    ///
+    /// NO `ctx.params()` ANSWER ANY MORE. This used to hold a fixed handle for
+    /// `kernels::Source::Slot(kernels::Kind::Params, 0)`, small and constant so
+    /// that `the_body_asks_for_the_elementwise_grid`'s exact dispatched list
+    /// stayed legible; `ple_combine` and `row_gather` were the two bodies that
+    /// asked for it, and both state their scalars as `Const` marks now. A mark
+    /// is passed by the CALLER, not resolved, so the tests below hand the
+    /// numbers in and this probe never sees the params run at all.
     struct Recorder {
         seen: RefCell<Vec<Kept>>,
         /// What `ctx.ask::<i32, keys::Rows>()` answers.
@@ -410,11 +404,14 @@ mod ported {
             if source == Src::Named("rows") {
                 return Ok(ArgValue::I32(self.rows.get()));
             }
-            // FIXED, not the counter below: kept small and constant so the
-            // one test that checks a whole dispatched list can still read it
-            // at a glance.
-            if source == Src::Slot(kernels::Kind::Params, 0) {
-                return Ok(ArgValue::Buffer(3));
+            // THE REQUEST COUNT, which `row_gather` asks for as a plain `u32`
+            // now that it is a scalar of the body's own rather than a field
+            // the driver wrote into a struct. Answered by name and not by the
+            // `T::U32` arm below, so that
+            // `the_row_gathers_two_words_are_the_width_then_the_count` can
+            // tell it apart from the width the caller passed.
+            if source == Src::Named("request_count") {
+                return Ok(ArgValue::U32(3));
             }
             Ok(match ty {
                 T::Buf
@@ -447,18 +444,26 @@ mod ported {
 
     /// The row this routine replaces is derived from its signature.
     ///
-    /// THREE operands, not the six a `kernel!` row stated. The row this
+    /// FOUR arguments, not the six a `kernel!` row stated. The row this
     /// replaced was positional over everything a launch read, `Env` included,
     /// so it carried `width` and `rows` beside the four buffers. Neither
     /// scalar is a parameter of any kind any more: `width` comes off
     /// `proj.width`, the mark's own rectangle, and `rows` is asked for from
     /// inside the body (`ctx.ask::<i32, keys::Rows>()` -- see
     /// `Recorder::resolve`, which is what a test answers that ask with now
-    /// that `Env` provenance cannot). What is left on the signature, and so
-    /// in `row.args`, is exactly the three buffers the shader binds: two
-    /// reads and a write, which is `Ty::Bf16sMut` and not a third `Bf16s` --
+    /// that `Env` provenance cannot). What is left on the signature, and so in
+    /// `row.args`, is the three buffers the shader binds -- two reads and a
+    /// write, which is `Ty::Bf16sMut` and not a third `Bf16s`, because
     /// [`kernels::shader::Element::TY_MUT`] is what a mark's write/read split
-    /// still says once a buffer's own type no longer implies which.
+    /// says once a buffer's own type no longer implies which -- and then the
+    /// one SCALAR the shader reads.
+    ///
+    /// That fourth entry is the migration. `inv_sqrt2` used to arrive inside
+    /// `PleCombineParams` on a storage binding, which is a `Ty::Buf` the
+    /// signature never mentioned because `ctx.params()` is a call and not a
+    /// parameter; as a `Const<f32>` mark it is `Ty::F32` here, resolved to
+    /// `Source::Slot(Kind::ParamF32, 0)` -- word 0 of the same statement run
+    /// the struct's first field read.
     #[test]
     fn the_routines_row_is_its_signature_and_names_the_two_that_were_not_operands() {
         let row = crate::ROUTINES
@@ -468,8 +473,9 @@ mod ported {
 
         assert_eq!(
             row.args.iter().copied().collect::<Vec<_>>(),
-            [Ty::Bf16s, Ty::Bf16s, Ty::Bf16sMut],
-            "the row's operands, in the row's order: two reads then a write"
+            [Ty::Bf16s, Ty::Bf16s, Ty::Bf16sMut, Ty::F32],
+            "the row's operands, in the row's order: two reads, a write, and \
+             the join's scale"
         );
     }
 
@@ -501,6 +507,7 @@ mod ported {
             In { ptr: Tensor::<bf16>::new(0), rows: 0, width: 64 },
             In { ptr: Tensor::<bf16>::new(1), rows: 0, width: 64 },
             Out { ptr: Tensor::<bf16>::new(2), rows: 0, width: 64 },
+            Const::new(core::f32::consts::FRAC_1_SQRT_2),
         )
         .expect("it dispatches");
 
@@ -535,12 +542,75 @@ mod ported {
                 ArgValue::Buffer(0),
                 ArgValue::Buffer(1),
                 ArgValue::Buffer(2),
-                ArgValue::Buffer(3)
+                ArgValue::F32(core::f32::consts::FRAC_1_SQRT_2)
             ],
-            "the three operands and the params slot -- and NOT `width` or \
+            "the three operands and the join's scale -- and NOT `width` or \
              `rows`, which are no longer arguments at all: `width` comes off \
              `proj`'s own rectangle and `rows` is asked for from inside the \
-             body (`Recorder::resolve` answers it, here as 7)"
+             body (`Recorder::resolve` answers it, here as 7). The fourth \
+             entry used to be `Buffer(3)`, the handle `ctx.params()` minted \
+             for the staged `PleCombineParams` block; the scale is a \
+             `Const<f32>` mark now, so it reaches the driver as the NUMBER \
+             the caller passed and `driver-wgpu`'s `bind` packs it into the \
+             `@group(1)` uniform instead of staging a storage buffer for it"
+        );
+    }
+
+    /// `row_gather` passes TWO words, and the width comes first.
+    ///
+    /// The gather is the one row in this family whose shader reads two
+    /// scalars, and the order between them is an ABI: `layout/row_gather.wgsl`
+    /// declares `struct Params { width: u32, count: u32 }` and
+    /// `driver-wgpu::lowering::routine::bind` packs the body's scalars into
+    /// the `@group(1)` block in the order the body passed them, so a swap here
+    /// binds the request count as the row pitch and the pitch as the request
+    /// count. Neither is a type error, both are plausible `u32`s, and the
+    /// gather would read whole rows out of the wrong place and report success.
+    ///
+    /// What this replaces is the same claim about the other carrier. `width`
+    /// was word 0 of a `RowGatherParams` STRUCT that a storage binding bound
+    /// and `count` was `Ty::InPacked` -- a value with no slot of its own,
+    /// appended to that struct's staged run by the driver. There is no struct
+    /// and no packed field now: `width` is a `Const<u32>` mark reading the
+    /// same word 0 of the same statement run by index, and `count` is an
+    /// ordinary `u32` the body asks the fire for and passes straight after it.
+    #[test]
+    fn the_row_gathers_two_words_are_the_width_then_the_count() {
+        let to = Recorder::default();
+        to.rows.set(3);
+        row_gather(
+            &to,
+            In { ptr: Tensor::<bf16>::new(0), rows: 0, width: 2048 },
+            Out { ptr: Tensor::<bf16>::new(1), rows: 0, width: 2048 },
+            Const::new(2048),
+        )
+        .expect("three requests is a launch");
+
+        let seen = to.seen.borrow();
+        let (_, entrypoint, lanes, args) = seen.first().expect("one dispatch");
+        assert_eq!(entrypoint, "row_gather_bfloat16");
+        assert_eq!(
+            *lanes,
+            [2048, 3, 1],
+            "one row per REQUEST, not one per token -- that is the whole point \
+             of the gather"
+        );
+        assert_eq!(
+            args.len(),
+            5,
+            "input, out, the index table, and then the two words of the block"
+        );
+        assert_eq!(
+            args[3],
+            ArgValue::U32(2048),
+            "the width the statement carries, which the mark reads at slot 0"
+        );
+        assert_eq!(
+            args[4],
+            ArgValue::U32(3),
+            "and the request count the fire answers, which `Recorder::resolve` \
+             gives as 3 -- a different number from the width on purpose, so a \
+             swap of the two cannot pass this"
         );
     }
 
@@ -681,6 +751,7 @@ mod ported {
             In { ptr: b, rows: 0, width: W },
             In { ptr: b, rows: 0, width: W },
             Out { ptr: m, rows: 0, width: W },
+            Const::new(core::f32::consts::FRAC_1_SQRT_2),
         )
         .expect("dispatches");
         embed_gather_4bit(
@@ -729,6 +800,7 @@ mod ported {
             &to,
             In { ptr: b, rows: 0, width: W },
             Out { ptr: m, rows: 0, width: W },
+            Const::new(W.unsigned_abs()),
         )
         .expect("dispatches");
 
@@ -799,6 +871,7 @@ mod ported {
                 In { ptr: Tensor::<bf16>::new(0), rows: 0, width: 0 },
                 In { ptr: Tensor::<bf16>::new(1), rows: 0, width: 0 },
                 Out { ptr: Tensor::<bf16>::new(2), rows: 0, width: 0 },
+                Const::new(core::f32::consts::FRAC_1_SQRT_2),
             ),
             Err(Refusal::Empty { what: "width" }),
             "`dispatch_workgroups(0, 1, 1)` is legal WebGPU that runs \
@@ -814,6 +887,7 @@ mod ported {
                 In { ptr: Tensor::<bf16>::new(0), rows: 0, width: 64 },
                 In { ptr: Tensor::<bf16>::new(1), rows: 0, width: 64 },
                 Out { ptr: Tensor::<bf16>::new(2), rows: 0, width: 64 },
+                Const::new(core::f32::consts::FRAC_1_SQRT_2),
             ),
             Err(Refusal::Empty { what: "rows" }),
             "the same refusal, for the fact that is asked for rather than \

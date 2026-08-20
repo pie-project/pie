@@ -312,6 +312,22 @@ fn nothing_this_crate_needs_to_build_compiles_c() {
         // find them and `kernels-cuda` is not in this closure at all. Third
         // move this entry has recorded, and the first that was an improvement
         // — one fewer crate whose build script a wgpu build waits on.
+        //
+        // AND IT IS BACK, which is the fourth move and the first regression.
+        // `model-ir` names `kernels_cuda::raises::Fa2Prefill::KEY` and
+        // `Fa2Decode::KEY` in `trace/op.rs` and `trace/builder.rs`, and
+        // re-exports `kernels_cuda::sigs` from `kernels.rs` — so the attention
+        // raises' words and the signature contracts live in the CUDA crate and
+        // every backend that builds a trace pulls it in behind them.
+        //
+        // Recorded rather than argued away. The cost is exactly what the entry
+        // above measured when it left: a wgpu build waits on `kernels-cuda`'s
+        // build script, which is the one that compiles C. Getting it out again
+        // means the raise keys and `sigs` living somewhere that is not one
+        // backend's crate, and that is a move across `model-ir`'s API rather
+        // than an edit here. What this list is for is making sure the next
+        // person to look knows it happened.
+        "kernels-cuda",
         // The Metal shader build, behind `native`, and macOS-only besides.
         // Same edge.
         "kernels-metal",

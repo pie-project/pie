@@ -2,12 +2,13 @@
 // CONTRACT.
 //
 // `gate`, `up`, `out` at `@group(0)` bindings 0, 1, 2 in every variant, and a
-// params struct at 3 for the three that have one -- `silu_mul` and its strided
-// form state no params at all, which is why that buffer is declared inside the
-// arms and not above them. Five entrypoints, three activations:
+// params struct at 3 for the TWO that still have one -- `silu_mul`, its
+// strided form and the dense GeGLU state no params at all, which is why that
+// buffer is declared inside the arms and not above them. Five entrypoints,
+// three activations:
 //
 //   silu_mul       out = silu(gate) * up                    no params
-//   geglu_tanh     out = gelu_tanh(gate) * up               GegluParams
+//   geglu_tanh     out = gelu_tanh(gate) * up               no params
 //   gptoss_swiglu  gpt-oss's clamped, alpha-scaled SwiGLU   GptOssSwiGluParams
 //
 // The third earns its model name: it bakes gpt-oss's asymmetric clamp, its
@@ -27,12 +28,14 @@
 // ## The grid is the extent, and the extent is in WORDS
 //
 // Metal launches these with `dispatchThreads`, an exact thread count, which is
-// why `GegluParams::unused` is unused and why `silu_mul` takes no params at
-// all: there is no tail to guard on that backend. `dispatch_workgroups` counts
-// WORKGROUPS, so the real extent here is `256 * ceil(n / 256)` and any width
-// that is not a multiple of the workgroup leaves invocations past the end. The
-// bound is `arrayLength(&out_)` -- the bound storage range, which needs nothing
-// from the caller and cannot drift from a scalar the row would have to grow.
+// why `GegluParams::unused` was unused -- and, in the end, why the struct went
+// away with the field and the dense GeGLU takes no params at all, which is the
+// shape `silu_mul` has had from the start: there is no tail to guard on that
+// backend. `dispatch_workgroups` counts WORKGROUPS, so the real extent here is
+// `256 * ceil(n / 256)` and any width that is not a multiple of the workgroup
+// leaves invocations past the end. The bound is `arrayLength(&out_)` -- the
+// bound storage range, which needs nothing from the caller and cannot drift
+// from a scalar the row would have to grow.
 //
 // And one invocation owns one WORD, which is TWO bf16 values: WGSL has no
 // 16-bit storage, so the launch's x extent is HALF the element count. That is
@@ -56,13 +59,32 @@
 @group(0) @binding(2) var<storage, read_write> out_: array<u32>;
 //#endif
 
-//#if defined(PIE_GEGLU)
-// Bound and never read, exactly as Metal's is -- see "the grid is the extent"
-// above. It stays because the row states `params: Buf`, and the bind group
-// layout a shell builds from the row is the same on all three backends.
-struct GegluParams { unused: u32 }
-@group(0) @binding(3) var<storage, read_write> params: GegluParams;
-//#elif defined(PIE_GEGLU_STRIDED)
+// THE DENSE GEGLU DECLARES NO PARAMS BINDING AT ALL, which is why this chain
+// opens on the strided arm rather than on `PIE_GEGLU`.
+//
+// `@group(0) @binding(3)` under `PIE_GEGLU` was `struct GegluParams { unused:
+// u32 }` and a `read_write` storage buffer to bind it with: a whole descriptor
+// and a whole staged word for a struct with ONE field that nothing in this
+// file ever read. The field was dead on arrival -- it was a per-row element
+// count read as `if (gid >= p.n) return;`, and "the grid is the extent" above
+// is the whole of why that bound could not stay. What kept the BINDING alive
+// after the field died was the row, which stated `params: Buf`; a shell built
+// the bind group layout out of the row, so every backend declared a slot for
+// it whether or not its body read one, and on this plane a declared slot must
+// be filled or every buffer after it shifts by one.
+//
+// The row is retired and `mlp::geglu_tanh` no longer calls `ctx.params()`, so
+// nothing states the buffer and nothing declares it. Deleting the DECLARATION
+// rather than skipping the slot is what keeps `driver-wgpu`'s explicit layout
+// and this body's three arguments the same number.
+//
+// The other two arms carried their numbers in a `binding(3)` storage struct for
+// the same reason and no longer do. The strided form's five pitches and
+// gpt-oss's `limit` and `alpha` ARE genuinely read -- they are numbers no grid
+// can supply -- so unlike `GegluParams` they became `Const` marks rather than
+// nothing, and the block they ride is the `@group(1)` uniform every other
+// stated scalar in this tree uses. Same words, same order, no descriptor.
+//#if defined(PIE_GEGLU_STRIDED)
 // gemma4's per-layer-embedding GeGLU reads a NARROW gate out of a WIDE table:
 // the PLE table is `[rows, n_layers * ple_dim]`, so layer L's slice is
 // `ple_dim` wide with `n_layers * ple_dim` between rows, while the gate and the
@@ -70,22 +92,37 @@ struct GegluParams { unused: u32 }
 // the flat kernel reading one walks into the NEXT layers' slices after the
 // first row -- not a crash and not even implausible numbers, since those slices
 // are the same table.
-struct GegluStridedParams {
+// All five stated, in the order `mlp::geglu_tanh_strided` passes them. `width`
+// and `rows` are the launch's own rectangle and the BODY also knows them --
+// that is not a duplication introduced here, it is what the struct already
+// held: the shader read the staged words while the grid came from the body,
+// and both still do.
+struct Params {
     width: u32,
     rows: u32,
     gate_pitch: u32,
     up_pitch: u32,
     out_pitch: u32,
 }
-@group(0) @binding(3) var<storage, read_write> params: GegluStridedParams;
+@group(1) @binding(0) var<uniform> params: Params;
 //#elif defined(PIE_GPTOSS)
-struct GptOssSwiGluParams {
-    // Was a per-row element count. See `GegluParams`.
-    unused: u32,
+// TWO WORDS, WHERE THE STRUCT HAD THREE.
+//
+// `GptOssSwiGluParams` opened with a per-row element count -- dead for the
+// reason the note above the strided arm gives at length, the same number
+// `GegluParams` held, and it outlived that struct only because `limit` and
+// `alpha` beside it are read. A struct has to carry a dead field to keep the
+// live ones at their offsets; a uniform packed from the marks the body PASSES
+// does not, so the dead word no longer reaches the GPU at all.
+//
+// It is still stated: `gptoss_swiglu` declares a slot-holder mark for it,
+// because `Const` slots are the statement's run counted in order and `limit`
+// sits at word 1. That holder goes when the DSL stops stating the word.
+struct Params {
     limit: f32,
     alpha: f32,
 }
-@group(0) @binding(3) var<storage, read_write> params: GptOssSwiGluParams;
+@group(1) @binding(0) var<uniform> params: Params;
 //#endif
 
 //#if defined(PIE_SILU_STRIDED)

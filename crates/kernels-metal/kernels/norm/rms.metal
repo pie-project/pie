@@ -13,13 +13,40 @@
 //     (attn_norm, q_norm, k_norm, ffn_norm, final_norm — all plus_one=true; see
 //     model/qwen36.cpp + ops/norm.cpp). MLX folds the +1 by materializing
 //     `mx::add(weight, 1.0f)` (float) before fast::rms_norm, so the effective gain
-//     is float (1.0f + weight); we apply it in float here when p.plus_one != 0.
+//     is float (1.0f + weight); we apply it in float here when plus_one != 0.
 //     The gated-RMSNorm (gated_rms.metal) does NOT use +1 (raw gate_norm weight).
+//
+// THE FIVE SCALARS ARE FIVE SCALARS, NOT A STRUCT.
+//
+// They took `constant RmsParams& p [[buffer(3)]]` -- MLX's layout out of
+// `norm/rms_params.h`, and the shape `kernels-vulkan` and `kernels-wgpu` then
+// copied. Every one of the five words is live, so nothing is deleted here:
+// `norm::rms_single_row` and its four siblings state them as `eps: Const<f32>`,
+// `axis: Const<i32>`, `w_stride: Const<u32>`, `plus_one: Const<u32>` and
+// `gain: Const<f32>` rather than forwarding `ctx.params()` whole, and bind five
+// `setBytes` where they bound a staged block. Words 0 through 4 of the
+// statement's run are the same five numbers they always were, reached by index
+// instead of by struct field. Three of them -- the stride, the gemma `+1` flag
+// and the gain -- were read HERE and named nowhere in Rust until now, which is
+// the whole of what this change buys.
+//
+// The buffer indices ASCEND IN THE STRUCT'S ORDER, because that order is the
+// statement's, and everything the struct used to sit in front of keeps the END
+// of its list: `row_pitch` was buffer 4 behind a block of five words and is
+// buffer 8 in front of five scalars, `r` moves 4 -> 8 and `s` 5 -> 9. That is
+// the same place in each case -- a conditional binding after the unconditional
+// ones -- and it is what keeps the five scalars at buffers 3..7 in ALL FIVE
+// entrypoints rather than at a different index in each.
+//
+// `axis_size`, `w_stride` and `plus_one` are `uint` here while their marks are
+// `Const<i32>`, `Const<u32>` and `Const<u32>`: the run is a `Vec<u32>` and the
+// BITS are the value, and the mark's Rust type is about what the BODY may do
+// with the number -- the axis is signed because `rms_threads` refuses a
+// non-positive extent, and the other two are never read in Rust at all.
 
 #include <metal_stdlib>
 using namespace metal;
 
-#include "rms_params.h"
 #include "rms_reduce.h"
 
 // One threadgroup owns one row, striding it in chunks of `tg_size * N_READS`.
@@ -37,11 +64,10 @@ using namespace metal;
 template <typename T, int N_READS>
 METAL_FUNC void rms_row_body(
     const device T* x, const device T* w, device T* out,
-    constant RmsParams& p, size_t row_base,
+    float eps, uint axis_size, uint w_stride, uint plus_one, float gain,
+    size_t row_base,
     threadgroup float* inv_rms, threadgroup float* partials,
     uint lid, uint simd_lane, uint simd_group, uint tg_size) {
-  const uint axis_size = p.axis_size;
-  const uint w_stride = p.w_stride;
   const uint span = tg_size * uint(N_READS);
 
   const device T* xr = x + row_base;
@@ -50,7 +76,7 @@ METAL_FUNC void rms_row_body(
     acc += rms_lane_square_sum_at<T, N_READS>(xr + start, axis_size, start);
   }
   const float inv = rms_inv_from_lane_sum(
-      acc, axis_size, p.eps, inv_rms, partials, simd_lane, simd_group);
+      acc, axis_size, eps, inv_rms, partials, simd_lane, simd_group);
 
   device T* outr = out + row_base;
   for (uint start = lid * uint(N_READS); start < axis_size; start += span) {
@@ -59,8 +85,8 @@ METAL_FUNC void rms_row_body(
     device T* os = outr + start;
     for (int i = 0; i < N_READS; i++) {
       if (start + uint(i) < axis_size) {
-        T wv = T(p.gain * (p.plus_one ? (1.0f + float(ws[w_stride * i]))
-                                      : float(ws[w_stride * i])));
+        T wv = T(gain * (plus_one ? (1.0f + float(ws[w_stride * i]))
+                                  : float(ws[w_stride * i])));
         os[i] = wv * static_cast<T>(xs[i] * inv);
       }
     }
@@ -72,7 +98,11 @@ template <typename T, int N_READS>
     const device T* x          [[buffer(0)]],
     const device T* w          [[buffer(1)]],
     device T* out              [[buffer(2)]],
-    constant RmsParams& p      [[buffer(3)]],
+    const constant float& eps  [[buffer(3)]],
+    const constant uint& axis_size [[buffer(4)]],
+    const constant uint& w_stride  [[buffer(5)]],
+    const constant uint& plus_one  [[buffer(6)]],
+    const constant float& gain     [[buffer(7)]],
     uint gid                   [[threadgroup_position_in_grid]],
     uint lid                   [[thread_position_in_threadgroup]],
     uint simd_lane             [[thread_index_in_simdgroup]],
@@ -80,7 +110,8 @@ template <typename T, int N_READS>
     uint tg_size               [[threads_per_threadgroup]]) {
   threadgroup float inv_rms[1], partials[32];
   rms_row_body<T, N_READS>(
-      x, w, out, p, size_t(gid) * p.axis_size,
+      x, w, out, eps, axis_size, w_stride, plus_one, gain,
+      size_t(gid) * axis_size,
       inv_rms, partials, lid, simd_lane, simd_group, tg_size);
 }
 
@@ -93,8 +124,12 @@ template <typename T, int N_READS>
     const device T* x          [[buffer(0)]],
     const device T* w          [[buffer(1)]],
     device T* out              [[buffer(2)]],
-    constant RmsParams& p      [[buffer(3)]],
-    constant int& row_pitch    [[buffer(4)]],
+    const constant float& eps  [[buffer(3)]],
+    const constant uint& axis_size [[buffer(4)]],
+    const constant uint& w_stride  [[buffer(5)]],
+    const constant uint& plus_one  [[buffer(6)]],
+    const constant float& gain     [[buffer(7)]],
+    const constant int& row_pitch  [[buffer(8)]],
     uint gid                   [[threadgroup_position_in_grid]],
     uint lid                   [[thread_position_in_threadgroup]],
     uint simd_lane             [[thread_index_in_simdgroup]],
@@ -102,7 +137,8 @@ template <typename T, int N_READS>
     uint tg_size               [[threads_per_threadgroup]]) {
   threadgroup float inv_rms[1], partials[32];
   rms_row_body<T, N_READS>(
-      x, w, out, p, size_t(gid) * size_t(row_pitch),
+      x, w, out, eps, axis_size, w_stride, plus_one, gain,
+      size_t(gid) * size_t(row_pitch),
       inv_rms, partials, lid, simd_lane, simd_group, tg_size);
 }
 
@@ -110,7 +146,9 @@ template <typename T, int N_READS>
   template [[host_name("rms_strided_row_" #name)]] [[kernel]] void      \
   rms_strided_row<itype, n_reads>(                                      \
       const device itype*, const device itype*, device itype*,          \
-      constant RmsParams&, constant int&, uint, uint, uint, uint, uint);
+      const constant float&, const constant uint&, const constant uint&, \
+      const constant uint&, const constant float&, const constant int&,  \
+      uint, uint, uint, uint, uint);
 
 instantiate_rms_strided_row(bfloat16, bfloat, 4)
 
@@ -121,15 +159,19 @@ instantiate_rms_strided_row(bfloat16, bfloat, 4)
 //
 // Rather than pass `n_rows`, the launch carries it: grid is (axis_threads,
 // n_rows, N) so the threadgroup's own position IS the (head, token) pair. That
-// keeps the argument table identical to `rms_strided_row`'s -- same buffer 4,
+// keeps the argument table identical to `rms_strided_row`'s -- same buffer 8,
 // same pitch value the other prefill kernels already bind.
 template <typename T, int N_READS>
 [[kernel]] void rms_strided_head_row(
     const device T* x          [[buffer(0)]],
     const device T* w          [[buffer(1)]],
     device T* out              [[buffer(2)]],
-    constant RmsParams& p      [[buffer(3)]],
-    constant int& row_pitch    [[buffer(4)]],
+    const constant float& eps  [[buffer(3)]],
+    const constant uint& axis_size [[buffer(4)]],
+    const constant uint& w_stride  [[buffer(5)]],
+    const constant uint& plus_one  [[buffer(6)]],
+    const constant float& gain     [[buffer(7)]],
+    const constant int& row_pitch  [[buffer(8)]],
     // All three position attributes are uint3: Metal rejects a signature that
     // mixes scalar and vector ones, and this kernel needs the threadgroup's
     // full 3-D position to carry the (head, token) pair.
@@ -140,8 +182,8 @@ template <typename T, int N_READS>
     uint3 tg_size              [[threads_per_threadgroup]]) {
   threadgroup float inv_rms[1], partials[32];
   rms_row_body<T, N_READS>(
-      x, w, out, p,
-      size_t(gid.z) * size_t(row_pitch) + size_t(gid.y) * p.axis_size,
+      x, w, out, eps, axis_size, w_stride, plus_one, gain,
+      size_t(gid.z) * size_t(row_pitch) + size_t(gid.y) * axis_size,
       inv_rms, partials, lid.x, simd_lane, simd_group, tg_size.x);
 }
 
@@ -149,7 +191,9 @@ template <typename T, int N_READS>
   template [[host_name("rms_strided_head_row_" #name)]] [[kernel]] void \
   rms_strided_head_row<itype, n_reads>(                                 \
       const device itype*, const device itype*, device itype*,          \
-      constant RmsParams&, constant int&, uint3, uint3, uint, uint, uint3);
+      const constant float&, const constant uint&, const constant uint&, \
+      const constant uint&, const constant float&, const constant int&,  \
+      uint3, uint3, uint, uint, uint3);
 
 instantiate_rms_strided_head_row(bfloat16, bfloat, 4)
 
@@ -157,7 +201,9 @@ instantiate_rms_strided_head_row(bfloat16, bfloat, 4)
   template [[host_name("rms_single_row_" #name)]] [[kernel]] void       \
   rms_single_row<itype, n_reads>(                                       \
       const device itype*, const device itype*, device itype*,          \
-      constant RmsParams&, uint, uint, uint, uint, uint);
+      const constant float&, const constant uint&, const constant uint&, \
+      const constant uint&, const constant float&,                       \
+      uint, uint, uint, uint, uint);
 
 instantiate_rms_single_row(bfloat16, bfloat, 4)
 
@@ -191,7 +237,7 @@ METAL_FUNC void rms_residual_impl(
     const device T* r,
     const device T* s,
     device T* out,
-    constant RmsParams& p,
+    float eps, uint axis_size, uint w_stride, uint plus_one, float gain,
     threadgroup float* local_inv_mean,
     threadgroup float* local_sums,
     uint gid,
@@ -199,8 +245,6 @@ METAL_FUNC void rms_residual_impl(
     uint simd_lane_id,
     uint simd_group_id,
     uint tg_size) {
-  const uint axis_size = p.axis_size;
-  const uint w_stride = p.w_stride;
   const uint span = tg_size * uint(N_READS);
 
   const size_t row = size_t(gid) * size_t(axis_size);
@@ -210,7 +254,7 @@ METAL_FUNC void rms_residual_impl(
     acc += rms_lane_square_sum_at<T, N_READS>(xr + start, axis_size, start);
   }
   const float inv = rms_inv_from_lane_sum(
-      acc, axis_size, p.eps, local_inv_mean, local_sums,
+      acc, axis_size, eps, local_inv_mean, local_sums,
       simd_lane_id, simd_group_id);
 
   const float scale = SCALED ? float(s[0]) : 1.0f;
@@ -219,8 +263,8 @@ METAL_FUNC void rms_residual_impl(
   for (uint start = lid * uint(N_READS); start < axis_size; start += span) {
     for (int i = 0; i < N_READS; i++) {
       if (start + uint(i) < axis_size) {
-        const float wv = p.gain * (p.plus_one ? (1.0f + float(w[w_stride * (start + uint(i))]))
-                                              : float(w[w_stride * (start + uint(i))]));
+        const float wv = gain * (plus_one ? (1.0f + float(w[w_stride * (start + uint(i))]))
+                                          : float(w[w_stride * (start + uint(i))]));
         const float normed = wv * (float(xr[start + uint(i)]) * inv);
         outr[start + uint(i)] = static_cast<T>((normed + float(rr[start + uint(i)])) * scale);
       }
@@ -233,8 +277,12 @@ template <typename T, int N_READS>
     const device T* x          [[buffer(0)]],
     const device T* w          [[buffer(1)]],
     device T* out              [[buffer(2)]],
-    constant RmsParams& p      [[buffer(3)]],
-    const device T* r          [[buffer(4)]],
+    const constant float& eps  [[buffer(3)]],
+    const constant uint& axis_size [[buffer(4)]],
+    const constant uint& w_stride  [[buffer(5)]],
+    const constant uint& plus_one  [[buffer(6)]],
+    const constant float& gain     [[buffer(7)]],
+    const device T* r          [[buffer(8)]],
     uint gid                   [[threadgroup_position_in_grid]],
     uint lid                   [[thread_position_in_threadgroup]],
     uint simd_lane_id          [[thread_index_in_simdgroup]],
@@ -242,7 +290,9 @@ template <typename T, int N_READS>
     uint tg_size               [[threads_per_threadgroup]]) {
   threadgroup float local_inv_mean[1];
   threadgroup float local_sums[32];
-  rms_residual_impl<T, N_READS, false>(x, w, r, nullptr, out, p, local_inv_mean, local_sums,
+  rms_residual_impl<T, N_READS, false>(x, w, r, nullptr, out,
+                                       eps, axis_size, w_stride, plus_one, gain,
+                                       local_inv_mean, local_sums,
                                        gid, lid, simd_lane_id, simd_group_id, tg_size);
 }
 
@@ -251,9 +301,13 @@ template <typename T, int N_READS>
     const device T* x          [[buffer(0)]],
     const device T* w          [[buffer(1)]],
     device T* out              [[buffer(2)]],
-    constant RmsParams& p      [[buffer(3)]],
-    const device T* r          [[buffer(4)]],
-    const device T* s          [[buffer(5)]],
+    const constant float& eps  [[buffer(3)]],
+    const constant uint& axis_size [[buffer(4)]],
+    const constant uint& w_stride  [[buffer(5)]],
+    const constant uint& plus_one  [[buffer(6)]],
+    const constant float& gain     [[buffer(7)]],
+    const device T* r          [[buffer(8)]],
+    const device T* s          [[buffer(9)]],
     uint gid                   [[threadgroup_position_in_grid]],
     uint lid                   [[thread_position_in_threadgroup]],
     uint simd_lane_id          [[thread_index_in_simdgroup]],
@@ -261,7 +315,9 @@ template <typename T, int N_READS>
     uint tg_size               [[threads_per_threadgroup]]) {
   threadgroup float local_inv_mean[1];
   threadgroup float local_sums[32];
-  rms_residual_impl<T, N_READS, true>(x, w, r, s, out, p, local_inv_mean, local_sums,
+  rms_residual_impl<T, N_READS, true>(x, w, r, s, out,
+                                      eps, axis_size, w_stride, plus_one, gain,
+                                      local_inv_mean, local_sums,
                                       gid, lid, simd_lane_id, simd_group_id, tg_size);
 }
 
@@ -269,12 +325,14 @@ template <typename T, int N_READS>
   template [[host_name("rms_residual_" #name)]]                          \
   [[kernel]] void rms_residual<itype, nreads>(                           \
       const device itype*, const device itype*, device itype*,           \
-      constant RmsParams&, const device itype*,                          \
+      const constant float&, const constant uint&, const constant uint&,  \
+      const constant uint&, const constant float&, const device itype*,   \
       uint, uint, uint, uint, uint);                                           \
   template [[host_name("rms_residual_scaled_" #name)]]                   \
   [[kernel]] void rms_residual_scaled<itype, nreads>(                    \
       const device itype*, const device itype*, device itype*,           \
-      constant RmsParams&, const device itype*, const device itype*,     \
-      uint, uint, uint, uint, uint);
+      const constant float&, const constant uint&, const constant uint&,  \
+      const constant uint&, const constant float&, const device itype*,   \
+      const device itype*, uint, uint, uint, uint, uint);
 
 instantiate_rms_residual(bfloat16, bfloat, 4)

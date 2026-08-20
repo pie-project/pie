@@ -217,7 +217,22 @@ fn named(key: &'static str, o: &mut Handles<'_, '_>, f: Facts) -> Result<Answer,
         // which is the honest answer where a cast is a silent truncation.
         Whence::Pooled(which) => Answer::Wide(u64::from(o.number(which)?)),
         Whence::Geometry(n) => Answer::Number(n),
-        Whence::Partials => Answer::Handle(o.table(FireTable::AttnPartials)?),
+        // NOT A REFUSAL WHEN IT IS ABSENT, which is what `table_or_unbound`
+        // was written for and what this arm was not using. The split decode's
+        // scratch is the one table whose absence a BODY is prepared for:
+        // `sdpa_paged_decode` asks for it before it knows how many ways the
+        // range splits, and drops the handle on the single-pass arm. And a
+        // pool that holds no partials buffer answers ONE split -- see
+        // `Handles::decode_splits`, which reads the same table to decide -- so
+        // the two agree that the handle will not be used.
+        //
+        // Refusing here made that agreement unreachable: a fire whose pool had
+        // never called `Pool::partials` could not run a paged decode at all,
+        // however short its history, because the ask failed before the body
+        // reached the arm that does not need it. `UNBOUND` is the honest
+        // answer, and a body that DID reach the fold with it would be refused
+        // by `encode` for binding a handle nothing minted.
+        Whence::Partials => Answer::Handle(o.table_or_unbound(FireTable::AttnPartials)),
         // NOT A LOOKUP, and that is why it lives here rather than in a
         // signature. How many ways to fold a decode's key range is a
         // judgement about THIS fire -- its history depth against its head
@@ -359,10 +374,22 @@ mod tests {
     /// The slot half -- input 2, output 0, the weights -- needs no gate here:
     /// the shared binder reads those the same way on three backends and
     /// `kernels`' own tests cover it.
+    ///
+    /// WHERE THE FACTS WENT. Before the marks, a signature named a fact by
+    /// TYPE -- `Held<keys::KvPageSize>` -- and `#[routine]` wrote the name
+    /// into `sources`, so the column below was the whole census. It is not
+    /// any more: a fact is asked for in the BODY now, `ctx.ask::<i32,
+    /// keys::KvPageSize>()`, and a body is code rather than a table. What is
+    /// left in the column is the handful of sources a MARK still derives --
+    /// the two positional weights `Const<Tensor<E>>` spells and the recurrent
+    /// slot table -- and this gate holds those. The body half is measured on
+    /// a device by `tests/arena.rs`, which runs every routine's body against
+    /// a real fire and names each refusal.
     #[test]
     fn every_fact_this_backend_s_kernels_name_is_one_it_answers() {
         let f = facts_for_test();
-        let mut unanswered: Vec<String> = Vec::new();
+        let mut unanswered: Vec<&'static str> = Vec::new();
+        let mut named: Vec<&'static str> = Vec::new();
         let mut asked = 0usize;
         let mut whole = 0usize;
         let mut routines = 0usize;
@@ -370,12 +397,17 @@ mod tests {
         for routine in kernels_vulkan::routines() {
             routines += 1;
             let mut bad = 0usize;
-            for (at, source) in routine.sources.iter().enumerate() {
+            for source in routine.sources {
                 for key in keys_of(source.as_ref()) {
                     asked += 1;
+                    if !named.contains(&key) {
+                        named.push(key);
+                    }
                     if whence(key, f).is_none() {
                         bad += 1;
-                        unanswered.push(format!("  {}[{at}]: {key}", routine.name));
+                        if !unanswered.contains(&key) {
+                            unanswered.push(key);
+                        }
                     }
                 }
             }
@@ -384,44 +416,49 @@ mod tests {
             }
         }
 
-        println!("routines whose facts are all answered: {whole} of {routines}");
-        println!("facts named but not answered: {}", unanswered.len());
-        for line in &unanswered {
-            println!("{line}");
-        }
-        // The denominator. A column read as empty satisfies every line above,
+        println!("routines whose column facts are all answered: {whole} of {routines}");
+        println!("distinct keys named by the column: {named:?}");
+        assert_eq!(
+            named,
+            ["weight", "weight2"],
+            "the column names a key it did not before -- a mark grew a source"
+        );
+        println!("of those, unanswered: {unanswered:?}");
+        // The denominator. A column read as empty satisfies every line below,
         // and a `sources` accessor that changed shape is exactly how that
-        // happens.
+        // happens. Ninety-odd, not the three-hundred-odd of the era when a
+        // signature named its facts -- see the note above.
         assert!(
-            asked > 200,
-            "{asked} facts read off this backend's column -- the sweep found \
+            asked > 50,
+            "{asked} sources read off this backend's column -- the sweep found \
              almost nothing, so the emptiness below is the reader's and not \
              the column's"
         );
-        // WHICH routines this backend cannot bind, named rather than
-        // counted. Every one of them wants the recurrent SLOT table, and
-        // this driver does not serve recurrent state at all: `frames.rs`
-        // refuses a plan carrying `rs_slot_ids`, and
-        // `engine/src/driver/backend/vulkan.rs` says so twice in prose. The
-        // refusal `whence` produces is therefore the right answer and not a
-        // hole -- the wrong answer would be a handle to something else.
+        // WHICH KEYS this backend cannot answer from the column, named rather
+        // than counted, and by KEY rather than by routine: two names account
+        // for all ninety-odd of them, and listing the routine-and-slot pairs
+        // would make this a diff of the kernel crate.
         //
-        // Named, because "five" would go on being true if a sixth routine
-        // arrived and one of these was ported.
+        // `weight` and `weight2` are rule E6's NAMED weights, which
+        // `Const<Tensor<E>>` derives as `Or(Named("weight"), Slot(Weight,
+        // 0))`. They are resolved from the statement's `LaunchSpec::weight`
+        // before a `Cx` exists -- `bind/mod.rs`'s `resolve_arg_windowed` --
+        // so `whence`, which answers a fact out of the FIRE, is the wrong
+        // half to ask, and its `None` is the right answer rather than a hole.
+        // The wrong answer would be a handle to something else.
+        //
+        // `recurrent_slots` used to be here, on the five `gdn_*` routines,
+        // because this driver does not serve recurrent state at all --
+        // `frames.rs` refuses a plan carrying `rs_slot_ids`. It left the
+        // column with the marks, not the crate: those bodies ask for it now,
+        // and `named` still refuses it by the same arm.
         assert_eq!(
             unanswered,
-            vec![
-                "  gdn_core_recurrent_prefill[6]: recurrent_slots",
-                "  gdn_core_recurrent_slotted[11]: recurrent_slots",
-                "  gdn_core_slotted[12]: recurrent_slots",
-                "  gdn_prep_prefill[13]: recurrent_slots",
-                "  gdn_prep_slotted[13]: recurrent_slots",
-            ],
-            "a different set of this backend's kernels names a fact it does \
-             not answer. If one LEFT, this driver learned to stage the \
-             recurrent slot table and the list comes down with it; if one \
-             ARRIVED, a signature started naming a fact `whence` has never \
-             heard of.",
+            ["weight", "weight2"],
+            "a different set of keys is named by this backend's column but \
+             not answered by `whence`. If one LEFT, a weight stopped being \
+             named; if one ARRIVED, a mark started deriving a source \
+             `whence` has never heard of.",
         );
     }
 

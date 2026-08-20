@@ -2484,7 +2484,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 0
-          }
+          },
+          "params": [
+            16,
+            4
+          ]
         }
       },
       "inputs": [
@@ -2505,7 +2509,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 0
-          }
+          },
+          "params": [
+            16,
+            4
+          ]
         }
       },
       "inputs": [
@@ -2526,7 +2534,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 0
-          }
+          },
+          "params": [
+            16,
+            4
+          ]
         }
       },
       "inputs": [
@@ -2890,7 +2902,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 1
-          }
+          },
+          "params": [
+            16,
+            4
+          ]
         }
       },
       "inputs": [
@@ -2911,7 +2927,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 1
-          }
+          },
+          "params": [
+            16,
+            4
+          ]
         }
       },
       "inputs": [
@@ -2932,7 +2952,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 1
-          }
+          },
+          "params": [
+            16,
+            4
+          ]
         }
       },
       "inputs": [
@@ -3421,7 +3445,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 2
-          }
+          },
+          "params": [
+            16,
+            4
+          ]
         }
       },
       "inputs": [
@@ -3442,7 +3470,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 2
-          }
+          },
+          "params": [
+            16,
+            4
+          ]
         }
       },
       "inputs": [
@@ -3463,7 +3495,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 2
-          }
+          },
+          "params": [
+            16,
+            4
+          ]
         }
       },
       "inputs": [
@@ -4402,7 +4438,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 4
-          }
+          },
+          "params": [
+            16,
+            4
+          ]
         }
       },
       "inputs": [
@@ -4423,7 +4463,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 4
-          }
+          },
+          "params": [
+            16,
+            4
+          ]
         }
       },
       "inputs": [
@@ -4444,7 +4488,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 4
-          }
+          },
+          "params": [
+            16,
+            4
+          ]
         }
       },
       "inputs": [
@@ -4933,7 +4981,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 5
-          }
+          },
+          "params": [
+            16,
+            4
+          ]
         }
       },
       "inputs": [
@@ -4954,7 +5006,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 5
-          }
+          },
+          "params": [
+            16,
+            4
+          ]
         }
       },
       "inputs": [
@@ -4975,7 +5031,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 5
-          }
+          },
+          "params": [
+            16,
+            4
+          ]
         }
       },
       "inputs": [
@@ -5464,7 +5524,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 6
-          }
+          },
+          "params": [
+            16,
+            4
+          ]
         }
       },
       "inputs": [
@@ -5485,7 +5549,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 6
-          }
+          },
+          "params": [
+            16,
+            4
+          ]
         }
       },
       "inputs": [
@@ -5506,7 +5574,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 6
-          }
+          },
+          "params": [
+            16,
+            4
+          ]
         }
       },
       "inputs": [

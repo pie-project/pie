@@ -6,21 +6,7 @@
 
 use kernels_macros::routine;
 use crate::routine::{Asks, Bind, Const, Ctx, Fire, InOut, Tensor, bf16, keys};
-use kernels::KernelSig;
 use kernels::routine::Refusal;
-
-
-/// The entrypoints this family's crossed routines spell, now that their
-/// rows are gone. See [`crate::RETIRED`].
-pub static ENTRYPOINTS: &[&str] = &[
-    "neox_decode_bfloat16",
-    "neox_freqs_decode_bfloat16",
-    "neox_freqs_mb_bfloat16",
-    "neox_mb_bfloat16",
-    "neox_prop_decode_bfloat16",
-    "neox_prop_mb_bfloat16",
-    "neox_strided_bfloat16",
-];
 
 /// The grid every rotation in this file launches: `[rotary/2, heads, rows]`.
 ///
@@ -332,7 +318,6 @@ pub fn neox_strided(
         ],
     )
 }
-
 
 #[cfg(test)]
 mod tests {

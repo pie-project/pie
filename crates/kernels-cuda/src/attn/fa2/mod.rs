@@ -107,9 +107,65 @@ use crate::attn::plan::info::{DecodePlanInfo, PrefillPlanInfo};
 use crate::jit::{ArgValue, Ctx, Cuda, Launch, Root};
 use crate::jit::abi::{bf16, unpack_aggregate};
 use crate::jit::abi::Tensor;
+use kernels::raises::Struct;
+use crate::raises::{Fa2Decode, Fa2Prefill};
 use kernels::routine::{Arg, Asks, Const, In, Out};
 use kernels::{Refusal, Ty};
 use crate::routine::Fire;
+
+// ── What a launcher does before it fires ────────────────────────────────────
+//
+// Two of the four things that kept `arms/fa2.rs` alive, moved to where the
+// launch is. Neither could ever have been a `Source`, and the reason is the
+// same for both: a column binds an ARGUMENT LIST, and these are WORK. The arm
+// was not carrying knowledge the signature lacked — it was carrying two
+// operations that had nowhere else to happen.
+//
+// They belong to the launcher rather than to a statement of their own because
+// of graph capture. `fire::launch::raise_attn_plans` runs OUTSIDE the captured
+// region; only what `run_captured` issues becomes a node. A prelude hoisted to
+// planning would be skipped by every replay, leaving the device reading the
+// schedule of whichever fire was captured.
+
+/// Widen this layer's quantised KV pages into their bf16 mirrors.
+///
+/// `arms/fa2.rs`'s `dequant_prelude`, and the discarded result is its too: a
+/// layer whose dtype `KvDType` does not name has nothing to widen, and the
+/// attention below still runs over pages that were never quantised. The
+/// condition is a BOOT fact, which is why it is a decline inside the callee
+/// rather than a branch here — nothing at this level knows the cache's dtype.
+fn dequant_prelude(ctx: &Ctx<'_>) {
+    let _ = crate::attn::kv_paged::dequant_kv_cache_layer_to_bf16_active(ctx);
+}
+
+/// Put the plan descriptor on the device, where this launch will read it.
+///
+/// `arms/fa2.rs`'s `upload`. The three numbers arrive as asked facts, resolved
+/// by the driver off the same plan cache and the same workspace carve the
+/// sixteen decode leaves come from — so a prefill descriptor cannot land in
+/// the decode carve, which is what a single shared key pair would have risked.
+///
+/// `int_base_bytes` is passed as ZERO because `dst` already carries it: the
+/// driver adds the plan's base once, where it reads the carve, rather than at
+/// every reader of it.
+///
+/// # Errors
+///
+/// [`Refusal::Device`] if the copy faulted.
+fn upload_plan(ctx: &Ctx<'_>, src: *const u8, len: usize, dst: *mut u8) -> Result<(), Refusal> {
+    if len == 0 || src.is_null() || dst.is_null() {
+        return Ok(());
+    }
+    // SAFETY: `src` is the plan cache's `PinnedBytes`, which the cache owns and
+    // outlives this fire and every replay of it; `len` is that buffer's own
+    // length, both read off one `as_slice()` in the driver. The slice is read
+    // and never held past the call.
+    let bytes = unsafe { core::slice::from_raw_parts(src, len) };
+    // SAFETY: `dst` addresses the fire's integer workspace at the plan's base,
+    // which the planner carved to hold at least these bytes, and `ctx`'s
+    // stream is live across the copy by `Ctx::on`'s contract.
+    unsafe { plan::upload_int_plan(bytes, dst as u64, 0, ctx.stream()) }
+}
 
 /// `kernels.def`'s `PIE_ATTN_HEAD_DIM` list, in its order.
 ///
@@ -117,7 +173,6 @@ use crate::routine::Fire;
 /// rather than by construction — two facts that happen to match, and whoever
 /// changes one says which.
 pub const HEAD_DIMS: &[u32] = &[64, 128, 256, 512];
-
 /// `kernels.def`'s `PIE_ATTN_DECODE_GQA` list, in its order.
 ///
 /// `utils.cuh:164-183`'s `DISPATCH_GQA_GROUP_SIZE` has an `else`; 5, 6 and 7
@@ -1334,70 +1389,6 @@ const CAPTURE_VARIANT: Refusal =
 /// observe to nothing.
 const CAPTURE_SINK: Refusal = Refusal::Absent { what: "the score sink" };
 
-/// One decode plan's named leaves, back into the aggregate `params.rs`
-/// consumes.
-///
-/// # The offsets are ADDRESSES here, against a zero base
-///
-/// `offset_ptr(base, off)` is `base.saturating_add(off)` for a non-negative
-/// `off` and `base` for a negative one (`params.rs:561`). A zero base makes
-/// the first case the identity, so `make_decode_params` writes back exactly
-/// the address `bind/table.rs`'s `fa2_decode_leaves` resolved -- which
-/// reproduces `offset_ptr` on the other side, so the two agree by
-/// construction rather than by review. A null leaf carries `-1`.
-///
-/// The alternative was forty lines of `DecodeParams` filling copied into this
-/// file. `params.rs` stays the one place that knows how a block is laid out.
-///
-/// `enable_cuda_graph` is not a leaf: the block mask is carved only under
-/// `split_kv && enable_cuda_graph`, so a non-null mask says both.
-#[allow(clippy::too_many_arguments)]
-fn decode_plan_of_leaves(
-    request_indices: *const i32,
-    kv_tile_indices: *const i32,
-    o_indptr: *const i32,
-    kv_chunk_size: *const i32,
-    block_valid_mask: *const u8,
-    tmp_v: *mut f32,
-    tmp_s: *mut f32,
-    padded_batch: i32,
-    split_kv: bool,
-    requests: i32,
-    num_q_heads: i32,
-    num_kv_heads: i32,
-    head_dim: i32,
-    page_size: i32,
-    hnd_layout: bool,
-    full_attention: bool,
-) -> DecodePlan {
-    fn at<T>(p: *const T) -> i64 {
-        if p.is_null() { -1 } else { p as usize as i64 }
-    }
-    DecodePlan {
-        info: DecodePlanInfo {
-            padded_batch_size: i64::from(padded_batch),
-            v_offset: at(tmp_v.cast_const()),
-            s_offset: at(tmp_s.cast_const()),
-            request_indices_offset: at(request_indices),
-            kv_tile_indices_offset: at(kv_tile_indices),
-            o_indptr_offset: at(o_indptr),
-            block_valid_mask_offset: at(block_valid_mask),
-            kv_chunk_size_ptr_offset: at(kv_chunk_size),
-            enable_cuda_graph: !block_valid_mask.is_null(),
-            split_kv,
-        },
-        device: crate::attn::fa2::plan::fa_device(),
-        num_requests: requests,
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        page_size,
-        int_base_bytes: 0,
-        hnd_layout,
-        full_attention_variant: full_attention,
-        valid: true,
-    }
-}
 
 /// `attn::dispatch_attention_flashinfer_decode`.
 ///
@@ -1417,7 +1408,7 @@ fn decode_plan_of_leaves(
 /// [`Refusal::Unstated`] for an unplanned cache or a lattice point that does
 /// not exist, and [`Refusal::Device`] if the compile, the load or the launch
 /// refused.
-#[routine(depth_prefix_plan)]
+#[routine(depth_prefix_plan, no_join)]
 pub fn dispatch_attention_flashinfer_decode(
     ctx: &Ctx<'_>,
     // `In(0)` STATED, and the same token on all six of this family's
@@ -1438,6 +1429,10 @@ pub fn dispatch_attention_flashinfer_decode(
     // `In<0, *const _>` is no longer the only one. (`OutSlot` and `Or` carried this
     // between rounds; both are deleted.)
     q: In<Tensor<bf16>>,
+    // THE PLAN, AS AN OPERAND. See
+    // [`dispatch_attention_flashinfer_prefill_bf16`]. `In(1)` keeps `q` at
+    // slot 0; what the position buys is that the derived column counts it.
+    plan: In<Struct<Fa2Decode>>,
     // `Out(0)` STATED. The slot is not a guess: `arms/fa2.rs`'s `o_or` is
     // documented `Source::Or(&Out(0), &Attn("o_out"))` and its body reads
     // `cx.arg_out(0)` before falling back, in all six arms; and
@@ -1475,47 +1470,44 @@ pub fn dispatch_attention_flashinfer_decode(
     let logits_soft_cap = ctx.ask::<f32, keys::AttnLogitsSoftCap>()?;
     let sm_scale = ctx.ask::<f32, keys::SmScale>()?;
 
+    // THE TWO PRELUDES, IN THE ARM'S ORDER. `arms/fa2.rs` widened the cache
+    // and then uploaded the descriptor, both before the launch and both on
+    // this stream. The order is not incidental: the widening reads the pages
+    // this plan's work lists address.
+    dequant_prelude(ctx);
+
     let k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
     let kv_last_page_lens = ctx.ask::<*const u32, keys::KvLastPageLens>()?;
     let lse = ctx.ask::<*mut f32, keys::AttnLseOut>()?;
-    let request_indices = ctx.ask::<*const i32, keys::Fa2DecodeRequestIndices>()?;
-    let kv_tile_indices = ctx.ask::<*const i32, keys::Fa2DecodeKvTileIndices>()?;
-    let o_indptr = ctx.ask::<*const i32, keys::Fa2DecodeOIndptr>()?;
-    let kv_chunk_size = ctx.ask::<*const i32, keys::Fa2DecodeKvChunkSize>()?;
-    let block_valid_mask = ctx.ask::<*const u8, keys::Fa2DecodeBlockValidMask>()?;
-    let tmp_v = ctx.ask::<*mut f32, keys::Fa2DecodeTmpV>()?;
-    let tmp_s = ctx.ask::<*mut f32, keys::Fa2DecodeTmpS>()?;
-    let padded_batch = ctx.ask::<i32, keys::Fa2DecodePaddedBatch>()?;
-    let split_kv = ctx.ask::<bool, keys::Fa2DecodeSplitKv>()?;
-    let requests = ctx.ask::<i32, keys::Fa2DecodeRequests>()?;
-    let num_q_heads = ctx.ask::<i32, keys::Fa2DecodeNumQHeads>()?;
-    let num_kv_heads = ctx.ask::<i32, keys::Fa2DecodeNumKvHeads>()?;
-    let head_dim = ctx.ask::<i32, keys::Fa2DecodeHeadDim>()?;
-    let page_size = ctx.ask::<i32, keys::Fa2DecodePageSize>()?;
-    let hnd_layout = ctx.ask::<bool, keys::Fa2DecodeHndLayout>()?;
-    let full_attention = ctx.ask::<bool, keys::Fa2DecodeFullAttention>()?;
     let broadcast_q = false;
     let v_pages = ctx.ask::<*mut u8, keys::KvValues>()?;
     let kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
     let kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
-    let plan = decode_plan_of_leaves(
-        request_indices,
-        kv_tile_indices,
-        o_indptr,
-        kv_chunk_size,
-        block_valid_mask,
-        tmp_v,
-        tmp_s,
-        padded_batch,
-        split_kv,
-        requests,
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        page_size,
-        hnd_layout,
-        full_attention,
-    );
+    // THE PLAN, WHOLE, AND THE STATEMENT SAID WHICH. Two decode schedules may
+    // stand at once -- gemma-4 states 256 and 512 -- and which one this fire
+    // executes used to be recovered by `bind::attn_plan` from the window on the
+    // `LaunchSpec`. The prep names it now.
+    if plan.ptr.is_null() {
+        return Err(Refusal::Null { what: "the decode plan this statement names" });
+    }
+    // SAFETY: `Fa2Decode` resolves only to a plan `raise_attn_plans` raised --
+    // `DecodePlan::as_ptr`'s own boxed cache, non-null above and live for the
+    // fire. The borrow ends inside this launch.
+    let cache = unsafe { &*plan.ptr };
+    let planned = dispatch::decode_plan_of(cache, crate::attn::fa2::plan::fa_device());
+    // THE DESCRIPTOR, OFF THE PLAN THIS STATEMENT NAMES. Three asks stood
+    // here -- `Fa2DecodeUploadSrc`/`Len`/`Dst` -- and each resolved through
+    // `bind::attn_plan`, which for decode GUESSED which schedule from the
+    // window on the `LaunchSpec`. The staging buffer is the cache's own and
+    // the carve offset is the cache's own, so a body holding the cache needs
+    // neither the asks nor the guess.
+    let int_base = ctx.ask::<*mut c_void, keys::AttnWorkspaceInt>()?;
+    upload_plan(
+        ctx,
+        cache.int_upload.as_slice().as_ptr(),
+        cache.int_upload.as_slice().len(),
+        (int_base as usize).saturating_add(cache.int_base_bytes) as *mut u8,
+    )?;
     let bufs = buffers(
         q.ptr,
         k_pages.cast::<bf16>(),
@@ -1532,11 +1524,11 @@ pub fn dispatch_attention_flashinfer_decode(
         core::ptr::null_mut(),
         core::ptr::null_mut(),
     );
-    let arm = decode_arm(plan.full_attention_variant, window_left, logits_soft_cap);
+    let arm = decode_arm(planned.full_attention_variant, window_left, logits_soft_cap);
     let (params, split) =
-        make_decode_params(&plan, &bufs, window_left, logits_soft_cap, sm_scale, broadcast_q);
-    decode(ctx, decode_at(&plan, arm, params.padded_batch_size), &params)?;
-    if plan.info.split_kv { fold(ctx, &split) } else { Ok(()) }
+        make_decode_params(&planned, &bufs, window_left, logits_soft_cap, sm_scale, broadcast_q);
+    decode(ctx, decode_at(&planned, arm, params.padded_batch_size), &params)?;
+    if planned.info.split_kv { fold(ctx, &split) } else { Ok(()) }
 }
 
 /// `attn::dispatch_attention_flashinfer_decode_lse` — the SAME kernel as
@@ -1573,10 +1565,14 @@ pub fn dispatch_attention_flashinfer_decode(
 ///
 /// [`dispatch_attention_flashinfer_decode`]'s, unchanged — this adds no
 /// refusal of its own, because a missing result is not reachable here.
-#[routine(depth_prefix_plan)]
+#[routine(depth_prefix_plan, no_join)]
 pub fn dispatch_attention_flashinfer_decode_lse(
     ctx: &Ctx<'_>,
     q: In<Tensor<bf16>>,
+    // THE PLAN, AS AN OPERAND. See
+    // [`dispatch_attention_flashinfer_prefill_bf16`]. `In(1)` keeps `q` at
+    // slot 0; what the position buys is that the derived column counts it.
+    plan: In<Struct<Fa2Decode>>,
     // REQUIRED, where the twin's is `Out<0, *mut bf16>`, and the difference is
     // the whole of the split. `Or`'s `Provenance::Either` is what
     // `accepts_an_unstated_result` (`model-ir/src/kernels.rs:227`) reads to
@@ -1602,34 +1598,18 @@ pub fn dispatch_attention_flashinfer_decode_lse(
     let logits_soft_cap = ctx.ask::<f32, keys::AttnLogitsSoftCap>()?;
     let sm_scale = ctx.ask::<f32, keys::SmScale>()?;
 
-    let _request_indices = ctx.ask::<*const i32, keys::Fa2DecodeRequestIndices>()?;
     let _k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
     let _v_pages = ctx.ask::<*mut u8, keys::KvValues>()?;
     let _kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
     let _kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
     let _kv_last_page_lens = ctx.ask::<*const u32, keys::KvLastPageLens>()?;
-    let _kv_tile_indices = ctx.ask::<*const i32, keys::Fa2DecodeKvTileIndices>()?;
-    let _o_indptr = ctx.ask::<*const i32, keys::Fa2DecodeOIndptr>()?;
-    let _kv_chunk_size = ctx.ask::<*const i32, keys::Fa2DecodeKvChunkSize>()?;
-    let _block_valid_mask = ctx.ask::<*const u8, keys::Fa2DecodeBlockValidMask>()?;
-    let _tmp_v = ctx.ask::<*mut f32, keys::Fa2DecodeTmpV>()?;
-    let _tmp_s = ctx.ask::<*mut f32, keys::Fa2DecodeTmpS>()?;
-    let _padded_batch = ctx.ask::<i32, keys::Fa2DecodePaddedBatch>()?;
-    let _split_kv = ctx.ask::<bool, keys::Fa2DecodeSplitKv>()?;
-    let _requests = ctx.ask::<i32, keys::Fa2DecodeRequests>()?;
-    let _num_q_heads = ctx.ask::<i32, keys::Fa2DecodeNumQHeads>()?;
-    let _num_kv_heads = ctx.ask::<i32, keys::Fa2DecodeNumKvHeads>()?;
-    let _head_dim = ctx.ask::<i32, keys::Fa2DecodeHeadDim>()?;
-    let _page_size = ctx.ask::<i32, keys::Fa2DecodePageSize>()?;
-    let _hnd_layout = ctx.ask::<bool, keys::Fa2DecodeHndLayout>()?;
-    let _full_attention = ctx.ask::<bool, keys::Fa2DecodeFullAttention>()?;
     let _broadcast_q = false;
     // EVERY PLAN LEAF IS ASKED FOR INSIDE THE CALLEE NOW, so this forwards the
     // two operands and the three the statement carries. The twenty-four that
     // used to be threaded through here are §6.2's FA2 plan leaves -- what the
     // planner built from this batch's history depth -- and a caller repeating
     // them was a caller able to disagree with the plan object being executed.
-    dispatch_attention_flashinfer_decode(ctx, q, o)
+    dispatch_attention_flashinfer_decode(ctx, q, plan, o)
 }
 
 /// `attn::dispatch_attention_flashinfer_decode_capture`.
@@ -1656,62 +1636,64 @@ pub fn dispatch_attention_flashinfer_decode_lse(
 /// As [`dispatch_attention_flashinfer_decode`], plus [`Refusal::Absent`] for a
 /// null sink and [`Refusal::Unstated`] for a soft cap or a window, neither of
 /// which composes with capture.
-#[routine(untraced)]
+#[routine(no_join)]
 pub fn dispatch_attention_flashinfer_decode_capture(
     ctx: &Ctx<'_>,
     q: In<Tensor<bf16>>,
+    // THE PLAN, AS AN OPERAND. See
+    // [`dispatch_attention_flashinfer_prefill_bf16`]. `In(1)` keeps `q` at
+    // slot 0; what the position buys is that the derived column counts it.
+    plan: In<Struct<Fa2Decode>>,
     o: Out<Tensor<bf16>>,
-    score_out: *mut f32,
-    score_indptr: *const i32,
     window_left: Const<i32>,
     logits_soft_cap: Const<f32>,
     sm_scale: Const<f32>) -> Result<(), Refusal> {
+    // ASKED, NOT BARE POINTERS. These two were the last thing keeping this row
+    // `untraced`: a `*mut f32` is not a mark, so the row carried no source
+    // column and nothing could bind it but a hand-written arm. They are facts
+    // the fire publishes, and `AttnScoreOut`/`AttnScoreIndptr` say so.
+    let score_out = ctx.ask::<*mut f32, keys::AttnScoreOut>()?;
+    let score_indptr = ctx.ask::<*const i32, keys::AttnScoreIndptr>()?;
+    // THE TWO PRELUDES, IN THE ARM'S ORDER: widen the cache, then land the
+    // descriptor, both on this stream before the launch reads either.
+    dequant_prelude(ctx);
     let lse = ctx.ask::<*mut f32, keys::AttnLseOut>()?;
-    let request_indices = ctx.ask::<*const i32, keys::Fa2DecodeRequestIndices>()?;
     let k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
     let v_pages = ctx.ask::<*mut u8, keys::KvValues>()?;
     let kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
     let kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
     let kv_last_page_lens = ctx.ask::<*const u32, keys::KvLastPageLens>()?;
-    let kv_tile_indices = ctx.ask::<*const i32, keys::Fa2DecodeKvTileIndices>()?;
-    let o_indptr = ctx.ask::<*const i32, keys::Fa2DecodeOIndptr>()?;
-    let kv_chunk_size = ctx.ask::<*const i32, keys::Fa2DecodeKvChunkSize>()?;
-    let block_valid_mask = ctx.ask::<*const u8, keys::Fa2DecodeBlockValidMask>()?;
-    let tmp_v = ctx.ask::<*mut f32, keys::Fa2DecodeTmpV>()?;
-    let tmp_s = ctx.ask::<*mut f32, keys::Fa2DecodeTmpS>()?;
-    let padded_batch = ctx.ask::<i32, keys::Fa2DecodePaddedBatch>()?;
-    let split_kv = ctx.ask::<bool, keys::Fa2DecodeSplitKv>()?;
-    let requests = ctx.ask::<i32, keys::Fa2DecodeRequests>()?;
-    let num_q_heads = ctx.ask::<i32, keys::Fa2DecodeNumQHeads>()?;
-    let num_kv_heads = ctx.ask::<i32, keys::Fa2DecodeNumKvHeads>()?;
-    let head_dim = ctx.ask::<i32, keys::Fa2DecodeHeadDim>()?;
-    let page_size = ctx.ask::<i32, keys::Fa2DecodePageSize>()?;
-    let hnd_layout = ctx.ask::<bool, keys::Fa2DecodeHndLayout>()?;
-    let full_attention = ctx.ask::<bool, keys::Fa2DecodeFullAttention>()?;
     let broadcast_q = false;
-    let plan = decode_plan_of_leaves(
-        request_indices,
-        kv_tile_indices,
-        o_indptr,
-        kv_chunk_size,
-        block_valid_mask,
-        tmp_v,
-        tmp_s,
-        padded_batch,
-        split_kv,
-        requests,
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        page_size,
-        hnd_layout,
-        full_attention,
-    );
+    // THE PLAN, WHOLE, AND THE STATEMENT SAID WHICH. Two decode schedules may
+    // stand at once -- gemma-4 states 256 and 512 -- and which one this fire
+    // executes used to be recovered by `bind::attn_plan` from the window on the
+    // `LaunchSpec`. The prep names it now.
+    if plan.ptr.is_null() {
+        return Err(Refusal::Null { what: "the decode plan this statement names" });
+    }
+    // SAFETY: `Fa2Decode` resolves only to a plan `raise_attn_plans` raised --
+    // `DecodePlan::as_ptr`'s own boxed cache, non-null above and live for the
+    // fire. The borrow ends inside this launch.
+    let cache = unsafe { &*plan.ptr };
+    let planned = dispatch::decode_plan_of(cache, crate::attn::fa2::plan::fa_device());
+    // THE DESCRIPTOR, OFF THE PLAN THIS STATEMENT NAMES. Three asks stood
+    // here -- `Fa2DecodeUploadSrc`/`Len`/`Dst` -- and each resolved through
+    // `bind::attn_plan`, which for decode GUESSED which schedule from the
+    // window on the `LaunchSpec`. The staging buffer is the cache's own and
+    // the carve offset is the cache's own, so a body holding the cache needs
+    // neither the asks nor the guess.
+    let int_base = ctx.ask::<*mut c_void, keys::AttnWorkspaceInt>()?;
+    upload_plan(
+        ctx,
+        cache.int_upload.as_slice().as_ptr(),
+        cache.int_upload.as_slice().len(),
+        (int_base as usize).saturating_add(cache.int_base_bytes) as *mut u8,
+    )?;
     // `:546-549`, before the variant test, and in that order.
     if score_out.is_null() || score_indptr.is_null() {
         return Err(CAPTURE_SINK);
     }
-    let Some(arm) = decode_capture_arm(plan.full_attention_variant, *window_left, *logits_soft_cap)
+    let Some(arm) = decode_capture_arm(planned.full_attention_variant, *window_left, *logits_soft_cap)
     else {
         return Err(CAPTURE_VARIANT);
     };
@@ -1730,93 +1712,16 @@ pub fn dispatch_attention_flashinfer_decode_capture(
         core::ptr::null_mut(),
         core::ptr::null_mut(),
     );
-    let (base, split) = make_decode_params(&plan, &bufs, *window_left, 0.0, *sm_scale, broadcast_q);
+    let (base, split) = make_decode_params(&planned, &bufs, *window_left, 0.0, *sm_scale, broadcast_q);
     let params = DecodeScoreParams {
         base,
         score_out: addr(score_out),
         score_indptr: addr(score_indptr),
     };
-    decode(ctx, decode_at(&plan, arm, params.base.padded_batch_size), &params)?;
-    if plan.info.split_kv { fold(ctx, &split) } else { Ok(()) }
+    decode(ctx, decode_at(&planned, arm, params.base.padded_batch_size), &params)?;
+    if planned.info.split_kv { fold(ctx, &split) } else { Ok(()) }
 }
 
-/// One prefill plan's named leaves, back into the aggregate `params.rs`
-/// consumes.
-///
-/// [`decode_plan_of_leaves`]' twin, and its doc is this one's: the offsets are
-/// ADDRESSES here, against a zero base, so `make_prefill_params` writes back
-/// exactly what `bind/table.rs`'s `fa2_prefill_leaves` resolved. A null leaf
-/// carries `-1`.
-///
-/// `enable_cuda_graph` is not a leaf: the block mask is carved only under
-/// `split_kv && enable_cuda_graph`, so a non-null mask says both. Neither is
-/// `valid` nor `use_sm90` — both are refusals the driver makes before it
-/// answers a single leaf, and [`prefill_plan_usable`] restates them for the
-/// planless pair, which still hands over the aggregate.
-#[allow(clippy::too_many_arguments)]
-fn prefill_plan_of_leaves(
-    request_indices: *const i32,
-    qo_tile_indices: *const i32,
-    kv_tile_indices: *const i32,
-    merge_indptr: *const i32,
-    o_indptr: *const i32,
-    kv_chunk_size: *const i32,
-    block_valid_mask: *const u8,
-    tmp_v: *mut f32,
-    tmp_s: *mut f32,
-    padded_batch: i32,
-    split_kv: bool,
-    total_rows: i32,
-    cta_tile_q: u32,
-    requests: i32,
-    num_q_heads: i32,
-    num_kv_heads: i32,
-    head_dim: i32,
-    page_size: i32,
-    window_left: i32,
-    hnd_layout: bool,
-    full_attention: bool,
-    causal_mask: bool,
-) -> PrefillPlan {
-    fn at<T>(p: *const T) -> i64 {
-        if p.is_null() { -1 } else { p as usize as i64 }
-    }
-    PrefillPlan {
-        info: PrefillPlanInfo {
-            padded_batch_size: i64::from(padded_batch),
-            total_num_rows: i64::from(total_rows),
-            // The DEVICE row count, which this driver does not fill on either
-            // side; `make_prefill_params` writes the field 0 and the fold
-            // reads what the kernel used.
-            total_num_rows_offset: -1,
-            cta_tile_q: i64::from(cta_tile_q),
-            request_indices_offset: at(request_indices),
-            qo_tile_indices_offset: at(qo_tile_indices),
-            kv_tile_indices_offset: at(kv_tile_indices),
-            merge_indptr_offset: at(merge_indptr),
-            o_indptr_offset: at(o_indptr),
-            kv_chunk_size_ptr_offset: at(kv_chunk_size),
-            v_offset: at(tmp_v.cast_const()),
-            s_offset: at(tmp_s.cast_const()),
-            block_valid_mask_offset: at(block_valid_mask),
-            enable_cuda_graph: !block_valid_mask.is_null(),
-            split_kv,
-        },
-        device: crate::attn::fa2::plan::fa_device(),
-        num_requests: requests,
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        page_size,
-        cta_tile_q,
-        window_left,
-        hnd_layout,
-        full_attention_variant: full_attention,
-        causal_mask,
-        use_sm90: false,
-        valid: true,
-    }
-}
 
 /// The paged prefill, over a plan and the buffers it addresses.
 ///
@@ -1856,10 +1761,23 @@ fn prefill_paged(
 /// `fire::flashinfer_fa2::plan_prefill` writes `use_sm90 = false` — and the
 /// refusal is kept so that wiring an SM90 family is one conditional and not an
 /// audit.
-#[routine]
+#[routine(no_join)]
 pub fn dispatch_attention_flashinfer_prefill_bf16(
     ctx: &Ctx<'_>,
     q: In<Tensor<bf16>>,
+    // THE PLAN, AS AN OPERAND. `In(1)` and not `In(0)`: `q`'s slot is stated
+    // in half this file's comments and in the tests, and a plan that took the
+    // first slot would move every one of them for nothing. What the position
+    // buys is that `arity_problem` and `check_plan` COUNT it -- an `ask` is a
+    // call the derived column cannot see, which `Asks`' own doc records as the
+    // step down from a type-system guarantee to a syntactic one.
+    //
+    // Twenty-two `ask` sites stood here and named the plan's fields one at a
+    // time. Each recorded *the value the plan was built at*, read back rather
+    // than restated so the fire could not disagree with the object it was
+    // executing -- which is a read-back standing in for a check nothing made.
+    // The object arrives whole now, so there is nothing to disagree with.
+    plan: In<Struct<Fa2Prefill>>,
     o: Out<Tensor<bf16>>) -> Result<(), Refusal> {
     // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
     // builder ever began stating them. A `Const` mark PROMISES the statement
@@ -1867,60 +1785,55 @@ pub fn dispatch_attention_flashinfer_prefill_bf16(
     // one the promise breaks at the fire, not at the type. §11.20.
     let logits_soft_cap = ctx.ask::<f32, keys::AttnLogitsSoftCap>()?;
     let sm_scale = ctx.ask::<f32, keys::SmScale>()?;
+    // THE DESCRIPTOR, AND NO WIDENING. `arms/fa2.rs`'s prefill arm ran no
+    // `dequant_prelude` where its decode twin did, and the omission is copied
+    // rather than repaired: a prefill reaches this having just written the KV
+    // it is about to read, so the pages are already the widths it wants.
 
     let qo_indptr = ctx.ask::<*const u32, keys::QoIndptr>()?;
     let lse = ctx.ask::<*mut f32, keys::AttnLseOut>()?;
-    let request_indices = ctx.ask::<*const i32, keys::Fa2PrefillRequestIndices>()?;
     let k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
     let v_pages = ctx.ask::<*mut u8, keys::KvValues>()?;
     let kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
     let kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
     let kv_last_page_lens = ctx.ask::<*const u32, keys::KvLastPageLens>()?;
-    let qo_tile_indices = ctx.ask::<*const i32, keys::Fa2PrefillQoTileIndices>()?;
-    let kv_tile_indices = ctx.ask::<*const i32, keys::Fa2PrefillKvTileIndices>()?;
-    let merge_indptr = ctx.ask::<*const i32, keys::Fa2PrefillMergeIndptr>()?;
-    let o_indptr = ctx.ask::<*const i32, keys::Fa2PrefillOIndptr>()?;
-    let kv_chunk_size = ctx.ask::<*const i32, keys::Fa2PrefillKvChunkSize>()?;
-    let block_valid_mask = ctx.ask::<*const u8, keys::Fa2PrefillBlockValidMask>()?;
-    let tmp_v = ctx.ask::<*mut f32, keys::Fa2PrefillTmpV>()?;
-    let tmp_s = ctx.ask::<*mut f32, keys::Fa2PrefillTmpS>()?;
-    let padded_batch = ctx.ask::<i32, keys::Fa2PrefillPaddedBatch>()?;
-    let split_kv = ctx.ask::<bool, keys::Fa2PrefillSplitKv>()?;
-    let total_rows = ctx.ask::<i32, keys::Fa2PrefillTotalRows>()?;
-    let cta_tile_q = ctx.ask::<u32, keys::Fa2PrefillCtaTileQ>()?;
-    let requests = ctx.ask::<i32, keys::Fa2PrefillRequests>()?;
-    let num_q_heads = ctx.ask::<i32, keys::Fa2PrefillNumQHeads>()?;
-    let num_kv_heads = ctx.ask::<i32, keys::Fa2PrefillNumKvHeads>()?;
-    let head_dim = ctx.ask::<i32, keys::Fa2PrefillHeadDim>()?;
-    let page_size = ctx.ask::<i32, keys::Fa2PrefillPageSize>()?;
-    let window_left = ctx.ask::<i32, keys::Fa2PrefillWindowLeft>()?;
-    let hnd_layout = ctx.ask::<bool, keys::Fa2PrefillHndLayout>()?;
-    let full_attention = ctx.ask::<bool, keys::Fa2PrefillFullAttention>()?;
-    let causal_mask = ctx.ask::<bool, keys::Fa2PrefillCausalMask>()?;
-    let plan = prefill_plan_of_leaves(
-        request_indices,
-        qo_tile_indices,
-        kv_tile_indices,
-        merge_indptr,
-        o_indptr,
-        kv_chunk_size,
-        block_valid_mask,
-        tmp_v,
-        tmp_s,
-        padded_batch,
-        split_kv,
-        total_rows,
-        cta_tile_q,
-        requests,
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        page_size,
-        window_left,
-        hnd_layout,
-        full_attention,
-        causal_mask,
-    );
+    // THE PLAN, WHOLE. `plan.ptr` is the driver's own boxed cache, minted by
+    // `raise_attn_plans` and handed back by the resolver against the KEY this
+    // statement names -- not recovered from a family string, and not guessed
+    // from a window.
+    if plan.ptr.is_null() {
+        return Err(Refusal::Null { what: "the prefill plan this statement names" });
+    }
+    // SAFETY: `Fa2Prefill` resolves only to `bind::attn_plan`'s pointer, which
+    // is `PrefillPlan::as_ptr`'s own boxed allocation -- non-null above, and
+    // live for the fire. The borrow ends inside this launch.
+    let cache = unsafe { &*plan.ptr };
+    let planned = dispatch::prefill_plan_of(cache, crate::attn::fa2::plan::fa_device());
+    // THE DESCRIPTOR, OFF THE PLAN THIS STATEMENT NAMES. Three asks stood
+    // here -- `Fa2PrefillUploadSrc`/`Len`/`Dst` -- and each resolved through
+    // `bind::attn_plan`, which for decode GUESSED which schedule from the
+    // window on the `LaunchSpec`. The staging buffer is the cache's own and
+    // the carve offset is the cache's own, so a body holding the cache needs
+    // neither the asks nor the guess.
+    let carve = ctx.ask::<*mut c_void, keys::AttnPrefillWorkspaceInt>()?;
+    upload_plan(
+        ctx,
+        cache.int_upload.as_slice().as_ptr(),
+        cache.int_upload.as_slice().len(),
+        (carve as usize).saturating_add(cache.int_base_bytes) as *mut u8,
+    )?;
+
+    // THE TWO BASES THE OFFSETS ARE RELATIVE TO, and they are the reason this
+    // is two asks rather than none. `prefill_plan_of_leaves` stuffed ABSOLUTE
+    // addresses into the offset fields and passed null bases, so `at(0, off)`
+    // read the address back; a real cache holds real offsets into the carve it
+    // was raised against. Both are §6.3 facts -- an address the allocator
+    // chose -- and neither is a plan leaf.
+    let float_base = ctx.ask::<*mut c_void, keys::AttnPrefillWorkspaceFloat>()?;
+    // `int_base_bytes` is the plan's own carve within the int workspace, which
+    // the descriptor upload above landed at.
+    let int_base = (carve as usize).saturating_add(cache.int_base_bytes) as *mut c_void;
+
     let bufs = buffers(
         q.ptr,
         k_pages.cast::<bf16>(),
@@ -1931,10 +1844,10 @@ pub fn dispatch_attention_flashinfer_prefill_bf16(
         kv_last_page_lens,
         qo_indptr,
         lse,
-        core::ptr::null_mut(),
-        core::ptr::null_mut(),
+        int_base,
+        float_base,
     );
-    prefill_paged(ctx, &bufs, &plan, logits_soft_cap, sm_scale)
+    prefill_paged(ctx, &bufs, &planned, logits_soft_cap, sm_scale)
 }
 
 /// `attn::dispatch_attention_flashinfer_prefill_capture_bf16`,
@@ -1953,82 +1866,74 @@ pub fn dispatch_attention_flashinfer_prefill_bf16(
 ///
 /// As [`dispatch_attention_flashinfer_prefill_bf16`], plus the capture
 /// refusals of [`dispatch_attention_flashinfer_decode_capture`].
-#[routine(untraced)]
+#[routine(no_join)]
 pub fn dispatch_attention_flashinfer_prefill_capture_bf16(
     ctx: &Ctx<'_>,
     q: In<Tensor<bf16>>,
+    // THE PLAN, AS AN OPERAND. See
+    // [`dispatch_attention_flashinfer_prefill_bf16`], whose comment carries
+    // the whole of why: `In(1)` keeps `q` at slot 0, and a mark is counted
+    // where an `ask` is a call the derived column cannot see.
+    plan: In<Struct<Fa2Prefill>>,
     o: Out<Tensor<bf16>>,
-    score_out: *mut f32,
-    score_indptr: *const i32,
-    // The capture window the arm computed; nothing publishes it before the
-    // fire, so no column can answer for it.
-    #[unbound]
-    score_window: u32,
     logits_soft_cap: Const<f32>,
     sm_scale: Const<f32>) -> Result<(), Refusal> {
+    // ASKED, NOT PARAMETERS. Two bare pointers and an `#[unbound] u32` stood
+    // here, and between them they were the whole reason this row could carry
+    // no source column. All three are the FIRE's -- the sink it carved, that
+    // sink's CSR, and the width it carved them at -- so `Cx` answers them and
+    // the row becomes one `route` can bind.
+    let score_out = ctx.ask::<*mut f32, keys::AttnScoreOut>()?;
+    let score_indptr = ctx.ask::<*const i32, keys::AttnScoreIndptr>()?;
+    let score_window = ctx.ask::<u32, keys::AttnScoreWindow>()?;
+    // THE DESCRIPTOR, AND NO WIDENING. `arms/fa2.rs`'s prefill arm ran no
+    // `dequant_prelude` where its decode twin did, and the omission is copied
+    // rather than repaired: a prefill reaches this having just written the KV
+    // it is about to read, so the pages are already the widths it wants.
     let lse = ctx.ask::<*mut f32, keys::AttnLseOut>()?;
-    let request_indices = ctx.ask::<*const i32, keys::Fa2PrefillRequestIndices>()?;
-    let window_left = ctx.ask::<i32, keys::Fa2PrefillWindowLeft>()?;
     let k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
     let v_pages = ctx.ask::<*mut u8, keys::KvValues>()?;
     let qo_indptr = ctx.ask::<*const u32, keys::QoIndptr>()?;
     let kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
     let kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
     let kv_last_page_lens = ctx.ask::<*const u32, keys::KvLastPageLens>()?;
-    let qo_tile_indices = ctx.ask::<*const i32, keys::Fa2PrefillQoTileIndices>()?;
-    let kv_tile_indices = ctx.ask::<*const i32, keys::Fa2PrefillKvTileIndices>()?;
-    let merge_indptr = ctx.ask::<*const i32, keys::Fa2PrefillMergeIndptr>()?;
-    let o_indptr = ctx.ask::<*const i32, keys::Fa2PrefillOIndptr>()?;
-    let kv_chunk_size = ctx.ask::<*const i32, keys::Fa2PrefillKvChunkSize>()?;
-    let block_valid_mask = ctx.ask::<*const u8, keys::Fa2PrefillBlockValidMask>()?;
-    let tmp_v = ctx.ask::<*mut f32, keys::Fa2PrefillTmpV>()?;
-    let tmp_s = ctx.ask::<*mut f32, keys::Fa2PrefillTmpS>()?;
-    let padded_batch = ctx.ask::<i32, keys::Fa2PrefillPaddedBatch>()?;
-    let split_kv = ctx.ask::<bool, keys::Fa2PrefillSplitKv>()?;
-    let total_rows = ctx.ask::<i32, keys::Fa2PrefillTotalRows>()?;
-    let cta_tile_q = ctx.ask::<u32, keys::Fa2PrefillCtaTileQ>()?;
-    let requests = ctx.ask::<i32, keys::Fa2PrefillRequests>()?;
-    let num_q_heads = ctx.ask::<i32, keys::Fa2PrefillNumQHeads>()?;
-    let num_kv_heads = ctx.ask::<i32, keys::Fa2PrefillNumKvHeads>()?;
-    let head_dim = ctx.ask::<i32, keys::Fa2PrefillHeadDim>()?;
-    let page_size = ctx.ask::<i32, keys::Fa2PrefillPageSize>()?;
-    let hnd_layout = ctx.ask::<bool, keys::Fa2PrefillHndLayout>()?;
-    let full_attention = ctx.ask::<bool, keys::Fa2PrefillFullAttention>()?;
-    let causal_mask = ctx.ask::<bool, keys::Fa2PrefillCausalMask>()?;
-    let plan = prefill_plan_of_leaves(
-        request_indices,
-        qo_tile_indices,
-        kv_tile_indices,
-        merge_indptr,
-        o_indptr,
-        kv_chunk_size,
-        block_valid_mask,
-        tmp_v,
-        tmp_s,
-        padded_batch,
-        split_kv,
-        total_rows,
-        cta_tile_q,
-        requests,
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        page_size,
-        window_left,
-        hnd_layout,
-        full_attention,
-        causal_mask,
-    );
+    // THE PLAN, WHOLE. As the plain prefill launcher: the resolver hands back
+    // what `raise_attn_plans` raised, against the KEY this statement names.
+    if plan.ptr.is_null() {
+        return Err(Refusal::Null { what: "the prefill plan this statement names" });
+    }
+    // SAFETY: `Fa2Prefill` resolves only to `bind::attn_plan`'s pointer, which
+    // is `PrefillPlan::as_ptr`'s own boxed allocation -- non-null above, and
+    // live for the fire. The borrow ends inside this launch.
+    let cache = unsafe { &*plan.ptr };
+    let planned = dispatch::prefill_plan_of(cache, crate::attn::fa2::plan::fa_device());
+    // THE DESCRIPTOR, OFF THE PLAN THIS STATEMENT NAMES. Three asks stood
+    // here -- `Fa2PrefillUploadSrc`/`Len`/`Dst` -- and each resolved through
+    // `bind::attn_plan`, which for decode GUESSED which schedule from the
+    // window on the `LaunchSpec`. The staging buffer is the cache's own and
+    // the carve offset is the cache's own, so a body holding the cache needs
+    // neither the asks nor the guess.
+    let carve = ctx.ask::<*mut c_void, keys::AttnPrefillWorkspaceInt>()?;
+    upload_plan(
+        ctx,
+        cache.int_upload.as_slice().as_ptr(),
+        cache.int_upload.as_slice().len(),
+        (carve as usize).saturating_add(cache.int_base_bytes) as *mut u8,
+    )?;
+    // The two bases the plan's offsets are relative to; §6.3 facts and not
+    // leaves. See the plain launcher.
+    let float_base = ctx.ask::<*mut c_void, keys::AttnPrefillWorkspaceFloat>()?;
+    let int_base = (carve as usize).saturating_add(cache.int_base_bytes) as *mut c_void;
     // `:849-856`. The sink first, then the variant, then the plan -- the C++'s
     // order, and the window is part of the sink here rather than of the
     // variant.
     if score_out.is_null() || score_indptr.is_null() || score_window == 0 {
         return Err(CAPTURE_SINK);
     }
-    let Some(arm) = prefill_capture_arm(plan.causal_mask, plan.window_left, *logits_soft_cap) else {
+    let Some(arm) = prefill_capture_arm(planned.causal_mask, planned.window_left, *logits_soft_cap) else {
         return Err(CAPTURE_VARIANT);
     };
-    prefill_plan_usable(&plan)?;
+    prefill_plan_usable(&planned)?;
     let bufs = buffers(
         q.ptr,
         k_pages.cast::<bf16>(),
@@ -2039,18 +1944,18 @@ pub fn dispatch_attention_flashinfer_prefill_capture_bf16(
         kv_last_page_lens,
         qo_indptr,
         lse,
-        core::ptr::null_mut(),
-        core::ptr::null_mut(),
+        int_base,
+        float_base,
     );
-    let (base, split) = make_prefill_params(&plan, &bufs, 0.0, *sm_scale);
+    let (base, split) = make_prefill_params(&planned, &bufs, 0.0, *sm_scale);
     let params = PrefillScoreParams {
         base,
         score_out: addr(score_out),
         score_indptr: addr(score_indptr),
         score_window: score_window,
     };
-    prefill(ctx, prefill_at(&plan, arm, params.base.padded_batch_size), &params)?;
-    if plan.info.split_kv { fold(ctx, &split) } else { Ok(()) }
+    prefill(ctx, prefill_at(&planned, arm, params.base.padded_batch_size), &params)?;
+    if planned.info.split_kv { fold(ctx, &split) } else { Ok(()) }
 }
 
 /// `attn::dispatch_attention_flashinfer_prefill_custom`,
@@ -2070,70 +1975,62 @@ pub fn dispatch_attention_flashinfer_prefill_capture_bf16(
 /// # Errors
 ///
 /// As [`dispatch_attention_flashinfer_prefill_bf16`].
-#[routine(untraced)]
+#[routine(no_join)]
 pub fn dispatch_attention_flashinfer_prefill_custom(
     ctx: &Ctx<'_>,
     q: In<Tensor<bf16>>,
+    // THE PLAN, AS AN OPERAND. See
+    // [`dispatch_attention_flashinfer_prefill_bf16`], whose comment carries
+    // the whole of why: `In(1)` keeps `q` at slot 0, and a mark is counted
+    // where an `ask` is a call the derived column cannot see.
+    plan: In<Struct<Fa2Prefill>>,
     o: Out<Tensor<bf16>>,
-    mask: *const u8,
-    mask_indptr: *const i32,
     logits_soft_cap: Const<f32>,
     sm_scale: Const<f32>) -> Result<(), Refusal> {
+    // ASKED, as the capturing pair's sinks: a bare `*const u8` is not a mark,
+    // and this row's column could not exist while it took one.
+    let mask = ctx.ask::<*const u8, keys::AttnMask>()?;
+    let mask_indptr = ctx.ask::<*const i32, keys::AttnMaskIndptr>()?;
+    // BOTH PRELUDES, over the PREFILL carve. The custom form is the one
+    // prefill arm that widened: it serves a text whose cache may be quantised.
+    dequant_prelude(ctx);
     let lse = ctx.ask::<*mut f32, keys::AttnLseOut>()?;
-    let window_left = ctx.ask::<i32, keys::Fa2PrefillWindowLeft>()?;
     let k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
     let v_pages = ctx.ask::<*mut u8, keys::KvValues>()?;
     let qo_indptr = ctx.ask::<*const u32, keys::QoIndptr>()?;
     let kv_page_indices = ctx.ask::<*const u32, keys::KvPageIndices>()?;
     let kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
     let kv_last_page_lens = ctx.ask::<*const u32, keys::KvLastPageLens>()?;
-    let request_indices = ctx.ask::<*const i32, keys::Fa2PrefillRequestIndices>()?;
-    let qo_tile_indices = ctx.ask::<*const i32, keys::Fa2PrefillQoTileIndices>()?;
-    let kv_tile_indices = ctx.ask::<*const i32, keys::Fa2PrefillKvTileIndices>()?;
-    let merge_indptr = ctx.ask::<*const i32, keys::Fa2PrefillMergeIndptr>()?;
-    let o_indptr = ctx.ask::<*const i32, keys::Fa2PrefillOIndptr>()?;
-    let kv_chunk_size = ctx.ask::<*const i32, keys::Fa2PrefillKvChunkSize>()?;
-    let block_valid_mask = ctx.ask::<*const u8, keys::Fa2PrefillBlockValidMask>()?;
-    let tmp_v = ctx.ask::<*mut f32, keys::Fa2PrefillTmpV>()?;
-    let tmp_s = ctx.ask::<*mut f32, keys::Fa2PrefillTmpS>()?;
-    let padded_batch = ctx.ask::<i32, keys::Fa2PrefillPaddedBatch>()?;
-    let split_kv = ctx.ask::<bool, keys::Fa2PrefillSplitKv>()?;
-    let total_rows = ctx.ask::<i32, keys::Fa2PrefillTotalRows>()?;
-    let cta_tile_q = ctx.ask::<u32, keys::Fa2PrefillCtaTileQ>()?;
-    let requests = ctx.ask::<i32, keys::Fa2PrefillRequests>()?;
-    let num_q_heads = ctx.ask::<i32, keys::Fa2PrefillNumQHeads>()?;
-    let num_kv_heads = ctx.ask::<i32, keys::Fa2PrefillNumKvHeads>()?;
-    let head_dim = ctx.ask::<i32, keys::Fa2PrefillHeadDim>()?;
-    let page_size = ctx.ask::<i32, keys::Fa2PrefillPageSize>()?;
-    let hnd_layout = ctx.ask::<bool, keys::Fa2PrefillHndLayout>()?;
-    let full_attention = ctx.ask::<bool, keys::Fa2PrefillFullAttention>()?;
-    let causal_mask = ctx.ask::<bool, keys::Fa2PrefillCausalMask>()?;
-    let plan = prefill_plan_of_leaves(
-        request_indices,
-        qo_tile_indices,
-        kv_tile_indices,
-        merge_indptr,
-        o_indptr,
-        kv_chunk_size,
-        block_valid_mask,
-        tmp_v,
-        tmp_s,
-        padded_batch,
-        split_kv,
-        total_rows,
-        cta_tile_q,
-        requests,
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        page_size,
-        window_left,
-        hnd_layout,
-        full_attention,
-        causal_mask,
-    );
+    // THE PLAN, WHOLE. As the plain prefill launcher: the resolver hands back
+    // what `raise_attn_plans` raised, against the KEY this statement names.
+    if plan.ptr.is_null() {
+        return Err(Refusal::Null { what: "the prefill plan this statement names" });
+    }
+    // SAFETY: `Fa2Prefill` resolves only to `bind::attn_plan`'s pointer, which
+    // is `PrefillPlan::as_ptr`'s own boxed allocation -- non-null above, and
+    // live for the fire. The borrow ends inside this launch.
+    let cache = unsafe { &*plan.ptr };
+    let planned = dispatch::prefill_plan_of(cache, crate::attn::fa2::plan::fa_device());
+    // THE DESCRIPTOR, OFF THE PLAN THIS STATEMENT NAMES. Three asks stood
+    // here -- `Fa2PrefillUploadSrc`/`Len`/`Dst` -- and each resolved through
+    // `bind::attn_plan`, which for decode GUESSED which schedule from the
+    // window on the `LaunchSpec`. The staging buffer is the cache's own and
+    // the carve offset is the cache's own, so a body holding the cache needs
+    // neither the asks nor the guess.
+    let carve = ctx.ask::<*mut c_void, keys::AttnPrefillWorkspaceInt>()?;
+    upload_plan(
+        ctx,
+        cache.int_upload.as_slice().as_ptr(),
+        cache.int_upload.as_slice().len(),
+        (carve as usize).saturating_add(cache.int_base_bytes) as *mut u8,
+    )?;
+    // The two bases the plan's offsets are relative to; §6.3 facts and not
+    // leaves. See the plain launcher.
+    let int_base = ctx.ask::<*mut c_void, keys::AttnPrefillWorkspaceInt>()?;
+    let float_base = ctx.ask::<*mut c_void, keys::AttnPrefillWorkspaceFloat>()?;
+    let int_base = (carve as usize).saturating_add(cache.int_base_bytes) as *mut c_void;
     let arm = prefill_custom_arm(*logits_soft_cap);
-    prefill_plan_usable(&plan)?;
+    prefill_plan_usable(&planned)?;
     let bufs = buffers(
         q.ptr,
         k_pages.cast::<bf16>(),
@@ -2144,16 +2041,109 @@ pub fn dispatch_attention_flashinfer_prefill_custom(
         kv_last_page_lens,
         qo_indptr,
         lse,
-        core::ptr::null_mut(),
-        core::ptr::null_mut(),
+        int_base,
+        float_base,
     );
-    let (mut params, split) = make_prefill_params(&plan, &bufs, *logits_soft_cap, *sm_scale);
+    let (mut params, split) = make_prefill_params(&planned, &bufs, *logits_soft_cap, *sm_scale);
     // `:1150-1155`, `:1163`.
     params.maybe_custom_mask = addr(mask);
     params.maybe_mask_indptr = addr(mask_indptr);
     params.window_left = -1;
-    prefill(ctx, prefill_at(&plan, arm, params.padded_batch_size), &params)?;
-    if plan.info.split_kv { fold(ctx, &split) } else { Ok(()) }
+    prefill(ctx, prefill_at(&planned, arm, params.padded_batch_size), &params)?;
+    if planned.info.split_kv { fold(ctx, &split) } else { Ok(()) }
+}
+
+/// Build this fire's prefill plan, for the launcher that gets none.
+///
+/// `arms/fa2.rs`'s `fa2_prefill_planless`, from the top through `plan_prefill`.
+/// The comment it replaces said the planning *"is the arm's, because a plan is
+/// `driver-cuda`'s vocabulary"* — and the planner it named, `plan::plan_prefill`,
+/// is in THIS crate and always was. What was actually the driver's is the
+/// CACHE's allocation and the two host CSRs, and those arrive as facts.
+///
+/// **The cache is written through, and the launcher's claim on it is exclusive
+/// for the launch**: a fire dispatches one statement at a time, which is the
+/// same warrant the arm's `&mut` had.
+///
+/// # Errors
+///
+/// [`Refusal::Empty`] for an empty batch or a zero head width,
+/// [`Refusal::Narrow`] for a query width that is not whole heads, and
+/// [`Refusal::Unstated`] when the planner declines.
+fn plan_own_prefill(ctx: &Ctx<'_>, q_width: i32) -> Result<PrefillPlan, Refusal> {
+    let requests = ctx.ask::<i32, keys::FireRequests>()?;
+    if requests <= 0 {
+        return Err(Refusal::Empty { what: "the batch" });
+    }
+    let head_dim = ctx.ask::<i32, keys::KvHeadDim>()?;
+    // The head count, which nobody carries: the query's width over the cache's
+    // head dim. `plan_prefill` is a host planner with no `Refusal` to carry a
+    // guard into -- it would `.max(1)` a zero divisor and truncate the
+    // rectangle -- so both checks are made here, where a refusal exists.
+    if head_dim <= 0 {
+        return Err(Refusal::Empty { what: "the layer's head dim" });
+    }
+    if q_width % head_dim != 0 {
+        return Err(Refusal::Narrow { what: "the query width, in heads", at: i64::from(q_width) });
+    }
+    let cache = ctx.ask::<*mut u8, keys::Fa2PrefillPlanCache>()?;
+    let qo_h = ctx.ask::<*const u32, keys::QoIndptrHost>()?;
+    let kv_h = ctx.ask::<*const u32, keys::KvPageIndptrHost>()?;
+    let n = requests as usize + 1;
+    // SAFETY: the fire's contract, which the two facts carry -- both are host
+    // CSRs of `requests + 1` entries, refused above if either is absent. The
+    // slices are read and not held past `plan_prefill`.
+    let (qo_h, kv_h) = unsafe {
+        (
+            core::slice::from_raw_parts(qo_h, n),
+            core::slice::from_raw_parts(kv_h, n),
+        )
+    };
+    // SAFETY: `Fa2PrefillPlanCache` answers the driver's own boxed allocation,
+    // non-null by that fact's refusal, and the launch holds it alone.
+    let cache = unsafe { &mut *cache.cast::<plan::PrefillPlanCache>() };
+    let device = plan::plan_device();
+    let planned = plan::plan_prefill(
+        cache,
+        qo_h,
+        kv_h,
+        ctx.ask::<i32, keys::Rows>()?,
+        requests,
+        q_width / head_dim,
+        ctx.ask::<i32, keys::KvNumHeads>()?,
+        head_dim,
+        ctx.ask::<i32, keys::KvPageSize>()?,
+        crate::attn::plan::Workspace {
+            float_bytes: ctx.ask::<usize, keys::AttnWorkspaceFloatBytes>()?,
+            int_bytes: ctx.ask::<usize, keys::AttnWorkspaceIntBytes>()?,
+        },
+        &device,
+        // `enable_cuda_graph`, and not the C++'s value: `false` sizes the
+        // tiling from this batch, `true` derives `cta_tile_q` from a bound the
+        // batch cannot exceed, so the layout can be baked once.
+        true,
+        ctx.ask::<i32, keys::WindowLeft>()?,
+        false,
+        ctx.ask::<bool, keys::KvHndLayout>()?,
+        true,
+        false,
+        false,
+    );
+    if let plan::Planned::Declined(why) = planned {
+        tracing::error!(%why, "the planless FA2 prefill could not plan its own fire");
+        return Err(Refusal::Unstated { what: "a plannable FA2 prefill fire; see the log" });
+    }
+    // THE DECODE CARVE, as the entry point this replaces used: the planless
+    // pair plans against `AttnWorkspace*` and not the prefill carve, so its
+    // descriptor lands there too.
+    upload_plan(
+        ctx,
+        cache.int_upload.as_slice().as_ptr(),
+        cache.int_upload.as_slice().len(),
+        (ctx.ask::<*mut core::ffi::c_void, keys::AttnWorkspaceInt>()? as usize)
+            .saturating_add(cache.int_base_bytes) as *mut u8,
+    )?;
+    Ok(dispatch::prefill_plan_of(cache, plan::fa_device()))
 }
 
 /// `attn::attention_flashinfer_prefill`, `attention_flashinfer.cu:1077-1113`
@@ -2161,35 +2151,30 @@ pub fn dispatch_attention_flashinfer_prefill_custom(
 ///
 /// `whole = true`, and the reason is in the name: no plan cache crosses the
 /// fire for this symbol, so one is built over the WHOLE batch on the way in
-/// and thrown away. **That planning is the arm's**, because a plan is
-/// `driver-cuda`'s vocabulary and the planner is its `plan_prefill` — a
-/// hundred lines of policy over `crate::attn::plan::prefill`, including the
-/// graph-mode demotion retry and the head-dim gate. What arrives here is the
-/// same [`PrefillPlan`] the planned three no longer take, which is why this
-/// body is [`prefill_paged`]'s caller and not a second one.
+/// and thrown away. That planning is [`plan_own_prefill`]'s, which is this
+/// body's own call and no longer an arm's — see there for what moved and why
+/// the reason it did not move sooner was mistaken.
 ///
 /// `:1063-1067` fixes three flags this path never varies:
 /// `enable_cuda_graph = false`, `full_attention_variant = false`,
 /// `causal_mask = true`. So [`prefill_arm`] always answers `CausalSoftcap` or
-/// `CausalWindow`, which is what the plan the arm hands over states.
+/// `CausalWindow`, which is what the plan states.
 ///
 /// # Errors
 ///
-/// As [`dispatch_attention_flashinfer_prefill_bf16`].
-#[routine(whole, untraced)]
+/// As [`dispatch_attention_flashinfer_prefill_bf16`], plus
+/// [`plan_own_prefill`]'s.
+#[routine(whole, no_join)]
 pub fn attention_flashinfer_prefill(
     ctx: &Ctx<'_>,
     q: In<Tensor<bf16>>,
     o: Out<Tensor<bf16>>,
-    // STILL THE AGGREGATE, AND IT CANNOT BECOME LEAVES HERE. The arm builds
-    // this plan from the host CSR mirrors on the way in; nothing published it
-    // before the fire, so `operand()` has nothing to read and there is no
-    // column to answer. `.wiki/kilimanjaro3.md` §3.3 keeps `Cx` query-only,
-    // so a binder that planned would be the other half of the same mistake.
-    #[unbound]
-    plan: PrefillPlan,
     logits_soft_cap: Const<f32>,
     sm_scale: Const<f32>) -> Result<(), Refusal> {
+    // WIDENING FIRST, as the arm had it: the planner walks the page CSRs this
+    // widening does not touch, but the launch below reads pages it does.
+    dequant_prelude(ctx);
+    let plan = plan_own_prefill(ctx, q.width)?;
     let lse = ctx.ask::<*mut f32, keys::AttnLseOut>()?;
     let int_buffer = ctx.ask::<*mut core::ffi::c_void, keys::AttnWorkspaceInt>()?;
     let k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
@@ -2243,7 +2228,7 @@ pub fn attention_flashinfer_prefill(
 /// # Errors
 ///
 /// [`dispatch_attention_flashinfer_prefill_bf16`]'s.
-#[routine(whole, untraced)]
+#[routine(whole, no_join)]
 pub fn attention_flashinfer_prefill_lse(
     ctx: &Ctx<'_>,
     q: In<Tensor<bf16>>,
@@ -2256,13 +2241,15 @@ pub fn attention_flashinfer_prefill_lse(
     // results unconditionally and `deepseek_v4/forward/mod.rs:146` states it
     // outside any region.
     o: Out<Tensor<bf16>>,
-    _lse: Out<Tensor<f32>>,
-    // The aggregate the arm built, as above: nothing published it before the
-    // fire, so there is no column to answer for it.
-    #[unbound]
-    plan: PrefillPlan,
-    logits_soft_cap: Const<f32>,
-    sm_scale: Const<f32>) -> Result<(), Refusal> {
+    _lse: Out<Tensor<f32>>) -> Result<(), Refusal> {
+    // ASKED, WHERE THE TWIN TAKES THEM AS `Const`, and the texts are why:
+    // `base.rs:410`'s builder for this spelling passes `vec![]` for its params
+    // run while `attn_at`'s passes `cap_and_scale(..)`. A `Const` mark PROMISES
+    // the statement carries the number at its slot; here nothing does, so the
+    // promise broke at the fire rather than at the type -- which is what
+    // `arms/fa2.rs` hid by passing `AttnCtx::logits_soft_cap` by hand.
+    let logits_soft_cap = Const { v: ctx.ask::<f32, keys::AttnLogitsSoftCap>()? };
+    let sm_scale = Const { v: ctx.ask::<f32, keys::SmScale>()? };
     let _int_buffer = ctx.ask::<*mut core::ffi::c_void, keys::AttnWorkspaceInt>()?;
     let _k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
     let _v_pages = ctx.ask::<*mut u8, keys::KvValues>()?;
@@ -2271,8 +2258,11 @@ pub fn attention_flashinfer_prefill_lse(
     let _kv_page_indptr = ctx.ask::<*const u32, keys::KvPageIndptr>()?;
     let _kv_last_page_lens = ctx.ask::<*const u32, keys::KvLastPageLens>()?;
     let _float_buffer = ctx.ask::<*mut core::ffi::c_void, keys::AttnWorkspaceFloat>()?;
-    // As above: the plan and its workspaces are the callee's to ask for.
-    attention_flashinfer_prefill(ctx, q, o, plan, logits_soft_cap, sm_scale)
+    // As above: the plan, its workspaces and the two preludes are the callee's.
+    // The LSE parameter is not forwarded and never was -- the callee asks for
+    // `keys::AttnLseOut`, and this spelling's declared result is what that
+    // fact answers with, which is the repair the doc above describes.
+    attention_flashinfer_prefill(ctx, q, o, logits_soft_cap, sm_scale)
 }
 
 /// The two plan-validity refusals, in the order the C++ made them.
@@ -2373,11 +2363,14 @@ const _: () = {
     // The decode pair. Same launcher, same plan, same lattice point; the
     // difference is entirely in these four columns.
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_decode);
-    // 15 → 28. The aggregate and the workspace pair left; sixteen named
-    // leaves arrived at 8..24. `impl_kernel_fn!` is stamped through 36.
-    assert!(d.len() == 2);
+    // 15 -> 28 -> 2 -> 3. The aggregate and the workspace pair left; sixteen
+    // named leaves arrived at 8..24 and then left again when the plan became
+    // an operand. What is here is the statement's own shape: the query, the
+    // plan it names, the result.
+    assert!(d.len() == 3);
     assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    assert!(matches!(d[2], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
     // `o` KEEPS `Or`. `attn_at` declares no result inside
     // `llama_like/forward/mod.rs:1638`'s `dsl::guarded_value`, and this flag
     // going false is that guard's value losing its writer.
@@ -2399,23 +2392,33 @@ const _: () = {
     assert!(true /* the parameter this pinned has left the signature */);
 
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_decode_lse);
-    assert!(d.len() == 3);
+    assert!(d.len() == 4);
     assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
-    // THE OPERAND SLOTS DID NOT SHIFT. Both results sit where the twin's
-    // marks put them, which is what makes the forward at the bottom of the
-    // body a forward rather than a re-ordering.
-    assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
+    // THE OPERAND SLOTS STILL DO NOT SHIFT RELATIVE TO THE TWIN. Both took the
+    // plan at `In(1)` in the same round, so the results sit one along on both
+    // and the forward at the bottom of the body is still a forward rather than
+    // a re-ordering.
+    assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::In, 1))));
+    assert!(matches!(d[2], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
     // The entry this line pinned is gone from the column: the
     // parameter it named left the signature when its fact stopped
     // being asked for as a parameter. See the routine.
     assert!(!<dispatch_attention_flashinfer_decode_lse as ::kernels::Derivation>::DERIVED[1].nullable);
     assert!(true /* the parameter this pinned has left the signature */);
 
-    // The planless prefill pair. One `Env` more than the decode pair before
-    // `lse` -- `qo_indptr` -- so the LSE sits at 7 rather than 6, and that
-    // one index is why these are written out instead of looped.
+    // The planless prefill pair. FOUR PARAMETERS EACH NOW, not five and six:
+    // the `#[unbound] plan: PrefillPlan` both carried is gone. It was the
+    // aggregate `arms/fa2.rs` built on the way in, and the reason it could
+    // never be bound was that nothing published it before the fire -- true,
+    // and beside the point, because the launcher can BUILD it. It does:
+    // `plan_own_prefill` walks the two host CSRs and calls `plan::plan_prefill`,
+    // both of which live in this crate and always did.
+    //
+    // The count dropping is the whole of what a reader should check here. A
+    // column with no `None` in it is a row `route` can bind, which is what
+    // took these two symbols off the hand-armed list.
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(attention_flashinfer_prefill);
-    assert!(d.len() == 5);
+    assert!(d.len() == 4);
     assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
     assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
         // `nullable` WAS TRUE HERE AND IS FALSE NOW, AND THIS PIN IS HOW YOU KNOW.
@@ -2425,20 +2428,20 @@ const _: () = {
     // buffer -- is stated on the OP now (`Op::dest`), by the builder that
     // minted that buffer. A launcher's type no longer decides a lowering.
     assert!(!<attention_flashinfer_prefill as ::kernels::Derivation>::DERIVED[1].nullable);
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    assert!(true /* the parameter this pinned has left the signature */);
+    // NOTHING IN THIS COLUMN IS UNSOURCED. The `plan` entry was the one `None`
+    // either of these carried, so its removal is what makes the pair bindable.
+    assert!(!d[2].is_none() && !d[3].is_none());
 
+    // THREE, AND THE TWO SCALARS ARE WHY IT IS NOT FOUR. `base.rs:410` builds
+    // this spelling with `vec![]` for its params run where `attn_at` builds
+    // the twin's with `cap_and_scale(..)`, so a `Const` here promised a slot
+    // no text fills. Both are asked for now.
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(attention_flashinfer_prefill_lse);
-    assert!(d.len() == 6);
+    assert!(d.len() == 3);
     assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
     assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    // The entry this line pinned is gone from the column: the
-    // parameter it named left the signature when its fact stopped
-    // being asked for as a parameter. See the routine.
+    assert!(matches!(d[2], Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
     assert!(!<attention_flashinfer_prefill_lse as ::kernels::Derivation>::DERIVED[1].nullable);
-    assert!(true /* the parameter this pinned has left the signature */);
 
     // THE FOUR THAT DID NOT SPLIT, AND THE CLAIM THAT REPLACED THEIR OLD ONE.
     //
@@ -2459,18 +2462,39 @@ const _: () = {
     // wrong buffer, and that is what this stops now.
     assert!(matches!(
         kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_decode_capture)[1],
-        Some(kernels::Source::Slot(kernels::Kind::Out, 0))
+        Some(kernels::Source::Slot(kernels::Kind::In, 1))
     ));
     assert!(matches!(
+        kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_decode_capture)[2],
+        Some(kernels::Source::Slot(kernels::Kind::Out, 0))
+    ));
+    // AT 2, BECAUSE THE PLAN SITS AT 1 -- and the assertion moving is the
+    // whole point of it being here. `o` is still result 0; what changed is
+    // that this launcher places three operands where it placed two, and a
+    // renumbering that was NOT the plan's arrival would have failed the same
+    // way. Its siblings still read `[1]` until they take the operand too.
+    assert!(matches!(
         kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_bf16)[1],
+        Some(kernels::Source::Slot(kernels::Kind::In, 1))
+    ));
+    assert!(matches!(
+        kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_bf16)[2],
         Some(kernels::Source::Slot(kernels::Kind::Out, 0))
     ));
     assert!(matches!(
         kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_capture_bf16)[1],
+        Some(kernels::Source::Slot(kernels::Kind::In, 1))
+    ));
+    assert!(matches!(
+        kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_capture_bf16)[2],
         Some(kernels::Source::Slot(kernels::Kind::Out, 0))
     ));
     assert!(matches!(
         kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_custom)[1],
+        Some(kernels::Source::Slot(kernels::Kind::In, 1))
+    ));
+    assert!(matches!(
+        kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_custom)[2],
         Some(kernels::Source::Slot(kernels::Kind::Out, 0))
     ));
 
@@ -2501,39 +2525,29 @@ const _: () = {
     // fact only the fire can answer, so the body asks its context for it and
     // there is no column entry left to hold in place.
 
-    // `attention_flashinfer_prefill` KEEPS FIVE ENTRIES AND NO NAMED ONE.
-    // `qo_indptr` was `d[4]`, a plan leaf pinned against its neighbours; it is
-    // asked for in the body now, and what is left is the shape the DSL owns:
-    // two operands, the plan the arm builds, and the two scalars the statement
-    // carries.
+    // `attention_flashinfer_prefill` KEEPS FOUR ENTRIES AND NO UNSOURCED ONE.
+    // `qo_indptr` was `d[4]`, a plan leaf pinned against its neighbours, and is
+    // asked for in the body; `plan` was `d[2]`, the `#[unbound]` aggregate the
+    // arm built, and the LAUNCHER builds it now (`plan_own_prefill`). What is
+    // left is the shape the DSL owns: two operands and the two scalars the
+    // statement carries.
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(attention_flashinfer_prefill);
-    assert!(d.len() == 5);
+    assert!(d.len() == 4);
     assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
     assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    assert!(d[2].is_none());
-    assert!(matches!(d[3], Some(kernels::Source::Slot(kernels::Kind::ParamF32, 0))));
-    assert!(matches!(d[4], Some(kernels::Source::Slot(kernels::Kind::ParamF32, 1))));
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
+    assert!(matches!(d[2], Some(kernels::Source::Slot(kernels::Kind::ParamF32, 0))));
+    assert!(matches!(d[3], Some(kernels::Source::Slot(kernels::Kind::ParamF32, 1))));
     // THE FORWARD IS INDEX-FOR-INDEX, and it is shorter at both ends now.
     // `attention_flashinfer_prefill_lse` hands its whole parameter list to the
     // twin above, so a key landing on a different index on either side would
     // be a re-ordering wearing a forward. What both lists carry is the shape
-    // the DSL owns: the operands, the plan, and the two scalars. `qo_indptr`
-    // and the rest of the plan leaves are asked for inside the body, where a
-    // caller cannot re-order them at all.
+    // the DSL owns: the operands and the two scalars. The plan leaves and the
+    // plan itself are the body's, where a caller cannot re-order them at all.
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(attention_flashinfer_prefill_lse);
-    assert!(d.len() == 6);
+    assert!(d.len() == 3);
     assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
     assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
     assert!(matches!(d[2], Some(kernels::Source::Slot(kernels::Kind::Out, 1))));
-    assert!(d[3].is_none());
-    assert!(matches!(d[4], Some(kernels::Source::Slot(kernels::Kind::ParamF32, 0))));
-    assert!(matches!(d[5], Some(kernels::Source::Slot(kernels::Kind::ParamF32, 1))));
     // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
     // fact only the fire can answer, so the body asks its context for it and
     // there is no column entry left to hold in place.
@@ -2549,16 +2563,27 @@ const _: () = {
     // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
     // fact only the fire can answer, so the body asks its context for it and
     // there is no column entry left to hold in place.
+    // NOTHING IS `None` HERE ANY MORE. `d[4]` was `#[unbound] score_window`,
+    // and the two bare sink pointers before it carried no source either -- the
+    // three together were why this row had no column at all. They are asked
+    // facts now (`AttnScoreOut`, `AttnScoreIndptr`, `AttnScoreWindow`), so
+    // what is left is the shape the DSL owns.
+    // EACH UP ONE, because the plan is an operand at `[1]` now. The SLOT
+    // numbers do not move -- a params run is its own space -- only the
+    // positions that read them.
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_capture_bf16);
-    assert!(d[4].is_none());
+    assert!(matches!(d[3], Some(kernels::Source::Slot(kernels::Kind::ParamF32, 0))));
+    assert!(matches!(d[4], Some(kernels::Source::Slot(kernels::Kind::ParamF32, 1))));
     // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
     // fact only the fire can answer, so the body asks its context for it and
     // there is no column entry left to hold in place.
     // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
     // fact only the fire can answer, so the body asks its context for it and
     // there is no column entry left to hold in place.
+    // AT TWO, NOT FOUR: `mask` and `mask_indptr` were bare pointers ahead of
+    // it and are `keys::AttnMask`/`AttnMaskIndptr` now.
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_custom);
-    assert!(matches!(d[4], Some(kernels::Source::Slot(kernels::Kind::ParamF32, 0))));
+    assert!(matches!(d[3], Some(kernels::Source::Slot(kernels::Kind::ParamF32, 0))));
     // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
     // fact only the fire can answer, so the body asks its context for it and
     // there is no column entry left to hold in place.
@@ -2663,21 +2688,32 @@ const _: () = {
     // four on every prefill signature and nothing corresponds to it on
     // decode; the prefill run is six leaves longer, which is what a schedule
     // that tiles QO rows has and a decode schedule does not.
+    // 7 -> 5 AND 7 -> 4 AND 6 -> 4. The capturing pair's two sink pointers and
+    // its window, and the custom form's mask pair, were the last parameters on
+    // this lattice that were not marks -- which is exactly what
+    // `#[routine(untraced)]` meant on the three rows that carried them, and
+    // why those rows had no source column for a binder to read. Every one is a
+    // fact the fire publishes, so all three say `#[routine(no_join)]` now and
+    // the counts below are the statements' own shapes.
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_decode_capture);
-    assert!(d.len() == 7);
+    assert!(d.len() == 6);
+    // THREE, AND THE THIRD IS THE PLAN. `q`, the raise, `o` -- where this
+    // read two and named the plan's twenty-two fields through `ask`, which the
+    // derived column could not see and this ledger could not count. It counts
+    // it now, which is what the operand was for.
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_bf16);
-    assert!(d.len() == 2);
+    assert!(d.len() == 3);
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_capture_bf16);
-    assert!(d.len() == 7);
-    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_custom);
-    assert!(d.len() == 6);
-    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(attention_flashinfer_prefill);
     assert!(d.len() == 5);
-    // The entry this line pinned is gone from the column: the
-    // parameter it named left the signature when its fact stopped
-    // being asked for as a parameter. See the routine.
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_custom);
+    assert!(d.len() == 5);
+    // FOUR AND FIVE, not five and six: the planless pair's `#[unbound] plan`
+    // is gone, the launcher building its own (`plan_own_prefill`). These two
+    // are the only prefill signatures the change touched.
+    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(attention_flashinfer_prefill);
+    assert!(d.len() == 4);
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(attention_flashinfer_prefill_lse);
-    assert!(d.len() == 6);
+    assert!(d.len() == 3);
     // The entry this line pinned is gone from the column: the
     // parameter it named left the signature when its fact stopped
     // being asked for as a parameter. See the routine.
@@ -2849,19 +2885,18 @@ const _: () = {
         assert!(d[i].is_some());
         i += 1;
     }
-    // THE CAPTURE TWIN'S THREE ARE STILL ITS OWN, and they are all that is
-    // left of the difference. `score_out`, `score_indptr` and `score_window`
-    // are `AttnCtx` fields no `Fire` accessor returns, so no column can bind
-    // them -- a bare pointer and an `#[unbound]` scalar say so at the
-    // parameter. Everything else the twin used to carry as a plan leaf is
-    // asked for in the body, on both symbols, which is why the two lists are
-    // the same length again.
+    // THE CAPTURE TWIN'S THREE ARE NOT ITS OWN ANY MORE, and the sentence
+    // that stood here is what they cost. It said `score_out`, `score_indptr`
+    // and `score_window` *"are `AttnCtx` fields no `Fire` accessor returns, so
+    // no column can bind them"* -- which was a statement about the ACCESSORS,
+    // not about the facts. Three accessors and three keys later they bind like
+    // anything else, and the twin's list is its statement's shape.
     let c = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_capture_bf16);
-    assert!(c.len() == 7);
+    assert!(c.len() == 5);
     let mut i = 0;
     while i < c.len() {
-        // The three unbound ones, and nothing else, answer `None`.
-        assert!(c[i].is_some() || i == 2 || i == 3 || i == 4);
+        // NOTHING answers `None` now. That is the claim.
+        assert!(c[i].is_some());
         i += 1;
     }
     // The entry this line pinned is gone from the column: the
@@ -2873,13 +2908,14 @@ const _: () = {
     // The entry this line pinned is gone from the column: the
     // parameter it named left the signature when its fact stopped
     // being asked for as a parameter. See the routine.
-    // THE CUSTOM-MASK TWIN'S TWO, as above: a mask plane and its stride that
-    // no `Fire` accessor returns, so no column binds them.
+    // THE CUSTOM-MASK TWIN'S TWO, as above: `keys::AttnMask` and
+    // `AttnMaskIndptr` now, where a bare pointer pair used to say that no
+    // column could bind them.
     let m = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_prefill_custom);
-    assert!(m.len() == 6);
+    assert!(m.len() == 5);
     let mut i = 0;
     while i < m.len() {
-        assert!(m[i].is_some() || i == 2 || i == 3);
+        assert!(m[i].is_some());
         i += 1;
     }
     // The entry this line pinned is gone from the column: the
@@ -2916,10 +2952,10 @@ const _: () = {
     // parameter it named left the signature when its fact stopped
     // being asked for as a parameter. See the routine.
 
-    // The capture twin, whose two extra parameters at 24/25 push the tail
-    // to 26..29.
+    // The capture twin, which is ONE longer than the plain pair and no longer
+    // two: `window_left` is a `Const` here where the plain form asks for it.
     let c = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_decode_capture);
-    assert!(c.len() == 7);
+    assert!(c.len() == 6);
     // The parameter this pinned has left the signature: what it
     // named is a fact only the fire can answer, asked for in the body.
     // The parameter this pinned has left the signature: what it
@@ -2930,11 +2966,11 @@ const _: () = {
     // parameter it named left the signature when its fact stopped
     // being asked for as a parameter. See the routine.
 
-    // EVERY COLUMN ON THE DECODE THREE IS ANSWERED. What keeps the arm is
-    // `fire/launch.rs:223` and nothing in this list: a replay runs no arm, so
-    // the H2D that refreshes the plan descriptor has to happen somewhere
-    // `Bound::derived` -- which goes straight to `table::dispatch` -- does
-    // not.
+    // EVERY COLUMN ON THE DECODE THREE IS ANSWERED, AND NOTHING KEEPS AN ARM.
+    // This said the H2D *"has to happen somewhere `Bound::derived` does not"*,
+    // which was true of the arm and false of the launcher: `upload_plan` runs
+    // in the body, inside the captured region, so a replay re-runs it exactly
+    // as it re-ran the arm's copy.
     let e = kernels::routine::sources::<crate::jit::Cuda, _, _>(dispatch_attention_flashinfer_decode_lse);
     let mut i = 0;
     while i < d.len() {
@@ -2942,16 +2978,16 @@ const _: () = {
         assert!(e[i].is_some());
         i += 1;
     }
-    // THE CAPTURE TWIN IS TWO SHORT, AND THEY ARE ITS OWN TWO. `score_out`
-    // and `score_indptr` are the `AttnCtx` fields the capture spelling
-    // publishes into; no `Fire` accessor returns either, so there is nothing
-    // for a key to be answered off. They sit at 2 and 3 now rather than 24 and
-    // 25 -- not because they moved, but because the twenty-odd plan leaves
-    // that used to sit between the operands and them are asked for in the body
-    // and occupy no argument position at all.
+    // THE CAPTURE TWIN IS NOT SHORT OF ANYTHING. The sentence that stood here
+    // said `score_out` and `score_indptr` are `AttnCtx` fields *"no `Fire`
+    // accessor returns, so there is nothing for a key to be answered off"* --
+    // which described the accessors rather than the fields. Both are keys now
+    // (`AttnScoreOut`, `AttnScoreIndptr`), answered off the same `attn_ctx()`
+    // every other attention fact comes through, and the twin's column is
+    // complete.
     let mut i = 0;
     while i < c.len() {
-        assert!(c[i].is_some() || i == 2 || i == 3);
+        assert!(c[i].is_some());
         i += 1;
     }
     // The entry this line pinned is gone from the column: the

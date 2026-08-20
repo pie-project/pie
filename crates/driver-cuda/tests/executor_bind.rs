@@ -32,6 +32,7 @@ use model_ir::trace::{FireClass, ValueId};
 struct Sentinels {
     weights: BTreeSet<String>,
     named: BTreeSet<ValueId>,
+    raised: BTreeSet<String>,
 }
 
 impl Resolver for Sentinels {
@@ -42,6 +43,21 @@ impl Resolver for Sentinels {
     fn named(&mut self, value: ValueId) -> Option<*mut c_void> {
         self.named.insert(value);
         Some(0x2000 as *mut c_void)
+    }
+    /// A THIRD SENTINEL, for the third thing a trace can name.
+    ///
+    /// `Resolver::raised` defaults to `None` — most resolvers hold no raises —
+    /// and this one answers every name by construction, which is what makes it
+    /// a census of what the plan ASKED rather than of what a fire holds. Left
+    /// on the default it refused `fa2.prefill` the moment the prefill launcher
+    /// began naming its plan, which is the default doing its job and not a
+    /// defect in it.
+    fn raised(&mut self, value: ValueId, key: &str) -> Option<*const c_void> {
+        self.raised.insert(key.to_string());
+        // ONE SENTINEL PER VALUE, so a launch that bound the wrong raise is a
+        // different address rather than the same one. The census above records
+        // the WORD; this records which object the statement named.
+        Some((0x3000 + value as usize) as *const c_void)
     }
 }
 
@@ -1480,31 +1496,20 @@ fn every_kernel_a_marked_fire_lowers_to_has_a_bridge_row() {
 /// answers, and it died when the descent moved the answer out of that
 /// `match`.
 ///
-/// The `bind::arms` registries are VALUES. A `Bound` carries the symbol, an
-/// `Option<Arm>` and an `Option<&str>` reason, and `arms::bound` looks one
-/// up — so the question can be asked properly, and it separates three states
-/// a text scan flattened into two:
+/// `bind::route::route` ANSWERS IT. It used to be a lookup in a table of
+/// `Bound` values and the table is gone; the question is the same and the
+/// answer is derived, which separates four states a text scan flattened into
+/// two:
 ///
-/// * **armed** — an `Arm` runs it;
-/// * **unbound** — no arm, and a sentence saying why, which
-///   `Bound::run` turns into a refusal naming the missing fact. That is a
-///   stated gap, and stated gaps are this tree's idiom, not its failures;
-/// * **absent** — the registries do not mention the symbol at all. A fire
-///   reaches `bind/mod.rs`'s `other =>` and refuses `NoArm`: a message about
-///   dispatch, naming neither what is missing nor who would supply it.
+/// * **bound** — the routine's own column runs it;
+/// * **driver** — `#[routine(driver)]`, and `bind::dispatch`'s match fires it;
+/// * **unbound** — a parameter nothing states, named. That is a stated gap,
+///   and stated gaps are this tree's idiom, not its failures;
+/// * **unknown** — no routine declares it, or one does and says `internal`.
+///   A fire naming one refuses `NoArm`: a message about dispatch, naming
+///   neither what is missing nor who would supply it.
 ///
-/// Only the third is a defect, and it is the one nothing could see. The
-/// bridge-row tests above cannot: a row and an arm are different questions,
-/// and a symbol can have the first without the second — which is exactly
-/// what happened to `driver_internal`'s four while `sigs()` grew to cover
-/// them.
-///
-/// # Why the reason belongs in the registry and not in a list here
-///
-/// A `Bound { arm: None, unbound: Some(..) }` puts the account beside the
-/// arms, in the field designed to hold it, where the person writing the arm
-/// will read it. An exemption list in a test puts it where only a failure
-/// sends anyone.
+/// Only the fourth is a defect, and it is the one nothing could see.
 #[test]
 fn every_lowered_symbol_runs_or_says_why_not() {
     let mut absent: BTreeSet<String> = BTreeSet::new();
@@ -1531,10 +1536,11 @@ fn every_lowered_symbol_runs_or_says_why_not() {
             "the {what} lowering produced no kernels at all"
         );
         for symbol in &l.kernels {
-            match driver_cuda::bind::arms::bound(symbol) {
-                Some(b) if b.arm.is_some() => armed += 1,
-                Some(_) => stated += 1,
-                None => {
+            match driver_cuda::bind::route::route(symbol) {
+                driver_cuda::bind::route::Route::Bound(_)
+                | driver_cuda::bind::route::Route::Driver => armed += 1,
+                driver_cuda::bind::route::Route::Unbound(_) => stated += 1,
+                driver_cuda::bind::route::Route::Unknown => {
                     absent.insert(symbol.clone());
                 }
             }
@@ -1546,15 +1552,16 @@ fn every_lowered_symbol_runs_or_says_why_not() {
     // for everything would report nothing and look like success.
     assert!(
         armed > 50,
-        "only {armed} armed symbols — the registry lookup broke"
+        "only {armed} runnable symbols — the derivation broke"
     );
     assert!(
         absent.is_empty(),
         "symbols a live deployment lowers to that the arm registries do not mention. \
          A fire naming one refuses with `NoArm`, which names neither what is missing \
-         nor who would supply it. Give each an arm, or a `Bound {{ arm: None, unbound: \
-         Some(..) }}` saying why there is none: {absent:?}\n\
-         ({armed} armed, {stated} stated-unbound across {} lowerings)",
+         nor who would supply it. Either no `#[routine]` declares the symbol, or one \
+         does and says `internal` -- which means a text is naming a body other \
+         routines call: {absent:?}\n\
+         ({armed} runnable, {stated} refused across {} lowerings)",
         corpus.len()
     );
 }

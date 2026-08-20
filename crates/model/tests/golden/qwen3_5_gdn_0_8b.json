@@ -154,7 +154,7 @@
       "kind": {
         "Rmsnorm": {
           "weight": "layer.0.attn_norm",
-          "variant": "Gemma"
+          "variant": "Plain"
         }
       },
       "inputs": [

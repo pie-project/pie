@@ -4,21 +4,9 @@
 //! the buffer order lives only in the shader's `@binding` numbering.
 
 use kernels_macros::routine;
-use kernels::KernelSig;
 use kernels::routine::{Refusal};
 
 use crate::routine::{Asks, Bind, Ctx, Fire, In, Out, Tensor, bf16, keys};
-
-/// EMPTY: this family's rows have been RETIRED — `driver-wgpu`'s
-/// `lowering::arm::argmax_logits` is this kernel's arm. The static stays
-/// because `lib.rs` sums the family tables into `KERNELS`.
-pub static KERNELS: &[KernelSig] = &[];
-
-/// The entrypoints this family's routines spell, now that its rows are gone.
-///
-/// `entrypoints()` is what the sweeps walk, and one compiles every name on a
-/// real adapter; a name stated nowhere is one that sweep stops building.
-pub static ENTRYPOINTS: &[&str] = &["argmax_logits_bfloat16"];
 
 /// `sample/argmax.wgsl` — `@compute @workgroup_size(256)`.
 ///

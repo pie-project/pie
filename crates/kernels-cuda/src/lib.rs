@@ -64,6 +64,9 @@ pub mod routine;
 /// The rows nothing can derive, because their host programs are `driver-cuda`'s.
 pub mod source;
 
+/// What this plane's fires RAISE, declared. See [`kernels::raises`].
+pub mod raises;
+
 /// Host programs `driver-cuda` calls directly, which are not a family.
 pub mod driver_internal;
 
@@ -191,6 +194,10 @@ pub fn sigs() -> &'static [KernelSig] {
                     depth_prefix_plan: r.depth_prefix_plan,
                     sources: r.sources,
                     derived: r.derived,
+                    internal: r.internal,
+                    asked: r.asked,
+                    no_join: r.no_join,
+                    driver: r.driver,
                     ..SIG_BASE
                 });
             }
@@ -209,6 +216,10 @@ const SIG_BASE: KernelSig = KernelSig {
     sources: &[],
     derived: &[],
     axes: &[],
+    internal: false,
+    asked: &[],
+    no_join: false,
+    driver: false,
 };
 
 /// The routine one trace symbol names, or `None` if no crossed family declares

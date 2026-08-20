@@ -23,10 +23,15 @@ using namespace metal;
 // wrong about the same checkpoint read as it shipped.
 #include "mxfp4_codec.h"
 
-struct DequantParams {
-    uint blocks;      // E8M0 exponents, one per block
-    uint block_size;  // elements per block
-};
+// THE TWO COUNTS ARE SCALARS, NOT A STRUCT.
+//
+// `DequantParams { blocks, block_size }` was a `constant&` at buffer 3 --
+// eight bytes behind a staged block -- and the two numbers are not one thing:
+// `blocks` is the launch's row count, which the ROUTINE derives from
+// `keys::Rows`, and `block_size` is what the STATEMENT states as a
+// `Const<i32>` mark. `quant/transcode.wgsl` already read them as two fields of
+// its own `@group(1)` block; this is that arrangement on the plane the struct
+// came from. `EncodeParams` below went the same way, for the same reason.
 
 /// One thread per block. The block is 32 elements in gpt-oss, so this is 16
 /// bytes read and 64 written -- wide enough that per-thread setup disappears
@@ -35,10 +40,11 @@ kernel void mxfp4_dequant_bf16(
     device const uchar* payload [[buffer(0)]],
     device const uchar* exponents [[buffer(1)]],
     device bfloat* out [[buffer(2)]],
-    constant DequantParams& p [[buffer(3)]],
+    const constant uint& blocks [[buffer(3)]],
+    const constant uint& block_size [[buffer(4)]],
     uint gid [[thread_position_in_grid]]) {
-    if (gid >= p.blocks) return;
-    const uint pb = p.block_size;
+    if (gid >= blocks) return;
+    const uint pb = block_size;
     const float factor = mxfp4_block_scale(exponents[gid]);
     const uint first = gid * pb;
     for (uint i = 0; i < pb; i += 2) {
@@ -49,11 +55,6 @@ kernel void mxfp4_dequant_bf16(
 }
 
 // ── BF16/F32 -> MLX affine U4, groups of 64 ──────────────────────────────────
-
-struct EncodeParams {
-    uint groups;      // total groups across the whole tensor
-    uint group_size;  // elements per group; 64 for every affine tensor here
-};
 
 /// The (scale, bias) MLX picks for one group.
 ///
@@ -95,14 +96,18 @@ inline void encode_affine_group(
     device uint* codes,
     device bfloat* scales,
     device bfloat* biases,
-    constant EncodeParams& p,
+    // The two that were `EncodeParams`. A helper takes them by value: they are
+    // scalars the entrypoint already holds, and threading a reference to a
+    // struct that no longer exists would be the only reason to keep one.
+    uint groups,
+    uint group_size,
     uint gid) {
-    if (gid >= p.groups) return;
-    const uint first = gid * p.group_size;
+    if (gid >= groups) return;
+    const uint first = gid * group_size;
 
     float w_min = INFINITY;
     float w_max = 0.0f;
-    for (uint i = 0; i < p.group_size; ++i) {
+    for (uint i = 0; i < group_size; ++i) {
         const float value = float(input[first + i]);
         w_min = min(w_min, value);
         w_max = max(w_max, value);
@@ -114,7 +119,7 @@ inline void encode_affine_group(
     // The codes come from the f32 parameters, not their BF16 rounding: MLX
     // rounds only on store, and agreeing with MLX matters more than being
     // self-consistent with what the runtime will read back.
-    for (uint w = 0; w < p.group_size / 8; ++w) {
+    for (uint w = 0; w < group_size / 8; ++w) {
         uint packed = 0;
         for (uint k = 0; k < 8; ++k) {
             const float value = float(input[first + w * 8 + k]);
@@ -130,9 +135,10 @@ kernel void affine_encode_u4_bf16(
     device uint* codes [[buffer(1)]],
     device bfloat* scales [[buffer(2)]],
     device bfloat* biases [[buffer(3)]],
-    constant EncodeParams& p [[buffer(4)]],
+    const constant uint& groups [[buffer(4)]],
+    const constant uint& group_size [[buffer(5)]],
     uint gid [[thread_position_in_grid]]) {
-    encode_affine_group<bfloat>(input, codes, scales, biases, p, gid);
+    encode_affine_group<bfloat>(input, codes, scales, biases, groups, group_size, gid);
 }
 
 kernel void affine_encode_u4_f32(
@@ -140,7 +146,8 @@ kernel void affine_encode_u4_f32(
     device uint* codes [[buffer(1)]],
     device bfloat* scales [[buffer(2)]],
     device bfloat* biases [[buffer(3)]],
-    constant EncodeParams& p [[buffer(4)]],
+    const constant uint& groups [[buffer(4)]],
+    const constant uint& group_size [[buffer(5)]],
     uint gid [[thread_position_in_grid]]) {
-    encode_affine_group<float>(input, codes, scales, biases, p, gid);
+    encode_affine_group<float>(input, codes, scales, biases, groups, group_size, gid);
 }

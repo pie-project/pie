@@ -7,7 +7,6 @@
 
 
 #include "common/bf16.slang"
-#include "ssm/gdn_params.slang"
 
 
 PIE_BUFFER_RO(0, mixed);
@@ -21,10 +20,48 @@ PIE_BUFFER_RO(7, dt_bias);
 PIE_BUFFER_RO(8, a_gate);
 PIE_BUFFER_RO(9, b_gate);
 [[vk::binding(10)]] RWStructuredBuffer<float> new_conv_state;
-PIE_PARAMS(11, GdnCoreParams, p);
 #if defined(PIE_SLOTTED)
-[[vk::binding(12)]] StructuredBuffer<uint> slot_ids;
+[[vk::binding(11)]] StructuredBuffer<uint> slot_ids;
 #endif
+
+// THE GEOMETRY IS A PUSH BLOCK, NOT A STORAGE STRUCT.
+//
+// This read `PIE_PARAMS(11, GdnCoreParams, p)` out of `ssm/gdn_params.slang`,
+// which was Metal's `gdn_params.h` ported field for field and said so: the
+// order was the launch contract because the HOST filled the same struct for
+// every backend. Three copies of one layout, checked nowhere, and a storage
+// block for forty-four live bytes cost this plane a descriptor, a staging slot
+// and the sentinel `Holds::params_block` mints for a buffer with no address.
+//
+// The routine names all eleven as `Const<i32>`/`Const<f32>` marks now, so the
+// contract is a SIGNATURE and the host fills nothing: the eleven are words
+// 0..10 of the same statement run the struct was staged from, reached by index
+// instead of by field, and `driver-vulkan::encode::words` packs them into this
+// range in the order the body passes them. Forty-four bytes is a push range on
+// every device this targets -- `Device::max_push` is guaranteed 128 -- and the
+// range the pipeline is built against is reflected out of the SPIR-V, so a
+// block that drifted from the body's list is a `Fault::PushRange` rather than
+// a shader reading a neighbour's number.
+//
+// The ORDER below is `model-dsl`'s `GdnShape::params`, because that is the
+// statement's and the marks are positional in it. `Dk` and `Dv` are the key
+// and value head dimensions and are NOT the same number in a GDN checkpoint;
+// `Hk` and `Hv` likewise, and `Hv / Hk` is the group-query replication factor
+// the conv-state writeback below is keyed on.
+struct Push {
+    int Dk;
+    int Dv;
+    int Hk;
+    int Hv;
+    int conv_dim;
+    int Kc;
+    int q_off;
+    int k_off;
+    int v_off;
+    float eps;
+    float inv_sqrt_dk;
+};
+[[vk::push_constant]] ConstantBuffer<Push> pc;
 
 groupshared float sh_reduce[4 * 32];
 
@@ -49,31 +86,31 @@ float row_sum32(float v, uint lx, uint ly) {
 
 float convsilu(int slot, int b_idx, int c) {
     float acc = PIE_LOAD(conv_b[c]);
-    for (int j = 0; j < p.Kc - 1; ++j)
-        acc += conv_state[(slot * p.Kc + (j + 1)) * p.conv_dim + c] * PIE_LOAD(conv_w[c * p.Kc + j]);
-    acc += PIE_LOAD(mixed[b_idx * p.conv_dim + c]) * PIE_LOAD(conv_w[c * p.Kc + (p.Kc - 1)]);
+    for (int j = 0; j < pc.Kc - 1; ++j)
+        acc += conv_state[(slot * pc.Kc + (j + 1)) * pc.conv_dim + c] * PIE_LOAD(conv_w[c * pc.Kc + j]);
+    acc += PIE_LOAD(mixed[b_idx * pc.conv_dim + c]) * PIE_LOAD(conv_w[c * pc.Kc + (pc.Kc - 1)]);
     return silu(acc);
 }
 
 void write_conv(int slot, int b_idx, int c) {
-    for (int j = 0; j < p.Kc - 1; ++j)
-        new_conv_state[(slot * p.Kc + j) * p.conv_dim + c] =
-            conv_state[(slot * p.Kc + (j + 1)) * p.conv_dim + c];
-    new_conv_state[(slot * p.Kc + (p.Kc - 1)) * p.conv_dim + c] =
-        PIE_LOAD(mixed[b_idx * p.conv_dim + c]);
+    for (int j = 0; j < pc.Kc - 1; ++j)
+        new_conv_state[(slot * pc.Kc + j) * pc.conv_dim + c] =
+            conv_state[(slot * pc.Kc + (j + 1)) * pc.conv_dim + c];
+    new_conv_state[(slot * pc.Kc + (pc.Kc - 1)) * pc.conv_dim + c] =
+        PIE_LOAD(mixed[b_idx * pc.conv_dim + c]);
 }
 
 [numthreads(32, 4, 1)]
 void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID, uint3 tid : SV_DispatchThreadID) {
     int n = int(group.z);
-    int b_idx = n / p.Hv;
-    int hv_idx = n % p.Hv;
-    int rep = p.Hv / p.Hk;
+    int b_idx = n / pc.Hv;
+    int hv_idx = n % pc.Hv;
+    int rep = pc.Hv / pc.Hk;
     int hk_idx = hv_idx / rep;
     bool hk_first = (hv_idx % rep) == 0;
     int dk_idx = int(local.x);
     int dv_idx = int(tid.y);
-    int n_per_t = p.Dk / 32;
+    int n_per_t = pc.Dk / 32;
 #if defined(PIE_SLOTTED)
     int slot = int(slot_ids[b_idx]);
 #else
@@ -86,21 +123,21 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID, uint3 tid : 
     float ksq = 0.0;
     for (int i = 0; i < n_per_t; ++i) {
         int d = n_per_t * dk_idx + i;
-        qraw[i] = convsilu(slot, b_idx, p.q_off + hk_idx * p.Dk + d);
-        kraw[i] = convsilu(slot, b_idx, p.k_off + hk_idx * p.Dk + d);
+        qraw[i] = convsilu(slot, b_idx, pc.q_off + hk_idx * pc.Dk + d);
+        kraw[i] = convsilu(slot, b_idx, pc.k_off + hk_idx * pc.Dk + d);
         qsq += qraw[i] * qraw[i];
         ksq += kraw[i] * kraw[i];
     }
-    float qinv = p.inv_sqrt_dk / sqrt(row_sum32(qsq, local.x, local.y) + p.eps);
-    float kinv = 1.0 / sqrt(row_sum32(ksq, local.x, local.y) + p.eps);
+    float qinv = pc.inv_sqrt_dk / sqrt(row_sum32(qsq, local.x, local.y) + pc.eps);
+    float kinv = 1.0 / sqrt(row_sum32(ksq, local.x, local.y) + pc.eps);
 
-    float vval = convsilu(slot, b_idx, p.v_off + hv_idx * p.Dv + dv_idx);
-    float ad = PIE_LOAD(a_gate[b_idx * p.Hv + hv_idx]) + PIE_LOAD(dt_bias[hv_idx]);
+    float vval = convsilu(slot, b_idx, pc.v_off + hv_idx * pc.Dv + dv_idx);
+    float ad = PIE_LOAD(a_gate[b_idx * pc.Hv + hv_idx]) + PIE_LOAD(dt_bias[hv_idx]);
     float sp = max(ad, 0.0) + log(1.0 + exp(-abs(ad)));
     float decay = exp(-exp(A_log[hv_idx]) * sp);
-    float beta = 1.0 / (1.0 + exp(-PIE_LOAD(b_gate[b_idx * p.Hv + hv_idx])));
+    float beta = 1.0 / (1.0 + exp(-PIE_LOAD(b_gate[b_idx * pc.Hv + hv_idx])));
 
-    uint state_base = uint(((slot * p.Hv + hv_idx) * p.Dv + dv_idx) * p.Dk);
+    uint state_base = uint(((slot * pc.Hv + hv_idx) * pc.Dv + dv_idx) * pc.Dk);
     float st[8];
     float kv = 0.0;
     for (int i = 0; i < n_per_t; ++i) {
@@ -119,16 +156,16 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID, uint3 tid : 
         rstate[state_base + uint(d)] = st[i];
     }
     outv = row_sum32(outv, local.x, local.y);
-    if (dk_idx == 0) core_out[(b_idx * p.Hv + hv_idx) * p.Dv + dv_idx] = PIE_STORE(outv);
+    if (dk_idx == 0) core_out[(b_idx * pc.Hv + hv_idx) * pc.Dv + dv_idx] = PIE_STORE(outv);
 
     if (dv_idx == 0 && hk_first) {
         for (int i = 0; i < n_per_t; ++i) {
             int d = n_per_t * dk_idx + i;
-            write_conv(slot, b_idx, p.q_off + hk_idx * p.Dk + d);
-            write_conv(slot, b_idx, p.k_off + hk_idx * p.Dk + d);
+            write_conv(slot, b_idx, pc.q_off + hk_idx * pc.Dk + d);
+            write_conv(slot, b_idx, pc.k_off + hk_idx * pc.Dk + d);
         }
     }
-    write_conv(slot, b_idx, p.v_off + hv_idx * p.Dv + dv_idx);
+    write_conv(slot, b_idx, pc.v_off + hv_idx * pc.Dv + dv_idx);
 }
 
 // pie:instantiate gdn_core_bfloat16

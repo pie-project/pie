@@ -2833,7 +2833,14 @@ pub mod qkv_fused {
             "qkv_decode_fused_dispatch",
             qkv_decode_fused_dispatch,
             namespace = "attn"
-        );
+        )
+        // AND OUTSIDE THE TRACE VOCABULARY, which `untraced!` does not say on
+        // its own: that macro says *"no column, and a string dispatch must
+        // refuse"*, which is also true of eight FA2 launchers a text names
+        // every fire. This says the other half -- no text may name it at all,
+        // so `route` answers `Unknown` rather than admitting a body whose
+        // parameters are bare pointers.
+        .internal();
 
     /// `attn/qkv_fused.cu:160` — `qkv_decode_qk_norm_rope_write_kv_bf16`.
     ///
@@ -3632,7 +3639,7 @@ pub mod kv_paged {
     /// written that answer around the old `Err` -- `arms/fa2.rs`'s
     /// `dequant_prelude` with `let _ =`, `dequant_kv_active_arm` with an
     /// `is_native_bf16` branch -- so no caller ever wanted the decline.
-    #[routine]
+    #[routine(driver)]
     #[allow(clippy::too_many_arguments)]
     pub fn dequant_kv_cache_layer_to_bf16_active(
         ctx: &Ctx<'_>) -> Result<(), Refusal> {
@@ -4274,7 +4281,7 @@ pub fn logit_softcap<T>(
 /// **No `Bound` row names this symbol.** The column below is derived from the
 /// signature and from [`logit_softcap`]'s arm, which is the same launch over
 /// a different element type; nothing else was assumed.
-#[routine]
+#[routine(internal)]
 pub fn logit_softcap_f16(
     ctx: &Ctx<'_>,
     x: InOut<Tensor<f16>>) -> Result<(), Refusal> {

@@ -118,6 +118,17 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
                             layer: l,
                         },
                         &rs,
+                        // mamba's conv carries the fused `[z | conv_dim | dt]`
+                        // block's middle third. The GDN recurrence numbers are
+                        // not this family's and are stated zero.
+                        dsl::cuda::GdnShape {
+                            k_heads: 0,
+                            v_heads: mb.num_heads,
+                            k_dim: 0,
+                            v_dim: mb.head_dim,
+                            conv_dim: mb.conv_dim(),
+                            conv_k: mb.conv_kernel,
+                        },
                     );
                     // `dt` and the decay `A` are per-token and computed
                     // ONCE, before the scan — a separate statement

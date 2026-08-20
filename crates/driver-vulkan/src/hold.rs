@@ -1449,26 +1449,19 @@ mod tests {
                 c.stem
             );
         }
-        for family in [
-            kernels_vulkan::sample::ROUTINES,
-            kernels_vulkan::ptir::ROUTINES,
-            kernels_vulkan::mlp::ROUTINES,
-            kernels_vulkan::layout::ROUTINES,
-            kernels_vulkan::rope::ROUTINES,
-            kernels_vulkan::norm::ROUTINES,
-            kernels_vulkan::ssm::ROUTINES,
-            kernels_vulkan::moe::ROUTINES,
-            kernels_vulkan::attn::ROUTINES,
-            kernels_vulkan::quant::ROUTINES,
-        ] {
-            for r in family {
-                assert!(
-                    LIVE.iter()
-                        .any(|c| c.routine.is_some_and(|held| held.name == r.name)),
-                    "`{}`'s family has landed, so it needs an arm too",
-                    r.name
-                );
-            }
+        // ONE LIST, WHERE THERE WERE TEN. Each module used to publish its own
+        // `ROUTINES`, and this walk named all ten so that a module added
+        // without a line here would be missed rather than silently uncovered.
+        // The crate publishes a single `routines()` now -- the census the
+        // proc macro builds -- so naming it is naming all of them, and the
+        // gap this loop was shaped to catch cannot open.
+        for r in kernels_vulkan::routines() {
+            assert!(
+                LIVE.iter()
+                    .any(|c| c.routine.is_some_and(|held| held.name == r.name)),
+                "`{}`'s family has landed, so it needs an arm too",
+                r.name
+            );
         }
     }
 

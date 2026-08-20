@@ -1,13 +1,13 @@
 // The gated activations: one file because they are one BINDING CONTRACT.
 //
 // All three take `(gate, up, out)` at buffers 0, 1, 2 and differ only in the
-// arithmetic between them -- and, for two of the three, in a params buffer at
+// arithmetic between them -- and, for one of the three, in a params buffer at
 // 3. They were three files of forty to ninety lines, which is a directory
 // listing that tells a reader nothing about which one their tensors fit.
 //
 //   silu_mul       out = silu(gate) * up                    no params
-//   geglu_tanh     out = gelu_tanh(gate) * up               GegluParams
-//   gptoss_swiglu  gpt-oss's clamped, alpha-scaled SwiGLU   GptOssSwiGluParams
+//   geglu_tanh     out = gelu_tanh(gate) * up               no params
+//   gptoss_swiglu  gpt-oss's clamped, alpha-scaled SwiGLU   limit, alpha
 //
 // The third earns its model name and keeps it: it bakes gpt-oss's asymmetric
 // clamp, its `alpha` and its `(up + 1)` term, which is nobody else's SwiGLU.
@@ -68,13 +68,16 @@ instantiate_silu_mul_strided(bfloat16, bfloat)
 
 instantiate_silu_mul(bfloat16, bfloat)
 
-// THE GRID IS THE EXTENT, so this carries no count.
+// THE GRID IS THE EXTENT, so this carries no count -- and, now, no params
+// buffer either.
 //
-// `n` used to be here and used to be read as `if (gid >= p.n) return;`. It
-// was stated by the text as the INTERMEDIATE WIDTH -- one row -- and the
-// dispatch covers `width * rows`, so every row after the first returned
-// immediately. A prefill's second token came back as zeros; a decode is one
-// row and never noticed.
+// `struct GegluParams { uint unused; }` stood here, taken by `geglu_tanh` as
+// `constant GegluParams& p [[buffer(3)]]` and immediately `(void)p`'d. Its one
+// field was `n`, read as `if (gid >= p.n) return;`. `n` was stated by the text
+// as the INTERMEDIATE WIDTH -- one row -- and the dispatch covers
+// `width * rows`, so every row after the first returned immediately. A
+// prefill's second token came back as zeros; a decode is one row and never
+// noticed.
 //
 // A per-row number cannot bound a whole-tensor dispatch, and the text cannot
 // state the whole: its shape says `[Tokens, intermediate]` and `Tokens` is
@@ -83,12 +86,18 @@ instantiate_silu_mul(bfloat16, bfloat)
 // output operand, so the dispatch is exactly the element count and a second
 // bound is a second answer to a question already answered.
 //
+// So the bound went and the field stayed, renamed `unused`, holding the
+// struct's size open. What kept the ARGUMENT after that was the row: it stated
+// `params: Buf`, an argument slot the encoder had to fill because an argument
+// table with a hole in it is not something it can be asked for, and all three
+// backends shaped their bind layouts from the same row. With the row retired
+// and `mlp::geglu_tanh` no longer calling `ctx.params()`, one field nothing
+// reads is not worth a buffer, a staged word and a slot: buffer 3 is simply
+// absent from this entrypoint and from its `instantiate` list.
+//
 // `silu_mul` above takes no params for exactly this reason and has always
-// been right. This is now the same shape.
-struct GegluParams {
-  uint unused;
-};
-
+// been right. This is now literally the same shape, and not merely the same
+// shape with a dead argument on the end.
 inline float gelu_tanh(float x) {
   constexpr float k = 0.7978845608028654f;  // sqrt(2/pi)
   const float inner = k * (x + 0.044715f * x * x * x);
@@ -100,9 +109,7 @@ template <typename T>
     const device T* gate      [[buffer(0)]],
     const device T* up        [[buffer(1)]],
     device T* out             [[buffer(2)]],
-    constant GegluParams& p   [[buffer(3)]],
     uint gid                  [[thread_position_in_grid]]) {
-  (void)p;
   const float g = gelu_tanh(static_cast<float>(gate[gid]));
   out[gid] = static_cast<T>(g * static_cast<float>(up[gid]));
 }
@@ -110,8 +117,7 @@ template <typename T>
 #define instantiate_geglu_tanh(name, itype)                            \
   template [[host_name("geglu_tanh_" #name)]]                          \
   [[kernel]] void geglu_tanh<itype>(                                   \
-      const device itype*, const device itype*, device itype*,         \
-      constant GegluParams&, uint);
+      const device itype*, const device itype*, device itype*, uint);
 
 instantiate_geglu_tanh(bfloat16, bfloat)
 
@@ -129,16 +135,9 @@ instantiate_geglu_tanh(bfloat16, bfloat)
 //
 // So the pitches are stated. At rows==1 every pitch is unused and this is the
 // flat kernel with an offset, which is what the M=1 path keeps doing.
-struct GegluStridedParams {
-  uint width;       // elements per row (ple_dim)
-  uint unused;      // was the row count -- see below
-  uint gate_pitch;  // elements between rows of `gate`
-  uint up_pitch;    // ... of `up` -- the wide one
-  uint out_pitch;   // ... of `out`
-};
 
 // THE GRID IS THE EXTENT, and the second word is dead for the same reason
-// `GegluParams`' is.
+// `GegluParams`' one word was, before that struct was deleted outright.
 //
 // This body read `gid.y` as the row and bounded itself with
 // `if (k >= p.width || m >= p.rows) return;`. Its row states
@@ -170,28 +169,39 @@ template <typename T>
     const device T* gate            [[buffer(0)]],
     const device T* up              [[buffer(1)]],
     device T* out                   [[buffer(2)]],
-    constant GegluStridedParams& p  [[buffer(3)]],
+    // THE FIVE THAT WERE `GegluStridedParams`, one `setBytes` apiece. `rows`
+    // is bound and not read here: the grid is the extent on this plane, and
+    // the field is kept in the argument list because the ROW states five words
+    // and the three planes share that run field for field.
+    const constant uint& width      [[buffer(3)]],
+    const constant uint& rows       [[buffer(4)]],
+    const constant uint& gate_pitch [[buffer(5)]],
+    const constant uint& up_pitch   [[buffer(6)]],
+    const constant uint& out_pitch  [[buffer(7)]],
     uint gid [[thread_position_in_grid]]) {
-  const uint m = gid / p.width;
-  const uint k = gid - m * p.width;
-  const float g = float(gate[size_t(m) * size_t(p.gate_pitch) + k]);
-  const float u = float(up[size_t(m) * size_t(p.up_pitch) + k]);
-  out[size_t(m) * size_t(p.out_pitch) + k] = static_cast<T>(gelu_tanh(g) * u);
+  (void)rows;
+  const uint m = gid / width;
+  const uint k = gid - m * width;
+  const float g = float(gate[size_t(m) * size_t(gate_pitch) + k]);
+  const float u = float(up[size_t(m) * size_t(up_pitch) + k]);
+  out[size_t(m) * size_t(out_pitch) + k] = static_cast<T>(gelu_tanh(g) * u);
 }
 
 #define instantiate_geglu_strided(name, itype)                     \
   template [[host_name("geglu_tanh_strided_" #name)]]              \
   [[kernel]] void geglu_tanh_strided<itype>(                       \
       const device itype*, const device itype*, device itype*,     \
-      constant GegluStridedParams&, uint);
+      const constant uint&, const constant uint&, const constant uint&, \
+      const constant uint&, const constant uint&, uint);
 
 instantiate_geglu_strided(bfloat16, bfloat)
 
-struct GptOssSwiGluParams {
-  uint unused;   // was a per-row element count -- see `GegluParams`
-  float limit;   // 7.0
-  float alpha;   // 1.702
-};
+// `GptOssSwiGluParams` opened with a per-row element count, dead for the reason
+// stated at length above `gelu_tanh` -- the same number `GegluParams` held, and
+// it outlived that struct only because `limit` and `alpha` beside it are read.
+// A struct has to carry a dead field to keep the live ones at their offsets;
+// two `setBytes` arguments do not, so the dead word is gone from the ABI here
+// and `gptoss_swiglu` declares a slot-holder mark for it host-side instead.
 
 // gpt-oss's SwiGLU, which is not anyone else's.
 //
@@ -206,13 +216,14 @@ template <typename T>
     const device T* gate            [[buffer(0)]],
     const device T* up              [[buffer(1)]],
     device T* out                   [[buffer(2)]],
-    constant GptOssSwiGluParams& p  [[buffer(3)]],
+    const constant float& limit     [[buffer(3)]],   // 7.0
+    const constant float& alpha     [[buffer(4)]],   // 1.702
     uint gid [[thread_position_in_grid]]) {
   float g = float(gate[gid]);
   float u = float(up[gid]);
-  g = min(g, p.limit);
-  u = clamp(u, -p.limit, p.limit);
-  const float sig = 1.0f / (1.0f + fast::exp(-p.alpha * g));
+  g = min(g, limit);
+  u = clamp(u, -limit, limit);
+  const float sig = 1.0f / (1.0f + fast::exp(-alpha * g));
   out[gid] = static_cast<T>((g * sig) * (u + 1.0f));
 }
 
@@ -220,6 +231,6 @@ template <typename T>
   template [[host_name("gptoss_swiglu_" #name)]]                   \
   [[kernel]] void gptoss_swiglu<itype>(                            \
       const device itype*, const device itype*, device itype*,     \
-      constant GptOssSwiGluParams&, uint);
+      const constant float&, const constant float&, uint);
 
 instantiate_gptoss_swiglu(bfloat16, bfloat)

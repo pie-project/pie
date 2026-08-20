@@ -9,265 +9,55 @@ pub struct Header {
     pub text: &'static str,
 }
 
-/// The impersonation layer: headers wearing NVIDIA's and the standard
-/// library's filenames, carried because the source that reaches for them is
-/// source we do not own and the spelling is the contract.
-///
-/// Goes to every compile, with [`LIBRARY`].
-///
-/// # The three lists are the header set, and they are maintained by hand
-///
-/// NVRTC matches `includeNames[]` against the **literal string in the
-/// `#include` directive** -- there is no search path and no resolution -- so
-/// an entry's `name` is exactly what the includer writes, and a header that
-/// is not in the set does not exist as far as a compile is concerned.
-/// **Adding a file under `kernels/` or `shim/` means adding a line to one of
-/// these.**
-///
-/// Forgetting is caught by `every_device_include_resolves` in this file's
-/// tests: it walks the set's own quoted `#include`s and fails on the first one
-/// nothing carries, at `cargo test` and on a machine with no GPU. What it
-/// cannot catch is a file nothing includes yet, or one reached only by an
-/// angled spelling. The compiler catches neither, because a short list still
-/// compiles.
-///
-/// 18 entries, from `shim/`.
-#[rustfmt::skip]
-pub const SHIM: &[Header] = &[
-    Header { name: "array", text: include_str!("../shim/array") },
-    Header { name: "cassert", text: include_str!("../shim/cassert") },
-    Header { name: "cooperative_groups.h", text: include_str!("../shim/cooperative_groups.h") },
-    Header { name: "cstddef", text: include_str!("../shim/cstddef") },
-    Header { name: "cstdint", text: include_str!("../shim/cstdint") },
-    Header { name: "cstring", text: include_str!("../shim/cstring") },
-    Header { name: "cuda.h", text: include_str!("../shim/cuda.h") },
-    Header { name: "cuda/cmath", text: include_str!("../shim/cuda/cmath") },
-    Header { name: "cuda/std/limits", text: include_str!("../shim/cuda/std/limits") },
-    Header { name: "cuda/std/optional", text: include_str!("../shim/cuda/std/optional") },
-    Header { name: "cuda_bf16.h", text: include_str!("../shim/cuda_bf16.h") },
-    Header { name: "cuda_fp16.h", text: include_str!("../shim/cuda_fp16.h") },
-    Header { name: "cuda_fp4.h", text: include_str!("../shim/cuda_fp4.h") },
-    Header { name: "cuda_fp8.h", text: include_str!("../shim/cuda_fp8.h") },
-    Header { name: "cuda_pipeline.h", text: include_str!("../shim/cuda_pipeline.h") },
-    Header { name: "cuda_runtime.h", text: include_str!("../shim/cuda_runtime.h") },
-    Header { name: "math_constants.h", text: include_str!("../shim/math_constants.h") },
-    Header { name: "type_traits", text: include_str!("../shim/type_traits") },
-];
+// ── The three lists, WALKED ────────────────────────────────────────────────
+//
+// `build.rs` writes them from `kernels/` and `shim/`, and this is the whole of
+// what it needed to know:
+//
+// * **which list** a file lands in is its DIRECTORY -- `shim/` to [`SHIM`],
+//   `kernels/flashinfer` and `kernels/xqa` to [`UPSTREAM`], the rest of
+//   `kernels/` to [`LIBRARY`];
+// * **what it is called** is its path minus that root;
+// * **and what else it is called** is scanned out of the `#include` directives
+//   that reach it, because NVRTC matches `includeNames[]` against the literal
+//   string in the directive and resolves nothing. A file two directives spell
+//   two ways needs an entry per spelling.
+//
+// # What the 187 hand-written lines cost, and what they bought
+//
+// They were maintained under a rule a person had to remember -- *"adding a
+// file under `kernels/` or `shim/` means adding a line to one of these"* --
+// and 174 of the 187 were the file's own path written twice. The other 13 were
+// the `../` spellings the upstream trees use to reach their siblings, which
+// `build.rs` finds by reading the directives that write them.
+//
+// The rule was checked from one side only. [`quoted_includes`] and
+// `every_device_include_resolves` walked the set's own includes and failed on
+// the first one nothing carried -- so a MISSING entry was caught, and the doc
+// was upfront that *"a file nothing includes yet"* was not. That gap is closed
+// by construction now: a file is carried because it EXISTS.
+//
+// # This is where the set was before `384aaeed0`
+//
+// A build script generated it, and the script's own header argued the case
+// against checking the output in: *"a stale file still COMPILES. Generated
+// into `OUT_DIR`, it cannot be stale by construction."* The lists were checked
+// in anyway when `kernels-cuda-new` was folded in, for one less compile stage.
+// See `Cargo.toml` for the whole of that argument, which reads the same way
+// now as it did then.
+//
+// `#[allow(clippy::all)]` on the include: the generated rows are one long line
+// each and no lint has anything to tell a table.
+#[allow(clippy::all)]
+mod generated {
+    use super::Header;
+    include!(concat!(env!("OUT_DIR"), "/headers.rs"));
+}
 
-/// This crate's own device text: every `__global__` template a unit compiles
-/// and the prelude they are written over.
-///
-/// Goes to every compile, with [`SHIM`]. See [`SHIM`] for the rule this list
-/// is maintained under.
-///
-/// 89 entries, from `kernels/`, minus the upstream subtrees.
-#[rustfmt::skip]
-pub const LIBRARY: &[Header] = &[
-    Header { name: "attn/attention_flashinfer.cuh", text: include_str!("../kernels/attn/attention_flashinfer.cuh") },
-    Header { name: "attn/attention_mla_fa2.cuh", text: include_str!("../kernels/attn/attention_mla_fa2.cuh") },
-    Header { name: "attn/attention_mla_naive.cuh", text: include_str!("../kernels/attn/attention_mla_naive.cuh") },
-    Header { name: "attn/attention_naive.cuh", text: include_str!("../kernels/attn/attention_naive.cuh") },
-    Header { name: "attn/attention_naive_paged.cuh", text: include_str!("../kernels/attn/attention_naive_paged.cuh") },
-    Header { name: "attn/attention_score_capture.cuh", text: include_str!("../kernels/attn/attention_score_capture.cuh") },
-    Header { name: "attn/attention_score_post.cuh", text: include_str!("../kernels/attn/attention_score_post.cuh") },
-    Header { name: "attn/attention_xqa.cuh", text: include_str!("../kernels/attn/attention_xqa.cuh") },
-    Header { name: "attn/attention_xqa_mha.cuh", text: include_str!("../kernels/attn/attention_xqa_mha.cuh") },
-    Header { name: "attn/attn_res.cuh", text: include_str!("../kernels/attn/attn_res.cuh") },
-    Header { name: "attn/attn_sink.cuh", text: include_str!("../kernels/attn/attn_sink.cuh") },
-    Header { name: "attn/dsa_indexer.cuh", text: include_str!("../kernels/attn/dsa_indexer.cuh") },
-    Header { name: "attn/dsv4_compress.cuh", text: include_str!("../kernels/attn/dsv4_compress.cuh") },
-    Header { name: "attn/fa2.cuh", text: include_str!("../kernels/attn/fa2.cuh") },
-    Header { name: "attn/fa4.cuh", text: include_str!("../kernels/attn/fa4.cuh") },
-    Header { name: "attn/head_dim_pad.cuh", text: include_str!("../kernels/attn/head_dim_pad.cuh") },
-    Header { name: "attn/kimi_mla.cuh", text: include_str!("../kernels/attn/kimi_mla.cuh") },
-    Header { name: "attn/kv_paged.cuh", text: include_str!("../kernels/attn/kv_paged.cuh") },
-    Header { name: "attn/mla_paged.cuh", text: include_str!("../kernels/attn/mla_paged.cuh") },
-    Header { name: "attn/pack_dense_mask.cuh", text: include_str!("../kernels/attn/pack_dense_mask.cuh") },
-    Header { name: "attn/page_compact.cuh", text: include_str!("../kernels/attn/page_compact.cuh") },
-    Header { name: "attn/qkv_fused.cuh", text: include_str!("../kernels/attn/qkv_fused.cuh") },
-    Header { name: "attn/softcap.cuh", text: include_str!("../kernels/attn/softcap.cuh") },
-    Header { name: "attn/split_packed.cuh", text: include_str!("../kernels/attn/split_packed.cuh") },
-    Header { name: "cascade/merge_states.cuh", text: include_str!("../kernels/cascade/merge_states.cuh") },
-    Header { name: "comm/all_reduce.cuh", text: include_str!("../kernels/comm/all_reduce.cuh") },
-    Header { name: "gemm/gemv.cuh", text: include_str!("../kernels/gemm/gemv.cuh") },
-    Header { name: "graph/supergraph.cuh", text: include_str!("../kernels/graph/supergraph.cuh") },
-    Header { name: "prelude/kv_paged_addr.cuh", text: include_str!("../kernels/prelude/kv_paged_addr.cuh") },
-    Header { name: "layout/deinterleave.cuh", text: include_str!("../kernels/layout/deinterleave.cuh") },
-    Header { name: "layout/embed.cuh", text: include_str!("../kernels/layout/embed.cuh") },
-    Header { name: "layout/envelope.cuh", text: include_str!("../kernels/layout/envelope.cuh") },
-    Header { name: "layout/envelope_device.cuh", text: include_str!("../kernels/layout/envelope_device.cuh") },
-    Header { name: "layout/gather_rows.cuh", text: include_str!("../kernels/layout/gather_rows.cuh") },
-    Header { name: "layout/gather_rows_tile.cuh", text: include_str!("../kernels/layout/gather_rows_tile.cuh") },
-    Header { name: "layout/gather_tokens.cuh", text: include_str!("../kernels/layout/gather_tokens.cuh") },
-    Header { name: "layout/geometry.cuh", text: include_str!("../kernels/layout/geometry.cuh") },
-    Header { name: "layout/graph_pad.cuh", text: include_str!("../kernels/layout/graph_pad.cuh") },
-    Header { name: "layout/slot_ops.cuh", text: include_str!("../kernels/layout/slot_ops.cuh") },
-    Header { name: "layout/split_gate_up.cuh", text: include_str!("../kernels/layout/split_gate_up.cuh") },
-    Header { name: "mlp/gaussian_topk.cuh", text: include_str!("../kernels/mlp/gaussian_topk.cuh") },
-    Header { name: "mlp/swiglu.cuh", text: include_str!("../kernels/mlp/swiglu.cuh") },
-    Header { name: "mlp/swiglu_tile.cuh", text: include_str!("../kernels/mlp/swiglu_tile.cuh") },
-    Header { name: "moe/dsv4_routing.cuh", text: include_str!("../kernels/moe/dsv4_routing.cuh") },
-    Header { name: "moe/expert_offsets.cuh", text: include_str!("../kernels/moe/expert_offsets.cuh") },
-    Header { name: "moe/moe_dispatch.cuh", text: include_str!("../kernels/moe/moe_dispatch.cuh") },
-    Header { name: "moe/moe_fused_tile.cuh", text: include_str!("../kernels/moe/moe_fused_tile.cuh") },
-    Header { name: "moe/moe_grouped_gemm.cuh", text: include_str!("../kernels/moe/moe_grouped_gemm.cuh") },
-    Header { name: "moe/moe_grouped_gemm_tile.cuh", text: include_str!("../kernels/moe/moe_grouped_gemm_tile.cuh") },
-    Header { name: "moe/topk_sigmoid.cuh", text: include_str!("../kernels/moe/topk_sigmoid.cuh") },
-    Header { name: "moe/topk_softmax.cuh", text: include_str!("../kernels/moe/topk_softmax.cuh") },
-    Header { name: "moe/topk_softmax_tile.cuh", text: include_str!("../kernels/moe/topk_softmax_tile.cuh") },
-    Header { name: "norm/add_bias.cuh", text: include_str!("../kernels/norm/add_bias.cuh") },
-    Header { name: "norm/altup.cuh", text: include_str!("../kernels/norm/altup.cuh") },
-    Header { name: "norm/altup_aux.cuh", text: include_str!("../kernels/norm/altup_aux.cuh") },
-    Header { name: "norm/dsv4_hc.cuh", text: include_str!("../kernels/norm/dsv4_hc.cuh") },
-    Header { name: "norm/elementwise.cuh", text: include_str!("../kernels/norm/elementwise.cuh") },
-    Header { name: "norm/rmsnorm.cuh", text: include_str!("../kernels/norm/rmsnorm.cuh") },
-    Header { name: "norm/rmsnorm_rasr_tile.cuh", text: include_str!("../kernels/norm/rmsnorm_rasr_tile.cuh") },
-    Header { name: "norm/rmsnorm_tile.cuh", text: include_str!("../kernels/norm/rmsnorm_tile.cuh") },
-    Header { name: "prelude/device.cuh", text: include_str!("../kernels/prelude/device.cuh") },
-    Header { name: "prelude/fp8.cuh", text: include_str!("../kernels/prelude/fp8.cuh") },
-    Header { name: "prelude/half2.cuh", text: include_str!("../kernels/prelude/half2.cuh") },
-    Header { name: "prelude/mma.cuh", text: include_str!("../kernels/prelude/mma.cuh") },
-    Header { name: "quant/dequant_fp4.cuh", text: include_str!("../kernels/quant/dequant_fp4.cuh") },
-    Header { name: "quant/dequant_fp8.cuh", text: include_str!("../kernels/quant/dequant_fp8.cuh") },
-    Header { name: "quant/dequant_wna16.cuh", text: include_str!("../kernels/quant/dequant_wna16.cuh") },
-    Header { name: "quant/dequant_wna16_tile.cuh", text: include_str!("../kernels/quant/dequant_wna16_tile.cuh") },
-    Header { name: "quant/dtype_cast.cuh", text: include_str!("../kernels/quant/dtype_cast.cuh") },
-    Header { name: "quant/mxfp4_marlin.cuh", text: include_str!("../kernels/quant/mxfp4_marlin.cuh") },
-    Header { name: "quant/quant_bf16_to_fp8.cuh", text: include_str!("../kernels/quant/quant_bf16_to_fp8.cuh") },
-    Header { name: "quant/quant_bf16_to_mxfp4.cuh", text: include_str!("../kernels/quant/quant_bf16_to_mxfp4.cuh") },
-    Header { name: "quant/transcode.cuh", text: include_str!("../kernels/quant/transcode.cuh") },
-    Header { name: "quant/wna16_gemv_tile.cuh", text: include_str!("../kernels/quant/wna16_gemv_tile.cuh") },
-    Header { name: "rope/rope.cuh", text: include_str!("../kernels/rope/rope.cuh") },
-    Header { name: "rope/rope_tile.cuh", text: include_str!("../kernels/rope/rope_tile.cuh") },
-    Header { name: "prelude/rope.cuh", text: include_str!("../kernels/prelude/rope.cuh") },
-    Header { name: "sample/argmax.cuh", text: include_str!("../kernels/sample/argmax.cuh") },
-    Header { name: "sample/argmax_tile.cuh", text: include_str!("../kernels/sample/argmax_tile.cuh") },
-    Header { name: "ssm/causal_conv1d.cuh", text: include_str!("../kernels/ssm/causal_conv1d.cuh") },
-    Header { name: "ssm/gated_delta_net.cuh", text: include_str!("../kernels/ssm/gated_delta_net.cuh") },
-    Header { name: "ssm/gated_delta_net_prep.cuh", text: include_str!("../kernels/ssm/gated_delta_net_prep.cuh") },
-    Header { name: "ssm/kda.cuh", text: include_str!("../kernels/ssm/kda.cuh") },
-    Header { name: "ssm/nemotron_h.cuh", text: include_str!("../kernels/ssm/nemotron_h.cuh") },
-    Header { name: "tile/alternatives.cuh", text: include_str!("../kernels/tile/alternatives.cuh") },
-    Header { name: "vision/gemma4_audio.cuh", text: include_str!("../kernels/vision/gemma4_audio.cuh") },
-    Header { name: "vision/gemma4_naive_kernels.cuh", text: include_str!("../kernels/vision/gemma4_naive_kernels.cuh") },
-    Header { name: "vision/gemma4_vision.cuh", text: include_str!("../kernels/vision/gemma4_vision.cuh") },
-    Header { name: "vision/qwen3_vl_tower.cuh", text: include_str!("../kernels/vision/qwen3_vl_tower.cuh") },
-    Header { name: "vision/tower_naive_kernels.cuh", text: include_str!("../kernels/vision/tower_naive_kernels.cuh") },
-];
-
-/// The internalised FlashInfer and XQA closure.
-///
-/// Kept out of [`DEVICE_HEADERS`] and handed only to the units that ask for
-/// it: this is somebody else's attention library and `nvrtcCreateProgram`
-/// copies every byte it is given, so a `norm` compile does not carry it. See
-/// [`SHIM`] for the rule this list is maintained under.
-///
-/// # 39 of the 79 entries name a file that is already here, on purpose
-///
-/// NVRTC does no path resolution, so a file two directives reach by two
-/// spellings needs an entry per spelling. The upstream trees moved in INTACT
-/// -- which is why not one upstream byte had to change -- so they still reach
-/// their siblings the way they always did, in two forms:
-///
-/// * `../cp_async.cuh`, from `attention/decode.cuh`. Thirteen of these, and
-///   they sort to the top of this list. `comm/` reaches its siblings exactly
-///   as `attention/` does, which is why internalising that directory added
-///   one spelling -- `../fp4_layout.cuh` -- and reused `../utils.cuh` and
-///   `../vec_dtypes.cuh` unchanged.
-/// * `cp_async.cuh`, bare, from a file in the same directory. Twenty-six of
-///   these, and they sort in among the real entries.
-///
-/// **Neither form is a typo and neither may be "corrected" to the path it
-/// duplicates.** An entry whose `name` does not match the tail of its
-/// `include_str!` path is one of these 39, it costs a pointer, and deleting
-/// one stops the compile at the first directive that spelled it that way.
-///
-/// 79 entries, from `kernels/flashinfer` and `kernels/xqa`.
-#[rustfmt::skip]
-pub const UPSTREAM: &[Header] = &[
-    Header { name: "../cp_async.cuh", text: include_str!("../kernels/flashinfer/cp_async.cuh") },
-    Header { name: "../fastdiv.cuh", text: include_str!("../kernels/flashinfer/fastdiv.cuh") },
-    Header { name: "../fp4_layout.cuh", text: include_str!("../kernels/flashinfer/fp4_layout.cuh") },
-    Header { name: "../frag_layout_swizzle.cuh", text: include_str!("../kernels/flashinfer/frag_layout_swizzle.cuh") },
-    Header { name: "../layout.cuh", text: include_str!("../kernels/flashinfer/layout.cuh") },
-    Header { name: "../math.cuh", text: include_str!("../kernels/flashinfer/math.cuh") },
-    Header { name: "../mma.cuh", text: include_str!("../kernels/flashinfer/mma.cuh") },
-    Header { name: "../page.cuh", text: include_str!("../kernels/flashinfer/page.cuh") },
-    Header { name: "../permuted_smem.cuh", text: include_str!("../kernels/flashinfer/permuted_smem.cuh") },
-    Header { name: "../pos_enc.cuh", text: include_str!("../kernels/flashinfer/pos_enc.cuh") },
-    Header { name: "../profiler.cuh", text: include_str!("../kernels/flashinfer/profiler.cuh") },
-    Header { name: "../utils.cuh", text: include_str!("../kernels/flashinfer/utils.cuh") },
-    Header { name: "../vec_dtypes.cuh", text: include_str!("../kernels/flashinfer/vec_dtypes.cuh") },
-
-    Header { name: "flashinfer/attention/cascade.cuh", text: include_str!("../kernels/flashinfer/attention/cascade.cuh") },
-    Header { name: "flashinfer/attention/decode.cuh", text: include_str!("../kernels/flashinfer/attention/decode.cuh") },
-    Header { name: "flashinfer/attention/default_decode_params.cuh", text: include_str!("../kernels/flashinfer/attention/default_decode_params.cuh") },
-    Header { name: "flashinfer/attention/default_prefill_params.cuh", text: include_str!("../kernels/flashinfer/attention/default_prefill_params.cuh") },
-    Header { name: "flashinfer/attention/mask.cuh", text: include_str!("../kernels/flashinfer/attention/mask.cuh") },
-    Header { name: "flashinfer/attention/mla.cuh", text: include_str!("../kernels/flashinfer/attention/mla.cuh") },
-    Header { name: "flashinfer/attention/mla_params.cuh", text: include_str!("../kernels/flashinfer/attention/mla_params.cuh") },
-    Header { name: "flashinfer/attention/prefill.cuh", text: include_str!("../kernels/flashinfer/attention/prefill.cuh") },
-    Header { name: "flashinfer/attention/state.cuh", text: include_str!("../kernels/flashinfer/attention/state.cuh") },
-    Header { name: "flashinfer/attention/variant_helper.cuh", text: include_str!("../kernels/flashinfer/attention/variant_helper.cuh") },
-    Header { name: "flashinfer/attention/variants.cuh", text: include_str!("../kernels/flashinfer/attention/variants.cuh") },
-    Header { name: "flashinfer/comm/trtllm_allreduce_fusion.cuh", text: include_str!("../kernels/flashinfer/comm/trtllm_allreduce_fusion.cuh") },
-    Header { name: "flashinfer/comm/vllm_custom_all_reduce.cuh", text: include_str!("../kernels/flashinfer/comm/vllm_custom_all_reduce.cuh") },
-    Header { name: "flashinfer/cp_async.cuh", text: include_str!("../kernels/flashinfer/cp_async.cuh") },
-    Header { name: "flashinfer/fastdiv.cuh", text: include_str!("../kernels/flashinfer/fastdiv.cuh") },
-    Header { name: "flashinfer/fp4_layout.cuh", text: include_str!("../kernels/flashinfer/fp4_layout.cuh") },
-    Header { name: "flashinfer/frag_layout_swizzle.cuh", text: include_str!("../kernels/flashinfer/frag_layout_swizzle.cuh") },
-    Header { name: "flashinfer/layout.cuh", text: include_str!("../kernels/flashinfer/layout.cuh") },
-    Header { name: "flashinfer/math.cuh", text: include_str!("../kernels/flashinfer/math.cuh") },
-    Header { name: "flashinfer/mma.cuh", text: include_str!("../kernels/flashinfer/mma.cuh") },
-    Header { name: "flashinfer/page.cuh", text: include_str!("../kernels/flashinfer/page.cuh") },
-    Header { name: "flashinfer/permuted_smem.cuh", text: include_str!("../kernels/flashinfer/permuted_smem.cuh") },
-    Header { name: "flashinfer/pos_enc.cuh", text: include_str!("../kernels/flashinfer/pos_enc.cuh") },
-    Header { name: "flashinfer/profiler.cuh", text: include_str!("../kernels/flashinfer/profiler.cuh") },
-    Header { name: "flashinfer/utils.cuh", text: include_str!("../kernels/flashinfer/utils.cuh") },
-    Header { name: "flashinfer/vec_dtypes.cuh", text: include_str!("../kernels/flashinfer/vec_dtypes.cuh") },
-    Header { name: "xqa/barriers.cuh", text: include_str!("../kernels/xqa/barriers.cuh") },
-    Header { name: "xqa/cuda_hint.cuh", text: include_str!("../kernels/xqa/cuda_hint.cuh") },
-    Header { name: "xqa/defines.h", text: include_str!("../kernels/xqa/defines.h") },
-    Header { name: "xqa/ldgsts.cuh", text: include_str!("../kernels/xqa/ldgsts.cuh") },
-    Header { name: "xqa/mha.cuh", text: include_str!("../kernels/xqa/mha.cuh") },
-    Header { name: "xqa/mha.h", text: include_str!("../kernels/xqa/mha.h") },
-    Header { name: "xqa/mhaUtils.cuh", text: include_str!("../kernels/xqa/mhaUtils.cuh") },
-    Header { name: "xqa/mha_components.cuh", text: include_str!("../kernels/xqa/mha_components.cuh") },
-    Header { name: "xqa/mha_stdheaders.cuh", text: include_str!("../kernels/xqa/mha_stdheaders.cuh") },
-    Header { name: "xqa/mma.cuh", text: include_str!("../kernels/xqa/mma.cuh") },
-    Header { name: "xqa/platform.h", text: include_str!("../kernels/xqa/platform.h") },
-    Header { name: "xqa/specDec.h", text: include_str!("../kernels/xqa/specDec.h") },
-    Header { name: "xqa/utils.cuh", text: include_str!("../kernels/xqa/utils.cuh") },
-    Header { name: "xqa/utils.h", text: include_str!("../kernels/xqa/utils.h") },
-    Header { name: "barriers.cuh", text: include_str!("../kernels/xqa/barriers.cuh") },
-    Header { name: "cascade.cuh", text: include_str!("../kernels/flashinfer/attention/cascade.cuh") },
-    Header { name: "cp_async.cuh", text: include_str!("../kernels/flashinfer/cp_async.cuh") },
-    Header { name: "cuda_hint.cuh", text: include_str!("../kernels/xqa/cuda_hint.cuh") },
-    Header { name: "defines.h", text: include_str!("../kernels/xqa/defines.h") },
-    Header { name: "fastdiv.cuh", text: include_str!("../kernels/flashinfer/fastdiv.cuh") },
-    Header { name: "layout.cuh", text: include_str!("../kernels/flashinfer/layout.cuh") },
-    Header { name: "ldgsts.cuh", text: include_str!("../kernels/xqa/ldgsts.cuh") },
-    Header { name: "mask.cuh", text: include_str!("../kernels/flashinfer/attention/mask.cuh") },
-    Header { name: "math.cuh", text: include_str!("../kernels/flashinfer/math.cuh") },
-    Header { name: "mha.h", text: include_str!("../kernels/xqa/mha.h") },
-    Header { name: "mhaUtils.cuh", text: include_str!("../kernels/xqa/mhaUtils.cuh") },
-    Header { name: "mha_components.cuh", text: include_str!("../kernels/xqa/mha_components.cuh") },
-    Header { name: "mha_stdheaders.cuh", text: include_str!("../kernels/xqa/mha_stdheaders.cuh") },
-    Header { name: "mla_params.cuh", text: include_str!("../kernels/flashinfer/attention/mla_params.cuh") },
-    Header { name: "mma.cuh", text: include_str!("../kernels/flashinfer/mma.cuh") },
-    Header { name: "page.cuh", text: include_str!("../kernels/flashinfer/page.cuh") },
-    Header { name: "platform.h", text: include_str!("../kernels/xqa/platform.h") },
-    Header { name: "prefill.cuh", text: include_str!("../kernels/flashinfer/attention/prefill.cuh") },
-    Header { name: "specDec.h", text: include_str!("../kernels/xqa/specDec.h") },
-    Header { name: "state.cuh", text: include_str!("../kernels/flashinfer/attention/state.cuh") },
-    Header { name: "utils.cuh", text: include_str!("../kernels/flashinfer/utils.cuh") },
-    Header { name: "utils.h", text: include_str!("../kernels/xqa/utils.h") },
-    Header { name: "variant_helper.cuh", text: include_str!("../kernels/flashinfer/attention/variant_helper.cuh") },
-    Header { name: "variants.cuh", text: include_str!("../kernels/flashinfer/attention/variants.cuh") },
-    Header { name: "vec_dtypes.cuh", text: include_str!("../kernels/flashinfer/vec_dtypes.cuh") },
-];
+pub use generated::{LIBRARY, SHIM, UPSTREAM};
 
 /// What every compile in this crate resolves an `#include` against, unless the
+/// unit asks for [`UPSTREAM`] as well.
 const SHIMMED: [Header; SHIM.len() + LIBRARY.len()] =
     join::<{ SHIM.len() + LIBRARY.len() }>(SHIM, LIBRARY);
 
@@ -275,6 +65,11 @@ const SHIMMED: [Header; SHIM.len() + LIBRARY.len()] =
 pub const DEVICE_HEADERS: &[Header] = &SHIMMED;
 
 /// [`DEVICE_HEADERS`] plus [`UPSTREAM`] — what a unit compiling upstream
+/// attention resolves against.
+///
+/// Not the default, and the reason is bytes: `nvrtcCreateProgram` copies every
+/// header it is given, so a `norm` compile that carried FlashInfer would pay
+/// for it on every launch that missed the cache.
 pub const ALL_HEADERS: &[Header] =
     &join::<{ SHIM.len() + LIBRARY.len() + UPSTREAM.len() }>(&SHIMMED, UPSTREAM);
 

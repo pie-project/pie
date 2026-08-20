@@ -513,6 +513,17 @@ pub enum Unbindable {
         /// Bytes the stand-in holds.
         seam: u64,
     },
+    /// The plan places a raise and no shader plane binds one.
+    ///
+    /// Not "not yet": a raise is a HOST aggregate a routine body reads to fill
+    /// the block a kernel takes, and this plane's bodies read their parameters
+    /// out of a push range or a storage block. Nothing here has one to hold, so
+    /// a lowering that reached this arm states an operand for a backend that
+    /// cannot have it — a trace built for the wrong plane.
+    NotOnThisPlane {
+        /// The raise, by the word its `raise!` declared.
+        key: String,
+    },
     /// An arena operand's rectangle runs past the arena the plan sized.
     ///
     /// Never seen in a real lowering -- and the tightest real operand ends
@@ -575,6 +586,10 @@ impl std::fmt::Display for Unbindable {
                     "`{name}` is a dispatch constant riding a weight slot, not a buffer"
                 )
             }
+            Self::NotOnThisPlane { key } => write!(
+                f,
+                "the plan places the raise `{key}`, which no shader plane binds"
+            ),
             Self::Unaddressable(why) => write!(f, "{why}"),
         }
     }
@@ -620,6 +635,10 @@ pub fn extent(arg: &Arg, launch: &Launch) -> Option<u64> {
                     .saturating_mul(u64::from(*bytes)),
             )
         }
+        // NO RECTANGLE TO MEASURE. A raise is a host aggregate the body
+        // reads whole; it has no rows, no width and no element size, which
+        // is why it is its own `Arg` and not a `Named` with zeros in it.
+        Arg::Raised { .. } => None,
         Arg::Weight(_) => None,
     }
 }
@@ -658,6 +677,7 @@ pub fn resolve<'a, R: Resolve>(
             }
             Bound::within(arena.buffer, at64, extent, min_offset).map_err(Unbindable::Unaddressable)
         }
+        Arg::Raised { key, .. } => Err(Unbindable::NotOnThisPlane { key: key.clone() }),
         Arg::Named { value, .. } => {
             let held = resolver
                 .named(*value)
@@ -717,8 +737,25 @@ pub fn bind<'a, R: Resolve>(
 ) -> Result<Vec<Bound<'a, R::Buffer>>, (usize, Unbindable)> {
     let span = launch.args.start as usize..launch.args.end as usize;
     let mut bound = Vec::with_capacity(span.len());
-    for (i, arg) in lowered.args[span].iter().enumerate() {
-        bound.push(resolve(arg, launch, arena, resolver, min_offset).map_err(|e| (i, e))?);
+    let covered = launch.rows.end - launch.rows.start;
+    for (i, arg) in lowered.args[span.clone()].iter().enumerate() {
+        // The same widening `lowering::routine::plan` does, for the same
+        // reason: an operand's row space is not always the launch's rectangle,
+        // and `Lowered::arg_rows` is where the lowering says so. Wider only --
+        // a count under the launch's would shrink an operand the launch is
+        // about to write, and catching that overrun is `extent`'s job.
+        let own = lowered.arg_rows.get(span.start + i).copied().unwrap_or(0);
+        let widened;
+        let against = if own > covered {
+            widened = Launch {
+                rows: launch.rows.start..launch.rows.start + own,
+                ..launch.clone()
+            };
+            &widened
+        } else {
+            launch
+        };
+        bound.push(resolve(arg, against, arena, resolver, min_offset).map_err(|e| (i, e))?);
     }
     Ok(bound)
 }
@@ -1533,6 +1570,44 @@ mod tests {
         );
     }
 
+    /// A raise is refused BY NAME, because this plane has nothing to hold it.
+    ///
+    /// # Not "not yet"
+    ///
+    /// `Arg::Raised` is a HOST aggregate -- a routine body reads one to fill
+    /// the block a kernel takes -- and on this plane a body reads its
+    /// parameters out of a push range or a `@group(1)` uniform. There is no
+    /// binding for a raise to become, so a lowering that places one was built
+    /// for a different backend, and the refusal says which word it was.
+    ///
+    /// Written because `every_refusal_this_crate_builds_is_one_a_test_names`
+    /// found this variant in the crate and in nothing that asserts it, which
+    /// is the state where a condition can be inverted with every suite still
+    /// green. The alternative was a line in that test's `UNNAMED` list; a
+    /// refusal one call reaches does not need one.
+    #[test]
+    fn a_raise_is_refused_because_no_shader_plane_here_binds_one() {
+        let buf = buffer(1 << 20);
+        let arena = Arena {
+            buffer: &buf,
+            bytes: 1 << 20,
+        };
+        let arg = Arg::Raised {
+            value: 0,
+            key: "gdn_core".to_string(),
+        };
+        let err =
+            resolve(&arg, &launch(1, 1), arena, &Store::default(), 256).expect_err("a raise");
+        assert_eq!(
+            err,
+            Unbindable::NotOnThisPlane {
+                key: "gdn_core".to_string()
+            },
+            "the refusal carries the word the `raise!` declared, so a trace \
+             built for the wrong plane says which operand gave it away"
+        );
+    }
+
     /// A misaligned offset is refused BY NAME and never rounded.
     ///
     /// 260 is inside the arena and a multiple of 4, so the plan is content and
@@ -1980,6 +2055,8 @@ mod tests {
     /// A `Lowered` holding nothing but the operands under test.
     fn lowered(args: Vec<Arg>) -> Lowered {
         Lowered {
+            // A hand-built lowering states no per-argument rows; zero is "no opinion".
+            arg_rows: Vec::new(),
             launches: Vec::new(),
             kernels: Vec::new(),
             rectangles: 0,

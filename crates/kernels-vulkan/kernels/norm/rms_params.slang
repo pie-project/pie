@@ -28,10 +28,13 @@ struct RmsParams {
 // `RmsParams` with the rotation's four scalars appended, for the fused
 // `rms_rope`. Appended and not interleaved, and that order is an ABI rather
 // than a preference: `driver-vulkan`'s `encode` mints this block as THE
-// STATEMENT'S PARAMS RUN followed by whatever the routine packed in after it,
-// which is the same shape `row_gather`'s `{ width, count }` has. The first
-// five fields are therefore the five a norm statement already states, field
-// for field, and the last four are the routine's own.
+// STATEMENT'S PARAMS RUN followed by whatever the routine packed in after it.
+// That is the shape `row_gather`'s `{ width, count }` used to have as a storage
+// struct, and still has as a push block now that `width` is a mark reading the
+// statement's word 0 and the count is the routine's own -- the carrier changed
+// and the order did not. The first five fields here are therefore the five a
+// norm statement already states, field for field, and the last four are the
+// routine's own.
 //
 // It is one block and not a block plus a push range because `binding::params`
 // can place a launch's scalars in one shape or the other and not both -- it
@@ -74,10 +77,16 @@ struct LayerScalarParams {
     uint hidden;
 };
 
-struct PleCombineParams {
-    float inv_sqrt2;
-    uint n;
-};
+// GONE: `PleCombineParams { inv_sqrt2, n }`.
+//
+// `layout/ple_combine.slang` was its only reader and it takes the scale as a
+// push constant now -- `inv_sqrt2` is an `f32` mark on the routine, word 0 of
+// the statement's own run, so there is no struct for a storage binding to
+// carry. The second field was dead before that: `n` was one ROW's element
+// count and the elementwise launch covers the whole `[n_layers, ple_dim]`
+// rectangle, so it could not bound the dispatch it was named for and stayed
+// only to hold the struct's size for parity with Metal's `PleCombineParams`.
+// A size nothing reads is not parity.
 
 struct SoftcapParams {
     float cap;

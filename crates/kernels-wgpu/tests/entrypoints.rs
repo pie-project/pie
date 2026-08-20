@@ -53,9 +53,13 @@ fn from_the_shaders() -> BTreeSet<String> {
         .collect()
 }
 
-fn from_the_table() -> BTreeSet<String> {
-    kernels_wgpu::entrypoints().into_iter().collect()
-}
+// `from_the_table` STOOD HERE, as `kernels_wgpu::entrypoints().collect()`.
+//
+// It is not a second reading any more. `entrypoints()` parses the same
+// `// pie:instantiate` directives `from_the_shaders` does, so the two are one
+// source under two names and every comparison between them held by
+// construction. The three tests that made that comparison are retired below,
+// each where it stood.
 
 /// Every entrypoint a ROUTINE body names, read out of this crate's own source.
 ///
@@ -321,135 +325,64 @@ fn entrypoint_tables() -> BTreeMap<String, Vec<String>> {
     out
 }
 
-/// A retired family's stated `ENTRYPOINTS` are exactly what its bodies FIRE.
+/// Every entrypoint a BODY fires is one the shader tree instantiates, and
+/// every one the tree instantiates is fired — but for the window-eliding
+/// variants nothing selects.
 ///
-/// `RETIRED` is hand-written, and it is what `entrypoints()` returns for a
-/// family whose rows are gone — so every sweep keyed on `entrypoints()` covers
-/// what this list says rather than what the shaders are. A row could not drift
-/// that way: its `axes` GENERATED its entrypoints. A typo here, or a body
-/// changed without the list, silently moves the sweeps off the real shader,
-/// which is the same silence the retirement already caused once.
+/// This is what is left of two tests that STOOD HERE, and it is the half of
+/// them that was ever real.
 ///
-/// Read out of the family's own module: the `entrypoint:` field of each `Fire`
-/// literal, resolved through `TABLE[point(..)]` where the body indexes an
-/// axis. A body that COMPUTED its entrypoint would be unreadable this way and
-/// [`resolve`] panics rather than skipping it.
+/// `a_retired_familys_stated_entrypoints_are_what_its_bodies_fire` compared the
+/// bodies to a hand-written `ENTRYPOINTS` list per family. Those lists are
+/// gone: `entrypoints()` reads the `// pie:instantiate` directives now, so
+/// there is no second statement to drift from the first.
+///
+/// `the_table_names_exactly_what_the_shaders_instantiate` compared that census
+/// to the tree, and with the census READ OFF the tree it became a set compared
+/// to itself. It did not go false, it went TAUTOLOGICAL — the §7 shape, where
+/// a check does not fail when its subject retires, it stops saying anything.
+///
+/// What survives is a comparison between two things that are still
+/// independent: the Rust bodies and the shader tree. A body firing a name no
+/// shader instantiates is a pipeline that cannot be built, discovered at the
+/// fire; a shader nothing fires is a variant every device sweep compiles and
+/// no test exercises. Neither is visible from either side alone.
+///
+/// Read out of the family's own module: the `entrypoint:` argument of each
+/// `Fire::at` call, resolved through `TABLE[point(..)]` where the body indexes
+/// an axis. A body that COMPUTED its entrypoint would be unreadable this way
+/// and [`resolve`] panics rather than skipping it.
 #[test]
-fn a_retired_familys_stated_entrypoints_are_what_its_bodies_fire() {
-    // One line per retired family, mirroring `lib.rs`'s `RETIRED`.
-    let families: &[(&str, &[&str])] = &[
-        ("sample.rs", kernels_wgpu::sample::ENTRYPOINTS),
-        ("ptir.rs", kernels_wgpu::ptir::ENTRYPOINTS),
-        ("mlp.rs", kernels_wgpu::mlp::ENTRYPOINTS),
-        ("norm.rs", kernels_wgpu::norm::ENTRYPOINTS),
-        ("layout.rs", kernels_wgpu::layout::ENTRYPOINTS),
-        ("rope.rs", kernels_wgpu::rope::ENTRYPOINTS),
-        ("quant.rs", kernels_wgpu::quant::ENTRYPOINTS),
-        ("moe.rs", kernels_wgpu::moe::ENTRYPOINTS),
-        ("ssm.rs", kernels_wgpu::ssm::ENTRYPOINTS),
-        ("attn.rs", kernels_wgpu::attn::ENTRYPOINTS),
-    ];
-
-    // Against `retired()`, not a COUNT of families. The first version of this
-    // compared `families.len()` to `retired_rows().len()` — a module count
-    // against a ROW count — which held only while every retired family was one
-    // kernel, and broke on `mlp`'s five. What has to hold is that the modules
-    // listed here name every entrypoint the crate says is retired.
-    let stated: BTreeSet<&str> = kernels_wgpu::retired().into_iter().collect();
-    let listed: BTreeSet<&str> = families
-        .iter()
-        .flat_map(|(_, e)| e.iter().copied())
-        .collect();
-    assert_eq!(
-        listed, stated,
-        "a family was retired without being checked here, which is how the \
-         stated list stops being compared to the bodies at all",
-    );
-
-    for (module, stated) in families {
-        let path = manifest().join("src").join(module);
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-        let tables = entrypoint_tables();
-        let mut fired = BTreeSet::new();
-        for (line, value) in fire_entrypoints(&text) {
-            match resolve(&value, &tables) {
-                Some(names) => fired.extend(names),
-                None => panic!(
-                    "{module}:{line}: `{value}` is neither a literal nor a \
-                     lookup into a table of literals, so no static reading of \
-                     this crate can say which entrypoints it fires",
-                ),
-            }
-        }
-        // AN IDENTITY NOW, and kept as one deliberately. It filtered out the
-        // entrypoints a row still stated, because a family part way through
-        // Stage 3 held rows for the kernels whose arms had not landed and
-        // `entrypoints()` already reached those through the table -- listing
-        // them here would have named them twice. Every family has crossed, so
-        // `sig` answers `None` for all of them and nothing is dropped.
-        //
-        // Left in rather than deleted because it is the line that would fail
-        // if a row came back: the comparison below would then see a name from
-        // both directions and disagree with itself, which is a worse failure
-        // to read than this filter quietly doing nothing.
-        let fired: BTreeSet<String> = fired
-            .into_iter()
-            .filter(|e| kernels_wgpu::sig(e).is_none())
-            .collect();
-        let want: BTreeSet<String> = stated.iter().map(|s| (*s).to_owned()).collect();
-
-        // Every entrypoint a body FIRES is stated. The reverse does not hold
-        // and must not be forced to: a retired row's `axes` generated points
-        // its body never selects, and `attn`'s are exactly the ones
-        // `refactor-bigplan.md` §8b is about — `_p32` and `_sg8` compile the
-        // sliding-window clamp out, and no body picks them. They stay in the
-        // census because the shader tree has them and the device sweep builds
-        // them; what would be wrong is a body firing something the census does
-        // not name, which is the direction asserted here.
-        let unfired: Vec<&String> = want.difference(&fired).collect();
-        assert!(
-            unfired
-                .iter()
-                .all(|e| e.contains("_p32") || e.contains("_sg8")),
-            "`{module}` states entrypoints no body fires and that are not the \
-             known window-eliding variants: {unfired:?}. A stated name nothing \
-             fires is a name every sweep walks and nothing exercises",
-        );
-        let fired: BTreeSet<String> = fired.into_iter().collect();
-        assert!(
-            fired.is_subset(&want),
-            "`{module}`'s bodies fire {:?}, which its `ENTRYPOINTS` does not \
-             state, and `ENTRYPOINTS` is what every sweep keyed on \
-             `entrypoints()` will walk",
-            fired.difference(&want).collect::<Vec<_>>(),
-        );
-    }
-}
-
-#[test]
-fn the_table_names_exactly_what_the_shaders_instantiate() {
+fn every_entrypoint_a_body_fires_is_one_the_shader_tree_instantiates() {
     let shaders = from_the_shaders();
-    let mut table = from_the_table();
-    table.extend(from_the_routines());
+    let fired = from_the_routines();
 
-    let undeclared: Vec<_> = shaders.difference(&table).collect();
-    assert!(
-        undeclared.is_empty(),
-        "{} entrypoints exist in kernels/ that no row declares. A new \
-         instantiation needs a row, or a point on an existing row's axis:\n{:#?}",
-        undeclared.len(),
-        undeclared,
-    );
-
-    let phantom: Vec<_> = table.difference(&shaders).collect();
+    let phantom: Vec<&String> = fired.difference(&shaders).collect();
     assert!(
         phantom.is_empty(),
-        "{} entrypoints are declared that no shader instantiates. An axis whose \
-         product over-generates is the usual cause — see `sdpa_paged_decode`, \
-         which lists its tails for exactly this reason:\n{:#?}",
+        "{} entrypoints are fired by a body and instantiated by no shader, so \
+         the pipeline cannot be built and the fire is where it is found:\n{:#?}",
         phantom.len(),
         phantom,
+    );
+
+    // The other direction is NOT an equality and must not be forced to be one.
+    // `_p32` and `_sg8` compile the sliding-window clamp out — they are ABI
+    // points inherited from Metal's table, `sdpa_paged.wgsl` says so at its
+    // head — and no body selects them. They stay in the census because the
+    // tree has them and the device sweep builds them.
+    let unfired: Vec<&String> = shaders.difference(&fired).collect();
+    assert!(
+        unfired
+            .iter()
+            .all(|e| e.contains("_p32") || e.contains("_sg8")),
+        "the tree instantiates entrypoints no body fires that are not the known \
+         window-eliding variants: {:#?}. A variant nothing fires is one every \
+         sweep compiles and nothing exercises",
+        unfired
+            .iter()
+            .filter(|e| !e.contains("_p32") && !e.contains("_sg8"))
+            .collect::<Vec<_>>(),
     );
 }
 
@@ -595,27 +528,19 @@ fn every_tier_has_a_baseline_beneath_it() {
     );
 }
 
-/// A tier never invents an entrypoint the table does not name.
-///
-/// The set comparison at the top of this file already covers it, since it folds
-/// tiers into the same set. Stated separately anyway, because the day somebody
-/// changes that fold is the day the coverage silently widens.
-#[test]
-fn a_tier_never_widens_the_four_hundred_and_eighty() {
-    let table = from_the_table();
-    for (file, variant) in kernels_wgpu::source::declared() {
-        if variant.tier == kernels_wgpu::Capability::Baseline {
-            continue;
-        }
-        assert!(
-            table.contains(&variant.entrypoint),
-            "kernels/{file}:{}: `{}` @{} is an entrypoint no row names",
-            variant.line,
-            variant.entrypoint,
-            variant.tier.tag(),
-        );
-    }
-}
+// `a_tier_never_widens_the_four_hundred_and_eighty` STOOD HERE. It walked the
+// tiered variants and required each to name an entrypoint the census already
+// carried, so a `@fp16` line could not smuggle in a name no baseline had.
+//
+// The census IS the directives now, tiers included, so a tiered variant's name
+// is in it because the variant exists. The check went TAUTOLOGICAL rather than
+// false, which is the failure this file keeps naming: it stops saying anything
+// and passes while doing so.
+//
+// The claim it was reaching for is `every_tier_has_a_baseline_beneath_it`,
+// below, and that one is real — it asks for the BASELINE beside each tier,
+// which is the fact a driver with no optional features depends on and which no
+// reading of the census alone can supply.
 
 /// Baseline is unsuffixed, so a driver that has never heard of a tier finds the
 /// right variant knowing only the entrypoint name.
@@ -637,29 +562,19 @@ fn baseline_variants_are_unsuffixed() {
     assert!(Capability::Baseline.requires().is_empty());
 }
 
-/// Every `// pie:instantiate` names an entrypoint the table declares.
-///
-/// The reverse of `the_table_names_exactly_what_the_shaders_instantiate`, per
-/// FILE rather than per set, so the failure message names the shader and the
-/// line rather than a name in a list of hundreds.
-#[test]
-fn every_instantiated_variant_is_one_the_table_declares() {
-    let mut known = from_the_table();
-    known.extend(from_the_routines());
-    for (file, text) in kernels_wgpu::SOURCES {
-        let variants = kernels_wgpu::instantiations(text)
-            .unwrap_or_else(|why| panic!("kernels/{file}: {why}"));
-        for variant in variants {
-            assert!(
-                known.contains(&variant.entrypoint),
-                "kernels/{file}:{}: `{}` is instantiated but neither a row nor \
-                 a routine body names it",
-                variant.line,
-                variant.entrypoint,
-            );
-        }
-    }
-}
+// `every_instantiated_variant_is_one_the_table_declares` STOOD HERE. It was the
+// per-FILE reverse of the set comparison at the top, so a shader instantiating
+// a name nothing declared failed with the file and line rather than with a
+// name in a list of hundreds.
+//
+// Same reason as above: what it compared the tree against is now read off the
+// tree. Every instantiated variant is one the census declares BECAUSE the
+// census is the instantiations.
+//
+// The per-file reading that gave it its good failure message is worth keeping
+// and is not lost: `every_entrypoint_a_body_fires_is_one_the_shader_tree
+// _instantiates` reads the Rust bodies against the same tree, which is the
+// comparison still made of two independent things.
 
 // RETIRED: THE TABLE IS EMPTY, so `sig` answers `None` and every candidate is
 // skipped.
@@ -1484,9 +1399,15 @@ fn no_shader_declares_a_read_only_storage_binding() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernels");
     let mut files = Vec::new();
     wgsl(&root, &mut files);
+    // THIRTY-SIX, WHICH WAS THIRTY-SEVEN. The packed parameter blocks were
+    // unwound across the tree -- every field is its own binding now -- and
+    // `layout/row_gather_params.inc.wgsl` went with the struct it declared.
+    // The count is a floor on what this scan READS, so it has to be lowered
+    // by hand when a file legitimately leaves; that is the whole point of
+    // writing it down.
     assert_eq!(
         files.len(),
-        37,
+        36,
         "the shader tree changed size; this scan reads every `.wgsl` under \
          `kernels/`, and a count that moved without anyone noticing is a \
          file it might not be reading"

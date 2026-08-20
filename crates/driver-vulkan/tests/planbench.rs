@@ -383,7 +383,20 @@ fn what_one_rectangle_costs_to_plan() {
                 .filter_map(|a| match a {
                     model_compiler::lower::Arg::Arena { width, .. }
                     | model_compiler::lower::Arg::Named { width, .. } => Some(*width),
-                    model_compiler::lower::Arg::Weight(_) => None,
+                    model_compiler::lower::Arg::Weight(_)
+                    | model_compiler::lower::Arg::Raised { .. } => None,
+                })
+                .collect();
+            // The same numbers PER ARGUMENT, which is how `Handles` indexes
+            // them -- a weight holds a place there and carries no width, so
+            // the compacted list above would shift every operand after it.
+            let arg_widths: Vec<i32> = args
+                .iter()
+                .map(|a| match a {
+                    model_compiler::lower::Arg::Arena { width, .. }
+                    | model_compiler::lower::Arg::Named { width, .. } => (*width).cast_signed(),
+                    model_compiler::lower::Arg::Weight(_)
+                    | model_compiler::lower::Arg::Raised { .. } => 0,
                 })
                 .collect();
             let (group, bits) = driver_vulkan::hold::affine_of(symbol).unwrap_or((0, 0));
@@ -405,7 +418,15 @@ fn what_one_rectangle_costs_to_plan() {
                 ..Default::default()
             };
             let mut handles =
-                driver_vulkan::hold::Handles::new(&bound, &ins, &outs, &weights, &params, &real);
+                driver_vulkan::hold::Handles::new(
+                    &bound,
+                    &arg_widths,
+                    &ins,
+                    &outs,
+                    &weights,
+                    &params,
+                    &real,
+                );
             let r = driver_vulkan::hold::routine_for(symbol).expect("a routine");
             std::hint::black_box(
                 driver_vulkan::bind::bind(r.args, r.sources, &mut handles, facts).is_ok(),

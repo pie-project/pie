@@ -593,6 +593,11 @@
       "dtype": "BF16"
     },
     {
+      "shape": [],
+      "dtype": "I32",
+      "raised": "fa2.decode"
+    },
+    {
       "shape": [
         "Tokens",
         {
@@ -1105,7 +1110,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 0
-          }
+          },
+          "params": [
+            3072,
+            4
+          ]
         }
       },
       "inputs": [
@@ -1537,7 +1546,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 2
-          }
+          },
+          "params": [
+            3072,
+            4
+          ]
         }
       },
       "inputs": [
@@ -1974,7 +1987,9 @@
         }
       },
       "inputs": [],
-      "outputs": [],
+      "outputs": [
+        65
+      ],
       "layer": null
     },
     {
@@ -1988,10 +2003,11 @@
         }
       },
       "inputs": [
-        63
+        63,
+        65
       ],
       "outputs": [
-        65
+        66
       ],
       "layer": 3
     },
@@ -2003,7 +2019,7 @@
         }
       },
       "inputs": [
-        65
+        66
       ],
       "outputs": [],
       "layer": 3
@@ -2016,11 +2032,11 @@
         }
       },
       "inputs": [
-        65,
+        66,
         58
       ],
       "outputs": [
-        66
+        67
       ],
       "layer": 3
     },
@@ -2034,10 +2050,10 @@
         }
       },
       "inputs": [
-        66
+        67
       ],
       "outputs": [
-        67
+        68
       ],
       "layer": 3
     },
@@ -2051,10 +2067,10 @@
         }
       },
       "inputs": [
-        67
+        68
       ],
       "outputs": [
-        68
+        69
       ],
       "layer": 3
     },
@@ -2068,11 +2084,11 @@
         }
       },
       "inputs": [
-        68
+        69
       ],
       "outputs": [
-        69,
-        70
+        70,
+        71
       ],
       "layer": 3
     },
@@ -2086,11 +2102,11 @@
         }
       },
       "inputs": [
-        69,
-        67
+        70,
+        68
       ],
       "outputs": [
-        71
+        72
       ],
       "layer": 3
     },
@@ -2101,10 +2117,10 @@
         }
       },
       "inputs": [
-        71
+        72
       ],
       "outputs": [
-        72
+        73
       ],
       "layer": 3
     },
@@ -2118,11 +2134,11 @@
         }
       },
       "inputs": [
-        69,
-        72
+        70,
+        73
       ],
       "outputs": [
-        73
+        74
       ],
       "layer": 3
     },
@@ -2133,11 +2149,11 @@
         }
       },
       "inputs": [
-        73,
-        70
+        74,
+        71
       ],
       "outputs": [
-        74
+        75
       ],
       "layer": 3
     },
@@ -2149,10 +2165,10 @@
         }
       },
       "inputs": [
-        67
+        68
       ],
       "outputs": [
-        75
+        76
       ],
       "layer": 3
     },
@@ -2163,10 +2179,10 @@
         }
       },
       "inputs": [
-        75
+        76
       ],
       "outputs": [
-        76
+        77
       ],
       "layer": 3
     },
@@ -2178,21 +2194,6 @@
         }
       },
       "inputs": [
-        76
-      ],
-      "outputs": [
-        77
-      ],
-      "layer": 3
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "norm::residual_add_bf16"
-        }
-      },
-      "inputs": [
-        74,
         77
       ],
       "outputs": [
@@ -2207,11 +2208,26 @@
         }
       },
       "inputs": [
-        66,
+        75,
         78
       ],
       "outputs": [
         79
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::residual_add_bf16"
+        }
+      },
+      "inputs": [
+        67,
+        79
+      ],
+      "outputs": [
+        80
       ],
       "layer": 3
     },
@@ -2225,10 +2241,10 @@
         }
       },
       "inputs": [
-        79
+        80
       ],
       "outputs": [
-        80
+        81
       ],
       "layer": 4
     },
@@ -2240,10 +2256,10 @@
         }
       },
       "inputs": [
-        80
+        81
       ],
       "outputs": [
-        81
+        82
       ],
       "layer": 4
     },
@@ -2254,12 +2270,12 @@
         }
       },
       "inputs": [
-        81
+        82
       ],
       "outputs": [
-        82,
         83,
-        84
+        84,
+        85
       ],
       "layer": 4
     },
@@ -2273,14 +2289,18 @@
           "state": {
             "store": "RecurrentState",
             "layer": 4
-          }
+          },
+          "params": [
+            3072,
+            4
+          ]
         }
       },
       "inputs": [
-        83
+        84
       ],
       "outputs": [
-        85
+        86
       ],
       "layer": 4
     },
@@ -2297,9 +2317,9 @@
       },
       "inputs": [],
       "outputs": [
-        86,
         87,
-        88
+        88,
+        89
       ],
       "layer": 4
     },
@@ -2310,13 +2330,13 @@
         }
       },
       "inputs": [
-        84,
-        86,
-        88
+        85,
+        87,
+        89
       ],
       "outputs": [
-        89,
-        90
+        90,
+        91
       ],
       "layer": 4
     },
@@ -2331,16 +2351,16 @@
         }
       },
       "inputs": [
-        85,
-        89,
-        84,
         86,
+        90,
+        85,
         87,
         88,
-        90
+        89,
+        91
       ],
       "outputs": [
-        91
+        92
       ],
       "layer": 4
     },
@@ -2352,7 +2372,7 @@
         }
       },
       "inputs": [
-        91
+        92
       ],
       "outputs": [],
       "layer": 4
@@ -2370,11 +2390,11 @@
         }
       },
       "inputs": [
-        91,
-        82
+        92,
+        83
       ],
       "outputs": [
-        92
+        93
       ],
       "layer": 4
     },
@@ -2386,11 +2406,11 @@
         }
       },
       "inputs": [
-        92,
-        79
+        93,
+        80
       ],
       "outputs": [
-        93
+        94
       ],
       "layer": 4
     },
@@ -2404,10 +2424,10 @@
         }
       },
       "inputs": [
-        93
+        94
       ],
       "outputs": [
-        94
+        95
       ],
       "layer": 4
     },
@@ -2421,10 +2441,10 @@
         }
       },
       "inputs": [
-        94
+        95
       ],
       "outputs": [
-        95
+        96
       ],
       "layer": 4
     },
@@ -2438,11 +2458,11 @@
         }
       },
       "inputs": [
-        95
+        96
       ],
       "outputs": [
-        96,
-        97
+        97,
+        98
       ],
       "layer": 4
     },
@@ -2456,11 +2476,11 @@
         }
       },
       "inputs": [
-        96,
-        94
+        97,
+        95
       ],
       "outputs": [
-        98
+        99
       ],
       "layer": 4
     },
@@ -2471,10 +2491,10 @@
         }
       },
       "inputs": [
-        98
+        99
       ],
       "outputs": [
-        99
+        100
       ],
       "layer": 4
     },
@@ -2488,11 +2508,11 @@
         }
       },
       "inputs": [
-        96,
-        99
+        97,
+        100
       ],
       "outputs": [
-        100
+        101
       ],
       "layer": 4
     },
@@ -2503,11 +2523,11 @@
         }
       },
       "inputs": [
-        100,
-        97
+        101,
+        98
       ],
       "outputs": [
-        101
+        102
       ],
       "layer": 4
     },
@@ -2519,10 +2539,10 @@
         }
       },
       "inputs": [
-        94
+        95
       ],
       "outputs": [
-        102
+        103
       ],
       "layer": 4
     },
@@ -2533,10 +2553,10 @@
         }
       },
       "inputs": [
-        102
+        103
       ],
       "outputs": [
-        103
+        104
       ],
       "layer": 4
     },
@@ -2548,21 +2568,6 @@
         }
       },
       "inputs": [
-        103
-      ],
-      "outputs": [
-        104
-      ],
-      "layer": 4
-    },
-    {
-      "kind": {
-        "Launch": {
-          "kernel": "norm::residual_add_bf16"
-        }
-      },
-      "inputs": [
-        101,
         104
       ],
       "outputs": [
@@ -2577,11 +2582,26 @@
         }
       },
       "inputs": [
-        93,
+        102,
         105
       ],
       "outputs": [
         106
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "norm::residual_add_bf16"
+        }
+      },
+      "inputs": [
+        94,
+        106
+      ],
+      "outputs": [
+        107
       ],
       "layer": 4
     },
@@ -2595,21 +2615,6 @@
         }
       },
       "inputs": [
-        106
-      ],
-      "outputs": [
-        107
-      ],
-      "layer": 5
-    },
-    {
-      "kind": {
-        "Matmul": {
-          "weight": "layer.5.up_proj",
-          "beta_one": false
-        }
-      },
-      "inputs": [
         107
       ],
       "outputs": [
@@ -2619,8 +2624,9 @@
     },
     {
       "kind": {
-        "Launch": {
-          "kernel": "mlp::relu2_bf16"
+        "Matmul": {
+          "weight": "layer.5.up_proj",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -2633,17 +2639,31 @@
     },
     {
       "kind": {
+        "Launch": {
+          "kernel": "mlp::relu2_bf16"
+        }
+      },
+      "inputs": [
+        109
+      ],
+      "outputs": [
+        110
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.5.down_proj",
           "beta_one": true
         }
       },
       "inputs": [
-        109,
-        106
+        110,
+        107
       ],
       "outputs": [
-        110
+        111
       ],
       "layer": 5
     },
@@ -2657,10 +2677,10 @@
         }
       },
       "inputs": [
-        110
+        111
       ],
       "outputs": [
-        111
+        112
       ],
       "layer": null
     },
@@ -2671,10 +2691,10 @@
         }
       },
       "inputs": [
-        111
+        112
       ],
       "outputs": [
-        112
+        113
       ],
       "layer": null
     }
@@ -2712,7 +2732,7 @@
       "layer": 3,
       "op": 58,
       "values": [
-        65
+        66
       ]
     },
     {
@@ -2720,13 +2740,13 @@
       "layer": 4,
       "op": 79,
       "values": [
-        91
+        92
       ]
     },
     {
       "seam": "out",
       "values": [
-        112
+        113
       ]
     }
   ]

@@ -5,24 +5,33 @@
 //! term, and its own first line says so.
 
 use kernels_macros::routine;
-use crate::routine::{Asks, Bind, Ctx, Fire, In, Out, Tensor, bf16, elementwise, elementwise_rows, keys};
-use kernels::KernelSig;
+use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, Out, Tensor, bf16, elementwise, elementwise_rows, keys};
 use kernels::routine::Refusal;
-
 
 /// gemma's gated activation: `gelu_tanh(gate) * up`, the tanh approximation
 /// and not the erf one.
 ///
-/// `mlp/gated.slang` under `PIE_GEGLU`. Bindings 0..=3 are gate, up, out and
-/// the `GegluParams` block, in that order, which is the order this signature
-/// states and not the order a trace states them.
+/// `mlp/gated.slang` under `PIE_GEGLU`. Bindings 0..=2 are gate, up and out,
+/// in that order, which is the order this signature states and not the order a
+/// trace states them. There is no binding 3.
 ///
-/// `params` is a buffer and not a scalar run: `PIE_PARAMS` expands to a
-/// `std430 readonly buffer`. Its one member is named `unused`, and it is --
-/// the shader bounds itself with `GetDimensions` on the output rather than
-/// with a count the caller passes. The binding still has to be filled, because
-/// a descriptor the layout declares and nothing writes is a fault inside
-/// `vkCreateComputePipelines`, not an error.
+/// **The `GegluParams` block is gone, source and all.** `PIE_PARAMS(3,
+/// GegluParams, p)` declared a `std430 readonly buffer` whose one member was
+/// named `unused` and was -- a per-row element count that once bounded a
+/// whole-tensor dispatch, retired because `past_the_end` bounds the store with
+/// `GetDimensions` on the output instead. The block outlived its field only
+/// because the row stated `params: Buf` and every backend built a bind layout
+/// out of the row.
+///
+/// This body used to open `let _params = ctx.params()?;` and then drop the
+/// handle without forwarding it, which was correct and looked like a mistake:
+/// `slangc` emits no binding decoration for a global the entrypoint never
+/// reads, so the module has no descriptor at 3 and forwarding one would be an
+/// arity refusal at the first real dispatch. What the call still did was mint
+/// `hold::params_block`'s sentinel and stage the statement's scalar run for a
+/// slot that does not exist. With the declaration deleted there is nothing
+/// left to ask for, and the source, the compiled module and this signature all
+/// say three.
 ///
 /// # Errors
 ///
@@ -33,7 +42,6 @@ pub fn geglu_tanh(
     gate: In<Tensor<bf16>>,
     up: In<Tensor<bf16>>,
     out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
-    let _params = ctx.params()?;
     let width = gate.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
@@ -63,13 +71,31 @@ pub fn geglu_tanh_strided(
     ctx: &Ctx<'_>,
     gate: In<Tensor<bf16>>,
     up: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
+    out: Out<Tensor<bf16>>,
+    // THE FIVE THAT WERE `GegluStridedParams`, in the order the row states
+    // them. `stated_width`/`stated_rows` are the launch's own rectangle, which
+    // this body also derives -- not a duplication introduced here: the struct
+    // already held both, the shader read the staged words and the grid came
+    // from the body, and both still do.
+    stated_width: Const<u32>,
+    stated_rows: Const<u32>,
+    gate_pitch: Const<u32>,
+    up_pitch: Const<u32>,
+    out_pitch: Const<u32>) -> Result<(), Refusal> {
     let width = gate.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
         Fire::at(crate::routine::module_path("geglu_tanh_strided_bfloat16", ctx.best()), "geglu_tanh_strided_bfloat16").apply(elementwise(width, rows)?),
-        &[gate.arg(), up.arg(), out.arg(), params],
+        &[
+            gate.arg(),
+            up.arg(),
+            out.arg(),
+            stated_width.arg(),
+            stated_rows.arg(),
+            gate_pitch.arg(),
+            up_pitch.arg(),
+            out_pitch.arg(),
+        ],
     )
 }
 
@@ -80,8 +106,13 @@ pub fn geglu_tanh_strided(
 /// it: dropping either the clamp or the `+1` produces a model that runs and is
 /// wrong, which is why this is a symbol a text names rather than a flag.
 ///
-/// `limit` and `alpha` ride the `GptOssSwiGluParams` block, so they reach the
-/// shader through `params` rather than as `f32` arguments here.
+/// `limit` and `alpha` are `Const` marks now: they were `GptOssSwiGluParams`'
+/// second and third fields, behind a dead per-row element count held only to
+/// keep them at their offsets. `Const` slots are the statement's run counted in
+/// declaration order, so reaching `limit` at word 1 means naming word 0 --
+/// `_stated_elements` is that name, and it is declared and NOT passed, so the
+/// dead word stops at the host instead of riding to the device inside a struct.
+/// The holder goes when the DSL stops stating the word.
 ///
 /// # Errors
 ///
@@ -91,21 +122,24 @@ pub fn gptoss_swiglu(
     ctx: &Ctx<'_>,
     gate: In<Tensor<bf16>>,
     up: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
+    out: Out<Tensor<bf16>>,
+    _stated_elements: Const<u32>,
+    limit: Const<f32>,
+    alpha: Const<f32>) -> Result<(), Refusal> {
     let width = gate.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
         Fire::at(crate::routine::module_path("gptoss_swiglu_bfloat16", ctx.best()), "gptoss_swiglu_bfloat16").apply(elementwise(width, rows)?),
-        &[gate.arg(), up.arg(), out.arg(), params],
+        &[gate.arg(), up.arg(), out.arg(), limit.arg(), alpha.arg()],
     )
 }
 
 /// The plain gated FFN activation: `silu(gate) * up`.
 ///
-/// Three bindings and no parameter block -- the only kernel in this file
-/// without one, because it needs no scalar the output's own length does not
-/// give it.
+/// Three bindings and no parameter block, which it needs none of: the output's
+/// own length is the bound and the grid is the extent. It was the only kernel
+/// in this file that could say so; [`geglu_tanh`] now says it too, having lost
+/// a block whose single field held nothing.
 ///
 /// The silu is computed through bf16 twice on purpose: `sigmoid` and the
 /// product are each rounded to bf16 before the multiply, which is what MLX
@@ -165,17 +199,6 @@ pub fn silu_mul_strided(
     )
 }
 
-
-/// The entrypoints this family's crossed routines spell, now that their rows
-/// are gone. See [`crate::RETIRED`].
-pub static ENTRYPOINTS: &[&str] = &[
-    "geglu_tanh_bfloat16",
-    "geglu_tanh_strided_bfloat16",
-    "gptoss_swiglu_bfloat16",
-    "silu_mul_bfloat16",
-    "silu_mul_strided_bfloat16",
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,9 +219,11 @@ mod tests {
     /// call that does not care about the exact number still runs whole; a
     /// test asserting a specific dispatch, or driving the empty-rows
     /// refusal, sets it first. `row_pitch` answers `silu_mul_strided`'s own
-    /// ask the same way. `ctx.params()`, which three of these five call for a
-    /// block none of them read the CONTENTS of, is answered generically by
-    /// `Ty` alone rather than by a field of its own.
+    /// ask the same way. `ctx.params()`, which TWO of these five still call --
+    /// `geglu_tanh` was the third until its block was deleted from
+    /// `mlp/gated.slang` outright -- is answered generically by `Ty` alone
+    /// rather than by a field of its own, since no test here inspects what a
+    /// params block holds.
     struct Seen {
         calls: RefCell<Vec<Call>>,
         rows: Cell<i32>,
@@ -285,6 +310,14 @@ mod tests {
             In { ptr: Tensor::<bf16>::new(0), rows: 3, width: 64 },
             In { ptr: Tensor::<bf16>::new(1), rows: 3, width: 64 },
             Out { ptr: Tensor::<bf16>::new(2), rows: 3, width: 64 },
+            // The five that were `GegluStridedParams`. The `up` pitch is wider
+            // than the width on purpose: gemma's PLE reads a narrow gate out of
+            // a wide table, which is why this form exists at all.
+            Const::new(64),
+            Const::new(3),
+            Const::new(64),
+            Const::new(512),
+            Const::new(64),
         )
         .expect("a pitch does not make it two-dimensional");
         gptoss_swiglu(
@@ -292,6 +325,12 @@ mod tests {
             In { ptr: Tensor::<bf16>::new(0), rows: 3, width: 64 },
             In { ptr: Tensor::<bf16>::new(1), rows: 3, width: 64 },
             Out { ptr: Tensor::<bf16>::new(2), rows: 3, width: 64 },
+            // Word 0 is the dead element count `GptOssSwiGluParams` opened
+            // with; the mark holds its slot so `limit` lands on word 1, and it
+            // is deliberately not passed.
+            Const::new(0),
+            Const::new(7.0),
+            Const::new(1.702),
         )
         .expect("64 wide by 3 rows is a launch");
         silu_mul(
@@ -316,6 +355,31 @@ mod tests {
                 ("silu_mul_bfloat16", [192, 1, 1]),
             ],
             "one dispatch each, named whole, over `width * rows` lanes on x"
+        );
+
+        // AND THE DENSE GEGLU BINDS THREE, not four. Its `GegluParams` block
+        // was a `PIE_PARAMS(3, ...)` declaration for a struct with one field
+        // named `unused` -- and `slangc` had already compiled the binding out
+        // for being unread, so the body took the handle as `_params` and threw
+        // it away. The declaration is gone from `mlp/gated.slang` now.
+        //
+        // The two arms that DO read their numbers no longer take a block
+        // either: five pitches and gpt-oss's limit and alpha are numbers no
+        // grid supplies, so unlike `GegluParams` they became `Const` marks
+        // rather than nothing, and they ride a push range packed from what the
+        // body passes. That is what makes these four counts differ from one
+        // another, and an arity that drifted would be a refusal at the first
+        // real dispatch -- worth pinning here rather than discovering on a
+        // device.
+        let bound: Vec<usize> = calls.iter().map(|(_, _, args)| args.len()).collect();
+        assert_eq!(
+            bound,
+            vec![3, 8, 5, 3],
+            "geglu_tanh and silu_mul take gate, up and out and stop. The \
+             strided GeGLU takes those three plus `GegluStridedParams`' five \
+             words. gpt-oss takes FIVE and not six: its struct opened with a \
+             dead element count, and the mark holding that slot is declared \
+             and never passed, so the dead word reaches no argument list"
         );
     }
 

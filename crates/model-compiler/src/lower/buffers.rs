@@ -149,7 +149,7 @@ impl Buffers {
                         if pairs.iter().any(|&(oi, _)| oi as usize == o) {
                             continue;
                         }
-                        if pinned.binary_search(&v).is_ok() {
+                        if pinned.binary_search(&v).is_ok() || is_raised(plan, v) {
                             offset[v as usize] = Self::NAMED;
                             continue;
                         }
@@ -163,7 +163,15 @@ impl Buffers {
                 }
             }
             for &v in &op.outputs {
-                if pinned.binary_search(&v).is_ok() {
+                // A RAISE IS NOT AN ACTIVATION AND TAKES NO ARENA BLOCK. It
+                // reaches this loop because `OpKind::Prep` has an output now,
+                // and without the guard `value_bytes` would size it from the
+                // empty shape stored beside it and `take_block` would hand
+                // back a real offset for zero bytes -- after which `slot`
+                // reads `Arg::Arena` and the raise is a rectangle at a place
+                // in the activation arena. It is `NAMED` for the reason every
+                // other `NAMED` value is: the backend holds it.
+                if pinned.binary_search(&v).is_ok() || is_raised(plan, v) {
                     offset[v as usize] = Self::NAMED;
                     continue;
                 }
@@ -335,4 +343,14 @@ pub const fn dtype_bytes(d: DType) -> u32 {
         DType::BF16 | DType::F16 => 2,
         DType::F32 | DType::I32 => 4,
     }
+}
+
+/// Whether this value is a raise rather than a tensor.
+///
+/// Asked of the VALUE and not of the op that produced it. A raise can only come
+/// from an `OpKind::Prep` today, and keying the rule on that would be a second
+/// place for the invariant to live -- one that goes quietly wrong the first
+/// time anything else publishes one.
+fn is_raised(plan: &ForwardPlan, v: ValueId) -> bool {
+    plan.values.get(v as usize).is_some_and(model_ir::trace::ValueInfo::is_raised)
 }

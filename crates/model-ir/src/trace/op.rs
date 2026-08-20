@@ -150,14 +150,33 @@ pub enum OpKind {
     ///
     /// The attention schedulers are the case it exists for: a FlashInfer plan
     /// is walked on the CPU from THIS batch's page CSR, lands in a workspace
-    /// the dispatch addresses, and is re-walked every fire — so it is neither
-    /// a launch nor a value. The driver used to infer it, by looking for the
-    /// dispatch symbol in the lowered kernel table; a text that states the
-    /// preparation says so instead.
+    /// the dispatch addresses, and is re-walked every fire — so it is not a
+    /// launch. The driver used to infer it, by looking for the dispatch symbol
+    /// in the lowered kernel table; a text that states the preparation says so
+    /// instead.
     ///
-    /// Produces nothing. What it publishes is reached through [`PrepKind`],
-    /// which is the whole vocabulary: a `Prep` cannot name an arbitrary host
-    /// program, only one the backend already knows how to run.
+    /// # It produces ONE VALUE, and it used to produce none
+    ///
+    /// *"Produces nothing. What it publishes is reached through `PrepKind`"* —
+    /// that was this doc, and everything downstream followed from it
+    /// mechanically. With no edge from the prep to the statements that execute
+    /// what it raised, the edge had to be rebuilt by hand in four places:
+    /// `bind::attn_plan` recovers it from a family string and, for decode,
+    /// GUESSES from the window on the `LaunchSpec`; `raise_attn_plans` cannot
+    /// tell which plan a statement wants so it raises one at the widest head
+    /// dim any layer stated; the object's fields scatter into 45 of
+    /// `kernels::keys`'s 182 keys, read back at 130 `ask` sites; and the
+    /// upload fence is ordered by hand where an edge would order itself.
+    ///
+    /// So it produces a value. `outputs[0]` is a RAISE — see
+    /// [`ValueInfo::raised`] — and the statements that read what this raised
+    /// take it as an operand, positionally, the way they take an activation.
+    /// `.wiki/designs/design-struct.md` carries the whole of it.
+    ///
+    /// [`PrepKind`] is still the whole vocabulary and is still closed: a
+    /// `Prep` cannot name an arbitrary host program, only one the backend
+    /// already knows how to run. Producing a value does not widen that by one
+    /// entry.
     Prep { prep: PrepKind },
     /// Two regions that both run, over complementary row ranges: prefix over
     /// `[0, fast_rows)`, tail over `[fast_rows, N)`. `fast_rows` is a runtime
@@ -281,15 +300,75 @@ pub enum PrepKind {
     PrefillAttention { head_dim: u32 },
 }
 
+impl PrepKind {
+    /// The raise this prep publishes, by the word `raise!` wrote.
+    ///
+    /// Read through [`kernels::raises::Raise`] rather than spelled here: the
+    /// key is declared once, in `kernels-cuda/src/raises.rs`, and a literal in
+    /// this file would be a second copy able to drift from it. `keys.rs`'s
+    /// preamble states the same rule for facts — *"the word appears once in
+    /// the tree"* — and this crate can honour it because it already depends on
+    /// `kernels-cuda`.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        use kernels::raises::Raise;
+        match self {
+            Self::DecodeAttention { .. } => kernels_cuda::raises::Fa2Decode::KEY,
+            Self::PrefillAttention { .. } => kernels_cuda::raises::Fa2Prefill::KEY,
+        }
+    }
+}
+
 /// The type of one SSA value in the trace.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ValueInfo {
-    /// Logical shape.
+    /// Logical shape. **Not this value's when [`Self::raised`] is set** — see
+    /// there.
     pub shape: Shape,
-    /// Element type.
+    /// Element type. **Not this value's when [`Self::raised`] is set.**
     pub dtype: DType,
     /// Set on values whose content selects per-element structure, such as a
     /// [`OpKind::TopK`] expert assignment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dyn_axis: Option<DynAxis>,
+    /// Set when this value is NOT A TENSOR: one object the fire raised, by the
+    /// word its `raise!` declared ([`PrepKind::key`]).
+    ///
+    /// # Why the other two fields are not `Option`
+    ///
+    /// Because a raise has neither a rectangle nor an element type, and making
+    /// [`Self::shape`] and [`Self::dtype`] optional to say so would rewrite
+    /// every reader of both. The invariant is instead: **a reader checks
+    /// [`Self::is_raised`] first**, and the one accessor that could silently
+    /// hand back a degenerate answer — `TraceBuilder::value_shape` — refuses
+    /// rather than returning the empty shape stored here.
+    ///
+    /// A `String` and not a type parameter because a trace is serialized: the
+    /// key is what survives to disk and back, and it is the same string the
+    /// binder resolves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raised: Option<String>,
+}
+
+impl ValueInfo {
+    /// One raised object, as a value.
+    ///
+    /// The shape is empty and the dtype is arbitrary; neither is read for a
+    /// raise, and [`Self::is_raised`] is what a reader must consult before
+    /// either. See [`Self::raised`].
+    #[must_use]
+    pub fn raise(key: &str) -> Self {
+        Self {
+            shape: Shape(Vec::new()),
+            dtype: DType::I32,
+            dyn_axis: None,
+            raised: Some(key.to_string()),
+        }
+    }
+
+    /// Whether this value is a raise rather than a tensor.
+    #[must_use]
+    pub fn is_raised(&self) -> bool {
+        self.raised.is_some()
+    }
 }

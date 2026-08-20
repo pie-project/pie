@@ -167,8 +167,47 @@ pub fn rows_from_regions(
 
     let segments = region_row_indptr.len().saturating_sub(1);
     if region_row_indptr.is_empty() {
+        // NO TABLE IS NOT "NO AXES", AND READING IT THAT WAY COST A PREFILL
+        // ITS ATTENTION KERNEL.
+        //
+        // A sig of zero says every axis is off, and `MULTI_TOKEN` is one of
+        // them: `GuardPred::WindowOne` reads it as "this row's query window is
+        // one row", which is what makes a fire take `sdpa_paged_decode`
+        // instead of the tiled or mma kernel. So a 2048-token prefill arriving
+        // without a table was lowered onto the per-row decode kernel, which
+        // re-reads the whole key run once per query row. It is not wrong --
+        // the logits are the same and every MLX gate still passes -- it is
+        // quadratic where the tiled form is not. Measured on Llama-3.2-1B by
+        // `attention_is_a_minority_of_a_long_prefill`: 2.104e-4 ms per token²
+        // against the mma kernel's 2.589e-5, attention 52% of the fire instead
+        // of 8%.
+        //
+        // And an empty table is a PRODUCTION case, not just a fixture's
+        // shorthand: `engine::scheduler::batch::planned_region_table` declines
+        // to build one whenever the attribution CSR is absent or any member
+        // owns no wire row, and returns three empty vectors.
+        //
+        // The width is knowable without the table, because `qo_indptr` is the
+        // same fact the table was built from -- that function's own rule is
+        // `w[1] - w[0] > 1` over the request's windows. Deriving it here is
+        // therefore not a guess standing in for the table; it is the one
+        // remaining reader computing what the absent producer would have said.
+        // The other axes are NOT derivable -- a hook, a mask, a LoRA and a
+        // depth are the scheduler's claims about a request and nothing in the
+        // step implies them -- so they stay off, which is what an absent table
+        // has always meant for them.
+        let mut sig = vec![0u32; rows];
+        for r in 0..readouts.qo_indptr.len().saturating_sub(1) {
+            let (lo, hi) = (readouts.qo_indptr[r], readouts.qo_indptr[r + 1]);
+            if hi <= lo || hi.saturating_sub(lo) == 1 {
+                continue;
+            }
+            for row in lo..hi.min(u32::try_from(rows).unwrap_or(u32::MAX)) {
+                sig[row as usize] = region_sig::MULTI_TOKEN;
+            }
+        }
         return Ok((0..rows)
-            .map(|i| Row::from_region(0, region_sig::MAX_LAYERS_FULL, samples[i]))
+            .map(|i| Row::from_region(sig[i], region_sig::MAX_LAYERS_FULL, samples[i]))
             .collect());
     }
     if segments != region_sig_bits.len() || segments != region_k.len() {
@@ -220,6 +259,43 @@ pub use walk::*;
 #[cfg(test)]
 mod region_tests {
     use super::*;
+
+    /// A STEP THAT ARRIVES WITHOUT A REGION TABLE STILL KNOWS HOW WIDE ITS
+    /// QUERY WINDOWS ARE.
+    ///
+    /// `MULTI_TOKEN` is the one axis `qo_indptr` implies, and reading an
+    /// absent table as "every axis off" told `GuardPred::WindowOne` that a
+    /// 2048-token prefill was a one-row window — which picks the per-row
+    /// decode attention kernel over the tiled one and makes the fire
+    /// quadratic. The other axes stay off, because nothing in a step implies
+    /// a hook, a mask, a LoRA or a truncated depth.
+    #[test]
+    fn no_region_table_still_reads_a_wide_request_as_multi_token() {
+        // Two requests: a four-token prefill and a one-token decode.
+        let qo = [0u32, 4, 5];
+        let rows = rows_from_regions(
+            5,
+            Readouts {
+                indices: &[],
+                indptr: &[],
+                qo_indptr: &qo,
+            },
+            &[],
+            &[],
+            &[],
+        )
+        .expect("a step with no table lowers");
+        assert!(
+            rows[..4].iter().all(|r| r.multi_token),
+            "every row of the wide request is a multi-token window"
+        );
+        assert!(!rows[4].multi_token, "and the decode's row is not");
+        assert!(
+            rows.iter()
+                .all(|r| !r.hooked && !r.custom_mask && !r.lora && r.depth_k.is_none()),
+            "no other axis is invented from a step that states none"
+        );
+    }
 
     #[test]
     fn each_axis_bit_lands_on_its_own_field() {
@@ -385,5 +461,150 @@ mod region_tests {
             rows.iter().map(|r| r.samples).collect::<Vec<_>>(),
             [false, false, false, true]
         );
+    }
+}
+
+#[cfg(test)]
+mod raised_operand {
+    use super::*;
+    use model_ir::trace::{
+        DType, Dim, ForwardPlan, Op, OpKind, PrepKind, Shape as VShape, ValueInfo,
+    };
+
+    /// A prep, then a launch that names what it raised.
+    ///
+    /// Hand-built rather than traced: no DSL states this yet — stage 4 is
+    /// where a real launcher takes the operand — and the point of the fixture
+    /// is that the LOWERING can carry one before anything asks it to.
+    fn plan_with_a_raise() -> ForwardPlan {
+        let prep = PrepKind::PrefillAttention { head_dim: 128 };
+        ForwardPlan {
+            family: "fixture.cuda".to_string(),
+            values: vec![
+                // 0: the raise the prep publishes.
+                ValueInfo::raise(prep.key()),
+                // 1: an ordinary activation, so the arena has something to do.
+                ValueInfo {
+                    shape: VShape(vec![Dim::Tokens, Dim::Const(64)]),
+                    dtype: DType::BF16,
+                    dyn_axis: None,
+                    raised: None,
+                },
+            ],
+            ops: vec![
+                Op {
+                    kind: OpKind::Prep { prep },
+                    inputs: Vec::new(),
+                    outputs: vec![0],
+                    layer: None,
+                    dest: Vec::new(),
+                },
+                Op {
+                    kind: OpKind::Launch {
+                        kernel: "attn::dispatch_attention_flashinfer_prefill_bf16".to_string(),
+                        weights: Vec::new(),
+                        state: None,
+                        params: Vec::new(),
+                        param_extents: Vec::new(),
+                    },
+                    inputs: vec![0],
+                    outputs: vec![1],
+                    layer: None,
+                    dest: Vec::new(),
+                },
+            ],
+            depth_window: false,
+            seams: Vec::new(),
+        }
+    }
+
+    fn rows(n: usize) -> Vec<Row> {
+        vec![
+            Row {
+                samples: true,
+                ..Row::default()
+            };
+            n
+        ]
+    }
+
+    /// THE STAGE 3 GATE: a raise reaches the lowering as itself.
+    #[test]
+    fn a_raise_lowers_to_its_own_arg_and_carries_the_word() {
+        let plan = plan_with_a_raise();
+        let out = lower(&plan, &rows(4), Fire::default()).expect("the fixture lowers");
+
+        let launch = out.launches.first().expect("the launch was emitted");
+        let args = &out.args[launch.args.start as usize..launch.args.end as usize];
+        let first = args.first().expect("the launch placed its operand");
+
+        match first {
+            Arg::Raised { value, key } => {
+                assert_eq!(*value, 0);
+                assert_eq!(key, PrepKind::PrefillAttention { head_dim: 128 }.key());
+            }
+            other => panic!("the raise lowered as {other:?}, not as itself"),
+        }
+    }
+
+    /// THE ARENA DECLINED IT, and that is not incidental.
+    ///
+    /// A raise reaches the allocator's output loop like any value. Without the
+    /// guard, `value_bytes` sizes it from the empty shape and `take_block`
+    /// hands back a real offset for zero bytes — after which `slot` reads
+    /// `Arg::Arena` and the raise is a rectangle at a place in the activation
+    /// arena, which is a wrong answer that binds.
+    #[test]
+    fn the_arena_gives_a_raise_no_block() {
+        let plan = plan_with_a_raise();
+        let out = lower(&plan, &rows(4), Fire::default()).expect("the fixture lowers");
+
+        assert_eq!(
+            out.value_offset[0],
+            Buffers::NAMED,
+            "the raise took an arena block"
+        );
+        assert_ne!(
+            out.value_offset[1],
+            Buffers::NAMED,
+            "and the activation beside it still got one, so the guard is not a blanket"
+        );
+    }
+
+    /// THE EDGE, END TO END: the prep's `value` is what the consumer's
+    /// `Arg::Raised` names.
+    ///
+    /// This is what lets a driver answer BY VALUE. The key cannot tell two
+    /// apart -- a stack whose layers disagree about head dim wants one
+    /// schedule per width and both spell `fa2.prefill` -- so a resolver keyed
+    /// on the word could only ever hand back whichever was raised last.
+    #[test]
+    fn the_preps_value_is_the_one_the_consumer_names() {
+        let plan = plan_with_a_raise();
+        let out = lower(&plan, &rows(4), Fire::default()).expect("the fixture lowers");
+
+        let prep = out.preps.first().expect("the prep was carried");
+        assert_eq!(prep.value, plan.ops[prep.at_op as usize].outputs[0]);
+
+        let launch = out.launches.first().expect("the launch was emitted");
+        let first = &out.args[launch.args.start as usize];
+        match first {
+            Arg::Raised { value, .. } => assert_eq!(
+                *value, prep.value,
+                "the consumer names a different object than the prep published"
+            ),
+            other => panic!("the raise lowered as {other:?}"),
+        }
+    }
+
+    /// A prep states no launch of its own; only the statement that reads it does.
+    #[test]
+    fn the_prep_itself_emits_no_launch() {
+        let plan = plan_with_a_raise();
+        let out = lower(&plan, &rows(4), Fire::default()).expect("the fixture lowers");
+
+        assert_eq!(out.launches.len(), 1, "the prep is not a launch");
+        assert_eq!(out.preps.len(), 1, "and it is still stated as a prep");
+        assert_eq!(out.preps[0].at_op, 0);
     }
 }

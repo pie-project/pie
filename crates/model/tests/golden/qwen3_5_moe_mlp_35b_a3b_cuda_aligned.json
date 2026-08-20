@@ -238,7 +238,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::rmsnorm_gemma_bf16",
+          "kernel": "norm::rmsnorm_bf16",
           "weights": [
             "layer.0.mlp_norm"
           ]

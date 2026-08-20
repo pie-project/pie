@@ -613,7 +613,7 @@ fn gemma4_matches_transformers_on_real_weights() {
                         host.truncate(host.len() / 2);
                         (host, width as usize)
                     }
-                    Arg::Weight(_) => continue,
+                    Arg::Weight(_) | Arg::Raised { .. } => continue,
                 };
                 let rows = host.len() / (width * 2);
                 let last = rows.saturating_sub(1);

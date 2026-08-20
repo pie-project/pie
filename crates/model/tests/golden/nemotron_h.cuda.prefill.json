@@ -1105,7 +1105,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 0
-          }
+          },
+          "params": [
+            3072,
+            4
+          ]
         }
       },
       "inputs": [
@@ -1537,7 +1541,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 2
-          }
+          },
+          "params": [
+            3072,
+            4
+          ]
         }
       },
       "inputs": [
@@ -2262,7 +2270,11 @@
           "state": {
             "store": "RecurrentState",
             "layer": 4
-          }
+          },
+          "params": [
+            3072,
+            4
+          ]
         }
       },
       "inputs": [

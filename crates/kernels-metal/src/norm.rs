@@ -112,11 +112,27 @@ fn head_row_grid(threads: u32, heads: i32, rows: i32) -> Result<[u32; 3], Refusa
 
 /// `out = w * (x / rms(x))`, one threadgroup per axis.
 ///
-/// The order of `x, w, out, params` is the SHADER's and not the trace's. A
-/// trace states inputs, outputs, then weights, so binding positionally puts
-/// the output where the norm weight belongs -- and nothing reports it, because
+/// The order of `x, w, out` is the SHADER's and not the trace's. A trace
+/// states inputs, outputs, then weights, so binding positionally puts the
+/// output where the norm weight belongs -- and nothing reports it, because
 /// Metal does not validate a binding. That mismatch is why this was the first
 /// row in the tree to state its operands, and here it is the argument order.
+///
+/// # All five of the struct's fields are STATED, where two were and three
+/// were unnameable
+///
+/// `eps`, `axis_size`, `w_stride`, `plus_one` and `gain` were a `RmsParams`
+/// block this body forwarded whole, and only the first two appeared here at
+/// all -- `eps` for no other reason than to hold slot 0 open so `axis` could
+/// be slot 1. The other three were read by `norm/rms.metal` out of words 2, 3
+/// and 4 and named NOWHERE in Rust, so nothing in this crate could say what a
+/// norm's gain was, whether it took gemma's `1 + w`, or how far apart the
+/// weight's channels sat.
+///
+/// All five are marks now: the same five words of the same statement run,
+/// reached by INDEX instead of by struct field, and the entrypoint takes them
+/// as five `constant` references at buffers 3 through 7 where it took one
+/// staged block at 3.
 ///
 /// # Errors
 ///
@@ -127,21 +143,39 @@ pub fn rms_single_row(
     x: In<Tensor<bf16>>,
     w: Const<Tensor<bf16>>,
     out: Out<Tensor<bf16>>,
-    // THE STRUCT'S FIRST TWO FIELDS, DECLARED SO THE SECOND ONE'S SLOT EXISTS.
-    // The body forwards `ctx.params()` whole, but the AXIS is the norm's own
-    // width and it is `params[1]` -- `ParamOr<1, ..>` at HEAD. `eps` holds
-    // slot 0 open for it. `x.width` is a row, which is the axis only when a
-    // row holds ONE norm; the strided twin below shows why that is not a rule.
+    // THE STRUCT'S FIVE FIELDS, IN THE STRUCT'S ORDER, because that order is
+    // the statement's: the block was staged from words 0..5 of this
+    // statement's run and every mark below reads the word its field sat at.
+    // `w: Const<Tensor<bf16>>` above does not disturb the count -- a
+    // `Const<Tensor<E>>` claims the WEIGHT run and not the params one.
+    //
+    // The body reads only `axis`, and `x.width` will not do instead: a row is
+    // the axis only when it holds ONE norm, which the strided twin below is
+    // the counterexample to.
     eps: Const<f32>,
-    axis: Const<i32>) -> Result<(), Refusal> {
-    let _ = eps;
-    let params = ctx.params()?;
+    axis: Const<i32>,
+    // THE THREE THE SHADER READ AND NOTHING HERE COULD NAME. `w_stride` is
+    // the distance between consecutive CHANNELS of the norm weight,
+    // `plus_one` is the gemma convention flag `rms_row_body` folds as
+    // `1 + w`, and `gain` is the scale applied in float before the single
+    // bf16 round. All three are passed and none is read here, which is a
+    // different thing from the dead marks this signature used to carry: they
+    // are the shader's to use, and this body's only job is to put them where
+    // it reads them.
+    //
+    // `u32` and not `i32` for the middle two because no arithmetic here wants
+    // a sign, and `Arg::unpack` for a `Const<u32>` takes the unsigned carrier
+    // and refuses the signed one -- so the spelling is a claim a caller has to
+    // match. The kernel spells all three `uint`/`float` to match.
+    w_stride: Const<u32>,
+    plus_one: Const<u32>,
+    gain: Const<f32>) -> Result<(), Refusal> {
     let width = x.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     let (lanes, group) = rms_grid(width, *axis, rows)?;
     ctx.fire(
         Fire::at(RMS_FILE, "rms_single_row_bfloat16").apply(Grid::of(lanes, group)),
-        &[x.arg(), w.arg(), out.arg(), params],
+        &[x.arg(), w.arg(), out.arg(), eps.arg(), axis.arg(), w_stride.arg(), plus_one.arg(), gain.arg()],
     )
 }
 
@@ -153,6 +187,11 @@ pub fn rms_single_row(
 /// threadgroup. That is the difference from [`rms_single_row`], whose single
 /// grid axis carries both the norm and the row.
 ///
+/// The pitch goes LAST, after the five the packed form also binds, so that
+/// folding a stride in does not renumber what the two share: it was buffer 4
+/// behind a block of five words and it is buffer 8 in front of five scalars,
+/// which is the same place.
+///
 /// # Errors
 ///
 /// [`Refusal::Empty`] for an empty axis or row count, and [`Refusal::Grid`]
@@ -163,16 +202,20 @@ pub fn rms_strided_row(
     x: In<Tensor<bf16>>,
     w: Const<Tensor<bf16>>,
     out: Out<Tensor<bf16>>,
-    // THE STRUCT'S FIRST TWO FIELDS, DECLARED SO THE SECOND ONE'S SLOT EXISTS.
-    // The body forwards `ctx.params()` whole -- the shader reads a struct --
-    // but the AXIS is the norm's own width and the body needs it to size the
-    // threadgroup, and it is NOT `x.width`: a strided row holds several norms
-    // and `x.width` is the pitch across all of them. It was `ParamOr<1, ..>`,
-    // so `eps` is declared here only to hold slot 0 open for it.
+    // [`rms_single_row`]'s five, at the same five words of the same run.
+    //
+    // The AXIS is the one this body reads, and it is NOT `x.width`: a strided
+    // row holds several norms and `x.width` is the pitch across all of them,
+    // so the threadgroup is sized from the mark. That is the difference from
+    // the wgpu and vulkan twins, where the group width is the shader's own
+    // and the axis reaches no launch -- a difference about the LAUNCH and not
+    // about the argument list, since the kernel spans `axis_size` on every
+    // plane.
     eps: Const<f32>,
-    axis: Const<i32>) -> Result<(), Refusal> {
-    let _ = eps;
-    let params = ctx.params()?;
+    axis: Const<i32>,
+    w_stride: Const<u32>,
+    plus_one: Const<u32>,
+    gain: Const<f32>) -> Result<(), Refusal> {
     let row_pitch = x.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     let t = rms_threads(*axis)?;
@@ -185,7 +228,7 @@ pub fn rms_strided_row(
     })?;
     ctx.fire(
         Fire::at(RMS_FILE, "rms_strided_row_bfloat16").apply(Grid::of([lanes, 1, 1], [t, 1, 1])),
-        &[x.arg(), w.arg(), out.arg(), params, row_pitch.arg()],
+        &[x.arg(), w.arg(), out.arg(), eps.arg(), axis.arg(), w_stride.arg(), plus_one.arg(), gain.arg(), row_pitch.arg()],
     )
 }
 
@@ -201,16 +244,18 @@ pub fn rms_strided_head_row(
     x: In<Tensor<bf16>>,
     w: Const<Tensor<bf16>>,
     out: Out<Tensor<bf16>>,
-    // THE STRUCT'S FIRST TWO FIELDS, DECLARED SO THE SECOND ONE'S SLOT EXISTS.
-    // The body forwards `ctx.params()` whole -- the shader reads a struct --
-    // but the AXIS is the norm's own width and the body needs it to size the
-    // threadgroup, and it is NOT `x.width`: a strided row holds several norms
-    // and `x.width` is the pitch across all of them. It was `ParamOr<1, ..>`,
-    // so `eps` is declared here only to hold slot 0 open for it.
+    // [`rms_single_row`]'s five, at the same five words of the same run, and
+    // the pitch after them for [`rms_strided_row`]'s reason.
+    //
+    // The AXIS sizes the threadgroup here as it does there, and it is NOT
+    // `x.width`: a strided row holds several norms and `x.width` is the pitch
+    // across all of them, so the head count below is the one divided by the
+    // other.
     eps: Const<f32>,
-    axis: Const<i32>) -> Result<(), Refusal> {
-    let _ = eps;
-    let params = ctx.params()?;
+    axis: Const<i32>,
+    w_stride: Const<u32>,
+    plus_one: Const<u32>,
+    gain: Const<f32>) -> Result<(), Refusal> {
     let row_pitch = x.width;
     // HOW MANY NORMS FIT THE ROW, which is the division HEAD spelled
     // `Over<Say<Width>, Else<Nth<1>, ..>>` and no driver answers as a fact.
@@ -219,16 +264,25 @@ pub fn rms_strided_head_row(
     let t = rms_threads(*axis)?;
     ctx.fire(
         Fire::at(RMS_FILE, "rms_strided_head_row_bfloat16").apply(Grid::of(head_row_grid(t, heads, rows)?, [t, 1, 1])),
-        &[x.arg(), w.arg(), out.arg(), params, row_pitch.arg()],
+        &[x.arg(), w.arg(), out.arg(), eps.arg(), axis.arg(), w_stride.arg(), plus_one.arg(), gain.arg(), row_pitch.arg()],
     )
 }
 
 /// [`rms_single_row`] with the block residual folded into its epilogue.
 ///
-/// The residual is buffer 4 and arrives AFTER the params struct, which is the
-/// order the fold adds it in: the conditional binding comes after the
-/// unconditional ones, so folding does not renumber the four every form
-/// shares.
+/// The residual is buffer 8 and it USED TO BE 4, because the params struct it
+/// arrives after is five scalars now rather than one block. The rule it
+/// follows is unchanged: the conditional binding comes after the
+/// unconditional ones, so folding does not renumber what every form shares --
+/// and what every form shares is now the three operands AND the five scalars
+/// at 3 through 7.
+///
+/// # This form stated NO scalar at all, and read five
+///
+/// It forwarded `ctx.params()` and declared nothing beside its four operands,
+/// so the whole of `RmsParams` reached `norm/rms.metal` through a block no
+/// signature described. Its three siblings at least held two slots open; this
+/// one and [`rms_residual_scaled`] held none.
 ///
 /// # Errors
 ///
@@ -239,19 +293,40 @@ pub fn rms_residual(
     x: In<Tensor<bf16>>,
     w: Const<Tensor<bf16>>,
     out: Out<Tensor<bf16>>,
-    r: In<Tensor<bf16>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
+    r: In<Tensor<bf16>>,
+    // [`rms_single_row`]'s five, at the same five words of the same run. They
+    // are declared after `r` and FIRED before it, because the two orders
+    // answer different questions: this list is the STATEMENT's, where an
+    // operand precedes a scalar, and the fire array is the KERNEL's buffer
+    // table, where the residual is the conditional binding and therefore
+    // last.
+    eps: Const<f32>,
+    axis_size: Const<i32>,
+    w_stride: Const<u32>,
+    plus_one: Const<u32>,
+    gain: Const<f32>) -> Result<(), Refusal> {
     let width = x.width;
+    // NOT `*axis_size`. A norm sandwich spans its whole row, so the two are
+    // the same number here -- but the launch has always taken the row's own
+    // width and re-aiming it at the mark is a dispatch that moves, which
+    // belongs in a change that can measure the move.
     let axis = x.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     let (lanes, group) = rms_grid(width, axis, rows)?;
     ctx.fire(
         Fire::at(RMS_FILE, "rms_residual_bfloat16").apply(Grid::of(lanes, group)),
-        &[x.arg(), w.arg(), out.arg(), params, r.arg()],
+        &[x.arg(), w.arg(), out.arg(), eps.arg(), axis_size.arg(), w_stride.arg(), plus_one.arg(), gain.arg(), r.arg()],
     )
 }
 
 /// [`rms_residual`] with a per-layer gain beside the residual.
+///
+/// `s` is a one-element BUFFER at 9 and `gain` below is a stated word at 7,
+/// and the two are not the same number wearing different carriers: the buffer
+/// is the checkpoint's per-layer embedding scale, read as `s[0]` by every
+/// thread after the add, while `gain` is `RmsParams`'s own field, folded into
+/// the weight before the norm's multiply. Both were reaching this kernel
+/// before and only one of them was visible from Rust.
 ///
 /// # Errors
 ///
@@ -263,15 +338,22 @@ pub fn rms_residual_scaled(
     w: Const<Tensor<bf16>>,
     out: Out<Tensor<bf16>>,
     r: In<Tensor<bf16>>,
-    s: In<Tensor<bf16>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
+    s: In<Tensor<bf16>>,
+    // [`rms_residual`]'s five, declared after the operands and fired before
+    // them, for the reason stated there.
+    eps: Const<f32>,
+    axis_size: Const<i32>,
+    w_stride: Const<u32>,
+    plus_one: Const<u32>,
+    gain: Const<f32>) -> Result<(), Refusal> {
     let width = x.width;
+    // NOT `*axis_size`, for [`rms_residual`]'s reason.
     let axis = x.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     let (lanes, group) = rms_grid(width, axis, rows)?;
     ctx.fire(
         Fire::at(RMS_FILE, "rms_residual_scaled_bfloat16").apply(Grid::of(lanes, group)),
-        &[x.arg(), w.arg(), out.arg(), params, r.arg(), s.arg()],
+        &[x.arg(), w.arg(), out.arg(), eps.arg(), axis_size.arg(), w_stride.arg(), plus_one.arg(), gain.arg(), r.arg(), s.arg()],
     )
 }
 
@@ -303,8 +385,12 @@ pub fn rms_residual_scaled(
 /// 3643).
 ///
 /// So the axis is declared and read, exactly as [`rms_single_row`] declares
-/// and reads it, and `eps` is here for the same reason it is there: to hold
-/// slot 0 open for the slot that matters.
+/// and reads it -- and `eps` is no longer declared only to hold slot 0 open
+/// for it. The struct it held the slot open INSIDE is gone: `norm/vector.metal`
+/// takes the two as buffers 2 and 3, one `setBytes` each where the routine
+/// bound a staged `VNormParams`, and both marks are now spent rather than one
+/// spent and one held. The words are the statement's own, at the indices the
+/// struct laid its fields out at, because that order was the statement's.
 ///
 /// # Errors
 ///
@@ -314,20 +400,18 @@ pub fn vnorm_single_row(
     ctx: &Ctx<'_>,
     x: In<Tensor<bf16>>,
     out: Out<Tensor<bf16>>,
-    // THE STRUCT'S FIRST TWO FIELDS, DECLARED SO THE SECOND ONE'S SLOT
-    // EXISTS. The body forwards `ctx.params()` whole -- the shader reads a
-    // `VNormParams` -- but the AXIS is the norm's own width and the body
-    // needs it to size the launch.
+    // THE STRUCT'S TWO FIELDS, BOTH OF THEM NOW BOUND. `eps` was declared
+    // only so the AXIS after it had a slot to be at, and the axis is the
+    // norm's own width -- the number this body sizes its launch from, and the
+    // one `dsl::metal::vnorm` states at `params[1]`.
     eps: Const<f32>,
     axis: Const<i32>) -> Result<(), Refusal> {
-    let _ = eps;
-    let params = ctx.params()?;
     let width = x.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     let (lanes, group) = rms_grid(width, *axis, rows)?;
     ctx.fire(
         Fire::at("norm/vector.metal", "vnorm_single_row_bfloat16").apply(Grid::of(lanes, group)),
-        &[x.arg(), out.arg(), params],
+        &[x.arg(), out.arg(), eps.arg(), axis.arg()],
     )
 }
 
@@ -342,6 +426,20 @@ pub fn vnorm_single_row(
 /// its first token and no other. `LaunchRule::RouterLane` records the same
 /// finding about the same missing axis, already fixed.
 ///
+/// # The head dim is a MARK, and it used to be an ask because it could not be
+///
+/// `eps` and `vd` were `GatedRmsParams`, forwarded whole, so a `Const` derived
+/// onto slot 0 would have read the struct's first field's bits rather than a
+/// scalar run -- and this body needs `vd` for the threadgroup width. It asked
+/// the FIRE for it instead, through `keys::VDim`, which is the same number by
+/// construction and a second question about it.
+///
+/// The struct is gone, so the question is too: `vd` is word 1 of the
+/// statement's own run, `norm/gated_rms.metal` reads the same word as buffer 5
+/// for its indexing, and the threadgroup this body sizes and the stride that
+/// shader strides by are now ONE number rather than two that agreed. The head
+/// COUNT stays an ask, because `keys::VHeads` never was a word of this run.
+///
 /// # Errors
 ///
 /// See [`head_row_grid`], plus [`Refusal::Empty`] for an empty head width.
@@ -351,20 +449,18 @@ pub fn gated_rms(
     x: In<Tensor<bf16>>,
     z: In<Tensor<bf16>>,
     w: Const<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
-    // BACK TO AN ASK, BECAUSE THIS ROUTINE'S PARAMS RUN IS A STRUCT.
-    // The body forwards `ctx.params()` whole -- the shader reads fields,
-    // not a scalar run -- so slot 0 is the struct's first field and a
-    // `Const` derived onto it reads that field's bits. HEAD spelled these
-    // `Ask<..>` for exactly this reason, and the drivers still answer them.
-    let vd = ctx.ask::<i32, keys::VDim>()?;
+    out: Out<Tensor<bf16>>,
+    // THE STRUCT'S TWO FIELDS, IN THE STRUCT'S ORDER because that order is
+    // the statement's. `eps` reaches only the shader; `vd` reaches the
+    // threadgroup width as well, which is what the section above is about.
+    eps: Const<f32>,
+    vd: Const<i32>) -> Result<(), Refusal> {
     let heads = ctx.ask::<i32, keys::VHeads>()?;
-    let params = ctx.params()?;
     let rows = ctx.ask::<i32, keys::Rows>()?;
-    let t = head_width(vd)?;
+    let t = head_width(*vd)?;
     ctx.fire(
         Fire::at(GATED_FILE, "gated_rms_bfloat16").apply(Grid::of(head_row_grid(t, heads, rows)?, [t, 1, 1])),
-        &[x.arg(), z.arg(), w.arg(), out.arg(), params],
+        &[x.arg(), z.arg(), w.arg(), out.arg(), eps.arg(), vd.arg()],
     )
 }
 
@@ -384,21 +480,20 @@ pub fn gated_rms_strided(
     x: In<Tensor<bf16>>,
     z: In<Tensor<bf16>>,
     w: Const<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
-    // BACK TO AN ASK, BECAUSE THIS ROUTINE'S PARAMS RUN IS A STRUCT.
-    // The body forwards `ctx.params()` whole -- the shader reads fields,
-    // not a scalar run -- so slot 0 is the struct's first field and a
-    // `Const` derived onto it reads that field's bits. HEAD spelled these
-    // `Ask<..>` for exactly this reason, and the drivers still answer them.
-    let vd = ctx.ask::<i32, keys::VDim>()?;
+    out: Out<Tensor<bf16>>,
+    // [`gated_rms`]'s two, at the same two words of the same run. The pitch
+    // after them keeps the END of the list, so folding a stride in does not
+    // renumber the buffers the two entrypoints share: it was buffer 5 behind
+    // a block of two words and it is buffer 6 in front of two scalars.
+    eps: Const<f32>,
+    vd: Const<i32>) -> Result<(), Refusal> {
     let heads = ctx.ask::<i32, keys::VHeads>()?;
-    let params = ctx.params()?;
     let row_pitch = x.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
-    let t = head_width(vd)?;
+    let t = head_width(*vd)?;
     ctx.fire(
         Fire::at(GATED_FILE, "gated_rms_strided_bfloat16").apply(Grid::of(head_row_grid(t, heads, rows)?, [t, 1, 1])),
-        &[x.arg(), z.arg(), w.arg(), out.arg(), params, row_pitch.arg()],
+        &[x.arg(), z.arg(), w.arg(), out.arg(), eps.arg(), vd.arg(), row_pitch.arg()],
     )
 }
 
@@ -421,9 +516,11 @@ fn head_width(vd: i32) -> Result<u32, Refusal> {
 
 /// gemma's per-layer scale: `out = x * scalar[0]`, elementwise.
 ///
-/// `params` is bound and not read. `LayerScalarParams` holds a hidden width
-/// the body bounds itself with the grid instead, and the buffer stays because
-/// the entrypoint declares it -- the struct's own header says so at length.
+/// AND NOTHING IS BOUND BESIDE THEM. This forwarded `ctx.params()` for a
+/// `LayerScalarParams` holding a hidden width the body bounds itself with the
+/// grid instead, and the buffer stayed only because the entrypoint declared it
+/// -- the struct's own header says so at length. The entrypoint no longer
+/// declares it, so the block is gone and this states no mark in its place.
 ///
 /// # Errors
 ///
@@ -434,12 +531,11 @@ pub fn layer_scalar_mul(
     x: In<Tensor<bf16>>,
     scalar: Const<Tensor<bf16>>,
     out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
-    let params = ctx.params()?;
     let width = x.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
         Fire::at("norm/layer_scalar.metal", "layer_scalar_mul_bfloat16").apply(Grid::of(elementwise(width, rows)?, [GROUP_X, 1, 1])),
-        &[x.arg(), scalar.arg(), out.arg(), params],
+        &[x.arg(), scalar.arg(), out.arg()],
     )
 }
 
@@ -617,11 +713,12 @@ mod tests {
         calls[0].clone()
     }
 
-    /// The shader declares `x, w, out, params` and a trace states inputs,
-    /// outputs, then weights. Binding in the trace's order puts the OUTPUT
-    /// where the norm weight belongs, which is the defect that made this
-    /// family the first to state its operands -- and Metal does not validate a
-    /// binding, so the only thing that reports it is a test like this one.
+    /// The kernel declares `x, w, out` and then its scalars, and a trace
+    /// states inputs, outputs, then weights. Binding in the trace's order puts
+    /// the OUTPUT where the norm weight belongs, which is the defect that made
+    /// this family the first to state its operands -- and Metal does not
+    /// validate a binding, so the only thing that reports it is a test like
+    /// this one.
     ///
     /// KNOWN FAILING, upstream of this crate: `out`'s `ArgValue::BufferMut(3)`
     /// is the correct claim for what an `Out<Tensor<bf16>>` SHOULD produce;
@@ -637,7 +734,16 @@ mod tests {
             &seen,
             In { ptr: Tensor::<bf16>::new(1), rows: 0, width: 8 },
             Const::new(Tensor::<bf16>::new(2)),
-            Out::new(Tensor::<bf16>::new(3)), Const::new(1e-5), Const::new(8))
+            Out::new(Tensor::<bf16>::new(3)),
+            // The struct's five fields, in the struct's order. The stride is
+            // one channel, the gemma `+1` is off and the gain is unity --
+            // three words this routine could not name until they became marks,
+            // and three this test therefore could not have stated before.
+            Const::new(1e-5),
+            Const::new(8),
+            Const::new(1),
+            Const::new(0),
+            Const::new(1.0))
         .expect("a launch");
         assert_eq!(
             one(&seen).1,
@@ -645,9 +751,15 @@ mod tests {
                 ArgValue::Buffer(1),
                 ArgValue::Buffer(2),
                 ArgValue::BufferMut(3),
-                ArgValue::Buffer(4)
+                ArgValue::F32(1e-5),
+                ArgValue::I32(8),
+                ArgValue::U32(1),
+                ArgValue::U32(0),
+                ArgValue::F32(1.0),
             ],
-            "x, w, out, params -- the shader's order and not the trace's"
+            "x, w, out and then the five scalars -- the shader's order and not \
+             the trace's, and where the staged block used to be one handle it \
+             is five words now"
         );
     }
 
@@ -695,7 +807,12 @@ mod tests {
             In::new(Tensor::<bf16>::new(1)),
             In::new(Tensor::<bf16>::new(2)),
             Const::new(Tensor::<bf16>::new(3)),
-            Out::new(Tensor::<bf16>::new(4)))
+            Out::new(Tensor::<bf16>::new(4)),
+            // The head dim is a MARK now and not a `keys::VDim` ask, so the
+            // 128 the threadgroup comes out as is stated here rather than
+            // answered by `Seen`.
+            Const::new(1e-5),
+            Const::new(128))
         .expect("a launch");
         let (fire, _) = one(&seen);
         assert_eq!(
@@ -730,10 +847,14 @@ mod tests {
             In { ptr: Tensor::<bf16>::new(1), rows: 0, width: 8 },
             Const::new(Tensor::<bf16>::new(2)),
             Out::new(Tensor::<bf16>::new(3)),
-            // The struct's first two fields, which the statement carries: an
-            // epsilon at slot 0 and the norm's own axis at slot 1.
+            // The struct's five fields, which the statement carries: an
+            // epsilon at slot 0, the norm's own axis at slot 1, and the three
+            // the kernel reads and this body does not.
             Const::new(1e-5),
-            Const::new(8))
+            Const::new(8),
+            Const::new(1),
+            Const::new(0),
+            Const::new(1.0))
         .expect("a launch");
         residual_add_strided(
             &seen,
@@ -746,8 +867,9 @@ mod tests {
         assert_eq!(
             calls[0].1.last(),
             Some(&ArgValue::I32(8)),
-            "rms_strided_row takes the pitch at 4, and the pitch is the axis \
-             now that one field is both"
+            "rms_strided_row takes the pitch at 8 -- after the five scalars \
+             that used to be one staged block at 3 -- and the pitch is the \
+             axis now that one field is both"
         );
         assert_eq!(
             calls[1].1.last(),
