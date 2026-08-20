@@ -1,9 +1,9 @@
 //! The PTIR substrate's own kernels -- the ones the tensor-compiler's
 //! emitted shader text cannot produce because they predate a region.
 
-use kernels_macros::routine;
 use crate::routine::{Asks, Bind, Ctx, Fire, In, Out, Tensor, bf16, keys};
 use kernels::routine::Refusal;
+use kernels_macros::routine;
 
 // This family's `kernel!` row was NOT filled, and that was never an
 // oversight: this backend's channel-plane interpreter does not dispatch
@@ -42,7 +42,8 @@ use kernels::routine::Refusal;
 pub fn copy_logits_bf16(
     ctx: &Ctx<'_>,
     source: In<Tensor<bf16>>,
-    destination: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    destination: Out<Tensor<bf16>>,
+) -> Result<(), Refusal> {
     let params = ctx.params()?;
     let vocab = source.width.unsigned_abs();
     let rows = ctx.ask::<u32, keys::Rows>()?;
@@ -53,7 +54,11 @@ pub fn copy_logits_bf16(
         return Err(Refusal::Empty { what: "vocab" });
     }
     ctx.fire(
-        Fire::at(crate::routine::module_path("copy_logits_bf16", ctx.best()), "copy_logits_bf16").apply([vocab, rows, 1]),
+        Fire::at(
+            crate::routine::module_path("copy_logits_bf16", ctx.best()),
+            "copy_logits_bf16",
+        )
+        .apply([vocab, rows, 1]),
         &[source.arg(), destination.arg(), params],
     )
 }

@@ -12,30 +12,6 @@ use kernels::routine::Refusal;
 
 use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, InOut, Out, Tensor, bf16, elementwise, elementwise_rows, keys};
 
-/// The shaders this family's routines reach: `(file, entrypoint)`, one pair
-/// per instantiated name.
-///
-/// A row's `axes` GENERATED these names and its `file` column said where they
-/// live. Retiring the row moved who NAMES them, not what exists -- the shader
-/// is still compiled and still dispatched -- so the pairs are stated here and
-/// [`crate::entrypoints`] reads them back. The FILE rides along because Metal
-/// compiles from `(path, entry name)` at run time, and `device_kernels.rs`
-/// builds every one of them against a real device; a name without its file
-/// would leave that sweep nothing to open. See [`crate::RETIRED`].
-pub static ENTRYPOINTS: &[(&str, &str)] = &[
-    ("norm/add_bias.metal", "add_bias_bfloat16"),
-    ("norm/gated_rms.metal", "gated_rms_bfloat16"),
-    ("norm/gated_rms.metal", "gated_rms_strided_bfloat16"),
-    ("norm/layer_scalar.metal", "layer_scalar_mul_bfloat16"),
-    ("norm/residual_add.metal", "residual_add_bfloat16"),
-    ("norm/residual_add.metal", "residual_add_strided_bfloat16"),
-    ("norm/rms.metal", "rms_residual_bfloat16"),
-    ("norm/rms.metal", "rms_residual_scaled_bfloat16"),
-    ("norm/rms.metal", "rms_single_row_bfloat16"),
-    ("norm/rms.metal", "rms_strided_head_row_bfloat16"),
-    ("norm/rms.metal", "rms_strided_row_bfloat16"),
-    ("norm/vector.metal", "vnorm_single_row_bfloat16"),
-];
 
 /// Threads per threadgroup for the two elementwise bodies here, for the
 /// reason `mlp.rs` states it: Metal declares no group size in the source, so
@@ -643,7 +619,6 @@ mod tests {
         rows: Cell<i32>,
         vd: Cell<i32>,
         vheads: Cell<i32>,
-        row_pitch: Cell<i32>,
         params_handle: Cell<u32>,
         /// THE STATEMENT\'S SCALAR RUN, for a body that reads a word by
         /// index. Empty means "4096 at every slot", which is a plausible
@@ -659,7 +634,6 @@ mod tests {
                 rows: Cell::new(2),
                 vd: Cell::new(128),
                 vheads: Cell::new(16),
-                row_pitch: Cell::new(4096),
                 params_handle: Cell::new(4),
                 words: RefCell::default(),
             }

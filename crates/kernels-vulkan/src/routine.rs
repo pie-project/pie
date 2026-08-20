@@ -190,7 +190,6 @@ impl ArgValue {
 // only difference was that CUDA passed them positionally. See that type for
 // what the shared `lanes`/`group` pair means.
 
-
 /// What a routine body dispatches through.
 ///
 /// Implemented by `driver-vulkan`. The split is the crate boundary: a body
@@ -298,16 +297,36 @@ impl ShaderValue for ArgValue {
         }
     }
     fn buffer_at(handle: u32, rows: i32, width: i32) -> Self {
-        Self::Buffer { handle, writes: false, rows, width }
+        Self::Buffer {
+            handle,
+            writes: false,
+            rows,
+            width,
+        }
     }
     fn buffer_mut_at(handle: u32, rows: i32, width: i32) -> Self {
-        Self::Buffer { handle, writes: true, rows, width }
+        Self::Buffer {
+            handle,
+            writes: true,
+            rows,
+            width,
+        }
     }
     fn buffer(handle: u32) -> Self {
-        Self::Buffer { handle, writes: false, rows: 0, width: 0 }
+        Self::Buffer {
+            handle,
+            writes: false,
+            rows: 0,
+            width: 0,
+        }
     }
     fn buffer_mut(handle: u32) -> Self {
-        Self::Buffer { handle, writes: true, rows: 0, width: 0 }
+        Self::Buffer {
+            handle,
+            writes: true,
+            rows: 0,
+            width: 0,
+        }
     }
     fn i32(v: i32) -> Self {
         Self::I32(v)
@@ -389,8 +408,6 @@ impl kernels::routine::Answers<Vulkan> for Ctx<'_> {
 /// One routine, in this backend's instantiation of the machinery.
 pub type Routine = kernels::routine::Routine<Vulkan>;
 
-
-
 /// The two launch rules a shader-plane body states its rectangle with.
 ///
 /// Re-exported and not re-written. Both of these, and the `rectangle` check
@@ -413,7 +430,6 @@ pub use crate::module::path as module_path;
 
 /// What a body asks the runtime for, once `Env` is out of the parameter list.
 pub use kernels::routine::{Answers, Asks};
-
 
 #[cfg(test)]
 mod tests {
@@ -523,14 +539,26 @@ mod tests {
         // as `uint16_t`, which is why this is not `PIE_ACT`: that macro is
         // `common/bf16.slang`'s own name for the same expansion, and the
         // element decides the `Ty` on a string the SIGNATURE never sees.
-        assert_eq!(<Tensor<bf16> as Arg<Vulkan>>::SPELLING, "StructuredBuffer<uint16_t>");
+        assert_eq!(
+            <Tensor<bf16> as Arg<Vulkan>>::SPELLING,
+            "StructuredBuffer<uint16_t>"
+        );
         assert_eq!(
             <Vulkan as kernels::shader::Lang>::BF16S_MUT,
             "RWStructuredBuffer<uint16_t>"
         );
-        assert_eq!(<Tensor<i32> as Arg<Vulkan>>::SPELLING, "StructuredBuffer<int>");
-        assert_eq!(<Tensor<u32> as Arg<Vulkan>>::SPELLING, "StructuredBuffer<uint>");
-        assert_eq!(<Tensor<u8> as Arg<Vulkan>>::SPELLING, "StructuredBuffer<uint8_t>");
+        assert_eq!(
+            <Tensor<i32> as Arg<Vulkan>>::SPELLING,
+            "StructuredBuffer<int>"
+        );
+        assert_eq!(
+            <Tensor<u32> as Arg<Vulkan>>::SPELLING,
+            "StructuredBuffer<uint>"
+        );
+        assert_eq!(
+            <Tensor<u8> as Arg<Vulkan>>::SPELLING,
+            "StructuredBuffer<uint8_t>"
+        );
         // Empty, and deliberately: nothing in the tree declares a 64-bit
         // shader integer, so there is no spelling to record. A guess here
         // would be worse than the gap.

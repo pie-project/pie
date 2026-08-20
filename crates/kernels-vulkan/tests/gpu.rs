@@ -1255,12 +1255,12 @@ fn rms_single_row_matches_a_scalar_reference() {
     params.extend_from_slice(&0u32.to_le_bytes()); // plus_one
     params.extend_from_slice(&1.0f32.to_le_bytes()); // gain
 
-    let operands = vec![bf16_bytes(&x), bf16_bytes(&w), vec![0u8; axis * 2], params];
+    let operands = vec![bf16_bytes(&x), bf16_bytes(&w), vec![0u8; axis * 2]];
     let out = gpu.dispatch(
         "rms_single_row_bfloat16",
         Capability::Baseline,
         &operands,
-        &[],
+        &params,
         [1, 1, 1],
     );
 
@@ -1298,12 +1298,12 @@ fn rms_folds_plus_one_before_the_bf16_round() {
     params.extend_from_slice(&1u32.to_le_bytes()); // plus_one
     params.extend_from_slice(&gain.to_le_bytes());
 
-    let operands = vec![bf16_bytes(&x), bf16_bytes(&w), vec![0u8; axis * 2], params];
+    let operands = vec![bf16_bytes(&x), bf16_bytes(&w), vec![0u8; axis * 2]];
     let out = gpu.dispatch(
         "rms_single_row_bfloat16",
         Capability::Baseline,
         &operands,
-        &[],
+        &params,
         [1, 1, 1],
     );
 
@@ -1355,17 +1355,19 @@ fn rms_strided_row_reads_its_pitch_from_the_push_block() {
     params.extend_from_slice(&0u32.to_le_bytes());
     params.extend_from_slice(&1.0f32.to_le_bytes());
 
-    let operands = vec![
-        bf16_bytes(&x),
-        bf16_bytes(&w),
-        vec![0u8; rows * pitch * 2],
-        params,
-    ];
+    // `row_pitch` is the SIXTH field of the strided form's push block, not a
+    // block of its own: `norm/rms.slang` grows `Push` by one `int` under
+    // `PIE_STRIDED`. It used to be pushed alone beside a `RmsParams` buffer,
+    // which is the arrangement the whole struct left when the binder stopped
+    // writing its parameter rows by hand.
+    params.extend_from_slice(&(pitch as i32).to_le_bytes());
+
+    let operands = vec![bf16_bytes(&x), bf16_bytes(&w), vec![0u8; rows * pitch * 2]];
     let out = gpu.dispatch(
         "rms_strided_row_bfloat16",
         Capability::Baseline,
         &operands,
-        &(pitch as i32).to_le_bytes(),
+        &params,
         [rows as u32, 1, 1],
     );
 
@@ -2259,23 +2261,25 @@ fn router_topk_picks_the_right_experts() {
         .map(|i| ((i * 7 + (i / n_experts) * 3) % 29) as f32 / 4.0)
         .collect();
 
+    // Three bindings and no fourth. The parameters are a push range now, and
+    // the `per_expert_scale` slot that used to be padded in here does not
+    // exist without `PIE_SCALED` -- it was only ever bound because a
+    // descriptor set had to be as long as the widest form of the family.
     let operands = vec![
         bf16_bytes(&logits),
         vec![0u8; rows * top_k * 4],
         vec![0u8; rows * top_k * 2],
-        // RouterParams { n_experts, experts_per_token, softmax_over_all, logits_pitch }
-        [n_experts as u32, top_k as u32, 1, n_experts as u32]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect(),
-        vec![0u8; n_experts * 2], // per_expert_scale, unread without PIE_SCALED
     ];
 
     let out = gpu.dispatch(
         "router_topk_bfloat16",
         Capability::Baseline,
         &operands,
-        &[],
+        // Push { n_experts, experts_per_token, softmax_over_all, logits_pitch }
+        &[n_experts as u32, top_k as u32, 1, n_experts as u32]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>(),
         [1, rows as u32, 1],
     );
 
@@ -2565,13 +2569,12 @@ fn geglu_strided_uses_each_of_its_three_pitches() {
         bf16_bytes(&gate),
         bf16_bytes(&up),
         vec![0u8; rows * out_pitch * 2],
-        params,
     ];
     let out = gpu.dispatch(
         "geglu_tanh_strided_bfloat16",
         Capability::Baseline,
         &operands,
-        &[],
+        &params,
         [width.div_ceil(16) as u32, rows.div_ceil(16) as u32, 1],
     );
 
@@ -2635,16 +2638,21 @@ fn gptoss_swiglu_clamps_its_two_inputs_differently() {
     ];
     let n = gate.len();
 
-    let mut params = 0u32.to_le_bytes().to_vec();
-    params.extend_from_slice(&limit.to_le_bytes());
+    // TWO FLOATS, AND THE DEAD WORD IN FRONT OF THEM IS GONE.
+    // `GptOssSwiGluParams` opened with a per-row element count nothing read,
+    // held only so `limit` and `alpha` kept their offsets in the storage
+    // struct. A push block is packed from the marks the body passes, so the
+    // filler stops at the host -- see the note above `Push` in
+    // `mlp/gated.slang`.
+    let mut params = limit.to_le_bytes().to_vec();
     params.extend_from_slice(&alpha.to_le_bytes());
 
-    let operands = vec![bf16_bytes(&gate), bf16_bytes(&up), vec![0u8; n * 2], params];
+    let operands = vec![bf16_bytes(&gate), bf16_bytes(&up), vec![0u8; n * 2]];
     let out = gpu.dispatch(
         "gptoss_swiglu_bfloat16",
         Capability::Baseline,
         &operands,
-        &[],
+        &params,
         [n.div_ceil(256) as u32, 1, 1],
     );
 
@@ -3105,10 +3113,9 @@ fn the_routing_pipeline_gathers_and_combines_back_to_where_it_started() {
         vec![0u8; padded * 4],
         vec![0u8; padded * 4],
         vec![0u8; (padded / tile) * 4],
-        params.clone(),
         vec![0u8; n * 4],
     ];
-    let sorted = gpu.dispatch("route_sort", Capability::Baseline, &sort, &[], [1, 1, 1]);
+    let sorted = gpu.dispatch("route_sort", Capability::Baseline, &sort, &params, [1, 1, 1]);
 
     let read_i32 = |b: &[u8]| -> Vec<i32> {
         b.chunks_exact(4)
@@ -3118,7 +3125,9 @@ fn the_routing_pipeline_gathers_and_combines_back_to_where_it_started() {
     let perm = read_i32(&sorted[1]);
     let row_expert = read_i32(&sorted[2]);
     let tile_expert = read_i32(&sorted[3]);
-    let inv = read_i32(&sorted[5]);
+    // FOUR, NOT FIVE. `route_sort`'s parameters left the descriptor set for a
+    // push range, so every binding after them moved down one.
+    let inv = read_i32(&sorted[4]);
 
     for e in 0..experts {
         let mut landed: Vec<i32> = (bases[e]..bases[e] + counts[e])
@@ -3164,13 +3173,12 @@ fn the_routing_pipeline_gathers_and_combines_back_to_where_it_started() {
         bf16_bytes(&x),
         vec![0u8; padded * width * 2],
         sorted[1].clone(),
-        params,
     ];
     let gathered = gpu.dispatch(
         "route_gather",
         Capability::Baseline,
         &gather,
-        &[],
+        &params,
         [width.div_ceil(16) as u32, padded.div_ceil(16) as u32, 1],
     );
 
@@ -3192,17 +3200,16 @@ fn the_routing_pipeline_gathers_and_combines_back_to_where_it_started() {
         gathered[1].clone(),
         bf16_bytes(&weights),
         vec![0u8; tokens * out_pitch * 2],
-        [width, k, out_pitch]
-            .iter()
-            .flat_map(|v| (*v as u32).to_le_bytes())
-            .collect(),
-        sorted[5].clone(),
+        sorted[4].clone(),
     ];
     let combined = gpu.dispatch(
         "combine_sorted",
         Capability::Baseline,
         &combine,
-        &[],
+        &[width, k, out_pitch]
+            .iter()
+            .flat_map(|v| (*v as u32).to_le_bytes())
+            .collect::<Vec<u8>>(),
         [width.div_ceil(16) as u32, tokens.div_ceil(16) as u32, 1],
     );
 
@@ -3366,11 +3373,7 @@ fn the_small_elementwise_kernels_read_their_scalars_from_the_right_place() {
     let out = gpu.dispatch(
         "layer_scalar_mul_bfloat16",
         Capability::Baseline,
-        &[
-            bf16_bytes(&x),
-            bf16_bytes(&[scalar]),
-            vec![0u8; n * 2],
-        ],
+        &[bf16_bytes(&x), bf16_bytes(&[scalar]), vec![0u8; n * 2]],
         &[],
         groups,
     );
@@ -3562,12 +3565,16 @@ fn rms_residual_adds_after_the_gain_and_scales_after_the_add() {
     }
     params.extend_from_slice(&gain.to_le_bytes());
 
+    // BINDING 3 IS THE RESIDUAL AND 4 IS THE SCALE, which is what
+    // `norm/rms.slang` says: the conditional bindings come after the three
+    // every form shares, and the parameter buffer that used to sit between
+    // them is a push range now. This list once read `[x, w, out, params, r,
+    // s]` and the shader would have found the residual under the scale.
     let post = 0.625f32;
     let mut operands = vec![
         bf16_bytes(&x),
         bf16_bytes(&w),
         vec![0u8; rows * axis * 2],
-        params,
         bf16_bytes(&r),
         bf16_bytes(&[post]),
     ];
@@ -3575,7 +3582,7 @@ fn rms_residual_adds_after_the_gain_and_scales_after_the_add() {
     let (xq, wq, rq) = (
         bf16_read(&operands[0]),
         bf16_read(&operands[1]),
-        bf16_read(&operands[4]),
+        bf16_read(&operands[3]),
     );
     let postq = bf16_to_f32(f32_to_bf16(post));
 
@@ -3588,7 +3595,7 @@ fn rms_residual_adds_after_the_gain_and_scales_after_the_add() {
             entrypoint,
             Capability::Baseline,
             &operands,
-            &[],
+            &params,
             [rows as u32, 1, 1],
         );
         let got = bf16_read(&out[2]);
@@ -3649,19 +3656,18 @@ fn router_topk_scaled_indexes_its_table_by_expert() {
             bf16_bytes(&logits),
             vec![0u8; rows * k * 4],
             vec![0u8; rows * k * 2],
-            params,
             bf16_bytes(&scale),
         ];
         let out = gpu.dispatch(
             "router_topk_scaled_bfloat16",
             Capability::Baseline,
             &operands,
-            &[],
+            &params,
             [1, rows as u32, 1],
         );
 
         let lq = bf16_read(&operands[0]);
-        let sq = bf16_read(&operands[4]);
+        let sq = bf16_read(&operands[3]);
         let ids: Vec<i32> = out[1]
             .chunks_exact(4)
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -4490,6 +4496,13 @@ fn the_pointwise_kernels_do_not_write_past_a_ragged_width() {
         0.5 * x * (1.0 + (k * (x + 0.044715 * x * x * x)).tanh())
     };
 
+    // THE SECOND FIELD IS THE PUSH BLOCK, AND THE FIRST TWO CASES HAVE NONE.
+    // The unstrided `geglu_tanh` read a `GegluParams` whose only field was a
+    // per-row element count no body ever supplied and the shader floored to
+    // its grid; `mlp/gated.slang` deleted the declaration rather than keep a
+    // struct that said something false. gpt-oss's two clamps are real
+    // numbers, so they stayed -- as a push range, and without the dead word
+    // that used to hold their offsets.
     let cases: Vec<(&str, Vec<u8>, Vec<f32>)> = vec![
         (
             "silu_mul_bfloat16",
@@ -4498,14 +4511,13 @@ fn the_pointwise_kernels_do_not_write_past_a_ragged_width() {
         ),
         (
             "geglu_tanh_bfloat16",
-            vec![0u8; 4],
+            Vec::new(),
             aq.iter().zip(&bq).map(|(g, u)| gelu(*g) * u).collect(),
         ),
         (
             "gptoss_swiglu_bfloat16",
             {
-                let mut p = vec![0u8; 4];
-                p.extend_from_slice(&limit.to_le_bytes());
+                let mut p = limit.to_le_bytes().to_vec();
                 p.extend_from_slice(&alpha.to_le_bytes());
                 p
             },
@@ -4521,11 +4533,8 @@ fn the_pointwise_kernels_do_not_write_past_a_ragged_width() {
     ];
 
     for (entrypoint, params, want) in cases {
-        let mut operands = vec![bf16_bytes(&a), bf16_bytes(&b), vec![0u8; n * 2]];
-        if !params.is_empty() {
-            operands.push(params);
-        }
-        let out = gpu.dispatch(entrypoint, Capability::Baseline, &operands, &[], groups);
+        let operands = vec![bf16_bytes(&a), bf16_bytes(&b), vec![0u8; n * 2]];
+        let out = gpu.dispatch(entrypoint, Capability::Baseline, &operands, &params, groups);
         assert_close(&bf16_read(&out[2]), &want, entrypoint);
     }
 }
@@ -5007,7 +5016,17 @@ impl GdnInputs {
     /// Binding order, with `mixed` and the gates rounded through bf16 first so
     /// the reference reads the same numbers the shader does. Only the ROUNDING
     /// is shared; every arithmetic step below is written out independently.
-    fn operands(&self, s: &GdnShape, eps: f32, slots: usize) -> Vec<Vec<u8>> {
+    ///
+    /// `eps: f32` STOOD HERE, on this and on `prep_operands`, and both dropped
+    /// it on the floor: the epsilon travels in the scalar run that
+    /// `GdnShape::params` builds, not in any buffer this returns. The loud-eps
+    /// fixture below is the one that would have suffered from the confusion --
+    /// it fires the same operands at `eps = 4.0` to pin WHERE the term sits
+    /// relative to the square root -- and it was always `params(loud)` doing
+    /// that work, so it is unaffected. A parameter ten call sites pass and
+    /// nothing reads is a standing invitation to believe the wrong one
+    /// matters.
+    fn operands(&self, s: &GdnShape, slots: usize) -> Vec<Vec<u8>> {
         let cd = s.conv_dim();
         vec![
             bf16_bytes(&self.mixed),
@@ -5024,7 +5043,6 @@ impl GdnInputs {
             bf16_bytes(&self.a_gate),
             bf16_bytes(&self.b_gate),
             vec![0u8; slots * s.kc * cd * 4],
-            s.params(eps),
         ]
     }
 }
@@ -5244,12 +5262,12 @@ fn gdn_core_computes_the_gated_delta_rule() {
     let eps = 1e-6f32;
     let inp = GdnInputs::build(&s, s.b);
 
-    let operands = inp.operands(&s, eps, s.b);
+    let operands = inp.operands(&s, s.b);
     let out = gpu.dispatch(
         "gdn_core_bfloat16",
         Capability::Baseline,
         &operands,
-        &[],
+        &s.params(eps),
         [1, (s.dv / 4) as u32, (s.b * s.hv) as u32],
     );
 
@@ -5292,8 +5310,8 @@ fn gdn_core_computes_the_gated_delta_rule() {
     let out = gpu.dispatch(
         "gdn_core_bfloat16",
         Capability::Baseline,
-        &inp.operands(&s, loud, s.b),
-        &[],
+        &inp.operands(&s, s.b),
+        &s.params(loud),
         [1, (s.dv / 4) as u32, (s.b * s.hv) as u32],
     );
     let (want_out, want_state, _) = gdn_reference(&s, &inp, loud, &|b| b, s.b);
@@ -5338,18 +5356,18 @@ fn the_slotted_gdn_core_follows_its_slot_map() {
     let plain = gpu.dispatch(
         "gdn_core_bfloat16",
         Capability::Baseline,
-        &inp.operands(&s, eps, s.b),
-        &[],
+        &inp.operands(&s, s.b),
+        &s.params(eps),
         groups,
     );
 
-    let mut identity = inp.operands(&s, eps, s.b);
+    let mut identity = inp.operands(&s, s.b);
     identity.push((0..s.b as u32).flat_map(|i| i.to_le_bytes()).collect());
     let same = gpu.dispatch(
         "gdn_core_slotted_bfloat16",
         Capability::Baseline,
         &identity,
-        &[],
+        &s.params(eps),
         groups,
     );
     for (i, what) in [(3usize, "core_out"), (2, "rstate"), (10, "new_conv_state")] {
@@ -5380,7 +5398,7 @@ fn the_slotted_gdn_core_follows_its_slot_map() {
         moved.rstate[to * width..(to + 1) * width]
             .copy_from_slice(&inp.rstate[from * width..(from + 1) * width]);
     }
-    let mut permuted = moved.operands(&s, eps, s.b);
+    let mut permuted = moved.operands(&s, s.b);
     permuted.push(
         perm.iter()
             .flat_map(|p| (*p as u32).to_le_bytes())
@@ -5390,7 +5408,7 @@ fn the_slotted_gdn_core_follows_its_slot_map() {
         "gdn_core_slotted_bfloat16",
         Capability::Baseline,
         &permuted,
-        &[],
+        &s.params(eps),
         groups,
     );
 
@@ -5433,7 +5451,7 @@ impl GdnInputs {
     /// `core_out` entirely and gains the three f32 scratch slabs, so a test
     /// that reused the fused operand vector would bind `conv_w` where the
     /// shader reads `rstate` and still run.
-    fn prep_operands(&self, s: &GdnShape, eps: f32, slots: usize) -> Vec<Vec<u8>> {
+    fn prep_operands(&self, s: &GdnShape, slots: usize) -> Vec<Vec<u8>> {
         let cd = s.conv_dim();
         let n = s.b * s.hv;
         vec![
@@ -5458,7 +5476,6 @@ impl GdnInputs {
             // unique per `dv` and there is no redundancy to remove.
             vec![0u8; 2 * n * 4],
             vec![0u8; slots * s.kc * cd * 4],
-            s.params(eps),
         ]
     }
 }
@@ -5496,16 +5513,16 @@ fn the_split_gdn_pair_is_the_fused_kernel_to_the_bit() {
     let fused = gpu.dispatch(
         "gdn_core_bfloat16",
         Capability::Baseline,
-        &inp.operands(&s, eps, s.b),
-        &[],
+        &inp.operands(&s, s.b),
+        &s.params(eps),
         [1, (s.dv / 4) as u32, n as u32],
     );
 
     let prepped = gpu.dispatch(
         "gdn_prep_bfloat16",
         Capability::Baseline,
-        &inp.prep_operands(&s, eps, s.b),
-        &[],
+        &inp.prep_operands(&s, s.b),
+        &s.params(eps),
         [1, 1, n as u32],
     );
 
@@ -5528,9 +5545,8 @@ fn the_split_gdn_pair_is_the_fused_kernel_to_the_bit() {
             prepped[9].clone(),
             prepped[10].clone(),
             prepped[11].clone(),
-            s.params(eps),
         ],
-        &[],
+        &s.params(eps),
         [1, (s.dv / 4) as u32, n as u32],
     );
 
@@ -5704,8 +5720,8 @@ fn the_prefill_scan_answers_the_decode_walked_token_by_token() {
         let out = gpu.dispatch(
             "gdn_core_bfloat16",
             Capability::Baseline,
-            &step.operands(&s, eps, 1),
-            &[],
+            &step.operands(&s, 1),
+            &s.params(eps),
             [1, (s.dv / 4) as u32, (s.hv) as u32],
         );
         walked.push(out[3].clone());
@@ -5714,10 +5730,13 @@ fn the_prefill_scan_answers_the_decode_walked_token_by_token() {
     }
 
     // The prefill prep, over the whole prompt at once.
-    let push: Vec<u8> = [pitch as i32, tokens as i32]
-        .iter()
-        .flat_map(|v| v.to_le_bytes())
-        .collect();
+    // ONE RANGE, NOT A BUFFER AND A RANGE. The prefill arms of
+    // `ssm/gdn_prep.slang` used to carry `GdnCoreParams` on a descriptor AND
+    // a push block for `row_pitch`/`n_scan`; the eleven geometry words are
+    // `Const` marks now, so everything arrives as words 0..12 of one run --
+    // fifty-two bytes, well inside the 128 `maxPushConstantsSize` guarantees.
+    let mut push: Vec<u8> = s.params(eps);
+    push.extend([pitch as i32, tokens as i32].iter().flat_map(|v| v.to_le_bytes()));
     let scratch = tokens * (pitch / 2) * 4;
     let prep = gpu.dispatch(
         "gdn_prep_prefill_bfloat16",
@@ -5740,8 +5759,6 @@ fn the_prefill_scan_answers_the_decode_walked_token_by_token() {
             vec![0u8; scratch],
             vec![0u8; scratch],
             vec![0u8; s.kc * cd * 4],
-            s.params(eps),
-            vec![0u8; 4],
         ],
         &push,
         [1, 1, (tokens * s.hv) as u32],
@@ -5764,8 +5781,6 @@ fn the_prefill_scan_answers_the_decode_walked_token_by_token() {
                 prep[8].clone(),
                 prep[9].clone(),
                 prep[10].clone(),
-                s.params(eps),
-                vec![0u8; 4],
             ],
             &push,
             [1, (s.dv as u32).div_ceil(rows * vrows), s.hv as u32],
@@ -5868,23 +5883,23 @@ fn the_slotted_split_pair_follows_the_same_map() {
         .flat_map(|p| (*p as u32).to_le_bytes())
         .collect();
 
-    let mut fused_ops = moved.operands(&s, eps, s.b);
+    let mut fused_ops = moved.operands(&s, s.b);
     fused_ops.push(slots.clone());
     let fused = gpu.dispatch(
         "gdn_core_slotted_bfloat16",
         Capability::Baseline,
         &fused_ops,
-        &[],
+        &s.params(eps),
         [1, (s.dv / 4) as u32, n as u32],
     );
 
-    let mut prep_ops = moved.prep_operands(&s, eps, s.b);
+    let mut prep_ops = moved.prep_operands(&s, s.b);
     prep_ops.push(slots.clone());
     let prepped = gpu.dispatch(
         "gdn_prep_slotted_bfloat16",
         Capability::Baseline,
         &prep_ops,
-        &[],
+        &s.params(eps),
         [1, 1, n as u32],
     );
 
@@ -5906,10 +5921,9 @@ fn the_slotted_split_pair_follows_the_same_map() {
             prepped[9].clone(),
             prepped[10].clone(),
             prepped[11].clone(),
-            s.params(eps),
             slots,
         ],
-        &[],
+        &s.params(eps),
         [1, (s.dv / 4) as u32, n as u32],
     );
 
@@ -6160,11 +6174,10 @@ fn rms_rope_answers_what_the_norm_and_the_rotation_answer() {
     let x: Vec<f32> = (0..rows * pitch)
         .map(|i| ((i * 37 % 71) as f32 - 35.0) / 16.0)
         .collect();
-    let w: Vec<f32> = (0..head_dim).map(|i| 0.5 + (i % 13) as f32 / 32.0).collect();
-    let positions: Vec<u8> = [7i32, 11]
-        .iter()
-        .flat_map(|p| p.to_le_bytes())
+    let w: Vec<f32> = (0..head_dim)
+        .map(|i| 0.5 + (i % 13) as f32 / 32.0)
         .collect();
+    let positions: Vec<u8> = [7i32, 11].iter().flat_map(|p| p.to_le_bytes()).collect();
 
     let mut params = Vec::new();
     params.extend_from_slice(&eps.to_le_bytes());
@@ -6178,13 +6191,19 @@ fn rms_rope_answers_what_the_norm_and_the_rotation_answer() {
     let normed = gpu.dispatch(
         "rms_strided_head_row_bfloat16",
         Capability::Baseline,
-        &[
-            bf16_bytes(&x),
-            bf16_bytes(&w),
-            vec![0u8; rows * pitch * 2],
-            params.clone(),
-        ],
-        &(pitch as i32).to_le_bytes(),
+        &[bf16_bytes(&x), bf16_bytes(&w), vec![0u8; rows * pitch * 2]],
+        // Three bindings and a twenty-four byte push block. The head form is
+        // only ever built with `PIE_STRIDED` beside it, so `row_pitch` is the
+        // sixth field of `Push` rather than a range of its own -- see
+        // `norm/rms.slang`. THE FUSED KERNEL BELOW STILL TAKES A BUFFER, and
+        // deliberately: `rms_rope.slang` says a launch's scalars go in a push
+        // range or in a parameter buffer and not both, and the fused form
+        // needs a struct either way.
+        &{
+            let mut push = params.clone();
+            push.extend_from_slice(&(pitch as i32).to_le_bytes());
+            push
+        },
         [1, heads as u32, rows as u32],
     );
 
@@ -6288,7 +6307,9 @@ fn rms_rope_leaves_the_unrotated_tail_normed() {
     let x: Vec<f32> = (0..rows * pitch)
         .map(|i| ((i * 29 % 53) as f32 - 26.0) / 12.0)
         .collect();
-    let w: Vec<f32> = (0..head_dim).map(|i| 0.75 + (i % 7) as f32 / 16.0).collect();
+    let w: Vec<f32> = (0..head_dim)
+        .map(|i| 0.75 + (i % 7) as f32 / 16.0)
+        .collect();
     let positions: Vec<u8> = [3i32, 5].iter().flat_map(|p| p.to_le_bytes()).collect();
 
     let mut params = Vec::new();
@@ -6301,13 +6322,19 @@ fn rms_rope_leaves_the_unrotated_tail_normed() {
     let normed = gpu.dispatch(
         "rms_strided_head_row_bfloat16",
         Capability::Baseline,
-        &[
-            bf16_bytes(&x),
-            bf16_bytes(&w),
-            vec![0u8; rows * pitch * 2],
-            params.clone(),
-        ],
-        &(pitch as i32).to_le_bytes(),
+        &[bf16_bytes(&x), bf16_bytes(&w), vec![0u8; rows * pitch * 2]],
+        // Three bindings and a twenty-four byte push block. The head form is
+        // only ever built with `PIE_STRIDED` beside it, so `row_pitch` is the
+        // sixth field of `Push` rather than a range of its own -- see
+        // `norm/rms.slang`. THE FUSED KERNEL BELOW STILL TAKES A BUFFER, and
+        // deliberately: `rms_rope.slang` says a launch's scalars go in a push
+        // range or in a parameter buffer and not both, and the fused form
+        // needs a struct either way.
+        &{
+            let mut push = params.clone();
+            push.extend_from_slice(&(pitch as i32).to_le_bytes());
+            push
+        },
         [1, heads as u32, rows as u32],
     );
     let just_normed = bf16_read(&normed[2]);

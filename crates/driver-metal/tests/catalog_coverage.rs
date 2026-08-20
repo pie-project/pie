@@ -390,6 +390,8 @@ fn the_text_this_driver_runs_is_the_text_the_row_states() {
     let bindings = [
         AT_METAL,
         MetalBinding {
+            qmm_partial_rows: false,
+            qmm_tile: None,
             quant_group: 128,
             quant_bits: 8,
             router_quant_group: 0,

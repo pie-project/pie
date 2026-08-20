@@ -163,6 +163,14 @@ pub use crate::capability::Capability;
 pub mod module;
 pub use crate::module::{MODULES, code, embedded};
 
+/// The `.slang` sources, and compiling one at run time.
+///
+/// Present WITHOUT `native`, unlike [`module`]: carrying the text is not
+/// compiling it, and the same split the census already draws — the tree
+/// DECLARES without a toolchain, a build COMPILES with one — is the reason
+/// `model-ir` can read this crate at all.
+pub mod runtime;
+
 // Named only by the doc links above, which rustdoc still has to resolve.
 #[allow(unused_imports)]
 use kernels::Axis;
@@ -271,7 +279,6 @@ pub static KERNELS: &[kernels::KernelSig] = &[];
 pub fn entrypoints() -> Vec<String> {
     module::CENSUS.iter().map(|n| (*n).to_owned()).collect()
 }
-
 
 /// The rows that have been retired, by the name their `kernel!` call had.
 ///
@@ -409,9 +416,11 @@ pub fn retired_rows() -> &'static [&'static str] {
 /// wrong buffer to the wrong slot and computes a plausible number.
 #[must_use]
 pub fn declared() -> Vec<kernels::routine::Declared> {
-    ROUTINES.iter().map(kernels::routine::Routine::declared).collect()
+    ROUTINES
+        .iter()
+        .map(kernels::routine::Routine::declared)
+        .collect()
 }
-
 
 /// Every crossed routine, with its body still attached.
 ///

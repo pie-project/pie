@@ -1415,7 +1415,14 @@ fn affine_qmv_fast_bandwidth_against_shape() {
         // curve; the verdict is read off the 8.
         for tokens in [8usize, 16, 32] {
             for (label, entry, cap, bm, bn, splits) in [
-                ("qmv", ENTRYPOINT, Capability::Baseline, 0usize, 0usize, 0usize),
+                (
+                    "qmv",
+                    ENTRYPOINT,
+                    Capability::Baseline,
+                    0usize,
+                    0usize,
+                    0usize,
+                ),
                 (
                     "qmm 16x16",
                     "affine_qmm_t_bfloat16_gs_128_b_4_bm_16_bn_16",

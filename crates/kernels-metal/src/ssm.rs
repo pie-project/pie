@@ -18,61 +18,6 @@ use kernels::routine::Refusal;
 
 use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, Out, Tensor, bf16, keys};
 
-/// The shaders this family's routines reach: `(file, entrypoint)`, one pair
-/// per instantiated name.
-///
-/// A row's `axes` GENERATED these names and its `file` column said where they
-/// live. Retiring the row moved who NAMES them, not what exists -- the shader
-/// is still compiled and still dispatched -- so the pairs are stated here and
-/// [`crate::entrypoints`] reads them back. The FILE rides along because Metal
-/// compiles from `(path, entry name)` at run time, and `device_kernels.rs`
-/// builds every one of them against a real device; a name without its file
-/// would leave that sweep nothing to open. See [`crate::RETIRED`].
-pub static ENTRYPOINTS: &[(&str, &str)] = &[
-    ("ssm/gdn_core.metal", "gdn_core_bfloat16"),
-    ("ssm/gdn_prep.metal", "gdn_core_recurrent_bfloat16"),
-    (
-        "ssm/gdn_prep.metal",
-        "gdn_core_recurrent_prefill_bfloat16_l_16_v_1",
-    ),
-    (
-        "ssm/gdn_prep.metal",
-        "gdn_core_recurrent_prefill_bfloat16_l_16_v_2",
-    ),
-    (
-        "ssm/gdn_prep.metal",
-        "gdn_core_recurrent_prefill_bfloat16_l_16_v_4",
-    ),
-    (
-        "ssm/gdn_prep.metal",
-        "gdn_core_recurrent_prefill_bfloat16_l_32_v_2",
-    ),
-    (
-        "ssm/gdn_prep.metal",
-        "gdn_core_recurrent_prefill_bfloat16_l_32_v_4",
-    ),
-    (
-        "ssm/gdn_prep.metal",
-        "gdn_core_recurrent_prefill_bfloat16_l_32_v_8",
-    ),
-    (
-        "ssm/gdn_prep.metal",
-        "gdn_core_recurrent_prefill_bfloat16_l_4_v_1",
-    ),
-    (
-        "ssm/gdn_prep.metal",
-        "gdn_core_recurrent_prefill_bfloat16_l_8_v_1",
-    ),
-    (
-        "ssm/gdn_prep.metal",
-        "gdn_core_recurrent_prefill_bfloat16_l_8_v_2",
-    ),
-    ("ssm/gdn_prep.metal", "gdn_core_recurrent_slotted_bfloat16"),
-    ("ssm/gdn_core.metal", "gdn_core_slotted_bfloat16"),
-    ("ssm/gdn_prep.metal", "gdn_prep_bfloat16"),
-    ("ssm/gdn_prep.metal", "gdn_prep_prefill_bfloat16"),
-    ("ssm/gdn_prep.metal", "gdn_prep_slotted_bfloat16"),
-];
 
 /// The dk lanes one simdgroup reduces over, and the x extent of every dispatch
 /// in this family.

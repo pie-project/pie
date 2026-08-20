@@ -19,14 +19,19 @@ use kernels::routine::{
 };
 use kernels::{Kind, Source, Ty, keys};
 
-/// The stand-in backend: an argument is one of four kinds, and the context
+/// The stand-in backend: an argument is one of three kinds, and the context
 /// records what a body launched instead of launching it.
+///
+/// `Ptr(usize)` STOOD HERE and was the fourth. A bare address is what an
+/// operand was before a statement placed a RECTANGLE at one, and nothing in
+/// this fixture builds a bare address any more -- `Region` carries the rows
+/// and the width a mark unpacks. The two arms that read it were spelled
+/// `Value::Region { ptr: p, .. }`, so its half never ran.
 #[derive(Clone, Copy)]
 struct Test;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Value {
-    Ptr(usize),
     I32(i32),
     F32(f32),
     /// An address the statement placed, WITH the shape it placed it at --
@@ -142,7 +147,7 @@ impl Arg<Test> for *const Bf16 {
 
     fn unpack(value: &Value, at: usize) -> Result<Self, Refusal> {
         match value {
-            Value::Ptr(p) | Value::Region { ptr: p, .. } => Ok(core::ptr::without_provenance(*p)),
+            Value::Region { ptr: p, .. } => Ok(core::ptr::without_provenance(*p)),
             _ => Err(Refusal::Kind { at, want: <Self as Arg<Test>>::TY }),
         }
     }
@@ -153,7 +158,7 @@ impl Arg<Test> for *mut Bf16 {
 
     fn unpack(value: &Value, at: usize) -> Result<Self, Refusal> {
         match value {
-            Value::Ptr(p) | Value::Region { ptr: p, .. } => {
+            Value::Region { ptr: p, .. } => {
                 Ok(core::ptr::without_provenance_mut(*p))
             }
             _ => Err(Refusal::Kind { at, want: <Self as Arg<Test>>::TY }),

@@ -724,9 +724,9 @@ fn every_module_parses_and_validates() {
         broken.join("\n\n"),
     );
     assert!(
-        checked >= 481,
+        checked >= 489,
         "only {checked} modules were checked; the shader tree instantiates \
-         481 entrypoints and a check that silently reads nothing is a check \
+         489 entrypoints and a check that silently reads nothing is a check \
          that passes",
     );
 }
@@ -795,8 +795,8 @@ fn no_baseline_module_needs_a_capability() {
         broken.join("\n\n"),
     );
     assert_eq!(
-        checked, 481,
-        "every entrypoint has a baseline variant, so {checked} is not 481 and \
+        checked, 489,
+        "every entrypoint has a baseline variant, so {checked} is not 489 and \
          either a variant is missing or this check stopped reading",
     );
 }
@@ -2942,14 +2942,18 @@ fn a_quantised_matvec_agrees_at_two_quantization_points() {
             .i32("out_vec_size", i32::try_from(n_out).expect("fits"))
             .done();
         // `LaunchRule::Qmv`: the vector on x beside the 32 lanes of one
-        // reduction, four outputs per y-slot and two slots per workgroup, so
-        // `ceil(out / 8)` groups on y.
+        // reduction, and four outputs per workgroup, so `ceil(out / 4)`
+        // groups on y.
         run(
             gpu,
             entrypoint,
             &[&w, &scale_buf, &bias_buf, &x, &y],
             &block,
-            [over(n_vec as u32, 4), over(n_out as u32, 8), 1],
+            [
+                over(n_vec as u32, kernels_wgpu::quant::PIE_MT.unsigned_abs()),
+                over(n_out as u32, 4),
+                1,
+            ],
         );
 
         let mut want = Vec::with_capacity(n_vec * n_out);
@@ -3137,8 +3141,7 @@ fn a_paged_kv_append_writes_through_its_page_table() {
             &rings[4], &rings[5], &page, &off, &rings[0],
         ],
         &[
-            false, false, true, true, false, false, false, false, false, false, false, false,
-            false,
+            false, false, true, true, false, false, false, false, false, false, false, false, false,
         ],
         &block,
         [
@@ -4400,11 +4403,11 @@ impl Affine {
 
     /// `PIE_QMV_VPT` — the values one lane of `quant/qmv.wgsl` pulls per pass.
     ///
-    /// Two words' worth, so 16 codes at four bits and 8 at eight. Asked of the
+    /// Four words' worth, so 32 codes at four bits and 16 at eight. Asked of the
     /// plane rather than recomputed at each call site, because it is a fact
     /// about the packing and the reduction has to agree with it.
     fn qmv_vpt(&self) -> usize {
-        (32 / self.bits as usize) * 2
+        (32 / self.bits as usize) * 4
     }
 
     fn words(&self) -> Vec<u8> {
@@ -4586,6 +4589,7 @@ fn a_tiled_gemm_agrees_over_every_tile_shape_and_quantization_point() {
                 let block = Block::of(&entrypoint)
                     .i32("k", i32::try_from(k).expect("fits"))
                     .i32("n", i32::try_from(n).expect("fits"))
+                    .i32("m", i32::try_from(m).expect("fits"))
                     .done();
                 // `LaunchRule::Qmm`: one workgroup per (column tile, row tile).
                 run(
@@ -4601,6 +4605,23 @@ fn a_tiled_gemm_agrees_over_every_tile_shape_and_quantization_point() {
                 // Only the first `m` rows are the caller's; the rest are the
                 // overhang the contract allows.
                 let real = &got[..m * n];
+                // AND NOTHING PAST THEM. `qmm_grid` rounds the row axis up
+                // with `div_ceil`, so at m = 33 the launch runs 48 or 64 rows
+                // of tiles; before `params.m` existed the extra rows were
+                // STORED, a tile's worth of overrun into whatever the arena
+                // put next. `driver-wgpu`'s `Serving::prefill` records what
+                // that cost end to end: an unrelated answer and a twelvefold
+                // slowdown. The sentinel is the proof it has stopped, and it
+                // is a proof the `..m * n` comparison above cannot give --
+                // that one is blind to everything past the caller's rows.
+                let after = &got[m * n..];
+                let touched = after.iter().filter(|v| v.to_bits() != f32::from_bits((SENTINEL & 0xffff) << 16).to_bits()).count();
+                assert_eq!(
+                    touched,
+                    0,
+                    "{entrypoint} wrote {touched} of {} overhang values past row {m}",
+                    after.len(),
+                );
                 if let Err(why) = agrees(real, &want, &entrypoint) {
                     wrong.push(why);
                 } else if bm == 64 && bn == 64 {
@@ -4677,6 +4698,7 @@ fn a_tiled_gemm_folds_its_residual_at_the_binding_the_row_names() {
         let block = Block::of(&entrypoint)
             .i32("k", i32::try_from(k).expect("fits"))
             .i32("n", i32::try_from(n).expect("fits"))
+            .i32("m", i32::try_from(m).expect("fits"))
             .done();
         run(
             gpu,
@@ -4776,7 +4798,11 @@ fn a_quantised_matvec_folds_its_residual_at_binding_five() {
             &entrypoint,
             &[&w, &scales, &biases, &x, &y, &residual],
             &block,
-            [over(n_vec as u32, 4), over(n_out as u32, 8), 1],
+            [
+                over(n_vec as u32, kernels_wgpu::quant::PIE_MT.unsigned_abs()),
+                over(n_out as u32, 4),
+                1,
+            ],
         );
 
         let mut plain = Vec::with_capacity(n_vec * n_out);
@@ -6129,7 +6155,11 @@ fn a_batched_rope_gives_every_row_its_own_position() {
         &[&x, &position],
         &[true, false],
         &block,
-        [(pairs as u32).div_ceil(2).div_ceil(32), heads as u32, rows as u32],
+        [
+            (pairs as u32).div_ceil(2).div_ceil(32),
+            heads as u32,
+            rows as u32,
+        ],
     );
 
     let shape = Neox {
@@ -6219,7 +6249,11 @@ fn a_frequency_table_rope_reads_a_reordered_block() {
             &[&x, &position, &inv_freq],
             &[true, false, false],
             &block,
-            [(pairs as u32).div_ceil(2).div_ceil(32), heads as u32, rows as u32],
+            [
+                (pairs as u32).div_ceil(2).div_ceil(32),
+                heads as u32,
+                rows as u32,
+            ],
         );
 
         let shape = Neox {
@@ -7250,7 +7284,7 @@ fn every_stated_row_is_dispatched_or_named() {
     // nothing reads exactly like a filter that passes**, which is the sentence
     // the removing commit wrote about `driver-cuda` and is equally true here.
     // Asserted rather than assumed — the count below is the same as it was.
-    // Hoisted: `entrypoints()` hands back an owned copy of all 481 names, and
+    // Hoisted: `entrypoints()` hands back an owned copy of all 489 names, and
     // asking inside the filter asked once per routine.
     let census = kernels_wgpu::entrypoints();
     let mut stated: Vec<&str> = kernels_wgpu::routines()
@@ -7919,6 +7953,9 @@ fn how_long_a_decodes_kernels_take() {
     // plane at the model's own quantisation. The grids are each kernel's own
     // launch rule.
     {
+        // `quant/qmv.wgsl`'s `PIE_MT`: the activation rows one workgroup
+        // carries. Must match the shader, the way `quant::mt_groups` must.
+        const QMV_MT: u32 = kernels_wgpu::quant::PIE_MT.unsigned_abs();
         let k = 1024usize;
         let n = 1024usize;
         let plane = Affine::new(64, 4, n, k, 0x7717);
@@ -7937,14 +7974,26 @@ fn how_long_a_decodes_kernels_take() {
                 .i32("in_vec_size", i32::try_from(k).expect("fits"))
                 .i32("out_vec_size", i32::try_from(n).expect("fits"))
                 .done();
+            // THE LAUNCHER'S OWN GRID, which this did not use and which is
+            // why the crossover it printed was fiction. `quant::qmv_grid`
+            // states LANES and the driver divides by the module's width, so
+            // the workgroup counts are `ceil(m / PIE_MT)` on x -- a workgroup
+            // carries PIE_MT activation rows -- and `ceil(n / 8) * 2` on y,
+            // since each covers four output columns.
+            //
+            // This passed `m` on x and `ceil(n / 8)` on y, so it dispatched
+            // PIE_MT times too many row groups (each recomputing rows it
+            // shares with its neighbours) over HALF the output columns. The
+            // matvec was being timed doing a different amount of work than
+            // the model asks of it, in both directions at once.
             let vector = per_dispatch(
                 &[&w, &scale_buf, &bias_buf, &x, &y],
                 &[false, false, false, false, true],
                 "affine_qmv_fast_bfloat16_gs_64_b_4",
                 &vec_block,
                 [
-                    u32::try_from(m).expect("fits"),
-                    over(u32::try_from(n).expect("fits"), 8),
+                    over(u32::try_from(m).expect("fits"), QMV_MT),
+                    over(u32::try_from(n).expect("fits"), 8) * 2,
                     1,
                 ],
             );
@@ -7953,6 +8002,7 @@ fn how_long_a_decodes_kernels_take() {
             let tiled_block = Block::of(tiled_name)
                 .i32("k", i32::try_from(k).expect("fits"))
                 .i32("n", i32::try_from(n).expect("fits"))
+                .i32("m", i32::try_from(m).expect("fits"))
                 .done();
             let tiled = per_dispatch(
                 &[&w, &scale_buf, &bias_buf, &x, &y],
@@ -7970,6 +8020,127 @@ fn how_long_a_decodes_kernels_take() {
                  tiled is {:.2}x the matvec",
                 tiled / vector
             );
+        }
+    }
+
+    // THE TILE. `project::QMM_TILE` is `(32, 32)` and its doc says why: 16
+    // has no cooperative-matrix build, and 1024 tokens of 4-bit qwen3-0.6B
+    // take 2563 ms at `(16, 32)` against 565 at `(32, 32)`. Measured on an
+    // RTX 4090 through Vulkan.
+    //
+    // Neither half of that argument is this backend's. wgpu has no
+    // cooperative matrix at all, so the reason 16 lost is absent and the
+    // reason 32 won is unmeasured here. This sweeps the tile over the shapes
+    // a llama-3.2-1B prefill states, at the 512 rows `pp512` fires.
+    {
+        let m = 512usize;
+        for (n, k, what) in [
+            (2048usize, 2048usize, "q/o "),
+            (8192, 2048, "g/u "),
+            (2048, 8192, "down"),
+        ] {
+            let plane = Affine::new(64, 4, n, k, 0x7717);
+            let w = storage(gpu, &plane.words());
+            let (scale_buf, _) = bf16s(gpu, &plane.scales);
+            let (bias_buf, _) = bf16s(gpu, &plane.biases);
+            for (bm, bn) in [
+                (16usize, 16usize),
+                (16, 32),
+                (16, 64),
+                (32, 16),
+                (32, 32),
+                (32, 64),
+                (64, 16),
+                (64, 32),
+                (64, 64),
+            ] {
+                let rows = m.div_ceil(bm) * bm;
+                let (x, _) = bf16s(gpu, &spread(rows * k, 61));
+                let y = sentinelled(gpu, (rows * n).div_ceil(2));
+                let name = format!("affine_qmm_t_bfloat16_gs_64_b_4_bm_{bm}_bn_{bn}");
+                let block = Block::of(&name)
+                    .i32("k", i32::try_from(k).expect("fits"))
+                    .i32("n", i32::try_from(n).expect("fits"))
+                    .i32("m", i32::try_from(m).expect("fits"))
+                    .done();
+                let ms = per_dispatch(
+                    &[&w, &scale_buf, &bias_buf, &x, &y],
+                    &[false, false, false, false, true],
+                    &name,
+                    &block,
+                    [
+                        over(u32::try_from(n).expect("fits"), bn as u32),
+                        over(u32::try_from(m).expect("fits"), bm as u32),
+                        1,
+                    ],
+                );
+                // The arithmetic is the same at every tile, so a rate makes
+                // the three shapes comparable to each other and to the
+                // machine's own peak.
+                let flop = 2.0 * (m * n * k) as f64;
+                let tflops = flop / (ms / 1000.0) / 1e12;
+                println!(
+                    "tile  {what}  n={n:5} k={k:5}  bm={bm:2} bn={bn:2}  \
+                     {ms:>8.3} ms   {tflops:>6.2} TFLOP/s"
+                );
+            }
+        }
+    }
+
+    // WHAT THE OVERHANG ROWS COST, which decides whether the prefill cliff
+    // is fixable.
+    //
+    // `driver-wgpu`'s `Serving::prefill` doc records that letting the GEMM
+    // run at a row count its tile does not divide is both wrong AND 5.4x
+    // slower than the matvec -- 97 tok/s at 496 rows where 512 rows reach
+    // 1240. The wrongness is understood (nothing bounds `write_out`). The
+    // SLOWNESS was not, and it decides the shape of any fix: if the overhang
+    // is slow because it multiplies whatever lies past the activation, then
+    // a partial-tile GEMM must ZERO the staged rows and not merely bound the
+    // stores, and bounding the stores alone would ship the slowdown.
+    //
+    // So: same launch, same grid of `m_pad / bm` row tiles, only the CONTENT
+    // of the overhang rows changed. Anything the fill does not explain is
+    // not the fill.
+    {
+        let (n, k, bm, bn) = (2048usize, 2048usize, 32usize, 64usize);
+        let m = 496usize;
+        let m_pad = m.div_ceil(bm) * bm;
+        let plane = Affine::new(64, 4, n, k, 0x7717);
+        let w = storage(gpu, &plane.words());
+        let (scale_buf, _) = bf16s(gpu, &plane.scales);
+        let (bias_buf, _) = bf16s(gpu, &plane.biases);
+        for (fill, what) in [
+            (0.0f32, "zeros   "),
+            (1.0, "ones    "),
+            (1e-41, "denormal"),
+            (f32::NAN, "NaN     "),
+            (f32::INFINITY, "infinity"),
+        ] {
+            let mut host = spread(m_pad * k, 61);
+            for v in host.iter_mut().skip(m * k) {
+                *v = fill;
+            }
+            let (x, _) = bf16s(gpu, &host);
+            let y = sentinelled(gpu, (m_pad * n).div_ceil(2));
+            let name = format!("affine_qmm_t_bfloat16_gs_64_b_4_bm_{bm}_bn_{bn}");
+            let block = Block::of(&name)
+                .i32("k", i32::try_from(k).expect("fits"))
+                .i32("n", i32::try_from(n).expect("fits"))
+                .i32("m", i32::try_from(m).expect("fits"))
+                .done();
+            let ms = per_dispatch(
+                &[&w, &scale_buf, &bias_buf, &x, &y],
+                &[false, false, false, false, true],
+                &name,
+                &block,
+                [
+                    over(u32::try_from(n).expect("fits"), bn as u32),
+                    over(u32::try_from(m_pad).expect("fits"), bm as u32),
+                    1,
+                ],
+            );
+            println!("overhang  m={m} pad={m_pad}  tail={what}  {ms:>8.3} ms");
         }
     }
 
@@ -8016,7 +8187,7 @@ fn how_long_a_decodes_kernels_take() {
             &[false, false, false, false, true],
             "affine_qmv_fast_bfloat16_gs_64_b_4",
             &block,
-            [1, over(u32::try_from(out_rows).expect("fits"), 8), 1],
+            [1, over(u32::try_from(out_rows).expect("fits"), 4), 1],
         );
         // Bytes a correct run must read: the packed plane, plus one scale and
         // one bias per group of `PIE_GROUP` codes, both bf16.
@@ -8074,7 +8245,7 @@ fn what_a_quantised_matvec_costs() {
         .i32("in_vec_size", i32::try_from(k).expect("fits"))
         .i32("out_vec_size", i32::try_from(n_out).expect("fits"))
         .done();
-    let grid = [1u32, over(n_out as u32, 8), 1];
+    let grid = [1u32, over(n_out as u32, 4), 1];
     // `dispatch_n` and not `run`, for the reason its own doc gives: a
     // benchmark wants the pipeline built once and the encoder reused, or it
     // measures `create_compute_pipeline`. The first draft of this test called
@@ -8187,9 +8358,8 @@ fn release_only() {
 /// measurements are now cheap to set up.
 #[test]
 fn whether_this_adapter_offers_the_cooperative_matrix_this_tree_calls_absent() {
-    let instance = wgpu::Instance::new(
-        wgpu::InstanceDescriptor::new_without_display_handle().with_env(),
-    );
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle().with_env());
     let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         force_fallback_adapter: false,
@@ -8381,8 +8551,12 @@ fn coop_gemm(@builtin(workgroup_id) wg: vec3<u32>) {
     let (m, n, k) = (512usize, 3584usize, 1024usize);
     // f16 `1.0` and `0.5`, so the product is exactly representable and a wrong
     // answer is visible rather than plausible: every output must be k * 0.5.
-    let a_bytes: Vec<u8> = std::iter::repeat_n([0x00u8, 0x3C], m * k).flatten().collect();
-    let b_bytes: Vec<u8> = std::iter::repeat_n([0x00u8, 0x38], k * n).flatten().collect();
+    let a_bytes: Vec<u8> = std::iter::repeat_n([0x00u8, 0x3C], m * k)
+        .flatten()
+        .collect();
+    let b_bytes: Vec<u8> = std::iter::repeat_n([0x00u8, 0x38], k * n)
+        .flatten()
+        .collect();
     let mk = |contents: &[u8], usage| {
         use wgpu::util::DeviceExt as _;
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -8702,11 +8876,13 @@ fn coop_qgemm(
     };
     let st = wgpu::BufferUsages::STORAGE;
     // Every nibble 1, every scale f16 0.5, every bias 0, every activation 1.0.
-    let w = mk(
-        bytemuck::cast_slice(&vec![0x1111_1111u32; n * k / 8]),
+    let w = mk(bytemuck::cast_slice(&vec![0x1111_1111u32; n * k / 8]), st);
+    let scales = mk(
+        &std::iter::repeat_n([0x00u8, 0x38], groups)
+            .flatten()
+            .collect::<Vec<u8>>(),
         st,
     );
-    let scales = mk(&std::iter::repeat_n([0x00u8, 0x38], groups).flatten().collect::<Vec<u8>>(), st);
     let biases = mk(&vec![0u8; groups * 2], st);
     let act = mk(
         &std::iter::repeat_n([0x00u8, 0x3C], m * k)
@@ -8935,6 +9111,7 @@ fn which_tile_the_batched_projection_wants() {
         let block = Block::of(&name)
             .i32("k", i32::try_from(k).expect("fits"))
             .i32("n", i32::try_from(n).expect("fits"))
+            .i32("m", i32::try_from(m).expect("fits"))
             .done();
         let ms = time(
             &name,
@@ -9056,9 +9233,8 @@ fn gdn_core_at(gpu: &Gpu, rows: usize) {
     let (dk, dv, hk, hv) = (128usize, 128usize, 16usize, 16usize);
     let (conv_dim, kc, slots) = (6144usize, 4usize, rows);
     let (q_off, k_off, v_off) = (0i32, 2048i32, 4096i32);
-    let words = |v: &[f32]| -> Vec<u8> {
-        v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()
-    };
+    let words =
+        |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>() };
     // The two recurrent planes and the one that receives the rolled window.
     let conv = storage(gpu, &words(&spread(slots * kc * conv_dim, 3)));
     let fresh = storage(gpu, &words(&vec![0.0f32; slots * kc * conv_dim]));
@@ -9074,7 +9250,14 @@ fn gdn_core_at(gpu: &Gpu, rows: usize) {
     // `GdnCoreParams`, field for field.
     let mut block: Vec<u8> = Vec::new();
     for v in [
-        dk as i32, dv as i32, hk as i32, hv as i32, conv_dim as i32, kc as i32, q_off, k_off,
+        dk as i32,
+        dv as i32,
+        hk as i32,
+        hv as i32,
+        conv_dim as i32,
+        kc as i32,
+        q_off,
+        k_off,
         v_off,
     ] {
         block.extend_from_slice(&v.to_le_bytes());
@@ -9084,8 +9267,8 @@ fn gdn_core_at(gpu: &Gpu, rows: usize) {
     let params = storage(gpu, &block);
 
     let bufs: [&wgpu::Buffer; 12] = [
-        &mixed, &conv, &rstate, &out, &conv_w, &conv_b, &a_log, &dt_bias, &a_gate, &b_gate,
-        &fresh, &params,
+        &mixed, &conv, &rstate, &out, &conv_w, &conv_b, &a_log, &dt_bias, &a_gate, &b_gate, &fresh,
+        &params,
     ];
     // `gdn_grid` states LANES `[32, Dv, rows * Hv]` over a `(32, 4)` workgroup.
     let grid = [1u32, (dv / 4) as u32, (rows * hv) as u32];
@@ -9162,14 +9345,22 @@ fn a_quantised_matvec_agrees_over_a_batch_of_activation_rows() {
                 .i32("in_vec_size", i32::try_from(k).expect("fits"))
                 .i32("out_vec_size", i32::try_from(n_out).expect("fits"))
                 .done();
-            // FOUR ROWS TO A WORKGROUP on x, which is `quarters()` on the
-            // launcher's side and `Rule::Qmv`'s `div_ceil(4)` on the driver's.
+            // `PIE_MT` ROWS TO A WORKGROUP on x, which is `mt_groups()` on
+            // the launcher's side and `Rule::Qmv`'s own division on the
+            // driver's. Spelled from the constant and not as a literal: a
+            // grid that under-dispatches x does not fail here, it leaves the
+            // upper rows unwritten, which is what this test then reports as
+            // a wrong VALUE at a confusing index.
             run(
                 gpu,
                 entrypoint,
                 &[&w, &scale_buf, &bias_buf, &x, &y],
                 &block,
-                [over(n_vec as u32, 4), over(n_out as u32, 8), 1],
+                [
+                    over(n_vec as u32, kernels_wgpu::quant::PIE_MT.unsigned_abs()),
+                    over(n_out as u32, 4),
+                    1,
+                ],
             );
             let mut want = Vec::with_capacity(n_vec * n_out);
             for vec_ in 0..n_vec {
@@ -9187,5 +9378,62 @@ fn a_quantised_matvec_agrees_over_a_batch_of_activation_rows() {
                 panic!("{n_vec} vectors of {n_out} columns: {why}");
             }
         }
+    }
+}
+
+/// WHAT A SUBMISSION COSTS WHEN IT COMPUTES NOTHING.
+///
+/// `driver-wgpu` fires once per decoded token: one command buffer, 228
+/// dispatches, `submit`, then `poll(Wait)`. The probe reports the whole of
+/// that window as `gpu=`, and at 104 tok/s it reads 8.4 ms. Adding up what
+/// `how_long_a_decodes_kernels_take` says the dispatches cost leaves a
+/// remainder, and this test is the only way to know whether the remainder is
+/// arithmetic nobody has attributed or a round trip nobody has counted.
+///
+/// So it times the window with NOTHING in it: an empty command buffer, and one
+/// holding an empty compute pass, submitted and waited on the way the driver
+/// does it. Whatever this reads is paid once per token no matter what the
+/// model is.
+///
+/// Run with `--ignored --nocapture --release`.
+#[test]
+#[ignore = "a timing, not a check"]
+fn what_a_submission_costs_when_it_computes_nothing() {
+    release_only();
+    let Some((gpu, _held)) = adapter() else {
+        return;
+    };
+    const ROUNDS: usize = 200;
+    for (what, pass) in [("empty buffer", false), ("empty pass  ", true)] {
+        // Warm, because the first submission of a process builds queues.
+        let mut best = f64::MAX;
+        for trial in 0..4 {
+            let at = std::time::Instant::now();
+            for _ in 0..ROUNDS {
+                let mut work = gpu
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("nothing"),
+                    });
+                if pass {
+                    work.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("nothing"),
+                        timestamp_writes: None,
+                    });
+                }
+                gpu.queue.submit([work.finish()]);
+                gpu.device
+                    .poll(wgpu::PollType::Wait {
+                        submission_index: None,
+                        timeout: None,
+                    })
+                    .expect("the queue drains");
+            }
+            let ms = at.elapsed().as_secs_f64() * 1000.0 / ROUNDS as f64;
+            if trial > 0 {
+                best = best.min(ms);
+            }
+        }
+        println!("submit+wait  {what}   {best:>8.4} ms/round trip");
     }
 }

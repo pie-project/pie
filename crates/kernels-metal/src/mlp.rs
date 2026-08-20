@@ -176,23 +176,6 @@ pub fn silu_mul(
 }
 
 
-/// The shaders this family's routines reach: `(file, entrypoint)`, one pair
-/// per instantiated name.
-///
-/// A row's `axes` GENERATED these names and its `file` column said where they
-/// live. Retiring the row moved who NAMES them, not what exists -- the shader
-/// is still compiled and still dispatched -- so the pairs are stated here and
-/// [`crate::entrypoints`] reads them back. The FILE rides along because Metal
-/// compiles from `(path, entry name)` at run time, and `device_kernels.rs`
-/// builds every one of them against a real device; a name without its file
-/// would leave that sweep nothing to open. See [`crate::RETIRED`].
-pub static ENTRYPOINTS: &[(&str, &str)] = &[
-    ("mlp/gated.metal", "geglu_tanh_bfloat16"),
-    ("mlp/gated.metal", "geglu_tanh_strided_bfloat16"),
-    ("mlp/gated.metal", "gptoss_swiglu_bfloat16"),
-    ("mlp/gated.metal", "silu_mul_bfloat16"),
-    ("mlp/gated.metal", "silu_mul_strided_bfloat16"),
-];
 
 #[cfg(test)]
 mod tests {

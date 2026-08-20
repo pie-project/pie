@@ -797,9 +797,14 @@ fn gdn_prefill(
 
 builder! {
     /// `repeat_interleave_heads_fp32`: produces `[Tokens, value_heads, key_dim]` f32 dataflow.
-    pub fn repeat_interleave_heads(x: &Val, value_heads: u32, key_dim: u32) -> Val {
+    pub fn repeat_interleave_heads(x: &Val, key_heads: u32, value_heads: u32, key_dim: u32) -> Val {
         symbol: "ssm::repeat_interleave_heads_fp32",
         on: x,
+        // `[k_heads, v_heads, key_dim]`, the repeat's own contract: it walks
+        // the compact K layout and writes each key head `v_heads / k_heads`
+        // times, so it needs both counts and the width. `key_dim` was already
+        // the caller's -- it states the output shape below with it.
+        params: [key_heads, value_heads, key_dim],
         inputs: [x],
         out: [Dim::Tokens, Dim::Const(value_heads), Dim::Const(key_dim)] as F32,
         made: "the head repeat produces its value",

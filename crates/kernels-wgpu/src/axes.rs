@@ -17,7 +17,7 @@ use kernels::Axis;
 /// `driver-metal`'s `AffineFormat::kernel_suffix` states the fact this
 /// encodes: bf16 is not an axis — it is the one activation dtype the driver
 /// instantiates. Declared anyway, and this is the divergence from CUDA that
-/// `.wiki/kernel-metal-refactor.md` §2.2 exists to justify: on CUDA the `_bf16`
+/// `.wiki/kernel-x/metal-refactor.md` §2.2 exists to justify: on CUDA the `_bf16`
 /// suffix is the sole record of an operand type the `void*` ABI drops, so it
 /// must stay authored. Here the macro pastes it, so it is a coordinate — and a
 /// second activation dtype becomes one more point instead of 470 new names.

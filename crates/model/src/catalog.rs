@@ -174,6 +174,43 @@ impl LoadShape {
 /// thing a table of models must not try to hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MetalBinding {
+    /// The tiled GEMM's `(bm, bn)`, when this BUILD measured its own.
+    ///
+    /// `None` takes [`QMM_TILE`], which is the shared stamp and the right
+    /// answer for a backend that has not asked the question. The field is
+    /// here because that constant's own doc names it: *"a backend wanting
+    /// its own tile has `qmm_tile` on `MetalBinding`"* -- the tile is a
+    /// property of the BINARY rather than of any checkpoint, and each
+    /// backend's seam builds its own binding, so this is where a binary
+    /// gets to disagree without moving anybody else's number.
+    ///
+    /// `driver-wgpu` is the one that does. See
+    /// `engine::driver::backend::wgpu` for the measurement.
+    ///
+    /// [`QMM_TILE`]: crate::shared::llama_like::project::QMM_TILE
+    pub qmm_tile: Option<(u32, u32)>,
+    /// Does this backend's tiled GEMM tolerate a row count its tile does not
+    /// divide?
+    ///
+    /// A BINARY PROPERTY, like [`qmm_tile`] beside it, and for the same
+    /// reason: the answer is a fact about which kernels were compiled, not
+    /// about the model.
+    ///
+    /// `false` everywhere it is not stated, because the tolerance is the
+    /// exception. `qmm_t` is written to a contract -- the caller allocates a
+    /// whole number of `BM` rows and the overhang is garbage it ignores --
+    /// and `kernels-metal` keeps it, calling MLX's `store_result` where a
+    /// `store_result_safe` sits beside it.
+    ///
+    /// `driver-wgpu` says `true`. Its `qmm_t.wgsl` carries `m` in `Params`
+    /// and returns from `write_out` on `row >= m`, so the overhang computes
+    /// and discards instead of storing. What that buys is the whole reason
+    /// this field exists: with the guard at `TokensMultipleOf(tile)`,
+    /// thirty-one prompt lengths in thirty-two fall to the matvec and a
+    /// 496-token prefill reads 529 tok/s against 512's 1238.
+    ///
+    /// [`qmm_tile`]: MetalBinding::qmm_tile
+    pub qmm_partial_rows: bool,
     /// The affine quantisation group width the staged tensors carry.
     ///
     /// Asked of the load, which reads it off the TENSORS. This said it was

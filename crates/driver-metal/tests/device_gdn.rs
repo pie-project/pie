@@ -1,11 +1,26 @@
 //! The gated-delta-net core, on the GPU, for the first time.
 //!
 //! `ssm/gdn_core.metal` and `ssm/gdn_prep.metal` are sixteen entry points
-//! compiled into every build this driver ships and signed into its archive,
-//! and `text_conformance`'s DARK ledger carries all sixteen: `qwen_3_5`'s
-//! Metal projection refuses the family, so no statement names them and no
-//! dispatch has ever opened one. They are the largest dark block in the tree
-//! and the ledger's own words for them are that the kernels are WRITTEN.
+//! compiled into every build this driver ships and signed into its archive.
+//!
+//! WHEN THIS FILE WAS WRITTEN all sixteen were dark, and this header said so:
+//! `qwen_3_5`'s Metal projection refused the family, so no statement named
+//! them and no dispatch had ever opened one. They were the largest dark block
+//! in the tree and the ledger's own word for them was WRITTEN.
+//!
+//! Every clause of that has since been falsified by work, which is the only
+//! way a paragraph like it is supposed to end. `model-dsl/src/metal.rs:2079`
+//! onward projects the family; `driver-metal`'s `lowering/consts.rs` builds
+//! its parameter struct and `lowering/routine.rs` crosses it; `ssm.rs` fires
+//! it at seven sites; and `routine::DARK` is now ONE row long and that row is
+//! `silu_mul_strided`. None of the sixteen are on it, and none are among the
+//! four names `kernels-metal`'s `UNFIRED` still carries.
+//!
+//! The paragraph is kept rather than deleted because the test below is only
+//! legible with it: everything the file does by hand, it does because at the
+//! time nothing else could, and a reader who finds hand-built `Dispatch`es in
+//! a family the lowering now reaches should know they are not a workaround
+//! for a gap that still exists. They are the measurement that closed it.
 //!
 //! Written is not measured. Nothing on any backend has asked a GDN kernel for
 //! a number — not a reference, not a differential, not a shape. The lowering
@@ -263,6 +278,54 @@ struct Answer {
 /// does not, and firing two arms against one slab is the mistake the shader's
 /// own header spends a paragraph on.
 #[allow(clippy::too_many_arguments)]
+/// The eleven `GdnShape::params` scalars, ONE BUFFER EACH, starting at `base`.
+///
+/// THERE WAS A STRUCT HERE and every fixture in this file staged one: a single
+/// `packed: true` slot pointing at eleven four-byte fields, matching a
+/// `GdnCoreParams` that `ssm/gdn_params.h` declared and that Vulkan and wgpu
+/// each kept their own copy of. `gdn_core.metal`'s header records its removal
+/// and the reason -- the routines name all eleven as `Const<i32>`/`Const<f32>`
+/// marks, so the contract is a SIGNATURE and there is no struct left to keep
+/// three copies of in step.
+///
+/// THE SHADERS MOVED AND THIS FILE DID NOT, which is the only reason the three
+/// tests below were red. A packed slot bound at 11 handed `gdn_core_bfloat16`
+/// a POINTER where it declares `const constant int& Dk`, and left Dv through
+/// inv_sqrt_dk bound to nothing at all. The failure was not a refusal: the
+/// pipeline builds, the dispatch encodes, and the kernel reads a garbage
+/// extent and writes nothing -- "row 0 v-head 0 channel 0 is 0 and the
+/// reference is 0.12245929", an all-zero output with no error anywhere.
+///
+/// AND `slot_ids` MOVED WITH THEM, which this file had equally missed. It was
+/// declared past the struct and now sits WHERE THE STRUCT DID, so the slotted
+/// forms bind it at 12 (prep) and 10 (recurrent) rather than 13 and 11. That
+/// is the one place the numbering moved, and `gdn_core.metal`'s header says
+/// so in as many words.
+///
+/// `at` walks the SAME staged run the struct was staged from, four bytes a
+/// field in `GdnShape::params` order, because that order was always the
+/// statement's and the removal did not touch it.
+fn gdn_scalar_slots(base: usize) -> Vec<ParamSlot> {
+    (0..11)
+        .map(|i| ParamSlot {
+            slot: base + i,
+            at: (i as u32) * 4,
+            bytes: 4,
+            packed: false,
+            value: Some(i as u8),
+        })
+        .collect()
+}
+
+/// [`gdn_scalar_slots`] plus the prefill scan's `row_pitch` and `n_scan`,
+/// which follow the eleven at words 11 and 12 of the same run.
+fn gdn_prefill_slots(base: usize) -> Vec<ParamSlot> {
+    let mut slots = gdn_scalar_slots(base);
+    slots.push(ParamSlot { slot: base + 11, at: 44, bytes: 4, packed: false, value: Some(11) });
+    slots.push(ParamSlot { slot: base + 12, at: 48, bytes: 4, packed: false, value: Some(12) });
+    slots
+}
+
 fn fire(
     context: &Context,
     compiler: &driver_metal::program::Compiler,
@@ -293,7 +356,10 @@ fn fire(
     let new_conv_a = alloc_f32(context, &vec![-99.0; SLOTS * KC * CDIM], "new_conv_state");
     let slot_a = slot_ids.map(|s| alloc_words(context, s, "slot_ids"));
 
-    let wide = if slot_ids.is_some() { 13 } else { 12 };
+    // `gdn_core` sealed: eleven buffers then eleven scalars, ending at 21.
+    // Slotted puts `slot_ids` at 11 -- where the struct used to sit -- and
+    // pushes the scalars to 12..22.
+    let (wide, scalar_base) = if slot_ids.is_some() { (23, 12) } else { (22, 11) };
     let mut args = vec![
         BoundArg {
             slice: Slice {
@@ -318,7 +384,8 @@ fn fire(
         (10, new_conv_a.gpu_address()),
     ];
     if let Some(s) = slot_a.as_ref() {
-        bind.push((12, s.gpu_address()));
+        // 11, not 12: `slot_ids` sits where the params struct did.
+        bind.push((11, s.gpu_address()));
     }
     for (slot, address) in &bind {
         args[*slot] = BoundArg {
@@ -330,9 +397,8 @@ fn fire(
         };
     }
 
-    // `GdnCoreParams`, a struct of eleven four-byte fields at buffer 11 --
-    // the one PACKED slot in this family, where the paged attention rows
-    // spell their scalars out one buffer at a time.
+    // The eleven scalars in `GdnShape::params` order, bound one buffer each
+    // now, the way the paged attention rows always bound theirs.
     let params = vec![
         DK as u32,
         DV as u32,
@@ -346,13 +412,7 @@ fn fire(
         EPS.to_bits(),
         (1.0f32 / (DK as f32).sqrt()).to_bits(),
     ];
-    let param_slots = vec![ParamSlot {
-        slot: 11,
-        at: 0,
-        bytes: 4,
-        packed: true,
-        value: Some(0),
-    }];
+    let param_slots = gdn_scalar_slots(scalar_base);
 
     let dispatch = Dispatch {
         symbol: entrypoint,
@@ -420,11 +480,21 @@ struct Pair {
 /// associates differently, which lands a few ulps away and inside any bound
 /// wide enough for bf16.
 ///
-/// The three ABIs in this family are three ABIs. `gdn_core` puts params at
+/// The three ABIs in this family are still three ABIs, and the paragraph that
+/// stood here counted them in the struct era: "`gdn_core` puts params at
 /// buffer 11 and `slot_ids` at 12; `gdn_prep` puts them at 12 and 13; and
 /// `gdn_core_recurrent` puts params at 10 and `slot_ids` at 11 -- which is
 /// where `gdn_core` puts its PARAMS. Nothing enforces that they agree,
-/// because nothing has ever bound them.
+/// because nothing has ever bound them."
+///
+/// THE LAST SENTENCE WAS RIGHT AND THIS FILE PAID FOR IT. Nothing bound them,
+/// the shaders retired the struct, and these fixtures went on staging one --
+/// so every index above is now off by the width of a struct that no longer
+/// exists. What each entrypoint reads is written out at
+/// [`gdn_scalar_slots`]: eleven loose scalars after the last buffer, with
+/// `slot_ids` where the struct used to be. Three ABIs and no shared
+/// declaration is still the state of things; the difference is only that the
+/// count is derived from a base here instead of typed out five times.
 #[allow(clippy::too_many_arguments)]
 fn fire_pair(
     context: &Context,
@@ -524,12 +594,17 @@ fn fire_pair(
         (9, new_conv_a.gpu_address()),
     ];
     let (prep_wide, rec_wide) = if let Some(s) = slot_a.as_ref() {
-        prep_bind.push((13, s.gpu_address()));
-        rec_bind.push((11, s.gpu_address()));
-        (14, 12)
-    } else {
+        prep_bind.push((12, s.gpu_address()));
+        rec_bind.push((10, s.gpu_address()));
         (13, 11)
+    } else {
+        (12, 10)
     };
+    // Those two are now the SCALAR BASE for each half, not the row width: the
+    // eleven follow whatever the last buffer was, so the row runs eleven
+    // further than it used to.
+    let (prep_base, rec_base) = (prep_wide, rec_wide);
+    let (prep_wide, rec_wide) = (prep_base + 11, rec_base + 11);
     let suffix = if slot_ids.is_some() { "_slotted" } else { "" };
     let prep_sym = format!("gdn_prep{suffix}_bfloat16");
     let rec_sym = format!("gdn_core_recurrent{suffix}_bfloat16");
@@ -545,13 +620,7 @@ fn fire_pair(
             touches: Touches::everything(&fill(&prep_bind, prep_wide)),
             args: fill(&prep_bind, prep_wide),
             params: params.clone(),
-            param_slots: vec![ParamSlot {
-                slot: 12,
-                at: 0,
-                bytes: 4,
-                packed: true,
-                value: Some(0),
-            }],
+            param_slots: gdn_scalar_slots(prep_base),
             layers: 0..1,
             op: 0,
         },
@@ -563,13 +632,7 @@ fn fire_pair(
             touches: Touches::everything(&fill(&rec_bind, rec_wide)),
             args: fill(&rec_bind, rec_wide),
             params: params.clone(),
-            param_slots: vec![ParamSlot {
-                slot: 10,
-                at: 0,
-                bytes: 4,
-                packed: true,
-                value: Some(0),
-            }],
+            param_slots: gdn_scalar_slots(rec_base),
             layers: 0..1,
             op: 0,
         },
@@ -872,8 +935,16 @@ fn tolerance_holds(worst: f32, what: &str) {
 /// that associates differently, which lands a few ulps out and inside any
 /// bound wide enough for a bf16 store.
 ///
-/// Four more entrypoints leave the DARK ledger's UNEXECUTED column here, and
-/// they leave it with the harder of the two available claims proved.
+/// Four more entrypoints stopped being merely written here, and they stopped
+/// with the harder of the two available claims proved.
+///
+/// This used to say they "leave the DARK ledger's UNEXECUTED column". There
+/// was no such column -- `routine::DARK` is a stem and a sentence, two fields
+/// and never three -- and the phrase was describing a wider ledger, from
+/// before the rows retired, that counted compiled-and-never-run separately
+/// from crossed. What replaced it is split in two: `DARK` holds only what no
+/// routine can express, and what is merely never FIRED is counted in
+/// `kernels-metal`'s `UNFIRED`. These four are on neither.
 #[test]
 #[ignore = "needs a Metal 4 device"]
 fn the_split_gdn_pair_is_the_fused_kernel_to_the_bit() {
@@ -1142,13 +1213,7 @@ fn fire_fused_one(
         touches: Touches::everything(&args),
         args,
         params: gdn_params(),
-        param_slots: vec![ParamSlot {
-            slot: 11,
-            at: 0,
-            bytes: 4,
-            packed: true,
-            value: Some(0),
-        }],
+        param_slots: gdn_scalar_slots(11),
         layers: 0..1,
         op: 0,
     };
@@ -1158,7 +1223,7 @@ fn fire_fused_one(
         .expect("the fused core builds");
     let staged =
         Params::stage(context, std::slice::from_ref(&dispatch)).expect("the scalars stage");
-    let table = ArgumentTable::new(context, 12).expect("a table");
+    let table = ArgumentTable::new(context, 22).expect("a table");
     let mut stepper = Stepper::new(context).expect("a stepper");
     stepper
         .run(|encoder| {
@@ -1245,10 +1310,10 @@ fn fire_prefill(
         }
         args
     };
-    // `row_pitch` and `n_scan` are separate `constant int&` operands, not
-    // fields of `GdnCoreParams`, so they are two more `ParamSlot`s -- the
-    // packed struct and the loose scalars in one row, which is the spelling
-    // `bind::encode` was built to serve.
+    // `row_pitch` and `n_scan` follow the eleven at words 11 and 12 of the
+    // same statement run. They were always loose `constant int&` operands
+    // beside the packed struct; now that the eleven are loose too, all
+    // thirteen are one uniform run and `gdn_prefill_slots` writes it.
     let scalars = {
         let mut v = gdn_params();
         v.push(ROW_PITCH as u32);
@@ -1268,7 +1333,7 @@ fn fire_prefill(
         (9, pre_k_a.gpu_address()),
         (10, pre_gate_a.gpu_address()),
         (11, new_conv_a.gpu_address()),
-        (13, slot_a.gpu_address()),
+        (12, slot_a.gpu_address()),
     ];
     let scan_bind = [
         (2usize, rstate_a.gpu_address()),
@@ -1276,7 +1341,7 @@ fn fire_prefill(
         (6, pre_q_a.gpu_address()),
         (7, pre_k_a.gpu_address()),
         (8, pre_gate_a.gpu_address()),
-        (11, slot_a.gpu_address()),
+        (10, slot_a.gpu_address()),
     ];
     let scan_sym = format!("gdn_core_recurrent_prefill_bfloat16_l_{lanes}_v_{vrows}");
     // `LANES` lanes own one `dv` row, so `32/LANES` rows share a simdgroup and
@@ -1289,32 +1354,12 @@ fn fire_prefill(
             file: "ssm/gdn_prep.metal",
             grid: [32, 1, (T_SCAN * HV) as u32],
             threadgroup: [32, 1, 1],
-            touches: Touches::everything(&fill(&prep_bind, 16)),
-            args: fill(&prep_bind, 16),
+            touches: Touches::everything(&fill(&prep_bind, 26)),
+            args: fill(&prep_bind, 26),
             params: scalars.clone(),
-            param_slots: vec![
-                ParamSlot {
-                    slot: 12,
-                    at: 0,
-                    bytes: 4,
-                    packed: true,
-                    value: Some(0),
-                },
-                ParamSlot {
-                    slot: 14,
-                    at: 44,
-                    bytes: 4,
-                    packed: false,
-                    value: Some(11),
-                },
-                ParamSlot {
-                    slot: 15,
-                    at: 48,
-                    bytes: 4,
-                    packed: false,
-                    value: Some(12),
-                },
-            ],
+            // Twelve buffers, `slot_ids` at 12, the eleven at 13..23, then
+            // row_pitch and n_scan at 24 and 25.
+            param_slots: gdn_prefill_slots(13),
             layers: 0..1,
             op: 0,
         },
@@ -1323,32 +1368,12 @@ fn fire_prefill(
             file: "ssm/gdn_prep.metal",
             grid: [32, grid_y, HV as u32],
             threadgroup: [32, 1, 1],
-            touches: Touches::everything(&fill(&scan_bind, 14)),
-            args: fill(&scan_bind, 14),
+            touches: Touches::everything(&fill(&scan_bind, 24)),
+            args: fill(&scan_bind, 24),
             params: scalars.clone(),
-            param_slots: vec![
-                ParamSlot {
-                    slot: 10,
-                    at: 0,
-                    bytes: 4,
-                    packed: true,
-                    value: Some(0),
-                },
-                ParamSlot {
-                    slot: 12,
-                    at: 44,
-                    bytes: 4,
-                    packed: false,
-                    value: Some(11),
-                },
-                ParamSlot {
-                    slot: 13,
-                    at: 48,
-                    bytes: 4,
-                    packed: false,
-                    value: Some(12),
-                },
-            ],
+            // `slot_ids` at 10, the eleven at 11..21, then row_pitch and
+            // n_scan at 22 and 23.
+            param_slots: gdn_prefill_slots(11),
             layers: 0..1,
             op: 0,
         },
@@ -1359,7 +1384,7 @@ fn fire_prefill(
         .ensure(context, compiler, &dispatches)
         .unwrap_or_else(|why| panic!("`{scan_sym}` builds a pipeline: {why}"));
     let staged = Params::stage(context, &dispatches).expect("the scalars stage");
-    let table = ArgumentTable::new(context, 16).expect("a table as wide as the prep row");
+    let table = ArgumentTable::new(context, 26).expect("a table as wide as the prep row");
     let mut stepper = Stepper::new(context).expect("a stepper");
     stepper
         .run(|encoder| encode(encoder, &table, &pipelines, &staged, &dispatches))

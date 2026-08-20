@@ -501,6 +501,7 @@ pub fn metal_facts(
     use model_dsl::{ScaleLayout, WeightRepr};
 
     LlamaLikeMetalFacts {
+        qmm_partial_rows: false,
         // TRUE and unread: the row this projection serves is gemma-4's DENSE
         // stack. `gemma-4-26b-a4b` is the generation's mixture and it is
         // untraced on every backend, and its config states `top_k_experts`
@@ -536,7 +537,10 @@ pub fn metal_facts(
         moe_repr: bind.moe_mxfp4.then_some(WeightRepr::Mxfp4Marlin),
         moe_bits: 4,
         qmm_tile: crate::shared::llama_like::project::QMM_TILE,
-        qmm_fp16_precast: crate::shared::llama_like::project::qmm_fp16_precast(bind.quant_group, bind.quant_bits),
+        qmm_fp16_precast: crate::shared::llama_like::project::qmm_fp16_precast(
+            bind.quant_group,
+            bind.quant_bits,
+        ),
         routed_qmm_fp16: crate::shared::llama_like::project::qmm_fp16_precast(
             bind.quant_group,
             bind.quant_bits,
@@ -1322,6 +1326,8 @@ mod tests {
             k_eq_v,
         };
         let bind = MetalBinding {
+            qmm_partial_rows: false,
+            qmm_tile: None,
             quant_group: 64,
             quant_bits: 4,
             router_quant_group: 0,
@@ -1371,6 +1377,8 @@ mod tests {
     fn the_metal_softmax_scale_is_the_one_the_per_layer_table_states() {
         use crate::catalog::MetalBinding;
         let bind = MetalBinding {
+            qmm_partial_rows: false,
+            qmm_tile: None,
             quant_group: 64,
             quant_bits: 4,
             router_quant_group: 0,
@@ -1447,6 +1455,8 @@ mod tests {
         // than the row's claim, so reading them off anything else would
         // compare the fixture against a gemma nobody ships.
         let bind = crate::catalog::MetalBinding {
+            qmm_partial_rows: false,
+            qmm_tile: None,
             quant_group: 64,
             quant_bits: 4,
             router_quant_group: 0,
@@ -1547,6 +1557,8 @@ mod tests {
                 k_eq_v: false,
             },
             &MetalBinding {
+                qmm_partial_rows: false,
+                qmm_tile: None,
                 quant_group: 64,
                 quant_bits: 4,
                 router_quant_group: 0,

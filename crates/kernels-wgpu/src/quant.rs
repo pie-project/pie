@@ -1,7 +1,7 @@
 //! The affine-quantised projections, and the codecs around them.
 //!
 //! This is 32 of the 99 rows and 304 of the 480 entrypoints, and the whole
-//! argument of `.wiki/kernel-metal-refactor.md` §2 is visible here: `qmm_t` is
+//! argument of `.wiki/kernel-x/metal-refactor.md` §2 is visible here: `qmm_t` is
 //! ONE template body in `quantized_qmm_t.wgsl` stamped over (group x bits x
 //! row tile x column tile), and enumerating its 54 instantiations as 54 rows
 //! would state the macro's job a second time by hand.
@@ -15,380 +15,176 @@ use kernels_macros::routine;
 use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, Out, Tensor, bf16, elementwise, elementwise_rows, f16, keys};
 use kernels::routine::Refusal;
 
-/// `affine_qmm_t`, indexed by `qmm_point`.
-static QMM_T: [&str; 54] = [
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_16_bn_16",
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_16_bn_32",
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_16_bn_64",
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_32_bn_16",
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_32_bn_32",
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_32_bn_64",
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_64_bn_16",
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_64_bn_32",
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_64_bn_64",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_16_bn_16",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_16_bn_32",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_16_bn_64",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_32_bn_16",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_32_bn_32",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_32_bn_64",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_64_bn_16",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_64_bn_32",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_64_bn_64",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_16_bn_16",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_16_bn_64",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_16",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_64",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_16",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_16_bn_16",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_16_bn_32",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_16_bn_64",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_32_bn_16",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_32_bn_32",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_32_bn_64",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_64_bn_16",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_64_bn_32",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_64_bn_64",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_16_bn_16",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_16_bn_32",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_16_bn_64",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_32_bn_16",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_32_bn_32",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_32_bn_64",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_64_bn_16",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_64_bn_32",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_64_bn_64",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_16_bn_16",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_16_bn_32",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_16_bn_64",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_32_bn_16",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_32_bn_32",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_32_bn_64",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_64_bn_16",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_64_bn_32",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_64_bn_64",
-];
+// ── THE NAMES, COMPOSED ───────────────────────────────────────────────────
+//
+// Twelve tables of literals stood here -- 261 rows -- and each was indexed by
+// folding two to four numbers into one integer: `QMM_T[qmm_point(group, bits,
+// bm, bn)?]`. The name IS those numbers, so the fold and the table it indexed
+// were a round trip: pack four axes into an offset, look the offset up, get the
+// four axes back as a string.
+//
+// `kernels-cuda` never wrote them because NVRTC lowers a template-id on ask, so
+// a CUDA body composes `"::pie::norm::rmsnorm_vec8<::pie::i32(512), false,
+// false>"` and hands it over. This crate is already the same shape -- it
+// expands its own sources at run time through `source::entrypoint_source` --
+// so it can compose too.
+//
+// **The axes still have to be CHECKED, and that is what `point` is for.** A
+// composed name for a point the shaders do not declare would be a
+// `Missing::NoVariant` at the fire; checking here makes it a `Refusal::Narrow`
+// naming the axis, which is what the tables' `position()` gave.
+//
+// # The comment that stood on the matvec tables is answered, not ignored
+//
+// It said the two-table layout was forced because *"the reader that says which
+// entrypoints this crate can fire only understands a lookup into a table of
+// literals"*. That reader is `crate::entrypoints`, and it does not read these:
+// it walks `source::declared()`, which parses the `// pie:instantiate` lines
+// out of the shader tree. The tables had stopped being its input and the note
+// had not caught up.
 
-/// `affine_qmm_t_bias`, indexed by `qmm_point`.
-static QMM_T_BIAS: [&str; 54] = [
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_16_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_16_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_16_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_32_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_32_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_32_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_64_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_64_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_64_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_16_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_16_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_16_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_32_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_32_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_32_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_64_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_64_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_64_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_16_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_16_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_32_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_32_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_64_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_64_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_16_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_16_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_16_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_32_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_32_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_32_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_64_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_64_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_64_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_16_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_16_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_16_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_32_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_32_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_32_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_64_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_64_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_64_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_16_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_16_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_16_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_32_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_32_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_32_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_64_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_64_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_64_bn_64",
-];
-
-/// `affine_qmm_t_residual`, indexed by `qmm_point`.
-static QMM_T_RESIDUAL: [&str; 54] = [
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_16_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_16_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_16_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_32_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_32_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_32_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_64_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_64_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_64_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_16_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_16_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_16_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_32_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_32_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_32_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_64_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_64_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_64_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_16_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_16_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_32_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_32_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_64_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_64_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_16_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_16_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_16_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_32_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_32_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_32_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_64_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_64_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_64_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_16_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_16_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_16_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_32_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_32_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_32_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_64_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_64_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_64_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_16_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_16_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_16_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_32_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_32_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_32_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_64_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_64_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_64_bn_64",
-];
-
-/// `affine_qmm_t_fp16_precast`, indexed by `tile_point`. One group size and one bit width.
-static QMM_T_FP16_PRECAST: [&str; 9] = [
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_16",
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_64",
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_16",
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_64",
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_16",
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_64",
-];
-
-/// `affine_qmm_t_bias_fp16_precast`, indexed by `tile_point`. One group size and one bit width.
-static QMM_T_BIAS_FP16_PRECAST: [&str; 9] = [
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_16",
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_64",
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_16",
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_64",
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_16",
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_64",
-];
-
-/// `affine_qmm_t_residual_fp16_precast`, indexed by `tile_point`. One group size and one bit width.
-static QMM_T_RESIDUAL_FP16_PRECAST: [&str; 9] = [
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_16",
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_64",
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_16",
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_64",
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_16",
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_64",
-];
-
-/// `affine_qmm_t_splitk`, indexed by `wide_point`. The column tile is 32 alone.
-static QMM_T_SPLITK: [&str; 18] = [
-    "affine_qmm_t_splitk_bfloat16_gs_32_b_4_bm_16_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_32_b_4_bm_32_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_32_b_4_bm_64_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_32_b_8_bm_16_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_32_b_8_bm_32_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_32_b_8_bm_64_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_64_b_8_bm_16_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_64_b_8_bm_32_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_64_b_8_bm_64_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_128_b_4_bm_16_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_128_b_4_bm_32_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_128_b_4_bm_64_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_128_b_8_bm_16_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_128_b_8_bm_32_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_128_b_8_bm_64_bn_32",
-];
-
-/// `affine_qmm_t_splitk_f32`, indexed by `wide_point`. The column tile is 32 alone.
-static QMM_T_SPLITK_F32: [&str; 18] = [
-    "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_4_bm_16_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_4_bm_32_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_4_bm_64_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_8_bm_16_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_8_bm_32_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_8_bm_64_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_8_bm_16_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_8_bm_32_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_8_bm_64_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_4_bm_16_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_4_bm_32_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_4_bm_64_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_8_bm_16_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_8_bm_32_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_8_bm_64_bn_32",
-];
-
-/// `affine_qmm_t_strided`, indexed by `wide_point`. The column tile is 32 alone.
-static QMM_T_STRIDED: [&str; 18] = [
-    "affine_qmm_t_strided_bfloat16_gs_32_b_4_bm_16_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_32_b_4_bm_32_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_32_b_4_bm_64_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_32_b_8_bm_16_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_32_b_8_bm_32_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_32_b_8_bm_64_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_64_b_8_bm_16_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_64_b_8_bm_32_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_64_b_8_bm_64_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_128_b_4_bm_16_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_128_b_4_bm_32_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_128_b_4_bm_64_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_128_b_8_bm_16_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_128_b_8_bm_32_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_128_b_8_bm_64_bn_32",
-];
-
-/// `affine_qmm_t_strided_residual`, indexed by `wide_point`. The column tile is 32 alone.
-static QMM_T_STRIDED_RESIDUAL: [&str; 18] = [
-    "affine_qmm_t_strided_residual_bfloat16_gs_32_b_4_bm_16_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_32_b_4_bm_32_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_32_b_4_bm_64_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_32_b_8_bm_16_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_32_b_8_bm_32_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_32_b_8_bm_64_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_64_b_8_bm_16_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_64_b_8_bm_32_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_64_b_8_bm_64_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_128_b_4_bm_16_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_128_b_4_bm_32_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_128_b_4_bm_64_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_128_b_8_bm_16_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_128_b_8_bm_32_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_128_b_8_bm_64_bn_32",
-];
-
-/// `affine_qmm_t_splitk_fp16_precast`, indexed by `row_tile_point`.
-static QMM_T_SPLITK_FP16_PRECAST: [&str; 3] = [
-    "affine_qmm_t_splitk_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_splitk_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_splitk_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_32",
-];
-
-/// `affine_qmm_t_splitk_fp16_precast_f32`, indexed by `row_tile_point`.
-static QMM_T_SPLITK_FP16_PRECAST_F32: [&str; 3] = [
-    "affine_qmm_t_splitk_fp16_precast_f32_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_splitk_fp16_precast_f32_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_splitk_fp16_precast_f32_bfloat16_gs_64_b_4_bm_64_bn_32",
-];
-
-/// `affine_qmm_t_strided_fp16_precast`, indexed by `row_tile_point`.
-static QMM_T_STRIDED_FP16_PRECAST: [&str; 3] = [
-    "affine_qmm_t_strided_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_strided_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_strided_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_32",
-];
-
-/// `affine_qmm_t_strided_fp16_precast_residual`, indexed by `row_tile_point`.
-static QMM_T_STRIDED_FP16_PRECAST_RESIDUAL: [&str; 3] = [
-    "affine_qmm_t_strided_fp16_precast_residual_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_strided_fp16_precast_residual_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_strided_fp16_precast_residual_bfloat16_gs_64_b_4_bm_64_bn_32",
-];
-
-/// How many entrypoints a matvec table holds per row-count arm.
+/// Every name the composers below can produce, over every point of every axis.
 ///
-/// The tables below are TWO tables end to end -- the one-row body first, the
-/// `PIE_MT4` four-row body second -- because the reader that says which
-/// entrypoints this crate can fire only understands a lookup into a table of
-/// literals. A pair of tables chosen by an `if` is the same fact and it cannot
-/// see it.
+/// # Why the crate states this and not a test
+///
+/// `tests/entrypoints.rs` reads this crate's SOURCE to answer *"which
+/// entrypoints does a body fire"*, and it refuses to skip what it cannot read:
+/// *"a scan that quietly reads less is a scan that agrees with everything."*
+/// It understood a literal and a lookup into a table of literals, which is
+/// what the bodies used to write.
+///
+/// A composed name is neither, and teaching a text scanner to expand
+/// `qmm_name("", *group, *bits, *bm, *bn)?` would put the lattice into the
+/// scanner -- a second place the axes are written, which is the thing the
+/// tables were deleted for. So the crate answers instead, by running the
+/// composers over the axes. One spelling: the composer, applied.
+///
+/// # It is not a table
+///
+/// A table is a list somebody typed and nothing checks. This is the product
+/// of `GROUPS`, `BIT_WIDTHS` and `TILES` through the same functions a fire
+/// calls, so a name here is a name a fire can reach, by construction. What
+/// checks it against reality is `composed_names_are_declared`, which compares
+/// it to the `// pie:instantiate` lines in the shader tree.
+#[must_use]
+pub fn composable() -> Vec<&'static str> {
+    let mut out = Vec::new();
+    let mut keep = |r: Result<&'static str, Refusal>| {
+        out.push(r.expect("an axis point, by construction"));
+    };
+    for form in ["", "_bias", "_residual"] {
+        for &gs in &GROUPS {
+            for &b in &BIT_WIDTHS {
+                for &bm in &TILES {
+                    for &bn in &TILES {
+                        keep(qmm_name(form, gs, b, bm, bn));
+                    }
+                }
+            }
+        }
+    }
+    // The wide forms are stamped at one column tile; see `WIDE_BN`.
+    for form in ["_splitk", "_splitk_f32", "_strided", "_strided_residual"] {
+        for &gs in &GROUPS {
+            for &b in &BIT_WIDTHS {
+                for &bm in &TILES {
+                    keep(qmm_name(form, gs, b, bm, WIDE_BN));
+                }
+            }
+        }
+    }
+    // `_fp16_precast` lands between the variant words, so these are pairs.
+    for (before, after) in [("", ""), ("_bias", ""), ("_residual", "")] {
+        for &bm in &TILES {
+            for &bn in &TILES {
+                keep(qmm_precast_name(before, after, bm, bn));
+            }
+        }
+    }
+    for (before, after) in
+        [("_splitk", ""), ("_splitk", "_f32"), ("_strided", ""), ("_strided", "_residual")]
+    {
+        for &bm in &TILES {
+            keep(qmm_precast_name(before, after, bm, WIDE_BN));
+        }
+    }
+    for form in ["fast", "fast_residual"] {
+        for &gs in &GROUPS {
+            for &b in &BIT_WIDTHS {
+                keep(qmv_name(form, gs, b));
+            }
+        }
+    }
+    // The matvec forms stamped at one codec point.
+    for form in ["tail", "tail_bias"] {
+        for &b in &BIT_WIDTHS {
+            keep(qmv_name(form, 64, b));
+        }
+    }
+    for &b in &BIT_WIDTHS {
+        keep(qmv_wide_strided_name(b));
+    }
+    out
+}
 
-/// `affine_qmv_fast`, indexed by `codec_point`.
-static QMV_FAST: [&str; 6] = [
-    "affine_qmv_fast_bfloat16_gs_32_b_4",
-    "affine_qmv_fast_bfloat16_gs_32_b_8",
-    "affine_qmv_fast_bfloat16_gs_64_b_4",
-    "affine_qmv_fast_bfloat16_gs_64_b_8",
-    "affine_qmv_fast_bfloat16_gs_128_b_4",
-    "affine_qmv_fast_bfloat16_gs_128_b_8",
-];
+/// The affine matmul's name at one point of its four axes.
+///
+/// `form` is the variant's own prefix -- `""`, `"_bias"`, `"_residual"` -- and
+/// the axes follow in the order the shader stamps them.
+fn qmm_name(form: &str, group: i32, bits: i32, bm: i32, bn: i32) -> Result<&'static str, Refusal> {
+    check(&GROUPS, group, "the group size")?;
+    check(&BIT_WIDTHS, bits, "the bit width")?;
+    check(&TILES, bm, "the row tile")?;
+    check(&TILES, bn, "the column tile")?;
+    Ok(kernels::jit::symbol(&format!(
+        "affine_qmm_t{form}_bfloat16_gs_{group}_b_{bits}_bm_{bm}_bn_{bn}"
+    )))
+}
 
-/// `affine_qmv_fast_residual`, indexed by `codec_point`.
-static QMV_FAST_RESIDUAL: [&str; 6] = [
-    "affine_qmv_fast_residual_bfloat16_gs_32_b_4",
-    "affine_qmv_fast_residual_bfloat16_gs_32_b_8",
-    "affine_qmv_fast_residual_bfloat16_gs_64_b_4",
-    "affine_qmv_fast_residual_bfloat16_gs_64_b_8",
-    "affine_qmv_fast_residual_bfloat16_gs_128_b_4",
-    "affine_qmv_fast_residual_bfloat16_gs_128_b_8",
-];
+/// [`qmm_name`] for the forms stamped at one group size and bit width.
+///
+/// The `_fp16_precast` family is `gs_64_b_4` alone, and that is not a default
+/// a caller may vary: the shader stamps one codec point, so a caller's group
+/// size would compose a name nothing declares.
+///
+/// # `before` and `after`, because the marker does not sit at one end
+///
+/// The plain family reads `affine_qmm_t{form}_bfloat16_...`, so one `form`
+/// carries everything. Here `_fp16_precast` lands in the MIDDLE of the variant
+/// words: `_splitk` comes before it and `_f32` after, giving
+/// `_splitk_fp16_precast_f32`. Passing one joined `form` composed
+/// `_splitk_f32_fp16_precast`, which is a name the tree does not declare --
+/// found by `composed_names_are_declared`, which is the whole reason that
+/// fixture walks the product instead of sampling it.
+fn qmm_precast_name(before: &str, after: &str, bm: i32, bn: i32) -> Result<&'static str, Refusal> {
+    check(&TILES, bm, "the row tile")?;
+    check(&TILES, bn, "the column tile")?;
+    Ok(kernels::jit::symbol(&format!(
+        "affine_qmm_t{before}_fp16_precast{after}_bfloat16_gs_64_b_4_bm_{bm}_bn_{bn}"
+    )))
+}
 
-/// `affine_qmv_tail`, indexed by `bits_point`.
-static QMV_TAIL: [&str; 2] = [
-    "affine_qmv_tail_bfloat16_gs_64_b_4",
-    "affine_qmv_tail_bfloat16_gs_64_b_8",
-];
+/// The wide strided matvec's name.
+///
+/// Its own function because the name carries two more axes than the family
+/// above -- `_v_4_kl_8`, the vector width and the K-lane count -- and both are
+/// stamped at ONE point. A `qmv_name` argument for a constant would read as a
+/// choice a caller has.
+fn qmv_wide_strided_name(bits: i32) -> Result<&'static str, Refusal> {
+    check(&BIT_WIDTHS, bits, "the bit width")?;
+    Ok(kernels::jit::symbol(&format!(
+        "affine_qmv_wide_strided_bfloat16_gs_64_b_{bits}_v_4_kl_8"
+    )))
+}
 
-/// `affine_qmv_tail_bias`, indexed by `bits_point`.
-static QMV_TAIL_BIAS: [&str; 2] = [
-    "affine_qmv_tail_bias_bfloat16_gs_64_b_4",
-    "affine_qmv_tail_bias_bfloat16_gs_64_b_8",
-];
-
-/// `affine_qmv_wide_strided`, indexed by `bits_point`.
-static QMV_WIDE_STRIDED: [&str; 2] = [
-    "affine_qmv_wide_strided_bfloat16_gs_64_b_4_v_4_kl_8",
-    "affine_qmv_wide_strided_bfloat16_gs_64_b_8_v_4_kl_8",
-];
+/// The matvec's name at one point of the codec axes.
+fn qmv_name(form: &str, group: i32, bits: i32) -> Result<&'static str, Refusal> {
+    check(&GROUPS, group, "the group size")?;
+    check(&BIT_WIDTHS, bits, "the bit width")?;
+    Ok(kernels::jit::symbol(&format!(
+        "affine_qmv_{form}_bfloat16_gs_{group}_b_{bits}"
+    )))
+}
 
 /// Group sizes the affine tree is compiled for, in table order.
 ///
@@ -411,43 +207,16 @@ const TILES: [i32; 3] = [16, 32, 64];
 /// the caller has and the grid reads it from here.
 const WIDE_BN: i32 = 32;
 
-/// Where a number sits on an axis, or a refusal naming the axis it is off.
-fn point(points: &[i32], v: i32, what: &'static str) -> Result<usize, Refusal> {
-    points.iter().position(|p| *p == v).ok_or(Refusal::Narrow {
-        what,
-        at: i64::from(v),
-    })
-}
-
-/// The quantisation point: group size major, bit width minor.
-fn codec_point(group: i32, bits: i32) -> Result<usize, Refusal> {
-    Ok(point(&GROUPS, group, "the group size")? * BIT_WIDTHS.len()
-        + point(&BIT_WIDTHS, bits, "the bit width")?)
-}
-
-/// The bit width alone, for the forms stamped at one group size.
-fn bits_point(bits: i32) -> Result<usize, Refusal> {
-    point(&BIT_WIDTHS, bits, "the bit width")
-}
-
-/// The tile point: row tile major, column tile minor.
-fn tile_point(bm: i32, bn: i32) -> Result<usize, Refusal> {
-    Ok(point(&TILES, bm, "the row tile")? * TILES.len() + point(&TILES, bn, "the column tile")?)
-}
-
-/// The row tile alone, for the forms stamped at `_bn_32`.
-fn row_tile_point(bm: i32) -> Result<usize, Refusal> {
-    point(&TILES, bm, "the row tile")
-}
-
-/// The full four-axis point of the tiled matmul.
-fn qmm_point(group: i32, bits: i32, bm: i32, bn: i32) -> Result<usize, Refusal> {
-    Ok(codec_point(group, bits)? * (TILES.len() * TILES.len()) + tile_point(bm, bn)?)
-}
-
-/// The three-axis point of the `_bn_32` forms.
-fn wide_point(group: i32, bits: i32, bm: i32) -> Result<usize, Refusal> {
-    Ok(codec_point(group, bits)? * TILES.len() + row_tile_point(bm)?)
+/// That a number is a point of its axis, or a refusal naming the axis.
+///
+/// The tables' `position()` with the index thrown away: a composed name does
+/// not need to know WHERE on the axis a value sits, only that it is on it.
+fn check(points: &[i32], v: i32, what: &'static str) -> Result<(), Refusal> {
+    points
+        .iter()
+        .any(|p| *p == v)
+        .then_some(())
+        .ok_or(Refusal::Narrow { what, at: i64::from(v) })
 }
 
 /// The tiled matmul's rectangle, in THREADS.
@@ -523,7 +292,7 @@ fn qmm_grid(n: i32, bn: i32, m: i32, bm: i32, split_k: i32) -> Result<[u32; 3], 
 /// group.
 ///
 /// It was the WIDE form's alone until `PIE_MT` gave the reducing form the same
-/// shape. The reducing form's workgroup owns eight output columns and reads
+/// shape. The reducing form's workgroup owns four output columns and reads
 /// their weights over the whole of K, so one activation row to a workgroup
 /// read the whole packed matrix once per token -- 67 GiB for a 512-token
 /// prefill of a 1B head, which is what the lm head's 617 ms was.
@@ -537,6 +306,74 @@ fn quarters(m: i32) -> i32 {
         m / 4 + i32::from(m % 4 != 0)
     }
 }
+
+/// The x extent the REDUCING forms take: `PIE_MT` activation rows a group.
+///
+/// [`quarters`]'s twin, and separate because the two numbers are different
+/// constants that happened to agree. The wide-strided body groups by
+/// `PIE_VEC`, which is 4; `reduce_store` groups by `PIE_MT`, which is not
+/// any more. Sharing one function made a change to `PIE_MT` silently
+/// mis-grid the wide form, which is three failing gpu tests and no clue.
+///
+/// Rounded up, and left non-positive as it came, for `qmv_grid` to refuse.
+fn mt_groups(m: i32) -> i32 {
+    if m <= 0 {
+        m
+    } else {
+        m / PIE_MT + i32::from(m % PIE_MT != 0)
+    }
+}
+
+/// The activation rows one reducing workgroup carries.
+///
+/// **Must match `quant/qmv.wgsl`'s `PIE_MT`,** and it is `pub` so that the
+/// two OTHER places that grid this kernel can say so in one number rather
+/// than three: `driver_wgpu::geometry`'s `Rule::Qmv` and the gpu tests that
+/// dispatch the entrypoint directly. All three used to spell a literal 4,
+/// and a shader that says 2 against a driver that says 4 does not refuse --
+/// it dispatches half the row groups and leaves the upper rows holding
+/// whatever the output buffer had. That reads as a plausible benchmark and
+/// a correct answer at every batch of four or fewer, which is every
+/// end-to-end check short of a real batch.
+///
+/// TWO AND NOT FOUR, measured on the switch sweep in
+/// `how_long_a_decodes_kernels_take` with the launcher's own grid, a
+/// 1024x1024 affine plane at gs 64 / 4 bits:
+///
+/// ```text
+///   m      PIE_MT = 4   PIE_MT = 2
+///   1       0.024 ms     0.017 ms
+///   2       0.026        0.018
+///   4       0.026        0.024
+///   8       0.040        0.037
+///   16      0.063        0.060
+///   32      0.110        0.111
+///   64      0.202        0.210
+///   512     1.497        1.637
+/// ```
+///
+/// It wins to 32 rows and loses past 64, and past 32 the tiled GEMM is the
+/// right kernel anyway -- `TokensMultipleOf(32)` admits it there and it is
+/// 0.7x the matvec at that width.
+///
+/// The one-row column is the surprise and the explanation: `mt == 1` runs
+/// `block_dot1` under either constant, and it still gained 29%. `mt` is
+/// clamped to `PIE_MT`, so at 2 the compiler can prove `reduce_store`'s
+/// four-row arm unreachable and delete `block_dot` outright -- and the
+/// entrypoint's register allocation stops being the fat arm's. The same
+/// effect, measured the other way, is why putting the nibble path INTO
+/// `block_dot` cost the one-row path 4 tok/s.
+///
+/// # Prefill does not feel this, and that was checked rather than assumed
+///
+/// The table above has 512 rows reading 1.637 ms against `PIE_MT = 4`'s
+/// 1.497 -- 9% worse -- so a prefill that reached the matvec would pay for
+/// this. None does: above the 16-32 crossover the launcher routes to
+/// `affine_qmm_t`, and an eight-row batched decode is the widest fire that
+/// takes this kernel at all. Measured end to end, pp2048 reads 705.8 tok/s
+/// against a 704 baseline and tg256-at-2048 reads 91.2 against 90.9, which
+/// is the crossover holding in situ and not merely in the bench.
+pub const PIE_MT: i32 = 2;
 
 fn qmv_grid(vecs: i32, out_vec_size: i32) -> Result<[u32; 3], Refusal> {
     if vecs <= 0 {
@@ -597,8 +434,8 @@ pub fn qmm_t(
     let n = y.width;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", QMM_T[qmm_point(*group, *bits, *bm, *bn)?]).apply(qmm_grid(n, *bn, m, *bm, 1)?),
-        &[w.arg(), scales.arg(), biases.arg(), x.arg(), y.arg(), k.arg(), n.arg()],
+        Fire::at("quant/qmm_t.wgsl", qmm_name("", *group, *bits, *bm, *bn)?).apply(qmm_grid(n, *bn, m, *bm, 1)?),
+        &[w.arg(), scales.arg(), biases.arg(), x.arg(), y.arg(), k.arg(), n.arg(), m.arg()],
     )
 }
 
@@ -629,7 +466,7 @@ pub fn qmm_t_bias(
     let n = y.width;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", QMM_T_BIAS[qmm_point(*group, *bits, *bm, *bn)?]).apply(qmm_grid(n, *bn, m, *bm, 1)?),
+        Fire::at("quant/qmm_t.wgsl", qmm_name("_bias", *group, *bits, *bm, *bn)?).apply(qmm_grid(n, *bn, m, *bm, 1)?),
         &[
             w.arg(),
             scales.arg(),
@@ -639,6 +476,7 @@ pub fn qmm_t_bias(
             bias.arg(),
             k.arg(),
             n.arg(),
+            m.arg(),
         ],
     )
 }
@@ -671,7 +509,7 @@ pub fn qmm_t_residual(
     let n = y.width;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", QMM_T_RESIDUAL[qmm_point(*group, *bits, *bm, *bn)?]).apply(qmm_grid(n, *bn, m, *bm, 1)?),
+        Fire::at("quant/qmm_t.wgsl", qmm_name("_residual", *group, *bits, *bm, *bn)?).apply(qmm_grid(n, *bn, m, *bm, 1)?),
         &[
             w.arg(),
             scales.arg(),
@@ -681,6 +519,7 @@ pub fn qmm_t_residual(
             k.arg(),
             n.arg(),
             residual.arg(),
+            m.arg(),
         ],
     )
 }
@@ -712,7 +551,7 @@ pub fn qmm_t_fp16_precast(
     let n = y.width;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", QMM_T_FP16_PRECAST[tile_point(*bm, *bn)?]).apply(qmm_grid(n, *bn, m, *bm, 1)?),
+        Fire::at("quant/qmm_t.wgsl", qmm_precast_name("", "", *bm, *bn)?).apply(qmm_grid(n, *bn, m, *bm, 1)?),
         &[
             w.arg(),
             scales.arg(),
@@ -721,6 +560,7 @@ pub fn qmm_t_fp16_precast(
             half_in.arg(),
             k.arg(),
             n.arg(),
+            m.arg(),
         ],
     )
 }
@@ -753,7 +593,7 @@ pub fn qmm_t_bias_fp16_precast(
     let n = y.width;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", QMM_T_BIAS_FP16_PRECAST[tile_point(*bm, *bn)?]).apply(qmm_grid(n, *bn, m, *bm, 1)?),
+        Fire::at("quant/qmm_t.wgsl", qmm_precast_name("_bias", "", *bm, *bn)?).apply(qmm_grid(n, *bn, m, *bm, 1)?),
         &[
             w.arg(),
             scales.arg(),
@@ -763,6 +603,7 @@ pub fn qmm_t_bias_fp16_precast(
             half_in.arg(),
             k.arg(),
             n.arg(),
+            m.arg(),
         ],
     )
 }
@@ -797,7 +638,7 @@ pub fn qmm_t_residual_fp16_precast(
     let n = y.width;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", QMM_T_RESIDUAL_FP16_PRECAST[tile_point(*bm, *bn)?]).apply(qmm_grid(n, *bn, m, *bm, 1)?),
+        Fire::at("quant/qmm_t.wgsl", qmm_precast_name("_residual", "", *bm, *bn)?).apply(qmm_grid(n, *bn, m, *bm, 1)?),
         &[
             w.arg(),
             scales.arg(),
@@ -807,6 +648,7 @@ pub fn qmm_t_residual_fp16_precast(
             half_in.arg(),
             k.arg(),
             n.arg(),
+            m.arg(),
         ],
     )
 }
@@ -859,7 +701,7 @@ pub fn qmm_t_splitk(
     let split_k = ctx.param(5)?;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", QMM_T_SPLITK[wide_point(*group, *bits, *bm)?]).apply(qmm_grid(n, WIDE_BN, m, *bm, split_k)?),
+        Fire::at("quant/qmm_t.wgsl", qmm_name("_splitk", *group, *bits, *bm, WIDE_BN)?).apply(qmm_grid(n, WIDE_BN, m, *bm, split_k)?),
         &[
             w.arg(),
             scales.arg(),
@@ -872,6 +714,7 @@ pub fn qmm_t_splitk(
             k_partition_size.arg(),
             split_k_partition_stride.arg(),
             split_k.arg(),
+            m.arg(),
         ],
     )
 }
@@ -924,7 +767,7 @@ pub fn qmm_t_splitk_f32(
     let split_k = ctx.param(5)?;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", QMM_T_SPLITK_F32[wide_point(*group, *bits, *bm)?]).apply(qmm_grid(n, WIDE_BN, m, *bm, split_k)?),
+        Fire::at("quant/qmm_t.wgsl", qmm_name("_splitk_f32", *group, *bits, *bm, WIDE_BN)?).apply(qmm_grid(n, WIDE_BN, m, *bm, split_k)?),
         &[
             w.arg(),
             scales.arg(),
@@ -937,6 +780,7 @@ pub fn qmm_t_splitk_f32(
             k_partition_size.arg(),
             split_k_partition_stride.arg(),
             split_k.arg(),
+            m.arg(),
         ],
     )
 }
@@ -994,7 +838,7 @@ pub fn qmm_t_splitk_fp16_precast(
     let split_k = ctx.param(5)?;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", QMM_T_SPLITK_FP16_PRECAST[row_tile_point(*bm)?]).apply(qmm_grid(n, WIDE_BN, m, *bm, split_k)?),
+        Fire::at("quant/qmm_t.wgsl", qmm_precast_name("_splitk", "", *bm, WIDE_BN)?).apply(qmm_grid(n, WIDE_BN, m, *bm, split_k)?),
         &[
             w.arg(),
             scales.arg(),
@@ -1007,6 +851,7 @@ pub fn qmm_t_splitk_fp16_precast(
             k_partition_size.arg(),
             split_k_partition_stride.arg(),
             split_k.arg(),
+            m.arg(),
         ],
     )
 }
@@ -1064,7 +909,7 @@ pub fn qmm_t_splitk_fp16_precast_f32(
     let split_k = ctx.param(5)?;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", QMM_T_SPLITK_FP16_PRECAST_F32[row_tile_point(*bm)?]).apply(qmm_grid(n, WIDE_BN, m, *bm, split_k)?),
+        Fire::at("quant/qmm_t.wgsl", qmm_precast_name("_splitk", "_f32", *bm, WIDE_BN)?).apply(qmm_grid(n, WIDE_BN, m, *bm, split_k)?),
         &[
             w.arg(),
             scales.arg(),
@@ -1077,6 +922,7 @@ pub fn qmm_t_splitk_fp16_precast_f32(
             k_partition_size.arg(),
             split_k_partition_stride.arg(),
             split_k.arg(),
+            m.arg(),
         ],
     )
 }
@@ -1110,7 +956,7 @@ pub fn qmm_t_strided(
     let row_stride = ctx.param(2)?;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", QMM_T_STRIDED[wide_point(*group, *bits, *bm)?]).apply(qmm_grid(n, WIDE_BN, m, *bm, 1)?),
+        Fire::at("quant/qmm_t.wgsl", qmm_name("_strided", *group, *bits, *bm, WIDE_BN)?).apply(qmm_grid(n, WIDE_BN, m, *bm, 1)?),
         &[
             w.arg(),
             scales.arg(),
@@ -1120,6 +966,7 @@ pub fn qmm_t_strided(
             k.arg(),
             n.arg(),
             row_stride.arg(),
+            m.arg(),
         ],
     )
 }
@@ -1154,7 +1001,7 @@ pub fn qmm_t_strided_residual(
     let row_stride = ctx.param(2)?;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", QMM_T_STRIDED_RESIDUAL[wide_point(*group, *bits, *bm)?]).apply(qmm_grid(n, WIDE_BN, m, *bm, 1)?),
+        Fire::at("quant/qmm_t.wgsl", qmm_name("_strided_residual", *group, *bits, *bm, WIDE_BN)?).apply(qmm_grid(n, WIDE_BN, m, *bm, 1)?),
         &[
             w.arg(),
             scales.arg(),
@@ -1165,6 +1012,7 @@ pub fn qmm_t_strided_residual(
             k.arg(),
             n.arg(),
             row_stride.arg(),
+            m.arg(),
         ],
     )
 }
@@ -1203,7 +1051,7 @@ pub fn qmm_t_strided_fp16_precast(
     let row_stride = ctx.param(2)?;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", QMM_T_STRIDED_FP16_PRECAST[row_tile_point(*bm)?]).apply(qmm_grid(n, WIDE_BN, m, *bm, 1)?),
+        Fire::at("quant/qmm_t.wgsl", qmm_precast_name("_strided", "", *bm, WIDE_BN)?).apply(qmm_grid(n, WIDE_BN, m, *bm, 1)?),
         &[
             w.arg(),
             scales.arg(),
@@ -1213,6 +1061,7 @@ pub fn qmm_t_strided_fp16_precast(
             k.arg(),
             n.arg(),
             row_stride.arg(),
+            m.arg(),
         ],
     )
 }
@@ -1253,7 +1102,7 @@ pub fn qmm_t_strided_fp16_precast_residual(
     let row_stride = ctx.param(2)?;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("quant/qmm_t.wgsl", QMM_T_STRIDED_FP16_PRECAST_RESIDUAL[row_tile_point(*bm)?]).apply(qmm_grid(n, WIDE_BN, m, *bm, 1)?),
+        Fire::at("quant/qmm_t.wgsl", qmm_precast_name("_strided", "_residual", *bm, WIDE_BN)?).apply(qmm_grid(n, WIDE_BN, m, *bm, 1)?),
         &[
             w.arg(),
             scales.arg(),
@@ -1264,6 +1113,7 @@ pub fn qmm_t_strided_fp16_precast_residual(
             k.arg(),
             n.arg(),
             row_stride.arg(),
+            m.arg(),
         ],
     )
 }
@@ -1466,7 +1316,7 @@ pub fn qmv_fast(
     let out_vec_size = y.width;
     let vecs = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("quant/qmv.wgsl", QMV_FAST[codec_point(*group, *bits)?]).apply(qmv_grid(quarters(vecs), out_vec_size)?),
+        Fire::at("quant/qmv.wgsl", qmv_name("fast", *group, *bits)?).apply(qmv_grid(mt_groups(vecs), out_vec_size)?),
         &[
             w.arg(),
             scales.arg(),
@@ -1502,7 +1352,7 @@ pub fn qmv_fast_residual(
     let out_vec_size = y.width;
     let vecs = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("quant/qmv.wgsl", QMV_FAST_RESIDUAL[codec_point(*group, *bits)?]).apply(qmv_grid(quarters(vecs), out_vec_size)?),
+        Fire::at("quant/qmv.wgsl", qmv_name("fast_residual", *group, *bits)?).apply(qmv_grid(mt_groups(vecs), out_vec_size)?),
         &[
             w.arg(),
             scales.arg(),
@@ -1538,7 +1388,7 @@ pub fn qmv_tail(
     let out_vec_size = y.width;
     let vecs = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("quant/qmv.wgsl", QMV_TAIL[bits_point(*bits)?]).apply(qmv_grid(quarters(vecs), out_vec_size)?),
+        Fire::at("quant/qmv.wgsl", qmv_name("tail", 64, *bits)?).apply(qmv_grid(mt_groups(vecs), out_vec_size)?),
         &[
             w.arg(),
             scales.arg(),
@@ -1571,7 +1421,7 @@ pub fn qmv_tail_bias(
     let out_vec_size = y.width;
     let vecs = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("quant/qmv.wgsl", QMV_TAIL_BIAS[bits_point(*bits)?]).apply(qmv_grid(quarters(vecs), out_vec_size)?),
+        Fire::at("quant/qmv.wgsl", qmv_name("tail_bias", 64, *bits)?).apply(qmv_grid(mt_groups(vecs), out_vec_size)?),
         &[
             w.arg(),
             scales.arg(),
@@ -1612,7 +1462,7 @@ pub fn qmv_wide_strided(
     let row_stride = ctx.param(2)?;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("quant/qmv.wgsl", QMV_WIDE_STRIDED[bits_point(*bits)?]).apply(qmv_grid(quarters(m), out_vec_size)?),
+        Fire::at("quant/qmv.wgsl", qmv_wide_strided_name(*bits)?).apply(qmv_grid(quarters(m), out_vec_size)?),
         &[
             w.arg(),
             scales.arg(),
@@ -1650,7 +1500,7 @@ pub fn qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4(
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
         Fire::at("quant/qmm_t.wgsl", "affine_qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4").apply(qmm_grid(n, 32, m, 128, 1)?),
-        &[w.arg(), scales.arg(), biases.arg(), x.arg(), y.arg(), k.arg(), n.arg()],
+        &[w.arg(), scales.arg(), biases.arg(), x.arg(), y.arg(), k.arg(), n.arg(), m.arg()],
     )
 }
 
@@ -1677,7 +1527,7 @@ pub fn qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2(
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
         Fire::at("quant/qmm_t.wgsl", "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2").apply(qmm_grid(n, 32, m, 32, 1)?),
-        &[w.arg(), scales.arg(), biases.arg(), x.arg(), y.arg(), k.arg(), n.arg()],
+        &[w.arg(), scales.arg(), biases.arg(), x.arg(), y.arg(), k.arg(), n.arg(), m.arg()],
     )
 }
 
@@ -1704,7 +1554,7 @@ pub fn qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2(
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
         Fire::at("quant/qmm_t.wgsl", "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2").apply(qmm_grid(n, 32, m, 64, 1)?),
-        &[w.arg(), scales.arg(), biases.arg(), x.arg(), y.arg(), k.arg(), n.arg()],
+        &[w.arg(), scales.arg(), biases.arg(), x.arg(), y.arg(), k.arg(), n.arg(), m.arg()],
     )
 }
 
@@ -1731,7 +1581,7 @@ pub fn qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1(
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
         Fire::at("quant/qmm_t.wgsl", "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1").apply(qmm_grid(n, 32, m, 64, 1)?),
-        &[w.arg(), scales.arg(), biases.arg(), x.arg(), y.arg(), k.arg(), n.arg()],
+        &[w.arg(), scales.arg(), biases.arg(), x.arg(), y.arg(), k.arg(), n.arg(), m.arg()],
     )
 }
 
@@ -1758,7 +1608,7 @@ pub fn qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4(
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
         Fire::at("quant/qmm_t.wgsl", "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4").apply(qmm_grid(n, 64, m, 64, 1)?),
-        &[w.arg(), scales.arg(), biases.arg(), x.arg(), y.arg(), k.arg(), n.arg()],
+        &[w.arg(), scales.arg(), biases.arg(), x.arg(), y.arg(), k.arg(), n.arg(), m.arg()],
     )
 }
 
@@ -1904,17 +1754,39 @@ mod tests {
 
     /// A codec or tile the tree does not carry is refused by NAME.
     ///
-    /// The bodies index literal spelling tables with these, so an unknown
-    /// point must not reach the index.
+    /// THE REASON CHANGED AND THE TEST DID NOT. It used to be that the bodies
+    /// indexed literal tables, so an off-axis number had to be caught before it
+    /// reached the index. There are no tables: a name is composed, and
+    /// `format!` will compose anything at all. So the check is doing MORE work
+    /// than it was, not less -- it is the only thing between an off-axis number
+    /// and a name the shader tree does not declare.
+    ///
+    /// What that name would cost is a `Missing::NoVariant` at the fire, on a
+    /// machine with a GPU, naming the composed string rather than the axis the
+    /// caller got wrong. `composed_names_are_declared` walks the whole product
+    /// against the census; this holds up the other side.
     #[test]
     fn a_point_the_tree_does_not_carry_is_refused_by_name() {
-        assert!(codec_point(48, 4).is_err());
-        assert!(codec_point(64, 3).is_err());
-        assert!(tile_point(24, 32).is_err());
-        assert!(bits_point(16).is_err());
-        // And the real points resolve inside their tables.
-        assert!(qmm_point(64, 4, 32, 32).expect("a real point") < QMM_T.len());
-        assert!(wide_point(128, 8, 64).expect("a real point") < QMM_T_SPLITK.len());
-        assert!(codec_point(128, 8).expect("a real point") < QMV_FAST.len());
+        assert!(qmm_name("", 48, 4, 32, 32).is_err(), "the group size");
+        assert!(qmm_name("", 64, 3, 32, 32).is_err(), "the bit width");
+        assert!(qmm_name("", 64, 4, 24, 32).is_err(), "the row tile");
+        assert!(qmm_name("", 64, 4, 32, 24).is_err(), "the column tile");
+        assert!(qmm_precast_name("", "", 24, 32).is_err(), "the row tile, precast");
+        assert!(qmv_name("fast", 48, 4).is_err(), "the group size, matvec");
+        assert!(qmv_wide_strided_name(16).is_err(), "the bit width, wide strided");
+
+        // And a real point composes the name the tables held.
+        assert_eq!(
+            qmm_name("_bias", 128, 8, 64, 16).expect("a real point"),
+            "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_64_bn_16"
+        );
+        assert_eq!(
+            qmm_precast_name("_splitk", "_f32", 32, 32).expect("a real point"),
+            "affine_qmm_t_splitk_fp16_precast_f32_bfloat16_gs_64_b_4_bm_32_bn_32"
+        );
+        assert_eq!(
+            qmv_name("fast", 128, 8).expect("a real point"),
+            "affine_qmv_fast_bfloat16_gs_128_b_8"
+        );
     }
 }

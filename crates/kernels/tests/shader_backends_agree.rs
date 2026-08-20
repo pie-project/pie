@@ -68,11 +68,16 @@ use kernels::KernelSig;
 /// that list and the three could not be compared at all: this gate was reading
 /// one table three times and finding it equal to itself.
 ///
-/// The slices carry per-plane names now and the union is honest. It is 101
-/// because vulkan has one family the others have not crossed — `rms_rope`, the
-/// fused norm+rope `norm.rs` has declared since before this migration — which
-/// is exactly the "a backend has GAINED a family" case the entrypoint census
-/// below states in `EXCLUSIVE`.
+/// The slices carry per-plane names now and the union is honest.
+///
+/// It was 101 with `rms_rope` -- the fused norm+rope -- crossed by vulkan
+/// alone. Metal has crossed it since, so NO kernel in this tree is now
+/// exclusive to one plane, and the union held at 101 while [`COMPARED`] rose
+/// by one. That is the "a backend has GAINED a family" case the entrypoint
+/// census below states in `EXCLUSIVE`, arriving from the direction this list
+/// wants: two of the 101 are crossed by exactly two planes -- `rms_rope`
+/// (vulkan, metal) and `silu_mul_strided` (wgpu, vulkan) -- and the other 99
+/// by all three.
 const CENSUS: usize = 101;
 
 /// How many of [`CENSUS`] are crossed by more than one backend, and so are
@@ -84,7 +89,12 @@ const CENSUS: usize = 101;
 /// stopped being a pair and the comparison it used to make disappeared
 /// without any test going red. Moving down WITH `CENSUS` is just a kernel
 /// leaving.
-const COMPARED: usize = 199;
+///
+/// It was 199, when `rms_rope` was vulkan's alone and contributed nothing.
+/// Metal crossed it, so the pair contributes one comparison and this rose --
+/// with `CENSUS` holding at 101, which is the shape a GAIN has and a drift
+/// does not.
+const COMPARED: usize = 200;
 
 /// A kernel a backend does not have AT ALL, and the sentence saying why.
 ///
@@ -637,6 +647,33 @@ fn retiring_a_row_does_not_shrink_a_backends_census() {
         ("vulkan", "sdpa_paged_decode_split_bfloat16_d_128"),
         ("vulkan", "sdpa_paged_decode_split_bfloat16_d_256"),
         ("vulkan", "sdpa_paged_decode_split_bfloat16_d_512"),
+        // AND WGPU HAS CROSSED THE SAME DECOMPOSITION, which is why the four
+        // `_split_` names appear twice: this list is keyed on (backend,
+        // name), and a name two backends have needs an entry for each or the
+        // one that is missing carries it into the shared census alone.
+        //
+        // `kernels-wgpu/src/attn.rs` fires them for real -- `PIE_SPLIT_BELOW`
+        // decides, at 128 workgroups, when one workgroup per (row, query
+        // head) is too few to fill a card, and `PIE_SPLITS` cuts the key
+        // range eight ways. That is the same argument vulkan's note makes
+        // above, arrived at independently on a backend whose smallest target
+        // is a twenty-core GPU.
+        //
+        // THE SECOND PASS HAS TWO NAMES. Vulkan calls it `_combine_` and wgpu
+        // calls it `_merge_`, and they are the same kernel: fold the
+        // unnormalised partial softmax states one slice each wrote. Nothing
+        // here can make them agree -- a rename crosses two shader trees and
+        // every table that spells them -- so what this file can do is write
+        // the divergence down where the next reader of either list will find
+        // it, rather than leave two spellings looking like two families.
+        ("wgpu", "sdpa_paged_decode_split_bfloat16_d_64"),
+        ("wgpu", "sdpa_paged_decode_split_bfloat16_d_128"),
+        ("wgpu", "sdpa_paged_decode_split_bfloat16_d_256"),
+        ("wgpu", "sdpa_paged_decode_split_bfloat16_d_512"),
+        ("wgpu", "sdpa_paged_decode_merge_bfloat16_d_64"),
+        ("wgpu", "sdpa_paged_decode_merge_bfloat16_d_128"),
+        ("wgpu", "sdpa_paged_decode_merge_bfloat16_d_256"),
+        ("wgpu", "sdpa_paged_decode_merge_bfloat16_d_512"),
         // THE FUSED NORM+MATVEC, which metal and vulkan both have and
         // wgpu has not crossed. Two backends gaining a family reads
         // oddly in a list called EXCLUSIVE, but the question the list
@@ -824,36 +861,28 @@ const DIVERGED: &[(&str, &str)] = &[
     // The day another backend splits its decode, its signature grows these
     // two and this entry is deleted -- which the test enforces, since an
     // entry whose backends have stopped disagreeing fails as stale.
-    // THREE transcode kernels, and this one is wgpu's own shape rather than a
-    // slot metal reserves.
+    // THE THREE TRANSCODE KERNELS WERE HERE, AND THEY ARE SETTLED.
     //
-    // The pair `{groups, group_size}` (`{blocks, block_size}` for mxfp4) is a
-    // params BUFFER on the other two backends: `driver-metal`'s arm mints it
-    // with `o.params_block()` and passes the handle positionally.
-    // `transcode.wgsl` has nowhere to put it — `@group(0)` holds only the
-    // three or four data buffers, densely numbered, and the pair is the two
-    // `u32` fields of the `@group(1) @binding(0)` uniform, which `bind` fills
-    // from the scalars a body forwards. So the divergence is not a slot one
-    // backend reserves; it is the same two numbers travelling as scalars
-    // instead of as a buffer.
+    // `encode_u4_bf16`, `encode_u4_f32` and `mxfp4_dequant_bf16` diverged on
+    // where one pair of numbers travelled: `{groups, group_size}`
+    // (`{blocks, block_size}` for mxfp4) was a params BUFFER on metal and
+    // vulkan, minted with `o.params_block()` and passed positionally, while
+    // `transcode.wgsl` had nowhere to put one -- its `@group(0)` bindings are
+    // dense data buffers and the pair is two `u32` fields of a `@group(1)`
+    // uniform filled from the scalars a body forwards. Same two numbers, two
+    // carriers.
     //
-    // These bodies previously took a `_params: Buf` they could not use and
-    // forwarded NO scalars at all, so the uniform arrived empty and the shader
-    // read zero groups — a loop that runs no iterations and reports success.
-    // Nothing caught it because all three rows were UNSTATED and no model
-    // fires them: `encode_u4` appears in no lowering in this tree.
-    (
-        "encode_u4_bf16",
-        "metal and vulkan hand the scalar pair over as a synthesized params BUFFER in the argument list; `transcode.wgsl` declares no such slot — its `@group(0)` bindings are dense and the pair is the two fields of the `@group(1)` uniform, which is built from the scalars a body forwards — so wgpu passes the two scalars and no buffer",
-    ),
-    (
-        "encode_u4_f32",
-        "metal and vulkan hand the scalar pair over as a synthesized params BUFFER in the argument list; `transcode.wgsl` declares no such slot — its `@group(0)` bindings are dense and the pair is the two fields of the `@group(1)` uniform, which is built from the scalars a body forwards — so wgpu passes the two scalars and no buffer",
-    ),
-    (
-        "mxfp4_dequant_bf16",
-        "metal and vulkan hand the scalar pair over as a synthesized params BUFFER in the argument list; `transcode.wgsl` declares no such slot — its `@group(0)` bindings are dense and the pair is the two fields of the `@group(1)` uniform, which is built from the scalars a body forwards — so wgpu passes the two scalars and no buffer",
-    ),
+    // All three backends now declare `[.., I32]` and no params buffer, so the
+    // entries went STALE and this gate said so rather than letting them sit.
+    // That is the whole design of this list: an excuse is deleted by the edit
+    // that settles it, and the deletion is the record.
+    //
+    // Worth keeping the history because of what the divergence was hiding.
+    // These bodies once took a `_params: Buf` they could not use and forwarded
+    // NO scalars at all, so the uniform arrived empty and the shader read zero
+    // groups -- a loop that runs no iterations and reports success. Nothing
+    // caught it because all three rows were UNSTATED and no model fires them:
+    // `encode_u4` appears in no lowering in this tree.
     // SEVENTEEN quant kernels, all the same shape, all metal's `pad: Buf`.
     //
     // `0fc54bedb` ("Seventeen quant kernels were reading whatever the last

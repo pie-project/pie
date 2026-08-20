@@ -67,6 +67,89 @@ const PAGED_DECODE: [&str; 4] = [
     "sdpa_paged_decode_bfloat16_d_512",
 ];
 
+/// The split decode's two halves, by head width.
+///
+/// One kernel per (row, query head, SLICE of the key range) writing a partial
+/// softmax state, and one merging the slices. See [`PIE_SPLITS`] for when the
+/// pair is preferred to the single kernel above and why.
+const PAGED_DECODE_SPLIT: [&str; 4] = [
+    "sdpa_paged_decode_split_bfloat16_d_64",
+    "sdpa_paged_decode_split_bfloat16_d_128",
+    "sdpa_paged_decode_split_bfloat16_d_256",
+    "sdpa_paged_decode_split_bfloat16_d_512",
+];
+
+const PAGED_DECODE_MERGE: [&str; 4] = [
+    "sdpa_paged_decode_merge_bfloat16_d_64",
+    "sdpa_paged_decode_merge_bfloat16_d_128",
+    "sdpa_paged_decode_merge_bfloat16_d_256",
+    "sdpa_paged_decode_merge_bfloat16_d_512",
+];
+
+/// How many ways a split decode cuts the key range.
+///
+/// The unsplit kernel dispatches one workgroup per (row, query head) and
+/// nothing else, so a single-sequence decode of Llama-3.2-1B is THIRTY-TWO
+/// workgroups on a twenty-core GPU -- and each of them walks the whole key
+/// history serially. There is nothing to run while a key load is in flight.
+///
+/// Four, and not more, because the split is not free: it costs a second
+/// dispatch a layer, a round trip through scratch, and a slice that may be
+/// empty on a short row. Four takes the 32 workgroups to 128, which clears
+/// the residency the same shader's `PIE_KR` note measures at two or three
+/// workgroups a core.
+///
+/// # What it is worth, measured
+///
+/// M4 Pro, Llama-3.2-1B 4-bit, one sequence, end to end through the engine.
+/// The 2048 column is four runs averaged, because that bench's run-to-run
+/// spread is wide enough to invert a decision on one sample.
+///
+/// | slices | tg128 @ 512 | tg256 @ 2048 |
+/// |---|---|---|
+/// | 1 (unsplit) | 113.1 | 80.2 |
+/// | 1 (split arm) | 110.5 | -- |
+/// | 4 | 111.7 | 85.4 |
+/// | **8** | **117.1** | **90.6** |
+/// | 16 | 113.0 | 88.5 |
+///
+/// THE PEAK IS INTERIOR, in both columns and at the same place, which is the
+/// shape every occupancy knob in this backend has had: `PIE_KR`'s sweep in
+/// `sdpa_paged.wgsl` says the same thing about the same kernel from the other
+/// side. Too few slices and the cores sit idle; too many and each one is a
+/// whole workgroup's setup and a whole workgroup's threadgroup memory for a
+/// handful of keys, and 32 x 16 = 512 workgroups of 10 KiB is well past what
+/// a core can hold resident.
+///
+/// Four was taken first and reads WORSE at 512 than not splitting at all,
+/// which is worth keeping in the table: it is the sample that would have
+/// closed this off as "helps long contexts, costs short ones" one step before
+/// the answer.
+///
+/// # And the number that is NOT this constant's
+///
+/// Setting it to ONE -- one slice, the identical key work, still two
+/// dispatches -- reads 110.5. That is what the second dispatch costs by
+/// itself, 2.6 tok/s over sixteen layers, or about 13 us a dispatch, which is
+/// the launch floor `what_a_submission_costs_when_it_computes_nothing`
+/// measures and not a byte of extra traffic.
+///
+/// It read 93.6 before `serve::fire` cached the module of a body-fired point.
+/// A routine that names an entrypoint the LOWERING does not carry misses the
+/// pass-one cache, and re-expanding two WGSL sources per fire cost twenty
+/// tok/s. Worth stating because the profile lied about where it was: it
+/// looked exactly like an expensive kernel.
+pub const PIE_SPLITS: i32 = 8;
+
+/// How many workgroups a fire has to be missing before the split is worth it.
+///
+/// The split exists to fill a machine the fire is too NARROW to fill, so a
+/// fire that is already wide -- a batched decode of many rows, where rows
+/// times query heads is workgroups enough -- takes the single kernel and
+/// pays neither the second dispatch nor the scratch. 128 is four times the
+/// single-sequence case this was measured on.
+pub const PIE_SPLIT_BELOW: i32 = 128;
+
 /// `sdpa_paged_tiled`, by head width. All four are real and all four are
 /// reachable.
 const PAGED_TILED: [&str; 4] = [
@@ -203,6 +286,46 @@ fn paged_decode_grid(head_dim: i32, q_heads: i32, rows: i32) -> Result<[u32; 3],
         at: i64::from(g[1]) * i64::from(keys),
     })?;
     Ok([g[0], y, g[2]])
+}
+
+/// [`paged_decode_grid`] with the SLICE on z.
+///
+/// The z axis is workgroups directly: the module's `@workgroup_size` has no z
+/// extent, so what is stated here is what is dispatched, and the body reads
+/// the count back off `num_workgroups.z` rather than the scalar.
+///
+/// # Errors
+///
+/// Whatever [`paged_decode_grid`] refuses, and [`Refusal::Grid`] on a
+/// non-positive split count.
+fn paged_split_grid(
+    head_dim: i32,
+    q_heads: i32,
+    rows: i32,
+    splits: i32,
+) -> Result<[u32; 3], Refusal> {
+    let g = paged_decode_grid(head_dim, q_heads, rows)?;
+    if splits <= 0 {
+        return Err(Refusal::Grid {
+            what: "the decode splits",
+            at: i64::from(splits),
+        });
+    }
+    Ok([g[0], g[1], splits.unsigned_abs()])
+}
+
+/// The merge's shape: one workgroup per (row, query head), `PIE_PAIRS` wide.
+///
+/// The x extent is [`vector_grid`]'s -- the same pairs-per-head the split arm
+/// reduces over, because a lane owns the same channel pair in both -- and the
+/// y extent is the ROW count with no key block on it, the merge having no
+/// second workgroup axis to spend.
+///
+/// # Errors
+///
+/// Whatever [`vector_grid`] refuses.
+fn paged_merge_grid(head_dim: i32, q_heads: i32, rows: i32) -> Result<[u32; 3], Refusal> {
+    vector_grid(head_dim, q_heads, rows)
 }
 
 /// The tiled shape: one 32 x 32 workgroup per (query head, block of 32 rows).
@@ -582,13 +705,67 @@ pub fn sdpa_paged_decode(
     let attention_mask_stride = ctx.ask::<u32, keys::AttentionMaskStride>()?;
     let attention_mask_enabled = ctx.ask::<Tensor<u8>, keys::AttentionMaskEnabled>()?;
     let rows = ctx.ask::<i32, keys::Rows>()?;
+    let point = head_point(*head_dim, &PAGED_DIMS)?;
+
+    // NARROW ENOUGH TO SPLIT? The unsplit kernel is one workgroup per (row,
+    // query head) and nothing more, so this product IS the occupancy, and the
+    // question the split answers is whether it fills the machine.
+    //
+    // The scratch is asked for rather than required: a deployment whose
+    // driver answers nothing here runs the single kernel, which is a complete
+    // implementation, so the split is an optimization the fire may decline
+    // and never a correctness dependency.
+    let workgroups = rows.saturating_mul(*q_heads);
+    let scratch = if workgroups < PIE_SPLIT_BELOW {
+        ctx.ask::<Tensor<f32>, keys::AttnScratch>().ok()
+    } else {
+        None
+    };
+
+    let Some(scratch) = scratch else {
+        return ctx.fire(
+            Fire::at("attn/sdpa_paged.wgsl", PAGED_DECODE[point]).apply(paged_decode_grid(*head_dim, *q_heads, rows)?),
+            &[
+                queries.arg(),
+                k_pages.arg_mut(),
+                v_pages.arg_mut(),
+                out.arg(),
+                gqa_factor.arg(),
+                position_ids.arg(),
+                req_of_token.arg(),
+                kv_page_indices.arg(),
+                kv_page_indptr.arg(),
+                page_size.arg(),
+                n_kv_heads.arg(),
+                scale.arg(),
+                attention_mask.arg(),
+                attention_mask_stride.arg(),
+                attention_mask_enabled.arg(),
+                window.arg(),
+                sinks,
+            ],
+        );
+    };
+
+    // TWO FIRES, NO BARRIER BETWEEN THEM. Every wgpu dispatch this driver
+    // encodes is serial on Metal -- `wgpu-hal`'s `computeCommandEncoder()` is
+    // `MTLDispatchTypeSerial`, so a dispatch drains the one before it -- and
+    // the driver puts a routine's fires in one command buffer and one compute
+    // pass. The merge therefore reads what the split wrote.
+    let splits = PIE_SPLITS;
+    // A BUFFER THE ARM DOES NOT READ IS PASSED ABSENT, and this is not
+    // optional tidiness: `Device::check_bindable` holds the bound entries
+    // against the module's READ slots, and `naga` drops a binding no
+    // reachable expression touches. The split arm writes its partial states
+    // to the scratch and never to `out`, so `out` is a hole here -- the same
+    // shape `sinks` has had all along, one argument position and no entry.
     ctx.fire(
-        Fire::at("attn/sdpa_paged.wgsl", PAGED_DECODE[head_point(*head_dim, &PAGED_DIMS)?]).apply(paged_decode_grid(*head_dim, *q_heads, rows)?),
+        Fire::at("attn/sdpa_paged.wgsl", PAGED_DECODE_SPLIT[point]).apply(paged_split_grid(*head_dim, *q_heads, rows, splits)?),
         &[
             queries.arg(),
             k_pages.arg_mut(),
             v_pages.arg_mut(),
-            out.arg(),
+            ctx.absent()?,
             gqa_factor.arg(),
             position_ids.arg(),
             req_of_token.arg(),
@@ -602,6 +779,37 @@ pub fn sdpa_paged_decode(
             attention_mask_enabled.arg(),
             window.arg(),
             sinks,
+            scratch.arg_mut(),
+            splits.arg(),
+        ],
+    )?;
+    // AND THE MERGE READS ALMOST NOTHING. Two buffers: the scratch the slices
+    // left and the output it normalizes into. Every query, key, value, index
+    // and mask belongs to the pass that already finished -- a merge that
+    // bound them would be binding the whole KV cache to a kernel that walks
+    // `splits` floats a lane.
+    ctx.fire(
+        Fire::at("attn/sdpa_paged.wgsl", PAGED_DECODE_MERGE[point]).apply(paged_merge_grid(*head_dim, *q_heads, rows)?),
+        &[
+            ctx.absent()?,
+            ctx.absent()?,
+            ctx.absent()?,
+            out.arg(),
+            gqa_factor.arg(),
+            ctx.absent()?,
+            ctx.absent()?,
+            ctx.absent()?,
+            ctx.absent()?,
+            page_size.arg(),
+            n_kv_heads.arg(),
+            scale.arg(),
+            ctx.absent()?,
+            attention_mask_stride.arg(),
+            ctx.absent()?,
+            window.arg(),
+            ctx.absent()?,
+            scratch.arg_mut(),
+            splits.arg(),
         ],
     )
 }

@@ -1,31 +1,45 @@
 //! The table's product, against itself and against the shader paths.
 //!
-//! This is invariant (1) of `.wiki/kernel-metal-refactor.md` §6:
+//! This is the check `.wiki/kernel-x/metal-refactor.md` §9 lists first, as
+//! "unchanged in form", and states as:
 //!
 //! > every entrypoint in `kernels/` resolves to exactly one (row, axis point),
 //! > and every (row, axis point) to exactly one entrypoint
 //!
-//! It is no longer checked here. The shader half of the comparison needed a C
-//! preprocessor — the axis product lives in `instantiate_*` macros and nothing
-//! else writes it down — so it arrived as a committed
-//! `entrypoints.generated.txt` that `scripts/metal-kernel-audit.py` wrote and
-//! this file diffed against the table. That artifact is deleted, and with it
-//! the only hermetic view a `cargo test` had of what the shaders instantiate.
+//! THE CITATION USED TO READ `.wiki/kernel-metal-refactor.md` §6, invariant
+//! (1). There is no such file -- the surviving document is under `kernel-x/`
+//! -- and neither the numbered form nor that wording is anywhere in `.wiki/`
+//! today. Whatever numbered them is gone, and the sentence above survives
+//! only here and in the two siblings that quote it. It is left standing
+//! because it is still exactly what this file asserts; what is corrected is
+//! the pointer, which named nothing and would have sent the next reader
+//! looking for a document to reconcile against.
 //!
-//! The Vulkan and WGSL siblings kept their halves of the same invariant, and
-//! the difference is the shading language rather than the effort: there a
-//! variant is DECLARED on a `// pie:instantiate` line, so the set is a parse.
-//! Here it is a macro expansion. `scripts/metal-kernel-audit.py --table` was
-//! the way to compare the two sets, and it is retired — it read the table's
-//! half by running `examples/entrypoints.rs`, which is deleted with the rest
-//! of `examples/`. Nothing compares them now, in a test or out of one.
+//! It is not checked HERE, but it is checked again. The shader half of the
+//! comparison needs a C preprocessor — the axis product lives in
+//! `instantiate_*` macros and nothing else writes it down — so it used to
+//! arrive as a committed `entrypoints.generated.txt` that
+//! `scripts/metal-kernel-audit.py` wrote and this file diffed against the
+//! table. That artifact was deleted, and for a while nothing compared the two
+//! sets, in a test or out of one.
 //!
-//! What still holds below is everything that reads the table, the routine name
+//! `tests/dispatch_matches_the_shader.rs` carries a minimal preprocessor now,
+//! written for a different question, and the set comparison came back with it
+//! in full: 481 names on each side and the same 481, matched EXACTLY and not
+//! by prefix, with no exception on either. So both halves are hermetic in
+//! `cargo test` again — the expensive one, a row whose axes over-generate and
+//! surface as a nil pipeline partway through somebody's generate, and the
+//! cheap one, a compiled kernel no row can dispatch.
+//!
+//! The Vulkan and WGSL siblings never lost their halves, and the difference is
+//! the shading language rather than the effort: there a variant is DECLARED on
+//! a `// pie:instantiate` line, so the set is a parse. Here it is a macro
+//! expansion, which is why the thing that reads it is three hundred lines in
+//! another file.
+//!
+//! What holds below is everything that reads the table, the routine name
 //! tables, and the shader tree's file names: a typo in a hand-written routine
-//! spelling is still red here rather than a nil pipeline on a device. What is
-//! NOT held is the set itself — a shader instantiating a name no row declares,
-//! or a row whose axes over-generate one no shader stamps, is green
-//! everywhere.
+//! spelling is red here rather than a nil pipeline on a device.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -33,21 +47,19 @@ use std::path::PathBuf;
 /// Every entrypoint the TABLE declares — its axis product, expanded.
 ///
 /// This was the shader tree's set, read from `entrypoints.generated.txt`. The
-/// two were held equal, so the readers below that ask "is this name real?" are
-/// unchanged in what they accept; what is gone is the test that made them
-/// equal, and no assertion here should be read as checking the shaders again.
+/// two are held equal again, by
+/// `dispatch_matches_the_shader::every_entrypoint_the_table_declares_is_one_the_shader_tree_writes`
+/// — so the readers below that ask "is this name real?" mean the shaders too,
+/// but they mean it by way of that file and not by anything asserted here.
 fn from_the_table() -> BTreeSet<String> {
     kernels_metal::entrypoints().into_iter().collect()
 }
 
-// The shader-vs-table comparison lived here: every entrypoint the census
-// listed had to be one a row declares, and every one a row declares had to be
-// in the census.
-//
-// It is deleted with the census it read. `scripts/metal-kernel-audit.py
-// --table` performs the same comparison, which is where it has to live now —
-// the shader set is an `instantiate_*` expansion and a preprocessor is the
-// only thing that produces it.
+// The shader-vs-table comparison lived here, reading a committed census, and
+// went when the census did. It lives in `dispatch_matches_the_shader.rs` now,
+// reading the shader tree directly: the shader set is an `instantiate_*`
+// expansion and a preprocessor is the only thing that produces it, so the
+// comparison follows the preprocessor rather than the other way round.
 //
 // A `//` tombstone and not a `///` one: it documents nothing, and as a doc
 // comment it attached itself to the item below and read as that item's
@@ -64,19 +76,20 @@ fn from_the_table() -> BTreeSet<String> {
 /// question: a name stated twice is a shader counted twice, and the 481
 /// below would then be describing 480 shaders.
 #[test]
-fn no_two_families_claim_the_same_entrypoint() {
-    let mut seen: std::collections::BTreeSet<&str> = Default::default();
-    let mut total = 0usize;
-    for family in kernels_metal::RETIRED {
-        for (file, name) in *family {
-            total += 1;
-            assert!(
-                seen.insert(name),
-                "`{name}` is claimed by two families; this one says {file}"
-            );
+fn no_two_files_stamp_the_same_entrypoint() {
+    // OVER THE EXPANSION, not over ten hand-written tables. The tables are
+    // gone; `build.rs` reads the `instantiate_*` macros, so what this holds up
+    // is a property of the SHADER TREE rather than of a list somebody kept.
+    //
+    // Two files stamping one name is a pipeline whose source depends on which
+    // file the driver happened to open, which is a silent wrong kernel.
+    let mut seen: std::collections::BTreeMap<&str, &str> = Default::default();
+    for (file, name) in kernels_metal::STAMPED {
+        if let Some(first) = seen.insert(name, file) {
+            panic!("`{name}` is stamped by both `{first}` and `{file}`");
         }
     }
-    assert_eq!(total, seen.len());
+    assert_eq!(seen.len(), kernels_metal::STAMPED.len());
 }
 
 /// The row count is load-bearing prose in three documents, so it is pinned
@@ -265,16 +278,22 @@ fn every_shader_path_the_routines_spell_is_a_file_on_disk() {
         missing.is_empty(),
         "these shader paths name no file under kernels/: {missing:#?}"
     );
-    // Was 40, against a hundred rows each stating one `file`. The rows are
-    // retired and `ENTRYPOINTS` states a path per INSTANTIATED name, so the
-    // same scan now reaches all 481 and this floor moved with it. That is
-    // not inflation: every one of those paths is dereferenced by
-    // `device_kernels.rs`, and a wrong one there is a pipeline that is
+    // 40, THEN 481, NOW 36, AND THE TRIP DOWN IS THE POINT. It was 40 against
+    // a hundred rows each stating one `file`; it went to 481 when `ENTRYPOINTS`
+    // began stating a path per INSTANTIATED name; and it is 36 now that
+    // `ENTRYPOINTS` is gone -- the shaders say what they stamp, so a Rust table
+    // repeating it was 481 chances to disagree. What is left is one literal per
+    // shader FILE, which is the only part a routine actually spells.
+    //
+    // A floor of 400 survived that deletion by three commits, green the whole
+    // time it was measuring nothing, and it is an equality now for exactly that
+    // reason. A path that names no file is still what this test is for --
+    // `device_kernels.rs` dereferences every one, and a wrong one is a pipeline
     // silently absent on a device.
-    assert!(
-        checked > 400,
-        "only {checked} shader paths were found, which means the scan stopped \
-         seeing them rather than that the crate stopped naming them"
+    assert_eq!(
+        checked, 36,
+        "the `.metal` literals this crate spells; a change here is a shader \
+         file added or removed, and the list above is what checks them"
     );
 }
 
@@ -318,60 +337,26 @@ fn every_entrypoint_an_attention_routine_can_name_is_one_the_table_declares() {
 /// SHAPES, so a module chosen for the wrong pair unpacks fluent nonsense
 /// instead of failing.
 #[test]
-fn every_entrypoint_a_quantised_projection_can_name_is_one_the_table_declares() {
-    use kernels_metal::quant::*;
+fn every_entrypoint_a_quantised_projection_can_name_is_one_the_tree_stamps() {
+    // THE TABLES IT WALKED ARE GONE, AND SO IS THE INDIRECTION. It chained
+    // nineteen `[&str; N]`s -- the axis product, written out -- and compared
+    // them to the census. `quant::composable` runs the same axes through the
+    // composers a fire calls, so what is compared is what a fire can reach.
+    //
+    // `PIE_GROUP` and `PIE_BITS` are a COORDINATE and not a label: g64/b8 and
+    // g128/b4 pack to identical SHAPES, so a module chosen for the wrong pair
+    // unpacks fluent nonsense instead of failing. That is what makes this
+    // sweep worth its breadth.
     let have = from_the_table();
-    let named: Vec<&str> = QMM_T
-        .iter()
-        .chain(QMM_T_BIAS.iter())
-        .chain(QMM_T_RESIDUAL.iter())
-        .chain(QMM_T_FP16_PRECAST.iter())
-        .chain(QMM_T_BIAS_FP16_PRECAST.iter())
-        .chain(QMM_T_RESIDUAL_FP16_PRECAST.iter())
-        .chain(QMM_T_SPLITK.iter())
-        .chain(QMM_T_SPLITK_F32.iter())
-        .chain(QMM_T_SPLITK_FP16_PRECAST.iter())
-        .chain(QMM_T_SPLITK_FP16_PRECAST_F32.iter())
-        .chain(QMM_T_STRIDED.iter())
-        .chain(QMM_T_STRIDED_RESIDUAL.iter())
-        .chain(QMM_T_STRIDED_FP16_PRECAST.iter())
-        .chain(QMM_T_STRIDED_FP16_PRECAST_RESIDUAL.iter())
-        .chain(QMV_FAST.iter())
-        .chain(QMV_FAST_RESIDUAL.iter())
-        .chain(QMV_TAIL.iter())
-        .chain(QMV_TAIL_BIAS.iter())
-        .chain(QMV_WIDE_STRIDED.iter())
-        .copied()
-        // The twelve a routine spells as a literal rather than indexing: the
-        // five hand-written `wm`/`wn` tiles, the two split-K reductions, the
-        // two casts and the three codecs. They are here so the sweep covers
-        // every name this family can hand a pipeline, not only the tabulated
-        // ones.
-        .chain([
-            "affine_qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4",
-            "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2",
-            "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2",
-            "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1",
-            "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4",
-            "qmm_splitk_reduce_bfloat16",
-            "qmm_splitk_reduce_f32_bfloat16",
-            "cast_qmm_input_bfloat16_to_float16",
-            "cast_qmm_input_strided_bfloat16_to_float16",
-            "affine_encode_u4_bf16",
-            "affine_encode_u4_f32",
-            "mxfp4_dequant_bf16",
-        ])
+    let missing: Vec<&str> = kernels_metal::quant::composable()
+        .into_iter()
+        .filter(|name| !have.contains(*name))
         .collect();
-    let absent: Vec<&&str> = named.iter().filter(|n| !have.contains(**n)).collect();
     assert!(
-        absent.is_empty(),
-        "these quantised entrypoints are named by a routine and instantiated \
-         by no shader: {absent:#?}"
-    );
-    assert_eq!(
-        named.len(),
-        303,
-        "every table above, and the twelve literals"
+        missing.is_empty(),
+        "{} composable projection name(s) are not in the census:\n  {}",
+        missing.len(),
+        missing.join("\n  ")
     );
 }
 
@@ -449,8 +434,16 @@ fn entrypoint_tables() -> BTreeMap<String, Vec<String>> {
             push(&mut out, &mut open, init);
         }
     }
-    assert!(
-        out.len() > 20,
+    // NINETEEN, AND IT WAS A FLOOR OF TWENTY. The 19 lattice tables that used
+    // to spell one entrypoint per axis product are retired -- a name is its
+    // axis values, so `qmm_name` builds it -- and what is scraped here now is
+    // the axes THEMSELVES, one array per axis rather than one per product. The
+    // floor outlived its subject by a hair: twenty tables became nineteen and
+    // the assertion that was meant to catch a scraper going blind caught the
+    // deletion instead.
+    assert_eq!(
+        out.len(),
+        19,
         "expected this crate's entrypoint axes, found {:?}",
         out.keys().collect::<Vec<_>>(),
     );
@@ -460,18 +453,49 @@ fn entrypoint_tables() -> BTreeMap<String, Vec<String>> {
 /// The entrypoints the second argument of one `Fire::at(file, entrypoint)`
 /// call can name, or `None` if no static reading can tell.
 ///
-/// Two shapes, and the plane forbids a third: a literal names itself, and
-/// `TABLE[point(..)]` names every string in `TABLE`, because the index picks a
+/// Three shapes, and the plane forbids a fourth: a literal names itself,
+/// `TABLE[point(..)]` names every string in `TABLE` because the index picks a
 /// head dimension or a quantisation point and every point on the axis is a
-/// real entrypoint. A name ASSEMBLED from a template — `format!` on a dtype
-/// suffix — is the defect this whole plane exists to prevent, so it is a panic
-/// below rather than a skip.
+/// real entrypoint, and a COMPOSER call names every point of its lattice.
+///
+/// # Why a composer is read by the crate and not by this scanner
+///
+/// The nineteen lattice tables are gone: a name is its axis values, so
+/// `qmm_name("", *group, *bits, *bm, *bn)?` builds it. That is not the defect
+/// this plane exists to prevent -- it is a `&'static str` from
+/// `kernels::jit::symbol`, chosen from an axis each of whose points is
+/// checked, not a `format!` a caller can spell anything into.
+///
+/// It is also not something to teach a text scanner, and `quant.rs`'s own
+/// header says why: expanding the call here "would put the lattice into the
+/// scanner -- a second place the axes are written, which is the thing the
+/// tables were deleted for". So the crate answers, in `composable()`, by
+/// running the composers over the axes; `composed_names_are_stamped` holds
+/// that product against `STAMPED`; and what is left for this file is to
+/// notice the shape and count it, so a composer arriving where nothing checks
+/// it is still a failure here.
 fn fired_names(value: &str, tables: &BTreeMap<String, Vec<String>>) -> Option<Vec<String>> {
     if let Some(rest) = value.strip_prefix('"') {
         return Some(vec![rest.split('"').next()?.to_owned()]);
     }
+    if composer(value) {
+        return Some(Vec::new());
+    }
     let (name, _) = value.split_once('[')?;
     tables.get(name.trim()).cloned()
+}
+
+/// Whether this argument is a call to one of `quant.rs`'s name composers.
+///
+/// By NAME, and the four are written out rather than matched on a `_name`
+/// suffix, because the excuse is not "it looks like a composer" -- it is
+/// "`composable()` walks this one's whole lattice". A fifth composer that
+/// `composable()` does not walk has to be added in both places or it fails
+/// here, which is the coupling worth having.
+fn composer(value: &str) -> bool {
+    ["qmm_name(", "qmm_precast_name(", "qmv_name(", "qmv_wide_strided_name("]
+        .iter()
+        .any(|c| value.starts_with(c))
 }
 
 /// Every `Fire::at(file, entrypoint)` call read out of source, with the line
@@ -597,40 +621,38 @@ const UNFIRED: &[&str] = &[
 /// census line, a routine firing a name nothing compiles, and an axis entry
 /// deleted from under a fire.
 #[test]
-fn every_entrypoint_a_body_fires_is_one_the_census_carries() {
-    // One line per retired family, mirroring `lib.rs`'s `RETIRED`. The sum is
-    // asserted against `entrypoints()` below, so a family added there and not
-    // here is red rather than unswept.
-    let families: &[(&str, &[(&str, &str)])] = &[
-        ("attn.rs", kernels_metal::attn::ENTRYPOINTS),
-        ("layout.rs", kernels_metal::layout::ENTRYPOINTS),
-        ("mlp.rs", kernels_metal::mlp::ENTRYPOINTS),
-        ("moe.rs", kernels_metal::moe::ENTRYPOINTS),
-        ("norm.rs", kernels_metal::norm::ENTRYPOINTS),
-        ("ptir.rs", kernels_metal::ptir::ENTRYPOINTS),
-        ("quant.rs", kernels_metal::quant::ENTRYPOINTS),
-        ("rope.rs", kernels_metal::rope::ENTRYPOINTS),
-        ("sample.rs", kernels_metal::sample::ENTRYPOINTS),
-        ("ssm.rs", kernels_metal::ssm::ENTRYPOINTS),
-    ];
-    let stated: usize = families.iter().map(|(_, e)| e.len()).sum();
-    assert_eq!(
-        stated,
-        kernels_metal::entrypoints().len(),
-        "the families swept here do not add up to what `entrypoints()` \
-         returns, so a family is retired and unread",
-    );
-
+fn every_entrypoint_a_body_fires_is_one_the_tree_stamps() {
+    // THE TEN HAND-WRITTEN CENSUSES ARE GONE, and with them the drift this
+    // test was written to catch. It compared each family's `ENTRYPOINTS` list
+    // against the `Fire::at` calls in the same file, because "a row could not
+    // drift this way -- its `axes` GENERATED its entrypoints. Ten hand-written
+    // lists totalling 481 lines can."
+    //
+    // `build.rs` expands the shader tree's `instantiate_*` macros, so the
+    // census generates again -- from the `.metal` files rather than from a
+    // row -- and the drift it named is not reachable. What is still worth
+    // holding is the OTHER half: a body firing a name no shader stamps, which
+    // `newFunctionWithName:` answers nil for on a device rather than failing
+    // here.
+    //
+    // Per module still, so a failure names the file to open.
+    let stamped: BTreeSet<&str> = kernels_metal::STAMPED.iter().map(|(_, n)| *n).collect();
     let tables = entrypoint_tables();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    let unfired: BTreeSet<&str> = UNFIRED.iter().copied().collect();
     let mut swept = 0usize;
-    for (module, census) in families {
+    let mut composed = 0usize;
+    for module in [
+        "attn.rs", "layout.rs", "mlp.rs", "moe.rs", "norm.rs", "ptir.rs", "quant.rs",
+        "rope.rs", "sample.rs", "ssm.rs",
+    ] {
         let path = root.join(module);
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
         let mut fired: BTreeSet<String> = BTreeSet::new();
         for (line, value) in fire_entrypoints(&text) {
+            if composer(&value) {
+                composed += 1;
+            }
             match fired_names(&value, &tables) {
                 Some(names) => fired.extend(names),
                 None => panic!(
@@ -640,42 +662,112 @@ fn every_entrypoint_a_body_fires_is_one_the_census_carries() {
                 ),
             }
         }
-        let named: BTreeSet<String> = census.iter().map(|(_, e)| (*e).to_owned()).collect();
-        assert_eq!(
-            census.len(),
-            named.len(),
-            "`{module}`'s census names a shader twice, so its length is \
-             counting one shader as two",
-        );
-
-        let uncompiled: Vec<&String> = fired.difference(&named).collect();
+        let uncompiled: Vec<&String> =
+            fired.iter().filter(|n| !stamped.contains(n.as_str())).collect();
         assert!(
             uncompiled.is_empty(),
-            "`{module}` fires {} entrypoints its census does not name, and \
+            "`{module}` fires {} entrypoint(s) no `.metal` file stamps, and \
              `newFunctionWithName:` answers nil for those on a device rather \
              than failing here: {uncompiled:#?}",
             uncompiled.len(),
         );
-
-        let idle: Vec<&String> = named
-            .difference(&fired)
-            .filter(|name| !unfired.contains(name.as_str()))
-            .collect();
-        assert!(
-            idle.is_empty(),
-            "`{module}`'s census names {} entrypoints no body fires. Either a \
-             routine was deleted and its census line stayed, or the shader is \
-             genuinely idle and belongs in `UNFIRED` with the reason: \
-             {idle:#?}",
-            idle.len(),
-        );
         swept += fired.len();
     }
-    assert_eq!(
-        swept + UNFIRED.len(),
-        stated,
-        "the fires read cover a different number of names than the census \
-         states, which means this read every family and agreed with each \
-         while disagreeing with the whole",
+    // A vacuity guard. A `fire_entrypoints` that stopped matching would sweep
+    // nothing and agree with everything, which is the failure mode this file's
+    // own header warns about twice.
+    assert!(
+        swept > 100,
+        "only {swept} fired entrypoint(s) were read out of ten modules; the \
+         scan has stopped matching",
     );
+    // A NUMBER AND AN ASSERTION, for the shape this file does not read
+    // itself. Nineteen fires spell a composed name, `composable()` walks
+    // 291 of them, and `composed_names_are_stamped` is where they are held.
+    // The count moving is a composer added or removed, and either way the
+    // question is whether that other file walked it.
+    assert_eq!(
+        composed, 19,
+        "the fires whose name is composed rather than spelled; \
+         `composable()` is what answers for these and \
+         `composed_names_are_stamped` is what checks it"
+    );
+}
+
+/// **A stamped entrypoint that no body fires is a kernel nothing can reach.**
+///
+/// The other direction, and it went dark when the ten hand-written censuses
+/// did. [`UNFIRED`] outlived the test that read it -- `cargo clippy` called it
+/// dead code, which is the honest description of an excuse list nothing
+/// consults.
+///
+/// What made it hard to bring back is that a body no longer spells most of
+/// its names: 291 of the 481 come out of `qmm_name` and its three siblings,
+/// so reading the sources alone answers 186 and calls the rest unreachable.
+/// The crate's own `composable()` is the missing term -- the same function
+/// `composed_names_are_stamped` uses, walking the same axes a fire walks --
+/// and the union of "what the modules spell" with "what the composers reach"
+/// is 477 of 481, exactly.
+///
+/// Exactly the four [`UNFIRED`] already named, with nothing new hiding behind
+/// them. Three are `sdpa_paged_decode`'s `_p32` points and one is
+/// `silu_mul_strided`; see that constant for what each is waiting on.
+///
+/// This is not the same question as
+/// `what_is_stamped_beyond_the_composed_family_is_a_known_number`, which pins
+/// 190 as a COUNT. A count moving tells you something changed. This says
+/// which shader compiles for nobody.
+#[test]
+fn a_stamped_entrypoint_no_body_fires_is_a_kernel_nothing_can_reach() {
+    let stamped: BTreeSet<&str> = kernels_metal::STAMPED.iter().map(|(_, n)| *n).collect();
+    let tables = entrypoint_tables();
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut fired: BTreeSet<String> = BTreeSet::new();
+    for module in [
+        "attn.rs", "layout.rs", "mlp.rs", "moe.rs", "norm.rs", "ptir.rs", "quant.rs",
+        "rope.rs", "sample.rs", "ssm.rs",
+    ] {
+        let path = root.join(module);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        for (_, value) in fire_entrypoints(&text) {
+            if let Some(names) = fired_names(&value, &tables) {
+                fired.extend(names);
+            }
+        }
+    }
+    // THE COMPOSED TERM. Without it this reports 291 dead kernels, every one
+    // of them fired by a `qmm_name` call the scanner deliberately does not
+    // expand. `composable()` is the crate answering for itself, which is the
+    // same arrangement `fired_names` documents.
+    fired.extend(kernels_metal::quant::composable().into_iter().map(str::to_owned));
+
+    let dead: Vec<&str> = stamped
+        .iter()
+        .copied()
+        .filter(|n| !fired.contains(*n) && !UNFIRED.contains(n))
+        .collect();
+    assert!(
+        dead.is_empty(),
+        "{} entrypoint(s) are stamped by a shader and fired by no body. Each \
+         is a translation unit this backend compiles on every device for \
+         nobody, and a name that reaches no dispatcher is the half of a typo \
+         `newFunctionWithName:` cannot report.\n{dead:#?}",
+        dead.len(),
+    );
+    // AND THE EXCUSE LIST DOES NOT OUTLIVE ITS SUBJECT, which is the failure
+    // that put `UNFIRED` in front of clippy in the first place.
+    let stale: Vec<&&str> = UNFIRED
+        .iter()
+        .filter(|n| fired.contains(**n) || !stamped.contains(*n))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "{} name(s) are argued unfired and are either fired now or stamped by \
+         nothing: {stale:#?}",
+        stale.len(),
+    );
+    // A NUMBER AND AN ASSERTION.
+    assert_eq!(fired.len(), 477, "the names the modules spell and the composers reach");
+    assert_eq!(stamped.len(), 481, "the names the shader tree stamps");
 }

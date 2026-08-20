@@ -29,7 +29,7 @@ use kernels::{Bind, Fire};
 use core::ptr::NonNull;
 
 use crate::jit::abi::bf16;
-use crate::jit::{Abi, Ctx, Launch};
+use crate::jit::{Ctx, Launch};
 use kernels::Refusal;
 
 /// The Q-tile height for prefill, `interface.py`'s `FwdConfig(128, ...)` for

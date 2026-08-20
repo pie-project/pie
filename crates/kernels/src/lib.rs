@@ -11,6 +11,11 @@
 pub mod bind;
 pub mod routine;
 
+// One point, compiled on demand and cached by everything that changes it.
+// CUDA reached this first because NVRTC lowers one instantiation on ask; the
+// other three each grew a LIST instead, and a list is what this deletes.
+pub mod jit;
+
 // The facts a launcher can name, as types rather than as words. One fact,
 // one type, one spelling of it in the whole tree.
 pub mod keys;

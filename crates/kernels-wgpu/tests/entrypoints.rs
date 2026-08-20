@@ -275,6 +275,28 @@ fn resolve(value: &str, tables: &BTreeMap<String, Vec<String>>) -> Option<Vec<St
         let name = rest.split('"').next()?;
         return Some(vec![name.to_owned()]);
     }
+    // A COMPOSED NAME, and the crate answers for it rather than this scanner.
+    //
+    // `quant.rs`'s bodies build their point out of the four numbers it IS --
+    // `qmm_name("", *group, *bits, *bm, *bn)?` -- where they used to index a
+    // table of 54 literals holding the same product. Expanding that here would
+    // mean writing the axes into this file, which is a second place they live
+    // and the reason the tables went. `kernels_wgpu::quant::composable` runs
+    // the same composers over the same axes, so what it answers is what a fire
+    // can reach, by construction.
+    //
+    // The whole product for ONE call site, which over-approximates: a body that
+    // only ever fires `_bias` still contributes the plain form. That direction
+    // is safe -- it can only make "every entrypoint a body fires is declared"
+    // stricter -- and the other direction, "every declared entrypoint is
+    // fired", is the one this breadth is FOR.
+    if value.contains("qmm_name(") || value.contains("qmv_name(")
+        || value.contains("qmm_precast_name(") || value.contains("qmv_wide_strided_name(")
+    {
+        return Some(
+            kernels_wgpu::quant::composable().into_iter().map(ToOwned::to_owned).collect(),
+        );
+    }
     let (name, _) = value.split_once('[')?;
     tables.get(name.trim()).cloned()
 }
@@ -405,7 +427,7 @@ fn every_entrypoint_a_body_fires_is_one_the_shader_tree_instantiates() {
 // answered was decided by `max_by_key`'s last-maximum tie-break rather than by
 // anything the file said -- and
 // `every_entrypoint_is_claimed_by_the_stem_that_owns_it` asserts that the stem
-// each of the 481 resolves to is the longest one that names it.
+// each of the 489 resolves to is the longest one that names it.
 
 /// The row count is `kernels-metal`'s, and that is the point rather than a
 /// coincidence: this backend's coverage is DEFINED as its sibling's, so the two
@@ -425,13 +447,13 @@ fn the_table_is_one_hundred_kernels_over_four_hundred_and_eighty_one_entrypoints
         kernels_wgpu::KERNELS.len() + kernels_wgpu::retired_rows().len(),
         100
     );
-    assert_eq!(kernels_wgpu::entrypoints().len(), 481);
+    assert_eq!(kernels_wgpu::entrypoints().len(), 489);
 }
 
 // RETIRED: THE TABLE IS EMPTY, so every entrypoint is skipped before it is
 // asked about.
 //
-// It walked all 481 entrypoints and required each to resolve to a row through
+// It walked all 489 entrypoints and required each to resolve to a row through
 // `sig_in` -- exact match first, then axis-point matching, so
 // `sdpa_paged_decode_bfloat16_d_128_p32` finds the `sdpa_paged_decode` row.
 // A family that had crossed was skipped, on the correct argument that such an
@@ -445,7 +467,7 @@ fn the_table_is_one_hundred_kernels_over_four_hundred_and_eighty_one_entrypoints
 //
 // The successor is the one that check was deferring to, and it is stronger:
 // `driver-wgpu::lowering::arm::the_armed_stems_are_the_ones_registered_and
-// _nothing_else` asserts that NO entrypoint is unclaimed, over the same 481,
+// _nothing_else` asserts that NO entrypoint is unclaimed, over the same 489,
 // and it is not a courtesy -- with no table to fall back to, an entrypoint no
 // stem claims cannot be planned by any path.
 
@@ -615,7 +637,7 @@ fn baseline_variants_are_unsuffixed() {
 /// the other three. So the list is closed, here, with reasons.
 ///
 /// Anything else must exist. `every_module_parses_and_validates` in
-/// `tests/gpu.rs` proves that naga accepted all 481 expanded modules, so a
+/// `tests/gpu.rs` proves that naga accepted all 489 expanded modules, so a
 /// `pie_*` name appearing in the CODE of one is a name that is defined — which
 /// covers `fn`s, `var<workgroup>`s and constants without having to parse a
 /// declaration. (`pie_partials`, a `var<workgroup>` in

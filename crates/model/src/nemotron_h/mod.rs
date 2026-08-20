@@ -532,6 +532,8 @@ mod tests {
         use model_ir::trace::FireClass;
 
         let bind = MetalBinding {
+            qmm_partial_rows: false,
+            qmm_tile: None,
             quant_group: 64,
             quant_bits: 4,
             router_quant_group: 0,

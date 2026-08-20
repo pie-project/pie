@@ -12268,7 +12268,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -12282,7 +12287,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -12650,7 +12660,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -12664,7 +12679,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -13032,7 +13052,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -13046,7 +13071,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -13745,7 +13775,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -13759,7 +13794,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -14127,7 +14167,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -14141,7 +14186,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -14509,7 +14559,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -14523,7 +14578,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -15222,7 +15282,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -15236,7 +15301,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -15604,7 +15674,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -15618,7 +15693,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -15986,7 +16066,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -16000,7 +16085,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -16699,7 +16789,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -16713,7 +16808,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -17081,7 +17181,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -17095,7 +17200,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -17463,7 +17573,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -17477,7 +17592,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -18176,7 +18296,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -18190,7 +18315,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -18558,7 +18688,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -18572,7 +18707,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -18940,7 +19080,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -18954,7 +19099,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -19653,7 +19803,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -19667,7 +19822,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -20035,7 +20195,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -20049,7 +20214,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -20417,7 +20587,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -20431,7 +20606,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -21130,7 +21310,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -21144,7 +21329,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -21512,7 +21702,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -21526,7 +21721,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -21894,7 +22094,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -21908,7 +22113,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -22607,7 +22817,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -22621,7 +22836,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -22989,7 +23209,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -23003,7 +23228,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -23371,7 +23601,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -23385,7 +23620,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -24084,7 +24324,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -24098,7 +24343,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -24466,7 +24716,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -24480,7 +24735,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -24848,7 +25108,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -24862,7 +25127,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -25561,7 +25831,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -25575,7 +25850,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -25943,7 +26223,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -25957,7 +26242,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -26325,7 +26615,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -26339,7 +26634,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -27038,7 +27338,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -27052,7 +27357,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -27420,7 +27730,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -27434,7 +27749,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -27802,7 +28122,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -27816,7 +28141,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -28515,7 +28845,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -28529,7 +28864,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -28897,7 +29237,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -28911,7 +29256,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -29279,7 +29629,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -29293,7 +29648,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -29992,7 +30352,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -30006,7 +30371,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -30374,7 +30744,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -30388,7 +30763,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -30756,7 +31136,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -30770,7 +31155,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -31469,7 +31859,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -31483,7 +31878,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -31851,7 +32251,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -31865,7 +32270,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -32233,7 +32643,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -32247,7 +32662,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -32946,7 +33366,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -32960,7 +33385,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -33328,7 +33758,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -33342,7 +33777,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -33710,7 +34150,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -33724,7 +34169,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -34423,7 +34873,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -34437,7 +34892,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -34805,7 +35265,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -34819,7 +35284,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -35187,7 +35657,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [
@@ -35201,7 +35676,12 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "ssm::repeat_interleave_heads_fp32"
+          "kernel": "ssm::repeat_interleave_heads_fp32",
+          "params": [
+            16,
+            48,
+            128
+          ]
         }
       },
       "inputs": [

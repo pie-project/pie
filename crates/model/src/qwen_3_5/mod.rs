@@ -221,8 +221,6 @@ const fn gdn(hidden: u32, key_heads: u32, value_heads: u32) -> Qwen35GdnFacts {
 /// generation next door does not.
 const ARCH: &str = "qwen3_5";
 
-
-
 /// The published context ceiling, shared by every row of the lineage.
 ///
 /// One constant because all five committed corpus configs state
@@ -867,6 +865,8 @@ mod tests {
         use model_ir::trace::FireClass;
 
         let bind = MetalBinding {
+            qmm_partial_rows: false,
+            qmm_tile: None,
             quant_group: 64,
             quant_bits: 4,
             router_quant_group: 64,

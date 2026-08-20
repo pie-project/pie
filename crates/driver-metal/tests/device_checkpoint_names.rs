@@ -94,8 +94,33 @@ fn served(
     &'static dyn model::catalog::Variant,
     model::encoding::Encoding,
 )> {
-    let meta = model_loader::checkpoint::read::parse_checkpoint_metadata(dir)
-        .unwrap_or_else(|e| panic!("{} did not read as a checkpoint: {e:?}", dir.display()));
+    let meta = match model_loader::checkpoint::read::parse_checkpoint_metadata(dir) {
+        Ok(meta) => meta,
+        // A DIRECTORY WITH NO WEIGHTS IN IT IS NOT A CHECKPOINT THAT FAILED,
+        // it is not a checkpoint, and the difference is the whole reason this
+        // is a skip and the line below is still a panic.
+        //
+        // A HuggingFace cache collects tokenizer-only downloads as a matter
+        // of course -- `snapshots/<sha>/` holding `config.json`,
+        // `tokenizer.json` and nothing else -- and this gate walks the cache
+        // rather than being handed one path, so it meets them. Treating one
+        // as a broken checkpoint made the gate fail for a reason that has
+        // nothing to do with the names it exists to prove, and it did: a
+        // `Qwen3-0.6B-4bit` entry whose 15M of tokenizer files outlived its
+        // weights turned this red with the map untouched.
+        //
+        // EVERY OTHER READ FAILURE STILL PANICS. If the safetensors are there
+        // and do not parse, or the index names a shard that is missing, that
+        // is a checkpoint this build cannot read and the gate should say so
+        // loudly. The discriminating fact is the one `read.rs` states when it
+        // finds neither `model.safetensors` nor its index -- the only refusal
+        // that means "there was nothing here to read in the first place".
+        Err(e) if format!("{e:?}").contains("no model.safetensors") => {
+            eprintln!("SKIP: {}: no weights, not a checkpoint", dir.display());
+            return None;
+        }
+        Err(e) => panic!("{} did not read as a checkpoint: {e:?}", dir.display()),
+    };
     let row = match model::catalog::identify(&meta, &model::catalog::Override::None) {
         Ok(row) => row,
         Err(why) => {

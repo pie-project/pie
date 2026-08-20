@@ -6,10 +6,10 @@
 //! kernel takes; collecting them into a struct would restate the binding order
 //! somewhere else, which is the thing this refactor removes.
 
-use kernels_macros::routine;
 use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, Out, Tensor, bf16, keys};
-use kernels::shader::{elementwise, elementwise_rows};
 use kernels::routine::Refusal;
+use kernels::shader::{elementwise, elementwise_rows};
+use kernels_macros::routine;
 
 /// Which of the six affine points `(group, bits)` names, or a refusal.
 ///
@@ -128,12 +128,24 @@ pub fn embed_gather_4bit(
     biases: Const<Tensor<bf16>>,
     out: Out<Tensor<bf16>>,
     group: Const<i32>,
-    bits: Const<i32>) -> Result<(), Refusal> {
+    bits: Const<i32>,
+) -> Result<(), Refusal> {
     let id = ctx.ask::<Tensor<i32>, keys::TokenIds>()?;
     let hidden = out.width;
     ctx.fire(
-        Fire::at(crate::routine::module_path(EMBED_GATHER[affine_point(*group, *bits)?], ctx.best()), EMBED_GATHER[affine_point(*group, *bits)?]).apply(elementwise(hidden, 1)?),
-        &[w.arg(), scales.arg(), biases.arg(), id.arg(), out.arg(), hidden.arg()],
+        Fire::at(
+            crate::routine::module_path(EMBED_GATHER[affine_point(*group, *bits)?], ctx.best()),
+            EMBED_GATHER[affine_point(*group, *bits)?],
+        )
+        .apply(elementwise(hidden, 1)?),
+        &[
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            id.arg(),
+            out.arg(),
+            hidden.arg(),
+        ],
     )
 }
 
@@ -156,13 +168,25 @@ pub fn embed_gather_mb_4bit(
     biases: Const<Tensor<bf16>>,
     out: Out<Tensor<bf16>>,
     group: Const<i32>,
-    bits: Const<i32>) -> Result<(), Refusal> {
+    bits: Const<i32>,
+) -> Result<(), Refusal> {
     let id = ctx.ask::<Tensor<i32>, keys::TokenIds>()?;
     let hidden = out.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path(EMBED_GATHER_MB[affine_point(*group, *bits)?], ctx.best()), EMBED_GATHER_MB[affine_point(*group, *bits)?]).apply(elementwise_rows(hidden, rows)?),
-        &[w.arg(), scales.arg(), biases.arg(), id.arg(), out.arg(), hidden.arg()],
+        Fire::at(
+            crate::routine::module_path(EMBED_GATHER_MB[affine_point(*group, *bits)?], ctx.best()),
+            EMBED_GATHER_MB[affine_point(*group, *bits)?],
+        )
+        .apply(elementwise_rows(hidden, rows)?),
+        &[
+            w.arg(),
+            scales.arg(),
+            biases.arg(),
+            id.arg(),
+            out.arg(),
+            hidden.arg(),
+        ],
     )
 }
 
@@ -185,11 +209,19 @@ pub fn embed_gather_scaled_4bit(
     out: Out<Tensor<bf16>>,
     embed_scale: Const<f32>,
     group: Const<i32>,
-    bits: Const<i32>) -> Result<(), Refusal> {
+    bits: Const<i32>,
+) -> Result<(), Refusal> {
     let id = ctx.ask::<Tensor<i32>, keys::TokenIds>()?;
     let hidden = out.width;
     ctx.fire(
-        Fire::at(crate::routine::module_path(EMBED_GATHER_SCALED[affine_point(*group, *bits)?], ctx.best()), EMBED_GATHER_SCALED[affine_point(*group, *bits)?]).apply(elementwise(hidden, 1)?),
+        Fire::at(
+            crate::routine::module_path(
+                EMBED_GATHER_SCALED[affine_point(*group, *bits)?],
+                ctx.best(),
+            ),
+            EMBED_GATHER_SCALED[affine_point(*group, *bits)?],
+        )
+        .apply(elementwise(hidden, 1)?),
         &[
             w.arg(),
             scales.arg(),
@@ -217,12 +249,20 @@ pub fn embed_gather_scaled_mb_4bit(
     out: Out<Tensor<bf16>>,
     embed_scale: Const<f32>,
     group: Const<i32>,
-    bits: Const<i32>) -> Result<(), Refusal> {
+    bits: Const<i32>,
+) -> Result<(), Refusal> {
     let id = ctx.ask::<Tensor<i32>, keys::TokenIds>()?;
     let hidden = out.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path(EMBED_GATHER_SCALED_MB[affine_point(*group, *bits)?], ctx.best()), EMBED_GATHER_SCALED_MB[affine_point(*group, *bits)?]).apply(elementwise_rows(hidden, rows)?),
+        Fire::at(
+            crate::routine::module_path(
+                EMBED_GATHER_SCALED_MB[affine_point(*group, *bits)?],
+                ctx.best(),
+            ),
+            EMBED_GATHER_SCALED_MB[affine_point(*group, *bits)?],
+        )
+        .apply(elementwise_rows(hidden, rows)?),
         &[
             w.arg(),
             scales.arg(),
@@ -269,11 +309,16 @@ pub fn ple_combine(
     // struct's other word -- a per-row element count bounding a whole-tensor
     // grid -- was dead, so with the scale stated as a mark there is nothing
     // left for a block to carry.
-    inv_sqrt2: Const<f32>) -> Result<(), Refusal> {
+    inv_sqrt2: Const<f32>,
+) -> Result<(), Refusal> {
     let width = proj.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("ple_combine_bfloat16", ctx.best()), "ple_combine_bfloat16").apply(elementwise(width, rows)?),
+        Fire::at(
+            crate::routine::module_path("ple_combine_bfloat16", ctx.best()),
+            "ple_combine_bfloat16",
+        )
+        .apply(elementwise(width, rows)?),
         &[proj.arg(), token.arg(), out.arg(), inv_sqrt2.arg()],
     )
 }
@@ -318,7 +363,8 @@ pub fn row_gather(
     out: Out<Tensor<bf16>>,
     // THE ROW PITCH, which was `RowGatherParams`'s first field and is the only
     // word of the two the STATEMENT carries. The count below is the fire's.
-    width: Const<u32>) -> Result<(), Refusal> {
+    width: Const<u32>,
+) -> Result<(), Refusal> {
     let rows = ctx.ask::<Tensor<u32>, keys::SamplingIndices>()?;
     // A `u32` and no longer an `InPacked`: there is no struct for it to be a
     // field of, so it is a scalar like any other and takes its place in the
@@ -326,7 +372,11 @@ pub fn row_gather(
     let count = ctx.ask::<u32, keys::RequestCount>()?;
     let row_count = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("row_gather_bfloat16", ctx.best()), "row_gather_bfloat16").apply(elementwise_rows(input.width, row_count)?),
+        Fire::at(
+            crate::routine::module_path("row_gather_bfloat16", ctx.best()),
+            "row_gather_bfloat16",
+        )
+        .apply(elementwise_rows(input.width, row_count)?),
         &[input.arg(), out.arg(), rows.arg(), width.arg(), count.arg()],
     )
 }
@@ -385,17 +435,18 @@ mod tests {
     }
 
     impl Encode for Seen {
-        fn resolve(
-            &self,
-            ty: kernels::Ty,
-            source: kernels::Source,
-        ) -> Result<ArgValue, Refusal> {
+        fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
             use kernels::keys::Fact;
             if source == <keys::Rows as Fact>::SOURCE {
                 return Ok(ArgValue::I32(self.rows.get()));
             }
             if source == <keys::TokenIds as Fact>::SOURCE {
-                return Ok(ArgValue::Buffer { handle: self.token_ids.get(), writes: false, rows: 0, width: 0 });
+                return Ok(ArgValue::Buffer {
+                    handle: self.token_ids.get(),
+                    writes: false,
+                    rows: 0,
+                    width: 0,
+                });
             }
             if source == <keys::SamplingIndices as Fact>::SOURCE {
                 return Ok(ArgValue::Buffer {
@@ -415,16 +466,27 @@ mod tests {
             // these tests build, and a positive tiling.
             if let kernels::Source::Slot(kernels::Kind::Param, n) = source {
                 return Ok(ArgValue::I32(
-                    self.words.borrow().get(usize::from(n)).copied().unwrap_or(4096),
+                    self.words
+                        .borrow()
+                        .get(usize::from(n))
+                        .copied()
+                        .unwrap_or(4096),
                 ));
             }
             if matches!(ty, kernels::Ty::Buf) {
-                return Ok(ArgValue::Buffer { handle: 900, writes: false, rows: 0, width: 0 });
+                return Ok(ArgValue::Buffer {
+                    handle: 900,
+                    writes: false,
+                    rows: 0,
+                    width: 0,
+                });
             }
             // Anything else is refused: a probe that invented an answer to a
             // fact it does not know would let a body pass under test while
             // the same fact went unanswered on a real driver.
-            Err(Refusal::Unstated { what: "a fact this probe does not answer" })
+            Err(Refusal::Unstated {
+                what: "a fact this probe does not answer",
+            })
         }
 
         fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
@@ -518,7 +580,11 @@ mod tests {
             Const::new(Tensor::<u32>::new(0)),
             Const::new(Tensor::<bf16>::new(1)),
             Const::new(Tensor::<bf16>::new(2)),
-            Out { ptr: Tensor::<bf16>::new(4), rows: 0, width: 2048 },
+            Out {
+                ptr: Tensor::<bf16>::new(4),
+                rows: 0,
+                width: 2048,
+            },
             Const::new(64),
             Const::new(4),
         )
@@ -531,7 +597,11 @@ mod tests {
             Const::new(Tensor::<u32>::new(0)),
             Const::new(Tensor::<bf16>::new(1)),
             Const::new(Tensor::<bf16>::new(2)),
-            Out { ptr: Tensor::<bf16>::new(4), rows: 0, width: 2048 },
+            Out {
+                ptr: Tensor::<bf16>::new(4),
+                rows: 0,
+                width: 2048,
+            },
             Const::new(64),
             Const::new(4),
         )
@@ -568,7 +638,11 @@ mod tests {
             Const::new(Tensor::<u32>::new(0)),
             Const::new(Tensor::<bf16>::new(1)),
             Const::new(Tensor::<bf16>::new(2)),
-            Out { ptr: Tensor::<bf16>::new(4), rows: 0, width: 2048 },
+            Out {
+                ptr: Tensor::<bf16>::new(4),
+                rows: 0,
+                width: 2048,
+            },
             Const::new(64),
             Const::new(4),
         )
@@ -578,7 +652,11 @@ mod tests {
             Const::new(Tensor::<u32>::new(0)),
             Const::new(Tensor::<bf16>::new(1)),
             Const::new(Tensor::<bf16>::new(2)),
-            Out { ptr: Tensor::<bf16>::new(4), rows: 0, width: 2048 },
+            Out {
+                ptr: Tensor::<bf16>::new(4),
+                rows: 0,
+                width: 2048,
+            },
             Const::new(45.25),
             Const::new(64),
             Const::new(4),
@@ -634,7 +712,11 @@ mod tests {
         seen.rows.set(26);
         ple_combine(
             &seen,
-            In { ptr: Tensor::<bf16>::new(0), rows: 0, width: 256 },
+            In {
+                ptr: Tensor::<bf16>::new(0),
+                rows: 0,
+                width: 256,
+            },
             In::new(Tensor::<bf16>::new(1)),
             Out::new(Tensor::<bf16>::new(2)),
             Const::new(core::f32::consts::FRAC_1_SQRT_2),
@@ -649,7 +731,11 @@ mod tests {
         seen.request_count.set(4);
         row_gather(
             &seen,
-            In { ptr: Tensor::<bf16>::new(0), rows: 0, width: 2048 },
+            In {
+                ptr: Tensor::<bf16>::new(0),
+                rows: 0,
+                width: 2048,
+            },
             Out::new(Tensor::<bf16>::new(1)),
             Const::new(2048),
         )

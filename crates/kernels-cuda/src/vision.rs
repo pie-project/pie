@@ -31,7 +31,6 @@ use kernels::{Bind, Fire};
 use core::ffi::c_void;
 
 use crate::jit::{Ctx, Launch};
-use crate::jit::Abi;
 use crate::jit::abi::{MaybeConst, bf16};
 use kernels::Refusal;
 

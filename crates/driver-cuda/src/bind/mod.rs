@@ -1009,10 +1009,15 @@ pub enum DispatchRefusal {
 // The FA2 dispatch arms are driver ops: each owns a mutable device-side plan
 // cache a `Cx` must never hand over, so a failed guard here is a refusal.
 
-/// The plan pointer a launch is handed; decode's full plan on a `-1` window.
 #[cfg(feature = "_cuda")]
-#[must_use]
 /// The PREFILL schedule this fire raised.
+///
+/// A ONE-LINE SUMMARY STOOD ABOVE THE `cfg`, reading "the plan pointer a
+/// launch is handed; decode's full plan on a `-1` window" -- a description of
+/// the decode arm the prose below explains was DELETED, sitting above the
+/// prose that explains it. It brought a second `#[must_use]` with it, which is
+/// how the compiler noticed: an attribute repeated on one item, warned today
+/// and a hard error later.
 ///
 /// # What this was, and what deleted it
 ///

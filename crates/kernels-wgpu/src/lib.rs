@@ -52,7 +52,7 @@
 //!
 //! ## The coverage is `kernels-metal`'s, deliberately
 //!
-//! Row for row, axis for axis, point for point: **100 kernels over 481
+//! Row for row, axis for axis, point for point: **100 kernels over 489
 //! entrypoints**, the same names in the same ten families, and
 //! `tests/entrypoints.rs` pins all three of those numbers against
 //! `kernels-metal`'s own source.
@@ -598,7 +598,7 @@ mod tests {
     /// Pinned here as well as in `tests/entrypoints.rs` because a `cargo test
     /// -p kernels-wgpu --lib` should be able to say whether the port is whole.
     #[test]
-    fn the_table_is_one_hundred_rows_over_four_hundred_and_eighty_one_entrypoints() {
+    fn the_table_is_one_hundred_rows_over_four_hundred_and_eighty_nine_entrypoints() {
         // Rows PLUS retired rows: `refactor-bigplan.md` §7 empties the table
         // family by family, and the hundred is what the two together name.
         assert_eq!(
@@ -606,7 +606,7 @@ mod tests {
             100,
             "one row per kernel in `kernels/`, retired or not"
         );
-        assert_eq!(entrypoints().len(), 481, "the product of every row's axes");
+        assert_eq!(entrypoints().len(), 489, "the product of every row's axes");
         assert_eq!(
             KERNELS.len(),
             0,
@@ -656,7 +656,7 @@ mod tests {
     // `Ceiling::StorageBinding` is where that is refused at run time against
     // the adapter's real limit, which is the check that matters and is not
     // keyed on the table; and `driver-wgpu::device`'s
-    // `every_entrypoint_in_the_tree_builds_a_pipeline_on_this_adapter` builds all 481
+    // `every_entrypoint_in_the_tree_builds_a_pipeline_on_this_adapter` builds all 489
     // entrypoints, so a kernel the adapter cannot lay out fails there by name.
 }
 

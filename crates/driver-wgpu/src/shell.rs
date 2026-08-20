@@ -480,6 +480,22 @@ impl Shell {
             deployment.rescale,
         )
         .map_err(Unopened::Device)?;
+        // The split decode's scratch, once for the deployment, and sized from
+        // the kernel plane's OWN two constants rather than from a copy of
+        // them. A slice count that grew past a literal here would not fail:
+        // `naga` bounds-checks a storage write, so the slices past the end
+        // would be dropped and the merge would fold a stale state into a
+        // plausible token.
+        //
+        // `PIE_SPLIT_BELOW` is the widest fire that takes the split at all --
+        // anything wider fills the machine on its own and runs the single
+        // kernel -- and the state is a running maximum, a denominator and one
+        // f32 accumulator per channel of a head.
+        let state = 2 + u64::from(text.geometry.head_dim);
+        let slices = u64::from(kernels_wgpu::attn::PIE_SPLITS.unsigned_abs());
+        let widest = u64::from(kernels_wgpu::attn::PIE_SPLIT_BELOW.unsigned_abs());
+        pool.scratch(&device, widest * slices * state * 4)
+            .map_err(Unopened::Device)?;
         let mut weights = Weights::new();
         weights
             .seam(&device, deployment.seam)

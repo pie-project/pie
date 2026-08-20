@@ -103,7 +103,6 @@ use crate::attn::fa2::params::{
     PrefillPlan, PrefillScoreParams, make_decode_params, make_prefill_params,
 };
 use crate::attn::fa2::geometry::{DecodeGeometry, Device, KvWidth, PrefillGeometry};
-use crate::attn::plan::info::{DecodePlanInfo, PrefillPlanInfo};
 use crate::jit::{ArgValue, Ctx, Cuda, Launch, Root};
 use crate::jit::abi::{bf16, unpack_aggregate};
 use crate::jit::abi::Tensor;
@@ -1279,10 +1278,11 @@ pub fn prefill_custom_arm(logits_soft_cap: f32) -> PrefillArm {
 //
 // `.wiki/kilimanjaro.md` §4 plans both away and D1 says a routine takes
 // fields rather than a struct. The decode three took their sixteen leaves as
-// `Env<keys::Fa2Decode*>` and `decode_plan_of_leaves` rebuilds the aggregate
-// inside this file -- so this impl now serves the FOLD and not a parameter,
-// and deleting it would take `unpack_aggregate` out of a path the five
-// prefill launchers still use. The [`ROUTINES`] ledger carries what the
+// `Env<keys::Fa2Decode*>` and `decode_plan_of_leaves` rebuilt the aggregate
+// inside this file. BOTH ARE GONE: the launchers name their plan as an
+// operand and read the cache whole, so nothing folds and nothing unfolds.
+// What keeps these impls is `unpack_aggregate`, still on the path the
+// planless pair takes. The [`ROUTINES`] ledger carries what the
 // prefill half is waiting on, which is the planless arm's local cache and
 // not the ceiling.
 
@@ -1368,9 +1368,9 @@ fn buffers(
 // `UNPLANNED_DECODE` STOOD HERE and is the one leaf the unfold deleted rather
 // than named. `attention_flashinfer.cu:504-508` threw on `!cache.valid`; the
 // three decode launchers tested it because they held the cache. They no
-// longer do, and `bind/table.rs`'s `fa2_decode_leaves` refuses before it
-// answers a single leaf -- so a validity flag reaching this file would be an
-// answer to a question already asked. `UNPLANNED_PREFILL` below still exists
+// longer do. The launcher reads the cache off its plan operand and checks
+// `valid` there, which is where the flag belongs: `fa2_decode_leaves`, which
+// used to refuse before answering a single leaf, is deleted with the leaves. `UNPLANNED_PREFILL` below still exists
 // because the five prefill launchers still take the aggregate.
 
 /// A capturing dispatch asked for with a soft cap or a window.
@@ -1519,10 +1519,19 @@ pub fn dispatch_attention_flashinfer_decode(
         // Decode has one query row per request, so there is no QO indptr.
         core::ptr::null(),
         lse,
-        // The zero base `decode_plan_of_leaves` documents: every workspace
-        // address is already in the leaves.
-        core::ptr::null_mut(),
-        core::ptr::null_mut(),
+        // THE DECODE CARVE'S TWO BASES, RAW. This passed a null pair while the
+        // leaves carried ABSOLUTE addresses in the offset fields --
+        // `decode_plan_of_leaves` stuffed them there and a zero base read them
+        // back out. The launcher reads the real cache now, whose offsets are
+        // relative to the carve it was raised against, so a null base would
+        // make every work-list pointer a small integer.
+        //
+        // RAW, and not `+ int_base_bytes` as the prefill twin passes:
+        // `make_decode_params` adds `plan.int_base_bytes` itself, where
+        // `make_prefill_params` says it has "no analogue ... because one
+        // prefill plan serves one fire".
+        int_base,
+        ctx.ask::<*mut c_void, keys::AttnWorkspaceFloat>()?,
     );
     let arm = decode_arm(planned.full_attention_variant, window_left, logits_soft_cap);
     let (params, split) =
@@ -1594,9 +1603,9 @@ pub fn dispatch_attention_flashinfer_decode_lse(
     // PROMISES the statement carries the number at its slot in the params
     // run; where nothing states one the promise is broken at the fire, not
     // at the type. See `.wiki/migration.md` §11.20.
-    let window_left = ctx.ask::<i32, keys::WindowLeft>()?;
-    let logits_soft_cap = ctx.ask::<f32, keys::AttnLogitsSoftCap>()?;
-    let sm_scale = ctx.ask::<f32, keys::SmScale>()?;
+    let _window_left = ctx.ask::<i32, keys::WindowLeft>()?;
+    let _logits_soft_cap = ctx.ask::<f32, keys::AttnLogitsSoftCap>()?;
+    let _sm_scale = ctx.ask::<f32, keys::SmScale>()?;
 
     let _k_pages = ctx.ask::<*mut u8, keys::KvKeys>()?;
     let _v_pages = ctx.ask::<*mut u8, keys::KvValues>()?;
@@ -1707,10 +1716,19 @@ pub fn dispatch_attention_flashinfer_decode_capture(
         kv_last_page_lens,
         core::ptr::null(),
         lse,
-        // The zero base `decode_plan_of_leaves` documents: every workspace
-        // address is already in the leaves.
-        core::ptr::null_mut(),
-        core::ptr::null_mut(),
+        // THE DECODE CARVE'S TWO BASES, RAW. This passed a null pair while the
+        // leaves carried ABSOLUTE addresses in the offset fields --
+        // `decode_plan_of_leaves` stuffed them there and a zero base read them
+        // back out. The launcher reads the real cache now, whose offsets are
+        // relative to the carve it was raised against, so a null base would
+        // make every work-list pointer a small integer.
+        //
+        // RAW, and not `+ int_base_bytes` as the prefill twin passes:
+        // `make_decode_params` adds `plan.int_base_bytes` itself, where
+        // `make_prefill_params` says it has "no analogue ... because one
+        // prefill plan serves one fire".
+        int_base,
+        ctx.ask::<*mut c_void, keys::AttnWorkspaceFloat>()?,
     );
     let (base, split) = make_decode_params(&planned, &bufs, *window_left, 0.0, *sm_scale, broadcast_q);
     let params = DecodeScoreParams {
@@ -2026,7 +2044,7 @@ pub fn dispatch_attention_flashinfer_prefill_custom(
     )?;
     // The two bases the plan's offsets are relative to; §6.3 facts and not
     // leaves. See the plain launcher.
-    let int_base = ctx.ask::<*mut c_void, keys::AttnPrefillWorkspaceInt>()?;
+    let _int_base = ctx.ask::<*mut c_void, keys::AttnPrefillWorkspaceInt>()?;
     let float_base = ctx.ask::<*mut c_void, keys::AttnPrefillWorkspaceFloat>()?;
     let int_base = (carve as usize).saturating_add(cache.int_base_bytes) as *mut c_void;
     let arm = prefill_custom_arm(*logits_soft_cap);
@@ -2608,9 +2626,11 @@ const _: () = {
     // until a fire read someone else's schedule.
     // THE DECODE THREE NO LONGER TAKE IT, AND THAT IS THE UNFOLD. Their
     // `int_buffer`/`float_buffer` were bases for offsets the driver now adds
-    // itself: `bind/table.rs`'s `fa2_decode_leaves` resolves
-    // `int_buffer + int_base_bytes + off` once and answers the address. A
-    // parameter that reappeared here would be a base with nothing to offset.
+    // itself. `fa2_decode_leaves` resolved `int_buffer + int_base_bytes + off`
+    // once and answered the address; it is deleted, and the base is back --
+    // the launcher passes the RAW carve and `make_decode_params` adds
+    // `int_base_bytes` itself. A null there is what this file shipped for one
+    // commit, and it made every work-list pointer a small integer.
     //
     // INT BEFORE FLOAT WAS THE ASSERTION THAT STOOD HERE, on two same-typed
     // adjacent indices. Its successor is the leaf run below: sixteen
@@ -2646,10 +2666,11 @@ const _: () = {
     //
     // BOTH ROUNDS ARE SPENT NOW. The carve is still the thing to get right
     // and it is got right one hop earlier: `bind/table.rs`'s
-    // `fa2_prefill_leaves` reads `Cx::attn_prefill_workspace` and answers
-    // ADDRESSES, so no prefill launcher takes a base and none can be handed
-    // the decode one. What replaces these four assertions is the leaf run
-    // below, at the indices the bases and the aggregate vacated.
+    // `fa2_prefill_leaves` read `Cx::attn_prefill_workspace` and answered
+    // ADDRESSES. It is deleted: a launcher asks for its own carve now and the
+    // two families ask DIFFERENT keys -- `AttnPrefillWorkspace*` against
+    // `AttnWorkspace*` -- which is what keeps a prefill from being handed the
+    // decode base.
 
     // ── AND THE PAIR THAT WAS WORDLESS BECAUSE IT WAS TWO FACTS ──────────
     //
@@ -2717,162 +2738,37 @@ const _: () = {
     // The entry this line pinned is gone from the column: the
     // parameter it named left the signature when its fact stopped
     // being asked for as a parameter. See the routine.
+    // ── AND THE THIRTY-EIGHT LEAVES, ALL OF WHICH HAVE LEFT ─────────────
+    //
+    // TWO MACROS STOOD HERE, `decode_leaves!` over three decode launchers
+    // and `prefill_leaves!` over three prefill ones, and between them they
+    // pinned thirty-eight `Env<keys::Fa2*>` entries -- sixteen at 8..24 on
+    // decode, twenty-two at 9..31 on prefill -- each to the one key that
+    // belonged at its index. The hazard they were written for is real and
+    // worth restating: `Env<T>` is `Provenance::Env` for EVERY `T`, so a key
+    // on the wrong parameter type-checks, binds, and reads the neighbouring
+    // array, and on prefill four `*const i32` work lists ran consecutively at
+    // 9..15, where a swapped pair schedules a kernel against the wrong list
+    // with nothing anywhere saying so.
+    //
+    // ALL THIRTY-EIGHT PARAMETERS ARE GONE. Every fact they carried turned
+    // out to be one only the fire can answer, so each body asks its context
+    // instead, and an index that does not exist cannot be held to the key
+    // that used to sit at it. The retirement was done leaf by leaf and left
+    // thirty-eight identical epitaphs inside two macro bodies whose only
+    // surviving statement was `let d = <$sym as Derivation>::SOURCES;` --
+    // six expansions binding a name nothing read, which is what the six
+    // `unused variable: d` warnings were.
+    //
+    // WHAT STILL GUARDS THE COLUMN is the run of length assertions above and
+    // below this note. They say how many entries each signature derives, and
+    // that is now the whole of the claim, because the entries left are the
+    // buffers, whose types differ and which therefore cannot silently trade
+    // places the way thirty-eight same-shaped `Env` scalars could. The
+    // ordering hazard did not get fixed; the parameters it needed went away.
+    // If any of these facts is ever a parameter again, the macros belong
+    // back here -- git remembers them at the commit that removed this block.
 
-    // ── AND THE THREE THAT DID, LEAF BY LEAF ────────────────────────────
-    //
-    // Sixteen `Env<keys::Fa2Decode*>` at 8..24 on all three decode
-    // launchers, in one order. `Env<T>` is `Provenance::Env` for every `T`,
-    // so a key on the wrong parameter type-checks, binds, and reads the
-    // neighbouring array -- these assertions are the only thing that says
-    // WHICH index carries WHICH fact.
-    //
-    // The three run identically because `_lse` forwards its whole list to
-    // the plain launcher and `_capture` differs only after 24.
-    macro_rules! decode_leaves {
-        ($sym:ty) => {{
-            let d = <$sym as kernels::Derivation>::SOURCES;
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-        }};
-    }
-    decode_leaves!(dispatch_attention_flashinfer_decode);
-    decode_leaves!(dispatch_attention_flashinfer_decode_lse);
-    decode_leaves!(dispatch_attention_flashinfer_decode_capture);
-
-    // ── AND THE PLANNED PREFILL THREE, LEAF BY LEAF ─────────────────────
-    //
-    // Twenty-two `Env<keys::Fa2Prefill*>` at 9..31 on all three, in one
-    // order, one index later than decode's run because `qo_indptr` sits at
-    // four here. The hazard is decode's and worse: four `*const i32` work
-    // lists run consecutively at 9..15, so a swapped pair type-checks, binds,
-    // and schedules a kernel against the wrong array.
-    //
-    // `window_left` at 27 is `keys::Fa2PrefillWindowLeft` and NOT
-    // `keys::WindowLeft`: this is the window the split was sized against,
-    // read back off the plan, where the other is the statement's own. On the
-    // planned three they are the same number today and the keys are not the
-    // same fact -- a statement may state a window a plan was not built for,
-    // and the leaf is what the schedule actually indexes.
-    macro_rules! prefill_leaves {
-        ($sym:ty) => {{
-            let d = <$sym as kernels::Derivation>::SOURCES;
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-    // THE PARAMETER THIS PINNED HAS LEFT THE SIGNATURE. What it named is a
-    // fact only the fire can answer, so the body asks its context for it and
-    // there is no column entry left to hold in place.
-        }};
-    }
-    prefill_leaves!(dispatch_attention_flashinfer_prefill_bf16);
-    prefill_leaves!(dispatch_attention_flashinfer_prefill_capture_bf16);
-    prefill_leaves!(dispatch_attention_flashinfer_prefill_custom);
 
     // THE PREFILL HEAD AND TAIL. `lse` is `Env` on all three: no text of any
     // of these symbols declares a second result.

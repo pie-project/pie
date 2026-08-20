@@ -636,6 +636,8 @@ mod tests {
     /// `mlx-community`'s usual 4-bit publication of a gemma-3.
     fn binding() -> MetalBinding {
         MetalBinding {
+            qmm_partial_rows: false,
+            qmm_tile: None,
             quant_group: 64,
             quant_bits: 4,
             router_quant_group: 0,
@@ -731,6 +733,8 @@ mod tests {
     fn the_binding_half_is_still_the_familys() {
         let f = shape();
         let b = MetalBinding {
+            qmm_partial_rows: false,
+            qmm_tile: None,
             quant_group: 128,
             quant_bits: 8,
             router_quant_group: 0,

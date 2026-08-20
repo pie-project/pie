@@ -1025,6 +1025,8 @@ fn text_of(
     // `driver-vulkan` was taken against; `ANY_ENCODING` on the Metal side is
     // the same constant for the same reason.
     let binding = model::catalog::MetalBinding {
+        qmm_partial_rows: false,
+        qmm_tile: None,
         quant_group: 64,
         quant_bits: 4,
         router_quant_group: 0,
@@ -1345,6 +1347,8 @@ kv_pages = 64
     fn a_model_that_holds_a_recurrent_state_is_refused_before_it_is_staged() {
         use model::catalog::Deployed;
         let binding = model::catalog::MetalBinding {
+            qmm_partial_rows: false,
+            qmm_tile: None,
             quant_group: 64,
             quant_bits: 4,
             router_quant_group: 0,

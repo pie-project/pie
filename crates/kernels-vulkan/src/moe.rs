@@ -16,9 +16,9 @@
 //! group is meant to fail BY NAME. The two statements disagreed for as long
 //! as both were prose; the shader settles it.
 
-use kernels_macros::routine;
 use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, Out, Tensor, bf16, elementwise_rows, keys};
 use kernels::routine::Refusal;
+use kernels_macros::routine;
 
 /// The workgroup a routed matmul tile walks with, on both axes.
 ///
@@ -287,11 +287,16 @@ pub fn router_topk(
     n_experts: Const<u32>,
     experts_per_token: Const<u32>,
     softmax_over_all: Const<u32>,
-    logits_pitch: Const<u32>) -> Result<(), Refusal> {
+    logits_pitch: Const<u32>,
+) -> Result<(), Refusal> {
     let _per_expert_scale = ctx.absent()?;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("router_topk_bfloat16", ctx.best()), "router_topk_bfloat16").apply(router_grid(rows)?),
+        Fire::at(
+            crate::routine::module_path("router_topk_bfloat16", ctx.best()),
+            "router_topk_bfloat16",
+        )
+        .apply(router_grid(rows)?),
         &[
             logits.arg(),
             expert_ids.arg(),
@@ -330,10 +335,15 @@ pub fn router_topk_scaled(
     n_experts: Const<u32>,
     experts_per_token: Const<u32>,
     softmax_over_all: Const<u32>,
-    logits_pitch: Const<u32>) -> Result<(), Refusal> {
+    logits_pitch: Const<u32>,
+) -> Result<(), Refusal> {
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("router_topk_scaled_bfloat16", ctx.best()), "router_topk_scaled_bfloat16").apply(router_grid(rows)?),
+        Fire::at(
+            crate::routine::module_path("router_topk_scaled_bfloat16", ctx.best()),
+            "router_topk_scaled_bfloat16",
+        )
+        .apply(router_grid(rows)?),
         &[
             logits.arg(),
             expert_ids.arg(),
@@ -406,9 +416,14 @@ pub fn route_sort(
     tile_rows: Const<u32>,
     padded: Const<u32>,
     width: Const<u32>,
-    x_pitch: Const<u32>) -> Result<(), Refusal> {
+    x_pitch: Const<u32>,
+) -> Result<(), Refusal> {
     ctx.fire(
-        Fire::at(crate::routine::module_path("route_sort", ctx.best()), "route_sort").apply([SORT_LANES, 1, 1]),
+        Fire::at(
+            crate::routine::module_path("route_sort", ctx.best()),
+            "route_sort",
+        )
+        .apply([SORT_LANES, 1, 1]),
         &[
             expert_ids.arg(),
             perm.arg(),
@@ -461,7 +476,8 @@ pub fn route_gather(
     tile_rows: Const<u32>,
     padded: Const<u32>,
     width: Const<u32>,
-    x_pitch: Const<u32>) -> Result<(), Refusal> {
+    x_pitch: Const<u32>,
+) -> Result<(), Refusal> {
     // THE OPERAND'S OWN RECTANGLE, and not the `width` mark beside it. The two
     // are the same number for every text this tree writes; they are not the same
     // FACT. `x.width` is what the arena allocated and is what the grid must
@@ -470,7 +486,11 @@ pub fn route_gather(
     let x_width = x.width;
     let padded_rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("route_gather", ctx.best()), "route_gather").apply(elementwise_rows(x_width, padded_rows)?),
+        Fire::at(
+            crate::routine::module_path("route_gather", ctx.best()),
+            "route_gather",
+        )
+        .apply(elementwise_rows(x_width, padded_rows)?),
         &[
             x.arg(),
             out.arg(),
@@ -511,13 +531,18 @@ pub fn combine_sorted(
     // `ExpertCombineParams`'s three fields, in its order.
     width: Const<u32>,
     experts_per_token: Const<u32>,
-    out_pitch: Const<u32>) -> Result<(), Refusal> {
+    out_pitch: Const<u32>,
+) -> Result<(), Refusal> {
     // The OPERAND's rectangle, which is what the grid covers — see
     // [`route_gather`] for why that is not the `width` mark beside it.
     let y_width = y.width;
     let tokens = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("combine_sorted", ctx.best()), "combine_sorted").apply(elementwise_rows(y_width, tokens)?),
+        Fire::at(
+            crate::routine::module_path("combine_sorted", ctx.best()),
+            "combine_sorted",
+        )
+        .apply(elementwise_rows(y_width, tokens)?),
         &[
             y.arg(),
             expert_weights.arg(),
@@ -547,12 +572,23 @@ pub fn shared_expert_combine(
     routed: In<Tensor<bf16>>,
     shared: In<Tensor<bf16>>,
     gate: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    out: Out<Tensor<bf16>>,
+) -> Result<(), Refusal> {
     let width = routed.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("shared_expert_combine", ctx.best()), "shared_expert_combine").apply(combine_grid(width.unsigned_abs(), rows)?),
-        &[routed.arg(), shared.arg(), gate.arg(), out.arg(), width.arg()],
+        Fire::at(
+            crate::routine::module_path("shared_expert_combine", ctx.best()),
+            "shared_expert_combine",
+        )
+        .apply(combine_grid(width.unsigned_abs(), rows)?),
+        &[
+            routed.arg(),
+            shared.arg(),
+            gate.arg(),
+            out.arg(),
+            width.arg(),
+        ],
     )
 }
 
@@ -576,7 +612,8 @@ pub fn shared_expert_combine_strided(
     routed: In<Tensor<bf16>>,
     shared: In<Tensor<bf16>>,
     gate: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    out: Out<Tensor<bf16>>,
+) -> Result<(), Refusal> {
     let width = routed.width;
     // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<1>` named.
     // This body forwards `ctx.params()` as a STRUCT, so the run is the
@@ -585,7 +622,11 @@ pub fn shared_expert_combine_strided(
     let row_pitch = ctx.param(1)?;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("shared_expert_combine_strided", ctx.best()), "shared_expert_combine_strided").apply(combine_grid(width.unsigned_abs(), rows)?),
+        Fire::at(
+            crate::routine::module_path("shared_expert_combine_strided", ctx.best()),
+            "shared_expert_combine_strided",
+        )
+        .apply(combine_grid(width.unsigned_abs(), rows)?),
         &[
             routed.arg(),
             shared.arg(),
@@ -643,13 +684,18 @@ pub fn qmv_routed(
     x_slot_stride: Const<i32>,
     x_row_stride: Const<i32>,
     slots_per_row: Const<i32>,
-    expert_ids: In<Tensor<i32>>) -> Result<(), Refusal> {
+    expert_ids: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     let in_vec_size = x.width;
     let out_vec_size = y.width;
     let _bias = ctx.absent()?;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("affine_qmv_routed_bfloat16_gs_64_b_4", ctx.best()), "affine_qmv_routed_bfloat16_gs_64_b_4").apply(routed_qmv_grid(rows, out_vec_size, *slots_per_row)?),
+        Fire::at(
+            crate::routine::module_path("affine_qmv_routed_bfloat16_gs_64_b_4", ctx.best()),
+            "affine_qmv_routed_bfloat16_gs_64_b_4",
+        )
+        .apply(routed_qmv_grid(rows, out_vec_size, *slots_per_row)?),
         &[
             w.arg(),
             scales.arg(),
@@ -693,12 +739,17 @@ pub fn qmv_routed_bias(
     x_slot_stride: Const<i32>,
     x_row_stride: Const<i32>,
     slots_per_row: Const<i32>,
-    expert_ids: In<Tensor<i32>>) -> Result<(), Refusal> {
+    expert_ids: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     let in_vec_size = x.width;
     let out_vec_size = y.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("affine_qmv_routed_bias_bfloat16_gs_64_b_4", ctx.best()), "affine_qmv_routed_bias_bfloat16_gs_64_b_4").apply(routed_qmv_grid(rows, out_vec_size, *slots_per_row)?),
+        Fire::at(
+            crate::routine::module_path("affine_qmv_routed_bias_bfloat16_gs_64_b_4", ctx.best()),
+            "affine_qmv_routed_bias_bfloat16_gs_64_b_4",
+        )
+        .apply(routed_qmv_grid(rows, out_vec_size, *slots_per_row)?),
         &[
             w.arg(),
             scales.arg(),
@@ -756,13 +807,18 @@ pub fn mxfp4_qmv_routed_bias(
     x_slot_stride: Const<i32>,
     x_row_stride: Const<i32>,
     slots_per_row: Const<i32>,
-    expert_ids: In<Tensor<i32>>) -> Result<(), Refusal> {
+    expert_ids: In<Tensor<i32>>,
+) -> Result<(), Refusal> {
     let _biases = ctx.absent()?;
     let in_vec_size = x.width;
     let out_vec_size = y.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4", ctx.best()), "mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4").apply(routed_qmv_grid(rows, out_vec_size, *slots_per_row)?),
+        Fire::at(
+            crate::routine::module_path("mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4", ctx.best()),
+            "mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4",
+        )
+        .apply(routed_qmv_grid(rows, out_vec_size, *slots_per_row)?),
         &[
             w.arg(),
             scales.arg(),
@@ -802,18 +858,25 @@ pub fn qmm_t_routed(
     // the matvec's `row_expert` rides slot 1 so the operand list is the same
     // length either way. The mark is here because the SLOT is a position now:
     // without it `tile_expert` would bind input 1 and read row ids as tile ids.
-    #[allow(unused_variables)]
-    pad: In<Tensor<bf16>>,
+    #[allow(unused_variables)] pad: In<Tensor<bf16>>,
     tile_expert: In<Tensor<i32>>,
     group: Const<i32>,
     bits: Const<i32>,
     tile_m: Const<i32>,
-    tile_n: Const<i32>) -> Result<(), Refusal> {
+    tile_n: Const<i32>,
+) -> Result<(), Refusal> {
     let k = x.width;
     let n = y.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path(AFFINE_QMM[affine_qmm_point(*group, *bits, *tile_m, *tile_n)?], ctx.best()), AFFINE_QMM[affine_qmm_point(*group, *bits, *tile_m, *tile_n)?]).apply(routed_qmm_grid(rows, n, *tile_m, *tile_n)?),
+        Fire::at(
+            crate::routine::module_path(
+                AFFINE_QMM[affine_qmm_point(*group, *bits, *tile_m, *tile_n)?],
+                ctx.best(),
+            ),
+            AFFINE_QMM[affine_qmm_point(*group, *bits, *tile_m, *tile_n)?],
+        )
+        .apply(routed_qmm_grid(rows, n, *tile_m, *tile_n)?),
         &[
             w.arg(),
             scales.arg(),
@@ -849,16 +912,20 @@ pub fn qmm_t_routed_fp16(
     // the matvec's `row_expert` rides slot 1 so the operand list is the same
     // length either way. The mark is here because the SLOT is a position now:
     // without it `tile_expert` would bind input 1 and read row ids as tile ids.
-    #[allow(unused_variables)]
-    pad: In<Tensor<bf16>>,
+    #[allow(unused_variables)] pad: In<Tensor<bf16>>,
     tile_expert: In<Tensor<i32>>,
     tile_m: Const<i32>,
-    tile_n: Const<i32>) -> Result<(), Refusal> {
+    tile_n: Const<i32>,
+) -> Result<(), Refusal> {
     let k = x.width;
     let n = y.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path(FP16_QMM[tile_point(*tile_m, *tile_n)?], ctx.best()), FP16_QMM[tile_point(*tile_m, *tile_n)?]).apply(routed_qmm_grid(rows, n, *tile_m, *tile_n)?),
+        Fire::at(
+            crate::routine::module_path(FP16_QMM[tile_point(*tile_m, *tile_n)?], ctx.best()),
+            FP16_QMM[tile_point(*tile_m, *tile_n)?],
+        )
+        .apply(routed_qmm_grid(rows, n, *tile_m, *tile_n)?),
         &[
             w.arg(),
             scales.arg(),
@@ -899,16 +966,20 @@ pub fn mxfp4_qmm_t_routed_bias(
     // the matvec's `row_expert` rides slot 1 so the operand list is the same
     // length either way. The mark is here because the SLOT is a position now:
     // without it `tile_expert` would bind input 1 and read row ids as tile ids.
-    #[allow(unused_variables)]
-    pad: In<Tensor<bf16>>,
+    #[allow(unused_variables)] pad: In<Tensor<bf16>>,
     tile_expert: In<Tensor<i32>>,
     tile_m: Const<i32>,
-    tile_n: Const<i32>) -> Result<(), Refusal> {
+    tile_n: Const<i32>,
+) -> Result<(), Refusal> {
     let k = x.width;
     let n = y.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path(MXFP4_QMM[tile_point(*tile_m, *tile_n)?], ctx.best()), MXFP4_QMM[tile_point(*tile_m, *tile_n)?]).apply(routed_qmm_grid(rows, n, *tile_m, *tile_n)?),
+        Fire::at(
+            crate::routine::module_path(MXFP4_QMM[tile_point(*tile_m, *tile_n)?], ctx.best()),
+            MXFP4_QMM[tile_point(*tile_m, *tile_n)?],
+        )
+        .apply(routed_qmm_grid(rows, n, *tile_m, *tile_n)?),
         &[
             w.arg(),
             exponents.arg(),
@@ -988,11 +1059,7 @@ mod tests {
     }
 
     impl Encode for Seen {
-        fn resolve(
-            &self,
-            ty: kernels::Ty,
-            source: kernels::Source,
-        ) -> Result<ArgValue, Refusal> {
+        fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
             use kernels::keys::Fact;
             if source == <keys::Rows as Fact>::SOURCE {
                 return Ok(ArgValue::I32(self.rows.get()));
@@ -1013,7 +1080,11 @@ mod tests {
             // these tests build, and a positive tiling.
             if let kernels::Source::Slot(kernels::Kind::Param, n) = source {
                 return Ok(ArgValue::I32(
-                    self.words.borrow().get(usize::from(n)).copied().unwrap_or(4096),
+                    self.words
+                        .borrow()
+                        .get(usize::from(n))
+                        .copied()
+                        .unwrap_or(4096),
                 ));
             }
             if source == kernels::Source::Slot(kernels::Kind::Params, 0) {
@@ -1134,8 +1205,16 @@ mod tests {
         seen.rows.set(96);
         route_gather(
             &seen,
-            In { ptr: Tensor::<bf16>::new(0), rows: 96, width: 64 },
-            Out { ptr: Tensor::<bf16>::new(1), rows: 96, width: 64 },
+            In {
+                ptr: Tensor::<bf16>::new(0),
+                rows: 96,
+                width: 64,
+            },
+            Out {
+                ptr: Tensor::<bf16>::new(1),
+                rows: 96,
+                width: 64,
+            },
             In::new(Tensor::<i32>::new(2)),
             // The SORT'S seven words, which this statement carries whole --
             // three of them for the sort's benefit and not this kernel's.
@@ -1154,9 +1233,17 @@ mod tests {
         seen.rows.set(24);
         combine_sorted(
             &seen,
-            In { ptr: Tensor::<bf16>::new(0), rows: 24, width: 64 },
+            In {
+                ptr: Tensor::<bf16>::new(0),
+                rows: 24,
+                width: 64,
+            },
             In::new(Tensor::<bf16>::new(1)),
-            Out { ptr: Tensor::<bf16>::new(2), rows: 24, width: 64 },
+            Out {
+                ptr: Tensor::<bf16>::new(2),
+                rows: 24,
+                width: 64,
+            },
             In::new(Tensor::<i32>::new(4)),
             // `ExpertCombineParams`: width, experts_per_token, out_pitch.
             Const::new(64),
@@ -1187,8 +1274,16 @@ mod tests {
             Const::new(Tensor::<u32>::new(0)),
             Const::new(Tensor::<bf16>::new(1)),
             Const::new(Tensor::<bf16>::new(2)),
-            In { ptr: Tensor::<bf16>::new(3), rows: 3, width: 512 },
-            Out { ptr: Tensor::<bf16>::new(4), rows: 3, width: 256 },
+            In {
+                ptr: Tensor::<bf16>::new(3),
+                rows: 3,
+                width: 512,
+            },
+            Out {
+                ptr: Tensor::<bf16>::new(4),
+                rows: 3,
+                width: 256,
+            },
             // The stack's three strides, which the STATEMENT carries: the
             // fixture set them on `seen` while they were facts, and states
             // them here now. They precede `expert_ids`, as the signature has
@@ -1239,8 +1334,16 @@ mod tests {
             &seen,
             Const::new(Tensor::<u32>::new(0)),
             Const::new(Tensor::<u8>::new(1)),
-            In { ptr: Tensor::<bf16>::new(3), rows: 1, width: 512 },
-            Out { ptr: Tensor::<bf16>::new(4), rows: 1, width: 256 },
+            In {
+                ptr: Tensor::<bf16>::new(3),
+                rows: 1,
+                width: 512,
+            },
+            Out {
+                ptr: Tensor::<bf16>::new(4),
+                rows: 1,
+                width: 256,
+            },
             Const::new(Tensor::<bf16>::new(7)),
             // The stack's three strides, which the STATEMENT carries: the
             // fixture set them on `seen` while they were facts, and states
@@ -1284,8 +1387,16 @@ mod tests {
             &seen,
             Const::new(Tensor::<u32>::new(0)),
             Const::new(Tensor::<u8>::new(1)),
-            In { ptr: Tensor::<bf16>::new(2), rows: 32, width: 128 },
-            Out { ptr: Tensor::<bf16>::new(3), rows: 32, width: 64 },
+            In {
+                ptr: Tensor::<bf16>::new(2),
+                rows: 32,
+                width: 128,
+            },
+            Out {
+                ptr: Tensor::<bf16>::new(3),
+                rows: 32,
+                width: 64,
+            },
             Const::new(Tensor::<bf16>::new(4)),
             In::new(Tensor::<bf16>::new(5)),
             In::new(Tensor::<i32>::new(6)),
@@ -1328,8 +1439,16 @@ mod tests {
             Const::new(Tensor::<u32>::new(0)),
             Const::new(Tensor::<bf16>::new(1)),
             Const::new(Tensor::<bf16>::new(2)),
-            In { ptr: Tensor::<bf16>::new(3), rows: 65, width: 256 },
-            Out { ptr: Tensor::<bf16>::new(4), rows: 65, width: 192 },
+            In {
+                ptr: Tensor::<bf16>::new(3),
+                rows: 65,
+                width: 256,
+            },
+            Out {
+                ptr: Tensor::<bf16>::new(4),
+                rows: 65,
+                width: 192,
+            },
             In::new(Tensor::<bf16>::new(5)),
             In::new(Tensor::<i32>::new(6)),
             Const::new(128),
@@ -1352,8 +1471,16 @@ mod tests {
             Const::new(Tensor::<u32>::new(0)),
             Const::new(Tensor::<bf16>::new(1)),
             Const::new(Tensor::<bf16>::new(2)),
-            In { ptr: Tensor::<bf16>::new(3), rows: 65, width: 256 },
-            Out { ptr: Tensor::<bf16>::new(4), rows: 65, width: 192 },
+            In {
+                ptr: Tensor::<bf16>::new(3),
+                rows: 65,
+                width: 256,
+            },
+            Out {
+                ptr: Tensor::<bf16>::new(4),
+                rows: 65,
+                width: 192,
+            },
             In::new(Tensor::<bf16>::new(5)),
             In::new(Tensor::<i32>::new(6)),
             Const::new(128),
@@ -1378,10 +1505,26 @@ mod tests {
         seen.rows.set(9);
         shared_expert_combine(
             &seen,
-            In { ptr: Tensor::<bf16>::new(0), rows: 9, width: 512 },
-            In { ptr: Tensor::<bf16>::new(1), rows: 9, width: 512 },
-            In { ptr: Tensor::<bf16>::new(2), rows: 9, width: 512 },
-            Out { ptr: Tensor::<bf16>::new(3), rows: 9, width: 512 },
+            In {
+                ptr: Tensor::<bf16>::new(0),
+                rows: 9,
+                width: 512,
+            },
+            In {
+                ptr: Tensor::<bf16>::new(1),
+                rows: 9,
+                width: 512,
+            },
+            In {
+                ptr: Tensor::<bf16>::new(2),
+                rows: 9,
+                width: 512,
+            },
+            Out {
+                ptr: Tensor::<bf16>::new(3),
+                rows: 9,
+                width: 512,
+            },
         )
         .unwrap();
         assert_eq!(one(&seen).1, [512, 9, 1]);
@@ -1391,10 +1534,26 @@ mod tests {
         seen.row_pitch.set(4096);
         shared_expert_combine_strided(
             &seen,
-            In { ptr: Tensor::<bf16>::new(0), rows: 9, width: 512 },
-            In { ptr: Tensor::<bf16>::new(1), rows: 9, width: 512 },
-            In { ptr: Tensor::<bf16>::new(2), rows: 9, width: 512 },
-            Out { ptr: Tensor::<bf16>::new(3), rows: 9, width: 512 },
+            In {
+                ptr: Tensor::<bf16>::new(0),
+                rows: 9,
+                width: 512,
+            },
+            In {
+                ptr: Tensor::<bf16>::new(1),
+                rows: 9,
+                width: 512,
+            },
+            In {
+                ptr: Tensor::<bf16>::new(2),
+                rows: 9,
+                width: 512,
+            },
+            Out {
+                ptr: Tensor::<bf16>::new(3),
+                rows: 9,
+                width: 512,
+            },
         )
         .unwrap();
         let (_, lanes, args) = one(&seen);

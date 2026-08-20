@@ -209,10 +209,222 @@ pub struct Serving<'a> {
     /// The PLAN switches at two rows; the KERNEL does not. `model`'s
     /// `TokensMultipleOf(tile)` guard takes the GEMM only when the tile
     /// DIVIDES the row count, so a two-row step lowers to the matvec out of
-    /// the prefill text. Measured, the GEMM costs the same for one row as
-    /// for thirty-two — it computes a whole tile either way — and the
-    /// crossover against the matvec is near 150 rows on both this backend
-    /// and `driver-vulkan`.
+    /// the prefill text. The GEMM costs the same for one row as for
+    /// thirty-two — it computes a whole tile either way.
+    ///
+    /// **The crossover is between 16 and 32 rows, not near 150.** The 150
+    /// came from `how_long_a_decodes_kernels_take`'s switch sweep while it
+    /// was gridding the matvec by neither of the launcher's two rules — `m`
+    /// row groups instead of `ceil(m / PIE_MT)`, over half the output
+    /// columns. Re-measured with `quant::qmv_grid`'s own rule, a 1024x1024
+    /// affine plane at gs 64 / 4 bits:
+    ///
+    /// ```text
+    ///   m     qmv       qmm_t     tiled / matvec
+    ///   1     0.024 ms  0.078 ms  3.29
+    ///   2     0.026     0.077     2.93
+    ///   4     0.026     0.073     2.75
+    ///   8     0.040     0.078     1.95
+    ///   16    0.063     0.077     1.22
+    ///   32    0.110     0.078     0.71
+    ///   128   0.385     0.185     0.48
+    ///   512   1.497     0.664     0.44
+    /// ```
+    ///
+    /// Which leaves the guard well placed by luck AT THE BOTTOM: `bm = 32` is
+    /// about where the GEMM starts winning, so every SMALL batch it refuses is
+    /// a batch the matvec should have had anyway.
+    ///
+    /// # AND BADLY PLACED EVERYWHERE ELSE -- THE PREFILL CLIFF
+    ///
+    /// That sentence used to stop at "anyway", and read as a defence of the
+    /// guard. It is only a statement about counts BELOW the tile.
+    /// `TokensMultipleOf` refuses every count the tile does not divide, which
+    /// is thirty-one lengths in thirty-two AT EVERY SIZE, and a 500-token
+    /// prompt is not a batch the matvec should have had.
+    ///
+    /// Measured on this deployment, llama-3.2-1B q4 on an M4 Pro, `pp` at the
+    /// stated prompt length:
+    ///
+    /// ```text
+    ///   256   1256.8 tok/s      496    529.2 tok/s
+    ///   480   1236.9            500    528.5
+    ///   512   1238.4            504    528.5
+    ///   1024  1112.3            511    527.2
+    /// ```
+    ///
+    /// A hard cliff on `n % 32`, worth 2.34x, and it is the whole fire and not
+    /// a tail chunk: the guest chunks a prompt to `max_embed_length` (4096
+    /// here), so 500 tokens arrive as ONE fire of 500 rows and every
+    /// projection in it takes the matvec arm. The isolated bench says the same
+    /// ratio from the other side -- at m = 512 on a 1024x1024 plane, qmv is
+    /// 1.637 ms against the GEMM's 0.664, or 2.47x -- which is close enough to
+    /// the 2.34x measured here to identify the path with no profiler.
+    ///
+    /// ## What fixing it needs, which is why this is a comment and not a patch
+    ///
+    /// Three things, and the first two are worthless without the third:
+    ///
+    /// 1. A fact for "this backend's GEMM tolerates a row count its tile does
+    ///    not divide", so the text can state `TokensGT(tile - 1)` where the
+    ///    backend has said so. It cannot be unconditional: `kernels-metal` and
+    ///    `kernels-vulkan` have the same contract and no such tolerance.
+    /// 2. `Rule::Qmm` rounding the row axis up rather than refusing with
+    ///    `Ungeometric::PartialTile`.
+    /// 3. THE KERNEL ACTUALLY TOLERATING IT. This is the work. `qmm_t.wgsl`
+    ///    has no `M` argument at all -- `Params` is variant-shaped and carries
+    ///    `k` and `n` -- so `write_out` cannot bound its rows, and rounding
+    ///    the grid up today does what `forward/mod.rs` says it was measured
+    ///    doing: "a finite wrong answer plus a tile's worth of overrun into
+    ///    the next value".
+    ///
+    /// Doing 1 and 2 without 3 is not a slow model, it is a wrong one, which
+    /// is why the order matters more than the size.
+    ///
+    /// ## 1 AND 2 WERE TRIED. THEY ARE WRONG *AND* SLOWER -- DO NOT REPEAT
+    ///
+    /// Measured, not reasoned: `geometry::eval`'s `PartialTile` refusal was
+    /// disabled and all three `GuardPred::TokensMultipleOf(tile)` in
+    /// `llama_like/forward/mod.rs` were relaxed to `TokensGT(tile - 1)`, so
+    /// the GEMM ran with its grid rounded up and its stores unbounded.
+    ///
+    /// WRONG, as the contract says. Sixteen greedy tokens after a 496-token
+    /// prompt of one repeated id:
+    ///
+    /// ```text
+    ///   refusing (matvec)  [1109 x11, 323, 315, 323, 315, 323]
+    ///   rounded up (GEMM)  [92652, 11, 755, 11, 11, 198, 52, 11, ...]
+    /// ```
+    ///
+    /// The matvec continues the repetition, which is the answer; the rounded
+    /// GEMM is unrelated text, not a near miss.
+    ///
+    /// AND SLOWER, which was NOT predicted and is the more useful half:
+    ///
+    /// ```text
+    ///          refusing   rounded up
+    ///   pp512    1239.4      1239.4     (multiple: same path, control)
+    ///   pp480    1241.1      1241.1     (multiple: same path, control)
+    ///   pp500     528.5       136.1     3.9x SLOWER
+    ///   pp496     529.2        97.1     5.4x SLOWER
+    /// ```
+    ///
+    /// So the partial-tile GEMM is not a fast answer waiting behind a safety
+    /// check. At 496 rows it ran at about a TWELFTH of the 1240 tok/s the
+    /// same kernel reaches at 512 -- far past what sixteen wasted rows in
+    /// five hundred can explain, and the wasted fraction cannot explain 496
+    /// being slower than 500 either.
+    ///
+    /// ### The denormal hypothesis was wrong, and that is good news
+    ///
+    /// The guess was that the overhang rows stage whatever lies past the
+    /// activation, so the FMA pipeline runs on denormals and NaNs, which
+    /// Apple's GPU does not do at rate -- and therefore that a partial-tile
+    /// GEMM would need the STAGING loop zeroed and not merely its stores
+    /// bounded.
+    ///
+    /// `kernels-wgpu`'s `how_long_a_decodes_kernels_take` tests exactly that:
+    /// one launch, `m = 496` padded to 512, `(bm, bn) = (32, 64)`, `n = k =
+    /// 2048`, with ONLY the content of the sixteen overhang rows changed.
+    ///
+    /// ```text
+    ///   tail=zeros      1.690 ms      tail=NaN        1.691 ms
+    ///   tail=ones       1.692 ms      tail=infinity   1.693 ms
+    ///   tail=denormal   1.690 ms
+    /// ```
+    ///
+    /// Three thousandths of a millisecond across the whole range, at 2.54
+    /// TFLOP/s -- the same rate this tile reaches on aligned shapes. The
+    /// overhang costs its arithmetic and NOTHING else, whatever is in it.
+    ///
+    /// So the twelvefold end-to-end slowdown is NOT the GEMM. It is a
+    /// downstream consequence of the CORRUPTION: the unbounded stores run a
+    /// tile's worth of rows into the next value in the arena, and something
+    /// that reads that value afterwards is what got slow. Which means the
+    /// slowness and the wrongness are one bug and not two, and bounding the
+    /// stores is expected to fix both.
+    ///
+    /// That flips the recommendation. The fix is the three parts above --
+    /// there is no fourth -- and part 3 is worth doing.
+    ///
+    /// ### PART 3 IS DONE
+    ///
+    /// `Params` now ends with `m`, passed at all nineteen `qmm_t.wgsl` fire
+    /// sites in `kernels-wgpu::quant` (each already computed it via
+    /// `ctx.ask::<i32, keys::Rows>()` for the grid and simply dropped it),
+    /// and `write_out` returns on `row >= params.m`. No grid arithmetic
+    /// changed: `qmm_grid` always rounded up with `div_ceil`.
+    ///
+    /// It is proved, not asserted.
+    /// `kernels-wgpu`'s `a_tiled_gemm_agrees_over_every_tile_shape_and_
+    /// quantization_point` fires m = 33 over nine tiles and six codecs and
+    /// now checks the overhang still holds its sentinel. Remove the `row`
+    /// term and it reports 705 of 705 overhang values written, so the check
+    /// measures the guard and not the weather.
+    ///
+    /// And with parts 1 and 2 stubbed out by hand on top of it, the cliff
+    /// goes away:
+    ///
+    /// ```text
+    ///            refusing   unbounded GEMM   bounded GEMM
+    ///   pp512      1238.1           1239.4         1238.1
+    ///   pp496       529.2             97.1         1187.2
+    /// ```
+    ///
+    /// 2.24x, and the twelvefold slowdown was indeed the corruption.
+    ///
+    /// ### ALL THREE PARTS ARE NOW IN, AND THE CLIFF IS GONE
+    ///
+    /// `MetalBinding::qmm_partial_rows` is the fact, `true` at this
+    /// backend's seam alone; the projections' guard reads
+    /// `GuardPred::TokensGT(tile - 1)` where it is set; and `Rule::Qmm`
+    /// above no longer refuses. Measured on the shipped build:
+    ///
+    /// ```text
+    ///   pp480   1237.5        pp496   1208.6   (was 529.2)
+    ///   pp512   1232.9        pp500   1217.4   (was 528.5)
+    ///   pp1024  1099.6        pp495   1213.1
+    /// ```
+    ///
+    /// Flat. `pp2048` is 894.7 and `tg128` 113.0, both unmoved.
+    ///
+    /// ### WHAT THE CORRECTNESS EVIDENCE ACTUALLY IS
+    ///
+    /// In the kernel, it is exact: `a_tiled_gemm_agrees_over_every_tile_
+    /// shape_and_quantization_point` fires m = 33 across nine tiles and six
+    /// codecs against a host sum, and now also proves the overhang keeps its
+    /// sentinel.
+    ///
+    /// End to end it is a CONTROL and not a match, and the distinction is
+    /// worth writing down because the obvious reading of the raw numbers is
+    /// that this change broke the model. A live probe at 496 tokens answers
+    /// differently under the GEMM than under the matvec. That looks damning
+    /// until the same comparison is run at 512, where BOTH paths are legal:
+    ///
+    /// ```text
+    ///   512  matvec  [220, 16, 13, 15, 13, 15, ...]
+    ///   512  GEMM    [5113, 64, 11, 264, 198, 1494, ...]
+    /// ```
+    ///
+    /// They disagree completely at a length with no partial tile in it. The
+    /// two families agree only to about 5% of the row's peak -- the tolerance
+    /// `the_tiled_gemm_answers_the_way_the_vector_kernel_does` asserts -- and
+    /// a greedy argmax over a random-token prompt has no margin, so the
+    /// families part on the first token whatever the row count is.
+    ///
+    /// Against that control the partial-tile numbers are what a CORRECT
+    /// implementation gives: the GEMM answers at 495 and 512 are identical,
+    /// 496 and 500 stay in the same token vocabulary, and the matvec answers
+    /// at 496 and 512 are identical to each other. Each family is
+    /// self-consistent across the modulus; only the families differ.
+    ///
+    /// `the_tiled_gemm_answers_the_way_the_vector_kernel_does_at_a_partial_
+    /// tile` is the test that would settle it directly -- a real logit row at
+    /// 495 tokens, one family against the other, under the 5% claim. It SKIPS
+    /// on this machine for want of a bf16 checkpoint its loader can quantize.
+    /// Run it where one exists; it is the last thing owed on this change. Note the matvec is FLAT to four rows —
+    /// one workgroup carries `PIE_MT = 4` of them and reads the weights once
+    /// — and rises with the row groups after.
     pub prefill: &'a ForwardPlan,
     /// The model's shape, for the launch rules that need it.
     pub geometry: Geometry,
@@ -383,6 +595,169 @@ impl Serving<'_> {
         // ONE binding, two uses, deliberately: `prefill` picks the text AND is
         // half the cache key, and a cache keyed on a different rule than the
         // one that chose the plan would serve one text's graph for the other.
+        // # What a batched decode costs, measured
+        //
+        // This one-line decision is also the batching policy, and it was
+        // never measured against a real batch until it was. Timed on an M4
+        // Pro, Llama-3.2-1B at 4 bits, n concurrent conversations of a
+        // one-token prompt so that every step below is a DECODE and not a
+        // prefill chunk -- which is the distinction the first version of this
+        // note got wrong, by histogramming steps without separating them:
+        //
+        // | conversations | launches | ms a step | ms a token |
+        // |---|---|---|---|
+        // | 1 | 244 | 7.52 | 7.52 |
+        // | 2 | 244 | 12.99 | 6.50 |
+        // | 7 | 228 | 22.12 | 3.16 |
+        // | 8 | 228 | 23.39 | 2.92 |
+        //
+        // **THE SECOND CONVERSATION VERY NEARLY COSTS A WHOLE STEP**, 7.52 ms
+        // to 12.99, a 1.16x improvement per token. A decode reads the whole
+        // 4-bit weight set to serve one token and that read is the floor, so
+        // a second row should ride it nearly free. The served consequence,
+        // with a KV cache large enough that nothing queues: aggregate
+        // throughput saturates near 230 tok/s however many conversations are
+        // offered, against 117 for one.
+        //
+        // ## Where it goes, which is NOT this line
+        //
+        // The step's own phases say the fire: `low=0 stage=54us fire=12623us`.
+        // And the two-row fire dispatches the SAME 244 launches at the SAME
+        // grids as the one-row fire -- `affine_qmv_fast` at `[1, 2048, 1]`
+        // either way -- because `quant/qmv.wgsl` carries `PIE_MT = 4`
+        // activation rows inside one workgroup. Nothing got bigger. The work
+        // inside each workgroup did.
+        //
+        // Two things happen at once when `mt` leaves one, both in
+        // `reduce_store`:
+        //
+        // * The lane drops from `block_dot1` to `block_dot`, and only
+        //   `block_dot1` has the `unpack4x8unorm` nibble path. Two rows pay
+        //   three instructions a code where one row pays about one.
+        // * `block_dot` computes all FOUR row slots regardless. `vecs` is
+        //   clamped to the last live row, so a two-row fire multiplies row 1
+        //   three times and throws two of them away.
+        //
+        // So a 2-row decode does 4 rows of arithmetic on the slow unpack, and
+        // 1.73x of a one-row step is what that predicts.
+        //
+        // ## Which text an n-row fire actually takes
+        //
+        // Not what the line below reads like, and worth stating because it
+        // was got wrong twice. `prefill` here selects the PLAN; the kernel is
+        // then chosen inside it by `GuardPred::TokensMultipleOf(bm)`, which
+        // admits the tiled GEMM only when the tile DIVIDES the row count. No
+        // batch a scheduler gathers divides 32, so THE GEMM ARM NEVER RUNS IN
+        // SERVING and every step here is matvec however many rows it carries.
+        //
+        // Dumped at 8 concurrent conversations, 228 launches:
+        //
+        // ```text
+        //   32 x affine_qmv_fast          grid=[2, 128, 1]
+        //   16 x affine_qmv_fast          grid=[2, 512, 1]
+        //   32 x affine_qmv_fast          grid=[2, 2048, 1]
+        //    1 x affine_qmv_fast          grid=[2, 32064, 1]
+        //   32 x affine_qmv_fast_residual grid=[2, 512, 1]
+        //   16 x kv_append_paged          grid=[1, 8, 8]
+        //   16 x neox_freqs_mb            grid=[1, 8, 8]
+        //   16 x neox_freqs_mb            grid=[1, 32, 8]
+        //   33 x rms_single_row           grid=[8, 1, 1]
+        //   16 x sdpa_paged_decode        grid=[32, 8, 1]
+        //   16 x silu_mul                 grid=[256, 1, 1]
+        // ```
+        //
+        // Every grid carries the rows: qmv in x, at `ceil(rows / PIE_MT)`;
+        // rope and the KV append in z; the norm and `silu_mul` in x. No
+        // `affine_qmm_t` appears at all.
+        //
+        // The `2` in the qmv grids above is `ceil(8 / PIE_MT)` at the
+        // `PIE_MT = 4` this was dumped under. It reads `4` now that
+        // `PIE_MT` is 2 -- the same rows over twice the workgroups, which
+        // is the whole of that change. Nothing else in the table moves.
+        //
+        // 228 and not 244 because the SPLIT is off, not because the text
+        // changed: `rows * q_heads` is 256 against `PIE_SPLIT_BELOW = 128`,
+        // so the one-pass `sdpa_paged_decode` replaces the split/merge pair
+        // and saves a launch a layer. A one-row fire states the pair.
+        //
+        // ## HOW TO DUMP THIS WITHOUT BEING LIED TO
+        //
+        // `probe::dump` is ONE-SHOT and fires on the first launch list at or
+        // over `PIE_WGPU_DUMP`. The first such list is whatever the server
+        // happened to gather, and the first reading of this table was a
+        // ONE-ROW fire read as an eight-row one -- every qmv grid began `1`,
+        // which is exactly what "the grid does not carry the rows" looks
+        // like. Read the ROW COUNT off `neox_freqs_mb`'s z before believing
+        // any of it, and if it is not the count you asked for, dump repeatedly
+        // and take a later fire.
+        //
+        // ## What NOT to do about it
+        //
+        // Not "put the nibble path in `block_dot`": qmv.wgsl's own list of
+        // things measured worse already has that entry, for the four-row form,
+        // where the live registers cost more than the instructions save.
+        //
+        // ## What was done about it, and what is left
+        //
+        // The untried thing was an `mt == 2` arm with a two-row block dot --
+        // half the live registers of the rejected experiment, and no wasted
+        // slots. `qmv.wgsl` now has one (`block_dot2`), and it took the two-
+        // stream aggregate from 133.7 to 168.6 tok/s, +26%, with one-stream
+        // tg128 and pp512 unmoved. Its table lives there.
+        //
+        // The same discipline applied to `block_dot`'s four rows LOSES, at
+        // every concurrency and on the one-row path too; that is measured and
+        // recorded there as well. So rows 3 and 4 keep the four-slot form,
+        // and the next launch-count lever is fusion, not this kernel.
+        //
+        // ## Which fusion is NOT available, and why it is not one commit
+        //
+        // Both dense projection joins are closed to this deployment, and it
+        // is worth writing down which door each is behind so the next reader
+        // does not open two of the three and conclude it is close.
+        //
+        // `q‖k‖v` is closed on PURPOSE and should stay closed. The text used
+        // to branch on a `qkv_fused` fact and the fact cost a checkpoint:
+        // once `driver-metal` stopped building `LlamaLikeFacts` itself, the
+        // CATALOG row's answer reached the text, that row is CUDA's, it says
+        // `true` on all eight llama-3 rows, and llama-3.2-1B died on
+        // `Unbound { symbol: "affine_qmv_fast_bfloat16_gs_64_b_4", why:
+        // UnknownWeight("layer.0.qkv") }`. `forward/mod.rs` states the three
+        // projections unconditionally now and says all of that in place.
+        //
+        // `gate‖up` is closed by THREE independent gates, and a change that
+        // clears fewer than all three gets a slower model, not a broken one,
+        // which is the failure mode that wastes an afternoon:
+        //
+        //   1. `builder.rs::dense_fused_projection_joins` returns early on
+        //      `Projections::InPlace`, and `compile_load_plan` authors every
+        //      MLX load with it.
+        //   2. `fused_join_candidate` takes a part only if
+        //      `is_raw(&raw.encoding, DType::BF16)`. THIS one is the wall.
+        //      An affine-u4 bank is a u32 weight plane with `.scales` and
+        //      `.biases` siblings, so the candidate is `None` before the
+        //      policy is ever consulted -- the join has no notion of
+        //      concatenating three planes per part, and giving it one is the
+        //      real work. (It is SOUND to concatenate them here, since both
+        //      banks are row-sharded and share a group size, but sound is
+        //      not written.)
+        //   3. `forward/mod.rs` ASSERTS `!metal.gate_up_fused`: there is no
+        //      packed arm in the Metal-side text, because `silu_mul` takes
+        //      gate and up as two buffers and nothing splits a packed bank.
+        //      A wgpu `silu_mul` reading one bank at an offset is the easy
+        //      part of this.
+        //
+        // So it is a model-crate change (a quantization-aware join), a
+        // shared-text change (the packed arm, currently asserted against),
+        // and a kernel -- for 16 launches of 244. Worth doing, not worth
+        // starting without the isolated bench wired up to confirm it, and
+        // NOT reachable from inside `driver-wgpu` alone, which is what the
+        // earlier "the next lever is fusion" line failed to say.
+        //
+        // And not this threshold. Moving it only trades one bad regime for
+        // the other: below 4 rows a step is qmv with three quarters of its
+        // slots idle, and at 4 and above it is a GEMM tiled 32x32 with seven
+        // eighths of a tile idle. A served deployment lives in the gap.
         let prefill = frame.rows() > 1;
         let plan = if prefill { self.prefill } else { self.plan };
         // Derived on the first step of a shape and kept: `lower` is a pure
@@ -417,9 +792,13 @@ impl Serving<'_> {
             .state(device, crate::binding::FireTable::TokenIds, &ids)
             .map_err(Unstepped::Failed)?;
 
-        let arena = device
-            .zeroed(low.arena_bytes as u64)
+        // FROM THE POOL. The allocation is handed back when `held` drops at
+        // the end of this function, which is what keeps the bind-group cache
+        // keyed on it warm from one token to the next.
+        let held_arena = device
+            .arena(low.arena_bytes as u64)
             .map_err(Unstepped::Failed)?;
+        let arena = held_arena.buffer();
         let model = Model {
             weights: held.weights,
             pool: held.pool,
@@ -432,7 +811,7 @@ impl Serving<'_> {
             low,
             Fire {
                 arena: crate::binding::Arena {
-                    buffer: &arena,
+                    buffer: arena,
                     bytes: low.arena_bytes as u64,
                 },
                 resolver: &model,
@@ -442,17 +821,18 @@ impl Serving<'_> {
                 prefix: self.prefix,
             },
         );
-        // The arena is dropped when this function returns, on both paths, which
-        // is what `driver-vulkan`'s explicit `device.free(arena)` on both sides
-        // of the `?` is standing in for. Nothing here can leak it, and nothing
-        // here can free it early either -- the read below still names it.
+        // The arena is handed back to the device's pool when this function
+        // returns, on both paths, which is what `driver-vulkan`'s explicit
+        // `device.free(arena)` on both sides of the `?` is standing in for.
+        // Nothing here can leak it, and nothing here can release it early
+        // either -- the read below still names it.
         let (fired, readout) = ran.map_err(Unstepped::Unfired)?;
-        let logits = logits(device, &arena, low, &readout).map_err(Unstepped::Unread)?;
+        let logits = logits(device, arena, low, &readout).map_err(Unstepped::Unread)?;
         // AFTER the fire and before the arena is dropped, which is the only
         // window it exists in.
         let kept = if self.keep_arena {
             device
-                .read_at(&arena, 0, low.arena_bytes as u64)
+                .read_at(arena, 0, low.arena_bytes as u64)
                 .map_err(Unstepped::Failed)?
         } else {
             Vec::new()

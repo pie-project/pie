@@ -22,7 +22,7 @@ use crate::jit::abi::MaybeConst;
 use crate::jit::abi::Tensor;
 use kernels::Refusal;
 use kernels::keys;
-use kernels::routine::{Asks, Const, In, Out};
+use kernels::routine::{Asks, In, Out};
 
 /// A device address held as an opaque word.
 pub use crate::jit::abi::DevicePtr;

@@ -19,25 +19,6 @@ use kernels::routine::Refusal;
 
 use crate::routine::{Asks, Bind, Const, Ctx, Fire, InOut, Tensor, bf16, keys};
 
-/// The shaders this family's routines reach: `(file, entrypoint)`, one pair
-/// per instantiated name.
-///
-/// A row's `axes` GENERATED these names and its `file` column said where they
-/// live. Retiring the row moved who NAMES them, not what exists -- the shader
-/// is still compiled and still dispatched -- so the pairs are stated here and
-/// [`crate::entrypoints`] reads them back. The FILE rides along because Metal
-/// compiles from `(path, entry name)` at run time, and `device_kernels.rs`
-/// builds every one of them against a real device; a name without its file
-/// would leave that sweep nothing to open. See [`crate::RETIRED`].
-pub static ENTRYPOINTS: &[(&str, &str)] = &[
-    ("rope/neox.metal", "neox_decode_bfloat16"),
-    ("rope/neox.metal", "neox_freqs_decode_bfloat16"),
-    ("rope/neox.metal", "neox_freqs_mb_bfloat16"),
-    ("rope/neox.metal", "neox_mb_bfloat16"),
-    ("rope/neox.metal", "neox_prop_decode_bfloat16"),
-    ("rope/neox.metal", "neox_prop_mb_bfloat16"),
-    ("rope/neox.metal", "neox_strided_bfloat16"),
-];
 
 /// The rotation's grid: one thread per PAIR, per head, per row.
 ///
@@ -386,7 +367,6 @@ mod tests {
         calls: RefCell<Vec<Call>>,
         positions: Cell<u32>,
         rows: Cell<i32>,
-        row_pitch: Cell<i32>,
     /// The fire's rope frequency table, as a handle.
     inv_freq: Cell<u32>,
     }
@@ -397,7 +377,6 @@ mod tests {
                 calls: RefCell::default(),
                 positions: Cell::new(2),
                 rows: Cell::new(4),
-                row_pitch: Cell::new(4096),
                 // The fire's frequency table, which `neox_freqs_*` asks for.
                 inv_freq: Cell::new(3),
             }

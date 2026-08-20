@@ -43,6 +43,22 @@
 @group(0) @binding(8) var<storage, read_write> attention_mask: array<u32>;
 @group(0) @binding(9) var<storage, read_write> attention_mask_enabled: array<u32>;
 @group(0) @binding(10) var<storage, read_write> sinks: array<u32>;
+//#if defined(PIE_SPLITK)
+// THE SPLIT'S PARTIAL SOFTMAX STATES, and the only buffer in this file that
+// belongs to neither the statement nor the model.
+//
+// It is the FIRE's, handed over as `keys::AttnScratch` the way the page CSR
+// and the rope ladder are, because a split of the key range is a decision
+// this backend makes about ITS occupancy and no authored trace should have to
+// know it happened. `f32` and not bf16: these are a running maximum and a
+// denominator, and rounding them to eight mantissa bits before the merge
+// would lose exactly the precision the online recurrence exists to keep.
+//
+// `2 + PIE_HEAD_DIM` floats per (row, query head, split), laid out in that
+// order so that one split's whole state is contiguous and the merge below
+// walks it with a stride it can hoist.
+@group(0) @binding(11) var<storage, read_write> pie_split_state: array<f32>;
+//#endif
 
 // The row's scalars in ROW order, at 0, 4, 8, 12, 16 and 20 -- and 24 under
 // `PIE_TILED`. All four bytes wide, so this block is the one place in the
@@ -76,6 +92,22 @@ struct Params {
     q_row_pitch: i32,
     o_row_pitch: i32,
 //#endif
+//#endif
+//#if defined(PIE_SPLITK)
+    // How many ways the key range is cut. At offset 24, which is where
+    // `PIE_TILED`'s `n_rows` sits -- the two are mutually exclusive arms and
+    // neither variant compiles the other's scalar, so the offset is reused
+    // rather than shared.
+    //
+    // A COUNT AND NOT A LENGTH. The kernel cannot be told how many keys a row
+    // has: that is the page CSR's answer and it is per REQUEST, while a fire
+    // launches one grid for every row it carries. So the host states how many
+    // slices to cut and each workgroup derives its own from the row's own
+    // `q_pos`, which means a short row simply leaves some splits empty. An
+    // empty split writes the identity of the merge -- `PIE_SDPA_NEG_INF`, a
+    // zero denominator and a zero accumulator -- so the combine needs no
+    // count of which ones were live.
+    splits: i32,
 //#endif
 }
 @group(1) @binding(0) var<uniform> params: Params;
@@ -284,15 +316,38 @@ const PIE_KB: u32 = 256u / PIE_PAIRS;
 // cheaply as one, so the tree folds `PIE_KR` blocks at a time and the barrier
 // count falls by the same factor.
 //
-// Eight, not four: the value staging that used to sit beside the scores is
-// gone (see the y-axis note in `decode_row`), so the budget it held pays for
-// twice the blocking instead. `PIE_KB * PIE_PAIRS` is 256 at every
-// instantiated head dim, so the score array is `PIE_KR` KiB everywhere -- 8
-// KiB, plus 2 KiB of merge state, against the 16352-byte floor `wgpu`'s
-// downlevel defaults guarantee. Sixteen does not fit that floor.
+// `PIE_KB * PIE_PAIRS` is 256 at every instantiated head dim, so the score
+// array is `PIE_KR` KiB everywhere, plus 2 KiB of merge state, against the
+// 16352-byte floor `wgpu`'s downlevel defaults guarantee. Sixteen does not
+// fit that floor at all.
 //
-// Measured at 8 against 4: decode 102.9 -> 104.0 tok/s at 512 context and
-// 71.2 -> 74.0 at 2048.
+// THIS IS A RESIDENCY LIMIT, NOT A BARRIER-COUNT ONE, which is the whole
+// reason it is not simply as large as it fits. Apple's GPU splits a fixed
+// threadgroup-memory budget between the workgroups it keeps resident on a
+// core, and this kernel is only 32 workgroups wide to begin with -- one per
+// query head -- so a workgroup that claims more memory takes away the only
+// thing there was to run while a key load is in flight. Swept whole, every
+// point correct at all 56 gpu tests:
+//
+//   PIE_KR   workgroup memory   tg128   tg256@2048
+//        2              4 KiB   104.0         71.8
+//        4              6 KiB   109.2         73.3
+//        8             10 KiB   110.4         75.3
+//       12             14 KiB    80.1         63.2
+//
+// Two is too few barriers-worth of work and twelve falls off the residency
+// cliff, so the peak is interior and it is at EIGHT -- the most memory a
+// workgroup can hold while two of them still fit a core.
+//
+// READ THE 2048 COLUMN MORE THAN ONCE. A single run at `PIE_KR = 4` read
+// 77.4 there and would have carried the decision; four more runs of the same
+// binary read 73.2, 73.5, 73.0 and 73.5. The long-context bench is one
+// sequence and one sample, and its spread is several percent -- wide enough
+// to invert this table's top two rows. The 512 column is stable to a tenth.
+//
+// This is the same occupancy wall `quant/qmv.wgsl`'s column count found from
+// the other side. Do not raise either without measuring: the arithmetic
+// argument says go up and the machine says no.
 const PIE_KR: u32 = 8u;
 const PIE_KSPAN: u32 = PIE_KR * PIE_KB;
 var<workgroup> pie_sdpa_part: array<f32, PIE_KSPAN * PIE_PAIRS>;
@@ -306,7 +361,11 @@ var<workgroup> pie_sdpa_macc: array<vec2<f32>, PIE_KB * PIE_PAIRS>;
 var<workgroup> pie_sdpa_mmax: array<f32, PIE_KB>;
 var<workgroup> pie_sdpa_msum: array<f32, PIE_KB>;
 
-fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32) {
+// `sp` and `n_splits` are the SLICE of this row's keys this workgroup owns.
+// One and zero is the whole range, which is the unsplit kernel exactly; the
+// split arm dispatches `n_splits` workgroups per (row, head) and each takes
+// its own slice, leaving the merge to `PIE_COMBINE`.
+fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32, sp: u32, n_splits: u32) {
     let d_out = lane * 2u;
     let req = req_of_token[row];
     let q_pos = position_ids[row];
@@ -319,6 +378,23 @@ fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32) {
     let q_base = q_base_for(row, q_head, n_q_heads);
     let o_base = o_base_for(row, q_head, n_q_heads);
     let kv_head = i32(q_head) / params.gqa_factor;
+
+    // THIS SPLIT'S SLICE, rounded to whole `PIE_KSPAN` blocks.
+    //
+    // Rounded, and not divided evenly, because the block is the unit the loop
+    // below stages and folds: a boundary that cut one would leave a partial
+    // block at both ends of it and the `kn` clamp would have to know about
+    // two limits instead of one. The cost is that the last split can be
+    // empty, which costs a workgroup that exits immediately.
+    //
+    // At `n_splits == 1` this is `[start, q_pos]` -- the whole range, no
+    // arithmetic changed -- which is what makes the unsplit arm and the split
+    // arm one body.
+    let span = q_pos + 1 - start;
+    let per = (span + i32(n_splits) - 1) / i32(n_splits);
+    let per_blocks = ((per + i32(PIE_KSPAN) - 1) / i32(PIE_KSPAN)) * i32(PIE_KSPAN);
+    let lo = start + i32(sp) * per_blocks;
+    let hi = min(q_pos, lo + per_blocks - 1);
 
     // # Three things measured here and NOT done, so nobody re-measures them
     //
@@ -407,9 +483,9 @@ fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32) {
     // online update -- the tree's shape and the order the keys update the
     // running max are exactly as they were -- it just stops paying the
     // rendezvous seven times out of eight.
-    var kp0 = start;
-    while (kp0 <= q_pos) {
-        let kn = min(i32(PIE_KSPAN), q_pos + 1 - kp0);
+    var kp0 = lo;
+    while (kp0 <= hi) {
+        let kn = min(i32(PIE_KSPAN), hi + 1 - kp0);
         // ONE KEY PER Y LANE. The block's keys are loaded and dotted at the
         // same time rather than one after another, which is the whole point of
         // the second workgroup axis: this kernel dispatches one workgroup per
@@ -506,6 +582,27 @@ fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32) {
         sum_exp = sum_exp * history_scale + pie_sdpa_msum[t] * other_scale;
         acc = acc * history_scale + other_scale * pie_sdpa_macc[t * PIE_PAIRS + lane];
     }
+//#if defined(PIE_SPLITK)
+    // STOP HERE AND STATE THE PARTIAL. No sink and no normalization: both are
+    // functions of the FINAL denominator, and this workgroup has only its own
+    // slice's. `PIE_COMBINE` does them once, after the states meet.
+    //
+    // Written unconditionally, including by a split whose slice was empty --
+    // the identity of the merge, which is what saves the combine from needing
+    // to know how many splits were live. Stale state from the previous layer
+    // sitting in an unwritten slot would otherwise be read as attention.
+    let stride = 2u + PIE_HEAD_DIM;
+    let base = ((row * n_q_heads + q_head) * n_splits + sp) * stride;
+    if (ky == 0u) {
+        if (lane == 0u) {
+            pie_split_state[base] = max_score;
+            pie_split_state[base + 1u] = sum_exp;
+        }
+        pie_split_state[base + 2u + d_out] = acc.x;
+        pie_split_state[base + 3u + d_out] = acc.y;
+    }
+}
+//#else
 //#if defined(PIE_WITH_SINK)
     let merged = pie_sdpa_merge_sink(sink_at(q_head), max_score, sum_exp);
     acc = acc * merged.output_scale;
@@ -519,6 +616,7 @@ fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32) {
     // writes it. The redundancy is `PIE_KB` fused multiply-adds, once per row.
     if (ky == 0u && at < arrayLength(&out_)) { out_[at] = pie_pack_bf16(norm.x, norm.y); }
 }
+//#endif
 
 //#endif
 
@@ -630,14 +728,87 @@ fn main(
 
 //#else
 
+//#if defined(PIE_COMBINE)
+
+// THE SECOND HALF OF THE SPLIT: merge what the slices left.
+//
+// One workgroup per (row, query head) and `PIE_PAIRS` lanes in it, which is
+// the same width the split arm's x axis has -- a lane owns the same channel
+// pair here that it accumulated there, so its two accumulator floats are the
+// only ones it reads.
+//
+// No workgroup memory and no barrier. The running max and the denominator are
+// scalars every lane needs, and reading them from storage `n_splits` times per
+// lane is cheaper than a rendezvous to share them: they are two floats at the
+// head of a state the lane is already reading.
+//
+// The merge is the same online-softmax fold the split arm ends with, over
+// `n_splits` states instead of `PIE_KB` -- and it is exact for the same
+// reason. Merging softmax states over a disjoint cover of the keys gives the
+// numerator and denominator of one pass over the union, which is what
+// flash-decoding rests on.
+@compute @workgroup_size(PIE_PAIRS, 1)
+fn main(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
+    let q_head = wg.x;
+    let row = wg.y;
+    let lane = lid.x;
+    let n_q_heads = groups.x;
+    let d_out = lane * 2u;
+    let n_splits = max(u32(params.splits), 1u);
+    let stride = 2u + PIE_HEAD_DIM;
+
+    var max_score = PIE_SDPA_NEG_INF;
+    var sum_exp = 0.0;
+    var acc = vec2<f32>(0.0, 0.0);
+    for (var t = 0u; t < n_splits; t = t + 1u) {
+        let base = ((row * n_q_heads + q_head) * n_splits + t) * stride;
+        let other_max = pie_split_state[base];
+        // Both are the floor until a slice with keys arrives, and that floor
+        // is FINITE for the reason the online include's header gives:
+        // `exp(-inf - -inf)` is NaN where `exp(0)` is 1.
+        let merged_max = max(max_score, other_max);
+        let history_scale = exp(max_score - merged_max);
+        let other_scale = exp(other_max - merged_max);
+        max_score = merged_max;
+        sum_exp = sum_exp * history_scale + pie_split_state[base + 1u] * other_scale;
+        let other = vec2<f32>(
+            pie_split_state[base + 2u + d_out],
+            pie_split_state[base + 3u + d_out],
+        );
+        acc = acc * history_scale + other_scale * other;
+    }
+
+    var norm = acc;
+    if (sum_exp != 0.0) { norm = acc / sum_exp; }
+    let o_base = o_base_for(row, q_head, n_q_heads);
+    let at = (o_base + d_out) >> 1u;
+    if (at < arrayLength(&out_)) { out_[at] = pie_pack_bf16(norm.x, norm.y); }
+}
+
+//#else
+
 @compute @workgroup_size(PIE_PAIRS, PIE_KB)
 fn main(
     @builtin(workgroup_id) wg: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(num_workgroups) groups: vec3<u32>,
 ) {
-    decode_row(wg.y, wg.x, lid.x, lid.y, groups.x);
+//#if defined(PIE_SPLITK)
+    // THE SPLIT ON Z. The x and y axes are the unsplit arm's exactly -- one
+    // workgroup per query head, one per row -- so only the third axis is new,
+    // and `num_workgroups.z` is where the count comes from rather than a
+    // second reading of the scalar.
+    decode_row(wg.y, wg.x, lid.x, lid.y, groups.x, wg.z, groups.z);
+//#else
+    decode_row(wg.y, wg.x, lid.x, lid.y, groups.x, 0u, 1u);
+//#endif
 }
+
+//#endif
 
 //#endif
 
@@ -649,6 +820,17 @@ fn main(
 // pie:instantiate sdpa_paged_decode_bfloat16_d_128_p32 PIE_HEAD_DIM=128 PIE_PAGE_SIZE=32 PIE_FAST_FULL=1
 // pie:instantiate sdpa_paged_decode_bfloat16_d_64_p32_sg8 PIE_HEAD_DIM=64 PIE_PAGE_SIZE=32 PIE_FAST_FULL=1 PIE_SHORT_GROUP=8
 // pie:instantiate sdpa_paged_decode_sink_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_WITH_SINK=1
+// The split pair, at the widths a decode reaches. No sink point: a sink is a
+// logit that joins the FINAL softmax, so it belongs to the combine arm alone,
+// and no deployment with sinks has yet been narrow enough to want the split.
+// pie:instantiate sdpa_paged_decode_split_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_SPLITK=1
+// pie:instantiate sdpa_paged_decode_split_bfloat16_d_128 PIE_HEAD_DIM=128 PIE_SPLITK=1
+// pie:instantiate sdpa_paged_decode_split_bfloat16_d_256 PIE_HEAD_DIM=256 PIE_SPLITK=1
+// pie:instantiate sdpa_paged_decode_split_bfloat16_d_512 PIE_HEAD_DIM=512 PIE_SPLITK=1
+// pie:instantiate sdpa_paged_decode_merge_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_SPLITK=1 PIE_COMBINE=1
+// pie:instantiate sdpa_paged_decode_merge_bfloat16_d_128 PIE_HEAD_DIM=128 PIE_SPLITK=1 PIE_COMBINE=1
+// pie:instantiate sdpa_paged_decode_merge_bfloat16_d_256 PIE_HEAD_DIM=256 PIE_SPLITK=1 PIE_COMBINE=1
+// pie:instantiate sdpa_paged_decode_merge_bfloat16_d_512 PIE_HEAD_DIM=512 PIE_SPLITK=1 PIE_COMBINE=1
 // pie:instantiate sdpa_paged_tiled_bfloat16_d_64 PIE_HEAD_DIM=64 PIE_TILED=1
 // pie:instantiate sdpa_paged_tiled_bfloat16_d_128 PIE_HEAD_DIM=128 PIE_TILED=1
 // pie:instantiate sdpa_paged_tiled_bfloat16_d_256 PIE_HEAD_DIM=256 PIE_TILED=1

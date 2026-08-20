@@ -4,9 +4,9 @@
 //! (`.wiki/kernel-x/vulkan-refactor.md` §6 step 1), chosen because it is one
 //! kernel and so is the smallest thing that can prove the whole surface.
 
-use kernels_macros::routine;
 use crate::routine::{Asks, Bind, Ctx, Fire, In, Out, Tensor, bf16, keys};
 use kernels::routine::Refusal;
+use kernels_macros::routine;
 
 /// `sample/argmax.slang:11` — `#define PIE_GROUP_X 1024`.
 ///
@@ -40,14 +40,19 @@ pub fn argmax_logits(
     logits: In<Tensor<bf16>>,
     next_token: Out<Tensor<u32>>,
     params: In<Tensor<bf16>>,
-    eos_flag: Out<Tensor<u32>>) -> Result<(), Refusal> {
+    eos_flag: Out<Tensor<u32>>,
+) -> Result<(), Refusal> {
     let rows = ctx.ask::<u32, keys::Rows>()?;
     if rows == 0 {
         return Err(Refusal::Empty { what: "rows" });
     }
     // `group.y` is the row, and x carries the one workgroup that reduces it.
     ctx.fire(
-        Fire::at(crate::routine::module_path("argmax_logits_bfloat16", ctx.best()), "argmax_logits_bfloat16").apply([GROUP_X, rows, 1]),
+        Fire::at(
+            crate::routine::module_path("argmax_logits_bfloat16", ctx.best()),
+            "argmax_logits_bfloat16",
+        )
+        .apply([GROUP_X, rows, 1]),
         &[logits.arg(), next_token.arg(), params.arg(), eos_flag.arg()],
     )
 }

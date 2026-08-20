@@ -55,9 +55,21 @@ template <typename T>
     const device uint* w_page            [[buffer(13)]],  // explicit/normalized physical destination
     const device uint* w_off             [[buffer(14)]],  // explicit/normalized in-page offset
     // Elements between one token's k_new/v_new row and the next, 0 meaning the
-    // packed [N, n_kv_heads, head_dim] a batched decode hands over. A prefill's
-    // rows sit in the scratch arena at its one common pitch, which for this
-    // family is several times as wide as a kv row.
+    // packed [N, n_kv_heads, head_dim] layout.
+    //
+    // NOBODY PASSES A NONZERO ONE. `kernels-metal`'s `kv_append_paged` is the
+    // only thing that binds this slot and it states 0; the Vulkan and WGSL
+    // siblings of this kernel do not declare the parameter at all, and their
+    // prefills append through the packed layout like everything else. So the
+    // branch below has one live arm, and this is a hook rather than a feature.
+    //
+    // It was written for a prefill whose rows sit in the scratch arena at that
+    // arena's one common pitch -- several times as wide as a kv row -- and
+    // reading the note as though that case were HANDLED is the mistake to
+    // avoid. Handling it needs a caller that knows the pitch, and on this
+    // plane a routine's `In` carries `rows` and `width` and no stride; see
+    // `kernels-cuda`'s `kimi_mla`, where the same distinction is a region
+    // field and a `Refusal::Narrow`.
     const constant int& src_row_stride   [[buffer(15)]],
     uint3 tid [[thread_position_in_grid]]) {
   const int d = int(tid.x);   // channel within head_dim

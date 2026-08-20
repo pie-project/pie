@@ -1133,6 +1133,9 @@
             "layer.0.mamba_a_log",
             "layer.0.mamba_d",
             "layer.0.mamba_dt_bias"
+          ],
+          "params": [
+            16
           ]
         }
       },
@@ -1168,7 +1171,14 @@
           "state": {
             "store": "RecurrentState",
             "layer": 0
-          }
+          },
+          "params": [
+            16,
+            64,
+            128,
+            8,
+            3072
+          ]
         }
       },
       "inputs": [
@@ -1569,6 +1579,9 @@
             "layer.2.mamba_a_log",
             "layer.2.mamba_d",
             "layer.2.mamba_dt_bias"
+          ],
+          "params": [
+            16
           ]
         }
       },
@@ -1604,7 +1617,14 @@
           "state": {
             "store": "RecurrentState",
             "layer": 2
-          }
+          },
+          "params": [
+            16,
+            64,
+            128,
+            8,
+            3072
+          ]
         }
       },
       "inputs": [
@@ -2312,6 +2332,9 @@
             "layer.4.mamba_a_log",
             "layer.4.mamba_d",
             "layer.4.mamba_dt_bias"
+          ],
+          "params": [
+            16
           ]
         }
       },
@@ -2347,7 +2370,14 @@
           "state": {
             "store": "RecurrentState",
             "layer": 4
-          }
+          },
+          "params": [
+            16,
+            64,
+            128,
+            8,
+            3072
+          ]
         }
       },
       "inputs": [

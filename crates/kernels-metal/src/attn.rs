@@ -14,82 +14,6 @@ use kernels::routine::Refusal;
 
 use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, InOut, Out, Tensor, Usize, bf16, elementwise, elementwise_rows, keys};
 
-/// The shaders this family's routines reach: `(file, entrypoint)`, one pair
-/// per instantiated name.
-///
-/// A row's `axes` GENERATED these names and its `file` column said where they
-/// live. Retiring the row moved who NAMES them, not what exists -- the shader
-/// is still compiled and still dispatched -- so the pairs are stated here and
-/// [`crate::entrypoints`] reads them back. The FILE rides along because Metal
-/// compiles from `(path, entry name)` at run time, and `device_kernels.rs`
-/// builds every one of them against a real device; a name without its file
-/// would leave that sweep nothing to open. See [`crate::RETIRED`].
-pub static ENTRYPOINTS: &[(&str, &str)] = &[
-    ("attn/gate.metal", "gate_bfloat16"),
-    ("attn/kv_write.metal", "kv_append_bfloat16"),
-    ("attn/kv_write.metal", "kv_append_paged_bfloat16"),
-    ("attn/logit_softcap.metal", "logit_softcap_bfloat16"),
-    ("attn/gate.metal", "q_gate_split_bfloat16"),
-    ("attn/sdpa_paged.metal", "sdpa_paged_decode_bfloat16_d_128"),
-    (
-        "attn/sdpa_paged.metal",
-        "sdpa_paged_decode_bfloat16_d_128_p32",
-    ),
-    ("attn/sdpa_paged.metal", "sdpa_paged_decode_bfloat16_d_256"),
-    ("attn/sdpa_paged.metal", "sdpa_paged_decode_bfloat16_d_512"),
-    ("attn/sdpa_paged.metal", "sdpa_paged_decode_bfloat16_d_64"),
-    (
-        "attn/sdpa_paged.metal",
-        "sdpa_paged_decode_bfloat16_d_64_p32",
-    ),
-    (
-        "attn/sdpa_paged.metal",
-        "sdpa_paged_decode_bfloat16_d_64_p32_sg8",
-    ),
-    (
-        "attn/sdpa_paged.metal",
-        "sdpa_paged_decode_sink_bfloat16_d_64",
-    ),
-    ("attn/sdpa_paged_mma.metal", "sdpa_paged_mma_bfloat16_d_64"),
-    (
-        "attn/sdpa_paged_mma.metal",
-        "sdpa_paged_mma_sink_bfloat16_d_64",
-    ),
-    ("attn/sdpa_paged.metal", "sdpa_paged_tiled_bfloat16_d_128"),
-    ("attn/sdpa_paged.metal", "sdpa_paged_tiled_bfloat16_d_256"),
-    ("attn/sdpa_paged.metal", "sdpa_paged_tiled_bfloat16_d_512"),
-    ("attn/sdpa_paged.metal", "sdpa_paged_tiled_bfloat16_d_64"),
-    (
-        "attn/sdpa_paged.metal",
-        "sdpa_paged_tiled_sink_bfloat16_d_64",
-    ),
-    (
-        "attn/sdpa_paged.metal",
-        "sdpa_paged_tiled_strided_bfloat16_d_256",
-    ),
-    (
-        "attn/sdpa_vector.metal",
-        "sdpa_vector_decode_bfloat16_d_128",
-    ),
-    (
-        "attn/sdpa_vector.metal",
-        "sdpa_vector_decode_bfloat16_d_256",
-    ),
-    ("attn/sdpa_vector.metal", "sdpa_vector_decode_bfloat16_d_64"),
-    (
-        "attn/sdpa_sliding.metal",
-        "sdpa_vector_decode_sink_bfloat16_d_64",
-    ),
-    (
-        "attn/sdpa_sliding.metal",
-        "sdpa_vector_decode_swa_bfloat16_d_256",
-    ),
-    (
-        "attn/sdpa_sliding.metal",
-        "sdpa_vector_decode_swa_bfloat16_d_512",
-    ),
-    ("attn/split_qkv.metal", "split_qkv_bf16"),
-];
 
 /// The head widths `sdpa_paged.metal` is compiled for.
 pub const PAGED_DIMS: [i32; 4] = [64, 128, 256, 512];
@@ -444,7 +368,6 @@ pub fn kv_append_paged(
     let ring_11 = ctx.absent()?;
     let w_page = ctx.ask::<Tensor<u32>, keys::KvWritePage>()?;
     let w_off = ctx.ask::<Tensor<u32>, keys::KvWriteOffset>()?;
-    let ring_15 = ctx.absent()?;
     let tokens = ctx.ask::<i32, keys::Rows>()?;
     let lanes = head_grid(*head_dim, *n_kv_heads, tokens)?;
     ctx.fire(
@@ -465,7 +388,30 @@ pub fn kv_append_paged(
             n_kv_heads.arg(),
             w_page.arg(),
             w_off.arg(),
-            ring_15,
+            // ZERO, STATED. Buffer 15 is `src_row_stride`, and unlike 4, 6-9
+            // and 11 the shader really declares it and really reads it:
+            // `kv_write.metal` takes `src_row_stride > 0 ? src_row_stride :
+            // row_stride`, so zero selects the packed
+            // `[N, n_kv_heads, head_dim]` a decode hands over.
+            //
+            // It was `ctx.absent()`, which is `Source::Lit(Lit::Null)` ->
+            // `Handles::null()` -- a handle with no allocation, bound at a
+            // slot declared `const constant int&`. The packed layout is what
+            // the kernel then took, and nothing guaranteed it: a nil handle
+            // reading as four zero bytes is a thing that happened to be true,
+            // not a thing that was arranged. Six slots beside this one are
+            // holes the shader declares nothing at, and the seventh was
+            // wearing their clothes.
+            //
+            // Zero is not the general answer -- a prefill whose rows sit in
+            // the scratch arena at a wider pitch needs that pitch, and this
+            // plane's `In` carries `rows` and `width` but no STRIDE to read it
+            // from. `kernels-cuda`'s `kimi_mla` names the same distinction and
+            // has a region field for it (`src.stride`, refused when narrow).
+            // Until this mark grows one, zero is the claim this routine is
+            // actually making, and making it out loud is what lets the shader
+            // comparison hold the slot instead of excusing it.
+            0_i32.arg(),
         ],
     )
 }
@@ -567,8 +513,21 @@ pub fn sdpa_paged_decode(
         Fire::at(PAGED_FILE, PAGED_DECODE[head_point(*head_dim, &PAGED_DIMS)?]).apply(Grid::of(vector_grid(*q_heads, rows)?, BIG_GROUP)),
         &[
             queries.arg(),
-            k_pages.arg_mut(),
-            v_pages.arg_mut(),
+            // READS, and every paged form below states them the same way.
+            // Attention consumes the cache; `kv_append_paged` is the one
+            // routine that fills it, and the shader agrees -- the paged
+            // templates declare both `const device T*`.
+            //
+            // They were bound `arg_mut` here, which `directed` files under
+            // `writes` alone. That kept the append -> attend order (as a WAW
+            // rather than the RAW it really is) and cost a barrier between
+            // every pair of attention dispatches sharing a cache, which on a
+            // multi-layer decode is most of them at about ten microseconds
+            // each. Naming a read a write is the cheap direction to be wrong
+            // in, but it is still wrong, and the encoder's own tally prices
+            // it.
+            k_pages.arg(),
+            v_pages.arg(),
             out.arg(),
             gqa_factor.arg(),
             position_ids.arg(),
@@ -633,8 +592,8 @@ pub fn sdpa_paged_decode_sink(
         Fire::at(PAGED_FILE, PAGED_DECODE_SINK[head_point(*head_dim, &SINK_DIMS)?]).apply(Grid::of(vector_grid(*q_heads, rows)?, BIG_GROUP)),
         &[
             queries.arg(),
-            k_pages.arg_mut(),
-            v_pages.arg_mut(),
+            k_pages.arg(),
+            v_pages.arg(),
             out.arg(),
             gqa_factor.arg(),
             position_ids.arg(),
@@ -701,8 +660,8 @@ pub fn sdpa_paged_tiled(
         Fire::at(PAGED_FILE, PAGED_TILED[head_point(*head_dim, &PAGED_DIMS)?]).apply(Grid::of(tiled_grid(*q_heads, n_rows, BIG_GROUP[0])?, BIG_GROUP)),
         &[
             queries.arg(),
-            k_pages.arg_mut(),
-            v_pages.arg_mut(),
+            k_pages.arg(),
+            v_pages.arg(),
             out.arg(),
             gqa_factor.arg(),
             position_ids.arg(),
@@ -765,8 +724,8 @@ pub fn sdpa_paged_tiled_sink(
         Fire::at(PAGED_FILE, PAGED_TILED_SINK[head_point(*head_dim, &SINK_DIMS)?]).apply(Grid::of(tiled_grid(*q_heads, n_rows, BIG_GROUP[0])?, BIG_GROUP)),
         &[
             queries.arg(),
-            k_pages.arg_mut(),
-            v_pages.arg_mut(),
+            k_pages.arg(),
+            v_pages.arg(),
             out.arg(),
             gqa_factor.arg(),
             position_ids.arg(),
@@ -842,8 +801,8 @@ pub fn sdpa_paged_tiled_strided(
         Fire::at(PAGED_FILE, PAGED_TILED_STRIDED[head_point(*head_dim, &STRIDED_DIMS)?]).apply(Grid::of(tiled_grid(*q_heads, n_rows, BIG_GROUP[0])?, BIG_GROUP)),
         &[
             queries.arg(),
-            k_pages.arg_mut(),
-            v_pages.arg_mut(),
+            k_pages.arg(),
+            v_pages.arg(),
             out.arg(),
             gqa_factor.arg(),
             position_ids.arg(),
@@ -914,8 +873,8 @@ pub fn sdpa_paged_mma(
         Fire::at(MMA_FILE, PAGED_MMA[head_point(*head_dim, &SINK_DIMS)?]).apply(Grid::of(tiled_grid(*q_heads, n_rows, MMA_GROUP[0])?, MMA_GROUP)),
         &[
             queries.arg(),
-            k_pages.arg_mut(),
-            v_pages.arg_mut(),
+            k_pages.arg(),
+            v_pages.arg(),
             out.arg(),
             gqa_factor.arg(),
             position_ids.arg(),
@@ -978,8 +937,8 @@ pub fn sdpa_paged_mma_sink(
         Fire::at(MMA_FILE, PAGED_MMA_SINK[head_point(*head_dim, &SINK_DIMS)?]).apply(Grid::of(tiled_grid(*q_heads, n_rows, MMA_GROUP[0])?, MMA_GROUP)),
         &[
             queries.arg(),
-            k_pages.arg_mut(),
-            v_pages.arg_mut(),
+            k_pages.arg(),
+            v_pages.arg(),
             out.arg(),
             gqa_factor.arg(),
             position_ids.arg(),
@@ -1260,13 +1219,10 @@ mod tests {
         attention_mask_stride: Cell<u32>,
         attention_mask_enabled: Cell<u32>,
         rows: Cell<i32>,
-        row_stride: Cell<i32>,
         kv_head_stride: Cell<u32>,
         kv_seq_stride: Cell<u32>,
         kv_write_page: Cell<u32>,
         kv_write_offset: Cell<u32>,
-        q_row_pitch: Cell<i32>,
-        o_row_pitch: Cell<i32>,
         q_row_stride: Cell<i32>,
         o_row_stride: Cell<i32>,
         absent_handle: Cell<u32>,
@@ -1288,13 +1244,10 @@ mod tests {
                 attention_mask_stride: Cell::new(0),
                 attention_mask_enabled: Cell::new(707),
                 rows: Cell::new(4),
-                row_stride: Cell::new(4096),
                 kv_head_stride: Cell::new(128),
                 kv_seq_stride: Cell::new(64),
                 kv_write_page: Cell::new(11),
                 kv_write_offset: Cell::new(12),
-                q_row_pitch: Cell::new(512),
-                o_row_pitch: Cell::new(256),
                 q_row_stride: Cell::new(512),
                 o_row_stride: Cell::new(256),
                 absent_handle: Cell::new(99),
@@ -1430,13 +1383,20 @@ mod tests {
         assert_eq!(fire.lanes[0], 4096, "and the width the head axis covers");
     }
 
-    /// The paged pool's six unread slots are bound where the pool puts them.
+    /// The paged pool's six unread slots are bound where the pool puts them,
+    /// and the seventh is not one of them.
     ///
     /// `w_page` and `w_off` are what this kernel actually writes through, and
     /// they sit at 13 and 14. Closing the ring's gaps would slide them to 7
     /// and 8, where the kernel reads two ring pointers -- and Metal validates
     /// no binding, so the token would be appended at whatever address those
     /// held.
+    ///
+    /// Fifteen was in the loop below and does not belong there. The shader
+    /// declares nothing at 4, 6-9 and 11 -- an address there is unread by
+    /// construction -- but it declares `const constant int& src_row_stride` at
+    /// 15 and reads it on every token. See the fire for why the number is
+    /// zero and why zero had to be said rather than left.
     #[test]
     fn a_paged_append_binds_the_rings_slots_it_does_not_read() {
         let seen = Seen::default();
@@ -1453,9 +1413,14 @@ mod tests {
         assert_eq!(args.len(), 16, "the pool's whole argument table");
         assert_eq!(args[13], Tensor::<u32>::new(11).arg(), "the destination page at thirteen");
         assert_eq!(args[14], Tensor::<u32>::new(12).arg(), "and its offset at fourteen");
-        for slot in [4, 6, 7, 8, 9, 11, 15] {
+        for slot in [4, 6, 7, 8, 9, 11] {
             assert_eq!(args[slot], ring.arg(), "slot {slot} still holds an address");
         }
+        assert_eq!(
+            args[15],
+            0_i32.arg(),
+            "fifteen is a scalar the shader reads, not a hole it declares nothing at"
+        );
     }
 
     /// A head width off the compiled axis is refused, not rounded.

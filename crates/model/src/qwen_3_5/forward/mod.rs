@@ -748,11 +748,13 @@ fn gdn_attn_body_cuda(
                         if gqa {
                             let qr = cuda::repeat_interleave_heads(
                                 &q,
+                                facts.key_heads,
                                 facts.value_heads,
                                 facts.key_head_dim,
                             );
                             let kr = cuda::repeat_interleave_heads(
                                 &k,
+                                facts.key_heads,
                                 facts.value_heads,
                                 facts.key_head_dim,
                             );

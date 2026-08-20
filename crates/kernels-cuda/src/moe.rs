@@ -9,7 +9,7 @@ use kernels_macros::routine;
 use crate::jit::{Ctx, Launch, Root, aligned16};
 use crate::jit::Abi;
 use crate::jit::abi::Tensor;
-use crate::jit::abi::{MaybeConst, bf16};
+use crate::jit::abi::bf16;
 use kernels::routine::{Asks, Const, In, InOut, Out, Region, Stride};
 // `keys` is imported as the module, not the facts inside it: `stated_source`
 // only emits a source when the path's second-to-last segment is `keys`.

@@ -306,7 +306,7 @@ pub fn unstrided_bf16(
     // builder ever began stating them. A `Const` mark PROMISES the statement
     // carries the number at its slot in the params run; where nothing states
     // one the promise breaks at the fire, not at the type. §11.20.
-    let eps = ctx.ask::<f32, keys::RmsEps>()?;
+    let _eps = ctx.ask::<f32, keys::RmsEps>()?;
 
     // Reads `x` through `y`'s rectangle: both widths here are `y.width`.
     let packed = In { ptr: x.ptr, rows: y.rows, width: y.width };

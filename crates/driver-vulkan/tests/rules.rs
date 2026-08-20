@@ -142,75 +142,68 @@ fn a_module_wider_than_the_guaranteed_floor_is_a_deliberate_bet() {
 /// `driver-metal`'s `packed_params_cover_the_struct` gives: a check whose
 /// expectation is computed the same way as the thing it checks agrees with
 /// itself. These numbers were read off the compiled modules by an independent
-/// SPIR-V walk written in another language, and two of them -- `router_topk`
-/// at 16 and `combine_sorted` at 12 -- are the same two blocks the Metal
-/// driver was found packing short.
+/// SPIR-V walk written in another language.
+///
+/// # It was 45 rows, and 38 of them left in one edit
+///
+/// A parameter block used to be how nearly every launch in this tree got its
+/// scalars: a struct in a storage buffer, bound after the data, filled by the
+/// host. The shaders moved theirs into `[[vk::push_constant]]` ranges instead,
+/// and a scalar that travels in a push range is not a binding at all -- so 38
+/// of these rows did not shrink or move, they stopped existing.
+///
+/// That is a real change and not a lost measurement, and the difference
+/// matters enough to say how it was told apart. A block that vanished because
+/// a walk stopped finding blocks would leave the module still declaring it;
+/// these modules declare a PUSH RANGE where the block used to be, which
+/// `the_push_ranges_are_where_the_parameter_blocks_went` below counts. The
+/// two sweeps are the two halves of one census, and 38 rows leaving one of
+/// them while the other holds 669 modules is the shape a MOVE has.
+///
+/// Two of the departed -- `router_topk` at 16 bytes and `combine_sorted` at 12
+/// -- were the same two blocks the Metal driver was found packing short, which
+/// is the sort of defect this table exists for and is worth keeping the name
+/// of even though the rows are gone.
+///
+/// # What is left, and why these seven kept a buffer
+///
+/// `argmax_logits` at 40 bytes, and the six `rms_rope` modules at 36. Both are
+/// over the 128-byte floor no device may go under, so neither is a size
+/// question -- they are the launches whose scalars `binding::params` places in
+/// a buffer because it places a launch's scalars in a push range OR a
+/// parameter buffer and never both, and these need the buffer for what else
+/// they carry.
+///
+/// The fused norm+rope is the clearest: 36 bytes at binding 2, where every
+/// other norm used to have 20 at binding 3. Both differences are the fusion.
+/// The binding moves because `x` is bound once as read-write where the norm
+/// alone binds an input and an output, so everything after `w` shifts down
+/// one; the size is `RmsParams` with the rotation's four scalars appended.
+/// Six rows because the family mirrors `neox`'s and this table counts modules
+/// rather than routines -- five of the six have no routine yet and would
+/// otherwise be exactly the unchecked ABI the count exists to catch.
 const PARAM_BLOCKS: &[(&str, u32, u32)] = &[
-    ("affine_encode_u4_bf16", 4, 8),
-    ("affine_encode_u4_f32", 4, 8),
     ("argmax_logits_bfloat16", 2, 40),
-    ("combine_sorted", 3, 12),
-    ("gated_rms_bfloat16", 4, 8),
-    ("gated_rms_strided_bfloat16", 4, 8),
-    ("gdn_core_bfloat16", 11, 44),
-    ("gdn_core_recurrent_bfloat16", 10, 44),
-    ("gdn_core_recurrent_prefill_bfloat16_l_16_v_1", 5, 44),
-    ("gdn_core_recurrent_prefill_bfloat16_l_16_v_2", 5, 44),
-    ("gdn_core_recurrent_prefill_bfloat16_l_16_v_4", 5, 44),
-    ("gdn_core_recurrent_prefill_bfloat16_l_32_v_2", 5, 44),
-    ("gdn_core_recurrent_prefill_bfloat16_l_32_v_4", 5, 44),
-    ("gdn_core_recurrent_prefill_bfloat16_l_32_v_8", 5, 44),
-    ("gdn_core_recurrent_prefill_bfloat16_l_4_v_1", 5, 44),
-    ("gdn_core_recurrent_prefill_bfloat16_l_8_v_1", 5, 44),
-    ("gdn_core_recurrent_prefill_bfloat16_l_8_v_2", 5, 44),
-    ("gdn_core_recurrent_slotted_bfloat16", 10, 44),
-    ("gdn_core_slotted_bfloat16", 11, 44),
-    ("gdn_prep_bfloat16", 12, 44),
-    ("gdn_prep_prefill_bfloat16", 12, 44),
-    ("gdn_prep_slotted_bfloat16", 12, 44),
-    ("geglu_tanh_strided_bfloat16", 3, 20),
-    ("gptoss_swiglu_bfloat16", 3, 12),
-    ("logit_softcap_bfloat16", 2, 8),
-    ("mxfp4_dequant_bf16", 3, 8),
-    ("ple_combine_bfloat16", 3, 8),
-    // The fused norm+rope: 36 bytes at binding 2, where every other norm has
-    // 20 at binding 3. Both differences are the fusion. The binding moves
-    // because `x` is bound once as read-write where the norm alone binds an
-    // input and an output, so everything after `w` shifts down one; the size
-    // is `RmsParams` with the rotation's four scalars appended, because
-    // `binding::params` places a launch's scalars in a push range OR a
-    // parameter buffer and never both, and a norm needs the buffer.
-    //
-    // Six rows because the family mirrors `neox`'s and this table counts
-    // modules rather than routines -- five of the six have no routine yet and
-    // would otherwise be exactly the unchecked ABI the count exists to catch.
     ("rms_rope_bfloat16", 2, 36),
     ("rms_rope_decode_bfloat16", 2, 36),
     ("rms_rope_freqs_bfloat16", 2, 36),
     ("rms_rope_freqs_decode_bfloat16", 2, 36),
     ("rms_rope_prop_bfloat16", 2, 36),
     ("rms_rope_prop_decode_bfloat16", 2, 36),
-    ("rms_residual_bfloat16", 3, 20),
-    ("rms_residual_scaled_bfloat16", 3, 20),
-    ("rms_single_row_bfloat16", 3, 20),
-    ("rms_strided_head_row_bfloat16", 3, 20),
-    ("rms_strided_row_bfloat16", 3, 20),
-    ("route_gather", 3, 28),
-    ("route_sort", 4, 28),
-    ("router_topk_bfloat16", 3, 16),
-    ("router_topk_scaled_bfloat16", 3, 16),
-    ("row_gather_bfloat16", 3, 8),
-    ("split_qkv_bf16", 4, 8),
-    ("vnorm_single_row_bfloat16", 2, 8),
 ];
 
 /// The block sizes this crate derives are the ones an independent walk read.
 ///
-/// Two claims at once, and the second is the one that would rot. That the 45
-/// sizes agree is the arithmetic being right. That there are exactly 45 -- no
-/// module has grown a parameter block this table does not know about, and none
-/// has lost one -- is what keeps a new kernel from arriving with an unchecked
-/// ABI and this file still passing.
+/// Two claims at once, and the second is the one that would rot. That the
+/// seven sizes agree is the arithmetic being right. That there are exactly
+/// seven -- no module has grown a parameter block this table does not know
+/// about, and none has lost one -- is what keeps a new kernel from arriving
+/// with an unchecked ABI and this file still passing.
+///
+/// The second claim is doing MORE work than it was, not less, now that the
+/// scalars have gone to push ranges. Seven is a small enough number that the
+/// buffer is the exception, and an eighth appearing is a launch that could not
+/// fit a push range and nobody said so.
 #[test]
 fn the_parameter_blocks_this_crate_measures_are_the_ones_the_modules_declare() {
     modules!();
@@ -254,6 +247,70 @@ fn the_parameter_blocks_this_crate_measures_are_the_ones_the_modules_declare() {
         disagreed.len(),
         PARAM_BLOCKS.len(),
         disagreed.join("\n  ")
+    );
+}
+
+/// The other half of the census: the scalars that left the buffers are in
+/// push ranges, and the ranges fit the floor every device guarantees.
+///
+/// Without this, the sweep above would have been free to keep passing as the
+/// tree emptied out from under it. Thirty-eight rows left it in one edit, and
+/// "the modules stopped declaring parameter blocks" reads exactly the same
+/// whether the scalars moved to a push range or stopped being passed at all --
+/// which is not a hypothetical failure, since a body that forwards no scalars
+/// into a block that arrives zeroed is a loop that runs no iterations and
+/// reports success.
+///
+/// So: 669 of the 681 modules declare a push range. The twelve that do not are
+/// the launches whose every scalar is a buffer's length, which a shader reads
+/// off the binding rather than being told.
+///
+/// The widths are stated as a floor rather than exactly, because instantiating
+/// a family at a new tile adds modules without changing any ABI and an exact
+/// count would fail for that. What is exact is the CEILING: 128 bytes is the
+/// `maxPushConstantsSize` every Vulkan device must offer, and a range past it
+/// is a launch that will not fire on a conformant driver. The widest here ends
+/// at offset 48 -- `gdn_prep`'s prefill arm, thirteen words -- so the tree is
+/// using a bit over a third of the guarantee.
+#[test]
+fn the_push_ranges_are_where_the_parameter_blocks_went() {
+    modules!();
+    let mut modules = 0usize;
+    let mut with_push = 0usize;
+    let mut widest = (0usize, 0u32, String::new());
+
+    for &(name, code) in kernels_vulkan::MODULES {
+        let d = declared(code);
+        modules += 1;
+        let Some(&last) = d.push_offsets.last() else { continue };
+        with_push += 1;
+        if d.push_offsets.len() > widest.0 {
+            widest = (d.push_offsets.len(), last, name.to_owned());
+        }
+    }
+
+    assert!(
+        modules > 600 && with_push > 600,
+        "{with_push} of {modules} modules declare a push range; the shader tree \
+         is 681 modules wide and 669 of them do, so a walk this short is a walk \
+         that stopped finding them rather than a tree that stopped having them"
+    );
+    assert!(
+        modules - with_push <= 20,
+        "{} modules declare no push range at all, up from the twelve whose only \
+         scalars are buffer lengths -- a launch that lost its scalars reads the \
+         same as one that never had any, and only this number tells them apart",
+        modules - with_push
+    );
+    // A push field is at most 16 bytes (a `float4`), so `last + 16` bounds the
+    // range without this test needing to know the widths `slangc` chose.
+    assert!(
+        widest.1 + 16 <= 128,
+        "`{}` puts a push field at offset {}, and {} bytes is past the 128 that \
+         is the `maxPushConstantsSize` every Vulkan device must offer",
+        widest.2,
+        widest.1,
+        widest.1 + 16
     );
 }
 

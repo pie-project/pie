@@ -298,14 +298,16 @@ pub fn fp32_to_bf16(
 pub fn repeat_interleave_heads_fp32(
     ctx: &Ctx<'_>,
     in_: In<Tensor<f32>>,
-    out: Out<Tensor<f32>>) -> Result<(), Refusal> {
+    out: Out<Tensor<f32>>,
+    // STATED, NOT ASKED. The checkpoint's geometry -- §11.20's case, and the
+    // spelling `kernels-metal` and `kernels-vulkan` have used since it.
+    k_h: Const<i32>,
+    v_h: Const<i32>,
+    d: Const<i32>) -> Result<(), Refusal> {
     // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
     // builder ever began stating them. A `Const` mark PROMISES the statement
     // carries the number at its slot in the params run; where nothing states
     // one the promise breaks at the fire, not at the type. §11.20.
-    let k_h = ctx.ask::<i32, keys::GdnKHeads>()?;
-    let v_h = ctx.ask::<i32, keys::GdnVHeads>()?;
-    let d = ctx.ask::<i32, keys::GdnVDim>()?;
 
     // No view here: the factors are scalars, not a width, so there is no
     // guard for `all()` to absorb.
@@ -315,7 +317,7 @@ pub fn repeat_interleave_heads_fp32(
                 k_h.arg(),
                 v_h.arg(),
                 d.arg(),
-                (v_h / k_h).arg(),
+                (*v_h / *k_h).arg(),
             ])
 }
 
@@ -516,13 +518,15 @@ pub fn nemotron_prepare_mamba_params(
     dt_bias: Const<Tensor<bf16>>,
     a: Out<Tensor<f32>>,
     d_f32: Out<Tensor<f32>>,
-    dt_bias_f32: Out<Tensor<f32>>) -> Result<(), Refusal> {
+    dt_bias_f32: Out<Tensor<f32>>,
+    // STATED, NOT ASKED. The checkpoint's geometry -- §11.20's case, and the
+    // spelling `kernels-metal` and `kernels-vulkan` have used since it.
+    num_heads: Const<i32>) -> Result<(), Refusal> {
     // ASKED, NOT `Const`: every one of these was `Env<keys::_>` before the
     // four marks, and no builder ever began stating them. A `Const` mark
     // PROMISES the statement carries the number at its slot in the params
     // run; where nothing states one the promise is broken at the fire, not
     // at the type. See `.wiki/migration.md` §11.20.
-    let num_heads = ctx.ask::<i32, keys::GdnVHeads>()?;
 
     ctx.fire(Fire::at("ssm/nemotron_h.cuh", "::pie::ssm::prepare_mamba_params<::pie::bf16>").apply(elementwise(num_heads.unsigned_abs())), &[
                 a_log.arg(),
@@ -719,17 +723,19 @@ pub fn nemotron_mamba_ssm_batched_bf16(
     d: In<Tensor<f32>>,
     dt_bias: In<Tensor<f32>>,
     da_precomputed: In<Tensor<f32>>,
-    y: Out<Tensor<c_void>>) -> Result<(), Refusal> {
+    y: Out<Tensor<c_void>>,
+    // STATED, NOT ASKED. The checkpoint's geometry -- §11.20's case, and the
+    // spelling `kernels-metal` and `kernels-vulkan` have used since it.
+    num_heads: Const<i32>,
+    head_dim: Const<i32>,
+    state_size: Const<i32>,
+    n_groups: Const<i32>,
+    conv_dim: Const<i32>) -> Result<(), Refusal> {
     // ASKED, NOT `Const`: every one of these was `Env<keys::_>` before the
     // four marks, and no builder ever began stating them. A `Const` mark
     // PROMISES the statement carries the number at its slot in the params
     // run; where nothing states one the promise is broken at the fire, not
     // at the type. See `.wiki/migration.md` §11.20.
-    let num_heads = ctx.ask::<i32, keys::GdnVHeads>()?;
-    let head_dim = ctx.ask::<i32, keys::GdnVDim>()?;
-    let state_size = ctx.ask::<i32, keys::GdnKDim>()?;
-    let n_groups = ctx.ask::<i32, keys::GdnNumGroups>()?;
-    let conv_dim = ctx.ask::<i32, keys::GdnConvDim>()?;
 
     let ssm_state_base = ctx.ask::<*mut core::ffi::c_void, keys::GdnRecurrentSlab>()?;
     let slot_ids = ctx.ask::<*const i32, keys::GdnSlotIds>()?;
@@ -740,7 +746,7 @@ pub fn nemotron_mamba_ssm_batched_bf16(
 
     const SSM_DECODE_BLOCK: u32 = 256;
 
-    let intermediate = num_heads.saturating_mul(head_dim);
+    let intermediate = num_heads.saturating_mul(*head_dim);
     let sequence_prefill = rows != r;
     let smem = 2 * state_size.unsigned_abs() * FLOAT;
     let (rows, heads) = (r.unsigned_abs(), num_heads.unsigned_abs());
@@ -1680,7 +1686,7 @@ const _: () = {
     assert!(!<recurrent_gated_delta_step_batched as ::kernels::Derivation>::DERIVED[5].nullable);
 
     // Three weights, three banks, and no input in the launcher at all.
-    assert!(<nemotron_prepare_mamba_params as ::kernels::Derivation>::DERIVED.len() == 6);
+    assert!(<nemotron_prepare_mamba_params as ::kernels::Derivation>::DERIVED.len() == 7);
     assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(nemotron_prepare_mamba_params)[0], Some(kernels::Source::Or(kernels::Source::Named(_), kernels::Source::Slot(kernels::Kind::Weight, 0)))));
     assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(nemotron_prepare_mamba_params)[1], Some(kernels::Source::Or(kernels::Source::Named(_), kernels::Source::Slot(kernels::Kind::Weight, 1)))));
     assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(nemotron_prepare_mamba_params)[2], Some(kernels::Source::Slot(kernels::Kind::Weight, 2))));
@@ -1705,7 +1711,7 @@ const _: () = {
     assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(zamba_rmsnorm_gated::<bf16>)[1], Some(kernels::Source::Slot(kernels::Kind::In, 1))));
 
     // The scan's whole operand run: what the aux slab was standing in for.
-    assert!(<nemotron_mamba_ssm_batched_bf16 as ::kernels::Derivation>::DERIVED.len() == 8);
+    assert!(<nemotron_mamba_ssm_batched_bf16 as ::kernels::Derivation>::DERIVED.len() == 13);
     assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(nemotron_mamba_ssm_batched_bf16)[1], Some(kernels::Source::Slot(kernels::Kind::In, 1))));
     assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(nemotron_mamba_ssm_batched_bf16)[4], Some(kernels::Source::Slot(kernels::Kind::In, 4))));
     assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(nemotron_mamba_ssm_batched_bf16)[5], Some(kernels::Source::Slot(kernels::Kind::In, 5))));
@@ -1737,7 +1743,7 @@ const _: () = {
     // the other two read `dt.width` off their own operands instead — same
     // count, different source.
     assert!(<nemotron_prepare_mamba_dt_da as ::kernels::Derivation>::DERIVED.len() == 5);
-    assert!(<nemotron_prepare_mamba_params as ::kernels::Derivation>::DERIVED.len() == 6);
+    assert!(<nemotron_prepare_mamba_params as ::kernels::Derivation>::DERIVED.len() == 7);
 
     // `h` comes off the second result: the first one's width is `h * d`.
     assert!(<kda_gate_beta as ::kernels::Derivation>::DERIVED.len() == 7);
@@ -1798,7 +1804,7 @@ const _: () = {
     // checkpoint tensors on the positional bank, three fp32 tables out, and
     // `gdn.v_h` the one fact the arm fetched by hand.
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(nemotron_prepare_mamba_params);
-    assert!(d.len() == 6);
+    assert!(d.len() == 7);
     assert!(matches!(d[0], Some(kernels::Source::Or(kernels::Source::Named(_), kernels::Source::Slot(kernels::Kind::Weight, 0)))));
     assert!(matches!(d[1], Some(kernels::Source::Or(kernels::Source::Named(_), kernels::Source::Slot(kernels::Kind::Weight, 1)))));
     assert!(matches!(d[2], Some(kernels::Source::Slot(kernels::Kind::Weight, 2))));
@@ -2014,7 +2020,7 @@ const _: () = {
     // `In(1)`'s marker is gone: `nullable` is false, though the kernel
     // still null-tests the pointer per element and the slot didn't move.
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(nemotron_mamba_ssm_batched_bf16);
-    assert!(d.len() == 8);
+    assert!(d.len() == 13);
     assert!(matches!(d[5], Some(kernels::Source::Slot(kernels::Kind::In, 5))));
     assert!(!<nemotron_mamba_ssm_batched_bf16 as ::kernels::Derivation>::DERIVED[5].nullable);
     assert!(matches!(d[6], Some(kernels::Source::Slot(kernels::Kind::In, 6))));
@@ -2132,7 +2138,7 @@ const _: () = {
     // The repeat: it declares its result, so `Out(0)` at slot 1 has
     // resolved since it started stating a value.
     let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(repeat_interleave_heads_fp32);
-    assert!(d.len() == 2);
+    assert!(d.len() == 5);
     assert!(matches!(d[0], Some(kernels::Source::Slot(kernels::Kind::In, 0))));
     assert!(matches!(d[1], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
 };

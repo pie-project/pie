@@ -609,6 +609,70 @@ fn every_dark_stem_names_a_kernel_that_is_still_here() {
     }
 }
 
+/// **Every shipped entrypoint is crossed by a routine or excused by name.**
+///
+/// This is the row `.wiki/kernel-x/metal-refactor.md` §9 writes as
+/// `every_entrypoint_resolves_through_sig_in` becoming
+/// `routine(symbol).is_some() || not_yet_crossed(symbol)`. The `after` half
+/// was never built. `not_yet_crossed.rs` does not exist -- what took its
+/// place is `routine::DARK`, one crate over and one row long -- and when the
+/// rows retired, the `before` half went with them. The disjunction has been
+/// TRUE this whole time and held by nothing.
+///
+/// The two checks above it run one direction only: DARK to the shaders, so
+/// that an excuse cannot outlive its subject. Both would pass on a tree where
+/// half the archive resolved to nothing, because neither ever asks a SHADER a
+/// question. This asks all 481, and the number is the point: it is
+/// `entrypoints()`'s own length, so a kernel added to the tree and crossed by
+/// nobody fails here on the commit that adds it rather than on the model load
+/// that first needs it.
+///
+/// # Why this is not `UNFIRED`
+///
+/// `kernels-metal`'s `UNFIRED` names four entrypoints no BODY fires. Three of
+/// them -- the `FAST_FULL` decode points -- pass here, because being fired by
+/// nothing is not the same as being crossed by nothing: a routine claims the
+/// `sdpa_paged_decode` stem and would resolve them if a fire ever named one.
+/// That gap is deliberate and is what makes the two lists different questions.
+/// A kernel can be reachable-in-principle and dispatched-by-nobody; what may
+/// not happen, and what this forbids, is a kernel that is neither, with no
+/// sentence anywhere saying why.
+#[test]
+fn every_shipped_entrypoint_is_crossed_or_carries_an_excuse() {
+    let dark = driver_metal::lowering::routine::DARK;
+    let excused = |symbol: &str| {
+        dark.iter().any(|(stem, _)| {
+            symbol
+                .strip_prefix(*stem)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('_'))
+        })
+    };
+
+    let shipped = kernels_metal::entrypoints();
+    let stranded: Vec<&str> = shipped
+        .iter()
+        .map(String::as_str)
+        .filter(|symbol| {
+            driver_metal::lowering::routine::crossed(symbol).is_none() && !excused(symbol)
+        })
+        .collect();
+
+    assert!(
+        stranded.is_empty(),
+        "{} shipped entrypoint(s) resolve to no routine and are on no \
+         ledger, so nothing in the tree says what they are for:\n  {}",
+        stranded.len(),
+        stranded.join("\n  ")
+    );
+
+    // The census is pinned by two sibling crates and by `entrypoints.rs`; it
+    // is restated here because THIS assertion is only worth its name if it
+    // ran over all of them. A `crossed` that started answering `Some` for
+    // everything would pass the loop above in silence; a census that shrank
+    // to nothing would too.
+    assert_eq!(shipped.len(), 481, "the census moved");
+}
+
 #[test]
 fn every_launch_of_every_text_becomes_a_legal_grid() {
     let mut faults: Vec<String> = Vec::new();
@@ -1570,16 +1634,26 @@ fn every_routine_agrees_with_the_shader_its_stem_names() {
 /// Both read row COLUMNS, and every Metal family has retired its rows. The
 /// statement half did not disappear with them -- it moved to where it is
 /// enforced rather than counted. A routine's argument list is positional and
-/// total: it cannot express a hole (which is why `silu_mul_strided` is
-/// [`DARK`] rather than crossed), and a scalar it cannot source is a
-/// `plan_launch` refusal, which
+/// total, and a scalar it cannot source is a `plan_launch` refusal, which
 /// [`every_launch_of_every_text_becomes_a_legal_grid`] runs for every launch
 /// of every text. A count that used to be thirteen and reached zero is now a
 /// thing that cannot be built.
 ///
-/// What does not survive that move is the ARGUMENT: seventeen slots with a
-/// paragraph each saying why they are empty. Those are facts about SHADERS,
-/// so they are held against shaders here.
+/// This paragraph used to add "(which is why `silu_mul_strided` is `DARK`
+/// rather than crossed)", offering the positional list as that kernel's
+/// reason for being dark. `routine::DARK` retracts it in its own entry: the
+/// hole stopped being the obstacle when `pad` became the idiom, and
+/// twenty-one routines now bind a valid address at an index their shader
+/// does not declare. What keeps `silu_mul_strided` dark is the PRODUCER --
+/// no text names it and no statement produces a `row_pitch` -- so the
+/// parenthetical was citing a retired cause, next to the very list that
+/// retired it. It is gone; the excuse lives where it is checked.
+///
+/// What does not survive that move is the ARGUMENT: a slot with a paragraph
+/// saying why it is empty. Those are facts about SHADERS, so they are held
+/// against shaders here. Seventeen of them arrived; consolidating the ones
+/// listed per instantiated symbol onto their stem said the same thing in
+/// twelve.
 ///
 /// Writing the list down against the real parameter lists corrected it twice,
 /// which is the point:
@@ -1591,6 +1665,16 @@ fn every_routine_agrees_with_the_shader_its_stem_names() {
 ///   declares, under a name the row made up. A row that names a real slot
 ///   after an imaginary one is the exact drift two statements of one fact
 ///   produce, and nothing could see it while the row was the only statement.
+///
+/// That second correction has since been finished elsewhere, and the entry it
+/// produced is gone from the list below. Naming the slot right did not make it
+/// filled: `kv_append_paged` was binding `ctx.absent()` there, and a scalar
+/// slot handed a null reads whatever the last dispatch left in that argument
+/// buffer. `kernels-metal`'s `dispatch_matches_the_shader` is what saw it,
+/// because it compares the KIND of every bind against the declaration and a
+/// null is not an `int`. The routine now says `0_i32`, which is the value the
+/// shader's `src_row_stride > 0 ? src_row_stride : row_stride` was already
+/// assuming, and a slot that states a value is not a slot nothing fills.
 const DELIBERATE: &[(&str, usize, &str)] = &[
     // A shared ring ABI `kv_append_paged` does not read. The shader declares
     // NOTHING at these indices -- they are holes in its `[[buffer(n)]]`
@@ -1601,8 +1685,6 @@ const DELIBERATE: &[(&str, usize, &str)] = &[
     ("kv_append_paged", 8, ""),
     ("kv_append_paged", 9, ""),
     ("kv_append_paged", 11, ""),
-    // Declared, and its real name. See the correction above.
-    ("kv_append_paged", 15, "src_row_stride"),
     // A slot the OTHER instantiation of the same kernel fills. `sinks` is
     // `LlamaLikeMetalFacts::attn_sinks`'s, and no text in `texts()` sets it;
     // `bias` is `affine_qmv_routed_bias`'s; `per_expert_scale` is

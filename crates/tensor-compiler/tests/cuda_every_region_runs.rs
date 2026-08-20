@@ -27,7 +27,7 @@ mod msl_corpus;
 
 use msl_corpus::{corpus_stages, extended_stages};
 use tensor_compiler::codegen::cuda::{emit_fused_region, validate_generated_region};
-use tensor_compiler::plan::{CompiledStage, LibraryOp, Region, RegionKind};
+use tensor_compiler::plan::{LibraryOp, Region, RegionKind};
 
 /// Regions this backend is allowed not to emit, and why that is not a hole.
 ///
@@ -51,7 +51,13 @@ const REFUSED: &[(&str, &str)] = &[
 ///
 /// `None` when nothing here excuses it, which is what makes the assertion
 /// below a question about the region rather than about this list.
-fn excuse(stage: &CompiledStage, region: &Region) -> Option<&'static str> {
+///
+/// IT TOOK THE STAGE TOO and read nothing off it. Every excuse in `REFUSED`
+/// turns on the region's own shape -- its kind, its claimed library op, how
+/// many nodes it carries -- so the stage it came from never entered the
+/// answer, and passing it suggested an excuse could depend on context that no
+/// excuse here does.
+fn excuse(region: &Region) -> Option<&'static str> {
     let RegionKind::Library(claimed) = region.kind else {
         return None;
     };
@@ -81,7 +87,7 @@ fn survey() -> Vec<(String, usize, bool, Option<&'static str>, String)> {
                 format!("{}#{}", stage.golden, stage.stage_index),
                 region_index,
                 ok,
-                excuse(&plan, region),
+                excuse(region),
                 why,
             ));
         }

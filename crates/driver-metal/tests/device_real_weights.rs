@@ -4699,6 +4699,8 @@ fn the_batched_gemm_answers_what_the_matvec_answers() {
     // The matvec side is the SAME binding with one fact flipped, so a
     // difference between the two answers cannot be a different deployment.
     let unbatched = MetalBinding {
+        qmm_partial_rows: false,
+        qmm_tile: None,
         qmm_multi_batch: false,
         ..observed
     };
@@ -6076,9 +6078,10 @@ fn tier_one_prefill_then_decode() {
         // what that produced on Qwen3.6-35B-A3B was not a wrong answer but a
         // HANG -- "the GPU did not reach event 3 within 60000 ms".
         if first == 0
-            && let Some(rs) = rs.as_ref() {
-                rs.pool.clear_slot(0).expect("the seat clears");
-            }
+            && let Some(rs) = rs.as_ref()
+        {
+            rs.pool.clear_slot(0).expect("the seat clears");
+        }
         let tokens: Vec<u32> = (0..count).map(|i| 1000 + (first + i) % 5000).collect();
         let positions: Vec<u32> = (first..first + count).collect();
         let step = Step {
@@ -6170,9 +6173,8 @@ fn tier_one_prefill_then_decode() {
                 context.residency().allocationCount(),
             );
         }
-        let submitted =
-            driver_metal::fire::run::submit(&mut machine, lowered, geometry, &mut live)
-                .expect("the fire commits");
+        let submitted = driver_metal::fire::run::submit(&mut machine, lowered, geometry, &mut live)
+            .expect("the fire commits");
         machine
             .stepper
             .wait_for(submitted.value)
@@ -6933,78 +6935,76 @@ fn first_routing_divergence(
     let staged = stage_prefill_fleet(context, step, shape.page_size, &freqs);
     let named = HashMap::new();
 
-    let mut prefix_arena = |binding: &MetalBinding,
-                            lowered: &model_compiler::lower::Lowered,
-                            n: usize|
-     -> Vec<u8> {
-        let rs = Slabs::of(context, row);
-        let slabs = |l: u16, w: &'static str| rs.as_ref()?.at(l, w);
-        let pool = Pool::allocate(context, shape).expect("a pool");
-        let arena = Allocation::new(
-            context,
-            (lowered.arena_bytes as u64).max(1),
-            "routing divergence arena",
-        )
-        .expect("an arena");
-        // SAFETY: freshly allocated. Zeroed so a slot no statement in the
-        // prefix wrote compares equal between the two spellings.
-        unsafe { arena.zero(0, arena.len()).expect("it zeroes") };
-        let pages = |layer: u16, values: bool| {
-            pool.layer(u32::from(layer)).map(|l| Slice {
-                address: if values {
-                    l.v.gpu_address()
-                } else {
-                    l.k.gpu_address()
-                },
-                bytes: shape.layer_bytes_at(u32::from(layer)),
-            })
-        };
-        let mut live = Live {
-            store: Store::new(Names::mlx(), &loaded.tensors, &named),
-            tables: &staged,
-            shape,
-            pages: &pages,
-            slabs: Some(&slabs),
-        };
-        let dispatches = driver_metal::lowering::dispatch::plan(
-            lowered,
-            driver_metal::lowering::executor::Frame {
-                arena: Slice {
-                    address: arena.gpu_address(),
-                    bytes: arena.len(),
-                },
-            },
-            dispatch_geometry(dg, binding),
-            &mut live,
-        )
-        .expect("the fire plans");
-        let prefix = &dispatches[..n.min(dispatches.len())];
-        let prepared =
-            driver_metal::fire::run::prepare(context, lowered, prefix).expect("the prefix prepares");
-        pipelines
-            .ensure(context, compiler, prefix)
-            .expect("the pipelines compile");
-        let mut stepper = driver_metal::device::Stepper::new(context).expect("a stepper");
-        stepper
-            .run(|encoder| {
-                driver_metal::bind::encode::encode(
-                    encoder,
-                    &prepared.table,
-                    &pipelines,
-                    &prepared.params,
-                    prefix,
-                )
-            })
-            .expect("the prefix runs");
-        // SAFETY: the command buffer retired.
-        unsafe {
-            core::slice::from_raw_parts(
-                arena.contents().as_ptr().cast_const().cast::<u8>(),
-                arena.len() as usize,
+    let mut prefix_arena =
+        |binding: &MetalBinding, lowered: &model_compiler::lower::Lowered, n: usize| -> Vec<u8> {
+            let rs = Slabs::of(context, row);
+            let slabs = |l: u16, w: &'static str| rs.as_ref()?.at(l, w);
+            let pool = Pool::allocate(context, shape).expect("a pool");
+            let arena = Allocation::new(
+                context,
+                (lowered.arena_bytes as u64).max(1),
+                "routing divergence arena",
             )
-        }
-        .to_vec()
-    };
+            .expect("an arena");
+            // SAFETY: freshly allocated. Zeroed so a slot no statement in the
+            // prefix wrote compares equal between the two spellings.
+            unsafe { arena.zero(0, arena.len()).expect("it zeroes") };
+            let pages = |layer: u16, values: bool| {
+                pool.layer(u32::from(layer)).map(|l| Slice {
+                    address: if values {
+                        l.v.gpu_address()
+                    } else {
+                        l.k.gpu_address()
+                    },
+                    bytes: shape.layer_bytes_at(u32::from(layer)),
+                })
+            };
+            let mut live = Live {
+                store: Store::new(Names::mlx(), &loaded.tensors, &named),
+                tables: &staged,
+                shape,
+                pages: &pages,
+                slabs: Some(&slabs),
+            };
+            let dispatches = driver_metal::lowering::dispatch::plan(
+                lowered,
+                driver_metal::lowering::executor::Frame {
+                    arena: Slice {
+                        address: arena.gpu_address(),
+                        bytes: arena.len(),
+                    },
+                },
+                dispatch_geometry(dg, binding),
+                &mut live,
+            )
+            .expect("the fire plans");
+            let prefix = &dispatches[..n.min(dispatches.len())];
+            let prepared = driver_metal::fire::run::prepare(context, lowered, prefix)
+                .expect("the prefix prepares");
+            pipelines
+                .ensure(context, compiler, prefix)
+                .expect("the pipelines compile");
+            let mut stepper = driver_metal::device::Stepper::new(context).expect("a stepper");
+            stepper
+                .run(|encoder| {
+                    driver_metal::bind::encode::encode(
+                        encoder,
+                        &prepared.table,
+                        &pipelines,
+                        &prepared.params,
+                        prefix,
+                    )
+                })
+                .expect("the prefix runs");
+            // SAFETY: the command buffer retired.
+            unsafe {
+                core::slice::from_raw_parts(
+                    arena.contents().as_ptr().cast_const().cast::<u8>(),
+                    arena.len() as usize,
+                )
+            }
+            .to_vec()
+        };
 
     /// Every router in one lowering: which statement it is, which layer, and
     /// the two arena spans that hold the scores it read and the ids it wrote.
@@ -7174,6 +7174,8 @@ fn a_tie_at_the_last_expert_is_where_the_two_spellings_part() {
         return;
     }
     let unbatched = MetalBinding {
+        qmm_partial_rows: false,
+        qmm_tile: None,
         qmm_multi_batch: false,
         ..observed
     };
@@ -7265,11 +7267,7 @@ fn a_tie_at_the_last_expert_is_where_the_two_spellings_part() {
             // comparison downstream at 0.27%.
             let uncertainty = (flip.gemm_logits[o] - flip.matvec_logits[o]).abs()
                 + (flip.gemm_logits[i] - flip.matvec_logits[i]).abs();
-            let floor = bf16_slack(
-                flip.gemm_logits[o]
-                    .abs()
-                    .max(flip.gemm_logits[i].abs()),
-            );
+            let floor = bf16_slack(flip.gemm_logits[o].abs().max(flip.gemm_logits[i].abs()));
             let resolution = uncertainty.max(floor);
             for (arm, scores) in [
                 ("the GEMM", &flip.gemm_logits),

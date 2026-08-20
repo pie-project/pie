@@ -366,6 +366,78 @@ pub fn plan_one<'a, R: Resolve>(
     }
 }
 
+/// [`plan_one`], for a routine that may state MORE than one dispatch.
+///
+/// The same work and the same refusals, without the narrowing at the end: a
+/// body states a list and this hands the list back. `plan_one` is the caller
+/// that wants exactly one and says so; a shell that records dispatches wants
+/// all of them.
+///
+/// # Why two passes over one statement is a routine's business and not a
+/// plan's
+///
+/// Because the second pass is a property of the DEVICE. `attn`'s split decode
+/// cuts a row's key range into slices so that a fire too narrow to fill this
+/// GPU has more workgroups, and then merges them -- and the same statement on
+/// a machine with fewer cores, or on a driver that does not split, is one
+/// dispatch. Putting the pair in the authored trace would put one backend's
+/// occupancy in a model description every backend reads.
+///
+/// # Errors
+///
+/// As [`plan_one`], less [`Undispatchable::Multiple`], which this cannot
+/// raise.
+pub fn plan_all<'a, R: Resolve>(
+    lowered: &'a Lowered,
+    launch: &Launch,
+    built: Built<'_>,
+    sources: Sources<'a, R>,
+    fire: Geometry,
+) -> Result<Vec<Dispatch<'a, R::Buffer>>, Undispatchable> {
+    let Built { declared, .. } = built;
+    let Sources {
+        arena,
+        resolver,
+        min_offset,
+    } = sources;
+    let symbol = lowered.kernels[launch.kernel as usize].as_str();
+    if launch.cond != Launch::NO_COND {
+        return Err(Undispatchable::Conditional {
+            symbol: symbol.to_owned(),
+            cond: launch.cond,
+        });
+    }
+    let Some(routine) = crate::lowering::routine::armed(symbol) else {
+        return Err(Undispatchable::Unknown {
+            symbol: symbol.to_owned(),
+        });
+    };
+    let facts = crate::lowering::hold::facts(
+        symbol,
+        launch.rows.end - launch.rows.start,
+        fire,
+        lowered.n_requests,
+        widths(lowered, launch).next_back().unwrap_or(0),
+        widths(lowered, launch).next().unwrap_or(0),
+    );
+    crate::lowering::routine::plan(
+        routine,
+        lowered,
+        launch,
+        declared,
+        Sources {
+            arena,
+            resolver,
+            min_offset,
+        },
+        facts,
+    )
+    .map_err(|why| Undispatchable::Routine {
+        symbol: symbol.to_owned(),
+        why: why.to_string(),
+    })
+}
+
 impl<B> Dispatch<'_, B> {
     /// Which bind group the parameter buffer belongs to, if there is one.
     ///

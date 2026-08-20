@@ -20,7 +20,6 @@ use kernels_macros::routine;
 use core::ffi::c_void;
 
 use crate::jit::abi::Tensor;
-use crate::jit::Abi as _;
 use kernels::routine::{Asks, Const, In, Out};
 // NOT UNUSED AT THE TOP LEVEL ONLY. Eight nested modules in this file reach
 // the element through `use super::bf16`, so the name has to be in scope here
@@ -307,9 +306,8 @@ pub mod params {
 pub mod attention_flashinfer {
     use crate::routine::Fire;
     use crate::jit::{Ctx, Launch};
-    use crate::jit::abi::Tensor;
+    
     use kernels::Refusal;
-    use kernels::routine::{Asks, Const, In, Out};
     use kernels_macros::routine;
     
     use kernels::{Bind};
@@ -400,13 +398,12 @@ pub mod attention_flashinfer {
 /// than separate calls. The driver issues them at the point on its own stream
 /// where those dispatches used to.
 pub mod attention_score_post {
-    use super::bf16;
+    
     use super::{Ctx, Launch, Refusal};
-    use crate::jit::abi::Tensor;
-    use kernels::keys;
-    use kernels::routine::{Asks, Const, In, Out};
+    
+    
     use kernels::{Bind, Fire};
-    use kernels_macros::routine;
+    
 
     /// `attn/attention_score_post.cuh` — the root all three compile out of.
     ///
@@ -1491,11 +1488,10 @@ pub mod mla_params {
 pub mod mla_naive {
     use super::bf16;
     use super::{Ctx, Launch, Refusal};
-    use crate::jit::abi::Tensor;
-    use kernels::keys;
-    use kernels::routine::{Asks, Const, In, Out};
+    
+    
     use kernels::{Bind, Fire};
-    use kernels_macros::routine;
+    
 
     /// `attn/attention_mla_naive.cuh` — the root the fallback pair compiles
     /// out of.
@@ -2030,11 +2026,10 @@ pub mod mla_fa2 {
     use super::{Ctx, Refusal};
     use crate::attn::plan::MlaPlanInfo;
     use crate::jit::Abi;
-    use crate::jit::abi::Tensor;
-    use kernels::keys;
-    use kernels::routine::{Asks, Const, In, Out};
-    use kernels::{Bind, Fire};
-    use kernels_macros::routine;
+    
+    
+    use kernels::Fire;
+    
 
     /// `attn/attention_mla_fa2.cuh` — the root this arm's symbols come out of.
     ///
@@ -2585,7 +2580,7 @@ pub unsafe fn dispatch_attention_mla_bf16(
 pub mod qkv_fused {
     use super::bf16;
     use super::{Ctx, Launch, Refusal};
-    use core::ffi::c_void;
+    
     use crate::jit::abi::Tensor;
     use kernels::keys;
     use kernels::routine::{Asks, Const, In, Out};
@@ -3070,7 +3065,7 @@ pub mod kv_paged {
     use core::ffi::c_void;
     use crate::jit::abi::Tensor;
     use kernels::keys;
-    use kernels::routine::{Asks, Const, In, Out};
+    use kernels::routine::{Asks, In};
     use kernels::{Bind, Fire};
     use kernels_macros::routine;
 

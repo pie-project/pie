@@ -21,7 +21,7 @@ use std::fmt;
 
 use crate::jit::{ArgValue, Ctx, Launch};
 use kernels::Refusal;
-use kernels::{Bind, Fire};
+use kernels::Fire;
 
 // ── the root ─────────────────────────────────────────────────────────────
 

@@ -362,10 +362,12 @@ fn transcript() -> Vec<String> {
     // crate's `Ctx`, which carries the cuBLAS handle rather than a
     // `DispatchCtx`. Same handle and the same null stream, so the oracle
     // below compares the same work it always did.
-    // SAFETY: the null stream is always live, and `handle` outlives this fn.
-    let jit = unsafe {
-        kernels_cuda::jit::Ctx::on(std::ptr::null_mut()).with_cublas(handle.cast())
-    };
+    // ONE WAS BUILT HERE AND NEVER USED. The loop below mints its own `gctx`
+    // per row off `ctx.cublas`, so this outer `Ctx` -- built off `handle`, the
+    // same cuBLAS handle by a different route -- fed nothing. Two contexts
+    // over one handle is not wrong, it is just one more than the test needs,
+    // and the unused one carried a `SAFETY` note implying somebody relied on
+    // it.
     let mut rows = Vec::new();
 
     for &(m, n, k) in DENSE {

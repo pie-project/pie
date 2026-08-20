@@ -872,12 +872,18 @@ fn a_page_shaped_decode_answers_the_whole_history() {
 /// The last entry point of the family, and the only one with a pitch.
 ///
 /// `sdpa_paged_tiled_strided` is the tiled body with `queries` and `out` rows
-/// a uniform distance apart instead of packed. `text_conformance`'s DARK
-/// ledger carries it as "no statement produces a row pitch", which is true and
-/// is also the whole of what was known about it: it is compiled at `_d_256`
-/// alone, signed into every build, and no test on any backend had ever asked
-/// it for a number. Dark for want of a caller is not the same as untrusted,
-/// and the difference is one dispatch.
+/// a uniform distance apart instead of packed. The DARK ledger carried it as
+/// "no statement produces a row pitch", which was true and was also the whole
+/// of what was known about it: it was compiled at `_d_256` alone, signed into
+/// every build, and no test on any backend had ever asked it for a number.
+/// Dark for want of a caller is not the same as untrusted, and the difference
+/// is one dispatch.
+///
+/// It has since left that ledger -- `attn.rs::sdpa_paged_tiled_strided` is a
+/// routine and `PAGED_TILED_STRIDED` its one point -- so the sentence above
+/// is history and not a standing description. `routine::DARK` is one row now
+/// and the row is `silu_mul_strided`. The dispatch below is why this one is
+/// no longer on it.
 ///
 /// The pitch is a PAD, not a reshape: rows are `Q_HEADS * D + PAD` apart and
 /// the pad is filled with a value that would wreck any answer that read it —

@@ -144,19 +144,33 @@ fn nothing_this_crate_needs_to_build_compiles_c() {
         // whose builds could compile C, and a script that exists is on it
         // whether or not the reason it exists has shrunk to one test.
         "driver-vulkan",
-        // `kernels-cuda` STOOD HERE, described as *"the CUDA table crate
-        // `model-compiler` reads its rows from"*, whose script wrote into
-        // `OUT_DIR` and declared no `links`. It is still in this closure --
-        // `cargo tree -e normal,build -p driver-vulkan` still names it, by way
-        // of `model-compiler` and `model-ir` -- and it no longer has a BUILD
-        // SCRIPT: `crates/kernels-cuda/build.rs` was deleted at `bac4fa327`,
-        // when a launch stopped being reached through a generated `static
-        // ROOT` and started naming its file and its symbol outright. Nothing
-        // is generated, so nothing generates it.
+        // The CUDA table crate, reached from here by way of `model-ir`, whose
+        // script writes into `OUT_DIR` and declares no `links`.
         //
-        // The row leaves because the fact left, not because the edge did, and
-        // that distinction is the whole point of this list: it is the crates
-        // whose builds could compile C, not the crates that are depended on.
+        // This row has now LEFT and COME BACK, and both moves are the list
+        // working. It left when `crates/kernels-cuda/build.rs` was deleted at
+        // `bac4fa327` -- a launch stopped being reached through a generated
+        // `static ROOT` and started naming its file and its symbol outright,
+        // so nothing was generated and nothing generated it. The edge stayed;
+        // only the fact went, which is the distinction this list is for.
+        //
+        // It is back because that crate has a build script again, for an
+        // unrelated reason and a good one. NVRTC does no path resolution: it
+        // matches `includeNames[]` against the literal string in an `#include`
+        // directive, so a compile needs a list of SPELLINGS rather than a list
+        // of files, and 187 lines of `include_str!` were being maintained
+        // under a rule a person had to remember. The script walks `kernels/`
+        // and `shim/` for the files, scans their own directives for the
+        // spellings, and emits the same three `const` slices into `OUT_DIR`.
+        // It is a directory walk and a string scan -- no `cc`, no `cmake`, no
+        // `nvcc`, nothing compiled -- which is why it satisfies the FIRST
+        // claim above and only has to be named here, in the list of workspace
+        // scripts somebody decided on.
+        //
+        // The evidence remains what the paragraph above says it is: this suite
+        // runs on a machine with no CUDA toolchain at all. If that script
+        // compiled anything, this test would not build, let alone pass.
+        "kernels-cuda",
         // The Metal shader build, behind `native`, and macOS-only besides.
         "kernels-metal",
         // slangc over the shader tree, and the `include_bytes!` table it

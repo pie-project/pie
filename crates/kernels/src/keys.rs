@@ -434,11 +434,7 @@ fact!(/// Elements per VALUE head. See [`GdnKDim`].
 fact!(/// The short convolution's channel count.
     GdnConvDim = "gdn.conv_dim" => Source::Named("gdn.conv_dim") => i32);
 
-fact!(/// The short convolution's kernel width.
-    GdnConvK = "gdn.conv_k" => Source::Named("gdn.conv_k") => i32);
 
-fact!(/// How many groups the key/value heads are split into.
-    GdnNumGroups = "gdn.n_groups" => Source::Named("gdn.n_groups") => i32);
 
 fact!(/// One seat's stride through the CONV state slab, in elements.
     ///
@@ -716,6 +712,26 @@ fact!(/// The page table.
 fact!(/// The page table's per-request offsets. See [`KvPageIndices`] for
     /// why this is `u32`.
     KvPageIndptr = "kv_page_indptr" => Source::Named("kv_page_indptr") => *const u32);
+
+fact!(/// Scratch a split decode attention leaves its partial softmax states in.
+    ///
+    /// THE FIRE'S, not the statement's, which is the whole reason it is a
+    /// fact and not an operand. Cutting a row's key range into slices so that
+    /// more workgroups exist is a decision a BACKEND makes about its own
+    /// occupancy -- a GPU with 32 query heads and 20 cores has nothing to run
+    /// while a key load is in flight -- and an authored trace that had to
+    /// declare a buffer for it would be carrying one driver's scheduling in a
+    /// model description every driver reads.
+    ///
+    /// `*mut f32` because it is written and then read back within one fire:
+    /// a running maximum, a denominator and an accumulator per (row, query
+    /// head, slice), at full width because rounding a denominator to eight
+    /// mantissa bits before the merge would throw away exactly what the
+    /// online recurrence is for.
+    ///
+    /// A driver that does not split answers nothing here and no body asks;
+    /// the unsplit kernel is a complete implementation on its own.
+    AttnScratch = "attn_scratch" => Source::Named("attn_scratch") => *mut f32);
 
 fact!(
     /// Whether this layer's KV pages carry envelopes.

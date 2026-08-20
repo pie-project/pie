@@ -157,6 +157,14 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
                         &da,
                         l,
                         mb.intermediate(),
+                        // The five the scan took as `keys::Gdn*`. Every one is
+                        // `mb`'s -- the checkpoint's mamba block -- which is
+                        // what makes them the statement's to carry.
+                        mb.num_heads,
+                        mb.head_dim,
+                        mb.state_size,
+                        mb.n_groups,
+                        mb.conv_dim(),
                     );
                     dsl::seam(core.trace(), &dsl::seam::ATTN_OUT, &[&core], Some(l));
                     // A GATED norm, not a plain one: `z` is the gate the

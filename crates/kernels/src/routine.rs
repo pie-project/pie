@@ -1677,18 +1677,12 @@ const fn spelling(elem: &'static str, carrier: &'static str) -> &'static str {
     if elem.is_empty() { carrier } else { elem }
 }
 
-/// The carrier's source, with the absent case given a shape.
-///
-/// [`crate::Source::Or`] holds `&'static Source`, so a chain needs its second
-/// half as a VALUE first. The `None` arm is never read: every caller matches
-/// on the carrier's source before asking, and the arm exists because a
-/// `const fn` returns one type.
-const fn or_null(inner: Option<crate::Source>) -> crate::Source {
-    match inner {
-        Some(s) => s,
-        None => crate::Source::Lit(crate::Lit::Null),
-    }
-}
+// `or_null` STOOD HERE -- *"the carrier's source, with the absent case given a
+// shape"*, wrapping an `Option<Source>` into a `Source::Or` chain's second
+// half because that variant holds a reference and needs a VALUE first. Its own
+// doc said the `None` arm was never read; the whole function is never called
+// now, and the two `_or_null` FACTS in `keys.rs` are unrelated -- they are
+// named keys a driver answers, not this.
 
 // THE TWO NAMED WEIGHT CHAINS, AS `static`s BECAUSE `Source::Or` HOLDS
 // REFERENCES. `Facts` carries `w_named` and `w_named2` and nothing else, so a

@@ -1237,6 +1237,51 @@ fn text_of(
     // what `mlx-community` publishes and what every measurement in
     // `driver-wgpu` was taken against.
     let binding = model::catalog::MetalBinding {
+        // TRUE, and this is the only backend that says so.
+        //
+        // `qmm_t.wgsl` carries `m` in `Params` and returns from `write_out`
+        // on `row >= m`, so a fire whose row count the tile does not divide
+        // computes a partial last tile and discards it instead of storing it
+        // over the next value in the arena. `kernels-wgpu`'s
+        // `a_tiled_gemm_agrees_over_every_tile_shape_and_quantization_point`
+        // fires m = 33 across nine tiles and six codecs and checks the
+        // overhang still holds its sentinel.
+        //
+        // What it is worth, measured here: pp496 goes 529.2 -> 1187.2 tok/s
+        // against pp512's 1238.1. The guard it lifts refused thirty-one
+        // prompt lengths in thirty-two, so this is not a corner case -- it is
+        // the common case, and 512 was the corner.
+        qmm_partial_rows: true,
+        // THIS BACKEND'S OWN TILE, and the one field here that is a
+        // measurement rather than a capability.
+        //
+        // `project::QMM_TILE` is `(32, 32)`, chosen on an RTX 4090 against a
+        // cooperative-matrix build. wgpu stamps no such instruction, so that
+        // reason is not this backend's, and `kernels-wgpu`'s own sweep at 512
+        // rows of llama-3.2-1B's shapes reads (in TFLOP/s):
+        //
+        // ```text
+        //            bn=16   bn=32   bn=64
+        //   bm=16     1.07    0.90    1.56
+        //   bm=32     1.04    1.68    2.54
+        //   bm=64     1.82    2.66    2.94
+        // ```
+        //
+        // (64, 64) is faster still and is NOT taken: `bm` is the modulus of
+        // the `TokensMultipleOf` guard, and a prompt the tile does not divide
+        // falls off the GEMM entirely. Measured on this deployment, 500
+        // tokens read 528 tok/s against 512 tokens' 1238 -- so doubling `bm`
+        // doubles how often a real prompt pays 2.3x, to buy 8%.
+        //
+        // `bn` costs nothing of the sort: it is the WEIGHT's axis, checked by
+        // `gemm_fits`, and every width this family states (512, 2048, 8192,
+        // 128256) is a multiple of 64.
+        //
+        // End to end on an M4 Pro, same sitting, medians of three:
+        // pp512 905.6 -> 1235.8 tok/s and pp2048 705.8 -> 895.0, with tg128
+        // unmoved at 117 because a decode takes the matvec and never this
+        // kernel.
+        qmm_tile: Some((32, 64)),
         quant_group: 64,
         quant_bits: 4,
         router_quant_group: 0,

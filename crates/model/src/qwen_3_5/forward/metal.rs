@@ -496,7 +496,6 @@ fn full_attn(c: &Ctx<'_>, l: u32, f: &Qwen35FullAttnFacts, y: &Val) -> Val {
         q_width,
         f.head_dim,
         /*paged=*/ true,
-        f.q_heads / f.kv_heads.max(1),
         f.kv_heads,
         // No sliding window: qwen3.5's full layers attend the whole context,
         // and the linear layers beside them are not attention at all.
@@ -675,7 +674,6 @@ fn mlp(
                         &bank(name, width),
                         moe.num_experts,
                         k,
-                        in_vec,
                         bits,
                         tile,
                         c.metal.routed_qmm_fp16 && bits == 4,

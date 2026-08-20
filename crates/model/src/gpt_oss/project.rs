@@ -537,6 +537,8 @@ mod tests {
     fn the_yarn_attention_factor_reaches_the_metal_softmax_squared() {
         let f = f20b();
         let bind = crate::catalog::MetalBinding {
+            qmm_partial_rows: false,
+            qmm_tile: None,
             quant_group: 64,
             quant_bits: 4,
             router_quant_group: 0,
@@ -601,6 +603,8 @@ mod tests {
         // agreed with a fixture that bound no second point -- two readings
         // of a deployment nobody loads.
         let bind = crate::catalog::MetalBinding {
+            qmm_partial_rows: false,
+            qmm_tile: None,
             quant_group: 64,
             quant_bits: 4,
             router_quant_group: 64,
@@ -644,6 +648,8 @@ mod tests {
         use model_ir::trace::{FireClass, OpKind};
         let f = f20b();
         let bind = crate::catalog::MetalBinding {
+            qmm_partial_rows: false,
+            qmm_tile: None,
             quant_group: 64,
             quant_bits: 4,
             router_quant_group: 0,

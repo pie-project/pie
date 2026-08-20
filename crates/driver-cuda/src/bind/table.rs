@@ -701,12 +701,6 @@ fn operand(
         Some(Source::Named(<keys::GdnConvDim as keys::Fact>::KEY)) => {
             f.cx.gdn().map(|g| ArgValue::I32(g.conv_dim))
         }
-        Some(Source::Named(<keys::GdnConvK as keys::Fact>::KEY)) => {
-            f.cx.gdn().map(|g| ArgValue::I32(g.conv_k))
-        }
-        Some(Source::Named(<keys::GdnNumGroups as keys::Fact>::KEY)) => {
-            f.cx.gdn().map(|g| ArgValue::I32(g.n_groups))
-        }
         // THE TWO STRIDES STAY 64-BIT: the product overflows `i32` at scale.
         Some(Source::Named(<keys::GdnConvStride as keys::Fact>::KEY)) => {
             f.cx.gdn().map(|g| ArgValue::I64(g.conv_stride_elems))
@@ -906,17 +900,21 @@ fn operand(
         Some(Source::Slot(Kind::Param, n)) => f.cx.param(n as usize).map(ArgValue::U32),
         Some(Source::Slot(Kind::ParamF32, n)) => f.cx.param_f32(n as usize).map(ArgValue::F32),
 
-        // THE FA2 DECODE PLAN, LEAF BY LEAF. See [`fa2_decode_leaves`].
-        //
         // WHAT A LAUNCHER THAT PLANS ITS OWN FIRE READS.
         //
-        // Not leaves: a leaf is read OFF a plan and these are read to BUILD
-        // one, so they come straight off the attention context rather than
-        // through `fa2_prefill_leaves` -- which would refuse, the plan it
-        // reads not being valid until the launcher has filled it.
+        // This header said "THE FA2 DECODE PLAN, LEAF BY LEAF" over nineteen
+        // arms; the leaves are gone and so are `fa2_decode_leaves` and its
+        // prefill twin -- a statement names its plan as an operand now.
+        //
+        // What is left is not a leaf and never was: a leaf is read OFF a plan
+        // and this is read to BUILD one, so it comes straight off the
+        // attention context. The plan it names is not valid until the
+        // launcher has filled it, which is why no fold could have answered.
         Some(Source::Named(<keys::Fa2PrefillPlanCache as keys::Fact>::KEY)) => {
             let a = f.cx.attn_ctx()?;
-            let layer = u32::try_from(f.cx.layer()).unwrap_or(0);
+            // The layer index was read here and handed to `attn_plan`, which
+            // used it to pick between decode's two schedules. That choice is
+            // gone -- see `attn_plan` -- and the read went with it.
             let raised = super::attn_plan(a);
             if raised.is_null() {
                 return Err(Refusal::Unstated { what: "a prefill plan cache to fill" });
@@ -1162,19 +1160,13 @@ pub(crate) struct Answering<'a> {
 }
 
 impl<'a> Answering<'a> {
-    /// THE FIRE'S ANSWERS WITH NO OPERANDS BEHIND THEM.
-    ///
-    /// For a hand-written arm: it places its own pointers and asks only for
-    /// facts, so the handle side is empty and a body that reaches for a SLOT
-    /// on one of these is refused -- which is the honest answer, there being
-    /// no statement here to have placed one.
-    #[must_use]
-    pub(crate) fn over_facts(cx: &'a Cx<'a>) -> Self {
-        Self {
-            handles: core::cell::RefCell::new(Handles::over(&[], 0, 0)),
-            facts: Facts::at(cx),
-        }
-    }
+    // `over_facts` STOOD HERE: an `Answering` with an empty handle side, for
+    // a hand-written arm that places its own pointers and asks only for
+    // facts, so that a body reaching for a SLOT on one was refused. It had no
+    // callers left. Hand arms went to the routine path, and `route.rs` shows
+    // the same retirement from the other side -- it had stopped naming this
+    // module at all, leaving `use super::table;` behind as an unused import.
+    // Everything that answers now answers over real operands.
 }
 
 impl kernels::routine::Answers<kernels_cuda::jit::Cuda> for Answering<'_> {
@@ -1578,10 +1570,11 @@ mod tests {
     // answers the rest.
 
 
-    /// Parameters whose fact came from their name rather than their type. Zero,
-    /// and `fact_of` is deleted, so this is a one-way door. `Env<keys::…>` is
-    /// the conversion; a bare `Env` clears this census by hiding the parameter.
-    const NAMED_FACTS: usize = 0;
+    // AND THE SECOND CENSUS'S CONSTANT OUTLIVED ITS TEST. `NAMED_FACTS = 0`
+    // stood right here, documented as a one-way door, with nothing left that
+    // read it: a ratchet is a number plus an assertion, and the assertion had
+    // already been removed by the paragraph above. A number alone ratchets
+    // nothing and reads as though something still checks it.
 
     /// A body asks in its own order, and that order is what gets bound.
     /// `lm_head_gemv_argmax_int8` asks an INPUT, two addresses the statement

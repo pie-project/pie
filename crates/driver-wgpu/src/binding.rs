@@ -486,6 +486,19 @@ pub enum FireTable {
     /// [`Resolve::slab`] and for the same reason: a slot index the driver
     /// invents points a scan at another request's carry.
     RecurrentSlots,
+    /// Scratch a SPLIT decode attention leaves its partial softmax states in.
+    ///
+    /// A fire's table and not a statement's operand for the same reason the
+    /// page CSR is one: how many ways to cut a row's key range so that more
+    /// workgroups exist is a decision about THIS GPU's occupancy, and an
+    /// authored trace that declared a buffer for it would carry one driver's
+    /// scheduling into a model description every driver reads.
+    ///
+    /// Unlike every table above it, nothing uploads this. It is written and
+    /// then read back inside a single fire -- by two dispatches of one
+    /// routine, which Metal serializes -- so the pool stages it once per
+    /// deployment and never touches its contents again.
+    AttnScratch,
 }
 
 /// The marker a constant rides the weight-name slot under.

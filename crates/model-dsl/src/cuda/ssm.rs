@@ -32,11 +32,14 @@ pub fn nemotron_prepare_mamba_params(
     dt_bias: &str,
     heads: u32,
 ) -> (Val, Val, Val) {
-    let outs = record_many(
+    let outs = record_many_with_params(
         t,
         Some(l),
         "ssm::nemotron_prepare_mamba_params",
         vec![a_log.to_string(), d.to_string(), dt_bias.to_string()],
+        // The head count, which the shapes below already state. It reached the
+        // routine as `keys::GdnVHeads`; the statement carries it now.
+        vec![heads],
         vec![],
         vec![
             (Shape(vec![Dim::Const(heads)]), DType::F32),
@@ -83,6 +86,11 @@ builder! {
         da: &Val,
         l: u32,
         intermediate: u32,
+        num_heads: u32,
+        head_dim: u32,
+        state_size: u32,
+        n_groups: u32,
+        conv_dim: u32,
     ) -> Val {
         symbol: "ssm::nemotron_mamba_ssm_batched_bf16",
         on: conv_out,
@@ -91,6 +99,10 @@ builder! {
             store: StateStore::RecurrentState,
             layer: l,
         }),
+        // `[num_heads, head_dim, state_size, n_groups, conv_dim]`, in the
+        // order the routine's marks declare. Five numbers that reached it as
+        // `keys::Gdn*` and are the checkpoint's.
+        params: [num_heads, head_dim, state_size, n_groups, conv_dim],
         inputs: [conv_out, dt, dt_raw, a, d, dt_bias, da],
         out: [Dim::Tokens, Dim::Const(intermediate)] as BF16,
         made: "the scan produces its value",

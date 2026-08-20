@@ -180,6 +180,17 @@ pub struct LlamaLikeMetalFacts {
     /// spells no tile: right for a GEMV-only deployment, wrong loudly for a GEMM one.
     #[serde(default)]
     pub qmm_tile: (u32, u32),
+    /// Does this build's tiled GEMM tolerate a row count its tile does not
+    /// divide? [`MetalBinding::qmm_partial_rows`].
+    ///
+    /// It decides ONE thing: whether the projections' guard reads
+    /// `TokensGT(tile - 1)` or `TokensMultipleOf(tile)`. The second is the
+    /// safe reading and the expensive one -- it refuses thirty-one row counts
+    /// in thirty-two, so a prompt whose length the tile does not divide runs
+    /// its whole prefill on the matvec at about 2.34x the cost.
+    ///
+    /// [`MetalBinding::qmm_partial_rows`]: crate::catalog::MetalBinding::qmm_partial_rows
+    pub qmm_partial_rows: bool,
     /// The ROUTED GEMM's tile, which is not the dense one.
     ///
     /// A separate fact because it decides a second thing the dense tile does
@@ -694,6 +705,7 @@ impl LlamaLikeMetalFacts {
     /// These are the driver's own defaults as its source reads them.
     pub fn synthetic() -> Self {
         Self {
+            qmm_partial_rows: false,
             fuse_residual_gemv: true,
             paged_multi_batch: true,
             qmm_multi_batch: true,
@@ -922,6 +934,21 @@ mod tests {
             (
                 "qmm_fp16_precast",
                 "one codec is stamped and this catalog is all of it",
+            ),
+            // A BUILD's stamp, like `qmm_tile` beside it -- which escapes
+            // this sweep only because it serialises as an array and the
+            // filter above keeps booleans and numbers. The answer is which
+            // kernels were compiled, so it does not vary by model family and
+            // three family fixtures would state it identically however they
+            // were written.
+            //
+            // Both arms are asserted directly on the predicate by
+            // `project::tests::the_partial_row_tolerance_is_the_builds_stamp_
+            // and_not_the_familys`, which is the statement a fixture pair
+            // would have made.
+            (
+                "qmm_partial_rows",
+                "a build's stamp, asserted directly in project::tests",
             ),
         ];
 

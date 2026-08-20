@@ -51,13 +51,34 @@ impl Grid {
         self.t * self.h * self.w / m
     }
 
-    /// M-RoPE sequence-cursor advance: the next text token sits one past the
-    /// largest positional extent of the span. Height/width are taken in merged
-    /// (LLM) units to match the merged token layout.
+    /// M-RoPE sequence-cursor advance: how far the cursor moves across the
+    /// whole span. Height/width are taken in merged (LLM) units to match the
+    /// merged token layout.
+    ///
+    /// EACH TEMPORAL PATCH IS ITS OWN SPAN, which is why `t` MULTIPLIES here
+    /// rather than joining the max. HF splits a video grid before it assigns
+    /// any position at all -- `repeat_interleave(video_grid_thw, t)` followed
+    /// by `video_grid_thw[:, 0] = 1` -- so what the model sees is `t` separate
+    /// grids of one frame each, and the cursor advances
+    /// `max(h, w) // merge` once per grid. See `Qwen3VLModel.get_rope_index`.
+    ///
+    /// `t` WAS INSIDE THE MAX and that was wrong in one direction only: a clip
+    /// whose frame count exceeded its largest merged spatial dimension used to
+    /// advance by the frame count, and every other clip advanced by one
+    /// frame's worth no matter how many frames it had. Both are the same
+    /// mistake, which is treating a sequence of frames as a single positional
+    /// block. For a still image `t` is 1 and this is `max(h, w)` exactly as
+    /// before, so nothing about the image path moved.
+    ///
+    /// WHAT THIS DOES NOT COUNT is the timestamp text between frames. Qwen3-VL
+    /// writes `<t1> <vision_start> frame1 <vision_end> <t2> ...`, and those
+    /// timestamp tokens advance the cursor like any other text. They are the
+    /// caller's tokens, counted where the caller counts its text; this
+    /// function answers for the visual rows only.
     pub fn mrope_position_span(&self, merge: u32) -> u32 {
         let hm = self.h / merge;
         let wm = self.w / merge;
-        self.t.max(hm).max(wm)
+        self.t * hm.max(wm)
     }
 }
 
@@ -293,7 +314,9 @@ impl QwenVisionConfig {
     }
 
     /// Lay out a Qwen visual span. `token_count` is the merged LLM token count;
-    /// `position_span` follows M-RoPE (`max(t, h/merge, w/merge)`).
+    /// `position_span` follows M-RoPE (`t · max(h/merge, w/merge)`: one
+    /// cursor advance per temporal patch, since upstream gives each frame its
+    /// own single-frame grid).
     pub fn layout(&self, h: u32, w: u32, num_frames: u32) -> VisualSpan {
         let patch_grid = self.grid(h, w, num_frames);
         let merge = self.merge_size;
@@ -375,17 +398,42 @@ impl QwenVisionConfig {
 /// Rows are emitted t-major, then h, then w — matching the flattened
 /// merged-grid order the encoder produces. Length equals the span's token
 /// count (`merged.t * merged.h * merged.w`). Mirrors the vision branch of HF
-/// `Qwen2VL.get_rope_index`.
+/// `Qwen3VLModel.get_rope_index`.
 ///
-/// Note: Qwen2.5/3-VL scale the temporal index by frame timing
-/// (`second_per_grid_t`); that scaling is a TODO (`VERIFY`). This emits the
-/// base `arange(t)` temporal index used by Qwen2-VL.
+/// THERE IS NO `second_per_grid_t` SCALING, and the note that once stood here
+/// calling that a TODO was asking a question the arch had already answered.
+/// Qwen2.5-VL spaces the temporal index by frame timing --
+/// `t_index = arange(t) * tokens_per_second * second_per_grid_t` -- and
+/// Qwen3-VL REMOVED it. Upstream says so twice: `time_interval` is left at its
+/// default of 1 at every `get_vision_position_ids` call in the Qwen3-VL model,
+/// and the `prepare_inputs_for_generation` override carries the comment
+/// "Qwen3VL use timestamps and remove second_per_grid_ts". Timestamps do the
+/// work frame timing used to: the prompt carries `<t1> ... <t2> ...` as
+/// ordinary text between frames, so the elapsed time reaches the model as
+/// tokens instead of as a stride. `Qwen36` is the only Qwen this crate builds
+/// a processor for, so the scaling is not merely unimplemented here — applying
+/// it would be wrong.
+///
+/// WHAT WAS ACTUALLY MISSING was one cursor per frame. Upstream splits a video
+/// grid into `t` single-frame grids before assigning positions, and each gets
+/// the running cursor as the offset for ALL THREE of its axes. So frame `i`
+/// sits `i * max(h, w)` past the anchor on t, h and w alike, where this used
+/// to give every frame the same anchor on h and w and separate them by one on
+/// t alone. Two frames of a 32×32 merged grid differed by 1 and should differ
+/// by 32. A still image has `t == 1` and is unchanged to the row.
+///
+/// The `i * max(h, w)` spacing assumes the frames are adjacent. Where the
+/// caller writes timestamp text between them it must add those tokens to the
+/// anchor itself, for the same reason it adds any other text: this function
+/// sees the visual rows and nothing else.
 pub fn qwen_mrope_positions(merged: Grid, anchor: u32) -> Vec<[u32; 3]> {
     let mut out = Vec::with_capacity((merged.t * merged.h * merged.w) as usize);
+    let advance = merged.h.max(merged.w);
     for ti in 0..merged.t {
+        let base = anchor + ti * advance;
         for hi in 0..merged.h {
             for wi in 0..merged.w {
-                out.push([anchor + ti, anchor + hi, anchor + wi]);
+                out.push([base, base + hi, base + wi]);
             }
         }
     }
@@ -396,7 +444,7 @@ pub fn qwen_mrope_positions(merged: Grid, anchor: u32) -> Vec<[u32; 3]> {
 /// began at `anchor` (i.e. `anchor + position_span`). The next text token's
 /// three M-RoPE components all start here.
 pub fn qwen_next_position(merged: Grid, anchor: u32) -> u32 {
-    anchor + merged.t.max(merged.h).max(merged.w)
+    anchor + merged.t * merged.h.max(merged.w)
 }
 
 // ============================================================================
@@ -1675,8 +1723,13 @@ mod tests {
         );
         assert_eq!(
             span.position_span,
-            span.grid.t.max(span.grid.h).max(span.grid.w)
+            span.grid.t * span.grid.h.max(span.grid.w)
         );
+        // A still image is one temporal patch, so the product above is the
+        // plain `max(h, w)` this test was written to pin. That is the whole
+        // reason the video fix could not have been caught here.
+        assert_eq!(span.grid.t, 1);
+        assert_eq!(span.position_span, span.grid.h.max(span.grid.w));
     }
 
     #[test]
@@ -1732,19 +1785,54 @@ mod tests {
         );
     }
 
+    /// EACH FRAME OF A CLIP GETS ITS OWN CURSOR, on all three axes.
+    ///
+    /// This test used to assert `max_t == grid.t - 1`: consecutive frames one
+    /// position apart on the temporal axis and stacked on top of each other on
+    /// the spatial ones. That is what you get by reading the temporal index as
+    /// `arange(t)`, and it is not what the model is given. Upstream splits the
+    /// video grid into `t` single-frame grids and offsets each by the running
+    /// cursor, so the spacing between frames is a whole frame's positional
+    /// extent -- `max(h, w)` -- and it applies to t, h and w alike.
     #[test]
-    fn qwen_video_mrope_temporal_axis_increments() {
+    fn qwen_video_frames_are_a_frame_apart_on_every_axis() {
         let q = Processor::for_arch(VisionArch::Qwen36);
         let span = q.layout_video(448, 448, 8);
         let pos = q.mrope_positions(&span, 0).unwrap();
         assert_eq!(pos.len() as u32, span.token_count);
-        // Temporal index ranges over the merged temporal grid.
-        let max_t = pos.iter().map(|p| p[0]).max().unwrap();
-        assert_eq!(max_t, span.grid.t - 1);
         assert!(
             span.grid.t > 1,
             "8 frames / temporal_patch_size should give t>1"
         );
+
+        let advance = span.grid.h.max(span.grid.w);
+        let rows_per_frame = (span.grid.h * span.grid.w) as usize;
+
+        // Frame `i` opens at `i · advance` on every axis, and its rows walk
+        // h/w from there.
+        for i in 0..span.grid.t {
+            let base = i * advance;
+            let first = pos[i as usize * rows_per_frame];
+            assert_eq!(first, [base, base, base], "frame {i} start");
+            let frame = &pos[i as usize * rows_per_frame..][..rows_per_frame];
+            assert!(
+                frame.iter().all(|p| p[0] == base),
+                "frame {i} temporal index is constant within the frame"
+            );
+            assert_eq!(
+                frame.iter().map(|p| p[1]).max().unwrap(),
+                base + span.grid.h - 1
+            );
+            assert_eq!(
+                frame.iter().map(|p| p[2]).max().unwrap(),
+                base + span.grid.w - 1
+            );
+        }
+
+        // And the cursor lands one frame past the last one, which is the
+        // clip's whole span -- not one frame's worth, as `max(t, h, w)` gave.
+        assert_eq!(qwen_next_position(span.grid, 0), span.grid.t * advance);
+        assert_eq!(span.position_span, span.grid.t * advance);
     }
 
     // ── Arch selection ────────────────────────────────────────────────────

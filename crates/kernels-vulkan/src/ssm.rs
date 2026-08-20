@@ -3,10 +3,10 @@
 //! `gdn` is an algorithm and not a model, so it takes no model qualifier --
 //! the same call the CUDA table makes for `delta_attn_kda` and `indexer_dsa`.
 
-use kernels_macros::routine;
 use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, Out, Tensor, bf16, keys};
 use kernels::BindMut;
 use kernels::routine::Refusal;
+use kernels_macros::routine;
 
 // Eight entrypoints here name a shader and cannot be reached, and the rows
 // that used to say so are gone. The reason is not the rows and did not leave
@@ -198,7 +198,8 @@ pub fn gdn_core(
     k_off: Const<i32>,
     v_off: Const<i32>,
     eps: Const<f32>,
-    inv_sqrt_dk: Const<f32>) -> Result<(), Refusal> {
+    inv_sqrt_dk: Const<f32>,
+) -> Result<(), Refusal> {
     // THE ELEVEN GEOMETRY MARKS, WHICH WERE `GdnCoreParams`' ELEVEN FIELDS.
     //
     // A block stood here saying *"BACK TO AN ASK, BECAUSE THIS ROUTINE'S
@@ -230,7 +231,11 @@ pub fn gdn_core(
     let new_conv_state = ctx.ask::<Tensor<f32>, keys::NewConvState>()?;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("gdn_core_bfloat16", ctx.best()), "gdn_core_bfloat16").apply(gdn_grid(rows, *v_heads, *v_dim)?),
+        Fire::at(
+            crate::routine::module_path("gdn_core_bfloat16", ctx.best()),
+            "gdn_core_bfloat16",
+        )
+        .apply(gdn_grid(rows, *v_heads, *v_dim)?),
         &[
             mixed.arg(),
             conv_state.arg(),
@@ -297,7 +302,8 @@ pub fn gdn_core_slotted(
     k_off: Const<i32>,
     v_off: Const<i32>,
     eps: Const<f32>,
-    inv_sqrt_dk: Const<f32>) -> Result<(), Refusal> {
+    inv_sqrt_dk: Const<f32>,
+) -> Result<(), Refusal> {
     // THE ELEVEN GEOMETRY MARKS, WHICH WERE `GdnCoreParams`' ELEVEN FIELDS.
     //
     // A block stood here saying *"BACK TO AN ASK, BECAUSE THIS ROUTINE'S
@@ -330,7 +336,11 @@ pub fn gdn_core_slotted(
     let slot_ids = ctx.ask::<Tensor<u32>, keys::RecurrentSlots>()?;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("gdn_core_slotted_bfloat16", ctx.best()), "gdn_core_slotted_bfloat16").apply(gdn_grid(rows, *v_heads, *v_dim)?),
+        Fire::at(
+            crate::routine::module_path("gdn_core_slotted_bfloat16", ctx.best()),
+            "gdn_core_slotted_bfloat16",
+        )
+        .apply(gdn_grid(rows, *v_heads, *v_dim)?),
         &[
             mixed.arg(),
             conv_state.arg(),
@@ -410,7 +420,8 @@ pub fn gdn_prep(
     k_off: Const<i32>,
     v_off: Const<i32>,
     eps: Const<f32>,
-    inv_sqrt_dk: Const<f32>) -> Result<(), Refusal> {
+    inv_sqrt_dk: Const<f32>,
+) -> Result<(), Refusal> {
     // THE ELEVEN GEOMETRY MARKS, WHICH WERE `GdnCoreParams`' ELEVEN FIELDS.
     //
     // A block stood here saying *"BACK TO AN ASK, BECAUSE THIS ROUTINE'S
@@ -441,7 +452,11 @@ pub fn gdn_prep(
     let new_conv_state = ctx.ask::<Tensor<f32>, keys::NewConvState>()?;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("gdn_prep_bfloat16", ctx.best()), "gdn_prep_bfloat16").apply(prep_grid(rows, *v_heads)?),
+        Fire::at(
+            crate::routine::module_path("gdn_prep_bfloat16", ctx.best()),
+            "gdn_prep_bfloat16",
+        )
+        .apply(prep_grid(rows, *v_heads)?),
         &[
             mixed.arg(),
             conv_state.arg(),
@@ -507,7 +522,8 @@ pub fn gdn_prep_slotted(
     k_off: Const<i32>,
     v_off: Const<i32>,
     eps: Const<f32>,
-    inv_sqrt_dk: Const<f32>) -> Result<(), Refusal> {
+    inv_sqrt_dk: Const<f32>,
+) -> Result<(), Refusal> {
     // THE ELEVEN GEOMETRY MARKS, WHICH WERE `GdnCoreParams`' ELEVEN FIELDS.
     //
     // A block stood here saying *"BACK TO AN ASK, BECAUSE THIS ROUTINE'S
@@ -539,7 +555,11 @@ pub fn gdn_prep_slotted(
     let slot_ids = ctx.ask::<Tensor<u32>, keys::RecurrentSlots>()?;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("gdn_prep_slotted_bfloat16", ctx.best()), "gdn_prep_slotted_bfloat16").apply(prep_grid(rows, *v_heads)?),
+        Fire::at(
+            crate::routine::module_path("gdn_prep_slotted_bfloat16", ctx.best()),
+            "gdn_prep_slotted_bfloat16",
+        )
+        .apply(prep_grid(rows, *v_heads)?),
         &[
             mixed.arg(),
             conv_state.arg(),
@@ -621,7 +641,8 @@ pub fn gdn_prep_prefill(
     k_off: Const<i32>,
     v_off: Const<i32>,
     eps: Const<f32>,
-    inv_sqrt_dk: Const<f32>) -> Result<(), Refusal> {
+    inv_sqrt_dk: Const<f32>,
+) -> Result<(), Refusal> {
     // THE ELEVEN GEOMETRY MARKS, WHICH WERE `GdnCoreParams`' ELEVEN FIELDS.
     //
     // A block stood here saying *"BACK TO AN ASK, BECAUSE THIS ROUTINE'S
@@ -659,7 +680,11 @@ pub fn gdn_prep_prefill(
     let row_pitch = mixed.width;
     let n_scan = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("gdn_prep_prefill_bfloat16", ctx.best()), "gdn_prep_prefill_bfloat16").apply(prep_grid(rows, *v_heads)?),
+        Fire::at(
+            crate::routine::module_path("gdn_prep_prefill_bfloat16", ctx.best()),
+            "gdn_prep_prefill_bfloat16",
+        )
+        .apply(prep_grid(rows, *v_heads)?),
         &[
             mixed.arg(),
             conv_state.arg(),
@@ -736,7 +761,8 @@ pub fn gdn_core_recurrent(
     k_off: Const<i32>,
     v_off: Const<i32>,
     eps: Const<f32>,
-    inv_sqrt_dk: Const<f32>) -> Result<(), Refusal> {
+    inv_sqrt_dk: Const<f32>,
+) -> Result<(), Refusal> {
     // THE ELEVEN GEOMETRY MARKS, WHICH WERE `GdnCoreParams`' ELEVEN FIELDS.
     //
     // A block stood here saying *"BACK TO AN ASK, BECAUSE THIS ROUTINE'S
@@ -768,7 +794,11 @@ pub fn gdn_core_recurrent(
     let new_conv_state = ctx.ask::<Tensor<f32>, keys::NewConvState>()?;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("gdn_core_recurrent_bfloat16", ctx.best()), "gdn_core_recurrent_bfloat16").apply(gdn_grid(rows, *v_heads, *v_dim)?),
+        Fire::at(
+            crate::routine::module_path("gdn_core_recurrent_bfloat16", ctx.best()),
+            "gdn_core_recurrent_bfloat16",
+        )
+        .apply(gdn_grid(rows, *v_heads, *v_dim)?),
         &[
             mixed.arg(),
             conv_state.arg(),
@@ -829,7 +859,8 @@ pub fn gdn_core_recurrent_slotted(
     k_off: Const<i32>,
     v_off: Const<i32>,
     eps: Const<f32>,
-    inv_sqrt_dk: Const<f32>) -> Result<(), Refusal> {
+    inv_sqrt_dk: Const<f32>,
+) -> Result<(), Refusal> {
     // THE ELEVEN GEOMETRY MARKS, WHICH WERE `GdnCoreParams`' ELEVEN FIELDS.
     //
     // A block stood here saying *"BACK TO AN ASK, BECAUSE THIS ROUTINE'S
@@ -862,7 +893,11 @@ pub fn gdn_core_recurrent_slotted(
     let slot_ids = ctx.ask::<Tensor<u32>, keys::RecurrentSlots>()?;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("gdn_core_recurrent_slotted_bfloat16", ctx.best()), "gdn_core_recurrent_slotted_bfloat16").apply(gdn_grid(rows, *v_heads, *v_dim)?),
+        Fire::at(
+            crate::routine::module_path("gdn_core_recurrent_slotted_bfloat16", ctx.best()),
+            "gdn_core_recurrent_slotted_bfloat16",
+        )
+        .apply(gdn_grid(rows, *v_heads, *v_dim)?),
         &[
             mixed.arg(),
             conv_state.arg(),
@@ -930,8 +965,7 @@ pub fn gdn_core_recurrent_prefill(
     // `[mixed, pre_q, pre_k, pre_gate]` and the scan takes the three prepared
     // planes only; the mark is here because the slot is a POSITION now, and
     // without it `pre_q` would bind `mixed`.
-    #[allow(unused_variables)]
-    pad: In<Tensor<bf16>>,
+    #[allow(unused_variables)] pad: In<Tensor<bf16>>,
     core_out: Out<Tensor<bf16>>,
     pre_q: In<Tensor<f32>>,
     pre_k: In<Tensor<f32>>,
@@ -965,7 +999,8 @@ pub fn gdn_core_recurrent_prefill(
     // `PIE_LANES`/`PIE_VROWS` at compile time, so `scan_point` below turns
     // them into a symbol rather than into an argument.
     lanes: Const<i32>,
-    vrows: Const<i32>) -> Result<(), Refusal> {
+    vrows: Const<i32>,
+) -> Result<(), Refusal> {
     // THE HEAD COUNT AND THE VALUE WIDTH, OFF THE MARKS. Both were asks --
     // *"BACK TO ASKS, AS THE OTHER TWO PLANES"* -- because this routine
     // forwarded its params run as a STRUCT the shader read by field, so slot
@@ -1003,7 +1038,11 @@ pub fn gdn_core_recurrent_prefill(
     }
     let per_group = (32 / lanes.unsigned_abs()) * vrows.unsigned_abs();
     ctx.fire(
-        Fire::at(crate::routine::module_path(SCAN[point], ctx.best()), SCAN[point]).apply([32, dv.unsigned_abs().div_ceil(per_group), hv.unsigned_abs()]),
+        Fire::at(
+            crate::routine::module_path(SCAN[point], ctx.best()),
+            SCAN[point],
+        )
+        .apply([32, dv.unsigned_abs().div_ceil(per_group), hv.unsigned_abs()]),
         &[
             rstate.arg_mut(),
             core_out.arg(),
@@ -1107,34 +1146,57 @@ mod tests {
     }
 
     impl Encode for Seen {
-        fn resolve(
-            &self,
-            ty: kernels::Ty,
-            source: kernels::Source,
-        ) -> Result<ArgValue, Refusal> {
+        fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
             use kernels::keys::Fact;
             if source == <keys::Rows as Fact>::SOURCE {
                 return Ok(ArgValue::I32(self.rows.get()));
             }
             if source == <keys::ConvState as Fact>::SOURCE {
-                return Ok(ArgValue::Buffer { handle: 501, writes: false, rows: 0, width: 0 });
+                return Ok(ArgValue::Buffer {
+                    handle: 501,
+                    writes: false,
+                    rows: 0,
+                    width: 0,
+                });
             }
             if source == <keys::RecurrentState as Fact>::SOURCE {
-                return Ok(ArgValue::Buffer { handle: 502, writes: true, rows: 0, width: 0 });
+                return Ok(ArgValue::Buffer {
+                    handle: 502,
+                    writes: true,
+                    rows: 0,
+                    width: 0,
+                });
             }
             if source == <keys::NewConvState as Fact>::SOURCE {
-                return Ok(ArgValue::Buffer { handle: 503, writes: true, rows: 0, width: 0 });
+                return Ok(ArgValue::Buffer {
+                    handle: 503,
+                    writes: true,
+                    rows: 0,
+                    width: 0,
+                });
             }
             if source == <keys::RecurrentSlots as Fact>::SOURCE {
-                return Ok(ArgValue::Buffer { handle: 504, writes: false, rows: 0, width: 0 });
+                return Ok(ArgValue::Buffer {
+                    handle: 504,
+                    writes: false,
+                    rows: 0,
+                    width: 0,
+                });
             }
             if matches!(ty, kernels::Ty::Buf) {
-                return Ok(ArgValue::Buffer { handle: 900, writes: false, rows: 0, width: 0 });
+                return Ok(ArgValue::Buffer {
+                    handle: 900,
+                    writes: false,
+                    rows: 0,
+                    width: 0,
+                });
             }
             // Anything else is refused: a probe that invented an answer to a
             // fact it does not know would let a body pass under test while
             // the same fact went unanswered on a real driver.
-            Err(Refusal::Unstated { what: "a fact this probe does not answer" })
+            Err(Refusal::Unstated {
+                what: "a fact this probe does not answer",
+            })
         }
 
         fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
@@ -1178,7 +1240,8 @@ mod tests {
             Const::new(K_OFF),
             Const::new(V_OFF),
             Const::new(EPS),
-            Const::new(INV_SQRT_DK))
+            Const::new(INV_SQRT_DK),
+        )
     }
 
     /// [`gdn_core_slotted`] over the same fixture, so the pair below differs
@@ -1204,7 +1267,8 @@ mod tests {
             Const::new(K_OFF),
             Const::new(V_OFF),
             Const::new(EPS),
-            Const::new(INV_SQRT_DK))
+            Const::new(INV_SQRT_DK),
+        )
     }
 
     /// [`gdn_prep`] over the same fixture.
@@ -1231,7 +1295,8 @@ mod tests {
             Const::new(K_OFF),
             Const::new(V_OFF),
             Const::new(EPS),
-            Const::new(INV_SQRT_DK))
+            Const::new(INV_SQRT_DK),
+        )
     }
 
     /// [`gdn_core_recurrent`] over the same fixture.
@@ -1255,7 +1320,8 @@ mod tests {
             Const::new(K_OFF),
             Const::new(V_OFF),
             Const::new(EPS),
-            Const::new(INV_SQRT_DK))
+            Const::new(INV_SQRT_DK),
+        )
     }
 
     /// [`gdn_core_recurrent_prefill`], whose thirteenth and twelfth words are
@@ -1274,7 +1340,11 @@ mod tests {
             // does not read -- see the routine's own doc comment.
             In::new(Tensor::<bf16>::new(0)),
             Out::new(Tensor::<bf16>::new(1)),
-            In { ptr: Tensor::<f32>::new(2), rows: 0, width: 256 },
+            In {
+                ptr: Tensor::<f32>::new(2),
+                rows: 0,
+                width: 256,
+            },
             In::new(Tensor::<f32>::new(3)),
             In::new(Tensor::<f32>::new(4)),
             Const::new(K_DIM),
@@ -1289,7 +1359,8 @@ mod tests {
             Const::new(EPS),
             Const::new(INV_SQRT_DK),
             Const::new(lanes),
-            Const::new(vrows))
+            Const::new(vrows),
+        )
     }
 
     /// A slotted form is the plain one plus a slot map, in that order.

@@ -524,19 +524,18 @@ pub fn q_rmsnorm_rope_bf16_rounded(
     ctx: &Ctx<'_>,
     q: InOut<Tensor<bf16>>,
     q_weight: Const<Tensor<bf16>>) -> Result<(), Refusal> {
-    // ASKED, NOT `Const`: every one of these was `Env<keys::_>` before the
-    // four marks, and no builder ever began stating them. A `Const` mark
-    // PROMISES the statement carries the number at its slot in the params
-    // run; where nothing states one the promise is broken at the fire, not
-    // at the type. See `.wiki/migration.md` §11.20.
-    let head_dim = ctx.ask::<i32, keys::KvHeadDim>()?;
-    let theta = ctx.ask::<f32, keys::Theta>()?;
-    let eps = ctx.ask::<f32, keys::RmsEps>()?;
-
-    // THE CALLEE ASKS FOR THE POSITIONS ITSELF, so this no longer forwards
-    // them: a fact only the fire can answer reaches a body through its own
-    // context, not through the argument list of whoever called it. The head
-    // pitch, theta and epsilon left this call for the same reason.
+    // THE CALLEE ASKS FOR ALL OF IT ITSELF, so this forwards none of it: a
+    // fact only the fire can answer reaches a body through its own context,
+    // not through the argument list of whoever called it. The positions, the
+    // head pitch, the theta and the epsilon all left this call for that
+    // reason.
+    //
+    // AND THE ASKS LEFT WITH THEM. Three `ctx.ask` lines stood here after the
+    // arguments they fed were gone -- `KvHeadDim`, `Theta`, `RmsEps` --
+    // reading facts into names nothing read. Removing them changes no
+    // refusal: `qk_rmsnorm_rope_bf16_rounded` asks the same three keys with
+    // the same `?`, so an unstated one refuses one frame later and with the
+    // same words. What they cost was a reader believing this body reads them.
     qk_rmsnorm_rope_bf16_rounded(
         ctx,
         q,
@@ -936,20 +935,15 @@ pub fn rope_partial_last_bf16(
 pub fn rope_partial_last_q_bf16(
     ctx: &Ctx<'_>,
     q: InOut<Tensor<bf16>>) -> Result<(), Refusal> {
-    // ASKED, NOT `Const`: HEAD spelled each of these `Env<keys::_>` and no
-    // builder ever began stating them. A `Const` mark PROMISES the statement
-    // carries the number at its slot in the params run; where nothing states
-    // one the promise breaks at the fire, not at the type. §11.20.
-    let head_dim = ctx.ask::<i32, keys::KvHeadDim>()?;
-    let rotary_dim = ctx.ask::<i32, keys::RotaryWidth>()?;
-    let theta = ctx.ask::<f32, keys::Theta>()?;
-    let interleaved = ctx.ask::<bool, keys::RopeInterleaved>()?;
-    let yarn_factor = ctx.ask::<f32, keys::YarnFactor>()?;
-    let yarn_beta_fast = ctx.ask::<f32, keys::YarnBetaFast>()?;
-    let yarn_beta_slow = ctx.ask::<f32, keys::YarnBetaSlow>()?;
-    let yarn_original_max_position = ctx.ask::<i32, keys::YarnOriginalMaxPosition>()?;
-
-    // THE CALLEE ASKS FOR THE POSITIONS ITSELF.
+    // THE CALLEE ASKS FOR ALL OF IT ITSELF -- the positions and the eight rope
+    // and YaRN numbers alike.
+    //
+    // EIGHT `ctx.ask` LINES STOOD HERE and fed nothing: `KvHeadDim`,
+    // `RotaryWidth`, `Theta`, `RopeInterleaved` and the four YaRN numbers,
+    // read into names no line below mentions. `rope_partial_last_bf16` asks
+    // for the same eight with the same `?`, so this refuses on exactly the
+    // same unstated facts as before, one frame later. Eight is enough of them
+    // that the block read like the body's own vocabulary.
     //
     // The two marks differ and the ADDRESS does not: this form takes `q` as
     // `InOut` because the statement places it once and declares it once,
@@ -1065,35 +1059,37 @@ const _: () = {
 const _: () = {
     let plain = kernels::routine::sources::<crate::jit::Cuda, _, _>(rope_bf16);
     assert!(plain.len() == 2);
-    let orig = kernels::routine::sources::<crate::jit::Cuda, _, _>(rope_yarn_original_bf16);
-};
-
-// The three YaRN lists don't line up (the `_last` pair omits
-// `attention_factor`), so a reorder can't be caught by eye. `n_max` is
-// `RowsTotal`, not `keys::Rows`: no region can stand in for the total.
-const _: () = {
-    // THE FIVE YARN NUMBERS ARE THE STATEMENT'S NOW, so there are no keys to
-    // hold the slots apart by: §3.2 puts the whole YaRN block among the
-    // checkpoint's rope constants, and it records why they belong together --
-    // they *"always arrive together and are always absent together"*, which as
-    // five `Env` parameters was an invariant a body had to guard and as five
-    // `Const` parameters is arity. A checkpoint with no YaRN block emits no
-    // statement carrying them, so `arity_problem` refuses it before a body
-    // runs. What is pinned is their ORDER in the params run, which is the
-    // thing a swap would still get wrong.
-    // `RowsTotal` LEFT THE PARAMETER LIST. It was `Env<i32, keys::RowsTotal>`
-    // -- the fire's total token count, which no region can stand in for --
-    // and §6.1 keeps it in `Env`'s successor: the body asks for it. What is
-    // left at `[6]` is the epsilon the statement now carries.
-    let dw = kernels::routine::sources::<crate::jit::Cuda, _, _>(qk_rmsnorm_rope_bf16_devwin);
-    let d = kernels::routine::sources::<crate::jit::Cuda, _, _>(rope_partial_last_bf16);
-    let q = kernels::routine::sources::<crate::jit::Cuda, _, _>(rope_partial_last_q_bf16);
-    let y = kernels::routine::sources::<crate::jit::Cuda, _, _>(rope_yarn_original_bf16);
+    // `rope_yarn_original_bf16` was bound here and asserted nothing. It is
+    // walked properly at the bottom of this file, where `whole` reads the
+    // source column.
 };
 
 // These four rows have no hand arm left, so this is the only thing that
 // catches a slot regressing to `None` (silently falling back to
 // `Refusal::Unstated`) under a `cargo check`-only regime.
+// THE FOUR ROWS THIS WALKS WERE WALKED TWICE, and the other walk asserted
+// nothing: a block above bound `qk_rmsnorm_rope_bf16_devwin`,
+// `rope_partial_last_bf16`, `rope_partial_last_q_bf16` and
+// `rope_yarn_original_bf16` to four names and stopped, under a comment saying
+// it was *"the only thing that catches a slot regressing to `None`"*.
+// `sources` returns `F::SOURCES` and inspects nothing, so what it caught was
+// that the four routines still EXIST and still satisfy `KernelFn` -- worth
+// something, and not what it said. This block is where the claim is kept.
+//
+// Its prose is worth carrying over, because it says what a `None` here would
+// mean. The three YaRN lists don't line up -- the `_last` pair omits
+// `attention_factor` -- so a reorder cannot be caught by eye. THE FIVE YARN
+// NUMBERS ARE THE STATEMENT'S NOW, so there are no keys to hold the slots
+// apart by: §3.2 puts the whole YaRN block among the checkpoint's rope
+// constants, and records why they belong together -- they *"always arrive
+// together and are always absent together"*, which as five `Env` parameters
+// was an invariant a body had to guard and as five `Const` parameters is
+// arity. A checkpoint with no YaRN block emits no statement carrying them, so
+// `arity_problem` refuses it before a body runs; what is pinned is their ORDER
+// in the params run, which is the thing a swap would still get wrong. And
+// `RowsTotal` LEFT the parameter list -- the fire's total token count, which
+// no region can stand in for -- because §6.1 keeps it in `Env`'s successor
+// and the body asks for it.
 const _: () = {
     // `Derived` CARRIES NO SOURCE, and never did: the two columns are
     // computed differently -- a `Derived` row is what `#[routine]` reads off

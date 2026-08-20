@@ -2601,8 +2601,22 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
         // llama-3.2-1B went from 262,144 one-thread workgroups per rotation to
         // 8,192 of thirty-two lanes, pp512 850 to 897 tok/s. This number is
         // the reason that was worth doing and the record that it was done.
+        //
+        // UP BY 2,095,584 at `d0fb52657`, and this is the rare rise that is a
+        // gain. The quantized matvec gives a workgroup FOUR output columns
+        // where it gave eight, so the column axis needs twice the groups over
+        // the same weights. Fewer columns a group is what let the scale and
+        // the bias hoist to once per lane-block, which is only sound while a
+        // block cannot straddle two quantization groups -- and the narrowest
+        // group this tree stamps is 32, so eight words of four-bit codes would
+        // read one scale for two groups' weights. Wrong, not slow.
+        //
+        // NOT `2ef735054` beside it, which doubled `PIE_QMV_VPT` to four words
+        // a lane. That halves the K loop's trip count inside a group and
+        // changes no grid, so this number is blind to it -- which is the right
+        // shape: this counts dispatched work, not work per lane.
         workgroups,
-        11_053_618,
+        13_149_202,
         "the plans dispatch a different amount of work"
     );
     // The third dimension is a prefill's rows, and only the paged decodes put
@@ -2621,8 +2635,18 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
         // tiling and it is paid here; the tile still wins, which is why the
         // total workgroup count above FELL by fourteen million in the same
         // change.
+        //
+        // y DOUBLED 25,136 -> 50,272 at `d0fb52657`, from the same halving of
+        // the matvec's output columns per workgroup that put 2,095,584 on the
+        // total above. It is llama-3.2-1B's lm head: 128,256 columns over four
+        // a group is 32,064 -- not this -- so the widest is the 4-bit qmv on
+        // gpt-oss's 201,088-column vocabulary, which at four columns a group
+        // and the `_wide_` row's own division lands exactly twice where it
+        // landed at eight. An axis that doubles when the divisor halves is the
+        // arithmetic agreeing with itself; an axis that did anything else here
+        // would be the news.
         widest_grid,
-        [14040, 25136, 64],
+        [14040, 50272, 64],
         "the widest grid in any dimension changed"
     );
 }

@@ -156,6 +156,8 @@ pub const fn build_kernels_at(
     moe_mxfp4: bool,
 ) -> MetalBinding {
     MetalBinding {
+        qmm_partial_rows: false,
+        qmm_tile: None,
         quant_group,
         quant_bits,
         router_quant_group,

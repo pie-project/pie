@@ -1,7 +1,7 @@
 //! The affine-quantised projections, and the codecs around them.
 //!
 //! This is 32 of the 99 rows and 304 of the 480 entrypoints, and the whole
-//! argument of `.wiki/kernel-metal-refactor.md` §2 is visible here: `qmm_t` is
+//! argument of `.wiki/kernel-x/metal-refactor.md` §2 is visible here: `qmm_t` is
 //! ONE template body in `quant/qmm_t.metal` stamped over (group x bits x
 //! row tile x column tile), and enumerating its 54 instantiations as 54 rows
 //! would state the macro's job a second time by hand.
@@ -16,1549 +16,188 @@ use kernels_macros::routine;
 use kernels::routine::Refusal;
 
 use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, Out, Tensor, bf16, elementwise, elementwise_rows, f16, keys};
+// ── THE NAMES, COMPOSED ───────────────────────────────────────────────────
+//
+// Twelve tables of literals stood here -- 261 rows -- and each was indexed by
+// folding two to four numbers into one integer: `QMM_T[qmm_point(group, bits,
+// bm, bn)?]`. The name IS those numbers, so the fold and the table it indexed
+// were a round trip: pack four axes into an offset, look the offset up, get the
+// four axes back as a string.
+//
+// `kernels-cuda` never wrote them because NVRTC lowers a template-id on ask, so
+// a CUDA body composes `"::pie::norm::rmsnorm_vec8<::pie::i32(512), false,
+// false>"` and hands it over. This crate is already the same shape -- it
+// expands its own sources at run time through `source::entrypoint_source` --
+// so it can compose too.
+//
+// **The axes still have to be CHECKED, and that is what `point` is for.** A
+// composed name for a point the shaders do not declare would be a
+// `Missing::NoVariant` at the fire; checking here makes it a `Refusal::Narrow`
+// naming the axis, which is what the tables' `position()` gave.
+//
+// # The comment that stood on the matvec tables is answered, not ignored
+//
+// It said the two-table layout was forced because *"the reader that says which
+// entrypoints this crate can fire only understands a lookup into a table of
+// literals"*. That reader is `crate::entrypoints`, and it does not read these:
+// it walks `source::declared()`, which parses the `// pie:instantiate` lines
+// out of the shader tree. The tables had stopped being its input and the note
+// had not caught up.
 
-/// The shaders this family's routines reach: `(file, entrypoint)`, one pair
-/// per instantiated name.
+/// Every name the composers below can produce, over every point of every axis.
 ///
-/// A row's `axes` GENERATED these names and its `file` column said where they
-/// live. Retiring the row moved who NAMES them, not what exists -- the shader
-/// is still compiled and still dispatched -- so the pairs are stated here and
-/// [`crate::entrypoints`] reads them back. The FILE rides along because Metal
-/// compiles from `(path, entry name)` at run time, and `device_kernels.rs`
-/// builds every one of them against a real device; a name without its file
-/// would leave that sweep nothing to open. See [`crate::RETIRED`].
-pub static ENTRYPOINTS: &[(&str, &str)] = &[
-    ("quant/transcode.metal", "affine_encode_u4_bf16"),
-    ("quant/transcode.metal", "affine_encode_u4_f32"),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_128_b_4_bm_16_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_128_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_128_b_4_bm_16_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_128_b_4_bm_32_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_128_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_128_b_4_bm_32_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_128_b_4_bm_64_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_128_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_128_b_4_bm_64_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_128_b_8_bm_16_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_128_b_8_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_128_b_8_bm_16_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_128_b_8_bm_32_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_128_b_8_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_128_b_8_bm_32_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_128_b_8_bm_64_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_128_b_8_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_128_b_8_bm_64_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_32_b_4_bm_16_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_32_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_32_b_4_bm_16_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_32_b_4_bm_32_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_32_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_32_b_4_bm_32_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_32_b_4_bm_64_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_32_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_32_b_4_bm_64_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_32_b_8_bm_16_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_32_b_8_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_32_b_8_bm_16_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_32_b_8_bm_32_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_32_b_8_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_32_b_8_bm_32_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_32_b_8_bm_64_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_32_b_8_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_32_b_8_bm_64_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_64_b_4_bm_16_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_64_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_64_b_4_bm_16_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_64_b_8_bm_16_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_64_b_8_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_64_b_8_bm_16_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_64_b_8_bm_32_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_64_b_8_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_64_b_8_bm_32_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_64_b_8_bm_64_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_64_b_8_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bfloat16_gs_64_b_8_bm_64_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_16_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_16_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_32_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_32_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_64_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_64_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_16_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_16_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_32_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_32_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_64_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_64_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_16_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_16_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_32_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_32_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_64_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_64_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_16_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_16_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_32_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_32_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_64_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_64_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_16_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_16_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_32_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_32_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_64_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_64_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_16_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_16_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_32_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_32_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_64_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_64_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_16_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_16_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_32_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_32_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_64_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_64_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_16_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_16_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_32_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_32_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_64_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_64_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_16_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_16_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_32_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_32_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_64_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_64_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_16_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_16_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_32_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_32_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_64_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_64_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_16_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_16_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_32_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_32_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_64_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_64_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_16_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_16_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_32_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_32_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_64_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_64_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_16",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_64",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_bfloat16_gs_128_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_bfloat16_gs_128_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_bfloat16_gs_128_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_bfloat16_gs_128_b_8_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_bfloat16_gs_128_b_8_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_bfloat16_gs_128_b_8_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_bfloat16_gs_32_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_bfloat16_gs_32_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_bfloat16_gs_32_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_bfloat16_gs_32_b_8_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_bfloat16_gs_32_b_8_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_bfloat16_gs_32_b_8_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_bfloat16_gs_64_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_bfloat16_gs_64_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_bfloat16_gs_64_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_bfloat16_gs_64_b_8_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_bfloat16_gs_64_b_8_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_bfloat16_gs_64_b_8_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_8_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_8_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_8_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_8_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_8_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_8_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_8_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_8_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_8_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_fp16_precast_f32_bfloat16_gs_64_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_fp16_precast_f32_bfloat16_gs_64_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_splitk_fp16_precast_f32_bfloat16_gs_64_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_bfloat16_gs_128_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_bfloat16_gs_128_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_bfloat16_gs_128_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_bfloat16_gs_128_b_8_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_bfloat16_gs_128_b_8_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_bfloat16_gs_128_b_8_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_bfloat16_gs_32_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_bfloat16_gs_32_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_bfloat16_gs_32_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_bfloat16_gs_32_b_8_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_bfloat16_gs_32_b_8_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_bfloat16_gs_32_b_8_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_bfloat16_gs_64_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_bfloat16_gs_64_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_bfloat16_gs_64_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_bfloat16_gs_64_b_8_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_bfloat16_gs_64_b_8_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_bfloat16_gs_64_b_8_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_fp16_precast_residual_bfloat16_gs_64_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_fp16_precast_residual_bfloat16_gs_64_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_fp16_precast_residual_bfloat16_gs_64_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_residual_bfloat16_gs_128_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_residual_bfloat16_gs_128_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_residual_bfloat16_gs_128_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_residual_bfloat16_gs_128_b_8_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_residual_bfloat16_gs_128_b_8_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_residual_bfloat16_gs_128_b_8_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_residual_bfloat16_gs_32_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_residual_bfloat16_gs_32_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_residual_bfloat16_gs_32_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_residual_bfloat16_gs_32_b_8_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_residual_bfloat16_gs_32_b_8_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_residual_bfloat16_gs_32_b_8_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_residual_bfloat16_gs_64_b_4_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_residual_bfloat16_gs_64_b_4_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_residual_bfloat16_gs_64_b_4_bm_64_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_residual_bfloat16_gs_64_b_8_bm_16_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_residual_bfloat16_gs_64_b_8_bm_32_bn_32",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmm_t_strided_residual_bfloat16_gs_64_b_8_bm_64_bn_32",
-    ),
-    ("quant/qmv.metal", "affine_qmv_fast_bfloat16_gs_128_b_4"),
-    ("quant/qmv.metal", "affine_qmv_fast_bfloat16_gs_128_b_8"),
-    ("quant/qmv.metal", "affine_qmv_fast_bfloat16_gs_32_b_4"),
-    ("quant/qmv.metal", "affine_qmv_fast_bfloat16_gs_32_b_8"),
-    ("quant/qmv.metal", "affine_qmv_fast_bfloat16_gs_64_b_4"),
-    ("quant/qmv.metal", "affine_qmv_fast_bfloat16_gs_64_b_8"),
-    (
-        "quant/qmv.metal",
-        "affine_qmv_fast_residual_bfloat16_gs_128_b_4",
-    ),
-    (
-        "quant/qmv.metal",
-        "affine_qmv_fast_residual_bfloat16_gs_128_b_8",
-    ),
-    (
-        "quant/qmv.metal",
-        "affine_qmv_fast_residual_bfloat16_gs_32_b_4",
-    ),
-    (
-        "quant/qmv.metal",
-        "affine_qmv_fast_residual_bfloat16_gs_32_b_8",
-    ),
-    (
-        "quant/qmv.metal",
-        "affine_qmv_fast_residual_bfloat16_gs_64_b_4",
-    ),
-    (
-        "quant/qmv.metal",
-        "affine_qmv_fast_residual_bfloat16_gs_64_b_8",
-    ),
-    ("quant/qmv.metal", "affine_qmv_tail_bfloat16_gs_64_b_4"),
-    ("quant/qmv.metal", "affine_qmv_tail_bfloat16_gs_64_b_8"),
-    ("quant/qmv.metal", "affine_qmv_tail_bias_bfloat16_gs_64_b_4"),
-    ("quant/qmv.metal", "affine_qmv_tail_bias_bfloat16_gs_64_b_8"),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmv_wide_strided_bfloat16_gs_64_b_4_v_4_kl_8",
-    ),
-    (
-        "quant/qmm_t.metal",
-        "affine_qmv_wide_strided_bfloat16_gs_64_b_8_v_4_kl_8",
-    ),
-    ("quant/qmm_t.metal", "cast_qmm_input_bfloat16_to_float16"),
-    (
-        "quant/qmm_t.metal",
-        "cast_qmm_input_strided_bfloat16_to_float16",
-    ),
-    ("quant/transcode.metal", "mxfp4_dequant_bf16"),
-    ("quant/qmm_t.metal", "qmm_splitk_reduce_bfloat16"),
-    ("quant/qmm_t.metal", "qmm_splitk_reduce_f32_bfloat16"),
-];
-/// `affine_qmm_t`, indexed by [`qmm_point`].
-pub static QMM_T: [&str; 54] = [
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_16_bn_16",
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_16_bn_32",
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_16_bn_64",
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_32_bn_16",
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_32_bn_32",
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_32_bn_64",
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_64_bn_16",
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_64_bn_32",
-    "affine_qmm_t_bfloat16_gs_32_b_4_bm_64_bn_64",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_16_bn_16",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_16_bn_32",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_16_bn_64",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_32_bn_16",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_32_bn_32",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_32_bn_64",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_64_bn_16",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_64_bn_32",
-    "affine_qmm_t_bfloat16_gs_32_b_8_bm_64_bn_64",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_16_bn_16",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_16_bn_64",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_16",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_64",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_16",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_16_bn_16",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_16_bn_32",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_16_bn_64",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_32_bn_16",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_32_bn_32",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_32_bn_64",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_64_bn_16",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_64_bn_32",
-    "affine_qmm_t_bfloat16_gs_64_b_8_bm_64_bn_64",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_16_bn_16",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_16_bn_32",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_16_bn_64",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_32_bn_16",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_32_bn_32",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_32_bn_64",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_64_bn_16",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_64_bn_32",
-    "affine_qmm_t_bfloat16_gs_128_b_4_bm_64_bn_64",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_16_bn_16",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_16_bn_32",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_16_bn_64",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_32_bn_16",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_32_bn_32",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_32_bn_64",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_64_bn_16",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_64_bn_32",
-    "affine_qmm_t_bfloat16_gs_128_b_8_bm_64_bn_64",
-];
+/// # Why the crate states this and not a test
+///
+/// `tests/entrypoints.rs` reads this crate's SOURCE to answer *"which
+/// entrypoints does a body fire"*, and it refuses to skip what it cannot read:
+/// *"a scan that quietly reads less is a scan that agrees with everything."*
+/// It understood a literal and a lookup into a table of literals, which is
+/// what the bodies used to write.
+///
+/// A composed name is neither, and teaching a text scanner to expand
+/// `qmm_name("", *group, *bits, *bm, *bn)?` would put the lattice into the
+/// scanner -- a second place the axes are written, which is the thing the
+/// tables were deleted for. So the crate answers instead, by running the
+/// composers over the axes. One spelling: the composer, applied.
+///
+/// # It is not a table
+///
+/// A table is a list somebody typed and nothing checks. This is the product
+/// of `GROUPS`, `BIT_WIDTHS` and `TILES` through the same functions a fire
+/// calls, so a name here is a name a fire can reach, by construction. What
+/// checks it against reality is `composed_names_are_declared`, which compares
+/// it to the `// pie:instantiate` lines in the shader tree.
+#[must_use]
+pub fn composable() -> Vec<&'static str> {
+    let mut out = Vec::new();
+    let mut keep = |r: Result<&'static str, Refusal>| {
+        out.push(r.expect("an axis point, by construction"));
+    };
+    for form in ["", "_bias", "_residual"] {
+        for &gs in &GROUPS {
+            for &b in &BIT_WIDTHS {
+                for &bm in &TILES {
+                    for &bn in &TILES {
+                        keep(qmm_name(form, gs, b, bm, bn));
+                    }
+                }
+            }
+        }
+    }
+    // The wide forms are stamped at one column tile; see `WIDE_BN`.
+    for form in ["_splitk", "_splitk_f32", "_strided", "_strided_residual"] {
+        for &gs in &GROUPS {
+            for &b in &BIT_WIDTHS {
+                for &bm in &TILES {
+                    keep(qmm_name(form, gs, b, bm, WIDE_BN));
+                }
+            }
+        }
+    }
+    // `_fp16_precast` lands between the variant words, so these are pairs.
+    for (before, after) in [("", ""), ("_bias", ""), ("_residual", "")] {
+        for &bm in &TILES {
+            for &bn in &TILES {
+                keep(qmm_precast_name(before, after, bm, bn));
+            }
+        }
+    }
+    for (before, after) in
+        [("_splitk", ""), ("_splitk", "_f32"), ("_strided", ""), ("_strided", "_residual")]
+    {
+        for &bm in &TILES {
+            keep(qmm_precast_name(before, after, bm, WIDE_BN));
+        }
+    }
+    for form in ["fast", "fast_residual"] {
+        for &gs in &GROUPS {
+            for &b in &BIT_WIDTHS {
+                keep(qmv_name(form, gs, b));
+            }
+        }
+    }
+    // The matvec forms stamped at one codec point.
+    for form in ["tail", "tail_bias"] {
+        for &b in &BIT_WIDTHS {
+            keep(qmv_name(form, 64, b));
+        }
+    }
+    for &b in &BIT_WIDTHS {
+        keep(qmv_wide_strided_name(b));
+    }
+    out
+}
 
-/// `affine_qmm_t_bias`, indexed by [`qmm_point`].
-pub static QMM_T_BIAS: [&str; 54] = [
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_16_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_16_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_16_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_32_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_32_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_32_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_64_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_64_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_4_bm_64_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_16_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_16_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_16_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_32_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_32_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_32_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_64_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_64_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_32_b_8_bm_64_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_16_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_16_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_32_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_32_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_64_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_4_bm_64_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_16_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_16_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_16_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_32_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_32_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_32_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_64_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_64_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_64_b_8_bm_64_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_16_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_16_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_16_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_32_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_32_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_32_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_64_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_64_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_4_bm_64_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_16_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_16_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_16_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_32_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_32_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_32_bn_64",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_64_bn_16",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_64_bn_32",
-    "affine_qmm_t_bias_bfloat16_gs_128_b_8_bm_64_bn_64",
-];
+/// The affine matmul's name at one point of its four axes.
+///
+/// `form` is the variant's own prefix -- `""`, `"_bias"`, `"_residual"` -- and
+/// the axes follow in the order the shader stamps them.
+fn qmm_name(form: &str, group: i32, bits: i32, bm: i32, bn: i32) -> Result<&'static str, Refusal> {
+    check(&GROUPS, group, "the group size")?;
+    check(&BIT_WIDTHS, bits, "the bit width")?;
+    check(&TILES, bm, "the row tile")?;
+    check(&TILES, bn, "the column tile")?;
+    Ok(kernels::jit::symbol(&format!(
+        "affine_qmm_t{form}_bfloat16_gs_{group}_b_{bits}_bm_{bm}_bn_{bn}"
+    )))
+}
 
-/// `affine_qmm_t_residual`, indexed by [`qmm_point`].
-pub static QMM_T_RESIDUAL: [&str; 54] = [
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_16_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_16_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_16_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_32_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_32_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_32_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_64_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_64_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_4_bm_64_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_16_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_16_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_16_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_32_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_32_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_32_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_64_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_64_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_32_b_8_bm_64_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_16_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_16_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_32_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_32_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_64_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_4_bm_64_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_16_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_16_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_16_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_32_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_32_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_32_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_64_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_64_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_64_b_8_bm_64_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_16_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_16_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_16_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_32_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_32_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_32_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_64_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_64_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_4_bm_64_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_16_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_16_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_16_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_32_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_32_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_32_bn_64",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_64_bn_16",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_64_bn_32",
-    "affine_qmm_t_residual_bfloat16_gs_128_b_8_bm_64_bn_64",
-];
+/// [`qmm_name`] for the forms stamped at one group size and bit width.
+///
+/// The `_fp16_precast` family is `gs_64_b_4` alone, and that is not a default
+/// a caller may vary: the shader stamps one codec point, so a caller's group
+/// size would compose a name nothing declares.
+///
+/// # `before` and `after`, because the marker does not sit at one end
+///
+/// The plain family reads `affine_qmm_t{form}_bfloat16_...`, so one `form`
+/// carries everything. Here `_fp16_precast` lands in the MIDDLE of the variant
+/// words: `_splitk` comes before it and `_f32` after, giving
+/// `_splitk_fp16_precast_f32`. Passing one joined `form` composed
+/// `_splitk_f32_fp16_precast`, which is a name the tree does not declare --
+/// found by `composed_names_are_declared`, which is the whole reason that
+/// fixture walks the product instead of sampling it.
+fn qmm_precast_name(before: &str, after: &str, bm: i32, bn: i32) -> Result<&'static str, Refusal> {
+    check(&TILES, bm, "the row tile")?;
+    check(&TILES, bn, "the column tile")?;
+    Ok(kernels::jit::symbol(&format!(
+        "affine_qmm_t{before}_fp16_precast{after}_bfloat16_gs_64_b_4_bm_{bm}_bn_{bn}"
+    )))
+}
 
-/// `affine_qmm_t_fp16_precast`, indexed by [`tile_point`]. One group size and one bit width.
-pub static QMM_T_FP16_PRECAST: [&str; 9] = [
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_16",
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_64",
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_16",
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_64",
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_16",
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_64",
-];
+/// The wide strided matvec's name.
+///
+/// Its own function because the name carries two more axes than the family
+/// above -- `_v_4_kl_8`, the vector width and the K-lane count -- and both are
+/// stamped at ONE point. A `qmv_name` argument for a constant would read as a
+/// choice a caller has.
+fn qmv_wide_strided_name(bits: i32) -> Result<&'static str, Refusal> {
+    check(&BIT_WIDTHS, bits, "the bit width")?;
+    Ok(kernels::jit::symbol(&format!(
+        "affine_qmv_wide_strided_bfloat16_gs_64_b_{bits}_v_4_kl_8"
+    )))
+}
 
-/// `affine_qmm_t_bias_fp16_precast`, indexed by [`tile_point`]. One group size and one bit width.
-pub static QMM_T_BIAS_FP16_PRECAST: [&str; 9] = [
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_16",
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_64",
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_16",
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_64",
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_16",
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_64",
-];
+/// The matvec's name at one point of the codec axes.
+fn qmv_name(form: &str, group: i32, bits: i32) -> Result<&'static str, Refusal> {
+    check(&GROUPS, group, "the group size")?;
+    check(&BIT_WIDTHS, bits, "the bit width")?;
+    Ok(kernels::jit::symbol(&format!(
+        "affine_qmv_{form}_bfloat16_gs_{group}_b_{bits}"
+    )))
+}
 
-/// `affine_qmm_t_residual_fp16_precast`, indexed by [`tile_point`]. One group size and one bit width.
-pub static QMM_T_RESIDUAL_FP16_PRECAST: [&str; 9] = [
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_16",
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_64",
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_16",
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_64",
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_16",
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_64",
-];
-
-/// `affine_qmm_t_splitk`, indexed by [`wide_point`]. The column tile is 32 alone.
-pub static QMM_T_SPLITK: [&str; 18] = [
-    "affine_qmm_t_splitk_bfloat16_gs_32_b_4_bm_16_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_32_b_4_bm_32_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_32_b_4_bm_64_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_32_b_8_bm_16_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_32_b_8_bm_32_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_32_b_8_bm_64_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_64_b_8_bm_16_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_64_b_8_bm_32_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_64_b_8_bm_64_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_128_b_4_bm_16_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_128_b_4_bm_32_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_128_b_4_bm_64_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_128_b_8_bm_16_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_128_b_8_bm_32_bn_32",
-    "affine_qmm_t_splitk_bfloat16_gs_128_b_8_bm_64_bn_32",
-];
-
-/// `affine_qmm_t_splitk_f32`, indexed by [`wide_point`]. The column tile is 32 alone.
-pub static QMM_T_SPLITK_F32: [&str; 18] = [
-    "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_4_bm_16_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_4_bm_32_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_4_bm_64_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_8_bm_16_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_8_bm_32_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_32_b_8_bm_64_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_8_bm_16_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_8_bm_32_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_8_bm_64_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_4_bm_16_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_4_bm_32_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_4_bm_64_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_8_bm_16_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_8_bm_32_bn_32",
-    "affine_qmm_t_splitk_f32_bfloat16_gs_128_b_8_bm_64_bn_32",
-];
-
-/// `affine_qmm_t_strided`, indexed by [`wide_point`]. The column tile is 32 alone.
-pub static QMM_T_STRIDED: [&str; 18] = [
-    "affine_qmm_t_strided_bfloat16_gs_32_b_4_bm_16_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_32_b_4_bm_32_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_32_b_4_bm_64_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_32_b_8_bm_16_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_32_b_8_bm_32_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_32_b_8_bm_64_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_64_b_8_bm_16_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_64_b_8_bm_32_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_64_b_8_bm_64_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_128_b_4_bm_16_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_128_b_4_bm_32_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_128_b_4_bm_64_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_128_b_8_bm_16_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_128_b_8_bm_32_bn_32",
-    "affine_qmm_t_strided_bfloat16_gs_128_b_8_bm_64_bn_32",
-];
-
-/// `affine_qmm_t_strided_residual`, indexed by [`wide_point`]. The column tile is 32 alone.
-pub static QMM_T_STRIDED_RESIDUAL: [&str; 18] = [
-    "affine_qmm_t_strided_residual_bfloat16_gs_32_b_4_bm_16_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_32_b_4_bm_32_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_32_b_4_bm_64_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_32_b_8_bm_16_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_32_b_8_bm_32_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_32_b_8_bm_64_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_64_b_4_bm_64_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_64_b_8_bm_16_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_64_b_8_bm_32_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_64_b_8_bm_64_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_128_b_4_bm_16_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_128_b_4_bm_32_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_128_b_4_bm_64_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_128_b_8_bm_16_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_128_b_8_bm_32_bn_32",
-    "affine_qmm_t_strided_residual_bfloat16_gs_128_b_8_bm_64_bn_32",
-];
-
-/// `affine_qmm_t_splitk_fp16_precast`, indexed by [`row_tile_point`].
-pub static QMM_T_SPLITK_FP16_PRECAST: [&str; 3] = [
-    "affine_qmm_t_splitk_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_splitk_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_splitk_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_32",
-];
-
-/// `affine_qmm_t_splitk_fp16_precast_f32`, indexed by [`row_tile_point`].
-pub static QMM_T_SPLITK_FP16_PRECAST_F32: [&str; 3] = [
-    "affine_qmm_t_splitk_fp16_precast_f32_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_splitk_fp16_precast_f32_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_splitk_fp16_precast_f32_bfloat16_gs_64_b_4_bm_64_bn_32",
-];
-
-/// `affine_qmm_t_strided_fp16_precast`, indexed by [`row_tile_point`].
-pub static QMM_T_STRIDED_FP16_PRECAST: [&str; 3] = [
-    "affine_qmm_t_strided_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_strided_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_strided_fp16_precast_bfloat16_gs_64_b_4_bm_64_bn_32",
-];
-
-/// `affine_qmm_t_strided_fp16_precast_residual`, indexed by [`row_tile_point`].
-pub static QMM_T_STRIDED_FP16_PRECAST_RESIDUAL: [&str; 3] = [
-    "affine_qmm_t_strided_fp16_precast_residual_bfloat16_gs_64_b_4_bm_16_bn_32",
-    "affine_qmm_t_strided_fp16_precast_residual_bfloat16_gs_64_b_4_bm_32_bn_32",
-    "affine_qmm_t_strided_fp16_precast_residual_bfloat16_gs_64_b_4_bm_64_bn_32",
-];
-
-/// `affine_qmv_fast`, indexed by [`codec_point`].
-pub static QMV_FAST: [&str; 6] = [
-    "affine_qmv_fast_bfloat16_gs_32_b_4",
-    "affine_qmv_fast_bfloat16_gs_32_b_8",
-    "affine_qmv_fast_bfloat16_gs_64_b_4",
-    "affine_qmv_fast_bfloat16_gs_64_b_8",
-    "affine_qmv_fast_bfloat16_gs_128_b_4",
-    "affine_qmv_fast_bfloat16_gs_128_b_8",
-];
-
-/// `affine_qmv_fast_residual`, indexed by [`codec_point`].
-pub static QMV_FAST_RESIDUAL: [&str; 6] = [
-    "affine_qmv_fast_residual_bfloat16_gs_32_b_4",
-    "affine_qmv_fast_residual_bfloat16_gs_32_b_8",
-    "affine_qmv_fast_residual_bfloat16_gs_64_b_4",
-    "affine_qmv_fast_residual_bfloat16_gs_64_b_8",
-    "affine_qmv_fast_residual_bfloat16_gs_128_b_4",
-    "affine_qmv_fast_residual_bfloat16_gs_128_b_8",
-];
-
-/// `affine_qmv_tail`, indexed by [`bits_point`].
-pub static QMV_TAIL: [&str; 2] = [
-    "affine_qmv_tail_bfloat16_gs_64_b_4",
-    "affine_qmv_tail_bfloat16_gs_64_b_8",
-];
-
-/// `affine_qmv_tail_bias`, indexed by [`bits_point`].
-pub static QMV_TAIL_BIAS: [&str; 2] = [
-    "affine_qmv_tail_bias_bfloat16_gs_64_b_4",
-    "affine_qmv_tail_bias_bfloat16_gs_64_b_8",
-];
-
-/// `affine_qmv_wide_strided`, indexed by [`bits_point`].
-pub static QMV_WIDE_STRIDED: [&str; 2] = [
-    "affine_qmv_wide_strided_bfloat16_gs_64_b_4_v_4_kl_8",
-    "affine_qmv_wide_strided_bfloat16_gs_64_b_8_v_4_kl_8",
-];
+/// That a number is a point of its axis, or a refusal naming the axis.
+///
+/// The tables' `position()` with the index thrown away: a composed name does
+/// not need to know WHERE on the axis a value sits, only that it is on it.
+fn check(points: &[i32], v: i32, what: &'static str) -> Result<(), Refusal> {
+    points
+        .iter()
+        .any(|p| *p == v)
+        .then_some(())
+        .ok_or(Refusal::Narrow { what, at: i64::from(v) })
+}
 
 /// Group sizes the affine tree is compiled for, in table order.
 ///
@@ -1581,44 +220,6 @@ const TILES: [i32; 3] = [16, 32, 64];
 /// the caller has and the grid reads it from here.
 const WIDE_BN: i32 = 32;
 
-/// Where a number sits on an axis, or a refusal naming the axis it is off.
-fn point(points: &[i32], v: i32, what: &'static str) -> Result<usize, Refusal> {
-    points.iter().position(|p| *p == v).ok_or(Refusal::Narrow {
-        what,
-        at: i64::from(v),
-    })
-}
-
-/// The quantisation point: group size major, bit width minor.
-fn codec_point(group: i32, bits: i32) -> Result<usize, Refusal> {
-    Ok(point(&GROUPS, group, "the group size")? * BIT_WIDTHS.len()
-        + point(&BIT_WIDTHS, bits, "the bit width")?)
-}
-
-/// The bit width alone, for the forms stamped at one group size.
-fn bits_point(bits: i32) -> Result<usize, Refusal> {
-    point(&BIT_WIDTHS, bits, "the bit width")
-}
-
-/// The tile point: row tile major, column tile minor.
-fn tile_point(bm: i32, bn: i32) -> Result<usize, Refusal> {
-    Ok(point(&TILES, bm, "the row tile")? * TILES.len() + point(&TILES, bn, "the column tile")?)
-}
-
-/// The row tile alone, for the forms stamped at `_bn_32`.
-fn row_tile_point(bm: i32) -> Result<usize, Refusal> {
-    point(&TILES, bm, "the row tile")
-}
-
-/// The full four-axis point of the tiled matmul.
-fn qmm_point(group: i32, bits: i32, bm: i32, bn: i32) -> Result<usize, Refusal> {
-    Ok(codec_point(group, bits)? * (TILES.len() * TILES.len()) + tile_point(bm, bn)?)
-}
-
-/// The three-axis point of the `_bn_32` forms.
-fn wide_point(group: i32, bits: i32, bm: i32) -> Result<usize, Refusal> {
-    Ok(codec_point(group, bits)? * TILES.len() + row_tile_point(bm)?)
-}
 
 /// The tiled matmul's rectangle, in THREADS, and its threadgroup.
 ///
@@ -1789,7 +390,7 @@ pub fn qmm_t(
     let n = y.width;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(QMM_FILE, QMM_T[qmm_point(*group, *bits, *bm, *bn)?]).apply(Grid::of(qmm_grid(n, *bn, m, *bm, 1)?, QMM_GROUP)),
+        Fire::at(QMM_FILE, qmm_name("", *group, *bits, *bm, *bn)?).apply(Grid::of(qmm_grid(n, *bn, m, *bm, 1)?, QMM_GROUP)),
         &[w.arg(), scales.arg(), biases.arg(), x.arg(), y.arg(), k.arg(), n.arg()],
     )
 }
@@ -1821,7 +422,7 @@ pub fn qmm_t_bias(
     let n = y.width;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(QMM_FILE, QMM_T_BIAS[qmm_point(*group, *bits, *bm, *bn)?]).apply(Grid::of(qmm_grid(n, *bn, m, *bm, 1)?, QMM_GROUP)),
+        Fire::at(QMM_FILE, qmm_name("_bias", *group, *bits, *bm, *bn)?).apply(Grid::of(qmm_grid(n, *bn, m, *bm, 1)?, QMM_GROUP)),
         &[
             w.arg(),
             scales.arg(),
@@ -1863,7 +464,7 @@ pub fn qmm_t_residual(
     let n = y.width;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(QMM_FILE, QMM_T_RESIDUAL[qmm_point(*group, *bits, *bm, *bn)?]).apply(Grid::of(qmm_grid(n, *bn, m, *bm, 1)?, QMM_GROUP)),
+        Fire::at(QMM_FILE, qmm_name("_residual", *group, *bits, *bm, *bn)?).apply(Grid::of(qmm_grid(n, *bn, m, *bm, 1)?, QMM_GROUP)),
         &[
             w.arg(),
             scales.arg(),
@@ -1903,7 +504,7 @@ pub fn qmm_t_fp16_precast(
     let n = y.width;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(QMM_FILE, QMM_T_FP16_PRECAST[tile_point(*bm, *bn)?]).apply(Grid::of(qmm_grid(n, *bn, m, *bm, 1)?, QMM_GROUP)),
+        Fire::at(QMM_FILE, qmm_precast_name("", "", *bm, *bn)?).apply(Grid::of(qmm_grid(n, *bn, m, *bm, 1)?, QMM_GROUP)),
         &[
             w.arg(),
             scales.arg(),
@@ -1943,7 +544,7 @@ pub fn qmm_t_bias_fp16_precast(
     let n = y.width;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(QMM_FILE, QMM_T_BIAS_FP16_PRECAST[tile_point(*bm, *bn)?]).apply(Grid::of(qmm_grid(n, *bn, m, *bm, 1)?, QMM_GROUP)),
+        Fire::at(QMM_FILE, qmm_precast_name("_bias", "", *bm, *bn)?).apply(Grid::of(qmm_grid(n, *bn, m, *bm, 1)?, QMM_GROUP)),
         &[
             w.arg(),
             scales.arg(),
@@ -2001,7 +602,7 @@ pub fn qmm_t_residual_fp16_precast(
     let n = y.width;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(QMM_FILE, QMM_T_RESIDUAL_FP16_PRECAST[tile_point(*bm, *bn)?]).apply(Grid::of(qmm_grid(n, *bn, m, *bm, 1)?, QMM_GROUP)),
+        Fire::at(QMM_FILE, qmm_precast_name("_residual", "", *bm, *bn)?).apply(Grid::of(qmm_grid(n, *bn, m, *bm, 1)?, QMM_GROUP)),
         &[
             w.arg(),
             scales.arg(),
@@ -2065,7 +666,7 @@ pub fn qmm_t_splitk(
     let split_k = ctx.param(5)?;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(QMM_FILE, QMM_T_SPLITK[wide_point(*group, *bits, *bm)?]).apply(Grid::of(qmm_grid(n, WIDE_BN, m, *bm, split_k)?, QMM_GROUP)),
+        Fire::at(QMM_FILE, qmm_name("_splitk", *group, *bits, *bm, WIDE_BN)?).apply(Grid::of(qmm_grid(n, WIDE_BN, m, *bm, split_k)?, QMM_GROUP)),
         &[
             w.arg(),
             scales.arg(),
@@ -2122,7 +723,7 @@ pub fn qmm_t_splitk_f32(
     let split_k = ctx.param(5)?;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(QMM_FILE, QMM_T_SPLITK_F32[wide_point(*group, *bits, *bm)?]).apply(Grid::of(qmm_grid(n, WIDE_BN, m, *bm, split_k)?, QMM_GROUP)),
+        Fire::at(QMM_FILE, qmm_name("_splitk_f32", *group, *bits, *bm, WIDE_BN)?).apply(Grid::of(qmm_grid(n, WIDE_BN, m, *bm, split_k)?, QMM_GROUP)),
         &[
             w.arg(),
             scales.arg(),
@@ -2173,7 +774,7 @@ pub fn qmm_t_splitk_fp16_precast(
     let split_k = ctx.param(5)?;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(QMM_FILE, QMM_T_SPLITK_FP16_PRECAST[row_tile_point(*bm)?]).apply(Grid::of(qmm_grid(n, WIDE_BN, m, *bm, split_k)?, QMM_GROUP)),
+        Fire::at(QMM_FILE, qmm_precast_name("_splitk", "", *bm, WIDE_BN)?).apply(Grid::of(qmm_grid(n, WIDE_BN, m, *bm, split_k)?, QMM_GROUP)),
         &[
             w.arg(),
             scales.arg(),
@@ -2226,7 +827,7 @@ pub fn qmm_t_splitk_fp16_precast_f32(
     let split_k = ctx.param(5)?;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(QMM_FILE, QMM_T_SPLITK_FP16_PRECAST_F32[row_tile_point(*bm)?]).apply(Grid::of(qmm_grid(n, WIDE_BN, m, *bm, split_k)?, QMM_GROUP)),
+        Fire::at(QMM_FILE, qmm_precast_name("_splitk", "_f32", *bm, WIDE_BN)?).apply(Grid::of(qmm_grid(n, WIDE_BN, m, *bm, split_k)?, QMM_GROUP)),
         &[
             w.arg(),
             scales.arg(),
@@ -2274,7 +875,7 @@ pub fn qmm_t_strided(
     let row_stride = ctx.param(2)?;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(QMM_FILE, QMM_T_STRIDED[wide_point(*group, *bits, *bm)?]).apply(Grid::of(qmm_grid(n, WIDE_BN, m, *bm, 1)?, QMM_GROUP)),
+        Fire::at(QMM_FILE, qmm_name("_strided", *group, *bits, *bm, WIDE_BN)?).apply(Grid::of(qmm_grid(n, WIDE_BN, m, *bm, 1)?, QMM_GROUP)),
         &[
             w.arg(),
             scales.arg(),
@@ -2316,7 +917,7 @@ pub fn qmm_t_strided_residual(
     let row_stride = ctx.param(2)?;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(QMM_FILE, QMM_T_STRIDED_RESIDUAL[wide_point(*group, *bits, *bm)?]).apply(Grid::of(qmm_grid(n, WIDE_BN, m, *bm, 1)?, QMM_GROUP)),
+        Fire::at(QMM_FILE, qmm_name("_strided_residual", *group, *bits, *bm, WIDE_BN)?).apply(Grid::of(qmm_grid(n, WIDE_BN, m, *bm, 1)?, QMM_GROUP)),
         &[
             w.arg(),
             scales.arg(),
@@ -2354,7 +955,7 @@ pub fn qmm_t_strided_fp16_precast(
     let row_stride = ctx.param(2)?;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(QMM_FILE, QMM_T_STRIDED_FP16_PRECAST[row_tile_point(*bm)?]).apply(Grid::of(qmm_grid(n, WIDE_BN, m, *bm, 1)?, QMM_GROUP)),
+        Fire::at(QMM_FILE, qmm_precast_name("_strided", "", *bm, WIDE_BN)?).apply(Grid::of(qmm_grid(n, WIDE_BN, m, *bm, 1)?, QMM_GROUP)),
         &[
             w.arg(),
             scales.arg(),
@@ -2400,7 +1001,7 @@ pub fn qmm_t_strided_fp16_precast_residual(
     let row_stride = ctx.param(2)?;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(QMM_FILE, QMM_T_STRIDED_FP16_PRECAST_RESIDUAL[row_tile_point(*bm)?]).apply(Grid::of(qmm_grid(n, WIDE_BN, m, *bm, 1)?, QMM_GROUP)),
+        Fire::at(QMM_FILE, qmm_precast_name("_strided", "_residual", *bm, WIDE_BN)?).apply(Grid::of(qmm_grid(n, WIDE_BN, m, *bm, 1)?, QMM_GROUP)),
         &[
             w.arg(),
             scales.arg(),
@@ -2635,7 +1236,7 @@ pub fn qmv_fast(
     let out_vec_size = y.width;
     let vecs = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(QMV_FILE, QMV_FAST[codec_point(*group, *bits)?]).apply(Grid::of(qmv_grid(vecs, out_vec_size)?, QMV_GROUP)),
+        Fire::at(QMV_FILE, qmv_name("fast", *group, *bits)?).apply(Grid::of(qmv_grid(vecs, out_vec_size)?, QMV_GROUP)),
         &[
             w.arg(),
             scales.arg(),
@@ -2670,7 +1271,7 @@ pub fn qmv_fast_residual(
     let out_vec_size = y.width;
     let vecs = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(QMV_FILE, QMV_FAST_RESIDUAL[codec_point(*group, *bits)?]).apply(Grid::of(qmv_grid(vecs, out_vec_size)?, QMV_GROUP)),
+        Fire::at(QMV_FILE, qmv_name("fast_residual", *group, *bits)?).apply(Grid::of(qmv_grid(vecs, out_vec_size)?, QMV_GROUP)),
         &[
             w.arg(),
             scales.arg(),
@@ -2707,7 +1308,7 @@ pub fn qmv_tail(
     let out_vec_size = y.width;
     let vecs = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(QMV_FILE, QMV_TAIL[bits_point(*bits)?]).apply(Grid::of(qmv_grid(vecs, out_vec_size)?, QMV_GROUP)),
+        Fire::at(QMV_FILE, qmv_name("tail", 64, *bits)?).apply(Grid::of(qmv_grid(vecs, out_vec_size)?, QMV_GROUP)),
         &[
             w.arg(),
             scales.arg(),
@@ -2716,11 +1317,31 @@ pub fn qmv_tail(
             y.arg(),
             in_vec_size.arg(),
             out_vec_size.arg(),
+            // Buffers 7 and 8 are `bias` and `expert_ids`, both POINTERS the
+            // template dereferences only under `BIASED` and `ROUTED`. Neither
+            // holds here, so an address that is merely valid is enough and the
+            // weights are the nearest one.
             w.arg(),
             w.arg(),
-            w.arg(),
-            w.arg(),
-            w.arg(),
+            // Buffers 9, 10 and 11 are NOT pointers. `gptoss_qmv_kernel`
+            // declares them `const constant int&`, and binding a buffer there
+            // hands the kernel the first four bytes of the quantized weights
+            // as a stride. Three of the twelve slots were padded with `w`
+            // as though the same argument were all one kind.
+            //
+            // Only `slot` is zero at `ROUTED=false`; `row` is not. `row =
+            // tid.x` is the batch vector, `qmv_grid` makes the x extent
+            // `vecs`, and line 513 reads `x + row * x_row_stride` OUTSIDE the
+            // `ROUTED` guard. So a single-token decode survived on `row == 0`
+            // multiplying the garbage away, and anything wider would have
+            // walked off the activation by a random distance.
+            //
+            // The honest numbers are the dense ones, and `affine_qmv_fast`
+            // states them a few hundred lines up as `x += tid.x *
+            // in_vec_size`: one slot per row, the slot as wide as the input.
+            in_vec_size.arg(),
+            in_vec_size.arg(),
+            1_i32.arg(),
         ],
     )
 }
@@ -2745,7 +1366,7 @@ pub fn qmv_tail_bias(
     let out_vec_size = y.width;
     let vecs = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(QMV_FILE, QMV_TAIL_BIAS[bits_point(*bits)?]).apply(Grid::of(qmv_grid(vecs, out_vec_size)?, QMV_GROUP)),
+        Fire::at(QMV_FILE, qmv_name("tail_bias", 64, *bits)?).apply(Grid::of(qmv_grid(vecs, out_vec_size)?, QMV_GROUP)),
         &[
             w.arg(),
             scales.arg(),
@@ -2755,10 +1376,14 @@ pub fn qmv_tail_bias(
             in_vec_size.arg(),
             out_vec_size.arg(),
             bias.arg(),
+            // Buffer 8 is `expert_ids`, a pointer this form never routes
+            // through. 9, 10 and 11 are `const constant int&` -- see
+            // [`qmv_tail`] for why padding them with the weights was a live
+            // stride and not a spare slot.
             w.arg(),
-            w.arg(),
-            w.arg(),
-            w.arg(),
+            in_vec_size.arg(),
+            in_vec_size.arg(),
+            1_i32.arg(),
         ],
     )
 }
@@ -2794,7 +1419,7 @@ pub fn qmv_wide_strided(
     let row_stride = ctx.param(2)?;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(QMM_FILE, QMV_WIDE_STRIDED[bits_point(*bits)?]).apply(Grid::of(qmv_grid(quarters(m), out_vec_size)?, QMV_GROUP)),
+        Fire::at(QMM_FILE, qmv_wide_strided_name(*bits)?).apply(Grid::of(qmv_grid(quarters(m), out_vec_size)?, QMV_GROUP)),
         &[
             w.arg(),
             scales.arg(),
@@ -3048,10 +1673,6 @@ mod tests {
         /// particular tiling or split count sets its own.
         words: RefCell<Vec<i32>>,
         rows: Cell<i32>,
-        row_stride: Cell<i32>,
-        k_partition_size: Cell<i32>,
-        split_k_partition_stride: Cell<i32>,
-        split_k: Cell<i32>,
     }
 
     impl Default for Seen {
@@ -3061,10 +1682,6 @@ mod tests {
                 params_handle: Cell::new(800),
                 words: RefCell::default(),
                 rows: Cell::new(4),
-                row_stride: Cell::new(8192),
-                k_partition_size: Cell::new(512),
-                split_k_partition_stride: Cell::new(65536),
-                split_k: Cell::new(8),
             }
         }
     }
@@ -3138,68 +1755,55 @@ mod tests {
         );
     }
 
-    /// The four-axis point is group major, then bits, then the row tile, then
-    /// the column tile.
+    /// The name a coordinate composes IS that coordinate.
     ///
-    /// The order is the instantiation macro's and not a choice: getting it
-    /// wrong picks a real entrypoint for the wrong coordinate. g64/b8 and
-    /// g128/b4 pack to identical shapes, so the wrong one of that pair
-    /// unpacks fluent nonsense rather than failing.
+    /// THE ASSERTION GOT SHORTER BECAUSE THE INDIRECTION WENT. This checked
+    /// that `qmm_point(32, 4, 16, 16)` was `0` and that `QMM_T[0]` was
+    /// `..._gs_32_b_4_bm_16_bn_16` -- two facts, because the coordinate was
+    /// folded into an offset and the offset was looked up. There is no offset:
+    /// the name is built out of the four numbers, so there is one fact.
+    ///
+    /// What that guarded is unchanged and still worth guarding. The order is
+    /// the instantiation macro's and not a choice: g64/b8 and g128/b4 pack to
+    /// identical SHAPES, so the wrong one of that pair unpacks fluent nonsense
+    /// rather than failing.
     #[test]
     fn the_quantisation_point_is_group_major() {
-        assert_eq!(qmm_point(32, 4, 16, 16), Ok(0));
-        assert_eq!(QMM_T[0], "affine_qmm_t_bfloat16_gs_32_b_4_bm_16_bn_16");
-        assert_eq!(qmm_point(32, 4, 16, 32), Ok(1));
-        assert_eq!(QMM_T[1], "affine_qmm_t_bfloat16_gs_32_b_4_bm_16_bn_32");
-        assert_eq!(qmm_point(32, 8, 16, 16), Ok(9));
-        assert_eq!(QMM_T[9], "affine_qmm_t_bfloat16_gs_32_b_8_bm_16_bn_16");
-        assert_eq!(qmm_point(64, 4, 16, 16), Ok(18));
-        assert_eq!(QMM_T[18], "affine_qmm_t_bfloat16_gs_64_b_4_bm_16_bn_16");
-        assert_eq!(qmm_point(128, 8, 64, 64), Ok(53));
-        assert_eq!(QMM_T[53], "affine_qmm_t_bfloat16_gs_128_b_8_bm_64_bn_64");
-        assert!(qmm_point(16, 4, 16, 16).is_err(), "no gs_16 is compiled");
-        assert!(qmm_point(64, 6, 16, 16).is_err(), "nor a six-bit code");
-        assert!(
-            qmm_point(64, 4, 128, 16).is_err(),
-            "nor a 128-row tile here"
+        assert_eq!(
+            qmm_name("", 32, 4, 16, 16).unwrap(),
+            "affine_qmm_t_bfloat16_gs_32_b_4_bm_16_bn_16"
         );
+        assert_eq!(
+            qmm_name("", 128, 8, 64, 64).unwrap(),
+            "affine_qmm_t_bfloat16_gs_128_b_8_bm_64_bn_64"
+        );
+        // The pair that packs alike, spelled apart.
+        assert_ne!(
+            qmm_name("", 64, 8, 16, 16).unwrap(),
+            qmm_name("", 128, 4, 16, 16).unwrap()
+        );
+        assert!(qmm_name("", 16, 4, 16, 16).is_err(), "no gs_16 is compiled");
+        assert!(qmm_name("", 64, 6, 16, 16).is_err(), "nor a six-bit code");
+        assert!(qmm_name("", 64, 4, 128, 16).is_err(), "nor a 128-row tile here");
     }
 
-    /// The `_bn_32` forms index a three-axis table and read their column tile
-    /// from [`WIDE_BN`].
+    /// The `_bn_32` forms read their column tile from [`WIDE_BN`].
     ///
-    /// Eighteen points where the plain form has fifty-four, because the
-    /// column tile is not a choice the caller has -- passing one would let a
-    /// `bn` reach the grid that no entrypoint was stamped at.
+    /// Eighteen points where the plain form has fifty-four, because the column
+    /// tile is not a choice the caller has -- passing one would let a `bn`
+    /// reach the grid that no entrypoint was stamped at. The composer takes
+    /// `WIDE_BN` at the call site, so a caller cannot pass another.
     #[test]
-    fn the_wide_forms_take_their_column_tile_from_the_shader() {
-        assert_eq!(QMM_T_SPLITK.len(), 18);
-        assert_eq!(wide_point(32, 4, 16), Ok(0));
+    fn the_wide_forms_are_stamped_at_one_column_tile() {
         assert_eq!(
-            QMM_T_SPLITK[0],
-            "affine_qmm_t_splitk_bfloat16_gs_32_b_4_bm_16_bn_32"
+            qmm_name("_splitk", 64, 4, 32, WIDE_BN).unwrap(),
+            "affine_qmm_t_splitk_bfloat16_gs_64_b_4_bm_32_bn_32"
         );
-        assert_eq!(wide_point(128, 8, 64), Ok(17));
-        let seen = Seen::default();
-        seen.rows.set(32);
-        qmm_t_strided(
-            &seen,
-            Const::new(Tensor::<u32>::new(1)),
-            Const::new(Tensor::<bf16>::new(2)),
-            Const::new(Tensor::<bf16>::new(3)),
-            In::new(Tensor::<bf16>::new(5)),
-            Out { ptr: Tensor::<bf16>::new(6), rows: 0, width: 2048 },
-            Const::new(64),
-            Const::new(4),
-            Const::new(32))
-        .expect("a launch");
-        let calls = seen.calls.borrow();
-        let (fire, _) = &calls[0];
         assert_eq!(
-            fire.lanes[0],
-            32 * (2048 / WIDE_BN as u32),
-            "the column axis is tiled at thirty-two whatever the caller thinks"
+            qmm_precast_name("_splitk", "_f32", 32, WIDE_BN).unwrap(),
+            "affine_qmm_t_splitk_fp16_precast_f32_bfloat16_gs_64_b_4_bm_32_bn_32"
         );
+        assert_eq!(WIDE_BN, 32);
     }
 
     /// The split-K matmul states its partition count on the GRID, and the

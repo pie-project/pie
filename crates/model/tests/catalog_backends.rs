@@ -51,6 +51,8 @@ use model_ir::trace::FireClass;
 /// — and `a_row_answers_the_same_way_at_every_encoding` below is what
 /// holds it to that.
 const BINDING: MetalBinding = MetalBinding {
+    qmm_partial_rows: false,
+    qmm_tile: None,
     quant_group: 64,
     quant_bits: 4,
     router_quant_group: 0,
@@ -334,6 +336,8 @@ fn no_door_serves_a_routed_bank_at_an_unstamped_point() {
     // `AffineQ::group_size` is a template constant and the shader
     // compiles `affine_qmv_routed` at group 64 / 4 bits alone.
     let unstamped = MetalBinding {
+        qmm_partial_rows: false,
+        qmm_tile: None,
         quant_group: 128,
         quant_bits: 4,
         router_quant_group: 0,
@@ -418,6 +422,8 @@ fn a_row_answers_the_same_way_at_every_encoding() {
     let encodings = [
         BINDING,
         MetalBinding {
+            qmm_partial_rows: false,
+            qmm_tile: None,
             quant_group: 32,
             quant_bits: 4,
             router_quant_group: 0,
@@ -426,6 +432,8 @@ fn a_row_answers_the_same_way_at_every_encoding() {
             ..BINDING
         },
         MetalBinding {
+            qmm_partial_rows: false,
+            qmm_tile: None,
             quant_group: 128,
             quant_bits: 8,
             router_quant_group: 0,
@@ -434,6 +442,8 @@ fn a_row_answers_the_same_way_at_every_encoding() {
             ..BINDING
         },
         MetalBinding {
+            qmm_partial_rows: false,
+            qmm_tile: None,
             fuse_residual_gemv: false,
             paged_multi_batch: false,
             qmm_multi_batch: false,
@@ -478,6 +488,8 @@ fn a_row_answers_the_same_way_at_every_encoding() {
 fn two_encodings_of_one_row_state_the_same_program() {
     let four = BINDING;
     let eight = MetalBinding {
+        qmm_partial_rows: false,
+        qmm_tile: None,
         quant_group: 128,
         quant_bits: 8,
         router_quant_group: 0,

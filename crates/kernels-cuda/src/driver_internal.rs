@@ -26,7 +26,6 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use crate::jit::{Ctx, Launch};
-use crate::jit::Abi;
 use crate::jit::abi::bf16;
 use crate::jit::abi::Tensor;
 use crate::{norm, quant};

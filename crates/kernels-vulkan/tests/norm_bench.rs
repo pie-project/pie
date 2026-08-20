@@ -78,7 +78,6 @@
 //! which is what the decode rows show, and it happens to also carry a
 //! long-standing prefill defect out with it.
 
-
 use ash::vk;
 use kernels_vulkan::Capability;
 
@@ -658,7 +657,7 @@ fn measure(bench: &Bench, what: &'static str, shape: Shape, stages: &[Stage]) ->
 
     bench.once(|cmd| unsafe {
         device.cmd_reset_query_pool(cmd, query_pool, 0, ITERATIONS as u32 + 1);
-        let mut pass = |cmd: vk::CommandBuffer| {
+        let pass = |cmd: vk::CommandBuffer| {
             for stage in stages {
                 stage.program.bind(bench, cmd, &stage.push);
                 device.cmd_dispatch(cmd, stage.grid[0], stage.grid[1], stage.grid[2]);
@@ -717,13 +716,7 @@ fn measure(bench: &Bench, what: &'static str, shape: Shape, stages: &[Stage]) ->
 }
 
 /// `RmsRopeParams`: the five `RmsParams` fields, then the rotation's four.
-fn rms_rope_params(
-    axis: usize,
-    row_pitch: usize,
-    rotary: usize,
-    scale: f32,
-    base: f32,
-) -> Vec<u8> {
+fn rms_rope_params(axis: usize, row_pitch: usize, rotary: usize, scale: f32, base: f32) -> Vec<u8> {
     let mut p = rms_params(axis);
     p.extend_from_slice(&(row_pitch as u32).to_le_bytes());
     p.extend_from_slice(&(rotary as u32).to_le_bytes());
@@ -798,7 +791,13 @@ fn the_fused_norm_and_rope_against_the_pair_it_replaces() {
         let params = bench.buffer(20, &rms_params(shape.head_dim));
         let fused_params = bench.buffer(
             36,
-            &rms_rope_params(shape.head_dim, pitch, shape.rotary, 1.0, (10000.0f32).log2()),
+            &rms_rope_params(
+                shape.head_dim,
+                pitch,
+                shape.rotary,
+                1.0,
+                (10000.0f32).log2(),
+            ),
         );
         let position = bench.buffer((shape.rows * 4) as u64, &7i32.to_le_bytes());
 
@@ -866,7 +865,10 @@ fn the_fused_norm_and_rope_against_the_pair_it_replaces() {
     }
 
     eprintln!();
-    eprintln!("  {:<12} {:>5} {:>5} {:>8} {:>8}", "what", "heads", "rows", "groups", "us");
+    eprintln!(
+        "  {:<12} {:>5} {:>5} {:>8} {:>8}",
+        "what", "heads", "rows", "groups", "us"
+    );
     for row in &rows {
         eprintln!(
             "  {:<12} {:>5} {:>5} {:>8} {:>8.2}",

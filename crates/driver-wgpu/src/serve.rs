@@ -426,6 +426,11 @@ pub fn fire<R: Resolve<Buffer = Buffer>, M: Modules>(
     // returns an owned `String`, so this map borrows nothing from `modules`.
     let mut seen: std::collections::BTreeMap<&str, crate::device::Read> =
         std::collections::BTreeMap::new();
+    // The same sources, shareable. `seen` owns one `String` per distinct
+    // symbol and the planning loop needs one per DISPATCH; this is the
+    // difference between an `Arc` bump and a copy of the expanded WGSL.
+    let mut arcs: std::collections::BTreeMap<&str, std::sync::Arc<str>> =
+        std::collections::BTreeMap::new();
     for (at, launch) in launches.iter().enumerate() {
         let symbol = lowered.kernels[launch.kernel as usize].as_str();
         if seen.contains_key(symbol) {
@@ -441,6 +446,7 @@ pub fn fire<R: Resolve<Buffer = Buffer>, M: Modules>(
                 tier: hit.tier,
                 declared: hit.declared.clone(),
             };
+            arcs.insert(symbol, std::sync::Arc::from(hit.source.as_str()));
             seen.insert(symbol, hit);
             continue;
         }
@@ -469,6 +475,7 @@ pub fn fire<R: Resolve<Buffer = Buffer>, M: Modules>(
                 declared: declared.clone(),
             },
         );
+        arcs.insert(symbol, std::sync::Arc::from(source.as_str()));
         seen.insert(
             symbol,
             crate::device::Read {
@@ -479,13 +486,25 @@ pub fn fire<R: Resolve<Buffer = Buffer>, M: Modules>(
         );
     }
 
+    // The points a BODY fires that no launch names. Kept apart from `seen`
+    // so that map stays borrowed for the whole loop: these need a source and
+    // a tier to build a pipeline from and nothing else, their block being
+    // reflected and memoized by `reflect::point`, which is where
+    // `routine::plan` binds against it.
+    let mut extra: std::collections::BTreeMap<&str, (std::sync::Arc<str>, Capability)> =
+        std::collections::BTreeMap::new();
     for (at, launch) in launches.iter().enumerate() {
         let symbol = lowered.kernels[launch.kernel as usize].as_str();
         // Present by construction: the pass above inserted every symbol this
         // loop can name, and refused the fire if it could not.
+        // BORROWED, and the source shared. `seen` is not touched again in
+        // this loop -- a point a body fires goes in `extra` -- so the declared
+        // block needs no copy, and the source is an `Arc` bump rather than a
+        // copy of the expanded WGSL.
         let read = &seen[symbol];
-        let (source, at_tier, declared) = (read.source.clone(), read.tier, &read.declared);
-        let planned_one = crate::dispatch::plan_one(
+        let (at_tier, declared) = (read.tier, &read.declared);
+        let source = std::sync::Arc::clone(&arcs[symbol]);
+        let planned_all = crate::dispatch::plan_all(
             lowered,
             launch,
             Built {
@@ -499,8 +518,8 @@ pub fn fire<R: Resolve<Buffer = Buffer>, M: Modules>(
             },
             geometry,
         );
-        let d = match planned_one {
-            Ok(d) => d,
+        let ds = match planned_all {
+            Ok(ds) => ds,
             Err(why) => {
                 return Err(Unfired::Unplannable {
                     at,
@@ -509,23 +528,82 @@ pub fn fire<R: Resolve<Buffer = Buffer>, M: Modules>(
                 });
             }
         };
-        // Only a STORAGE block gets a buffer here. The uniform case is the
-        // ordinary one and its buffer is the device's to make, per dispatch, in
-        // `Device::run_all` -- which can own it because that call waits, so the
-        // block is alive for exactly as long as the queue needs it and no
-        // longer. Vulkan cannot do that: its push constants and its parameter
-        // blocks are two different mechanisms and only one of them is a buffer.
-        match &d.params {
-            Params::Block {
-                bytes,
-                at: ParamSlot::Storage(_),
-            } => match device.buffer(bytes) {
-                Ok(b) => blocks.push(Some(b)),
-                Err(why) => return Err(Unfired::Refused { at, why }),
-            },
-            _ => blocks.push(None),
+        for d in ds {
+            // A ROUTINE MAY STATE MORE THAN ONE. `attn`'s split decode is two
+            // passes over one statement -- slices, then the merge that
+            // finishes them -- and the second names a point the LOWERING does
+            // not carry, so its module is read here rather than in pass one.
+            //
+            // The read is cached per shell exactly as pass one's is: `pick`
+            // and `reflect::declared` are a WGSL expansion and a full `naga`
+            // parse, and paying them per launch is what pass one exists to
+            // stop.
+            let (src, tier_of) = if d.symbol == symbol {
+                (std::sync::Arc::clone(&source), at_tier)
+            } else if let Some((src, point_tier)) = extra.get(d.symbol) {
+                (std::sync::Arc::clone(src), *point_tier)
+            } else {
+                // ONCE PER SHELL, through the same cache pass one uses, and
+                // this is not a nicety. `pick` expands the WGSL from the
+                // embedded tree -- includes spliced, `//#if` arms resolved --
+                // and pass one exists because doing that per launch measured
+                // 700 ms of a 58 ms step. A body-fired point that missed the
+                // cache would pay it per FIRE: measured at two picks a token,
+                // it cost 113.1 -> 93.6 tok/s on Llama-3.2-1B at 512 context,
+                // which is most of a millisecond and a half for two strings.
+                let (src, point_tier) = match pipelines.module(d.symbol, tier) {
+                    Some(hit) => (hit.source.clone(), hit.tier),
+                    None => {
+                        let Some((src, point_tier)) = pick(modules, d.symbol, tier) else {
+                            return Err(Unfired::NoModule {
+                                at,
+                                symbol: d.symbol.to_owned(),
+                            });
+                        };
+                        let point_declared = match crate::reflect::declared(&src) {
+                            Ok(one) => one,
+                            Err(why) => {
+                                return Err(Unfired::Unreadable {
+                                    at,
+                                    symbol: d.symbol.to_owned(),
+                                    why,
+                                });
+                            }
+                        };
+                        pipelines.remember(
+                            d.symbol,
+                            tier,
+                            crate::device::Read {
+                                source: src.clone(),
+                                tier: point_tier,
+                                declared: point_declared,
+                            },
+                        );
+                        (src, point_tier)
+                    }
+                };
+                let src: std::sync::Arc<str> = std::sync::Arc::from(src.as_str());
+                extra.insert(d.symbol, (std::sync::Arc::clone(&src), point_tier));
+                (src, point_tier)
+            };
+            // Only a STORAGE block gets a buffer here. The uniform case is the
+            // ordinary one and its buffer is the device's to make, per dispatch, in
+            // `Device::run_all` -- which can own it because that call waits, so the
+            // block is alive for exactly as long as the queue needs it and no
+            // longer. Vulkan cannot do that: its push constants and its parameter
+            // blocks are two different mechanisms and only one of them is a buffer.
+            match &d.params {
+                Params::Block {
+                    bytes,
+                    at: ParamSlot::Storage(_),
+                } => match device.buffer(bytes) {
+                    Ok(b) => blocks.push(Some(b)),
+                    Err(why) => return Err(Unfired::Refused { at, why }),
+                },
+                _ => blocks.push(None),
+            }
+            planned.push((d.symbol.to_owned(), tier_of, src, d));
         }
-        planned.push((symbol.to_owned(), at_tier, source, d));
     }
 
     // THE ANSWER, ASKED FOR WITH THE WORK. `Lowered::readout` states where the
@@ -614,13 +692,88 @@ pub fn fire<R: Resolve<Buffer = Buffer>, M: Modules>(
 /// free, at 100% instead of 0%. And the prize is the 2.05 ms named above — not
 /// the tens of milliseconds a decode's per-launch average suggests, which is
 /// the mistake this note existed to prevent and which was made again anyway.
+///
+/// # The same step on an M4 Pro, and why the list above no longer applies
+///
+/// Llama-3.2-1B at 4 bits, a one-row decode of 244 dispatches, release, after
+/// everything above and after the split decode. Timed by bracketing the
+/// phases of `Device::run_all_reading` and of `Turns::step`:
+///
+/// | | us |
+/// |---|---|
+/// | `lowering::cached` lookup | 0.4 |
+/// | `Pool::stage` | 65 |
+/// | plan, pass one and two | ~350 |
+/// | `check_bindable` + shadows | 11 |
+/// | **bind groups x 244** | **85** |
+/// | encoding | 7 |
+/// | submit | 165 |
+/// | **the GPU wait** | **7900** |
+/// | logits readback and widening | 50 |
+/// | **whole step** | **8500** |
+///
+/// So the bind groups are 85 us here, not the 2.05 ms the 4090 table names,
+/// and the arena-lifetime cache the note above spends a section arguing for
+/// would be worth **one percent of one percent** of a token. That plan is
+/// retired: the arena came from a pool in the meantime and Metal's descriptor
+/// sets are cheap, and either one alone would have been enough.
+///
+/// THE HOST IS DONE. Every host phase together is 0.7 ms of 8.5, and the wait
+/// is 93%. This is worth stating flatly because two host bugs worth twenty
+/// tok/s were found in this file within a day of measuring it -- the right
+/// conclusion from that is not "keep looking here", it is "the looking now
+/// has a number attached and the number is small".
+///
+/// The wait is 7.9 ms over 244 dispatches, 32 us each, against a dispatch
+/// floor measured at ~13 us in `kernels_wgpu::attn`'s split note. Roughly
+/// FORTY PERCENT of a decoded token is the launch floor rather than
+/// arithmetic, and the lever is the one the section above already names:
+/// fewer launches. The decode's fifteen dispatches a layer are two RMS norms
+/// on a ONE-workgroup grid, two rope fires, a KV append over eight
+/// workgroups, the split and its merge, a `silu_mul`, and seven `qmv`s --
+/// q, k, v, o, gate, up, down. Three of those seven are one fused matmul
+/// each in every other serving stack.
+///
+/// ## How much of the wait is the count, measured rather than argued
+///
+/// [`Fire::prefix`] already truncates a fire to its first n launches, so the
+/// wait can be measured AS A FUNCTION OF THE COUNT without changing a kernel:
+/// step the prefix by four across a run of decodes and fit the line. Over the
+/// settled half of such a run, 44 points from 86 launches to 244:
+///
+/// ```text
+/// wait ~= 1655 us + 23.0 us x launches      (7280 us at 244)
+/// ```
+///
+/// Only 1.7 ms of a decode's wait is independent of how many launches it is
+/// spread over. The slope is not all floor -- a later launch does real work
+/// too -- but the floor's own share is known independently: the split-K note
+/// in `kernels_wgpu::attn` measures a dispatch that does NO extra work at
+/// ~13 us. So roughly 13 of the 23 is floor and 10 is arithmetic, and
+/// **244 x 13 us = 3.2 ms of a 7.3 ms wait is the launch floor.**
+///
+/// Two cautions on the method, because it is cheap enough to be re-run wrong.
+/// A truncated fire computes garbage, so the KV cache diverges and only the
+/// TIMES mean anything. And the first fires of a run are warm-up: fitting
+/// them in moves the slope by half.
+///
+/// The same sweep prices the tail directly. From 240 launches to 244 -- the
+/// final norm, the row gather and the lm head over 32064 workgroups -- is
+/// about 300 us, which retires the reading that `PIE_WGPU_PROBE_EACH` gives:
+/// that mode's submit-and-wait per launch put the lm head at 3 ms, ten times
+/// over, because it charges every launch a queue round trip. Per-launch
+/// probing ranks launches. It does not price them.
 fn record(
     device: &Device,
     pipelines: &mut Pipelines,
     planned: &[(
         String,
         Capability,
-        String,
+        // SHARED, not cloned. A launch's source is the whole expanded WGSL --
+        // tens of kilobytes -- and this list has one entry per DISPATCH, so a
+        // `String` here was a memcpy of the text per dispatch per step. Two
+        // dispatches of one point share the one buffer.
+        std::sync::Arc<str>,
         crate::dispatch::Dispatch<'_, Buffer>,
     )],
     blocks: &[Option<Buffer>],

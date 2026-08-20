@@ -5,9 +5,11 @@
 //! carries no information today; it is declared rather than baked into the
 //! symbol so that a second activation dtype is a point, not eleven new names.
 
-use kernels_macros::routine;
-use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, InOut, Out, Tensor, bf16, elementwise, elementwise_rows, keys};
+use crate::routine::{
+    Asks, Bind, Const, Ctx, Fire, In, InOut, Out, Tensor, bf16, elementwise, elementwise_rows, keys,
+};
 use kernels::routine::Refusal;
+use kernels_macros::routine;
 
 /// The workgroup width every reducing kernel in this file is compiled at.
 ///
@@ -166,12 +168,26 @@ pub fn rms_single_row(
     // match.
     w_stride: Const<u32>,
     plus_one: Const<u32>,
-    gain: Const<f32>) -> Result<(), Refusal> {
+    gain: Const<f32>,
+) -> Result<(), Refusal> {
     let width = x.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("rms_single_row_bfloat16", ctx.best()), "rms_single_row_bfloat16").apply(per_axis(width, *axis, rows)?),
-        &[x.arg(), w.arg(), out.arg(), eps.arg(), axis.arg(), w_stride.arg(), plus_one.arg(), gain.arg()],
+        Fire::at(
+            crate::routine::module_path("rms_single_row_bfloat16", ctx.best()),
+            "rms_single_row_bfloat16",
+        )
+        .apply(per_axis(width, *axis, rows)?),
+        &[
+            x.arg(),
+            w.arg(),
+            out.arg(),
+            eps.arg(),
+            axis.arg(),
+            w_stride.arg(),
+            plus_one.arg(),
+            gain.arg(),
+        ],
     )
 }
 
@@ -208,12 +224,27 @@ pub fn rms_strided_row(
     axis: Const<i32>,
     w_stride: Const<u32>,
     plus_one: Const<u32>,
-    gain: Const<f32>) -> Result<(), Refusal> {
+    gain: Const<f32>,
+) -> Result<(), Refusal> {
     let row_pitch = x.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("rms_strided_row_bfloat16", ctx.best()), "rms_strided_row_bfloat16").apply(per_row(rows)?),
-        &[x.arg(), w.arg(), out.arg(), eps.arg(), axis.arg(), w_stride.arg(), plus_one.arg(), gain.arg(), row_pitch.arg()],
+        Fire::at(
+            crate::routine::module_path("rms_strided_row_bfloat16", ctx.best()),
+            "rms_strided_row_bfloat16",
+        )
+        .apply(per_row(rows)?),
+        &[
+            x.arg(),
+            w.arg(),
+            out.arg(),
+            eps.arg(),
+            axis.arg(),
+            w_stride.arg(),
+            plus_one.arg(),
+            gain.arg(),
+            row_pitch.arg(),
+        ],
     )
 }
 
@@ -244,15 +275,30 @@ pub fn rms_strided_head_row(
     axis: Const<i32>,
     w_stride: Const<u32>,
     plus_one: Const<u32>,
-    gain: Const<f32>) -> Result<(), Refusal> {
+    gain: Const<f32>,
+) -> Result<(), Refusal> {
     let row_pitch = x.width;
     // HOW MANY NORMS FIT THE ROW -- the division HEAD spelled `Over<Say<Width>,
     // Else<Nth<1>, ..>>`, which no driver answers as a fact.
     let heads = if *axis > 0 { row_pitch / *axis } else { 0 };
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("rms_strided_head_row_bfloat16", ctx.best()), "rms_strided_head_row_bfloat16").apply(per_head_row(heads, rows)?),
-        &[x.arg(), w.arg(), out.arg(), eps.arg(), axis.arg(), w_stride.arg(), plus_one.arg(), gain.arg(), row_pitch.arg()],
+        Fire::at(
+            crate::routine::module_path("rms_strided_head_row_bfloat16", ctx.best()),
+            "rms_strided_head_row_bfloat16",
+        )
+        .apply(per_head_row(heads, rows)?),
+        &[
+            x.arg(),
+            w.arg(),
+            out.arg(),
+            eps.arg(),
+            axis.arg(),
+            w_stride.arg(),
+            plus_one.arg(),
+            gain.arg(),
+            row_pitch.arg(),
+        ],
     )
 }
 
@@ -344,7 +390,8 @@ fn per_head_row_rotating(
 pub fn rms_rope(
     ctx: &Ctx<'_>,
     x: InOut<Tensor<bf16>>,
-    w: Const<Tensor<bf16>>) -> Result<(), Refusal> {
+    w: Const<Tensor<bf16>>,
+) -> Result<(), Refusal> {
     let params = ctx.params()?;
     let position = ctx.ask::<Tensor<i32>, keys::Positions>()?;
     // THE STRUCT'S OWN FIELDS, BY INDEX, and that is what this routine has
@@ -375,7 +422,11 @@ pub fn rms_rope(
     // indexing by one and a launch sized by the other.
     let heads = if axis > 0 { row_pitch / axis } else { 0 };
     ctx.fire(
-        Fire::at(crate::routine::module_path("rms_rope_bfloat16", ctx.best()), "rms_rope_bfloat16").apply(per_head_row_rotating(heads, rows, rotary, axis)?),
+        Fire::at(
+            crate::routine::module_path("rms_rope_bfloat16", ctx.best()),
+            "rms_rope_bfloat16",
+        )
+        .apply(per_head_row_rotating(heads, rows, rotary, axis)?),
         // Four operands and NO scalars. Everything this kernel takes rides
         // the block, which `driver-vulkan`'s `encode` mints as the
         // statement's whole params run -- so the nine fields of
@@ -419,7 +470,8 @@ pub fn rms_residual(
     axis_size: Const<i32>,
     w_stride: Const<u32>,
     plus_one: Const<u32>,
-    gain: Const<f32>) -> Result<(), Refusal> {
+    gain: Const<f32>,
+) -> Result<(), Refusal> {
     let width = x.width;
     // NOT `*axis_size`. A norm sandwich spans its whole row, so the two are
     // the same number here -- but the launch has always taken the row's own
@@ -428,8 +480,22 @@ pub fn rms_residual(
     let axis = x.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("rms_residual_bfloat16", ctx.best()), "rms_residual_bfloat16").apply(per_axis(width, axis, rows)?),
-        &[x.arg(), w.arg(), out.arg(), eps.arg(), axis_size.arg(), w_stride.arg(), plus_one.arg(), gain.arg(), r.arg()],
+        Fire::at(
+            crate::routine::module_path("rms_residual_bfloat16", ctx.best()),
+            "rms_residual_bfloat16",
+        )
+        .apply(per_axis(width, axis, rows)?),
+        &[
+            x.arg(),
+            w.arg(),
+            out.arg(),
+            eps.arg(),
+            axis_size.arg(),
+            w_stride.arg(),
+            plus_one.arg(),
+            gain.arg(),
+            r.arg(),
+        ],
     )
 }
 
@@ -464,14 +530,30 @@ pub fn rms_residual_scaled(
     axis_size: Const<i32>,
     w_stride: Const<u32>,
     plus_one: Const<u32>,
-    gain: Const<f32>) -> Result<(), Refusal> {
+    gain: Const<f32>,
+) -> Result<(), Refusal> {
     let width = x.width;
     // NOT `*axis_size`, for [`rms_residual`]'s reason.
     let axis = x.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("rms_residual_scaled_bfloat16", ctx.best()), "rms_residual_scaled_bfloat16").apply(per_axis(width, axis, rows)?),
-        &[x.arg(), w.arg(), out.arg(), eps.arg(), axis_size.arg(), w_stride.arg(), plus_one.arg(), gain.arg(), r.arg(), s.arg()],
+        Fire::at(
+            crate::routine::module_path("rms_residual_scaled_bfloat16", ctx.best()),
+            "rms_residual_scaled_bfloat16",
+        )
+        .apply(per_axis(width, axis, rows)?),
+        &[
+            x.arg(),
+            w.arg(),
+            out.arg(),
+            eps.arg(),
+            axis_size.arg(),
+            w_stride.arg(),
+            plus_one.arg(),
+            gain.arg(),
+            r.arg(),
+            s.arg(),
+        ],
     )
 }
 
@@ -517,14 +599,19 @@ pub fn vnorm_single_row(
     // `Vec<u32>` and the BITS are the value, and what the mark's type decides
     // is what a body may do with the number.
     eps: Const<f32>,
-    axis_size: Const<i32>) -> Result<(), Refusal> {
+    axis_size: Const<i32>,
+) -> Result<(), Refusal> {
     let width = x.width;
     // NOT `*axis_size`, and the doc above says at length why not: this is the
     // gap `kernels-metal`'s twin closed and this one has not.
     let axis = x.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("vnorm_single_row_bfloat16", ctx.best()), "vnorm_single_row_bfloat16").apply(per_axis(width, axis, rows)?),
+        Fire::at(
+            crate::routine::module_path("vnorm_single_row_bfloat16", ctx.best()),
+            "vnorm_single_row_bfloat16",
+        )
+        .apply(per_axis(width, axis, rows)?),
         &[x.arg(), out.arg(), eps.arg(), axis_size.arg()],
     )
 }
@@ -572,11 +659,16 @@ pub fn gated_rms(
     // is an ASK and not a mark. It stays one: `keys::VHeads` is the FIRE's
     // fact and never was a word of this run.
     eps: Const<f32>,
-    vd: Const<i32>) -> Result<(), Refusal> {
+    vd: Const<i32>,
+) -> Result<(), Refusal> {
     let heads = ctx.ask::<i32, keys::VHeads>()?;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("gated_rms_bfloat16", ctx.best()), "gated_rms_bfloat16").apply(per_head_row(heads, rows)?),
+        Fire::at(
+            crate::routine::module_path("gated_rms_bfloat16", ctx.best()),
+            "gated_rms_bfloat16",
+        )
+        .apply(per_head_row(heads, rows)?),
         &[x.arg(), z.arg(), w.arg(), out.arg(), eps.arg(), vd.arg()],
     )
 }
@@ -605,13 +697,26 @@ pub fn gated_rms_strided(
     out: Out<Tensor<bf16>>,
     // [`gated_rms`]'s two, at the same two words of the same run.
     eps: Const<f32>,
-    vd: Const<i32>) -> Result<(), Refusal> {
+    vd: Const<i32>,
+) -> Result<(), Refusal> {
     let heads = ctx.ask::<i32, keys::VHeads>()?;
     let row_pitch = x.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("gated_rms_strided_bfloat16", ctx.best()), "gated_rms_strided_bfloat16").apply(per_head_row(heads, rows)?),
-        &[x.arg(), z.arg(), w.arg(), out.arg(), eps.arg(), vd.arg(), row_pitch.arg()],
+        Fire::at(
+            crate::routine::module_path("gated_rms_strided_bfloat16", ctx.best()),
+            "gated_rms_strided_bfloat16",
+        )
+        .apply(per_head_row(heads, rows)?),
+        &[
+            x.arg(),
+            z.arg(),
+            w.arg(),
+            out.arg(),
+            eps.arg(),
+            vd.arg(),
+            row_pitch.arg(),
+        ],
     )
 }
 
@@ -635,11 +740,16 @@ pub fn layer_scalar_mul(
     ctx: &Ctx<'_>,
     x: In<Tensor<bf16>>,
     scalar: Const<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    out: Out<Tensor<bf16>>,
+) -> Result<(), Refusal> {
     let width = x.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("layer_scalar_mul_bfloat16", ctx.best()), "layer_scalar_mul_bfloat16").apply(elementwise(width, rows)?),
+        Fire::at(
+            crate::routine::module_path("layer_scalar_mul_bfloat16", ctx.best()),
+            "layer_scalar_mul_bfloat16",
+        )
+        .apply(elementwise(width, rows)?),
         &[x.arg(), scalar.arg(), out.arg()],
     )
 }
@@ -658,11 +768,16 @@ pub fn residual_add(
     ctx: &Ctx<'_>,
     x: In<Tensor<bf16>>,
     residual: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    out: Out<Tensor<bf16>>,
+) -> Result<(), Refusal> {
     let width = x.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("residual_add_bfloat16", ctx.best()), "residual_add_bfloat16").apply(elementwise(width, rows)?),
+        Fire::at(
+            crate::routine::module_path("residual_add_bfloat16", ctx.best()),
+            "residual_add_bfloat16",
+        )
+        .apply(elementwise(width, rows)?),
         &[x.arg(), residual.arg(), out.arg()],
     )
 }
@@ -688,11 +803,16 @@ pub fn residual_add_strided(
     // rectangle the text laid out -- two fires of one deployment stride the
     // same way -- so it fails `ask`'s own test and no driver answers
     // `keys::RowPitch`.
-    row_pitch: Const<i32>) -> Result<(), Refusal> {
+    row_pitch: Const<i32>,
+) -> Result<(), Refusal> {
     let width = x.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("residual_add_strided_bfloat16", ctx.best()), "residual_add_strided_bfloat16").apply(elementwise_rows(width, rows)?),
+        Fire::at(
+            crate::routine::module_path("residual_add_strided_bfloat16", ctx.best()),
+            "residual_add_strided_bfloat16",
+        )
+        .apply(elementwise_rows(width, rows)?),
         &[x.arg(), residual.arg(), out.arg(), row_pitch.arg()],
     )
 }
@@ -716,11 +836,16 @@ pub fn residual_add_strided(
 pub fn add_bias(
     ctx: &Ctx<'_>,
     out: InOut<Tensor<bf16>>,
-    bias: Const<Tensor<bf16>>) -> Result<(), Refusal> {
+    bias: Const<Tensor<bf16>>,
+) -> Result<(), Refusal> {
     let width = out.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("add_bias_bfloat16", ctx.best()), "add_bias_bfloat16").apply(elementwise_rows(width, rows)?),
+        Fire::at(
+            crate::routine::module_path("add_bias_bfloat16", ctx.best()),
+            "add_bias_bfloat16",
+        )
+        .apply(elementwise_rows(width, rows)?),
         &[out.arg(), bias.arg(), width.arg()],
     )
 }
@@ -766,11 +891,7 @@ mod tests {
     }
 
     impl Encode for Seen {
-        fn resolve(
-            &self,
-            ty: kernels::Ty,
-            source: kernels::Source,
-        ) -> Result<ArgValue, Refusal> {
+        fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
             // The statement's own scalars, read by index where the params run
             // is the shader's struct -- see `Asks::param`.
             if let kernels::Source::Slot(kernels::Kind::Param, n) = source {
@@ -790,12 +911,19 @@ mod tests {
                 return Ok(ArgValue::I32(self.heads_per_row.get()));
             }
             if matches!(ty, kernels::Ty::Buf) {
-                return Ok(ArgValue::Buffer { handle: 900, writes: false, rows: 0, width: 0 });
+                return Ok(ArgValue::Buffer {
+                    handle: 900,
+                    writes: false,
+                    rows: 0,
+                    width: 0,
+                });
             }
             // Anything else is refused: a probe that invented an answer to a
             // fact it does not know would let a body pass under test while
             // the same fact went unanswered on a real driver.
-            Err(Refusal::Unstated { what: "a fact this probe does not answer" })
+            Err(Refusal::Unstated {
+                what: "a fact this probe does not answer",
+            })
         }
 
         fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
@@ -823,9 +951,17 @@ mod tests {
         seen.rows.set(3);
         rms_single_row(
             &seen,
-            In { ptr: Tensor::<bf16>::new(0), rows: 3, width: 128 },
+            In {
+                ptr: Tensor::<bf16>::new(0),
+                rows: 3,
+                width: 128,
+            },
             Const::new(Tensor::<bf16>::new(1)),
-            Out { ptr: Tensor::<bf16>::new(2), rows: 3, width: 128 },
+            Out {
+                ptr: Tensor::<bf16>::new(2),
+                rows: 3,
+                width: 128,
+            },
             // The struct's five fields, in the struct's order: this row holds
             // ONE norm, so the axis is the row's own 128. The stride is one
             // channel, the gemma `+1` is off and the gain is unity -- three
@@ -835,13 +971,26 @@ mod tests {
             Const::new(128),
             Const::new(1),
             Const::new(0),
-            Const::new(1.0))
+            Const::new(1.0),
+        )
         .expect("a launch");
         residual_add(
             &seen,
-            In { ptr: Tensor::<bf16>::new(0), rows: 3, width: 128 },
-            In { ptr: Tensor::<bf16>::new(1), rows: 3, width: 128 },
-            Out { ptr: Tensor::<bf16>::new(2), rows: 3, width: 128 },
+            In {
+                ptr: Tensor::<bf16>::new(0),
+                rows: 3,
+                width: 128,
+            },
+            In {
+                ptr: Tensor::<bf16>::new(1),
+                rows: 3,
+                width: 128,
+            },
+            Out {
+                ptr: Tensor::<bf16>::new(2),
+                rows: 3,
+                width: 128,
+            },
         )
         .expect("a launch");
 
@@ -870,9 +1019,17 @@ mod tests {
         seen.rows.set(5);
         rms_strided_head_row(
             &seen,
-            In { ptr: Tensor::<bf16>::new(0), rows: 5, width: 4096 },
+            In {
+                ptr: Tensor::<bf16>::new(0),
+                rows: 5,
+                width: 4096,
+            },
             Const::new(Tensor::<bf16>::new(1)),
-            Out { ptr: Tensor::<bf16>::new(2), rows: 5, width: 4096 },
+            Out {
+                ptr: Tensor::<bf16>::new(2),
+                rows: 5,
+                width: 4096,
+            },
             // The struct's five fields. Eight heads across a 4096-wide row is
             // a 512-wide norm, and the body divides one by the other rather
             // than being told the count a second time; the last three are the
@@ -892,12 +1049,25 @@ mod tests {
         // rows]` whatever `vd` says.
         gated_rms(
             &seen,
-            In { ptr: Tensor::<bf16>::new(0), rows: 5, width: 0 },
-            In { ptr: Tensor::<bf16>::new(1), rows: 5, width: 0 },
+            In {
+                ptr: Tensor::<bf16>::new(0),
+                rows: 5,
+                width: 0,
+            },
+            In {
+                ptr: Tensor::<bf16>::new(1),
+                rows: 5,
+                width: 0,
+            },
             Const::new(Tensor::<bf16>::new(2)),
-            Out { ptr: Tensor::<bf16>::new(3), rows: 5, width: 0 },
+            Out {
+                ptr: Tensor::<bf16>::new(3),
+                rows: 5,
+                width: 0,
+            },
             Const::new(1e-5),
-            Const::new(128))
+            Const::new(128),
+        )
         .expect("a launch");
 
         let calls = seen.calls.borrow();
@@ -923,18 +1093,43 @@ mod tests {
         seen.rows.set(3);
         residual_add(
             &seen,
-            In { ptr: Tensor::<bf16>::new(0), rows: 3, width: 128 },
-            In { ptr: Tensor::<bf16>::new(1), rows: 3, width: 128 },
-            Out { ptr: Tensor::<bf16>::new(2), rows: 3, width: 128 },
+            In {
+                ptr: Tensor::<bf16>::new(0),
+                rows: 3,
+                width: 128,
+            },
+            In {
+                ptr: Tensor::<bf16>::new(1),
+                rows: 3,
+                width: 128,
+            },
+            Out {
+                ptr: Tensor::<bf16>::new(2),
+                rows: 3,
+                width: 128,
+            },
         )
         .expect("a launch");
         seen.row_pitch.set(4096);
         residual_add_strided(
             &seen,
-            In { ptr: Tensor::<bf16>::new(0), rows: 3, width: 128 },
-            In { ptr: Tensor::<bf16>::new(1), rows: 3, width: 128 },
-            Out { ptr: Tensor::<bf16>::new(2), rows: 3, width: 128 },
-         Const::new(4096))
+            In {
+                ptr: Tensor::<bf16>::new(0),
+                rows: 3,
+                width: 128,
+            },
+            In {
+                ptr: Tensor::<bf16>::new(1),
+                rows: 3,
+                width: 128,
+            },
+            Out {
+                ptr: Tensor::<bf16>::new(2),
+                rows: 3,
+                width: 128,
+            },
+            Const::new(4096),
+        )
         .expect("a launch");
 
         let calls = seen.calls.borrow();
@@ -960,7 +1155,11 @@ mod tests {
         seen.rows.set(7);
         add_bias(
             &seen,
-            InOut { ptr: Tensor::<bf16>::new(0), rows: 7, width: 640 },
+            InOut {
+                ptr: Tensor::<bf16>::new(0),
+                rows: 7,
+                width: 640,
+            },
             Const::new(Tensor::<bf16>::new(1)),
         )
         .expect("a launch");

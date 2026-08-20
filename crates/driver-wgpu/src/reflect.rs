@@ -477,6 +477,44 @@ pub fn entrypoint(name: &str, tier: kernels_wgpu::Capability) -> Result<Declared
     declared(&source)
 }
 
+/// [`entrypoint`] at [`kernels_wgpu::Capability::Baseline`], MEMOIZED.
+///
+/// For the one caller that has an entrypoint name and no shell behind it:
+/// `lowering::routine::plan`, when a body fires a point whose name is not the
+/// plan's symbol. A routine that states two dispatches -- a split decode and
+/// the merge that finishes it -- names the second one itself, so nothing
+/// upstream had a chance to reflect it.
+///
+/// Memoized because that caller runs once per LAUNCH per step, and the miss
+/// is a full WGSL expansion plus a `naga` parse: `serve::fire`'s own pass one
+/// exists because paying that per launch measured 700 ms of a 58 ms step.
+///
+/// Baseline, and not the shell's tier, because the tier is a property of the
+/// DEVICE and this side of the planner does not carry one. That is a real
+/// narrowing and it is checked where it matters: a point reached this way
+/// must have a baseline variant, which every entrypoint in the tree has --
+/// `gpu::no_baseline_module_needs_a_capability` asserts exactly that over all
+/// of them.
+///
+/// # Errors
+///
+/// [`Unreadable`] as [`entrypoint`], on the first look at a name.
+pub fn point(name: &str) -> Result<Declared, Unreadable> {
+    use std::sync::{Mutex, OnceLock};
+    static MEMO: OnceLock<Mutex<std::collections::BTreeMap<String, Declared>>> = OnceLock::new();
+    let memo = MEMO.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()));
+    if let Ok(seen) = memo.lock() {
+        if let Some(hit) = seen.get(name) {
+            return Ok(hit.clone());
+        }
+    }
+    let read = entrypoint(name, kernels_wgpu::Capability::Baseline)?;
+    if let Ok(mut seen) = memo.lock() {
+        seen.insert(name.to_owned(), read.clone());
+    }
+    Ok(read)
+}
+
 /// The builtins an entry point takes, as the two questions this module asks.
 struct Builtins {
     /// Does it take `@builtin(num_workgroups)`?

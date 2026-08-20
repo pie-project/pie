@@ -13,7 +13,6 @@ use kernels::{Bind, Fire};
 use core::ffi::c_void;
 
 use crate::jit::{Ctx, Launch, Root};
-use crate::jit::Abi;
 use kernels::Refusal;
 
 /// `graph/supergraph.cuh` — the root these two compile a symbol out of.

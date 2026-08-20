@@ -973,6 +973,33 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
+/// An arena borrowed from [`Device::arena`], handed back when it drops.
+///
+/// Deliberately not `Deref`: the arena is a [`Buffer`] and every caller wants
+/// `&Buffer`, so one named accessor is clearer than an implicit conversion
+/// that would also make `Arena` look like something that could be stored.
+pub struct Arena<'d> {
+    device: &'d Device,
+    /// `Some` for the whole of the guard's life; `None` only inside `drop`.
+    buffer: Option<Buffer>,
+}
+
+impl Arena<'_> {
+    /// The allocation this guard holds.
+    #[must_use]
+    pub fn buffer(&self) -> &Buffer {
+        self.buffer.as_ref().expect("held until the guard drops")
+    }
+}
+
+impl Drop for Arena<'_> {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            self.device.shelve(buffer);
+        }
+    }
+}
+
 /// A storage buffer, and how many bytes it holds.
 ///
 /// Plain data with no device reference, so a caller can keep a table of these
@@ -1200,6 +1227,20 @@ pub struct Device {
     /// Grown to the largest range ever asked for and never shrunk. See
     /// `read` for why one buffer is enough.
     staging: Mutex<Option<wgpu::Buffer>>,
+    /// Arenas handed back by a finished step, ready for the next one.
+    ///
+    /// A fire's arena used to be a FRESH `zeroed` buffer every token, and the
+    /// cost of that is not the allocation. It is [`Self::cached`]: a bind
+    /// group is keyed by the buffers it names, nearly every group a fire binds
+    /// names the arena, and a new handle each token is a new key each token --
+    /// so the cache missed on every arena-touching group, rebuilt it, and
+    /// filled up until the whole map was dropped. Handing the SAME allocation
+    /// back turns those misses into hits.
+    ///
+    /// A vector and not one slot, because two steps may be in flight on two
+    /// threads and each must get its own; `swap_remove` is what keeps them
+    /// from sharing one.
+    arenas: Mutex<Vec<Buffer>>,
     /// Bind groups already built, keyed by what they bind.
     ///
     /// A bind group is IMMUTABLE -- it names buffers and ranges, never
@@ -1468,6 +1509,7 @@ impl Device {
             unreachable,
             errors,
             staging: Mutex::default(),
+            arenas: Mutex::default(),
             cached: Mutex::default(),
         })
     }
@@ -1725,6 +1767,65 @@ impl Device {
         });
         self.drained()?;
         Ok(Buffer { inner, size })
+    }
+
+    /// A zeroed arena, from the pool when one fits and fresh when none does.
+    ///
+    /// The returned guard hands the allocation back when it drops, so the next
+    /// step gets the SAME `wgpu::Buffer` and every bind group naming it is a
+    /// hit in [`Self::cached`] instead of a rebuild. That is the whole point;
+    /// the allocation itself was never the expensive part.
+    ///
+    /// **Reuse is bounded above as well as below.** A buffer is taken only
+    /// when it fits the ask and is no more than twice it, because a prefill
+    /// arena is orders of magnitude larger than a decode's and reusing one for
+    /// the other would zero a hundred megabytes a token to save a bind group.
+    ///
+    /// **Zeroed, and by a real clear.** `wgpu` zero-initialises a fresh buffer
+    /// and the arena's first readers rely on that; a recycled one holds the
+    /// last step's values. The clear is submitted and NOT waited on -- one
+    /// queue, and commands on it run in the order they were submitted, so the
+    /// fire that follows cannot start before it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::zeroed`].
+    pub fn arena(&self, bytes: u64) -> Result<Arena<'_>, Failed> {
+        let span = bytes.next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT).max(4);
+        let taken = {
+            let mut pool = self.arenas.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            pool.iter()
+                .position(|held| held.size >= span && held.size <= span.saturating_mul(2))
+                .map(|at| pool.swap_remove(at))
+        };
+        let buffer = match taken {
+            Some(held) => {
+                let mut work = self
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("arena/clear"),
+                    });
+                work.clear_buffer(&held.inner, 0, Some(span));
+                self.queue.submit([work.finish()]);
+                self.drained()?;
+                held
+            }
+            None => self.zeroed(bytes)?,
+        };
+        Ok(Arena {
+            device: self,
+            buffer: Some(buffer),
+        })
+    }
+
+    /// Take an arena back, if the pool has room for it.
+    fn shelve(&self, buffer: Buffer) {
+        let mut pool = self.arenas.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Four, which is more than the one in-flight step this driver has ever
+        // had and few enough that a pool of prefill arenas cannot be a leak.
+        if pool.len() < 4 {
+            pool.push(buffer);
+        }
     }
 
     /// A storage buffer holding `bytes`.
@@ -2344,6 +2445,18 @@ impl Device {
         // still land before the pass that reads them, and `wgpu-core` tracks
         // the usage transition and emits the barrier either way. What was
         // bought by the split was nothing.
+        //
+        // AND THE SPLIT NO LONGER HAPPENS AT ALL. Counted on an M4 Pro, a
+        // one-row decode of Llama-3.2-1B: `passes=1 copies=0`, all 244
+        // dispatches in one compute pass with no shadow between them. The
+        // "451 of 452 launches shadow something" above was measured before
+        // the arena's operands stopped aliasing, and a reader looking for
+        // the cost of the pass boundary here will find there is none left to
+        // find. What is left between two dispatches is the barrier `wgpu`
+        // puts there because it cannot prove them independent -- and in a
+        // transformer they mostly are not -- which is the ~13 us a dispatch
+        // that `kernels_wgpu::attn`'s split note measures in situ and that
+        // `serve::record`'s M4 table turns into forty percent of a token.
         let mut submission: Vec<wgpu::CommandBuffer> = Vec::new();
         let mut at = 0;
         let mut work = encoder("fire");

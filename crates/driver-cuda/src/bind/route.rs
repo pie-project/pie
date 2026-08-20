@@ -105,13 +105,10 @@
 //! `Vec<u32>`, so an unbounded window arrives as `0xFFFF_FFFF` and
 //! `as_declared`'s `U32 -> I32` refuses above `i32::MAX`.
 //!
-use core::ffi::c_void;
-
 use kernels::Refusal;
 use kernels::routine::{In, Out};
 
 use super::cx::Cx;
-use super::table;
 
 /// The `In<N, T>` a hand arm would otherwise write out longhand.
 ///

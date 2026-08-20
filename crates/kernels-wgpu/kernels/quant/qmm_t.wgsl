@@ -143,6 +143,14 @@ struct Params {
     k_partition_size: i32,
     split_k_partition_stride: i32,
 //#endif
+    // THE ROW COUNT, and the reason `write_out` can bound its rows.
+    //
+    // Last on purpose: every other field's offset is what it was before this
+    // one existed, so adding it could not move a field a variant already
+    // reads. It is unconditional because the guard must hold for every
+    // variant -- a form that omitted it would be the one form that still
+    // overruns.
+    m: i32,
 }
 //#endif
 
@@ -372,10 +380,6 @@ const PIE_BN4 = PIE_BN / 4;
 // BN=16 gives 64 of them across 128 lanes -- the only declared shape that does
 // not fill the workgroup, and the reason `r` is bounds-checked below.
 const PIE_ACCV = (PIE_BM * PIE_BN4 + 127) / 128;
-// Whether a lane holds exactly two accumulators AND every lane is live, which
-// is `BM * BN4 == 256`. A const expression, so the branch it guards is folded
-// before register allocation ever sees the other arm.
-const PIE_ACC2 = PIE_BM * PIE_BN4 == 256;
 
 var<workgroup> xs: array<vec4<f32>, PIE_BM * PIE_BK4>;
 // Stored K-major (`ws[kk * BN4 + c4]`) though it is read column-major, so that
@@ -452,14 +456,35 @@ fn affine_quad(col: u32, k: u32) -> vec4<f32> {
 // fetch produced, and it was invisible at the tile-aligned shapes the earlier
 // tests happened to use. `n` is in the uniform block, so the guard is exact.
 //
-// The ROW overhang cannot be guarded here, because no entrypoint's block
-// carries `m` -- the launch names the grid and nothing else. So the contract is
-// that the output allocation is a whole number of `BM` rows; those extra rows
-// are written with garbage and ignored. That is a real requirement on the
-// caller, not an oversight: `qmm_t.metal` has the same overhang deliberately,
-// calling MLX's `store_result` where a `store_result_safe` sits right beside it.
+// THE ROW OVERHANG IS GUARDED TOO, AND USED NOT TO BE.
+//
+// It used to say the row overhang *could not* be guarded here, because no
+// entrypoint's block carried `m` -- the launch named the grid and nothing
+// else -- so the contract was that the output allocation is a whole number of
+// `BM` rows and the extra rows were written with garbage and ignored, exactly
+// as `qmm_t.metal` does by calling MLX's `store_result` where a
+// `store_result_safe` sits beside it.
+//
+// That was never a shortage of information. Every one of this file's
+// entrypoints already computed `m` -- `ctx.ask::<i32, keys::Rows>()` in
+// `kernels-wgpu::quant`, which is what `qmm_grid` rounds up with `div_ceil`
+// -- and simply did not pass it. Now `Params` ends with `m` and this is the
+// whole of what that buys.
+//
+// What it is FOR: a fire whose row count the tile does not divide. Refusing
+// one (`Ungeometric::PartialTile`, and `GuardPred::TokensMultipleOf` above
+// it) costs a prefill 2.34x on thirty-one prompt lengths in thirty-two,
+// because the fire falls to the matvec. `driver-wgpu`'s `Serving::prefill`
+// carries the numbers and what letting it through did before this guard
+// existed: an unrelated answer AND a twelvefold slowdown, the second being
+// the first's consequence and not a cost of padding.
+//
+// `gpu.rs`'s `a_tiled_gemm_agrees_over_every_tile_shape_and_quantization_point`
+// is the proof. It fires m = 33 over all nine tiles and six codecs and now
+// asserts the overhang still holds its sentinel; delete the `row` term below
+// and it reports 705 of 705 overhang values written.
 fn write_out(row: u32, col: u32, value: f32, slice: u32) {
-    if col >= u32(params.n) {
+    if col >= u32(params.n) || row >= u32(params.m) {
         return;
     }
     var v = value;
@@ -560,63 +585,211 @@ fn main(
         }
         workgroupBarrier();
 
-        // TWO ROWS OVER ONE COLUMN GROUP, where the general loop below runs
-        // each accumulator's whole K sweep on its own.
+        // EVERY ROW THE LANE OWNS, OVER ONE COLUMN GROUP -- so the four
+        // `ws` vec4s an inner step needs are read ONCE and retire every
+        // accumulator, instead of once per accumulator.
         //
         // `c4` is `idx % BN4` and `idx` differs between accumulators by
         // exactly PIE_LANES, so where `BN4` divides 128 -- it is 4, 8 or 16 at
-        // every declared shape -- every accumulator a lane holds sits in the
-        // SAME column group and differs only in its row. The four `ws` vec4s
-        // an inner step reads are therefore the same four for both, and the
-        // general loop reads them twice: ten workgroup loads retire what six
-        // can.
+        // every declared shape, since BN is 16, 32 or 64 -- every
+        // accumulator a lane holds sits in the SAME column group and differs
+        // only in its row, by a fixed `PIE_LANES / BN4`.
         //
-        // Guarded on two accumulators exactly, because that is the shape where
-        // `BM * BN4` is 256 and both rows are certainly live -- (32, 32),
-        // (64, 16) and (16, 64). The general loop keeps the `r >= BM` guard
-        // for (16, 16), whose 64 accumulators do not fill the workgroup.
+        // That is the whole of this loop's arithmetic intensity. Per K step a
+        // lane reads `4 + ACCV` workgroup vec4s and retires `16 * ACCV`
+        // multiplies, where the per-accumulator sweep this replaces read
+        // `5 * ACCV` for the same work: 3.2 multiplies a load at every shape,
+        // against 5.3 at two accumulators and 10.7 at eight.
+        //
+        // # Why this was worth writing
+        //
+        // It used to be a two-accumulator special case with a general loop
+        // beside it, and the special case was the only fast path. Sweeping
+        // the tile at 512 rows of llama-3.2-1B's own shapes, the three tiles
+        // where `BM * BN4` is exactly 256 -- (16, 64), (32, 32), (64, 16) --
+        // read 1.56, 1.70 and 1.85 TFLOP/s, and the other six ALL read about
+        // 1.0. The tile did not predict the rate; whether it hit the special
+        // case did. (64, 64) has four times (32, 32)'s accumulators and the
+        // best intensity available, and it was the SLOWEST shape measured.
+        //
+        // After, on the same sweep -- the ACC2 shapes reproduce to the third
+        // digit, so this arm is the old special case at ACCV = 2 and the
+        // change is what happens above it:
+        //
+        // ```text
+        //            bn=16   bn=32   bn=64        (TFLOP/s, q/o at m=512)
+        //   bm=16     1.07    0.90    1.56
+        //   bm=32     1.04    1.68    2.54   <- was 0.99
+        //   bm=64     1.82    2.66    2.94   <- was 1.07, 0.98
+        // ```
+        //
+        // # WHY THE ACCUMULATORS ARE NAMED AND NOT AN ARRAY
+        //
+        // The first attempt at this was one loop over `acc[a]`, which is the
+        // obvious spelling and LOST: (32, 32) fell 1.68 -> 1.40 and (64, 16)
+        // 1.85 -> 1.24, while the wide tiles gained only to 1.2. A dynamically
+        // indexed `array<vec4<f32>, N>` local is not registers -- MSL puts it
+        // in thread-local memory -- so the loop traded four workgroup reads
+        // for ACCV stack round-trips and paid on every shape that already had
+        // a fast path.
+        //
+        // It is worth knowing which suspect it was NOT. The inner `r < BM`
+        // guard was replaced by a clamp, on the theory that the branch cost
+        // it: (32, 32) moved 1.40 -> 1.44 and (16, 16) fell 1.14 -> 0.52,
+        // since its dead half then did the full sweep. The branch was never
+        // the problem.
+        //
+        // So the arms below are unrolled by hand at 1, 2, 4 and 8, which is
+        // every `ceil(BM * BN4 / 128)` the declared shapes produce. The cost
+        // is a fifth arm to add if a tile ever needs one, so the
+        // per-accumulator sweep they replaced stays below them as the
+        // fallback -- an unlisted `ACCV` is then SLOW rather than silently
+        // short by however many accumulators the arms did not name.
         //
         // The accumulation order is UNCHANGED, which the parity walk against
         // `kernels-metal` and `kernels-vulkan` requires: each accumulator
-        // still folds its own `xv.x * w0 + xv.y * w1 + ...` in that order.
-        if PIE_ACC2 {
-            let c4 = local % u32(PIE_BN4);
-            let r0 = local / u32(PIE_BN4);
-            let r1 = r0 + PIE_LANES / u32(PIE_BN4);
-            var s0 = acc[0];
-            var s1 = acc[min(1u, u32(PIE_ACCV) - 1u)];
+        // still folds `xv.x * w0 + xv.y * w1 + ...` in that order, over
+        // ascending `k4`.
+        let c4 = local % u32(PIE_BN4);
+        let r0 = local / u32(PIE_BN4);
+        let rstep = PIE_LANES / u32(PIE_BN4);
+        // Clamped so an arm naming more accumulators than this shape holds
+        // still COMPILES. Every arm below is guarded by a const comparison,
+        // so only one survives folding and the clamps in it are identities.
+        let n0 = min(0u, u32(PIE_ACCV) - 1u);
+        let n1 = min(1u, u32(PIE_ACCV) - 1u);
+        let n2 = min(2u, u32(PIE_ACCV) - 1u);
+        let n3 = min(3u, u32(PIE_ACCV) - 1u);
+        let n4 = min(4u, u32(PIE_ACCV) - 1u);
+        let n5 = min(5u, u32(PIE_ACCV) - 1u);
+        let n6 = min(6u, u32(PIE_ACCV) - 1u);
+        let n7 = min(7u, u32(PIE_ACCV) - 1u);
+
+        if u32(PIE_ACCV) == 8u {
+            var s0 = acc[n0];
+            var s1 = acc[n1];
+            var s2 = acc[n2];
+            var s3 = acc[n3];
+            var s4 = acc[n4];
+            var s5 = acc[n5];
+            var s6 = acc[n6];
+            var s7 = acc[n7];
             for (var k4 = 0u; k4 < u32(PIE_BK4); k4 = k4 + 1u) {
                 let kk = k4 * 4u;
                 let w0 = ws[(kk + 0u) * u32(PIE_BN4) + c4];
                 let w1 = ws[(kk + 1u) * u32(PIE_BN4) + c4];
                 let w2 = ws[(kk + 2u) * u32(PIE_BN4) + c4];
                 let w3 = ws[(kk + 3u) * u32(PIE_BN4) + c4];
-                let x0 = xs[r0 * u32(PIE_BK4) + k4];
-                let x1 = xs[r1 * u32(PIE_BK4) + k4];
+                let x0 = xs[(r0) * u32(PIE_BK4) + k4];
+                let x1 = xs[(r0 + 1u * rstep) * u32(PIE_BK4) + k4];
+                let x2 = xs[(r0 + 2u * rstep) * u32(PIE_BK4) + k4];
+                let x3 = xs[(r0 + 3u * rstep) * u32(PIE_BK4) + k4];
+                let x4 = xs[(r0 + 4u * rstep) * u32(PIE_BK4) + k4];
+                let x5 = xs[(r0 + 5u * rstep) * u32(PIE_BK4) + k4];
+                let x6 = xs[(r0 + 6u * rstep) * u32(PIE_BK4) + k4];
+                let x7 = xs[(r0 + 7u * rstep) * u32(PIE_BK4) + k4];
+                s0 = s0 + x0.x * w0 + x0.y * w1 + x0.z * w2 + x0.w * w3;
+                s1 = s1 + x1.x * w0 + x1.y * w1 + x1.z * w2 + x1.w * w3;
+                s2 = s2 + x2.x * w0 + x2.y * w1 + x2.z * w2 + x2.w * w3;
+                s3 = s3 + x3.x * w0 + x3.y * w1 + x3.z * w2 + x3.w * w3;
+                s4 = s4 + x4.x * w0 + x4.y * w1 + x4.z * w2 + x4.w * w3;
+                s5 = s5 + x5.x * w0 + x5.y * w1 + x5.z * w2 + x5.w * w3;
+                s6 = s6 + x6.x * w0 + x6.y * w1 + x6.z * w2 + x6.w * w3;
+                s7 = s7 + x7.x * w0 + x7.y * w1 + x7.z * w2 + x7.w * w3;
+            }
+            acc[n0] = s0;
+            acc[n1] = s1;
+            acc[n2] = s2;
+            acc[n3] = s3;
+            acc[n4] = s4;
+            acc[n5] = s5;
+            acc[n6] = s6;
+            acc[n7] = s7;
+        } else if u32(PIE_ACCV) == 4u {
+            var s0 = acc[n0];
+            var s1 = acc[n1];
+            var s2 = acc[n2];
+            var s3 = acc[n3];
+            for (var k4 = 0u; k4 < u32(PIE_BK4); k4 = k4 + 1u) {
+                let kk = k4 * 4u;
+                let w0 = ws[(kk + 0u) * u32(PIE_BN4) + c4];
+                let w1 = ws[(kk + 1u) * u32(PIE_BN4) + c4];
+                let w2 = ws[(kk + 2u) * u32(PIE_BN4) + c4];
+                let w3 = ws[(kk + 3u) * u32(PIE_BN4) + c4];
+                let x0 = xs[(r0) * u32(PIE_BK4) + k4];
+                let x1 = xs[(r0 + 1u * rstep) * u32(PIE_BK4) + k4];
+                let x2 = xs[(r0 + 2u * rstep) * u32(PIE_BK4) + k4];
+                let x3 = xs[(r0 + 3u * rstep) * u32(PIE_BK4) + k4];
+                s0 = s0 + x0.x * w0 + x0.y * w1 + x0.z * w2 + x0.w * w3;
+                s1 = s1 + x1.x * w0 + x1.y * w1 + x1.z * w2 + x1.w * w3;
+                s2 = s2 + x2.x * w0 + x2.y * w1 + x2.z * w2 + x2.w * w3;
+                s3 = s3 + x3.x * w0 + x3.y * w1 + x3.z * w2 + x3.w * w3;
+            }
+            acc[n0] = s0;
+            acc[n1] = s1;
+            acc[n2] = s2;
+            acc[n3] = s3;
+        } else if u32(PIE_ACCV) == 2u {
+            var s0 = acc[n0];
+            var s1 = acc[n1];
+            for (var k4 = 0u; k4 < u32(PIE_BK4); k4 = k4 + 1u) {
+                let kk = k4 * 4u;
+                let w0 = ws[(kk + 0u) * u32(PIE_BN4) + c4];
+                let w1 = ws[(kk + 1u) * u32(PIE_BN4) + c4];
+                let w2 = ws[(kk + 2u) * u32(PIE_BN4) + c4];
+                let w3 = ws[(kk + 3u) * u32(PIE_BN4) + c4];
+                let x0 = xs[(r0) * u32(PIE_BK4) + k4];
+                let x1 = xs[(r0 + 1u * rstep) * u32(PIE_BK4) + k4];
                 s0 = s0 + x0.x * w0 + x0.y * w1 + x0.z * w2 + x0.w * w3;
                 s1 = s1 + x1.x * w0 + x1.y * w1 + x1.z * w2 + x1.w * w3;
             }
-            acc[0] = s0;
-            acc[min(1u, u32(PIE_ACCV) - 1u)] = s1;
-        } else {
-        for (var a = 0u; a < u32(PIE_ACCV); a = a + 1u) {
-            let idx = local + a * PIE_LANES;
-            let r = idx / u32(PIE_BN4);
-            let c4 = idx - r * u32(PIE_BN4);
-            // The one shape whose lanes outnumber its rows. No barrier stands
-            // between here and the epilogue, so a lane may leave early.
-            if r >= u32(PIE_BM) { continue; }
-            var s = acc[a];
-            for (var k4 = 0u; k4 < u32(PIE_BK4); k4 = k4 + 1u) {
-                let xv = xs[r * u32(PIE_BK4) + k4];
-                let kk = k4 * 4u;
-                s = s + xv.x * ws[(kk + 0u) * u32(PIE_BN4) + c4]
-                      + xv.y * ws[(kk + 1u) * u32(PIE_BN4) + c4]
-                      + xv.z * ws[(kk + 2u) * u32(PIE_BN4) + c4]
-                      + xv.w * ws[(kk + 3u) * u32(PIE_BN4) + c4];
+            acc[n0] = s0;
+            acc[n1] = s1;
+        } else if u32(PIE_ACCV) == 1u {
+            // ONE accumulator, and the only shape that reaches it -- (16, 16)
+            // -- has 64 of them across 128 lanes, so half the workgroup owns a
+            // row past the tile and must not read `xs` at all. Leaving early
+            // is safe: no barrier stands between here and the epilogue, which
+            // makes the same test before it writes.
+            if r0 < u32(PIE_BM) {
+                var s0 = acc[n0];
+                for (var k4 = 0u; k4 < u32(PIE_BK4); k4 = k4 + 1u) {
+                    let kk = k4 * 4u;
+                    let w0 = ws[(kk + 0u) * u32(PIE_BN4) + c4];
+                    let w1 = ws[(kk + 1u) * u32(PIE_BN4) + c4];
+                    let w2 = ws[(kk + 2u) * u32(PIE_BN4) + c4];
+                    let w3 = ws[(kk + 3u) * u32(PIE_BN4) + c4];
+                    let x0 = xs[(r0) * u32(PIE_BK4) + k4];
+                    s0 = s0 + x0.x * w0 + x0.y * w1 + x0.z * w2 + x0.w * w3;
+                }
+                acc[n0] = s0;
             }
-            acc[a] = s;
-        }
+        } else {
+            // NO DECLARED SHAPE REACHES THIS, and it exists so that one added
+            // later is slow rather than wrong. The arms above are unrolled at
+            // the four `ACCV` the nine declared tiles produce; a tenth tile
+            // with, say, 16 accumulators would otherwise fall into the ACCV
+            // == 1 arm and leave fifteen of them at zero, which is a fluent
+            // wrong answer and the failure this file exists to avoid.
+            //
+            // It is the per-accumulator sweep the arms above replaced, kept
+            // for its correctness rather than its rate: `5 * ACCV` workgroup
+            // reads for `16 * ACCV` multiplies, and a dynamically indexed
+            // `acc`, which is about 1.0 TFLOP/s where the arms reach 2.9.
+            for (var a = 0u; a < u32(PIE_ACCV); a = a + 1u) {
+                let r = r0 + a * rstep;
+                if r >= u32(PIE_BM) { continue; }
+                var s = acc[a];
+                for (var k4 = 0u; k4 < u32(PIE_BK4); k4 = k4 + 1u) {
+                    let xv = xs[r * u32(PIE_BK4) + k4];
+                    let kk = k4 * 4u;
+                    s = s + xv.x * ws[(kk + 0u) * u32(PIE_BN4) + c4]
+                          + xv.y * ws[(kk + 1u) * u32(PIE_BN4) + c4]
+                          + xv.z * ws[(kk + 2u) * u32(PIE_BN4) + c4]
+                          + xv.w * ws[(kk + 3u) * u32(PIE_BN4) + c4];
+                }
+                acc[a] = s;
+            }
         }
 
         kb = kb + u32(PIE_BK);

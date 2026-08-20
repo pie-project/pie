@@ -11,7 +11,7 @@
 //! dense `qmv_fast` had six, so a Qwen3-MoE or routed gemma-4 at any other
 //! format had no pipeline at all. The five missing instantiations are in
 //! `quantized_qmv.wgsl` now, with the evidence for widening rather than
-//! refusing. `.wiki/kernel-metal-refactor.md` §9 records it.
+//! refusing. `.wiki/kernel-x/metal-refactor.md` §9 records it.
 
 use kernels_macros::routine;
 

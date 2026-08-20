@@ -459,19 +459,43 @@ pub fn lanes(rule: Rule, dims: Dims, module: Module) -> Result<[u32; 3], Ungeome
         // `kernels-wgpu::quant::qmv_grid` is handed `quarters(vecs)` for the
         // same reason. The Slang module has no such tiling; changing this arm
         // there would ask for a quarter of the workgroups its shader needs.
-        Rule::Qmv => [module.local.at(0) * rows.div_ceil(4), dims.width.div_ceil(4), 1],
+        Rule::Qmv => [
+            module.local.at(0) * rows.div_ceil(kernels_wgpu::quant::PIE_MT.unsigned_abs()),
+            dims.width.div_ceil(4),
+            1,
+        ],
         Rule::Qmm => {
             // The tile comes from the MODULE. Choosing one here would be
             // choosing a decomposition the compiled shader does not have.
             let tile = module.tile.ok_or(Ungeometric::Untiled)?;
             let (bm, bn) = (tile.rows.max(1), tile.cols.max(1));
-            if !rows.is_multiple_of(bm) {
-                // Refusing, not falling back to a matvec grid:
-                // `affine_qmm_t` reads its tile FROM the grid, so a matvec grid
-                // points it at a tiling that is not there and a two-token
-                // prefill came back entirely NaN.
-                return Err(Ungeometric::PartialTile { rows, tile: bm });
-            }
+            // NO `PartialTile` REFUSAL HERE ANY MORE, and the reason is in
+            // the kernel and not in this arm.
+            //
+            // It used to refuse a row count `bm` does not divide, because
+            // `qmm_t.wgsl` stored its whole last tile and a padded grid ran a
+            // tile's worth of rows over the next value in the arena. (It
+            // refused rather than falling back to a matvec grid because
+            // `affine_qmm_t` reads its tile FROM the grid, so a matvec grid
+            // points it at a tiling that is not there and a two-token prefill
+            // came back entirely NaN. That part is still true, which is why
+            // the answer is to round up and not to substitute a shape.)
+            //
+            // `Params` now ends with `m` and `write_out` returns on
+            // `row >= m`, so the last tile computes and discards. The
+            // `div_ceil` below was always here -- rounding up is not a change
+            // of arithmetic, only of what the arm allows to reach it.
+            //
+            // What the refusal cost: it is the modulus behind
+            // `GuardPred::TokensMultipleOf`, which refused thirty-one prompt
+            // lengths in thirty-two, and a 496-token prefill read 529.2 tok/s
+            // against 512's 1238.1. With the bound in place it reads 1187.2.
+            //
+            // This is unconditional because every kernel this driver can
+            // reach through `Rule::Qmm` is `qmm_t.wgsl`. A driver whose GEMM
+            // still stores its overhang must keep the refusal --
+            // `Ungeometric::PartialTile` stays, and `driver-metal` and
+            // `driver-vulkan` still raise it.
             // One workgroup per (column tile, row tile), and the module is
             // `(32, 2, 2)` -- 128 lanes cooperating on one tile, not one lane
             // per output.
@@ -886,7 +910,8 @@ mod tests {
         [32, 8, 1],
     ];
 
-    /// One statement, wide enough that no arm in the tree runs out of operands.
+    /// One statement whose operands are `width` wide, wide enough in every
+    /// other dimension that no arm in the tree runs out of operands.
     ///
     /// The three sweeps below drive the ROUTINE path, because that is where a
     /// grid comes from now: `kernels_wgpu::KERNELS` is empty, no symbol
@@ -904,17 +929,17 @@ mod tests {
     /// That is what lets a sweep skip a refusal and still mean something. A
     /// refusal here is "this body is not compiled for that head width" or
     /// "that scalar was not stated", never "the fixture was too short".
-    fn statement() -> Vec<model_compiler::lower::Arg> {
-        statement_wide(128)
-    }
-
-    /// [`statement`] whose operands are `width` wide.
     ///
     /// THE RESULT'S WIDTH IS THE STATEMENT'S NOW. A routed matvec reads its
     /// output width off `y.width` -- the rectangle the text gave the operand
     /// -- where the driver used to hand it `out_vec_size` as a fire number. A
     /// sweep over output widths therefore has to vary the RECTANGLE, not just
     /// the scalar run, or the body answers 128 whatever the case says.
+    ///
+    /// WHICH IS WHY THE FIXED-WIDTH `statement()` IS GONE. It stood above this
+    /// one and returned `statement_wide(128)`, and it held all the prose
+    /// above; every sweep had already moved to the parameterised form, because
+    /// a sweep that cannot vary the rectangle cannot vary the answer.
     fn statement_wide(width: u32) -> Vec<model_compiler::lower::Arg> {
         let mut args: Vec<model_compiler::lower::Arg> = (0..12usize)
             .map(|n| model_compiler::lower::Arg::Arena {

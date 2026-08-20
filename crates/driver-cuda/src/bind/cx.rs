@@ -300,8 +300,15 @@ impl<'a> Cx<'a> {
         self.fire.attn.ok_or(Refusal::Unstated { what: "the fire's attention context" })
     }
 
-    /// The op join this statement was bound under. Its one caller,
-    /// [`super::attn_plan`], picks a decode plan on `window_of(..) == -1`.
+    /// The op join this statement was bound under.
+    ///
+    /// KEPT WITHOUT A CALLER, and the caller it lost is worth naming: this
+    /// said *"its one caller, [`super::attn_plan`], picks a decode plan on
+    /// `window_of(..) == -1`"*. That pick is deleted -- a statement names the
+    /// schedule it executes now, so `attn_plan` takes no spec and infers
+    /// nothing (`.wiki/designs/design-struct.md` §7). The accessor stays
+    /// because a `Cx` handing out its own join is not a thing the removal of
+    /// one reader makes wrong.
     #[must_use]
     pub const fn spec(&self) -> &'a super::LaunchSpec {
         self.fire.spec

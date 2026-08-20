@@ -26,7 +26,6 @@ use kernels::{Bind, Fire};
 use core::ptr::NonNull;
 
 use crate::jit::{Ctx, Launch};
-use crate::jit::Abi;
 use crate::jit::abi::bf16;
 use kernels::Refusal;
 

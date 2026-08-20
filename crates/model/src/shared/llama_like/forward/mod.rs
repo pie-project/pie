@@ -358,7 +358,54 @@ fn llama_like_metal_text(
         //
         // Stated POSITIVELY, still: the arm that runs on the common path is
         // the one that wants to be read first.
+        //
+        // # WHAT THIS PREDICATE COSTS A PREFILL
+        //
+        // `TokensMultipleOf` is right about the CONTRACT and expensive about
+        // the fire. It refuses thirty-one row counts in thirty-two at every
+        // size, not merely below the tile, so a prompt whose length the tile
+        // does not divide runs its whole prefill on the matvec. Measured on
+        // `driver-wgpu`, llama-3.2-1B q4 on an M4 Pro: 512 tokens prefill at
+        // 1238 tok/s and 500 at 528, a 2.34x cliff on `n % 32`.
+        //
+        // REPAIRED, and not on this line: the repair was a backend learning
+        // to TOLERATE a partial row tile, which `metal.qmm_partial_rows`
+        // below now asks about. What follows is why that was the order.
+        //
+        // A backend would first have to tolerate a partial row tile -- and
+        // when this was written none did:
+        // the quoted precondition is `M % BM == 0` precisely because these
+        // kernels take no `M`, so the last tile cannot bound its stores and
+        // rounding the grid up overruns the next value, which is the measured
+        // failure two paragraphs up. `driver-wgpu/src/turns.rs`'s `prefill`
+        // doc carries the numbers and the three-part shape of the fix -- and
+        // the measurement that relaxing THIS predicate to `TokensGT(tile - 1)`
+        // with the driver's refusal disabled is not merely wrong (it is: a
+        // 496-token prompt answers with unrelated text) but 5.4x SLOWER than
+        // the matvec it replaces. Do not relax it as a first step -- though
+        // the slowness is the CORRUPTION and not the padded grid: the same
+        // kernel at 496 rows padded to 512 runs at its full 2.54 TFLOP/s no
+        // matter what the overhang rows contain, zeros or NaNs alike. Bound
+        // the kernel's stores first and both symptoms should go.
         let tile = metal.qmm_tile.0.max(1);
+        // THE ROW GUARD, and which of the two readings this build gets.
+        //
+        // `TokensMultipleOf(tile)` is what the GEMM's contract requires of a
+        // backend that stores its whole last tile, and it is expensive: it
+        // refuses thirty-one row counts in thirty-two, so a prompt whose
+        // length the tile does not divide runs its ENTIRE prefill on the
+        // matvec. Measured on `driver-wgpu`, llama-3.2-1B q4 on an M4 Pro,
+        // 496 tokens read 529.2 tok/s where 512 read 1238.1.
+        //
+        // `TokensGT(tile - 1)` is the same intent -- take the GEMM once there
+        // are enough rows for it to beat the matvec -- without the modulus,
+        // and it is correct only where the kernel bounds its own stores. That
+        // is the fact, and it is false unless a backend states it.
+        let rows_guard = if metal.qmm_partial_rows {
+            GuardPred::TokensGT(tile - 1)
+        } else {
+            GuardPred::TokensMultipleOf(tile)
+        };
         // The POINT is a parameter because one tensor in this stack may not
         // share it: see `LlamaLikeMetalFacts::router_repr`. Everything else
         // -- the guard, its two arms, the shape the value takes -- is the
@@ -449,7 +496,7 @@ fn llama_like_metal_text(
             if let Some(v) = staged.borrow().get(&x.key()) {
                 return v.clone();
             }
-            let v = dsl::metal::cast_qmm_input_when(x, GuardPred::TokensMultipleOf(tile));
+            let v = dsl::metal::cast_qmm_input_when(x, rows_guard);
             staged.borrow_mut().insert(x.key(), v.clone());
             v
         };
@@ -496,7 +543,7 @@ fn llama_like_metal_text(
             let shape = (Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16);
             let half = staged.then(|| stage(x));
             let (g, v) = dsl::guarded_value(x.trace(), w.layer, shape);
-            g.arm(GuardPred::TokensMultipleOf(tile), || match &half {
+            g.arm(rows_guard, || match &half {
                 Some(h) => {
                     dsl::metal::qmm_fp16(h, w, gpt);
                 }
@@ -525,7 +572,7 @@ fn llama_like_metal_text(
             let shape = (Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16);
             let half = precast.then(|| stage(x));
             let (g, v) = dsl::guarded_value(x.trace(), w.layer, shape);
-            g.arm(GuardPred::TokensMultipleOf(tile), || match &half {
+            g.arm(rows_guard, || match &half {
                 Some(h) => {
                     dsl::metal::qmm_residual_fp16(h, w, residual, &gemm_point);
                 }
@@ -757,7 +804,6 @@ fn llama_like_metal_text(
                         &bank(m),
                         f.n_experts,
                         k,
-                        in_vec,
                         bits,
                         tile,
                         metal.routed_qmm_fp16 && bits == 4,
@@ -1171,7 +1217,6 @@ fn llama_like_metal_text(
                     q_w,
                     head_dim,
                     paged,
-                    f.q_heads / kv_heads.max(1),
                     kv_heads,
                     window,
                     // The attention SINK this layer has, if any: a per-head

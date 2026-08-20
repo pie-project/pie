@@ -484,7 +484,12 @@ impl Variant for Gemma4 {
                 "gemma-4 31B/26B-A4B on CUDA: these rows read V out of the K projection (`attention_k_eq_v`) and ship no `v_proj`; the hand-written text projects one. The Metal text reads it (`LlamaLikeMetalFacts::v_from_k`) and serves these rows",
             ));
         }
-        Ok(project::trace(&self.shape, self.sliding_window, class, load.layer_scalars))
+        Ok(project::trace(
+            &self.shape,
+            self.sliding_window,
+            class,
+            load.layer_scalars,
+        ))
     }
 
     /// Gemma-4's own turn protocol, and the reason [`Variant::chat`] is
@@ -1017,6 +1022,8 @@ mod tests {
         use model_ir::trace::FireClass;
 
         let bind = MetalBinding {
+            qmm_partial_rows: false,
+            qmm_tile: None,
             quant_group: 64,
             quant_bits: 4,
             router_quant_group: 0,

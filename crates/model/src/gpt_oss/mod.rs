@@ -748,6 +748,8 @@ mod tests {
         // every gpt-oss published: the checkpoint lists its dense tensors as
         // affine/64/4 and leaves the expert banks to the top-level mxfp4/32.
         let bind = MetalBinding {
+            qmm_partial_rows: false,
+            qmm_tile: None,
             quant_group: 64,
             quant_bits: 4,
             router_quant_group: 0,
@@ -847,6 +849,8 @@ mod tests {
 
         let at = |router_group: u32, router_bits: u32| {
             let bind = MetalBinding {
+                qmm_partial_rows: false,
+                qmm_tile: None,
                 quant_group: 64,
                 quant_bits: 4,
                 router_quant_group: router_group,

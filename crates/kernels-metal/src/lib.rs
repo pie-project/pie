@@ -23,7 +23,7 @@
 //! second time, by hand, and `.wiki/kernel-refactor.md` §5's own test — *would
 //! the two share one C++ definition?* — answers that they are not distinct
 //! kernels. So a row carries its [`Axis`]es and the product is the entrypoint
-//! set. `.wiki/kernel-metal-refactor.md` §2 is the argument in full.
+//! set. `.wiki/kernel-x/metal-refactor.md` §2 is the argument in full.
 //!
 //! The consequence worth stating on the way in: **the table is now where the
 //! shader tree's coverage is written down.** `qmv_fast` is compiled for six
@@ -128,29 +128,33 @@ pub use METAL_ROUTINES as ROUTINES;
 /// once the last backend can also write this line.
 pub static KERNELS: &[KernelSig] = &[];
 
-/// The entrypoints of the families whose `kernel!` rows have been RETIRED.
-///
-/// Stated at the SOURCE rather than at each consumer: one edit instead of N,
-/// every sweep keeps its coverage untouched, and the census stays whole so
-/// the comparison against a backend that has not retired the same rows keeps
-/// meaning what it meant.
-///
-/// This list grows as families cross and the table shrinks under it. When the
-/// last one crosses, `KERNELS` is empty and this is the whole census — which
-/// is `.wiki/kernel-x/refactor-bigplan.md` §7 Stage 4, and why it is a list
-/// of families rather than one flat slice.
-pub const RETIRED: &[&[(&str, &str)]] = &[
-    attn::ENTRYPOINTS,
-    layout::ENTRYPOINTS,
-    mlp::ENTRYPOINTS,
-    moe::ENTRYPOINTS,
-    norm::ENTRYPOINTS,
-    ptir::ENTRYPOINTS,
-    quant::ENTRYPOINTS,
-    rope::ENTRYPOINTS,
-    sample::ENTRYPOINTS,
-    ssm::ENTRYPOINTS,
-];
+// ── WHAT THE SHADER TREE STAMPS ───────────────────────────────────────────
+//
+// Ten `ENTRYPOINTS` tables stood here, 481 `(file, entrypoint)` rows across
+// the families, and every one of them was a name a `.metal` file already
+// spells. `tests/entrypoints.rs`'s header said what that cost:
+//
+//   The shader half of the comparison needed a C preprocessor -- the axis
+//   product lives in `instantiate_*` macros and nothing else writes it down
+//   ... NOTHING COMPARES THEM NOW, IN A TEST OR OUT OF ONE.
+//
+//   What is NOT held is the set itself -- a shader instantiating a name no row
+//   declares, or a row whose axes over-generate one no shader stamps, is green
+//   everywhere.
+//
+// `build.rs` expands the macros, so the two halves are one half. It is not a C
+// preprocessor and does not need to be: the tree uses no `##`, no `#if` and no
+// conditional anything, and nests twice. What it will not do is guess -- a
+// call it cannot read fails the build, because a name silently leaving the set
+// is the state the header above describes.
+//
+// The expansion was checked against the tables it replaces before they went:
+// 481 against 481, with nothing on either side alone.
+mod stamped {
+    include!(concat!(env!("OUT_DIR"), "/entrypoints.rs"));
+}
+
+pub use stamped::STAMPED;
 
 /// Every routine this backend has crossed, with the backend forgotten.
 ///
@@ -230,7 +234,7 @@ pub const ELSEWHERE: &[kernels::routine::Declared] = &[kernels::routine::Declare
 /// Every entrypoint this backend can dispatch, sorted. The set
 /// `scripts/metal-kernel-audit.py` compares against the shader tree.
 ///
-/// Rows plus [`RETIRED`], because those are two different questions now. A
+/// Rows plus [`STAMPED`], because those are two different questions now. A
 /// row's `axes` generate its entrypoints, so this used to be BOTH "what the
 /// table says" and "what the backend can do" — deleting a row separates them
 /// for the first time, and every sweep keyed on this function would silently
@@ -239,10 +243,7 @@ pub const ELSEWHERE: &[kernels::routine::Declared] = &[kernels::routine::Declare
 /// shader still in the tree and still fired by a routine, with nothing
 /// failing.
 pub fn entrypoints() -> Vec<String> {
-    let mut out: Vec<String> = RETIRED
-        .iter()
-        .flat_map(|family| family.iter().map(|(_, name)| (*name).to_owned()))
-        .collect();
+    let mut out: Vec<String> = STAMPED.iter().map(|(_, name)| (*name).to_owned()).collect();
     out.sort();
     out
 }
@@ -287,9 +288,9 @@ pub fn kernel_of(symbol: &str) -> Option<&'static str> {
     static CENSUS: std::sync::OnceLock<std::collections::BTreeSet<&'static str>> =
         std::sync::OnceLock::new();
     let census = CENSUS.get_or_init(|| {
-        RETIRED
+        STAMPED
             .iter()
-            .flat_map(|family| family.iter().map(|(_, name)| *name))
+            .map(|(_, name)| *name)
             .chain(DECLARED_ELSEWHERE.iter().copied())
             .collect()
     });
@@ -314,7 +315,7 @@ pub fn kernel_of(symbol: &str) -> Option<&'static str> {
 /// quiet the moment the last row retired.
 #[must_use]
 pub fn shaders() -> Vec<(&'static str, &'static str)> {
-    let mut out: Vec<(&str, &str)> = RETIRED.iter().flat_map(|f| f.iter().copied()).collect();
+    let mut out: Vec<(&str, &str)> = STAMPED.to_vec();
     out.sort_unstable();
     out
 }
@@ -322,7 +323,7 @@ pub fn shaders() -> Vec<(&'static str, &'static str)> {
 
 /// Points this backend NAMES but does not build, and the whole of that set.
 ///
-/// [`RETIRED`] is the census of what can still be dispatched, and every
+/// [`STAMPED`] is the census of what can still be dispatched, and every
 /// name in it rides a `(file, entrypoint)` pair that `device_kernels.rs`
 /// opens against a real device. These are neither: they resolve so that
 /// `model-ir`'s `check_plan` can check a text, and there is no shader
@@ -342,7 +343,7 @@ pub const DECLARED_ELSEWHERE: &[&str] = &["rms_rope_bfloat16"];
 
 /// The rows that have been retired, by the name their `kernel!` call had.
 ///
-/// [`RETIRED`] answers "what can still be dispatched"; this answers "what
+/// [`STAMPED`] answers "what can still be dispatched"; this answers "what
 /// used to be a row here". The cross-backend parity tests scrape every
 /// backend's sources and compare row for row, so while the crossing is in
 /// flight they need to know which rows are absent on purpose. It empties when
@@ -480,10 +481,7 @@ pub fn retired_rows() -> &'static [&'static str] {
 /// Every entrypoint whose row is gone and whose routine now answers for it.
 #[must_use]
 pub fn retired() -> Vec<&'static str> {
-    RETIRED
-        .iter()
-        .flat_map(|f| f.iter().map(|(_, name)| *name))
-        .collect()
+    STAMPED.iter().map(|(_, name)| *name).collect()
 }
 
 /// Whether `name` appears in `symbol` bounded by underscores on both sides.

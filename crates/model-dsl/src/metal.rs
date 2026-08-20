@@ -1079,7 +1079,13 @@ pub fn sdpa(
     q_width: u32,
     head_dim: u32,
     paged: bool,
-    gqa_factor: u32,
+    // `gqa_factor: u32` STOOD HERE, and every caller computed it as
+    // `q_heads / kv_heads.max(1)` to hand to a body that derives the same
+    // ratio from the two head counts it is already told. A parameter nothing
+    // reads is worse than absent: it is a number two call sites still work
+    // out, and a wrong one would have gone unnoticed because nothing
+    // downstream would ever have disagreed with it. See the params run below,
+    // which records the same removal from the other side.
     kv_heads: u32,
     window: i32,
     sinks: Option<&str>,
@@ -1939,7 +1945,11 @@ pub fn routed_qmm(
     w: &MatW,
     n_experts: u32,
     experts_per_token: u32,
-    in_vec: u32,
+    // `in_vec: u32` STOOD HERE, unread, for the reason the params run below
+    // gives about `k`: the contraction is the operands' own rectangle now and
+    // the marks carry it. `routed_qmv` beside this still TAKES one and still
+    // states it -- the sorted stack's three strides are built from it -- so
+    // the two signatures differing is the point rather than an inconsistency.
     bits: u32,
     tile: (u32, u32),
     staged: bool,

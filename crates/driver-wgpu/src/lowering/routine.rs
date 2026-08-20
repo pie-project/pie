@@ -125,6 +125,17 @@ pub enum Unplanned {
         /// Which table it wanted.
         what: crate::binding::FireTable,
     },
+    /// The body fired a point whose module could not be read.
+    ///
+    /// Only reachable for a point the body names ITSELF -- one that is not the
+    /// plan's symbol, so the shell never reflected it. See
+    /// [`crate::reflect::point`].
+    NoPoint {
+        /// The entrypoint the body named.
+        point: &'static str,
+        /// What `naga` or the tree said.
+        why: String,
+    },
 }
 
 impl std::fmt::Display for Unplanned {
@@ -156,6 +167,9 @@ impl std::fmt::Display for Unplanned {
                  fire does not hold",
                 if *values { "values" } else { "keys" }
             ),
+            Self::NoPoint { point, why } => {
+                write!(f, "the body fired `{point}`, whose module is unreadable: {why}")
+            }
             Self::Absent { at, what } => write!(
                 f,
                 "the body's operand {at} wants the fire's {what:?}, which this \
@@ -182,6 +196,14 @@ pub struct Stated {
     pub module: String,
     /// The entrypoint it named.
     pub entrypoint: String,
+    /// The same name, still borrowed from the body's own symbol table.
+    ///
+    /// [`Self::entrypoint`] is what a test compares and prints; this is what a
+    /// [`Dispatch`] can HOLD. A dispatch's symbol is a `&'a str` borrowed from
+    /// the lowering, and a routine that fires a point the lowering does not
+    /// name -- a split decode's merge pass -- has no such borrow to give. The
+    /// body's tables are `&'static str`, which outlives every `'a` there is.
+    pub point: &'static str,
     /// The lanes it asked for, BEFORE the division into workgroups.
     pub lanes: [u32; 3],
     /// Its buffer operands, as handles its arm minted.
@@ -282,6 +304,7 @@ impl Encode for Planner<'_, '_> {
             // WGSL file holds many entrypoints, so the file IS the module key.
             module: fire.file.to_owned(),
             entrypoint: fire.entrypoint.to_owned(),
+            point: fire.entrypoint,
             lanes: fire.lanes,
             handles,
             scalars,
@@ -426,7 +449,14 @@ pub fn bind<'a, B>(
                 b
             }),
             ArgValue::Usize(v) => (8, v.to_le_bytes()),
-            ArgValue::Buffer(_) => unreachable!("buffers were split out above"),
+            // A SECOND `Buffer(_)` ARM STOOD HERE saying `unreachable!()`, and
+            // it was not merely redundant with the skip at the top -- the two
+            // DISAGREED about what a buffer in this run means. The first arm
+            // wins by position, so the panic could never fire; had the arms
+            // been written the other way round, every routine with a buffer
+            // operand would have aborted here. It dates from before `Shaped`
+            // joined the skip, when the skip named only `Shaped` and this
+            // named `Buffer`. One claim per variant now, and it is the skip.
         };
         while !bytes.len().is_multiple_of(width) {
             bytes.push(0);
@@ -624,7 +654,7 @@ pub fn plan<'a, R: crate::binding::Resolve>(
     // the planner a borrow and gives the `Handles` back after.
     let handles = RefCell::new(handles);
     let stated = stating(routine, &taken_args, &handles, facts)?;
-    let mut handles = handles.into_inner();
+    let handles = handles.into_inner();
 
     // The operands the BODY asked for, resolved in the order it asked. Not
     // the statement's order: `Handles` minted a handle per ask, and this
@@ -694,10 +724,32 @@ pub fn plan<'a, R: crate::binding::Resolve>(
     }
 
     let symbol = lowered.kernels[launch.kernel as usize].as_str();
-    stated
-        .iter()
-        .map(|one| bind(one, &bounds, scalars, declared, symbol, launch))
-        .collect()
+    // EACH DISPATCH AGAINST ITS OWN MODULE. For every routine but one the
+    // point a body fires IS the plan's symbol, and `declared` -- reflected by
+    // the shell, at the shell's tier -- is the right answer with no lookup at
+    // all. A routine that states a second pass names a second entrypoint, and
+    // binding that pass against the first one's block is how a split decode's
+    // extra scalar landed four bytes past the end of a struct it never
+    // shared.
+    let mut out = Vec::with_capacity(stated.len());
+    for one in &stated {
+        let point = if one.point == symbol {
+            None
+        } else {
+            Some(crate::reflect::point(one.point).map_err(|why| Unplanned::NoPoint {
+                point: one.point,
+                why: why.to_string(),
+            })?)
+        };
+        let named = point.as_ref().unwrap_or(declared);
+        // The dispatch is named by what the BODY fired, not by what the plan
+        // was keyed on. They agree everywhere but the second pass, and the
+        // day they do not, the shell builds a pipeline for the point that was
+        // planned rather than for the one whose bindings were checked.
+        let at = if one.point == symbol { symbol } else { one.point };
+        out.push(bind(one, &bounds, scalars, named, at, launch)?);
+    }
+    Ok(out)
 }
 
 /// The routine and the arm for a symbol, if this backend has crossed it AND
@@ -847,6 +899,8 @@ mod tests {
         let stated = Stated {
             module: "m.wgsl".to_owned(),
             entrypoint: "e".to_owned(),
+            // The same name a `Dispatch` can HOLD; see `Stated::point`.
+            point: "e",
             lanes: [1, 1, 1],
             handles: Vec::new(),
             scalars: vec![ArgValue::I32(1), ArgValue::Usize(2)],
@@ -875,6 +929,8 @@ mod tests {
         let stated = Stated {
             module: "m.wgsl".to_owned(),
             entrypoint: "e".to_owned(),
+            // The same name a `Dispatch` can HOLD; see `Stated::point`.
+            point: "e",
             lanes: [1, 1, 1],
             handles: vec![0, 4],
             scalars: Vec::new(),
@@ -1139,6 +1195,8 @@ mod tests {
         let stated = Stated {
             module: "m".to_owned(),
             entrypoint: "e".to_owned(),
+            // The same name a `Dispatch` can HOLD; see `Stated::point`.
+            point: "e",
             lanes: [1, 1, 1],
             handles: vec![0, 1],
             scalars: Vec::new(),
@@ -1239,6 +1297,8 @@ mod tests {
         let stated = Stated {
             module: "m.wgsl".to_owned(),
             entrypoint: "e".to_owned(),
+            // The same name a `Dispatch` can HOLD; see `Stated::point`.
+            point: "e",
             lanes: [1, 1, 1],
             handles: Vec::new(),
             scalars: vec![ArgValue::Usize(1), ArgValue::Usize(2)],

@@ -407,10 +407,9 @@ impl Drop for CudaDriver {
     }
 }
 
-pub(crate) fn sync_status(status: i32, op: &str) -> Result<()> {
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(anyhow!("{op} failed with status {status}"))
-    }
-}
+// `sync_status` STOOD HERE: it turned a nonzero `i32` into
+// "{op} failed with status {status}". Nothing in the crate called it. The FFI
+// this wrapped stopped returning bare status codes to this layer, so the one
+// thing it did -- name the operation beside the number -- is now done where
+// the call is made, with the operation in scope rather than passed in as a
+// string.

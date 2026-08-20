@@ -266,6 +266,13 @@ pub fn cuda_facts(
 /// as `_bm_16 | _bm_32 | _bm_64` and all hand-list a `bm_32` build, so 32
 /// resolves in every tree; the CUDA backend does not read this field. A
 /// backend wanting its own tile has `qmm_tile` on [`MetalBinding`].
+///
+/// `driver-wgpu` now DOES, and the escape hatch above is how: it states
+/// `(32, 64)` at its engine seam. The reason is the one this doc gives for
+/// 32 -- there is no cooperative-matrix build on that backend, so the
+/// argument for the shared value does not reach it -- and the number is a
+/// 1.36x pp512 measured on an M4 Pro. It is a WIDER tile and not a
+/// narrower one, so it does not move `TokensMultipleOf`, which is `bm`'s.
 pub const QMM_TILE: (u32, u32) = (32, 32);
 
 /// Whether this build's dense GEMM stages its activation to `half`.
@@ -644,7 +651,12 @@ pub fn metal_facts(
         // has nowhere to put a bit width.
         moe_bits: 4,
         // ── what this BUILD stamped ──
-        qmm_tile: QMM_TILE,
+        // [`QMM_TILE`] unless this BUILD measured its own. See the
+        // constant: the shared value was chosen against a
+        // cooperative-matrix build, which is not every backend's situation,
+        // and the escape hatch its doc names is this field.
+        qmm_tile: bind.qmm_tile.unwrap_or(QMM_TILE),
+        qmm_partial_rows: bind.qmm_partial_rows,
         qmm_fp16_precast: qmm_fp16_precast(bind.quant_group, bind.quant_bits),
         // False at the codec that would allow it. See the fact: this family's
         // routed checkpoint reordered a next-layer top-k under half rounding
@@ -1113,6 +1125,8 @@ mod tests {
     /// is for: the g64/b4 publication and the g128/b8 one.
     fn binding(group: u32, bits: u32) -> MetalBinding {
         MetalBinding {
+            qmm_partial_rows: false,
+            qmm_tile: None,
             quant_group: group,
             quant_bits: bits,
             router_quant_group: 0,
@@ -1372,6 +1386,37 @@ mod tests {
         assert_ne!(m.qmm_tile, (0, 0), "a stem does not resolve");
     }
 
+    /// The partial-row tolerance is the BUILD's stamp too, and both arms
+    /// reach the facts.
+    ///
+    /// This is the statement a fixture pair would have made, and it is here
+    /// rather than there for the same reason `qmm_tile` above is: the answer
+    /// is a fact about which kernels were compiled, so it does not vary by
+    /// model family and three family fixtures would state it identically.
+    /// `facts::tests::every_metal_predicate_is_stated_more_than_one_way_or_
+    /// excused` excuses it by name and points here.
+    ///
+    /// FALSE is the default and the one that matters: a build that says
+    /// nothing gets the contract `qmm_t` is written to, where the caller
+    /// allocates a whole number of `BM` rows. Only `driver-wgpu` says true,
+    /// and only because its `write_out` returns on `row >= params.m`.
+    #[test]
+    fn the_partial_row_tolerance_is_the_builds_stamp_and_not_the_familys() {
+        let mut bind = binding(64, 4);
+        assert!(
+            !bind.qmm_partial_rows,
+            "a binding that says nothing does not tolerate a partial tile"
+        );
+        let off = metal_facts(qwen3_row(), Deployed::metal(&bind), &bind);
+        assert!(!off.qmm_partial_rows);
+        bind.qmm_partial_rows = true;
+        let on = metal_facts(qwen3_row(), Deployed::metal(&bind), &bind);
+        assert!(
+            on.qmm_partial_rows,
+            "the binding's answer reaches the facts, or the guard cannot read it"
+        );
+    }
+
     /// The expert bank states its own format only when the load left it
     /// in MXFP4.
     ///
@@ -1384,6 +1429,8 @@ mod tests {
     fn the_expert_bank_names_its_own_format_only_when_the_load_left_one() {
         let plain = binding(64, 4);
         let mixed = MetalBinding {
+            qmm_partial_rows: false,
+            qmm_tile: None,
             moe_mxfp4: true,
             ..binding(64, 4)
         };
@@ -1604,7 +1651,10 @@ mod fp16_precast_tests {
         // The 8-bit affine snapshots `mlx-community` publishes of these same
         // rows. `instantiate_qmm_t_fp16_precast` takes a tile and nothing
         // else, so there is no `_b_8` precast symbol to name.
-        assert!(!super::qmm_fp16_precast(64, 8), "no 8-bit precast is stamped");
+        assert!(
+            !super::qmm_fp16_precast(64, 8),
+            "no 8-bit precast is stamped"
+        );
         // g128/b4 and g32/b4 pack to the same extents as g64 and would
         // resolve to a symbol that reads every scale from the wrong offset.
         assert!(!super::qmm_fp16_precast(128, 4));

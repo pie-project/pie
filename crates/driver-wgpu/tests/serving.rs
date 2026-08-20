@@ -2500,9 +2500,38 @@ fn a_rows_answer_does_not_depend_on_the_tokens_after_it() {
 /// difference in a comparison that exists to isolate one.
 #[test]
 fn the_tiled_gemm_answers_the_way_the_vector_kernel_does() {
+    the_two_families_agree(prompt());
+}
+
+/// The same comparison at a row count the tile does NOT divide.
+///
+/// This is the whole correctness claim behind bounding `write_out` by
+/// `params.m`. `qmm_grid` rounds the row axis up with `div_ceil`, so a fire
+/// of 495 rows launches 512 rows' worth of tiles and the last seventeen are
+/// arithmetic on whatever lies past the activation. Before the bound those
+/// rows were STORED, over the next value in the arena, and `Serving::prefill`
+/// records what that cost: an unrelated answer and a twelvefold slowdown.
+///
+/// A logit row is the right probe because it is downstream of every
+/// projection in the model -- if any one of them wrote past its rows, the
+/// value it landed on is read by a later layer and the readout moves.
+///
+/// 495 and not 496: it is odd, it is not a multiple of 16, 32 or 64, and so
+/// it exercises the overhang at every tile this backend can pick rather than
+/// only the one it picks today.
+#[test]
+fn the_tiled_gemm_answers_the_way_the_vector_kernel_does_at_a_partial_tile() {
+    let mut p = prompt();
+    while p.len() < 495 {
+        p.extend_from_slice(&PERIOD);
+    }
+    p.truncate(495);
+    the_two_families_agree(p);
+}
+
+fn the_two_families_agree(prompt: Vec<u32>) {
     let Some(_held) = gpu() else { return };
     let Some(real) = weights() else { return };
-    let prompt = prompt();
 
     let answer = |vector: bool| -> Vec<f32> {
         let mut shell = shelled_with(real, 24, vector);
@@ -3675,7 +3704,10 @@ fn what_a_prefill_costs_at_length() {
             }
         }
     }
-    println!("\n  a prefill, fastest of {} interleaved rounds:", ROUNDS - 1);
+    println!(
+        "\n  a prefill, fastest of {} interleaved rounds:",
+        ROUNDS - 1
+    );
     for (i, &r) in rows.iter().enumerate() {
         println!(
             "    {r:4} rows {:8.1} ms  {:6.0} tok/s  {:7.3} ms a row",
@@ -3994,6 +4026,26 @@ fn where_a_prefills_time_goes_across_its_plan() {
 /// suspect on a backend with no such instruction; it was wrong that the
 /// suspicion would pay.
 ///
+/// # THAT CONCLUSION IS NOW WRONG, and the premise is why
+///
+/// `engine::driver::backend::wgpu` sets `qmm_tile: Some((32, 64))`, which is
+/// exactly the "own tile" this test said the backend did not need. Nothing
+/// above was mismeasured -- 32x64 really did read 0.94x -- but the number it
+/// measured was a property of the KERNEL, not of the tile.
+///
+/// `quant/qmm_t.wgsl` had one fast inner loop, guarded on a lane holding
+/// exactly two accumulators, and a per-accumulator sweep for everything else.
+/// Every tile with `BM * BN4 == 256` took the fast loop and every other tile
+/// took the slow one, so the sweep above was comparing (32, 32) on the good
+/// path against (32, 64) on the bad one and reading the difference as the
+/// tile's. Unrolling the loop at 1, 2, 4 and 8 accumulators moved 32x64 from
+/// 0.99 to 2.54 TFLOP/s isolated and took an M4 Pro's pp512 from 905.6 to
+/// 1235.8 tok/s end to end.
+///
+/// So this test is worth RE-RUNNING rather than believing, and its real
+/// lesson is the one it did not draw: a tile sweep over a kernel with a
+/// shape-conditional fast path measures the condition, not the shape.
+///
 /// Run with `--ignored --nocapture --release`.
 #[test]
 #[ignore = "measurement"]
@@ -4183,10 +4235,7 @@ fn which_kernels_a_prefill_spends_its_gpu_time_in() {
         *per_symbol_count.entry(nm.as_str()).or_default() += 1;
     }
 
-    let mut rows: Vec<(usize, &str)> = per_symbol_count
-        .iter()
-        .map(|(nm, c)| (*c, *nm))
-        .collect();
+    let mut rows: Vec<(usize, &str)> = per_symbol_count.iter().map(|(nm, c)| (*c, *nm)).collect();
     rows.sort_by_key(|r| std::cmp::Reverse(r.0));
     println!("\n  every rectangle a 512-row prefill fires, by symbol:");
     for (count, nm) in &rows {

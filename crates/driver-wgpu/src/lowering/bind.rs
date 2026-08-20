@@ -310,6 +310,7 @@ fn table_of(key: &str) -> Option<FireTable> {
         _ if key == keys::RopeFrequencies::KEY => FireTable::RopeFrequencies,
         _ if key == keys::SamplingIndices::KEY => FireTable::SamplingIndices,
         _ if key == keys::RecurrentSlots::KEY => FireTable::RecurrentSlots,
+        _ if key == keys::AttnScratch::KEY => FireTable::AttnScratch,
         _ => return None,
     })
 }

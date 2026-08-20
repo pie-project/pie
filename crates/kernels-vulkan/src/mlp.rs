@@ -4,9 +4,11 @@
 //! name: it bakes gpt-oss's asymmetric clamp, its `alpha` and its `(up + 1)`
 //! term, and its own first line says so.
 
-use kernels_macros::routine;
-use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, Out, Tensor, bf16, elementwise, elementwise_rows, keys};
+use crate::routine::{
+    Asks, Bind, Const, Ctx, Fire, In, Out, Tensor, bf16, elementwise, elementwise_rows, keys,
+};
 use kernels::routine::Refusal;
+use kernels_macros::routine;
 
 /// gemma's gated activation: `gelu_tanh(gate) * up`, the tanh approximation
 /// and not the erf one.
@@ -41,11 +43,16 @@ pub fn geglu_tanh(
     ctx: &Ctx<'_>,
     gate: In<Tensor<bf16>>,
     up: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    out: Out<Tensor<bf16>>,
+) -> Result<(), Refusal> {
     let width = gate.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("geglu_tanh_bfloat16", ctx.best()), "geglu_tanh_bfloat16").apply(elementwise(width, rows)?),
+        Fire::at(
+            crate::routine::module_path("geglu_tanh_bfloat16", ctx.best()),
+            "geglu_tanh_bfloat16",
+        )
+        .apply(elementwise(width, rows)?),
         &[gate.arg(), up.arg(), out.arg()],
     )
 }
@@ -81,11 +88,16 @@ pub fn geglu_tanh_strided(
     stated_rows: Const<u32>,
     gate_pitch: Const<u32>,
     up_pitch: Const<u32>,
-    out_pitch: Const<u32>) -> Result<(), Refusal> {
+    out_pitch: Const<u32>,
+) -> Result<(), Refusal> {
     let width = gate.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("geglu_tanh_strided_bfloat16", ctx.best()), "geglu_tanh_strided_bfloat16").apply(elementwise(width, rows)?),
+        Fire::at(
+            crate::routine::module_path("geglu_tanh_strided_bfloat16", ctx.best()),
+            "geglu_tanh_strided_bfloat16",
+        )
+        .apply(elementwise(width, rows)?),
         &[
             gate.arg(),
             up.arg(),
@@ -125,11 +137,16 @@ pub fn gptoss_swiglu(
     out: Out<Tensor<bf16>>,
     _stated_elements: Const<u32>,
     limit: Const<f32>,
-    alpha: Const<f32>) -> Result<(), Refusal> {
+    alpha: Const<f32>,
+) -> Result<(), Refusal> {
     let width = gate.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("gptoss_swiglu_bfloat16", ctx.best()), "gptoss_swiglu_bfloat16").apply(elementwise(width, rows)?),
+        Fire::at(
+            crate::routine::module_path("gptoss_swiglu_bfloat16", ctx.best()),
+            "gptoss_swiglu_bfloat16",
+        )
+        .apply(elementwise(width, rows)?),
         &[gate.arg(), up.arg(), out.arg(), limit.arg(), alpha.arg()],
     )
 }
@@ -154,11 +171,16 @@ pub fn silu_mul(
     ctx: &Ctx<'_>,
     gate: In<Tensor<bf16>>,
     up: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    out: Out<Tensor<bf16>>,
+) -> Result<(), Refusal> {
     let width = gate.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("silu_mul_bfloat16", ctx.best()), "silu_mul_bfloat16").apply(elementwise(width, rows)?),
+        Fire::at(
+            crate::routine::module_path("silu_mul_bfloat16", ctx.best()),
+            "silu_mul_bfloat16",
+        )
+        .apply(elementwise(width, rows)?),
         &[gate.arg(), up.arg(), out.arg()],
     )
 }
@@ -185,7 +207,8 @@ pub fn silu_mul_strided(
     ctx: &Ctx<'_>,
     gate: In<Tensor<bf16>>,
     up: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    out: Out<Tensor<bf16>>,
+) -> Result<(), Refusal> {
     // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<1>` named.
     // This body forwards `ctx.params()` as a STRUCT, so the run is the
     // shader's layout and no `Const` mark can name a word inside it; the
@@ -194,7 +217,11 @@ pub fn silu_mul_strided(
     let width = gate.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("silu_mul_strided_bfloat16", ctx.best()), "silu_mul_strided_bfloat16").apply(elementwise_rows(width, rows)?),
+        Fire::at(
+            crate::routine::module_path("silu_mul_strided_bfloat16", ctx.best()),
+            "silu_mul_strided_bfloat16",
+        )
+        .apply(elementwise_rows(width, rows)?),
         &[gate.arg(), up.arg(), out.arg(), row_pitch.arg()],
     )
 }
@@ -247,11 +274,7 @@ mod tests {
         // Anything else is refused: a probe that invented an answer to a
         // fact it does not know would let a body pass under test while the
         // same fact went unanswered on a real driver.
-        fn resolve(
-            &self,
-            ty: kernels::Ty,
-            source: kernels::Source,
-        ) -> Result<ArgValue, Refusal> {
+        fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
             // The statement's own scalars, read by index where the params run
             // is the shader's struct -- see `Asks::param`.
             if let kernels::Source::Slot(kernels::Kind::Param, n) = source {
@@ -266,9 +289,16 @@ mod tests {
                 return Ok(ArgValue::I32(self.row_pitch.get()));
             }
             if matches!(ty, kernels::Ty::Buf) {
-                return Ok(ArgValue::Buffer { handle: 900, writes: false, rows: 0, width: 0 });
+                return Ok(ArgValue::Buffer {
+                    handle: 900,
+                    writes: false,
+                    rows: 0,
+                    width: 0,
+                });
             }
-            Err(Refusal::Unstated { what: "a fact this probe does not answer" })
+            Err(Refusal::Unstated {
+                what: "a fact this probe does not answer",
+            })
         }
 
         fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
@@ -300,16 +330,40 @@ mod tests {
         // treats "3 rows" as meaning; `width: 64` rides each mark directly.
         geglu_tanh(
             &seen,
-            In { ptr: Tensor::<bf16>::new(0), rows: 3, width: 64 },
-            In { ptr: Tensor::<bf16>::new(1), rows: 3, width: 64 },
-            Out { ptr: Tensor::<bf16>::new(2), rows: 3, width: 64 },
+            In {
+                ptr: Tensor::<bf16>::new(0),
+                rows: 3,
+                width: 64,
+            },
+            In {
+                ptr: Tensor::<bf16>::new(1),
+                rows: 3,
+                width: 64,
+            },
+            Out {
+                ptr: Tensor::<bf16>::new(2),
+                rows: 3,
+                width: 64,
+            },
         )
         .expect("64 wide by 3 rows is a launch");
         geglu_tanh_strided(
             &seen,
-            In { ptr: Tensor::<bf16>::new(0), rows: 3, width: 64 },
-            In { ptr: Tensor::<bf16>::new(1), rows: 3, width: 64 },
-            Out { ptr: Tensor::<bf16>::new(2), rows: 3, width: 64 },
+            In {
+                ptr: Tensor::<bf16>::new(0),
+                rows: 3,
+                width: 64,
+            },
+            In {
+                ptr: Tensor::<bf16>::new(1),
+                rows: 3,
+                width: 64,
+            },
+            Out {
+                ptr: Tensor::<bf16>::new(2),
+                rows: 3,
+                width: 64,
+            },
             // The five that were `GegluStridedParams`. The `up` pitch is wider
             // than the width on purpose: gemma's PLE reads a narrow gate out of
             // a wide table, which is why this form exists at all.
@@ -322,9 +376,21 @@ mod tests {
         .expect("a pitch does not make it two-dimensional");
         gptoss_swiglu(
             &seen,
-            In { ptr: Tensor::<bf16>::new(0), rows: 3, width: 64 },
-            In { ptr: Tensor::<bf16>::new(1), rows: 3, width: 64 },
-            Out { ptr: Tensor::<bf16>::new(2), rows: 3, width: 64 },
+            In {
+                ptr: Tensor::<bf16>::new(0),
+                rows: 3,
+                width: 64,
+            },
+            In {
+                ptr: Tensor::<bf16>::new(1),
+                rows: 3,
+                width: 64,
+            },
+            Out {
+                ptr: Tensor::<bf16>::new(2),
+                rows: 3,
+                width: 64,
+            },
             // Word 0 is the dead element count `GptOssSwiGluParams` opened
             // with; the mark holds its slot so `limit` lands on word 1, and it
             // is deliberately not passed.
@@ -335,9 +401,21 @@ mod tests {
         .expect("64 wide by 3 rows is a launch");
         silu_mul(
             &seen,
-            In { ptr: Tensor::<bf16>::new(0), rows: 3, width: 64 },
-            In { ptr: Tensor::<bf16>::new(1), rows: 3, width: 64 },
-            Out { ptr: Tensor::<bf16>::new(2), rows: 3, width: 64 },
+            In {
+                ptr: Tensor::<bf16>::new(0),
+                rows: 3,
+                width: 64,
+            },
+            In {
+                ptr: Tensor::<bf16>::new(1),
+                rows: 3,
+                width: 64,
+            },
+            Out {
+                ptr: Tensor::<bf16>::new(2),
+                rows: 3,
+                width: 64,
+            },
         )
         .expect("64 wide by 3 rows is a launch");
 
@@ -401,9 +479,21 @@ mod tests {
             matches!(
                 silu_mul(
                     &seen,
-                    In { ptr: Tensor::<bf16>::new(0), rows: 0, width: 64 },
-                    In { ptr: Tensor::<bf16>::new(1), rows: 0, width: 64 },
-                    Out { ptr: Tensor::<bf16>::new(2), rows: 0, width: 64 },
+                    In {
+                        ptr: Tensor::<bf16>::new(0),
+                        rows: 0,
+                        width: 64
+                    },
+                    In {
+                        ptr: Tensor::<bf16>::new(1),
+                        rows: 0,
+                        width: 64
+                    },
+                    Out {
+                        ptr: Tensor::<bf16>::new(2),
+                        rows: 0,
+                        width: 64
+                    },
                 ),
                 Err(Refusal::Empty { what: "rows" })
             ),
@@ -417,9 +507,21 @@ mod tests {
             matches!(
                 silu_mul(
                     &seen,
-                    In { ptr: Tensor::<bf16>::new(0), rows: 3, width: 0 },
-                    In { ptr: Tensor::<bf16>::new(1), rows: 3, width: 0 },
-                    Out { ptr: Tensor::<bf16>::new(2), rows: 3, width: 0 },
+                    In {
+                        ptr: Tensor::<bf16>::new(0),
+                        rows: 3,
+                        width: 0
+                    },
+                    In {
+                        ptr: Tensor::<bf16>::new(1),
+                        rows: 3,
+                        width: 0
+                    },
+                    Out {
+                        ptr: Tensor::<bf16>::new(2),
+                        rows: 3,
+                        width: 0
+                    },
                 ),
                 Err(Refusal::Empty { what: "width" })
             ),
@@ -445,9 +547,21 @@ mod tests {
         seen.rows.set(1 << 13);
         let e = silu_mul(
             &seen,
-            In { ptr: Tensor::<bf16>::new(0), rows: 1 << 13, width: 1 << 20 },
-            In { ptr: Tensor::<bf16>::new(1), rows: 1 << 13, width: 1 << 20 },
-            Out { ptr: Tensor::<bf16>::new(2), rows: 1 << 13, width: 1 << 20 },
+            In {
+                ptr: Tensor::<bf16>::new(0),
+                rows: 1 << 13,
+                width: 1 << 20,
+            },
+            In {
+                ptr: Tensor::<bf16>::new(1),
+                rows: 1 << 13,
+                width: 1 << 20,
+            },
+            Out {
+                ptr: Tensor::<bf16>::new(2),
+                rows: 1 << 13,
+                width: 1 << 20,
+            },
         );
         assert!(
             matches!(

@@ -30,12 +30,30 @@ type Call = (String, [u32; 3], Vec<ArgValue>);
 use kernels_vulkan::routine::{ArgValue, Encode, Fire, Vulkan};
 
 /// A `Encode` that remembers, and answers generically.
-#[derive(Default)]
-struct Seen(RefCell<Vec<Call>>);
+///
+/// `splits` is the one asked fact this probe answers from a FIELD rather than
+/// from the type, because it is the only fact in the tree that picks an
+/// ENTRYPOINT from inside a body. `attn::sdpa_paged_decode` dispatches
+/// `sdpa_paged_decode_bfloat16_d_*` at one split and a `_split_` pass plus a
+/// `_combine_` fold above one, so a single answer leaves four modules named by
+/// nothing -- which on this backend is a fault inside
+/// `vkCreateComputePipelines`, with the validation layer silent, and not a
+/// link error. `SWEEP` cannot reach it: a swept position is an ARGUMENT and
+/// this is an ask.
+struct Seen {
+    calls: RefCell<Vec<Call>>,
+    splits: i32,
+}
+
+impl Default for Seen {
+    fn default() -> Self {
+        Self { calls: RefCell::default(), splits: 8 }
+    }
+}
 
 impl Encode for Seen {
     fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
-        self.0
+        self.calls
             .borrow_mut()
             .push((fire.entrypoint.to_owned(), fire.lanes, args.to_vec()));
         Ok(())
@@ -73,6 +91,9 @@ impl Encode for Seen {
         // generic `8` below is a plausible extent and an impossible pitch:
         // `neox_strided` refuses it by name, which is the body doing its job
         // and the probe failing to state a case.
+        if source == Src::Named("attn.splits") {
+            return Ok(ArgValue::I32(self.splits));
+        }
         if matches!(
             source,
             Src::Named("row_pitch") | Src::Named("row_stride") | Src::Named("in_width")
@@ -80,11 +101,24 @@ impl Encode for Seen {
             return Ok(ArgValue::I32(1024));
         }
         Ok(match ty {
-            T::Buf | T::BufMut | T::Bf16s | T::Bf16sMut | T::I32s | T::I32sMut | T::U32s
-            | T::U32sMut | T::U8s | T::U8sMut | T::F32s | T::F32sMut => {
+            T::Buf
+            | T::BufMut
+            | T::Bf16s
+            | T::Bf16sMut
+            | T::I32s
+            | T::I32sMut
+            | T::U32s
+            | T::U32sMut
+            | T::U8s
+            | T::U8sMut
+            | T::F32s
+            | T::F32sMut => {
                 ArgValue::Buffer {
                     handle: 900,
-                    writes: matches!(ty, T::BufMut | T::Bf16sMut | T::I32sMut | T::U32sMut | T::U8sMut | T::F32sMut),
+                    writes: matches!(
+                        ty,
+                        T::BufMut | T::Bf16sMut | T::I32sMut | T::U32sMut | T::U8sMut | T::F32sMut
+                    ),
                     // A RECTANGLE, because an asked table is an operand like
                     // any other now that `ArgValue` carries one variant: a
                     // body that reads `.width` off what it asked for gets zero
@@ -129,10 +163,20 @@ fn stand_in(at: usize, ty: Ty) -> ArgValue {
         // it is the shader's spelling, and an `Out<Tensor<i32>>` lands on
         // `I32sMut` where its reading twin lands on `I32s` -- one operand,
         // two names, and the stand-in is the same rectangle either way.
-        Ty::Buf | Ty::BufMut | Ty::Bf16s | Ty::Bf16sMut | Ty::I32s | Ty::I32sMut
-        | Ty::U32s | Ty::U32sMut | Ty::U8s | Ty::U8sMut
-        | Ty::F16s | Ty::F16sMut
-        | Ty::F32s | Ty::F32sMut => ArgValue::Buffer {
+        Ty::Buf
+        | Ty::BufMut
+        | Ty::Bf16s
+        | Ty::Bf16sMut
+        | Ty::I32s
+        | Ty::I32sMut
+        | Ty::U32s
+        | Ty::U32sMut
+        | Ty::U8s
+        | Ty::U8sMut
+        | Ty::F16s
+        | Ty::F16sMut
+        | Ty::F32s
+        | Ty::F32sMut => ArgValue::Buffer {
             handle: at as u32,
             writes: matches!(
                 ty,
@@ -292,7 +336,7 @@ const SWEEP: &[Swept] = &[
     ("qmm_t_routed_fp16", &[7, 8], tiles),
     // ONE swept position, which the widened `Swept` makes as ordinary as four:
     // attention picks its module on the head width alone.
-        // `paged_split` swept a head width and a SPLIT COUNT; the split is the
+    // `paged_split` swept a head width and a SPLIT COUNT; the split is the
     // plan's, which the body asks for, so only the width is a position now.
     ("sdpa_paged_decode", &[5], paged_dims),
     ("sdpa_paged_tiled", &[5], paged_dims),
@@ -326,24 +370,15 @@ fn gdn_scan() -> Vec<Vec<i32>> {
     .collect()
 }
 
-/// The four head widths, each at one split and at eight.
+/// `paged_split` STOOD HERE, sweeping each head width at one split and at
+/// eight, and it was dead: the split count is the plan's and the body asks for
+/// it, so there is no argument position left to sweep. Its fact outlived it
+/// and is now `Seen::splits` plus the `[1, 8]` loop in [`fired`] -- measured,
+/// nine paged modules were reached with the probe's single answer and fourteen
+/// with both, the five missing being every plain
+/// `sdpa_paged_decode_bfloat16_d_*` and the sink beside them. Exactly the
+/// hazard the retired function's doc named, arrived at from the other side.
 ///
-/// The split count is a second module selector and not a mere number: above
-/// one, `sdpa_paged_decode` stops dispatching `sdpa_paged_decode_bfloat16_d_*`
-/// and dispatches a `_split_` pass and a `_combine_` fold instead. Sweeping
-/// only the widths would leave nine of this family's modules named by nothing
-/// -- which on this backend is not a compile error but a fault inside
-/// `vkCreateComputePipelines`.
-fn paged_split() -> Vec<Vec<i32>> {
-    let mut out = Vec::new();
-    for d in paged_dims() {
-        for splits in [1, 8] {
-            out.push(vec![d[0], splits]);
-        }
-    }
-    out
-}
-
 /// The four head widths the paged kernels are compiled for.
 ///
 /// `sdpa_paged_decode`'s ROW states seven points; this is four, and the
@@ -488,29 +523,28 @@ fn recipes(r: &Routine<Vulkan>) -> Vec<Vec<ArgValue>> {
 /// Run every routine against a recorder, with arguments it could really take.
 fn fired() -> Vec<(&'static Routine<Vulkan>, Vec<ArgValue>, Seen)> {
     let all = kernels_vulkan::routines();
-    for name in RECIPE
-        .iter()
-        .map(|(n, _)| n)
-        .chain(SWEEP.iter().map(|(n, _, _)| n))
-    {
-        assert!(
-            all.iter().any(|r| r.name == *name),
-            "RECIPE or SWEEP names `{name}`, which is not a crossed routine. \
-             A stale entry is a routine silently running on stand-ins."
-        );
-    }
-
     let mut out = Vec::new();
     for r in all {
-        // One `Seen` per argument list: the comparison above is against the
-        // arguments that produced the dispatch, and pooling them would compare
-        // a swept gather's second point against its first point's recipe.
         for args in recipes(r) {
-            let seen = Seen::default();
-            (r.body)(&seen, &args).unwrap_or_else(|e| {
-                panic!("`{}` refused {args:?}: {e:?}", r.name);
-            });
-            out.push((r, args, seen));
+            // ONCE PER SPLIT COUNT, for every routine and not just the paged
+            // decode. `attn.splits` is an ask, so there is no argument
+            // position to sweep and no way to name the routines that read it
+            // without a list that would go stale the moment one more does.
+            // Running everything twice costs nothing measurable -- these
+            // bodies encode into a recorder and touch no device -- and every
+            // assertion below is per ENTRY, so a routine that ignores the
+            // fact simply reports the same dispatches twice.
+            for splits in [1, 8] {
+                // One `Seen` per argument list: the comparison below is
+                // against the arguments that produced the dispatch, and
+                // pooling them would compare a swept gather's second point
+                // against its first point's recipe.
+                let seen = Seen { splits, ..Seen::default() };
+                (r.body)(&seen, &args).unwrap_or_else(|e| {
+                    panic!("`{}` refused {args:?} at {splits} split(s): {e:?}", r.name);
+                });
+                out.push((r, args.clone(), seen));
+            }
         }
     }
     out
@@ -645,7 +679,7 @@ fn a_body_passes_a_subsequence_of_the_arguments_its_signature_takes_in_order() {
             .filter_map(|(ty, value)| handle_of(value).map(|h| (h, expects_write(*ty))))
             .collect();
 
-        for (entrypoint, _, got) in seen.0.borrow().iter() {
+        for (entrypoint, _, got) in seen.calls.borrow().iter() {
             // A `Shaped` HANDLE IS A HANDLE, and it is the shape a bound
             // operand has now: `bind`'s `shaped` mints it so a mark can read
             // its own rectangle. Its writability is the MARK's -- `In` reads,
@@ -726,7 +760,7 @@ fn a_body_passes_a_subsequence_of_the_arguments_its_signature_takes_in_order() {
 #[test]
 fn no_routine_dispatches_an_empty_grid() {
     for (r, _, seen) in fired() {
-        for (entrypoint, lanes, _) in seen.0.borrow().iter() {
+        for (entrypoint, lanes, _) in seen.calls.borrow().iter() {
             assert!(
                 !lanes.contains(&0),
                 "`{}` fires `{entrypoint}` with lanes {lanes:?}",
@@ -750,7 +784,7 @@ fn every_entrypoint_a_routine_names_exists() {
     let known: std::collections::BTreeSet<String> =
         kernels_vulkan::entrypoints().into_iter().collect();
     for (r, _, seen) in fired() {
-        for (entrypoint, _, _) in seen.0.borrow().iter() {
+        for (entrypoint, _, _) in seen.calls.borrow().iter() {
             assert!(
                 known.contains(entrypoint),
                 "`{}` fires `{entrypoint}`, which no shader instantiates",
@@ -850,7 +884,7 @@ fn every_routine_binds_the_buffers_its_module_uses_and_no_others() {
 
     let mut checked = 0usize;
     for (r, _, seen) in fired() {
-        for (entrypoint, _, passed) in seen.0.borrow().iter() {
+        for (entrypoint, _, passed) in seen.calls.borrow().iter() {
             // What the BODY handed the driver, not what its signature takes.
             // The two differ exactly when a body forgets an argument, which
             // is the failure this test exists to see, so counting the

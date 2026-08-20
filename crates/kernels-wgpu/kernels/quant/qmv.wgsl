@@ -63,9 +63,23 @@ struct Params {
 
 // Activation rows one workgroup carries, and the whole point of the shape.
 //
-// A workgroup owns eight OUTPUT columns and reads their weights over the whole
-// of K -- eight rows of the packed matrix, which for a 2048-wide int4 head is
-// 8 KiB. One activation row per workgroup meant the lm head read that 8 KiB
+// A workgroup owns FOUR output columns and reads their weights over the whole
+// of K -- four rows of the packed matrix, which for a 2048-wide int4 head is
+// 4 KiB.
+
+// It owned EIGHT, as two y-slots of four, until the workgroup was narrowed to
+// `@workgroup_size(32, 1, 1)`. The launchers state y in INVOCATIONS and the
+// driver divides by the module's own width, so dropping the y extent doubled
+// the workgroup count at the same total work without touching a launcher.
+// Measured per dispatch, decode shapes: q/o 2048x2048 0.025 -> 0.021 ms
+// (147 -> 179 GB/s), gate/up 8192x2048 0.063 -> 0.061, down 2048x8192
+// 0.047 -> 0.044, lm head 128256x2048 0.793 -> 0.783. End to end tg128
+// 104.7 -> 107.6 tok/s and tg256@2048 73.8 -> 75.5, prefill unchanged.
+// A decode's k/v plane is 512 rows, which was 64 workgroups on a 20-core
+// GPU -- three per core, with no second wave to hide a memory stall behind.
+// This is the opposite lever to widening x to 64 lanes, which was tried and
+// measured worse at every shape; the parallelism this kernel wants is MORE
+// workgroups, not wider ones. One activation row per workgroup meant the lm head read that 8 KiB
 // once per token: a 512-token prefill pulled the whole 64 MiB head 512 times,
 // 67 GiB, and the measured 617 ms of a 1981 ms prefill is exactly that traffic
 // at this device's bandwidth. Four rows to a workgroup retire four times the
@@ -81,11 +95,11 @@ struct Params {
 // the arithmetic is dead there and the allocation is not. `quant::qmv_fast`
 // row, which is also exactly when `Rule::Qmv`'s quartered x extent differs
 // from the row count.
-const PIE_MT = 4u;
+const PIE_MT = 2u;
 
-// 8 output columns (two y-slots of four) x `PIE_MT` activation rows x the 32
-// local-x lanes each column is split over.
-var<workgroup> qmv_partials: array<f32, 8u * PIE_MT * 32u>;
+// 4 output columns x `PIE_MT` activation rows x the 32 local-x lanes each
+// column is split over.
+var<workgroup> qmv_partials: array<f32, 4u * PIE_MT * 32u>;
 
 // The `i`-th bf16 of a word already loaded. Not `pie_load_bf16`: that one takes
 // a `ptr<storage, ...>`, which naga 30 parses and then refuses to validate
@@ -156,8 +170,21 @@ fn x_word(vec_: u32, k: u32) -> u32 {
     return x[i >> 1u];
 }
 
-// Values one lane pulls per pass: two words' worth, so 16 at four bits and 8 at
-// eight. The GLSL passed this as a runtime argument and then wrote the inner
+// Values one lane pulls per pass: FOUR words' worth, so 32 at four bits and 16
+// at eight.
+//
+// It was two words'. Four halves the trip count of the K loop and doubles the
+// weight loads in flight per lane, which is what a serial-dispatch GPU has to
+// hide a memory stall behind. Measured per dispatch: lm head 128256x2048
+// 0.783 -> 0.741 ms (188 -> 199 GB/s), gate/up 8192x2048 0.061 -> 0.058,
+// down 2048x8192 0.044 -> 0.042; tg128 107.6 -> 110.2 tok/s. Prefill is
+// unchanged -- it goes through `qmm_t`.
+//
+// FOUR AND NOT EIGHT. The scale and bias are hoisted to once per lane-block,
+// which is only sound while a block cannot straddle two quantization groups
+// -- `PIE_QMV_VPT <= PIE_GROUP`, and the narrowest group this file stamps is
+// 32. Eight words is 64 codes at four bits and would read one scale for two
+// groups' weights, which is wrong and not slow. The GLSL passed this as a runtime argument and then wrote the inner
 // loop to a constant 16 with `i < values_per_thread` inside; here it is a real
 // const-expression -- `PIE_BITS` is a prelude const -- so the loop bound is the
 // constant and the redundant guard is gone. The OTHER guard is not redundant:
@@ -165,7 +192,7 @@ fn x_word(vec_: u32, k: u32) -> u32 {
 // Whether the nibble fast path above applies: four bits to a code, so a
 // 32-bit word is eight of them and two `unpack4x8unorm` calls cover it.
 const PIE_NIBBLE_FAST = PIE_BITS == 4;
-const PIE_QMV_VPT = PIE_CODES_PER_WORD * 2;
+const PIE_QMV_VPT = PIE_CODES_PER_WORD * 4;
 
 // One lane's block of `PIE_QMV_VPT` values, for FOUR rows at once.
 //
@@ -372,6 +399,25 @@ fn block_dot1(rows: vec4<u32>, vec_: u32, k0: u32) -> vec4<f32> {
 // the rounding), and the `unpack4x8unorm` path in `block_dot` below, where the
 // extra live registers cost more than the instructions save.
 //
+// THE NIBBLE PATH IN `block_dot` WAS TRIED A SECOND TIME, structured the way
+// `block_dot2` is -- unpack the eight weight vectors once, then walk the four
+// activation rows ONE AT A TIME, so no more than one accumulator and eight
+// activation floats are live beside them. That is the exact discipline that
+// made `block_dot2` a 26% win at two rows, and at four rows it loses anyway:
+//
+//   streams        1       4       8      16
+//   before       114.0   194.8   250.1   217.5 tok/s
+//   after        109.8   137.7   167.1   187.5 tok/s
+//
+// Two rows is the shape where the unpack pays and four is not, so the entry
+// above stands and the arm split is the answer, not a rewrite of `block_dot`.
+//
+// AND NOTE THE ONE-STREAM COLUMN. `mt == 1` does not go through `block_dot`
+// at all, and it still fell 114.0 -> 109.8. The arms share an entrypoint, so
+// the register allocation is the WORST arm's, and a fat arm taxes every fire
+// that never enters it. That is the reason `block_dot2` is written lean, and
+// it is the first thing to weigh before adding a third arm here.
+//
 // 64 K-LANES INSTEAD OF 32 was tried a second time, on the theory that a
 // 512-row plane gives only 64 workgroups and 4096 invocations for a whole GPU,
 // and that the table above was reading occupancy. It is not. Doubling the x
@@ -399,6 +445,174 @@ struct BlockM {
     a1: vec4<f32>,
     a2: vec4<f32>,
     a3: vec4<f32>,
+}
+
+// One lane's block for four output columns and EXACTLY TWO activation rows.
+//
+// # Why a second special case, when `block_dot` already handles two
+//
+// It handles two by computing four. `reduce_store` clamps `vecs` to the last
+// live row, so a two-row fire runs row 1 three times and discards two of
+// them -- and it takes the slow unpack besides, because only `block_dot1`
+// has the nibble path. Measured on an M4 Pro, Llama-3.2-1B, two concurrent
+// conversations: 12.99 ms a step against 7.52 ms for one conversation, where
+// the weights read is the same read. Four rows of arithmetic on three
+// instructions a code is exactly the 1.73x that is.
+//
+// # What this arm bought
+//
+// M4 Pro, Llama-3.2-1B q4, both sides built and measured back to back on the
+// same thermal state (the machine drifted a few percent warmer across the
+// day, so only same-sitting pairs mean anything):
+//
+// ```text
+//                          before    after
+//   2 streams, aggregate   133.7     168.6 tok/s    +26%
+//   2 streams, per-stream   68.7      90.2 tok/s
+//   8 streams, aggregate      -      205.2 tok/s
+//   1 stream,  tg128       111.1     113.9 tok/s    unchanged (mt == 1)
+//   1 stream,  pp512       900.7     902.2 tok/s    unchanged
+// ```
+//
+// The one-row and prefill paths do not come through here and did not move,
+// which is the check that the extra arm cost the entrypoint no registers.
+//
+// Two rows is the shape a SERVED deployment actually decodes in -- the
+// second conversation is the common case, not the fourth -- and it is the
+// one shape where the nibble path is affordable. The list at the foot of
+// this file records `unpack4x8unorm` in `block_dot` as measured worse, and
+// that stands: the FOUR-row form keeps four accumulators and four rows of
+// activations live across the unpack, and the register pressure costs more
+// than the instructions save. This form keeps two accumulators and walks one
+// row's activations at a time, so the eight unpacked vectors are the only
+// thing held across.
+//
+// The order the products reach each accumulator is `block_dot1`'s, k
+// ascending, so a row summed here and the same row summed alone agree bit
+// for bit.
+struct BlockM2 {
+    a0: vec4<f32>,
+    a1: vec4<f32>,
+}
+
+fn block_dot2(rows: vec4<u32>, vecs: vec2<u32>, k0: u32) -> BlockM2 {
+    let n = u32(params.in_vec_size);
+    let cpw = u32(PIE_CODES_PER_WORD);
+    let mask = (1u << u32(PIE_BITS)) - 1u;
+    let g = rows * (n / u32(PIE_GROUP)) + vec4<u32>(k0 / u32(PIE_GROUP));
+    let s = vec4<f32>(
+        qmv_bf16(scales[g.x >> 1u], g.x),
+        qmv_bf16(scales[g.y >> 1u], g.y),
+        qmv_bf16(scales[g.z >> 1u], g.z),
+        qmv_bf16(scales[g.w >> 1u], g.w),
+    );
+    let b = vec4<f32>(
+        qmv_bf16(biases[g.x >> 1u], g.x),
+        qmv_bf16(biases[g.y >> 1u], g.y),
+        qmv_bf16(biases[g.z >> 1u], g.z),
+        qmv_bf16(biases[g.w >> 1u], g.w),
+    );
+    let wbase = rows * (n / cpw);
+    var a0 = vec4<f32>(0.0);
+    var a1 = vec4<f32>(0.0);
+    var xsum = vec2<f32>(0.0);
+    let whole = k0 + u32(PIE_QMV_VPT) <= n;
+    for (var jw = 0u; jw < u32(PIE_QMV_VPT) / u32(PIE_CODES_PER_WORD); jw = jw + 1u) {
+        let base = k0 + jw * u32(PIE_CODES_PER_WORD);
+        if base >= n {
+            break;
+        }
+        let at = wbase + vec4<u32>(base / u32(PIE_CODES_PER_WORD));
+        let word = vec4<u32>(w[at.x], w[at.y], w[at.z], w[at.w]);
+        if PIE_NIBBLE_FAST && whole {
+            let lo = vec4<u32>(0x0f0f0f0fu);
+            let e0 = unpack4x8unorm(word.x & lo.x) * 255.0;
+            let e1 = unpack4x8unorm(word.y & lo.y) * 255.0;
+            let e2 = unpack4x8unorm(word.z & lo.z) * 255.0;
+            let e3 = unpack4x8unorm(word.w & lo.w) * 255.0;
+            let sh = (word >> vec4<u32>(4u)) & lo;
+            let o0 = unpack4x8unorm(sh.x) * 255.0;
+            let o1 = unpack4x8unorm(sh.y) * 255.0;
+            let o2 = unpack4x8unorm(sh.z) * 255.0;
+            let o3 = unpack4x8unorm(sh.w) * 255.0;
+            // ONE ROW AT A TIME across the unpack, which is the whole
+            // difference from the four-row attempt: eight activation floats
+            // are live here, not thirty-two.
+            let p0 = x_word(vecs.x, base);
+            let p1 = x_word(vecs.x, base + 2u);
+            let p2 = x_word(vecs.x, base + 4u);
+            let p3 = x_word(vecs.x, base + 6u);
+            let u0 = pie_bf16_to_f32(p0 & 0xffffu);
+            let u1 = pie_bf16_to_f32(p0 >> 16u);
+            let u2 = pie_bf16_to_f32(p1 & 0xffffu);
+            let u3 = pie_bf16_to_f32(p1 >> 16u);
+            let u4 = pie_bf16_to_f32(p2 & 0xffffu);
+            let u5 = pie_bf16_to_f32(p2 >> 16u);
+            let u6 = pie_bf16_to_f32(p3 & 0xffffu);
+            let u7 = pie_bf16_to_f32(p3 >> 16u);
+            xsum.x = xsum.x + u0 + u1 + u2 + u3 + u4 + u5 + u6 + u7;
+            a0 = a0 + u0 * vec4<f32>(e0.x, e1.x, e2.x, e3.x);
+            a0 = a0 + u1 * vec4<f32>(o0.x, o1.x, o2.x, o3.x);
+            a0 = a0 + u2 * vec4<f32>(e0.y, e1.y, e2.y, e3.y);
+            a0 = a0 + u3 * vec4<f32>(o0.y, o1.y, o2.y, o3.y);
+            a0 = a0 + u4 * vec4<f32>(e0.z, e1.z, e2.z, e3.z);
+            a0 = a0 + u5 * vec4<f32>(o0.z, o1.z, o2.z, o3.z);
+            a0 = a0 + u6 * vec4<f32>(e0.w, e1.w, e2.w, e3.w);
+            a0 = a0 + u7 * vec4<f32>(o0.w, o1.w, o2.w, o3.w);
+            let q0 = x_word(vecs.y, base);
+            let q1 = x_word(vecs.y, base + 2u);
+            let q2 = x_word(vecs.y, base + 4u);
+            let q3 = x_word(vecs.y, base + 6u);
+            let v0 = pie_bf16_to_f32(q0 & 0xffffu);
+            let v1 = pie_bf16_to_f32(q0 >> 16u);
+            let v2 = pie_bf16_to_f32(q1 & 0xffffu);
+            let v3 = pie_bf16_to_f32(q1 >> 16u);
+            let v4 = pie_bf16_to_f32(q2 & 0xffffu);
+            let v5 = pie_bf16_to_f32(q2 >> 16u);
+            let v6 = pie_bf16_to_f32(q3 & 0xffffu);
+            let v7 = pie_bf16_to_f32(q3 >> 16u);
+            xsum.y = xsum.y + v0 + v1 + v2 + v3 + v4 + v5 + v6 + v7;
+            a1 = a1 + v0 * vec4<f32>(e0.x, e1.x, e2.x, e3.x);
+            a1 = a1 + v1 * vec4<f32>(o0.x, o1.x, o2.x, o3.x);
+            a1 = a1 + v2 * vec4<f32>(e0.y, e1.y, e2.y, e3.y);
+            a1 = a1 + v3 * vec4<f32>(o0.y, o1.y, o2.y, o3.y);
+            a1 = a1 + v4 * vec4<f32>(e0.z, e1.z, e2.z, e3.z);
+            a1 = a1 + v5 * vec4<f32>(o0.z, o1.z, o2.z, o3.z);
+            a1 = a1 + v6 * vec4<f32>(e0.w, e1.w, e2.w, e3.w);
+            a1 = a1 + v7 * vec4<f32>(o0.w, o1.w, o2.w, o3.w);
+            continue;
+        }
+        for (var c = 0u; c < u32(PIE_CODES_PER_WORD); c = c + 2u) {
+            if !whole && base + c >= n {
+                break;
+            }
+            let k = base + c;
+            let xw = vec2<u32>(x_word(vecs.x, k), x_word(vecs.y, k));
+            let xv0 = vec2<f32>(
+                pie_bf16_to_f32(xw.x & 0xffffu),
+                pie_bf16_to_f32(xw.y & 0xffffu),
+            );
+            xsum = xsum + xv0;
+            let code0 = vec4<f32>((word >> vec4<u32>(u32(PIE_BITS) * c)) & vec4<u32>(mask));
+            a0 = a0 + xv0.x * code0;
+            a1 = a1 + xv0.y * code0;
+            if !whole && k + 1u >= n {
+                break;
+            }
+            let xv1 = vec2<f32>(
+                pie_bf16_to_f32(xw.x >> 16u),
+                pie_bf16_to_f32(xw.y >> 16u),
+            );
+            xsum = xsum + xv1;
+            let code1 = vec4<f32>((word >> vec4<u32>(u32(PIE_BITS) * (c + 1u))) & vec4<u32>(mask));
+            a0 = a0 + xv1.x * code1;
+            a1 = a1 + xv1.y * code1;
+        }
+    }
+    return BlockM2(
+        s * a0 + b * vec4<f32>(xsum.x),
+        s * a1 + b * vec4<f32>(xsum.y),
+    );
 }
 
 fn block_dot(rows: vec4<u32>, vecs: vec4<u32>, k0: u32) -> BlockM {
@@ -504,7 +718,7 @@ fn block_dot(rows: vec4<u32>, vecs: vec4<u32>, k0: u32) -> BlockM {
 
 //#if !defined(PIE_WIDE_STRIDED)
 fn reduce_store(lid: u32, ly: u32, wg: vec3<u32>) {
-    let out0 = wg.y * 8u + ly * 4u;
+    let out0 = wg.y * 4u;
     let vec0 = wg.x * PIE_MT;
 
     // How many activation rows the fire actually bound.
@@ -558,6 +772,13 @@ fn reduce_store(lid: u32, ly: u32, wg: vec3<u32>) {
             t0 = t0 + block_dot1(rows, vecs.x, k0);
             k0 = k0 + u32(PIE_QMV_VPT) * 32u;
         }
+    } else if mt == 2u {
+        while k0 < u32(params.in_vec_size) {
+            let part = block_dot2(rows, vecs.xy, k0);
+            t0 = t0 + part.a0;
+            t1 = t1 + part.a1;
+            k0 = k0 + u32(PIE_QMV_VPT) * 32u;
+        }
     } else {
         while k0 < u32(params.in_vec_size) {
             let part = block_dot(rows, vecs, k0);
@@ -572,7 +793,7 @@ fn reduce_store(lid: u32, ly: u32, wg: vec3<u32>) {
     // sixteen are written whether or not the group has four live rows: the
     // spare ones hold the zeros they were accumulated from, and the tree and
     // the store below walk only `mt` of them.
-    let slot0 = (ly * 4u) * PIE_MT;
+    let slot0 = 0u;
     qmv_partials[(slot0 + 0u * PIE_MT + 0u) * 32u + lid] = t0.x;
     qmv_partials[(slot0 + 1u * PIE_MT + 0u) * 32u + lid] = t0.y;
     qmv_partials[(slot0 + 2u * PIE_MT + 0u) * 32u + lid] = t0.z;
@@ -580,18 +801,29 @@ fn reduce_store(lid: u32, ly: u32, wg: vec3<u32>) {
     // The other three rows' slots, written only by a group that HAS them. A
     // decode writes four partials here, which is what it wrote before `PIE_MT`
     // existed; writing all sixteen cost it 3 tok/s of 64 and bought nothing.
+    // ONE SLOT INDEX PER `mi`, GUARDED BY `mt` AND NOT BY `mt > 1` ALONE.
+    // These used to be twelve stores under a single `if mt > 1u`, which is
+    // right only while `PIE_MT` is 4: slot `(r, mi)` is `r * PIE_MT + mi`, so
+    // an `mi` at or past `PIE_MT` is not out of bounds -- it is ROW `r + 1`'s
+    // slot, written with row `r`'s partial. At `PIE_MT = 2` that silently
+    // corrupted every other output column and cost three gpu tests and an
+    // afternoon.
     if mt > 1u {
         qmv_partials[(slot0 + 0u * PIE_MT + 1u) * 32u + lid] = t1.x;
-        qmv_partials[(slot0 + 0u * PIE_MT + 2u) * 32u + lid] = t2.x;
-        qmv_partials[(slot0 + 0u * PIE_MT + 3u) * 32u + lid] = t3.x;
         qmv_partials[(slot0 + 1u * PIE_MT + 1u) * 32u + lid] = t1.y;
-        qmv_partials[(slot0 + 1u * PIE_MT + 2u) * 32u + lid] = t2.y;
-        qmv_partials[(slot0 + 1u * PIE_MT + 3u) * 32u + lid] = t3.y;
         qmv_partials[(slot0 + 2u * PIE_MT + 1u) * 32u + lid] = t1.z;
-        qmv_partials[(slot0 + 2u * PIE_MT + 2u) * 32u + lid] = t2.z;
-        qmv_partials[(slot0 + 2u * PIE_MT + 3u) * 32u + lid] = t3.z;
         qmv_partials[(slot0 + 3u * PIE_MT + 1u) * 32u + lid] = t1.w;
+    }
+    if mt > 2u {
+        qmv_partials[(slot0 + 0u * PIE_MT + 2u) * 32u + lid] = t2.x;
+        qmv_partials[(slot0 + 1u * PIE_MT + 2u) * 32u + lid] = t2.y;
+        qmv_partials[(slot0 + 2u * PIE_MT + 2u) * 32u + lid] = t2.z;
         qmv_partials[(slot0 + 3u * PIE_MT + 2u) * 32u + lid] = t2.w;
+    }
+    if mt > 3u {
+        qmv_partials[(slot0 + 0u * PIE_MT + 3u) * 32u + lid] = t3.x;
+        qmv_partials[(slot0 + 1u * PIE_MT + 3u) * 32u + lid] = t3.y;
+        qmv_partials[(slot0 + 2u * PIE_MT + 3u) * 32u + lid] = t3.z;
         qmv_partials[(slot0 + 3u * PIE_MT + 3u) * 32u + lid] = t3.w;
     }
     workgroupBarrier();
@@ -656,11 +888,11 @@ fn reduce_store(lid: u32, ly: u32, wg: vec3<u32>) {
 // serial K loop that gets the same answer with 4 of 32 lanes busy. There is no
 // barrier in here, which is why the early returns below are safe.
 fn wide_strided(lid: vec3<u32>, wg: vec3<u32>) {
-    let row_slot = lid.y * 4u + (lid.x & 3u);
+    let row_slot = lid.x & 3u;
     if lid.x >= 4u {
         return;
     }
-    let row = wg.y * 8u + row_slot;
+    let row = wg.y * 4u + row_slot;
     let vec0 = wg.x * u32(PIE_VEC);
     if row >= u32(params.out_vec_size) {
         return;
@@ -678,7 +910,7 @@ fn wide_strided(lid: vec3<u32>, wg: vec3<u32>) {
 }
 //#endif
 
-@compute @workgroup_size(32, 2, 1)
+@compute @workgroup_size(32, 1, 1)
 fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(workgroup_id) wg: vec3<u32>,

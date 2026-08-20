@@ -4,9 +4,9 @@
 //! form), each in a decode and a multi-batch shape. The `freqs` pair reads a
 //! host-computed table, which is what llama-3.1's wavelength ramp needs.
 
-use kernels_macros::routine;
 use crate::routine::{Asks, Bind, Const, Ctx, Fire, InOut, Tensor, bf16, keys};
 use kernels::routine::Refusal;
+use kernels_macros::routine;
 
 /// The grid every rotation in this file launches: `[rotary/2, heads, rows]`.
 ///
@@ -86,12 +86,23 @@ pub fn neox_decode(
     scale: Const<f32>,
     base: Const<f32>,
     head_dim: Const<i32>,
-    rotary: Const<i32>) -> Result<(), Refusal> {
+    rotary: Const<i32>,
+) -> Result<(), Refusal> {
     let position = ctx.ask::<Tensor<i32>, keys::Positions>()?;
     let width = x.width;
     ctx.fire(
-        Fire::at(crate::routine::module_path("neox_decode_bfloat16", ctx.best()), "neox_decode_bfloat16").apply(rope_grid(*rotary, width, *head_dim, 1)?),
-        &[x.arg(), position.arg(), scale.arg(), base.arg(), head_dim.arg()],
+        Fire::at(
+            crate::routine::module_path("neox_decode_bfloat16", ctx.best()),
+            "neox_decode_bfloat16",
+        )
+        .apply(rope_grid(*rotary, width, *head_dim, 1)?),
+        &[
+            x.arg(),
+            position.arg(),
+            scale.arg(),
+            base.arg(),
+            head_dim.arg(),
+        ],
     )
 }
 
@@ -108,13 +119,24 @@ pub fn neox_mb(
     scale: Const<f32>,
     base: Const<f32>,
     head_dim: Const<i32>,
-    rotary: Const<i32>) -> Result<(), Refusal> {
+    rotary: Const<i32>,
+) -> Result<(), Refusal> {
     let position = ctx.ask::<Tensor<i32>, keys::Positions>()?;
     let width = x.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("neox_mb_bfloat16", ctx.best()), "neox_mb_bfloat16").apply(rope_grid(*rotary, width, *head_dim, rows)?),
-        &[x.arg(), position.arg(), scale.arg(), base.arg(), head_dim.arg()],
+        Fire::at(
+            crate::routine::module_path("neox_mb_bfloat16", ctx.best()),
+            "neox_mb_bfloat16",
+        )
+        .apply(rope_grid(*rotary, width, *head_dim, rows)?),
+        &[
+            x.arg(),
+            position.arg(),
+            scale.arg(),
+            base.arg(),
+            head_dim.arg(),
+        ],
     )
 }
 
@@ -144,7 +166,8 @@ pub fn neox_freqs_decode(
     scale: Const<f32>,
     head_dim: Const<i32>,
     mscale: Const<f32>,
-    rotary: Const<i32>) -> Result<(), Refusal> {
+    rotary: Const<i32>,
+) -> Result<(), Refusal> {
     // THE FIRE'S FREQUENCY TABLE, ASKED FOR. `Ask<keys::RopeFrequencies, Buf>`
     // before the marks: a table the driver builds once per fire, not a weight
     // the checkpoint carries and no builder places one. As a
@@ -155,7 +178,11 @@ pub fn neox_freqs_decode(
     let position = ctx.ask::<Tensor<i32>, keys::Positions>()?;
     let width = x.width;
     ctx.fire(
-        Fire::at(crate::routine::module_path("neox_freqs_decode_bfloat16", ctx.best()), "neox_freqs_decode_bfloat16").apply(rope_grid(*rotary, width, *head_dim, 1)?),
+        Fire::at(
+            crate::routine::module_path("neox_freqs_decode_bfloat16", ctx.best()),
+            "neox_freqs_decode_bfloat16",
+        )
+        .apply(rope_grid(*rotary, width, *head_dim, 1)?),
         &[
             x.arg(),
             position.arg(),
@@ -189,7 +216,8 @@ pub fn neox_freqs_mb(
     scale: Const<f32>,
     head_dim: Const<i32>,
     mscale: Const<f32>,
-    rotary: Const<i32>) -> Result<(), Refusal> {
+    rotary: Const<i32>,
+) -> Result<(), Refusal> {
     // THE FIRE'S FREQUENCY TABLE, ASKED FOR. `Ask<keys::RopeFrequencies, Buf>`
     // before the marks: a table the driver builds once per fire, not a weight
     // the checkpoint carries and no builder places one. As a
@@ -201,7 +229,11 @@ pub fn neox_freqs_mb(
     let width = x.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("neox_freqs_mb_bfloat16", ctx.best()), "neox_freqs_mb_bfloat16").apply(rope_grid(*rotary, width, *head_dim, rows)?),
+        Fire::at(
+            crate::routine::module_path("neox_freqs_mb_bfloat16", ctx.best()),
+            "neox_freqs_mb_bfloat16",
+        )
+        .apply(rope_grid(*rotary, width, *head_dim, rows)?),
         &[
             x.arg(),
             position.arg(),
@@ -232,12 +264,23 @@ pub fn neox_prop_decode(
     scale: Const<f32>,
     base: Const<f32>,
     head_dim: Const<i32>,
-    rotary: Const<i32>) -> Result<(), Refusal> {
+    rotary: Const<i32>,
+) -> Result<(), Refusal> {
     let position = ctx.ask::<Tensor<i32>, keys::Positions>()?;
     let width = x.width;
     ctx.fire(
-        Fire::at(crate::routine::module_path("neox_prop_decode_bfloat16", ctx.best()), "neox_prop_decode_bfloat16").apply(rope_grid(*rotary, width, *head_dim, 1)?),
-        &[x.arg(), position.arg(), scale.arg(), base.arg(), head_dim.arg()],
+        Fire::at(
+            crate::routine::module_path("neox_prop_decode_bfloat16", ctx.best()),
+            "neox_prop_decode_bfloat16",
+        )
+        .apply(rope_grid(*rotary, width, *head_dim, 1)?),
+        &[
+            x.arg(),
+            position.arg(),
+            scale.arg(),
+            base.arg(),
+            head_dim.arg(),
+        ],
     )
 }
 
@@ -259,13 +302,24 @@ pub fn neox_prop_mb(
     scale: Const<f32>,
     base: Const<f32>,
     head_dim: Const<i32>,
-    rotary: Const<i32>) -> Result<(), Refusal> {
+    rotary: Const<i32>,
+) -> Result<(), Refusal> {
     let position = ctx.ask::<Tensor<i32>, keys::Positions>()?;
     let width = x.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at(crate::routine::module_path("neox_prop_mb_bfloat16", ctx.best()), "neox_prop_mb_bfloat16").apply(rope_grid(*rotary, width, *head_dim, rows)?),
-        &[x.arg(), position.arg(), scale.arg(), base.arg(), head_dim.arg()],
+        Fire::at(
+            crate::routine::module_path("neox_prop_mb_bfloat16", ctx.best()),
+            "neox_prop_mb_bfloat16",
+        )
+        .apply(rope_grid(*rotary, width, *head_dim, rows)?),
+        &[
+            x.arg(),
+            position.arg(),
+            scale.arg(),
+            base.arg(),
+            head_dim.arg(),
+        ],
     )
 }
 
@@ -296,7 +350,8 @@ pub fn neox_strided(
     // deployment stride the same way -- so it fails `ask`'s own test and no
     // driver answers `keys::RowPitch`. Metal's twin declares it identically;
     // the three planes must ask the binder the same questions.
-    row_pitch: Const<i32>) -> Result<(), Refusal> {
+    row_pitch: Const<i32>,
+) -> Result<(), Refusal> {
     let position = ctx.ask::<Tensor<i32>, keys::Positions>()?;
     let width = x.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
@@ -307,7 +362,11 @@ pub fn neox_strided(
         });
     }
     ctx.fire(
-        Fire::at(crate::routine::module_path("neox_strided_bfloat16", ctx.best()), "neox_strided_bfloat16").apply(rope_grid(*rotary, width, *head_dim, rows)?),
+        Fire::at(
+            crate::routine::module_path("neox_strided_bfloat16", ctx.best()),
+            "neox_strided_bfloat16",
+        )
+        .apply(rope_grid(*rotary, width, *head_dim, rows)?),
         &[
             x.arg(),
             position.arg(),
@@ -346,9 +405,8 @@ mod tests {
         calls: RefCell<Vec<Call>>,
         positions: Cell<u32>,
         rows: Cell<i32>,
-        row_pitch: Cell<i32>,
-    /// The fire's rope frequency table, as a handle.
-    inv_freq: Cell<u32>,
+        /// The fire's rope frequency table, as a handle.
+        inv_freq: Cell<u32>,
     }
 
     impl Default for Seen {
@@ -357,7 +415,6 @@ mod tests {
                 calls: RefCell::default(),
                 positions: Cell::new(700),
                 rows: Cell::new(3),
-                row_pitch: Cell::new(8192),
                 // The fire's frequency table, which `neox_freqs_*` asks for.
                 // 9 is what `each_schedule_pushes_the_block_its_own_symbol_
                 // declares` pins by name; it predates the ask -- `inv_freq`
@@ -369,11 +426,7 @@ mod tests {
     }
 
     impl Encode for Seen {
-        fn resolve(
-            &self,
-            ty: kernels::Ty,
-            source: kernels::Source,
-        ) -> Result<ArgValue, Refusal> {
+        fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
             // The statement's own scalars, read by index where the params run
             // is the shader's struct -- see `Asks::param`.
             if let kernels::Source::Slot(kernels::Kind::Param, n) = source {
@@ -396,15 +449,27 @@ mod tests {
             // an ask now: it is built once per fire, not carried by the
             // checkpoint, so no statement places it.
             if source == <keys::RopeFrequencies as Fact>::SOURCE {
-                return Ok(ArgValue::Buffer { handle: self.inv_freq.get(), writes: false, rows: 0, width: 0 });
+                return Ok(ArgValue::Buffer {
+                    handle: self.inv_freq.get(),
+                    writes: false,
+                    rows: 0,
+                    width: 0,
+                });
             }
             if matches!(ty, kernels::Ty::Buf) {
-                return Ok(ArgValue::Buffer { handle: 900, writes: false, rows: 0, width: 0 });
+                return Ok(ArgValue::Buffer {
+                    handle: 900,
+                    writes: false,
+                    rows: 0,
+                    width: 0,
+                });
             }
             // Anything else is refused: a probe that invented an answer to a
             // fact it does not know would let a body pass under test while
             // the same fact went unanswered on a real driver.
-            Err(Refusal::Unstated { what: "a fact this probe does not answer" })
+            Err(Refusal::Unstated {
+                what: "a fact this probe does not answer",
+            })
         }
 
         fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
@@ -433,7 +498,11 @@ mod tests {
         let seen = Seen::default();
         neox_freqs_decode(
             &seen,
-            InOut { ptr: Tensor::<bf16>::new(0), rows: 0, width: 4096 },
+            InOut {
+                ptr: Tensor::<bf16>::new(0),
+                rows: 0,
+                width: 4096,
+            },
             Const::new(1.0),
             Const::new(128),
             Const::new(1.0),
@@ -442,7 +511,11 @@ mod tests {
         .expect("a launch");
         neox_freqs_mb(
             &seen,
-            InOut { ptr: Tensor::<bf16>::new(0), rows: 0, width: 4096 },
+            InOut {
+                ptr: Tensor::<bf16>::new(0),
+                rows: 0,
+                width: 4096,
+            },
             Const::new(1.0),
             Const::new(128),
             Const::new(1.0),
@@ -478,7 +551,11 @@ mod tests {
         let seen = Seen::default();
         neox_decode(
             &seen,
-            InOut { ptr: Tensor::<bf16>::new(0), rows: 0, width: 2048 },
+            InOut {
+                ptr: Tensor::<bf16>::new(0),
+                rows: 0,
+                width: 2048,
+            },
             Const::new(1.0),
             Const::new(10_000.0),
             Const::new(256),
@@ -545,7 +622,11 @@ mod tests {
             matches!(
                 neox_strided(
                     &seen,
-                    InOut { ptr: Tensor::<bf16>::new(0), rows: 0, width: 4096 },
+                    InOut {
+                        ptr: Tensor::<bf16>::new(0),
+                        rows: 0,
+                        width: 4096
+                    },
                     Const::new(1.0),
                     Const::new(10_000.0),
                     Const::new(128),
@@ -581,7 +662,11 @@ mod tests {
         let seen = Seen::default();
         neox_mb(
             &seen,
-            InOut { ptr: Tensor::<bf16>::new(0), rows: 0, width: 4096 },
+            InOut {
+                ptr: Tensor::<bf16>::new(0),
+                rows: 0,
+                width: 4096,
+            },
             Const::new(0.5),
             Const::new(10_000.0),
             Const::new(128),
@@ -590,7 +675,11 @@ mod tests {
         .expect("a launch");
         neox_freqs_mb(
             &seen,
-            InOut { ptr: Tensor::<bf16>::new(0), rows: 0, width: 4096 },
+            InOut {
+                ptr: Tensor::<bf16>::new(0),
+                rows: 0,
+                width: 4096,
+            },
             Const::new(0.5),
             Const::new(128),
             Const::new(0.75),
@@ -599,7 +688,11 @@ mod tests {
         .expect("a launch");
         neox_strided(
             &seen,
-            InOut { ptr: Tensor::<bf16>::new(0), rows: 0, width: 4096 },
+            InOut {
+                ptr: Tensor::<bf16>::new(0),
+                rows: 0,
+                width: 4096,
+            },
             Const::new(0.5),
             Const::new(10_000.0),
             Const::new(128),
@@ -645,11 +738,10 @@ mod tests {
             ArgValue::Buffer {
                 handle: 9,
                 writes: false,
-                    rows: 0,
-                    width: 0
+                rows: 0,
+                width: 0
             },
             "and only the frequency form binds a second buffer, at 2, read-only"
         );
     }
 }
-
