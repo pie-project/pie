@@ -368,7 +368,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "mlp::chunked_swiglu_bf16"
+          "kernel": "mlp::chunked_swiglu_into_bf16"
         }
       },
       "inputs": [

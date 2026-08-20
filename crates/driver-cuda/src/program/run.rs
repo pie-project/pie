@@ -148,8 +148,15 @@ impl Prepared {
                 }
             }
         }
-        let scratch_layout = layout(&descriptors).map_err(|why| {
-            Error::invalid(
+        // WHAT EACH VALUE'S SHAPE RESOLVED TO. A descriptor whose `last` is
+        // zero makes the fused argmax scan no columns and leave its
+        // zero-initialised result, which reads back as token 0 forever.
+        if std::env::var_os("PIE_TRACE_VALUES").is_some() {
+            for (i, d) in descriptors.iter().enumerate() {
+                eprintln!("[desc] {i} {d:?}");
+            }
+        }
+        let scratch_layout = layout(&descriptors).map_err(|why| {            Error::invalid(
                 "program::run",
                 format!("this fire's scratch does not fit: {why:?}"),
             )
@@ -404,9 +411,19 @@ impl Prepared {
                 &row_stride.to_le_bytes(),
                 stream,
             )?;
+            let offset = row_of(lane);
+            // WHICH ROW the program will scan. Past the end of a gathered
+            // buffer reads whatever follows it, and an argmax over that is a
+            // token nobody chose.
+            if std::env::var_os("PIE_TRACE_VALUES").is_some() {
+                eprintln!(
+                    "[intr] slot={slot} lane={lane} base={base:#x} \
+                     mode={storage} width={width} stride={row_stride} row={offset}"
+                );
+            }
             self.intrinsic_offsets.write_at(
                 at * size_of::<u32>(),
-                &row_of(lane).to_le_bytes(),
+                &offset.to_le_bytes(),
                 stream,
             )?;
         }

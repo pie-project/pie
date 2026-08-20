@@ -297,6 +297,14 @@ pub fn gemma4_cuda(facts: &Gemma4Facts, cuda: &Gemma4CudaFacts, class: FireClass
                 &w.post_attn_norm,
                 &w.pre_ffw_norm,
                 hidden,
+                // The identity, which is what gemma-4's own last layer
+                // applies: it lands through the unfused
+                // `norm::rmsnorm_residual_add_bf16`, which scales by nothing,
+                // so the fused path must agree with it about the same
+                // landing. `rsqrt_2` was tried here and the generation stayed
+                // incoherent either way -- this row's numerics need more than
+                // this one number, and guessing it is not the repair.
+                1.0,
             );
             y = landed;
 
@@ -344,6 +352,8 @@ pub fn gemma4_cuda(facts: &Gemma4Facts, cuda: &Gemma4CudaFacts, class: FireClass
                     &w.ple_norm,
                     &next.attn_norm,
                     hidden,
+                    // As above.
+                    1.0,
                 );
                 y = landed;
                 normed = next_norm;

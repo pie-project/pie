@@ -115,12 +115,28 @@ pub static ARMS: &[Bound] = &[
     // the export that has neither.
     Bound {
         symbol: "quant::mxfp4_moe_gate_up_decode_bf16",
-        arm: Some(mxfp4_moe_gate_up_decode_bf16_arm),
-        unbound: None,
+        arm: None,
+        unbound: Some("a per-expert POINTER ARRAY for the packed bank and its scales. Measured with \
+             `compute-sanitizer` on gpt-oss-20b: the kernel does \
+             `packed_ptrs[expert]`, so both parameters are `const u8* const*` \
+             over `num_experts` entries, and the launcher binds the BANK's own \
+             base address instead -- the first eight bytes of MXFP4 weight data \
+             read as a pointer. That is an illegal address that poisons the \
+             context, and the next module load reports it, so the failure names \
+             an unrelated kernel. Nothing in this tree builds the array: \
+             `build_moe_ptrs_aligned` is qwen3.5's statement-side one and gpt-oss \
+             states only the bank by name. Refusing at LOAD is the honest \
+             answer until something does"),
     },
     // `scale_ptrs` is NOT `Weight(1)`: the positional bank is a separate slice
-    // from the suffixed lookup `keys::WeightScales` names.
-    Bound::derived("quant::mxfp4_moe_down_decode_bf16"),
+    // from the suffixed lookup `keys::WeightScales` names. Its kernel takes
+    // the same two pointer ARRAYS as the gate/up twin above and is unfireable
+    // for the same measured reason.
+    Bound {
+        symbol: "quant::mxfp4_moe_down_decode_bf16",
+        arm: None,
+        unbound: Some("the same per-expert pointer arrays the gate/up twin above needs"),
+    },
 
     // The positional weights are marked because `In(2)`..`In(5)` are ANSWERABLE
     // -- they resolve the moment a statement places six operands, to buffers

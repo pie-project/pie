@@ -201,19 +201,26 @@ pub fn rmsnorm_no_scale(x: &Val) -> Val {
 
 /// `norm::rmsnorm_residual_add_scale_rmsnorm_bf16`: norm, residual add, scale, next norm.
 /// Returns `(hidden, norm_out)` in that order.
+///
+/// `scale` is the routine's one `Const`, and the caller states it: the
+/// unfused landing (`norm_residual_add`) applies none, so a family that folds
+/// the next norm in must say what it scales by rather than leave a parameter
+/// nothing supplies.
 pub fn norm_residual_scale_norm(
     x: &Val,
     y: &Val,
     w: &NormW,
     next: &NormW,
     hidden: u32,
+    scale: f32,
 ) -> (Val, Val) {
     let shape = (Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16);
     let ids = x.t.with(w.layer, |b| {
-        b.launch(
+        b.launch_with_params(
             "norm::rmsnorm_residual_add_scale_rmsnorm_bf16",
             vec![w.name.clone(), next.name.clone()],
             None,
+            vec![scale.to_bits()],
             // `y` is the old stream: read, accumulated into, and returned.
             vec![x.id, y.id],
             vec![shape.clone(), shape],

@@ -558,18 +558,24 @@ pub fn rmsnorm_gated_fp32_in<T>(
     gate: In<Tensor<T>>,
     // Named, not banked: Env<this op's builder pushes `vec![x, gate]`, keys::Unstated>, no weight operand.
     weight: Const<Tensor<f32>>,
-    y: Out<Tensor<T>>,
-    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
-    // `Env<i32, keys::Unstated>`, a mark that claimed no source at
-    // all; `#[unbound]` is that sentence without the fake key.
-    #[unbound]
-    per_head_dim: i32) -> Result<(), Refusal> {
+    y: Out<Tensor<T>>) -> Result<(), Refusal> {
     // ASKED, NOT `Const`: `OpKind::RmsnormGated` carries a weight name and
     // nothing else, and only `OpKind::Launch` gets a params run out of
     // `lower::walk` — so a `Const<f32>` here promised an epsilon the
     // statement has nowhere to put, and every qwen3.5 gated norm refused.
     // HEAD spelled it `Env<keys::RmsEps>`.
     let eps = ctx.ask::<f32, keys::RmsEps>()?;
+    // THE GATED-DELTA-NET HEAD WIDTH, which is what this row's `Bound` entry
+    // said was missing: *"needs `Facts::per_head_dim()`, not a new `Source`"*.
+    // It needs neither. `per_head_dim` was `#[unbound]` and read as zero,
+    // which this body takes as "the whole row" -- so the one family that
+    // states this op would have normalised across every head at once.
+    //
+    // `keys::GdnVDim` is the answer and the driver already holds it: qwen3.5
+    // is the only text that emits `OpKind::RmsnormGated` (nemotron's gated
+    // norm is `ssm::zamba_rmsnorm_gated_bf16`, a stated launch of its own),
+    // and its core output is `[N, V_h, V_d]` — one head is `v_d` wide.
+    let per_head_dim = ctx.ask::<i32, keys::GdnVDim>()?;
     let dst = y.all("the normalised row's width")?;
     let hidden = if per_head_dim == 0 { dst.width } else { per_head_dim };
     let launch = rows_per_head(&dst, per_head_dim)?;
@@ -655,11 +661,17 @@ pub fn rmsnorm_residual_add_scale_rmsnorm_bf16(
     // `Weight<0, *const _>`/`Weight<1, *const _>`: stating `x` sets the input counter without consuming a slot.
     weight: Const<Tensor<bf16>>,
     hidden: InOut<Tensor<bf16>>,
-    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
-    // `Env<f32, keys::Unstated>`, a mark that claimed no source at
-    // all; `#[unbound]` is that sentence without the fake key.
-    #[unbound]
-    scale: f32,
+    // THE STATEMENT CARRIES IT NOW. It was `#[unbound]` -- a parameter
+    // nothing supplies -- and that one entry is what kept this row out of the
+    // binder, so gemma-4 traced, lowered and refused here at every layer
+    // boundary. There is no fact to ask for either: `Cx::named_scale` reads
+    // `DispatchCtx::scales`, and no deployment publishes a `layer_scale`.
+    //
+    // The number belongs to the CALLER, and gemma-4's own text says which:
+    // its last layer lands unfused through `norm::rmsnorm_residual_add_bf16`,
+    // which applies no scale at all, so the fused path must apply the
+    // identity or the two branches would disagree about the same landing.
+    scale: Const<f32>,
     next_weight: Const<Tensor<bf16>>,
     norm_out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
     // ASKED, NOT `Const`: every one of these was `Env<keys::_>` before the

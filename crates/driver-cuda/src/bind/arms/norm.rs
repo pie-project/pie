@@ -68,22 +68,17 @@ pub static ARMS: &[Bound] = &[
     // Its weight is the NAMED bank, unlike `norm::rmsnorm_gated_bf16`. The
     // obvious repair for the blocker below is a trap: the named source resolves
     // to zero rather than refusing, and zero normalises over `k * v_d`.
-    Bound {
-        symbol: "norm::rmsnorm_gated_fp32_in_bf16",
-        arm: None,
-        unbound: Some(
-            "the gated-delta-net head width; needs `Facts::per_head_dim()`, not a new `Source`",
-        ),
-    },
+    // The head width is `keys::GdnVDim`, which this driver has always
+    // answered; the row's reason asked for a `Facts` query that was not the
+    // one it needed. See the routine.
+    Bound::derived("norm::rmsnorm_gated_fp32_in_bf16"),
     // The two weights are `Bank<0, _>`/`Bank<1, _>`; a counted `In(1)` is the
     // residual STREAM and hands a gamma reader a slab of activations.
-    Bound {
-        symbol: "norm::rmsnorm_residual_add_scale_rmsnorm_bf16",
-        arm: None,
-        unbound: Some(
-            "the layer's residual scale; needs `Facts::layer_scale()`, and no statement carries it",
-        ),
-    },
+    // The statement carries the residual scale now, so the reason this row
+    // gave -- "needs `Facts::layer_scale()`, and no statement carries it" --
+    // is answered from the other side: gemma-4's builder states it, and no
+    // deployment ever published a `layer_scale` to be asked for.
+    Bound::derived("norm::rmsnorm_residual_add_scale_rmsnorm_bf16"),
     Bound {
         symbol: "norm::hc_pre_postprocess_bf16",
         arm: None,

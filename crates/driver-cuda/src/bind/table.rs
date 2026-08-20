@@ -1166,7 +1166,7 @@ pub unsafe fn dispatch(
     // THE WHOLE BOUND LIST, on request. A wrong ADDRESS is invisible: the
     // launch succeeds and the numbers come out wrong, which is the one failure
     // a refusal-driven bring-up cannot see. `PIE_TRACE_BINDS=1` prints it.
-    if std::env::var_os("PIE_TRACE_BINDS").is_some() {
+    if tracing("PIE_TRACE_BINDS") {
         eprintln!("[bind] {symbol} n_in={} n_out={} -> {args:?}", spec.n_in, spec.n_out);
     }
     // AND WHAT THE LAUNCH LEFT IN ITS RESULTS. A binding can be right in every
@@ -1176,7 +1176,7 @@ pub unsafe fn dispatch(
     //
     // Deliberately expensive: it synchronises the stream. A diagnostic that
     // changed the schedule it is measuring would be worse than none.
-    let peek = std::env::var_os("PIE_TRACE_VALUES").is_some();
+    let peek = tracing("PIE_TRACE_VALUES");
     // WHAT THE BODY MAY STILL ASK FOR. `Env` left the parameter list, so a
     // fact only the fire can answer is no longer bound into `args` above --
     // the body asks, and this lends it the same `Handles` and `Facts` the
@@ -1245,6 +1245,26 @@ fn peek_results(symbol: &str, args: &[ArgValue], n_in: usize, stream: *mut c_voi
     }
 }
 
+/// Whether a diagnostic env var is set, read ONCE.
+///
+/// `var_os` walks the environment, and these sit in `dispatch`, which runs per
+/// launch per fire -- a probe that cost a scan per launch would change the
+/// schedule it exists to describe.
+fn tracing(var: &'static str) -> bool {
+    use std::collections::BTreeMap;
+    use std::sync::{OnceLock, RwLock};
+    static SEEN: OnceLock<RwLock<BTreeMap<&'static str, bool>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| RwLock::new(BTreeMap::new()));
+    if let Some(&hit) = seen.read().ok().and_then(|m| m.get(var).copied()).as_ref() {
+        return hit;
+    }
+    let hit = std::env::var_os(var).is_some();
+    if let Ok(mut m) = seen.write() {
+        m.insert(var, hit);
+    }
+    hit
+}
+
 /// A bf16 bit pattern as the float it stands for.
 fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
@@ -1294,7 +1314,7 @@ impl kernels::routine::Answers<kernels_cuda::jit::Cuda> for Answering<'_> {
         // wrong ANSWER is invisible where a missing one is a refusal — so the
         // one thing that cannot be read off a failing fire is the number the
         // kernel ran on. `PIE_TRACE_ASKS=1` prints it.
-        if std::env::var_os("PIE_TRACE_ASKS").is_some() {
+        if tracing("PIE_TRACE_ASKS") {
             eprintln!("[ask] {source:?} -> {v:?}");
         }
         Ok(v)
@@ -1627,13 +1647,24 @@ mod tests {
 
         // Reproducible without running this test, which matters under a
         // check-only regime: `crossed` is exactly the `Bound::derived` rows.
-        // There are 127 of them and the routine registry declares every one,
+        // There are 129 of them and the routine registry declares every one,
         // so the two counts coincide today — they need not, and a
         // `Bound::derived` naming a symbol nothing declares would be invisible
         // here while still answering `Route::Bound` at load.
+        //
+        // 127 until three rows crossed, each blocked on ONE parameter nothing
+        // supplied: `gemm::act_x_wt_bias_bf16` on a `beta` its two twins state
+        // by SYMBOL, `norm::rmsnorm_residual_add_scale_rmsnorm_bf16` on a
+        // residual scale its statement carries now, and
+        // `norm::rmsnorm_gated_fp32_in_bf16` on a head width `keys::GdnVDim`
+        // always answered. All three were declared, pinned, goldened and
+        // unfireable, one per family: gpt-oss, gemma-4, qwen3.5. And one
+        // crossed the OTHER way: `quant::mxfp4_moe_down_decode_bf16` went back
+        // to refusing, because `compute-sanitizer` showed its kernel indexing
+        // a per-expert pointer array nothing in this tree builds.
         let n = kernels_cuda::sigs().iter().filter(|s| crossed(s.symbol)).count();
         assert_eq!(
-            n, 127,
+            n, 129,
             "{n} declared symbols are crossed onto the derived column. \
              Crossing one changes how a real fire is planned, so the count \
              moves only on purpose."

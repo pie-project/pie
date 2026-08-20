@@ -247,12 +247,15 @@ pub fn act_x_wt_bias_bf16(
     // swapping them compiles and binds the wrong tensor.
     w: Const<Tensor<c_void>>,
     bias: Const<Tensor<c_void>>,
-    y: Out<Tensor<c_void>>,
-    // NOTHING SUPPLIES THIS AND THE SIGNATURE SAYS SO. It was
-    // `Env<f32, keys::Unstated>`, a mark that claimed no source at
-    // all; `#[unbound]` is that sentence without the fake key.
-    #[unbound]
-    beta: f32) -> Result<(), Refusal> {
+    y: Out<Tensor<c_void>>) -> Result<(), Refusal> {
+    // ZERO, AS `act_x_w`'s IS, and for the same reason stated the same way:
+    // this statement PRODUCES `y`, so there is nothing in it to accumulate
+    // into. `beta` was `#[unbound]` and that was the one entry keeping the
+    // row out of the binder -- "the entry this row is blocked on", says the
+    // pin below -- so gpt-oss's biased projections had a routine, a column,
+    // a golden and no way to fire. The number that separates the twins is
+    // stated by the SYMBOL here exactly as it is there.
+    let beta = 0.0f32;
     // [`act_x_wt_bf16`]'s `m`/`n`/`k` hazard again. `y`'s own extents are
     // forwarded to `norm::add_bias` below rather than restated.
     let dst = crate::layout::stated(y.all("n or k"))?;
@@ -461,12 +464,12 @@ const _: () = {
 
     // Pins the two banks' order: swapping `w` and `bias` still compiles and
     // binds the wrong tensor.
-    assert!(<act_x_wt_bias_bf16 as ::kernels::Derivation>::DERIVED.len() == 5);
+    assert!(<act_x_wt_bias_bf16 as ::kernels::Derivation>::DERIVED.len() == 4);
     assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(act_x_wt_bias_bf16)[1], Some(kernels::Source::Or(kernels::Source::Named(_), kernels::Source::Slot(kernels::Kind::Weight, 0)))));
     assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(act_x_wt_bias_bf16)[2], Some(kernels::Source::Or(kernels::Source::Named(_), kernels::Source::Slot(kernels::Kind::Weight, 1)))));
     assert!(matches!(kernels::routine::sources::<crate::jit::Cuda, _, _>(act_x_wt_bias_bf16)[3], Some(kernels::Source::Slot(kernels::Kind::Out, 0))));
-    // `beta`, the entry this row is blocked on.
-    assert!(kernels::routine::sources::<crate::jit::Cuda, _, _>(act_x_wt_bias_bf16)[4].is_none());
+    // `beta` LEFT THE COLUMN: the symbol states it, so there is no fifth
+    // entry and nothing left for this row to be blocked on.
 
     // Entries 0..=3 are all `None`: the column claims no operands, even for
     // `y_ptrs_dev`'s `*mut` pointee.

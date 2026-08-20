@@ -1195,6 +1195,9 @@
           "kernel": "ssm::zamba_rmsnorm_gated_bf16",
           "weights": [
             "layer.0.mamba_norm"
+          ],
+          "params": [
+            8
           ]
         }
       },
@@ -1624,6 +1627,9 @@
           "kernel": "ssm::zamba_rmsnorm_gated_bf16",
           "weights": [
             "layer.2.mamba_norm"
+          ],
+          "params": [
+            8
           ]
         }
       },
@@ -2357,6 +2363,9 @@
           "kernel": "ssm::zamba_rmsnorm_gated_bf16",
           "weights": [
             "layer.4.mamba_norm"
+          ],
+          "params": [
+            8
           ]
         }
       },

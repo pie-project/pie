@@ -342,6 +342,24 @@ impl Session {
                 extents,
             })
             .collect();
+        // WHAT THE PROGRAM IS. A sampler that publishes a constant is
+        // indistinguishable from one that never read the logits, and the ops
+        // are the only place the difference shows.
+        if std::env::var_os("PIE_TRACE_VALUES").is_some() {
+            eprintln!(
+                "[plan] flags={:#x} ops={} values={} error={:?}",
+                plan.flags,
+                plan.ops.len(),
+                plan.value_types.len(),
+                plan.error
+            );
+            for (i, op) in plan.ops.iter().enumerate() {
+                eprintln!(
+                    "[op] {i} code={:#x} intrinsic={} results={}",
+                    op.code, op.intrinsic, op.result_count
+                );
+            }
+        }
         let mut prepared = Prepared::build(alloc, plan, &members, stream)?;
         let (base, vocab, row_stride) = logits;
         if base != 0 {

@@ -742,6 +742,21 @@ impl LoadedModel {
     /// `Resolver::weight`. Checkpoint names, fused names and aliases all answer.
     #[allow(dead_code)]
     pub(crate) fn weight(&self, name: &str) -> Option<*const std::ffi::c_void> {
+        // EVERY NAME THE LOAD HOLDS, once. A miss names what was wanted; only
+        // this names what is there, and the difference between the two is
+        // where a trace and a load contract stopped agreeing.
+        if std::env::var_os("PIE_TRACE_WEIGHTS").is_some() {
+            use std::sync::Once;
+            static DUMP: Once = Once::new();
+            DUMP.call_once(|| {
+                for k in self.weights.keys() {
+                    eprintln!("[held] {k}");
+                }
+                for (k, v) in &self.aliases {
+                    eprintln!("[alias] {k} -> {v}");
+                }
+            });
+        }
         if let Some(b) = self.weights.get(name) {
             return Some(b.ptr.cast_const());
         }

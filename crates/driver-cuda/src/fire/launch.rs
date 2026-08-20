@@ -465,6 +465,33 @@ fn run_program(
         return Ok(false);
     }
 
+    // THE BYTES THE PROGRAM IS ABOUT TO SAMPLE, at the address and row it was
+    // pointed at. Everything else about the binding is checkable from the
+    // host; the CONTENT at the moment of the fire is not, and a sampler that
+    // answers zero looks the same whether it read the wrong buffer or the
+    // right one wrongly.
+    if std::env::var_os("PIE_TRACE_VALUES").is_some() && logits.0 != 0 {
+        let (base, vocab, stride) = logits;
+        let at = base + (row as u64) * u64::from(stride) * 2;
+        let mut host = [0u16; 8];
+        // SAFETY: the readout buffer's own claim -- `rows * stride` live bf16
+        // at `base` -- and this row is inside it.
+        let rc = unsafe {
+            cudarc::runtime::sys::cudaMemcpy(
+                host.as_mut_ptr().cast(),
+                at as *const std::ffi::c_void,
+                core::mem::size_of_val(&host),
+                cudarc::runtime::sys::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+            )
+        };
+        let seen: Vec<f32> = host
+            .iter()
+            .map(|b| f32::from_bits(u32::from(*b) << 16))
+            .collect();
+        eprintln!(
+            "[sample] base={base:#x} row={row} vocab={vocab} stride={stride} rc={rc:?} {seen:.4?}"
+        );
+    }
     let Some(instance) = instances.get(&instance_id) else {
         return Ok(false);
     };
@@ -1540,7 +1567,23 @@ fn attention_pins(
             "attn::dispatch_attention_flashinfer_decode_lse",
         ]
     } else {
-        &["attn::dispatch_attention_flashinfer_prefill_bf16"]
+        // ALL THREE PREFILL SPELLINGS, for the reason the decode arm above
+        // gives and which was written there and not here: a single-name
+        // lookup refuses an `_lse`-stating family outright, because the
+        // `else` below is `PIE_STATUS_UNSUPPORTED`.
+        //
+        // gpt-oss is that family. Its attention statement produces TWO
+        // results -- the output and the LSE its sink rescale reads -- so it
+        // states `attention_flashinfer_prefill_lse`, and this list named only
+        // the plan-raising `dispatch_` spelling. The model loaded, traced and
+        // lowered, then refused its first prefill with *the lowering states
+        // no attn::dispatch_attention_flashinfer_prefill_bf16* -- which was
+        // true, and not the question.
+        &[
+            "attn::dispatch_attention_flashinfer_prefill_bf16",
+            "attn::attention_flashinfer_prefill",
+            "attn::attention_flashinfer_prefill_lse",
+        ]
     };
     let Some(fi) = lowered
         .launches
@@ -2469,7 +2512,13 @@ pub(crate) fn step_impl(
     }
     impl Resolver for LiveResolver<'_> {
         fn weight(&mut self, name: &str) -> Option<*const std::ffi::c_void> {
-            self.model.weight(name)
+            let hit = self.model.weight(name);
+            // See `MapResolver`'s: a miss is silent by design, so the one
+            // thing a biasless launch never says is which name it wanted.
+            if hit.is_none() && std::env::var_os("PIE_TRACE_WEIGHTS").is_some() {
+                eprintln!("[weight] miss: {name}");
+            }
+            hit
         }
         fn named(&mut self, value: ValueId) -> Option<*mut std::ffi::c_void> {
             self.named.get(&value).map(|b| b.as_ptr())

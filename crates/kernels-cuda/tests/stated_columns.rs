@@ -628,6 +628,27 @@ const DIVERGED_IN_PLACE: &[DivergedInPlace] = &[
               the rotated `q` as its one result.",
     },
     DivergedInPlace {
+        symbol: "mlp::chunked_swiglu_bf16",
+        was: &[(0, 1)],
+        is: &[],
+        why: "ONE KERNEL, TWO STATEMENT SHAPES, and the pair belonged to \
+              only one of them. The dense MLP states `[x]` and takes back a \
+              result the arena places; qwen3.5's ALIGNED MoE leg states \
+              `[x, stage]`, because `build_moe_ptrs_aligned` has already \
+              baked that buffer's address into the device pointer arrays the \
+              batched-cuBLAS fallback dereferences, so there the result must \
+              BE the operand. `InOut` derives `Source::Alias(1, 0)` and reads \
+              INPUT 1, so putting it on the shared symbol made every llama, \
+              qwen3 and gemma fire refuse at its tenth launch with *the fire \
+              does not carry an input operand* -- and leaving it off would \
+              have sent the aligned leg's result somewhere the pointer \
+              arrays do not name. The alias moved to \
+              `mlp::chunked_swiglu_into_bf16`, whose statement really does \
+              place a destination; this row keeps the plain shape and \
+              §11.6's rule agrees, since the launcher fires `packed` and `y` \
+              as two marks rather than one twice.",
+    },
+    DivergedInPlace {
         symbol: "mlp::geglu_tanh_bf16",
         was: &[(0, 0)],
         is: &[],

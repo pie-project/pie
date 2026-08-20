@@ -901,7 +901,33 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
         .saturating_add(planned.plan.attn_float_workspace_bytes)
         .saturating_add(planned.plan.persistent_input_bytes)
         .saturating_add(planned.plan.runtime_quant_scratch_bytes);
-    let total_pages = planned.budget.saturating_sub(resident_arena) / per_page;
+    // THE RECURRENT-STATE POOL, WHICH WAS ADVERTISED AS ZERO.
+    //
+    // `rs_cache_required` already said the model needs one and `rs_cache_slot_bytes`
+    // said how big a slot is; the COUNT sat at a literal `0` among the claims
+    // this shell has not implemented. It is not one of them -- the cache is
+    // real and `RecurrentStateCache::grow` sizes it on demand -- but the
+    // engine reads the count as the switch: `bootstrap` sets `is_rs` from
+    // `rs_cache_slots > 0`, so zero turns the whole path off and the first
+    // hybrid fire asks one slot of a pool with none. Qwen3.5 loaded, traced,
+    // lowered and died at `KV capacity: allocation of 1 units can never fit
+    // (pool total 0)`.
+    //
+    // An EIGHTH of what the arena leaves, capped: the pool serves folded state
+    // AND buffer pages from the same slots (`bootstrap`'s note, measured on
+    // Qwen3.6-27B), so it must hold more than one per admitted process, and it
+    // must not eat the KV pool it is subtracted from below.
+    let rs_slot_bytes = costs.state_slot_bytes().max(1);
+    let free_after_arena = planned.budget.saturating_sub(resident_arena);
+    let rs_cache_slots: u32 = if costs.has_linear_state() {
+        u32::try_from((free_after_arena / 8 / rs_slot_bytes).min(512)).unwrap_or(0)
+    } else {
+        0
+    };
+    // Reserved BEFORE the pages, so the two halves of one budget cannot both
+    // spend it.
+    let total_pages =
+        free_after_arena.saturating_sub(u64::from(rs_cache_slots) * rs_slot_bytes) / per_page;
 
     let caps = driver_api::DriverCapabilities {
         abi_version: driver_api::PIE_DRIVER_ABI_VERSION,
@@ -927,7 +953,7 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
         // is a claim a program binds against, so a false one is a silent no-op.
         swap_pool_size: 0,
         kv_copy_domain_mask: 0,
-        rs_cache_slots: 0,
+        rs_cache_slots,
         rs_cache_slot_bytes: costs.state_slot_bytes(),
         elastic_page_bytes: 0,
         elastic_budget_pages: 0,

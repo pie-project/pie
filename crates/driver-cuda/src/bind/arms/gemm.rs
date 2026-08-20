@@ -24,4 +24,7 @@ pub static ARMS: &[Bound] = &[
     // allocator from handing this launch a buffer nothing wrote.
     Bound::derived("gemm::act_x_w_acc"),
     Bound::derived("gemm::act_x_wt_bf16_out_fp32"),
+    // The biased projection gpt-oss states. Bindable since `beta` became the
+    // symbol's rather than a parameter nothing supplies — see the routine.
+    Bound::derived("gemm::act_x_wt_bias_bf16"),
 ];

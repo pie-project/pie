@@ -34,6 +34,12 @@ enum Value {
     Region { ptr: usize, rows: i32, width: i32 },
 }
 
+// A PLANE WITH NO ABSENT VALUE, which is a legal answer and the one this
+// fixture gives: `Option<In<..>>` unpacks as `Some` everywhere here, because
+// nothing this backend binds can stand for "the statement placed nothing".
+// The trait's defaults say exactly that, so the impl is empty on purpose.
+impl kernels::routine::Absent for Value {}
+
 #[derive(Default)]
 struct Ctx {
     fired: std::cell::RefCell<Vec<&'static str>>,

@@ -564,6 +564,18 @@ fn llama_like(w: &mut Wiring<'_>) {
             ("q_bias", "self_attn.q_proj.bias"),
             ("k_bias", "self_attn.k_proj.bias"),
             ("v_bias", "self_attn.v_proj.bias"),
+            // THE LANDING'S BIAS, which stopped at the three above for the
+            // reason `driver::names`' ROLES table already records: they *"were
+            // added for qwen-2 and stopped there, because qwen-2's `o_proj`
+            // carries none. gpt-oss's does"*. That table learned the fourth
+            // name and this wiring did not, so gpt-oss loaded, reported itself
+            // healthy, and refused at `norm::add_bias_bf16` -- the fire does
+            // not carry a weight -- because no alias answered
+            // `layer.{i}.o_bias`.
+            //
+            // Safe for the families that ship none: `alias` records nothing
+            // for a checkpoint that does not publish the tensor.
+            ("o_bias", "self_attn.o_proj.bias"),
         ] {
             w.alias(format!("layer.{i}.{trace}"), n(ckpt));
         }

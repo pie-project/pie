@@ -521,11 +521,48 @@ impl Observed {
         N: AsRef<str>,
         S: AsRef<[u64]>,
     {
-        let mut by_name = BTreeMap::new();
+        // THE LOWEST LAYER WINS, because that is the one [`Manifest`] states.
+        //
+        // `logical` collapses a stack's per-layer tensors onto one key, so
+        // thirty-five `q_proj`s arrive as one entry and something has to
+        // choose. `insert` chose the LAST, and for every model whose layers
+        // are one width that is the same answer as the first. Gemma-4's are
+        // not: a sliding layer's heads are `head_dim` (256) and a
+        // full-attention layer's are `global_head_dim` (512), so layer 0 is
+        // `[2048, 1536]` and layer 34 is `[4096, 1536]`. `Manifest`'s own doc
+        // settles which to compare -- *"expands `{}` to layer 0 and compares
+        // once, and layer 0 is a sliding layer in every gemma-4"* -- and the
+        // observer answered with layer 34, so gemma-4 matched NO row in the
+        // catalog and refused to load against the numbers it was authored
+        // from.
+        let mut by_name: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        let mut at: BTreeMap<String, u64> = BTreeMap::new();
         for (name, extents) in pairs {
-            by_name.insert(Self::logical(name.as_ref()), extents.as_ref().to_vec());
+            let raw = name.as_ref();
+            let key = Self::logical(raw);
+            let index = Self::layer_index(raw).unwrap_or(0);
+            if at.get(&key).is_some_and(|&seen| seen <= index) {
+                continue;
+            }
+            at.insert(key.clone(), index);
+            by_name.insert(key, extents.as_ref().to_vec());
         }
         Self { by_name }
+    }
+
+    /// The layer index a raw tensor name carries, if it carries one.
+    ///
+    /// Both spellings, for the reason [`Self::logical`] reads both: a
+    /// HuggingFace checkpoint writes `layers.7.` and pie's own artifacts
+    /// write `layer.7.`.
+    fn layer_index(raw: &str) -> Option<u64> {
+        let (at, token) = ["layers.", "layer."]
+            .into_iter()
+            .filter_map(|token| raw.find(token).map(|at| (at, token)))
+            .min_by_key(|(at, _)| *at)?;
+        let rest = &raw[at + token.len()..];
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
     }
 
     /// The extents published under a logical name.

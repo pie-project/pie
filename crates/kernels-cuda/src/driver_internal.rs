@@ -257,9 +257,6 @@ pub fn rmsnorm_gated_fp32_in_bf16(
         In { ptr: gate.cast::<bf16>(), rows: num_rows, width: hidden },
         Const { v: weight.cast::<f32>() },
         shape(y.cast::<bf16>()),
-        // `per_head_dim`, WHICH NOTHING SUPPLIES: zero is "the whole row",
-        // which is what the routine's own guard reads it as.
-        0,
     )
 }
 

@@ -331,14 +331,33 @@ impl DispatchPlan {
                         ..LaunchSpec::default()
                     },
                     // The FIRST weight rides the spec too, for `scale.*` arms.
-                    OpKind::Launch { weights, params, .. } => LaunchSpec {
+                    // `params` does NOT: see below.
+                    OpKind::Launch { weights, .. } => LaunchSpec {
                         weight: weights.first().cloned(),
                         weight2: weights.get(1).cloned(),
-                        params: params.clone(),
                         ..LaunchSpec::default()
                     },
                     _ => LaunchSpec::default(),
                 };
+                // THE LOWERING'S PARAMS RUN, NOT THE OP'S, and for two reasons.
+                //
+                // A SEMANTIC op has no `params` field at all, so reading the
+                // op left every one of them with an empty run -- and
+                // `lower::walk` now gives a semantic op the scalars its own
+                // variant carries (`OpKind::Rope`'s `partial` IS
+                // `rope_partial_bf16`'s `rotary_dim`). Reading the op threw
+                // that away again one layer down, and gemma-4 refused at its
+                // first partial rope.
+                //
+                // And for a STATED launch the two are not equal either: the
+                // lowering substitutes `param_extents` into the run, so a
+                // statement whose scalar is a shape's element count carried
+                // the placeholder here rather than the number.
+                spec.params = lowered
+                    .params
+                    .get(launch.params.start as usize..launch.params.end as usize)
+                    .unwrap_or_default()
+                    .to_vec();
                 spec.outs = outs;
                 spec.n_in = op.inputs.len();
                 // Mirrors the lowerer's split, not the op's dataflow:
@@ -1441,7 +1460,14 @@ impl MapResolver {
 
 impl Resolver for MapResolver {
     fn weight(&mut self, name: &str) -> Option<*const c_void> {
-        self.weights.get(name).copied()
+        let hit = self.weights.get(name).copied();
+        // A NAME THE LOAD DOES NOT HOLD. The miss is silent by design -- a
+        // nullable bias binds null and the launch runs biasless -- so the one
+        // thing a wrong ANSWER never says is which name it wanted.
+        if hit.is_none() && std::env::var_os("PIE_TRACE_WEIGHTS").is_some() {
+            eprintln!("[weight] miss: {name}");
+        }
+        hit
     }
     fn named(&mut self, value: ValueId) -> Option<*mut c_void> {
         self.named.get(&value).copied()

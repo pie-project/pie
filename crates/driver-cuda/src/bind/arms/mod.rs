@@ -124,9 +124,19 @@ pub const fn row_census() -> (usize, usize, usize) {
 // wants something `Cx` may not offer (northstar §3.3).
 const _: () = {
     let (armed, refused, driver) = row_census();
-    // 137 since `mlp::chunked_swiglu_into_bf16` joined: one kernel, two
-    // statement shapes, two contracts -- see the routine.
-    assert!(armed == 137);
+    // 139 since `mlp::chunked_swiglu_into_bf16` joined (one kernel, two
+    // statement shapes, two contracts), `gemm::act_x_wt_bias_bf16` stopped
+    // being blocked on a `beta` its symbol states, and
+    // `norm::rmsnorm_residual_add_scale_rmsnorm_bf16` on a scale its
+    // statement carries, and `norm::rmsnorm_gated_fp32_in_bf16` on a head
+    // width `keys::GdnVDim` always answered. The last three moved OUT of
+    // `refused`, which is why that count drops by three -- and gpt-oss's two
+    // MXFP4 decode rows moved the other way, from armed to refused, because
+    // `compute-sanitizer` showed the kernel indexing a per-expert POINTER
+    // ARRAY nothing in this tree builds. A load-time refusal that names the
+    // reason beats an illegal address that poisons the context and surfaces
+    // on an unrelated kernel's module load.
+    assert!(armed == 138);
     assert!(refused == 31);
     assert!(driver == 3);
 };
