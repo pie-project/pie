@@ -24,6 +24,7 @@
 pub mod batch;
 pub mod channel;
 mod error;
+pub mod envelope;
 pub mod layout;
 pub mod loader;
 pub mod lowering;

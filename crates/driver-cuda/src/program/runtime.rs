@@ -2,8 +2,9 @@
 //!
 //! The CUDA half only — NVRTC, cubins, `CUmodule`s; backend-agnostic work
 //! (cache keys, LRU tiers, channel rings) lives in [`driver_pipeline`]. CUDA
-//! emits one kind, `PIE_KERNEL_FUSED`, one per region; library regions the
-//! driver implements natively. Nothing is cached until every region of every
+//! emits one kind, `PIE_KERNEL_FUSED`, one per region — library regions
+//! included, since this driver implements none of them natively. Nothing is
+//! cached until every region of every
 //! stage compiles — a half-installed program is a wrong answer, not a slow one.
 
 use std::collections::HashMap;
@@ -23,9 +24,6 @@ use super::compile::Module;
 /// `PIE_KERNEL_FUSED` — the only kind the CUDA emitter produces. From the ABI,
 /// not a literal, so a renumbering is a build break, not an empty slot forever.
 const KERNEL_FUSED: u32 = driver::driver_api::local::PIE_KERNEL_FUSED;
-
-/// `PIE_REGION_LIBRARY` — a region the driver implements rather than compiles.
-const REGION_LIBRARY: u8 = driver::driver_api::local::PIE_REGION_LIBRARY;
 
 /// One compiled region: the module that holds it and how wide to launch it.
 #[derive(Debug)]
@@ -49,8 +47,9 @@ pub struct Stage {
 }
 
 impl Stage {
-    /// The region with this index, if it was generated. `None` for a library
-    /// or host-declined region; distinguish those by asking the plan, not this.
+    /// The region with this index, if it was compiled. `None` only for a
+    /// host-declined region: this driver compiles library regions too, because
+    /// it implements none of them natively.
     #[must_use]
     pub fn region(&self, region_index: u32) -> Option<&Region> {
         self.regions
@@ -339,19 +338,40 @@ impl Runtime {
         architecture: &str,
     ) -> Result<Stage, Failure> {
         let mut regions = Vec::new();
-        for (region_index, region) in plan.fused.iter().enumerate() {
+        for region_index in 0..plan.fused.len() {
             let region_index = u32::try_from(region_index).map_err(|_| Failure::Deterministic {
                 reason: "a stage with more than 4 billion regions is not a stage".into(),
             })?;
-            // A library region is implemented natively, so the host emits
-            // nothing for it — not a gap, so don't look it up as `Slot::Absent`.
-            if region.kind == REGION_LIBRARY {
-                continue;
-            }
+            // NOT skipped for being a library region. `PIE_REGION_LIBRARY`
+            // means the plan OFFERS a native implementation, and a driver that
+            // has one may take it; this one has none — `emit_cuda_stage` sends
+            // every region, library or not, through `emit_fused_region`, where
+            // Metal's `grouped_library` picks `emit_grouped_nucleus` instead.
+            // Skipping here dropped the emitted kernel on the floor: the
+            // sampler's whole chain — softmax, top-p mask, Gumbel draw — never
+            // launched, its scratch stayed at the `memset`, and every nonzero
+            // temperature published token 0 (`.wiki/migration.md` §11.21). A
+            // `Slot::Absent` below is the honest answer if a library region
+            // ever arrives unemitted.
             let (source, entry) = match index.get(KERNEL_FUSED, stage_index, region_index) {
                 Slot::Kernel { source, entry } => (source, entry),
-                // The host declined on purpose; the driver takes its own path.
-                Slot::Refused(_) => continue,
+                // NOT a `continue`. "The host declined on purpose" presumes a
+                // driver with its own path for the region, and this one has
+                // none — every region it runs is a compiled `PIE_KERNEL_FUSED`.
+                // Skipping a refusal dropped the region's ops from the fire
+                // while the plan still budgeted their scratch, so they read
+                // back as the zeros `Prepared::build` memset and published a
+                // confident wrong answer. A reason nobody can act on is still
+                // better than an answer nobody can distinguish.
+                Slot::Refused(why) => {
+                    return Err(Failure::Deterministic {
+                        reason: format!(
+                            "stage {stage_index} region {region_index} was declined by the \
+                             emitter ({why}); this driver runs only compiled regions, so a \
+                             declined one would silently not run at all"
+                        ),
+                    });
+                }
                 Slot::Absent => {
                     return Err(Failure::Deterministic {
                         reason: format!(

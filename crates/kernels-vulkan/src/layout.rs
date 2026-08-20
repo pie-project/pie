@@ -609,21 +609,18 @@ mod tests {
     /// difference was `LaunchRule::Elementwise` against `ElementwiseRows` and
     /// the driver read it off the row; here each body says which it is.
     ///
-    /// KNOWN FAILING, upstream of this crate: `row_gather`'s `out` is an
-    /// `Out<Tensor<bf16>>` and the `writes: true` below is the claim that
-    /// SHOULD reach the driver for it. Under `kernel!`, `Buf` and `BufMut`
-    /// were separate carriers and `BufMut`'s own `Bind` impl called
-    /// `V::buffer_mut`; the merge into one `Tensor<E>` carrier (this
-    /// refactor) moved the read/write fact to the MARK (`Out`, `InOut`), but
-    /// `kernels::routine`'s `Bind` impls for `Out<E>`/`InOut<E>` (outside
-    /// this crate) delegate to `self.ptr.arg()` exactly as `In<E>` does, so
-    /// no shader-plane dispatch anywhere in this tree can presently produce
-    /// `writes: true` for a positional argument -- confirmed against
-    /// `driver-vulkan::encode::Encode::fire`, which takes the bit off the
-    /// fired `ArgValue` with no re-derivation from the declared `Ty`. The
-    /// assertion is left stating the correct claim rather than weakened to
-    /// match the gap; it will start passing once `Out`/`InOut`'s `Bind`
-    /// impls choose the mutable constructor for a writable carrier.
+    /// The `writes: true` below is load-bearing, not decoration.
+    /// `row_gather`'s `out` is an `Out<Tensor<bf16>>`, and the direction
+    /// survives to the driver only because `kernels::routine`'s `Bind` impl
+    /// for `Out<E>`/`InOut<E>` reaches for `BindMut` -- `Tensor<E>`'s
+    /// `arg_mut`, which is `V::buffer_mut` -- where `In<E>` reaches for
+    /// `Bind`. On this plane `Elem::Read` and `Elem::Write` are the SAME
+    /// type, so the trait is the only thing carrying the fact:
+    /// `driver-vulkan::encode::Encode::fire` takes the bit straight off the
+    /// fired `ArgValue` and never re-derives it from the declared `Ty`, and
+    /// `device::hazards` decides every barrier from what that bit says. A
+    /// mark that bound read-only would cost no error and no crash, only a
+    /// missing write-then-read barrier and a fluent wrong answer.
     #[test]
     fn the_two_join_kernels_ask_for_the_grids_their_shaders_are_written_for() {
         let seen = Seen::default();

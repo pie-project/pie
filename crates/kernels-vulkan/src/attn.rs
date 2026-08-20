@@ -791,7 +791,18 @@ fn flash_decode(
     // from it, and a conservative "writes" between two dispatches that share
     // the buffer costs one execution barrier it was going to need anyway --
     // where narrowing it to a read and getting the direction wrong is a race.
-    let mut args = vec![out.arg()];
+    // `arg_mut`, and the whole decode depends on it. `out` arrives here as a
+    // bare `Tensor<bf16>` -- the caller's `Out<Tensor<bf16>>` mark was spent
+    // at the signature and cannot travel through a helper's positional
+    // parameter -- so the direction has to be restated at the bind. Bound
+    // with `arg()` the fold's own output is not in the driver's write set,
+    // `driver-vulkan::device::hazards` sees no write-then-read between this
+    // dispatch and the projection that consumes the attention output, and no
+    // barrier is emitted: the projection reads the previous step's numbers
+    // wherever the card has not caught up. It is a race, so it is fluent and
+    // wrong rather than a crash, and it costs one barrier per layer per
+    // decode step to be right.
+    let mut args = vec![out.arg_mut()];
     let entrypoint = match which.sinks {
         Some((sinks, module)) => {
             args.push(sinks.arg());

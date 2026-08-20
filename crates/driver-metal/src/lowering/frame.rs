@@ -189,6 +189,31 @@ pub fn rows_of(step: &Step<'_>) -> Result<Vec<Row>, Unbridgeable> {
     if n == 0 {
         return Err(Unbridgeable::NoRows);
     }
+    // The region table arrives in WIRE-row space and is read in TOKEN-row
+    // space: the engine counts one wire row per request
+    // (`planned_region_table` walks `program_row_indptr`), while the rule
+    // below numbers one row per token. `qo_indptr` maps between them -- wire
+    // row `i` owns token rows `qo_indptr[i]..qo_indptr[i + 1]` -- so the
+    // table is TRANSLATED here rather than reinterpreted. `driver-cuda`'s
+    // `fire::launch` does the same thing at the same point and says so.
+    //
+    // Passing the wire table straight through is not a refusal but a wrong
+    // shape: a single-request prefill states `[0, 1]`, which tiles token row
+    // 0 and leaves every other row of the fire uncovered, so the rule below
+    // refused with `DoNotTile { at: 1 }` and no prefill could lower at all.
+    let region_row_indptr: Vec<u32> = step
+        .region_row_indptr
+        .iter()
+        .map(|&wire_row| {
+            // Out of range is passed through rather than clamped: a clamp
+            // would name the wrong rows, where `u32::MAX` is refused by
+            // `rows_from_regions` as the drift it is.
+            step.qo_indptr
+                .get(wire_row as usize)
+                .copied()
+                .unwrap_or(u32::MAX)
+        })
+        .collect();
     // ONE COPY OF THE RULE, and not this crate's own.
     //
     // What stood here was a line-for-line duplicate of
@@ -206,7 +231,7 @@ pub fn rows_of(step: &Step<'_>) -> Result<Vec<Row>, Unbridgeable> {
             indptr: step.sampling_indptr,
             qo_indptr: step.qo_indptr,
         },
-        step.region_row_indptr,
+        &region_row_indptr,
         step.region_sig,
         step.region_k,
     )
@@ -342,14 +367,17 @@ mod tests {
 
     #[test]
     fn a_region_signature_becomes_the_row_it_describes() {
+        // Two requests of two tokens each, because a region table is stated in
+        // WIRE rows -- one per request -- so two regions is two requests. The
+        // token coverage is the same [0,2) / [2,4) it always was.
         let s = Step {
             token_ids: &[1, 2, 3, 4],
-            qo_indptr: &[0, 4],
-            region_row_indptr: &[0, 2, 4],
+            qo_indptr: &[0, 2, 4],
+            region_row_indptr: &[0, 1, 2],
             region_sig: &[sig::TRUNCATED, sig::LORA | sig::MASK],
             region_k: &[4, MAX_LAYERS_FULL],
-            sampling_indices: &[3],
-            sampling_indptr: &[0, 1],
+            sampling_indices: &[1],
+            sampling_indptr: &[0, 0, 1],
         };
         let rows = rows_of(&s).expect("a fire");
         assert_eq!(
@@ -398,15 +426,46 @@ mod tests {
     fn regions_that_leave_a_row_uncovered_are_refused_by_row() {
         // A row with no feature point would lower as the default, which is a
         // DIFFERENT program from the one the scheduler seriated it into.
+        //
+        // Stated in wire rows: two requests, and a table that names only the
+        // first. Wire row 1 is where the second request's tokens begin, so
+        // the gap opens at token row 2.
         let s = Step {
             token_ids: &[1, 2, 3],
-            qo_indptr: &[0, 3],
-            region_row_indptr: &[0, 2],
+            qo_indptr: &[0, 2, 3],
+            region_row_indptr: &[0, 1],
             region_sig: &[0],
             region_k: &[MAX_LAYERS_FULL],
             ..Step::default()
         };
         assert_eq!(rows_of(&s), Err(Unbridgeable::RegionsDoNotTile { at: 2 }));
+    }
+
+    #[test]
+    fn a_region_table_is_read_in_wire_rows_and_not_in_token_rows() {
+        // The regression this pins: `planned_region_table` counts ONE row per
+        // request, and the rule underneath counts one per token. A
+        // single-request prefill therefore states `[0, 1]` however many
+        // tokens it carries, and reading that as token rows tiles row 0 and
+        // leaves the rest of the fire uncovered.
+        //
+        // Before the translation this refused every prefill with
+        // `DoNotTile { at: 1 }`, which is what `pie run` hit on Metal: no
+        // prompt of more than one token could lower at all.
+        let s = Step {
+            token_ids: &[1, 2, 3, 4, 5],
+            qo_indptr: &[0, 5],
+            region_row_indptr: &[0, 1],
+            region_sig: &[sig::TRUNCATED],
+            region_k: &[4],
+            ..Step::default()
+        };
+        let rows = rows_of(&s).expect("one request's prefill is one region");
+        assert_eq!(rows.len(), 5, "every token of the fire is a row");
+        assert!(
+            rows.iter().all(|r| r.depth_k == Some(4)),
+            "the region covers all five rows, not just the first"
+        );
     }
 
     #[test]

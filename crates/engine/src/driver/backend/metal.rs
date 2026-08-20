@@ -14,10 +14,10 @@
 //! `resize_pool` are served against the ported KV pool — `resize_pool` commits
 //! or releases pages without moving an address a fire has bound, the pages
 //! being sparse. `encode` refuses, as the CUDA side does: Metal media encode is
-//! unsupported on both. `copy_state` refuses because no row this driver serves
-//! has recurrent state — the rows that do refuse a Metal load at the row
-//! itself. Refusing by name rather than being absent is what makes this a
-//! working seam with a stated hole.
+//! unsupported on both. `copy_state` is served against the ported recurrent
+//! pool, which the hybrid rows allocate; a checkpoint with no linear-attention
+//! layers refuses it by name, because a fork of such a row has nothing to move
+//! that `copy_kv` has not already moved.
 
 use anyhow::{Result, anyhow, bail};
 
@@ -165,16 +165,46 @@ impl Driver for MetalDriver {
         match self.shell.launch(frame)? {
             driver_metal::serve::Launched::Exhausted => Ok(FrameLaunchOutcome::Exhausted),
             driver_metal::serve::Launched::Impossible => Ok(FrameLaunchOutcome::Impossible),
-            driver_metal::serve::Launched::Ran { faults } => {
+            driver_metal::serve::Launched::Ran { faults, ran_steps } => {
                 // Reported here rather than in the driver, because choosing a
                 // logging backend is not a library's business. A fault kills
                 // the one instance and does not fail the frame; the guest
                 // behind it learns of it from the poison word
                 // `driver::Registry::fire` publishes, not from this line.
-                for (instance, why) in faults {
+                for (instance, why) in &faults {
                     tracing::warn!(instance, %why, "metal: program faulted");
                 }
-                let (_raw, completion) = self.broker.launch_completion(1);
+                // WHAT BECAME OF EACH REQUEST, which is a separate statement
+                // from "the frame ran" below and is equally required.
+                //
+                // The scheduler hands every batch member a `TerminalCell` and
+                // resolves that member's work item by READING it; an untouched
+                // cell holds `Pending`, which `resolve_from_terminal` turns
+                // into `work item completion terminal outcome is still
+                // Pending` and the guest sees as `channel is poisoned:
+                // pipeline: forward failed`. CUDA writes these from its stream
+                // callback and `remote` from the executor's reply, so a
+                // host-side driver has to write them here -- see the same
+                // reasoning, at length, on `vulkan::publish_terminals`.
+                publish_terminals(frame, &faults, ran_steps)?;
+                let (raw, completion) = self.broker.launch_completion(1);
+                // SETTLED ON RETURN, which is what `Ran` means on this
+                // backend and is where it differs from CUDA's seam. There the
+                // target is handed DOWN (`shell.launch(frame, target)`) and
+                // the shell signals it when the GPU retires the work; here
+                // `Shell::launch` waits for every step itself
+                // (`stepper.wait_for` per in-flight fire) and runs the bound
+                // programs over the read-out before it returns, so by this
+                // line there is nothing left in flight to wait for.
+                //
+                // Minting the completion and dropping the target -- which is
+                // what stood here -- is not a slow path but a permanent one:
+                // nothing else in this crate holds the target, so no epoch was
+                // ever published and the scheduler parked on the wait id for
+                // good. `[pie-sched] driver 0 stalled ... in_flight_launches
+                // (1) settled=false` every sixty seconds, on a frame whose GPU
+                // work had finished before the message was first printed.
+                self.broker.notify(completion.wait_id(), raw.target_epoch);
                 Ok(FrameLaunchOutcome::Launched(completion))
             }
         }
@@ -204,7 +234,7 @@ impl Driver for MetalDriver {
 
     /// # Errors
     ///
-    /// Always today: no model this backend serves has recurrent state.
+    /// A checkpoint with no recurrent stack, or a seat outside the pool's.
     fn copy_state(&mut self, desc: &StateCopyPlan) -> Result<SubmissionCompletion> {
         self.shell.copy_state(desc)?;
         Ok(settle_control(&self.broker))
@@ -241,5 +271,155 @@ impl Driver for MetalDriver {
     fn close_channel(&mut self, id: u64) -> Result<()> {
         self.shell.close_channel(id);
         Ok(())
+    }
+}
+
+/// Tell every batch member's work item what became of it.
+///
+/// SUCCESS unless the instance behind the cell faulted this frame, or the
+/// step it belongs to never fired, in which case FAILED. `Launched::Ran`
+/// means every step up to `ran_steps` was submitted, waited for and read out,
+/// so there is no third answer to give: a member that neither ran nor faulted
+/// does not exist on this backend.
+///
+/// A fault is matched by INSTANCE and not by step, which is deliberate over
+/// `vulkan`'s per-step precision: `driver-metal` reports faults for the frame
+/// rather than per step, and an instance whose program faulted is poisoned
+/// for the whole frame anyway, so failing its other steps' cells says what is
+/// already true rather than losing information.
+///
+/// `ran_steps` is the OTHER half of that statement and is not an
+/// optimisation. A step whose device-resolved geometry was not on its channel
+/// yet comes back `Filled::Early`: the driver stops there, and every step
+/// from it onwards has fired nothing. Publishing SUCCESS for those members --
+/// which is what a per-frame answer does -- tells the scheduler a fire
+/// happened, and the guest reads a cell the fire would have written and finds
+/// the previous turn's value. FAILED is the true statement, and the guest
+/// sees the error rather than a fluent wrong answer.
+///
+/// # Errors
+///
+/// A step that names a number of cells its roster does not, or a null cell:
+/// both would have this write past what the scheduler owns, and a raw pointer
+/// is not something a later layer can check.
+fn publish_terminals(
+    frame: &FrameSubmission,
+    faults: &[(u64, String)],
+    ran_steps: usize,
+) -> Result<()> {
+    for (index, step) in frame.steps.iter().enumerate() {
+        if step.terminal_cells.is_empty() {
+            // A step the scheduler is not waiting on -- the driver's own
+            // tests build frames this way -- where writing nothing is the
+            // whole of the right answer.
+            continue;
+        }
+        if step.terminal_cells.len() != step.roster_rows.len() {
+            bail!(
+                "driver-metal: step {index} names {} terminal cells for {} members",
+                step.terminal_cells.len(),
+                step.roster_rows.len()
+            );
+        }
+        for (&cell, &row) in step.terminal_cells.iter().zip(&step.roster_rows) {
+            if cell.is_null() {
+                bail!("driver-metal: a member of step {index} has a null terminal cell");
+            }
+            let id = *frame.instance_ids.get(row as usize).ok_or_else(|| {
+                anyhow!("driver-metal: roster row {row} is outside the frame's instances")
+            })?;
+            let word = if index >= ran_steps || faults.iter().any(|(faulted, _)| *faulted == id) {
+                ::driver_api::PIE_TERMINAL_OUTCOME_FAILED
+            } else {
+                ::driver_api::PIE_TERMINAL_OUTCOME_SUCCESS
+            };
+            // SAFETY: the cell is one the scheduler owns for the life of this
+            // frame and handed down in the submission; `publish` is a release
+            // store into an `AtomicU32` the engine only ever reads, so the
+            // reader that observes the outcome also observes everything the
+            // fire wrote before it.
+            unsafe {
+                (*cell).publish(word);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// The ports this seam claims are the ones it can actually resolve.
+    ///
+    /// The claim is not free: a driver that names `PIE_DECODE_ENVELOPE_PORTS`
+    /// is handed decode envelopes whose geometry it must read off its own
+    /// channels, which is what `driver_metal::envelope::fill` and the peek
+    /// beside it are for. `serve/load.rs` claimed 0 for as long as neither
+    /// existed, and the engine answered the 0 by folding the geometry on the
+    /// host -- which cannot know `EmbedTokens` and said so, by name. So the
+    /// pair is asserted together: the mask, and a call into the machinery
+    /// that earns it.
+    #[test]
+    fn the_geometry_ports_this_seam_claims_are_ones_it_can_resolve() {
+        // The number is a MEASUREMENT, not a constant this file also owns.
+        // `forward.rs` gates the decode envelope on
+        // `device_port_mask & required == required`, where `required` is
+        // computed per envelope by `envelope_required_ports`; the envelope a
+        // real `pie run` of qwen3-0.6b on THIS machine built asked for this,
+        // and said so while the claim was still zero:
+        //
+        //     decode envelope on a driver without device geometry ports
+        //     (mask 0x0, needs 0x25): falling back to host-evaluated
+        //     serialized execution
+        //
+        // Quoting the observed requirement rather than the constant this
+        // driver reports keeps the two sides independent: a
+        // `PIE_DECODE_ENVELOPE_PORTS` that changed under us would fail here
+        // rather than agree with itself.
+        const MEASURED_REQUIREMENT: u32 = 0x25;
+        // The gate itself, once, so the control below asks the same question
+        // of a different mask rather than restating the arithmetic. Written
+        // as a closure because `0 & MEASURED_REQUIREMENT` spelled inline is
+        // `clippy::erasing_op` -- correct about the expression and wrong
+        // about the intent, which is that the ZERO this driver used to report
+        // does not pass a gate the real one does.
+        let covers = |mask: u32| mask & MEASURED_REQUIREMENT == MEASURED_REQUIREMENT;
+        let claimed = ::driver_api::PIE_DECODE_ENVELOPE_PORTS;
+        assert!(
+            covers(claimed),
+            "the mask this seam reports must cover what a real decode envelope asked for"
+        );
+        // The control: the value this file used to report fails that same
+        // gate, which is why the run took the host fallback and died on
+        // `EmbedTokens is not host-derivable`.
+        assert!(
+            !covers(0),
+            "a mask of zero must NOT satisfy the gate, or this test proves nothing"
+        );
+        // And what is NOT claimed is stated too, because this driver stops
+        // strictly short of the wgpu seam beside it: the device-geometry set
+        // names the pages, the CSR and the write descriptor, and
+        // `serve::launch` derives every row's write target from its position
+        // rather than reading one. `envelope::fill` refuses that class by
+        // name for the same reason.
+        assert_ne!(
+            claimed & ::driver_api::PIE_DEVICE_GEOMETRY_PORTS,
+            ::driver_api::PIE_DEVICE_GEOMETRY_PORTS,
+            "this seam claims the decode envelope's ports, not every geometry port"
+        );
+        assert_eq!(
+            claimed & ::driver_api::PIE_DEVICE_PORT_ATTN_MASK,
+            0,
+            "a dense device mask reaches the Metal text through the region table, not the \
+             plan, so the port is not claimed"
+        );
+        // The machinery the claim promises, asked for an instance that is not
+        // there: it must answer by NAME rather than by not existing.
+        let registry = driver_metal::channel::Registry::new();
+        let refused = driver_metal::envelope::geometry(&registry, 7, 16)
+            .expect_err("there is no instance 7");
+        assert!(
+            refused.to_string().contains('7'),
+            "the refusal names the instance it could not find: {refused}"
+        );
     }
 }

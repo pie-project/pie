@@ -141,6 +141,78 @@ impl Pool {
         Ok(())
     }
 
+    /// Copy one seat's conv pair and DeltaNet memory onto another's, in every
+    /// layer.
+    ///
+    /// What a FORK means. A request that branches off another shares its
+    /// prefix, and for the attention layers that is what `copy_kv` moves;
+    /// for the linear-attention layers the whole prefix is compressed into
+    /// this seat, so the branch has to take a copy of it or start from a
+    /// zeroed history that never saw the prompt.
+    ///
+    /// Both conv planes travel, for the same reason [`Self::clear_slot`]
+    /// zeroes both: `carry_forward` copies the write plane over the read one
+    /// after the next fire, so a destination whose write plane still held the
+    /// seat's old window would have that window come back a step later and
+    /// overwrite what was just copied in.
+    ///
+    /// # Errors
+    ///
+    /// Either slot past the pool's count.
+    ///
+    /// # Safety
+    ///
+    /// No fire may be reading or writing either seat. Same contract as
+    /// [`Self::carry_forward`], and the caller owns it for the same reason:
+    /// this is a host `memmove` over bound addresses, ordered against the GPU
+    /// by nothing but the caller having waited.
+    pub unsafe fn copy_slot(&self, src: u32, dst: u32) -> Result<()> {
+        let shape = self.shape;
+        for slot in [src, dst] {
+            if slot >= shape.slots {
+                return Err(crate::error::Error::Unserved {
+                    what: "copy_state",
+                    message: format!(
+                        "slot {slot} is outside the {} this pool was allocated with",
+                        shape.slots
+                    ),
+                });
+            }
+        }
+        // A seat onto itself is what a plan says when the scheduler renumbers
+        // without moving anything. Copying would be correct and pointless;
+        // saying so here keeps the overlap argument below trivial.
+        if src == dst {
+            return Ok(());
+        }
+        for l in &self.layers {
+            // SAFETY: the caller has waited. `Region::copy` is a memmove and
+            // the two spans are distinct -- `src != dst` above -- so they
+            // cannot overlap within a plane.
+            unsafe {
+                l.conv.copy(
+                    shape.conv_offset(dst),
+                    l.conv.handle(),
+                    shape.conv_offset(src),
+                    shape.conv_bytes_per_slot(),
+                )?;
+                l.new_conv.copy(
+                    shape.conv_offset(dst),
+                    l.new_conv.handle(),
+                    shape.conv_offset(src),
+                    shape.conv_bytes_per_slot(),
+                )?;
+                l.state.copy(
+                    shape.state_offset(dst),
+                    l.state.handle(),
+                    shape.state_offset(src),
+                    shape.state_bytes_per_slot(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Make what the last fire wrote what the next fire reads.
     ///
     /// The whole plane and not the fired slots. That is the correctness

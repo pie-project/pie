@@ -20,4 +20,4 @@ pub use validate::{second_party_region_supported, validate_generated_region};
 
 /// `kCudaGeneratedEmitterVersion` — bumped whenever emitted CUDA changes, so
 /// the driver's compile cache keys on it.
-pub const CUDA_GENERATED_EMITTER_VERSION: u16 = 21;
+pub const CUDA_GENERATED_EMITTER_VERSION: u16 = 22;

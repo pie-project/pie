@@ -1078,6 +1078,22 @@ fn text_of(
             // `Shell::open` rather than guessing.
             n_experts: 0,
             experts_per_token: 0,
+            // The recurrent pair, which is NOT the attention pair: a
+            // gated-deltanet layer's value heads size the recurrent slab, the
+            // gated norm and the scan grid, and a stack that mixes them with
+            // full attention layers states both. Zero for a stack with none,
+            // which `Geometry::recurrent` reads as "use the attention pair" --
+            // the behaviour every fixture predating the pair was measured on.
+            v_heads: deployment
+                .recurrent
+                .as_ref()
+                .and_then(|rs| u32::try_from(rs.v_h).ok())
+                .unwrap_or(0),
+            v_dim: deployment
+                .recurrent
+                .as_ref()
+                .and_then(|rs| u32::try_from(rs.v_d).ok())
+                .unwrap_or(0),
         },
         layers: u16::try_from(deployment.layers).map_err(|_| {
             anyhow!(
@@ -1338,6 +1354,11 @@ kv_pages = 64
             paged_multi_batch: true,
             qmm_multi_batch: true,
             add_bias: true,
+            // The same value `text_of` states, for the same reason: this test
+            // measures a refusal on the recurrent slot, so every other fact
+            // must be the one the seam really deploys with or the refusal it
+            // observes is a different text's.
+            fused_qk_rope: true,
         };
 
         let mut hybrids = 0;
@@ -1701,10 +1722,21 @@ kv_pages = 64
                     .step(std::slice::from_ref(&turn))
                     .unwrap_or_else(|e| panic!("the step ran: {e}"));
                 assert_eq!(step.rows, rows, "the fire answered a different width");
-                let vocab = step.logits.vocab;
-                // The last row is the one that has seen the whole prompt.
-                let at = (rows - 1) * vocab;
-                let row = &step.logits.values[at..at + vocab];
+                // The row that has seen the whole prompt, ASKED FOR BY NAME.
+                // A turn reads out one row and the readout buffer holds only
+                // the rows a fire gathered, so `values` is one distribution
+                // however many tokens were fired -- indexing it at
+                // `(rows - 1) * vocab` walked off the end of a 32-token
+                // prefill. `readout_of` is the seam between the two spaces
+                // and `Logits::row` is what resolves it.
+                let at = *step
+                    .readout_of
+                    .first()
+                    .expect("the one turn this step fired names a readout");
+                let row = step
+                    .logits
+                    .row(at)
+                    .expect("the readout row this step named is a row it read");
                 let next = row
                     .iter()
                     .enumerate()

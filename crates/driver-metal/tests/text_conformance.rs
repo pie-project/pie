@@ -482,11 +482,23 @@ fn fires(text: &Text) -> Vec<(FireClass, Lowered)> {
         .into_iter()
         .map(|(class, rows)| {
             let plan = (text.plan)(class);
+            // `multi_token` IS THE PREFILL, and a row count is not.
+            //
+            // These rows were `Row::default()` at both classes, so the
+            // prefill lane was thirty-two rows each carrying a ONE-token
+            // query window -- a batched decode, which is a real fire and not
+            // the one this asks about. `GuardPred::WindowOne` reads exactly
+            // that field (`lower::walk`), and `llama_like`'s attention arms
+            // on it, so the fixture answered "every row is one token" and the
+            // plan correctly named `sdpa_paged_decode`. The test that exists
+            // to keep a prefill off the per-row kernel was reading the guard
+            // that puts a BATCHED DECODE there on purpose.
             let low = lower(
                 &plan,
                 &vec![
                     Row {
                         samples: true,
+                        multi_token: class != FireClass::Decode,
                         ..Row::default()
                     };
                     rows
@@ -861,9 +873,7 @@ fn shader_slots(
                 .split('&')
                 .next()
                 .unwrap_or(decl)
-                .split_whitespace()
-                .filter(|w| *w != "const" && *w != "constant" && *w != "device")
-                .next_back()
+                .split_whitespace().rfind(|w| *w != "const" && *w != "constant" && *w != "device")
                 .unwrap_or("");
             if PRIMITIVE.contains(&base) {
                 "scalar"
@@ -1074,35 +1084,6 @@ fn between_parens(src: &str, at: usize) -> Option<String> {
     Some(src[open + 1..close].to_owned())
 }
 
-/// **The routine's signature agrees with its shader.**
-///
-/// `model::executor` used to bind "operands in the trace's stated order" —
-/// inputs, then outputs, then weights, at buffers `0..n`. That is the
-/// COMPILER's convention and it is not the kernels'. `affine_qmv_fast`
-/// declares `w, scales, biases, x, y`: weights first. So the activation bound
-/// where the packed weight belongs, and every operand after it was one slot
-/// further wrong — on all nine of `llama_like`'s statements.
-///
-/// A `kernel!` row's `operands` column was the first answer, and this test
-/// checked that column against the `.metal` source. The routines replaced it:
-/// a body's Rust signature IS the argument table, in order, and the arm in
-/// `lowering/arm.rs` is what fills it. So the comparison moves to the
-/// signature, and it gets stronger by moving — the column was stated on
-/// forty-eight of a hundred rows, and every routine has a signature.
-///
-/// The row is still what joins the two. It states `symbol` and `file`, which
-/// is where the shader is; the routine states the parameters. Neither alone
-/// can be checked against the MSL.
-///
-/// Two claims, and the second is the one that caught the original bug:
-///
-/// * same count. A signature with more buffers than the shader declares
-///   binds past the end of the argument table.
-/// * the writable buffer in the same place. `Ty::BufMut` and `Ty::F32sMut`
-///   are the routine saying "this one is written", and the shader says it
-///   with the absence of `const`. A routine that puts its output where the
-///   shader put an input does not fault; it writes over its own input and
-///   returns something plausible.
 /// The index of the bracket that closes the one at `start`.
 fn balanced(bytes: &[u8], start: usize) -> Option<usize> {
     let mut depth = 0i32;
@@ -1186,6 +1167,27 @@ fn dispatch_list(name: &str) -> Option<Vec<(String, String)>> {
         let body = close + text[close..].find('{')?;
         let end = balanced(text.as_bytes(), body)?;
         let body = &text[body..end];
+        // A DISPATCHED VALUE NEED NOT BE A PARAMETER.
+        //
+        // The signature was the whole table when this was written, and it is
+        // not: `ctx.ask` binds what the ENVIRONMENT carries rather than what
+        // the statement does, and such a value is dispatched beside the
+        // parameters. Reading only the signature leaves those entries with an
+        // empty type, and an empty type is not `InPacked`, so the strip below
+        // stopped at the first one and `row_gather` counted the request count
+        // -- a field of the struct at buffer 3 -- as a fifth buffer.
+        for (at, _) in body.match_indices("ctx.ask::<") {
+            let Some(name) = body[..at].rsplit_once("let ").map(|(_, n)| n) else {
+                continue;
+            };
+            let name = name.split(['=', ':']).next().unwrap_or_default().trim();
+            let Some(ty) = body[at + "ctx.ask::<".len()..].split(',').next() else {
+                continue;
+            };
+            if !name.is_empty() {
+                types.insert(name.to_owned(), ty.trim().to_owned());
+            }
+        }
         let list = body.rfind("&[")?;
         let list_end = balanced(body.as_bytes(), list + 1)?;
         return Some(
@@ -1242,6 +1244,47 @@ fn routine_kind(ty: &str) -> Option<&'static str> {
     }
 }
 
+/// The ORPHAN this absorbed, and what it was doing loose in the file.
+///
+/// Everything from here to the next rule sat above `fn balanced`, a
+/// bracket-matching helper it says nothing about -- left behind when the
+/// test it documents moved down past the helpers. A doc comment with no
+/// item under it is not a compile error and `-D warnings` only reached it
+/// once this crate's clippy step was run, which no machine had done on this
+/// branch. It is kept whole rather than deleted: it records the ORIGINAL
+/// defect, which the ledger below is the descendant of.
+///
+///
+/// `model::executor` used to bind "operands in the trace's stated order" —
+/// inputs, then outputs, then weights, at buffers `0..n`. That is the
+/// COMPILER's convention and it is not the kernels'. `affine_qmv_fast`
+/// declares `w, scales, biases, x, y`: weights first. So the activation bound
+/// where the packed weight belongs, and every operand after it was one slot
+/// further wrong — on all nine of `llama_like`'s statements.
+///
+/// A `kernel!` row's `operands` column was the first answer, and this test
+/// checked that column against the `.metal` source. The routines replaced it:
+/// a body's Rust signature IS the argument table, in order, and the arm in
+/// `lowering/arm.rs` is what fills it. So the comparison moves to the
+/// signature, and it gets stronger by moving — the column was stated on
+/// forty-eight of a hundred rows, and every routine has a signature.
+///
+/// The row is still what joins the two. It states `symbol` and `file`, which
+/// is where the shader is; the routine states the parameters. Neither alone
+/// can be checked against the MSL.
+///
+/// Two claims, and the second is the one that caught the original bug:
+///
+/// * same count. A signature with more buffers than the shader declares
+///   binds past the end of the argument table.
+/// * the writable buffer in the same place. `Ty::BufMut` and `Ty::F32sMut`
+///   are the routine saying "this one is written", and the shader says it
+///   with the absence of `const`. A routine that puts its output where the
+///   shader put an input does not fault; it writes over its own input and
+///   returns something plausible.
+///
+/// ---
+///
 /// **Every routine's dispatch list, held against its shader's buffers.**
 ///
 /// This check kept two ledgers and now keeps none, and the emptying is the

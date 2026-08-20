@@ -25,6 +25,21 @@ pub struct Gemma4CudaFacts {
     /// through [`model_ir::facts::window_left_at`], which documents its shape.
     #[serde(default)]
     pub window_left: Vec<i32>,
+    /// Each layer's `layer_scalar`, the `[1]` tensor its PLE landing
+    /// multiplies the residual by.
+    ///
+    /// A CHECKPOINT'S NUMBER, so it belongs in the statement rather than in a
+    /// fact the fire asks for (`.wiki/migration.md` §11.20's rule: two fires of
+    /// the same deployment cannot see different answers here). It reaches this
+    /// struct from `Deployed::layer_scalars`, which the loader fills by reading
+    /// each tensor to the host once.
+    ///
+    /// Empty means "no row states one", and the landing then scales by the
+    /// identity — which is what every synthetic fixture does and what this
+    /// text did for every layer of every deployment until the walk against
+    /// transformers was able to run and disagree.
+    #[serde(default)]
+    pub layer_scalars: Vec<f32>,
 }
 
 impl Gemma4CudaFacts {
@@ -38,6 +53,9 @@ impl Gemma4CudaFacts {
             fused_qkv: true,
             gate_up_fused: true,
             kv_native_bf16: true,
+            // A fixture states no checkpoint, so it states no scalar and the
+            // landing scales by the identity.
+            layer_scalars: Vec::new(),
         }
     }
 }

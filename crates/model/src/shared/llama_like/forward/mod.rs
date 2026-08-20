@@ -455,7 +455,28 @@ fn llama_like_metal_text(
         };
         // Whether the batched arm multiplies in `half`. See
         // `LlamaLikeMetalFacts::qmm_fp16_precast`.
-        let precast = metal.qmm_fp16_precast;
+        //
+        // The fact is read as a PERMISSION and not as an assertion, which is
+        // the difference between a text that will not load and one that
+        // lowers a little slower than it could. `affine_qmm_t_fp16_precast`
+        // is stamped at `gs = 64, b = 4` and nowhere else, so at any other
+        // codec the staged spelling names a symbol that does not exist and
+        // `builder`'s signature check refuses the whole declaration. A fact
+        // is authored per deployment and its codec is authored beside it, so
+        // the two CAN disagree, and one did: the 8-bit `llama_like` row in
+        // `driver-metal`'s `text_conformance` set `affine_bits: 8` over a
+        // `synthetic()` whose `qmm_fp16_precast` is `true`, and named
+        // `affine_qmm_t_fp16_precast_bfloat16_gs_64_b_8_bm_32_bn_32`. The
+        // codec is the thing that cannot be argued with, so it is conjoined
+        // here rather than trusted to every author.
+        let precast = metal.qmm_fp16_precast
+            && crate::shared::llama_like::project::qmm_fp16_precast(
+                match metal.proj_repr {
+                    model_dsl::WeightRepr::Scaled { group, .. } => group,
+                    _ => 0,
+                },
+                metal.affine_bits,
+            );
         // `staged` is the POINT's and not the deployment's, for the same
         // reason `pt` is a parameter: one projection in this stack may not
         // share the stack's codec. The router gate is 8-bit where the
@@ -1128,6 +1149,11 @@ fn llama_like_metal_text(
                     // the kernel, through the row's `grid_param`.
                     metal.rotary_dim_at(l, f.head_dim),
                     metal.rope_freq_table,
+                    // WHICH READING of that extent, which is a second fact
+                    // and not derivable from the first: a partial rotary is
+                    // either a head of its own size or a slice of a wider
+                    // one, and only the config says which.
+                    metal.rope_proportional,
                 )
             };
             // A shared layer appends nothing: its source already did.

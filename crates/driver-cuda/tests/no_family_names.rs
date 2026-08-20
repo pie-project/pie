@@ -75,6 +75,17 @@ fn budget() -> BTreeMap<&'static str, usize> {
         // `low_freq_factor`/`high_freq_factor`, and a refusal that will not
         // say whose scheme it wants is not worth printing.
         ("bind/arms/rope.rs", 1),
+        // Two, and both are a MEASUREMENT's provenance rather than a branch.
+        // The two MXFP4 decode rows are unbound on a per-expert pointer array
+        // nothing in this tree builds; the reason names gpt-oss because that
+        // is the export `compute-sanitizer` was run against to establish the
+        // kernel really indexes `packed_ptrs[expert]`, and names qwen3.5
+        // because `build_moe_ptrs_aligned` is ITS statement-side builder and a
+        // reader who did not know that would go looking for a bug in it. A
+        // refusal that cannot say what was measured, on what, is a refusal
+        // nobody can act on. Neither mention reaches a dispatch decision:
+        // both arms are `arm: None`.
+        ("bind/arms/quant.rs", 2),
         // Zero, kept explicit rather than dropped: its three mentions were
         // `ffi::pie_k_gemm_act_x_wt_bf16` call sites, now
         // `use crate::fire::gemm::act_x_wt_bf16;` -- neither spelling

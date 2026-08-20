@@ -241,6 +241,148 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
+/// Temporary throughput probe: counts fires and launches and splits the wall
+/// clock into encode (CPU recording) and submit-to-drained (GPU). Enabled by
+/// `PIE_WGPU_PROBE=1`; a no-op otherwise.
+pub mod probe {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    use std::time::Instant;
+
+    static FIRES: AtomicU64 = AtomicU64::new(0);
+    static LAUNCHES: AtomicU64 = AtomicU64::new(0);
+    static ENCODE_NS: AtomicU64 = AtomicU64::new(0);
+    static GPU_NS: AtomicU64 = AtomicU64::new(0);
+    static ON: AtomicBool = AtomicBool::new(false);
+    static INIT: std::sync::Once = std::sync::Once::new();
+
+    fn on() -> bool {
+        INIT.call_once(|| {
+            let want = std::env::var_os("PIE_WGPU_PROBE").is_some();
+            ON.store(want, Relaxed);
+            if want {
+                std::thread::spawn(|| {
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        let (fires, launches, encode, gpu) = take();
+                        if fires == 0 {
+                            continue;
+                        }
+                        eprintln!(
+                            "[probe] fires={fires} launches={launches} \
+                             launches/fire={:.1} encode={encode:.1}ms gpu={gpu:.1}ms \
+                             gpu/launch={:.0}us",
+                            launches as f64 / fires as f64,
+                            gpu * 1000.0 / launches as f64,
+                        );
+                        report();
+                    }
+                });
+            }
+        });
+        ON.load(Relaxed)
+    }
+
+    /// A start stamp, or `None` when the probe is off.
+    pub fn now() -> Option<Instant> {
+        on().then(Instant::now)
+    }
+
+    /// Fold one fire's launch count and split timings into the counters.
+    pub fn record(launches: usize, started: Option<Instant>, encoded: Option<Instant>) {
+        let (Some(started), Some(encoded)) = (started, encoded) else {
+            return;
+        };
+        let done = Instant::now();
+        FIRES.fetch_add(1, Relaxed);
+        LAUNCHES.fetch_add(launches as u64, Relaxed);
+        ENCODE_NS.fetch_add((encoded - started).as_nanos() as u64, Relaxed);
+        GPU_NS.fetch_add((done - encoded).as_nanos() as u64, Relaxed);
+    }
+
+    /// Take and clear the counters: `(fires, launches, encode_ms, gpu_ms)`.
+    pub fn take() -> (u64, u64, f64, f64) {
+        (
+            FIRES.swap(0, Relaxed),
+            LAUNCHES.swap(0, Relaxed),
+            ENCODE_NS.swap(0, Relaxed) as f64 / 1e6,
+            GPU_NS.swap(0, Relaxed) as f64 / 1e6,
+        )
+    }
+
+    static DUMPED: AtomicU64 = AtomicU64::new(0);
+
+    /// Time each launch on its own submission instead of recording the whole
+    /// fire into one command buffer. Costs a queue round trip per launch, which
+    /// is the price of knowing WHICH launch spends the fire's time -- wgpu
+    /// exposes no timestamp query here, and one submit means one number.
+    pub fn per_launch() -> bool {
+        on() && std::env::var_os("PIE_WGPU_PROBE_EACH").is_some()
+    }
+
+    static COST: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>>> =
+        std::sync::OnceLock::new();
+
+    /// Charge `nanos` to `entrypoint`.
+    pub fn charge(entrypoint: &str, grid: [u32; 3], nanos: u64) {
+        let map = COST.get_or_init(Default::default);
+        let key = format!("{entrypoint} grid={grid:?}");
+        let mut map = map.lock().expect("probe map");
+        let slot = map.entry(key).or_insert((0, 0));
+        slot.0 += 1;
+        slot.1 += nanos;
+    }
+
+    /// Print the per-entrypoint totals, most expensive first, and clear them.
+    pub fn report() {
+        let Some(map) = COST.get() else { return };
+        let mut rows: Vec<(String, (u64, u64))> =
+            std::mem::take(&mut *map.lock().expect("probe map"))
+                .into_iter()
+                .collect();
+        if rows.is_empty() {
+            return;
+        }
+        rows.sort_by_key(|(_, (_, ns))| std::cmp::Reverse(*ns));
+        let total: u64 = rows.iter().map(|(_, (_, ns))| ns).sum();
+        eprintln!("[cost] total {:.1}ms", total as f64 / 1e6);
+        for (name, (n, ns)) in rows.iter().take(20) {
+            eprintln!(
+                "[cost] {:7.1}ms {:5.1}% {n:4} x {name}",
+                *ns as f64 / 1e6,
+                *ns as f64 * 100.0 / total as f64,
+            );
+        }
+    }
+
+    /// Print one fire's launch list (entrypoint and grid) the first time a fire
+    /// of at least `PIE_WGPU_DUMP` launches is seen.
+    pub fn dump(seen: impl Fn() -> Vec<(String, [u32; 3])>) {
+        if !on() {
+            return;
+        }
+        let Some(min) = std::env::var("PIE_WGPU_DUMP").ok().and_then(|v| v.parse::<usize>().ok())
+        else {
+            return;
+        };
+        if DUMPED.load(Relaxed) != 0 {
+            return;
+        }
+        let list = seen();
+        if list.len() < min {
+            return;
+        }
+        DUMPED.store(1, Relaxed);
+        let mut counts: std::collections::BTreeMap<(String, [u32; 3]), usize> =
+            std::collections::BTreeMap::new();
+        for (name, groups) in list {
+            *counts.entry((name, groups)).or_default() += 1;
+        }
+        for ((name, groups), n) in counts {
+            eprintln!("[dump] {n:4} x {name} grid={groups:?}");
+        }
+    }
+}
+
 use kernels_wgpu::Capability;
 
 use crate::binding::{Allocation, Bound};
@@ -1932,6 +2074,7 @@ impl Device {
     /// anything after it, which singles out no dispatch and must not pretend
     /// to.
     pub fn run_all(&self, run: &[Recorded<'_, '_>]) -> Result<Ran, (Stage, Failed)> {
+        let started = probe::now();
         if run.is_empty() {
             return Ok(Ran::default());
         }
@@ -1948,6 +2091,11 @@ impl Device {
         for (at, one) in run.iter().enumerate() {
             shadows.push(self.shadow(one).map_err(|e| (Stage::Launch(at), e))?);
         }
+        probe::dump(|| {
+            run.iter()
+                .map(|one| (one.pipeline.entrypoint.clone(), one.groups))
+                .collect()
+        });
         let copies: usize = shadows.iter().map(|s| s.len()).sum();
 
         // Then every bind group, so that recording holds only references.
@@ -1963,6 +2111,47 @@ impl Device {
             self.device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) })
         };
+        if probe::per_launch() {
+            for (at, one) in run.iter().enumerate() {
+                let mut work = encoder("fire/one");
+                for copy in &shadows[at] {
+                    work.copy_buffer_to_buffer(
+                        &copy.from.inner,
+                        copy.at,
+                        &copy.into,
+                        0,
+                        Some(copy.bytes),
+                    );
+                }
+                {
+                    let mut pass = work.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("fire/one"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&one.pipeline.pipeline);
+                    pass.set_bind_group(STORAGE_GROUP, &bound[at].storage, &[]);
+                    if let Some(block) = &bound[at].uniform {
+                        pass.set_bind_group(UNIFORM_GROUP, block, &[]);
+                    }
+                    pass.dispatch_workgroups(one.groups[0], one.groups[1], one.groups[2]);
+                }
+                let whole = Stage::Submission { of: at };
+                let began = std::time::Instant::now();
+                self.queue.submit([work.finish()]);
+                self.drained().map_err(|e| (whole, e))?;
+                self.wait().map_err(|e| (whole, e))?;
+                probe::charge(
+                    &one.pipeline.entrypoint,
+                    one.groups,
+                    began.elapsed().as_nanos() as u64,
+                );
+            }
+            probe::record(run.len(), started, probe::now());
+            return Ok(Ran {
+                shadowed: copies,
+                buffers: run.len(),
+            });
+        }
         // ONE command buffer for the whole fire, copies and passes alike.
         //
         // A shadow point still ends the pass -- `copy_buffer_to_buffer` is not
@@ -2029,6 +2218,7 @@ impl Device {
         }
         submission.push(work.finish());
         let buffers = submission.len();
+        let encoded = probe::now();
         self.queue.submit(submission);
         let whole = Stage::Submission { of: run.len() };
         self.drained().map_err(|e| (whole, e))?;
@@ -2037,6 +2227,7 @@ impl Device {
         // drop: they go when `bound` and `shadows` do, which is after the queue
         // is done with them.
         self.wait().map_err(|e| (whole, e))?;
+        probe::record(run.len(), started, encoded);
         drop(bound);
         drop(shadows);
         Ok(Ran {

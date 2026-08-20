@@ -280,6 +280,32 @@ pub fn rms_residual_scaled(
 /// gemma's value norm, and the absent weight is the whole difference from
 /// [`rms_single_row`] -- which is why `out` is buffer 1 here and 2 there.
 ///
+/// # The axis is a HEAD and never the row
+///
+/// This read `axis = x.width` and it is the one norm in this file that can
+/// never mean that. `Deployment::v_norm` is a PER-HEAD RMS over the value
+/// projection: `dsl::metal::vnorm` states `head_dim` in `params[1]` and
+/// `norm/vector.metal` reads that slot as `axis_size`, so the SHADER always
+/// normalized 256 channels while this body sized the launch for 2048.
+///
+/// `rms_grid`'s own doc says what that costs -- *"Handing such a fire one
+/// threadgroup per row normalizes head 0 and leaves every other head as the
+/// projection wrote it"* -- and it is worse here than there, because the
+/// output is a fresh arena value rather than the input: gemma-4-26b-a4b's V
+/// is 8 heads of 256 over 4 rows, so `width/axis == 1` gave 4 threadgroups
+/// where 32 were owed, and threadgroups 0..3 wrote row 0's FIRST FOUR heads
+/// while heads 4..7 and rows 1..3 kept whatever the arena held from an
+/// earlier statement. Measured against MLX at position zero: head 0 agreed
+/// to four decimals and element 1043 -- head 4 -- read 72.5 where MLX says
+/// -0.124. Every layer's attention then read three quarters of a stale value
+/// tensor, which is position-INDEPENDENT and NaN-free, and the readout was a
+/// fluent-looking distribution with the wrong argmax (236772 against MLX's
+/// 3643).
+///
+/// So the axis is declared and read, exactly as [`rms_single_row`] declares
+/// and reads it, and `eps` is here for the same reason it is there: to hold
+/// slot 0 open for the slot that matters.
+///
 /// # Errors
 ///
 /// See [`rms_grid`].
@@ -287,12 +313,18 @@ pub fn rms_residual_scaled(
 pub fn vnorm_single_row(
     ctx: &Ctx<'_>,
     x: In<Tensor<bf16>>,
-    out: Out<Tensor<bf16>>) -> Result<(), Refusal> {
+    out: Out<Tensor<bf16>>,
+    // THE STRUCT'S FIRST TWO FIELDS, DECLARED SO THE SECOND ONE'S SLOT
+    // EXISTS. The body forwards `ctx.params()` whole -- the shader reads a
+    // `VNormParams` -- but the AXIS is the norm's own width and the body
+    // needs it to size the launch.
+    eps: Const<f32>,
+    axis: Const<i32>) -> Result<(), Refusal> {
+    let _ = eps;
     let params = ctx.params()?;
     let width = x.width;
-    let axis = x.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
-    let (lanes, group) = rms_grid(width, axis, rows)?;
+    let (lanes, group) = rms_grid(width, *axis, rows)?;
     ctx.fire(
         Fire::at("norm/vector.metal", "vnorm_single_row_bfloat16").apply(Grid::of(lanes, group)),
         &[x.arg(), out.arg(), params],

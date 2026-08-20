@@ -1084,7 +1084,15 @@ pub fn qmm_t_residual_fp16_precast(
     residual: In<Tensor<bf16>>,
     bm: Const<i32>,
     bn: Const<i32>) -> Result<(), Refusal> {
-    let k = residual.width;
+    // THE ACTIVATION'S WIDTH AND NOT THE RESIDUAL'S. `k` is the reduction
+    // depth -- how far along a row of the weight the tile walks -- so it is
+    // the width of what is being multiplied, and the residual is shaped like
+    // the RESULT. The two are equal only where a projection is square, which
+    // is why reading the wrong one survives every shape test and fails on a
+    // real model: qwen3's attention output projection takes a 2048-wide q
+    // and adds a 1024-wide residual, so this halved `k` and the tile summed
+    // the first half of every row. Finite, varied and wrong.
+    let k = half_in.width;
     let n = y.width;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
@@ -1128,7 +1136,22 @@ pub fn qmm_t_splitk(
     bm: Const<i32>) -> Result<(), Refusal> {
     let k = x.width;
     let n = out.width;
-    let row_stride = ctx.absent()?;
+    // A SCALAR AND ZERO, NOT AN ABSENT BUFFER. `Push`, `PushReduce` and
+    // `PushCast` in `quant/qmm_t.slang` declare these words unconditionally
+    // so that every form pushes the pipeline layout's whole range, and the
+    // form fired here reads none of them -- `input_stride()` and
+    // `output_stride()` answer `k` and `n` unless `PIE_STRIDED` is on, and
+    // the reduce and cast arms index by their own two. The words exist to
+    // hold the places the scalars after them sit at, so any value does.
+    //
+    // They were `ctx.absent()`, which on this plane mints a null BUFFER: each
+    // one landed among the OPERANDS instead of among the scalars, so the body
+    // bound more buffers than the module decorates AND pushed a block short
+    // by that many words, every later scalar reading its neighbour's. Both
+    // halves are a refusal or silent garbage at the first real dispatch, and
+    // no shipped text fires a split-K GEMM or the unstrided cast, which is
+    // why neither was seen.
+    let row_stride = 0i32;
     // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<3>` named.
     // This body forwards `ctx.params()` as a STRUCT, so the run is the
     // shader's layout and no `Const` mark can name a word inside it; the
@@ -1155,7 +1178,7 @@ pub fn qmm_t_splitk(
             out.arg(),
             k.arg(),
             n.arg(),
-            row_stride,
+            row_stride.arg(),
             k_partition_size.arg(),
             split_k_partition_stride.arg(),
             split_k.arg(),
@@ -1189,7 +1212,22 @@ pub fn qmm_t_splitk_f32(
     bm: Const<i32>) -> Result<(), Refusal> {
     let k = x.width;
     let n = out.width;
-    let row_stride = ctx.absent()?;
+    // A SCALAR AND ZERO, NOT AN ABSENT BUFFER. `Push`, `PushReduce` and
+    // `PushCast` in `quant/qmm_t.slang` declare these words unconditionally
+    // so that every form pushes the pipeline layout's whole range, and the
+    // form fired here reads none of them -- `input_stride()` and
+    // `output_stride()` answer `k` and `n` unless `PIE_STRIDED` is on, and
+    // the reduce and cast arms index by their own two. The words exist to
+    // hold the places the scalars after them sit at, so any value does.
+    //
+    // They were `ctx.absent()`, which on this plane mints a null BUFFER: each
+    // one landed among the OPERANDS instead of among the scalars, so the body
+    // bound more buffers than the module decorates AND pushed a block short
+    // by that many words, every later scalar reading its neighbour's. Both
+    // halves are a refusal or silent garbage at the first real dispatch, and
+    // no shipped text fires a split-K GEMM or the unstrided cast, which is
+    // why neither was seen.
+    let row_stride = 0i32;
     // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<3>` named.
     // This body forwards `ctx.params()` as a STRUCT, so the run is the
     // shader's layout and no `Const` mark can name a word inside it; the
@@ -1216,7 +1254,7 @@ pub fn qmm_t_splitk_f32(
             out.arg(),
             k.arg(),
             n.arg(),
-            row_stride,
+            row_stride.arg(),
             k_partition_size.arg(),
             split_k_partition_stride.arg(),
             split_k.arg(),
@@ -1255,7 +1293,22 @@ pub fn qmm_t_splitk_fp16_precast(
     bm: Const<i32>) -> Result<(), Refusal> {
     let k = half_in.width;
     let n = out.width;
-    let row_stride = ctx.absent()?;
+    // A SCALAR AND ZERO, NOT AN ABSENT BUFFER. `Push`, `PushReduce` and
+    // `PushCast` in `quant/qmm_t.slang` declare these words unconditionally
+    // so that every form pushes the pipeline layout's whole range, and the
+    // form fired here reads none of them -- `input_stride()` and
+    // `output_stride()` answer `k` and `n` unless `PIE_STRIDED` is on, and
+    // the reduce and cast arms index by their own two. The words exist to
+    // hold the places the scalars after them sit at, so any value does.
+    //
+    // They were `ctx.absent()`, which on this plane mints a null BUFFER: each
+    // one landed among the OPERANDS instead of among the scalars, so the body
+    // bound more buffers than the module decorates AND pushed a block short
+    // by that many words, every later scalar reading its neighbour's. Both
+    // halves are a refusal or silent garbage at the first real dispatch, and
+    // no shipped text fires a split-K GEMM or the unstrided cast, which is
+    // why neither was seen.
+    let row_stride = 0i32;
     // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<3>` named.
     // This body forwards `ctx.params()` as a STRUCT, so the run is the
     // shader's layout and no `Const` mark can name a word inside it; the
@@ -1282,7 +1335,7 @@ pub fn qmm_t_splitk_fp16_precast(
             half_in.arg(),
             k.arg(),
             n.arg(),
-            row_stride,
+            row_stride.arg(),
             k_partition_size.arg(),
             split_k_partition_stride.arg(),
             split_k.arg(),
@@ -1321,7 +1374,22 @@ pub fn qmm_t_splitk_fp16_precast_f32(
     bm: Const<i32>) -> Result<(), Refusal> {
     let k = half_in.width;
     let n = out.width;
-    let row_stride = ctx.absent()?;
+    // A SCALAR AND ZERO, NOT AN ABSENT BUFFER. `Push`, `PushReduce` and
+    // `PushCast` in `quant/qmm_t.slang` declare these words unconditionally
+    // so that every form pushes the pipeline layout's whole range, and the
+    // form fired here reads none of them -- `input_stride()` and
+    // `output_stride()` answer `k` and `n` unless `PIE_STRIDED` is on, and
+    // the reduce and cast arms index by their own two. The words exist to
+    // hold the places the scalars after them sit at, so any value does.
+    //
+    // They were `ctx.absent()`, which on this plane mints a null BUFFER: each
+    // one landed among the OPERANDS instead of among the scalars, so the body
+    // bound more buffers than the module decorates AND pushed a block short
+    // by that many words, every later scalar reading its neighbour's. Both
+    // halves are a refusal or silent garbage at the first real dispatch, and
+    // no shipped text fires a split-K GEMM or the unstrided cast, which is
+    // why neither was seen.
+    let row_stride = 0i32;
     // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<3>` named.
     // This body forwards `ctx.params()` as a STRUCT, so the run is the
     // shader's layout and no `Const` mark can name a word inside it; the
@@ -1348,7 +1416,7 @@ pub fn qmm_t_splitk_fp16_precast_f32(
             half_in.arg(),
             k.arg(),
             n.arg(),
-            row_stride,
+            row_stride.arg(),
             k_partition_size.arg(),
             split_k_partition_stride.arg(),
             split_k.arg(),
@@ -1520,7 +1588,9 @@ pub fn qmm_t_strided_fp16_precast_residual(
     half_in: In<Tensor<f16>>,
     residual: In<Tensor<bf16>>,
     bm: Const<i32>) -> Result<(), Refusal> {
-    let k = residual.width;
+    // The activation's width, for the reason [`qmm_t_residual_fp16_precast`]
+    // states: `k` is the reduction depth and the residual is result-shaped.
+    let k = half_in.width;
     let n = y.width;
     // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<2>` named.
     // The run is the shader's struct layout, so no `Const` mark can name a
@@ -1561,9 +1631,24 @@ pub fn qmm_splitk_reduce(
     ctx: &Ctx<'_>,
     y: Out<Tensor<bf16>>,
     partial: In<Tensor<bf16>>) -> Result<(), Refusal> {
-    let k = ctx.absent()?;
+    let k = 0i32;
     let n = y.width;
-    let row_stride = ctx.absent()?;
+    // A SCALAR AND ZERO, NOT AN ABSENT BUFFER. `Push`, `PushReduce` and
+    // `PushCast` in `quant/qmm_t.slang` declare these words unconditionally
+    // so that every form pushes the pipeline layout's whole range, and the
+    // form fired here reads none of them -- `input_stride()` and
+    // `output_stride()` answer `k` and `n` unless `PIE_STRIDED` is on, and
+    // the reduce and cast arms index by their own two. The words exist to
+    // hold the places the scalars after them sit at, so any value does.
+    //
+    // They were `ctx.absent()`, which on this plane mints a null BUFFER: each
+    // one landed among the OPERANDS instead of among the scalars, so the body
+    // bound more buffers than the module decorates AND pushed a block short
+    // by that many words, every later scalar reading its neighbour's. Both
+    // halves are a refusal or silent garbage at the first real dispatch, and
+    // no shipped text fires a split-K GEMM or the unstrided cast, which is
+    // why neither was seen.
+    let row_stride = 0i32;
     // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<3>` named.
     // This body forwards `ctx.params()` as a STRUCT, so the run is the
     // shader's layout and no `Const` mark can name a word inside it; the
@@ -1580,9 +1665,9 @@ pub fn qmm_splitk_reduce(
         &[
             y.arg(),
             partial.arg(),
-            k,
+            k.arg(),
             n.arg(),
-            row_stride,
+            row_stride.arg(),
             split_k_partition_stride.arg(),
             split_k.arg(),
         ],
@@ -1607,9 +1692,24 @@ pub fn qmm_splitk_reduce_f32(
     ctx: &Ctx<'_>,
     y: Out<Tensor<bf16>>,
     partial: In<Tensor<f32>>) -> Result<(), Refusal> {
-    let k = ctx.absent()?;
+    let k = 0i32;
     let n = y.width;
-    let row_stride = ctx.absent()?;
+    // A SCALAR AND ZERO, NOT AN ABSENT BUFFER. `Push`, `PushReduce` and
+    // `PushCast` in `quant/qmm_t.slang` declare these words unconditionally
+    // so that every form pushes the pipeline layout's whole range, and the
+    // form fired here reads none of them -- `input_stride()` and
+    // `output_stride()` answer `k` and `n` unless `PIE_STRIDED` is on, and
+    // the reduce and cast arms index by their own two. The words exist to
+    // hold the places the scalars after them sit at, so any value does.
+    //
+    // They were `ctx.absent()`, which on this plane mints a null BUFFER: each
+    // one landed among the OPERANDS instead of among the scalars, so the body
+    // bound more buffers than the module decorates AND pushed a block short
+    // by that many words, every later scalar reading its neighbour's. Both
+    // halves are a refusal or silent garbage at the first real dispatch, and
+    // no shipped text fires a split-K GEMM or the unstrided cast, which is
+    // why neither was seen.
+    let row_stride = 0i32;
     // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<3>` named.
     // This body forwards `ctx.params()` as a STRUCT, so the run is the
     // shader's layout and no `Const` mark can name a word inside it; the
@@ -1626,9 +1726,9 @@ pub fn qmm_splitk_reduce_f32(
         &[
             y.arg(),
             partial.arg(),
-            k,
+            k.arg(),
             n.arg(),
-            row_stride,
+            row_stride.arg(),
             split_k_partition_stride.arg(),
             split_k.arg(),
         ],
@@ -1652,9 +1752,24 @@ pub fn cast_qmm_input_bfloat16_to_float16(
     ctx: &Ctx<'_>,
     cast_in: In<Tensor<bf16>>,
     half_out: Out<Tensor<f16>>) -> Result<(), Refusal> {
-    let k = ctx.absent()?;
-    let n = ctx.absent()?;
-    let row_stride = ctx.absent()?;
+    let k = 0i32;
+    let n = 0i32;
+    // A SCALAR AND ZERO, NOT AN ABSENT BUFFER. `Push`, `PushReduce` and
+    // `PushCast` in `quant/qmm_t.slang` declare these words unconditionally
+    // so that every form pushes the pipeline layout's whole range, and the
+    // form fired here reads none of them -- `input_stride()` and
+    // `output_stride()` answer `k` and `n` unless `PIE_STRIDED` is on, and
+    // the reduce and cast arms index by their own two. The words exist to
+    // hold the places the scalars after them sit at, so any value does.
+    //
+    // They were `ctx.absent()`, which on this plane mints a null BUFFER: each
+    // one landed among the OPERANDS instead of among the scalars, so the body
+    // bound more buffers than the module decorates AND pushed a block short
+    // by that many words, every later scalar reading its neighbour's. Both
+    // halves are a refusal or silent garbage at the first real dispatch, and
+    // no shipped text fires a split-K GEMM or the unstrided cast, which is
+    // why neither was seen.
+    let row_stride = 0i32;
     // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<3>` named.
     // The run is the shader's struct layout, so no `Const` mark can name a
     // word inside it, and `keys::Count` is answered by no driver.
@@ -1664,9 +1779,9 @@ pub fn cast_qmm_input_bfloat16_to_float16(
         &[
             cast_in.arg(),
             half_out.arg(),
-            k,
-            n,
-            row_stride,
+            k.arg(),
+            n.arg(),
+            row_stride.arg(),
             count.arg(),
         ],
     )

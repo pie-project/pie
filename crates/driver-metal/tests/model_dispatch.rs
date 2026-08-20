@@ -513,9 +513,18 @@ mod from_a_frame {
         // regions differ lowers differently from one whose regions do not.
         // This is where the two tasks meet: the region table supplies the
         // rows, and the text's depth axis is what makes them matter.
+        // FOUR WIRE ROWS, and that is what a region table indexes.
+        //
+        // This was one request of four tokens with regions at `[0, 2, 4]`,
+        // which reads as a table over TOKEN rows -- and the bridge translates
+        // through `qo_indptr` exactly as `driver-cuda` does, so wire rows 2
+        // and 4 of a one-request step resolved to `u32::MAX` and every
+        // seriated case here refused before it reached the thing it asks
+        // about. Two tokens a request keeps the fire a prefill and gives the
+        // two regions two wire rows each.
         let plain = Step {
-            token_ids: &[1, 2, 3, 4],
-            qo_indptr: &[0, 4],
+            token_ids: &[1, 2, 3, 4, 5, 6, 7, 8],
+            qo_indptr: &[0, 2, 4, 6, 8],
             ..Step::default()
         };
         // Full-depth rows first, truncated last — the order a depth split
@@ -553,13 +562,18 @@ mod from_a_frame {
         // rows. This is the contract the frame bridge inherits the moment the
         // text states an axis, and it is why the region table's ORDER matters.
         let unseriated = Step {
-            token_ids: &[1, 2, 3, 4],
-            qo_indptr: &[0, 4],
+            token_ids: &[1, 2, 3, 4, 5, 6, 7, 8],
+            qo_indptr: &[0, 2, 4, 6, 8],
             region_row_indptr: &[0, 2, 4],
             region_sig: &[sig::TRUNCATED, 0],
             region_k: &[4, u32::MAX],
             ..Step::default()
         };
+        // The ORDER is what must refuse it. Stated over one request, this
+        // step's regions named wire rows that did not exist and the refusal
+        // came from the translation instead -- a green assertion about
+        // something else entirely. The seriated twin above lowers under the
+        // same numbering, so the difference between them is the order alone.
         assert!(
             lower_step(&plan_for(FireClass::Prefill), &unseriated).is_err(),
             "an unseriated region table lowered anyway"

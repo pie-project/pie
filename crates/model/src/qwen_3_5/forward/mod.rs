@@ -5,6 +5,20 @@
 //! [`qwen3_5_gdn_block`], [`qwen3_5_full_attn_block`]) and
 //! [`qwen3_5_hybrid`] composes their bodies per layer, so a fragment's test
 //! and the whole model's test read the same ops.
+//!
+//! # `rmsnorm_gemma_bf16` in the tables below is a RECORD, not a claim
+//!
+//! Every op table here maps a trace op to what the legacy CUDA prototype's
+//! `qwen3_5_forward.cpp` launches for it, and for the norms that launch is
+//! `kernels::norm::rmsnorm_gemma_bf16` -- `xhat * (1 + w)`. Those rows are
+//! left as written because they are an accurate transcription of that file
+//! and because that file is where this generation's whole `norm_variant`
+//! story came from. THE PROTOTYPE IS WRONG. `mlx_lm.models.qwen3_5` folds
+//! plainly, both published Qwen3.6 checkpoints ship gains trained from one,
+//! and the Metal MLX gate fails under the gemma fold and passes under the
+//! plain one. The `variant` column states what THIS crate traces; the
+//! kernel column states what one C++ file launched. See the generation's
+//! module doc.
 
 pub mod facts;
 pub mod metal;
@@ -397,7 +411,7 @@ fn moe_mlp_body_cuda(
 /// residual stream as a fragment parameter ([`dsl::input`]),
 /// exactly the MoE fragment's shape. The FULL-attention layer kind of this
 /// family — not llama_like's: q_proj 2× wide with the per-head
-/// `[query | gate]` split, sigmoid output gate, partial rope, Gemma-fold
+/// `[query | gate]` split, sigmoid output gate, partial rope, plain-fold
 /// per-head norms — is its own fragment, [`qwen3_5_full_attn_block`], and
 /// [`qwen3_5_hybrid`] composes all three bodies into the full model.
 ///
@@ -768,8 +782,8 @@ fn gdn_attn_body_cuda(
 /// | Matmul(k_proj)            | kernels::gemm::act_x_w → [N, Hk]                   |
 /// | Matmul(v_proj)            | kernels::gemm::act_x_w → [N, Hk]                   |
 /// | SplitQGate                | kernels::layout::split_q_gate_bf16 (per-head q‖gate)    |
-/// | RmsnormPerHead(q, Gemma)  | kernels::norm::rmsnorm_gemma_bf16 over N·Hq rows of d |
-/// | RmsnormPerHead(k, Gemma)  | kernels::norm::rmsnorm_gemma_bf16 over N·Hkv rows of d|
+/// | RmsnormPerHead(q, Plain)  | kernels::norm::rmsnorm_gemma_bf16 over N·Hq rows of d |
+/// | RmsnormPerHead(k, Plain)  | kernels::norm::rmsnorm_gemma_bf16 over N·Hkv rows of d|
 /// | Rope(partial)             | kernels::rope::rope_partial_bf16 (rotary_dim chans)   |
 /// | KvAppend                  | kernels::attn::write_kv_to_pages / _explicit          |
 /// | Attention                 | dispatch_attention_flashinfer_{decode,prefill}|
@@ -876,7 +890,7 @@ impl FullAttnLayerW {
 /// ONLY the kernel CHOICES lower under `Some(lower)`: the KV write (the
 /// per-fire `HasWriteDesc` guard, both arms stated — llama_like's 4a
 /// form) and the attention kernel (FlashInfer decode vs the planned
-/// prefill dispatch). Everything else — the norms (incl. the Gemma
+/// prefill dispatch). Everything else — the norms (incl. the plain
 /// per-head pair), the projections and splits, the partial rope, the
 /// sigmoid output gate, the o_proj fold — is a 1:1-kernel semantic op
 /// and stays semantic in every form.
@@ -901,7 +915,7 @@ fn full_attn_body(t: &Trace, l: u32, facts: &Qwen35FullAttnFacts, y: &Val) -> Va
     };
     let (q, gate) = split_q_gate(&qg, facts.q_heads, facts.head_dim);
 
-    // Per-head q/k norms (the weight knows: Gemma fold, per-head), then
+    // Per-head q/k norms (the weight knows: plain fold, per-head), then
     // partial rope: only the first rotary_dim channels of each head rotate.
     let q = rmsnorm(&q, &w.q_norm);
     let k = rmsnorm(&k, &w.k_norm);
@@ -923,7 +937,7 @@ fn full_attn_body(t: &Trace, l: u32, facts: &Qwen35FullAttnFacts, y: &Val) -> Va
 /// ONLY the kernel CHOICES differ from the semantic text: the KV write
 /// (the per-fire `HasWriteDesc` guard, both arms stated — llama_like's 4a
 /// form) and the attention kernel (FlashInfer decode vs the planned
-/// prefill dispatch). Everything else — the norms (incl. the Gemma
+/// prefill dispatch). Everything else — the norms (incl. the plain
 /// per-head pair), the projections and splits, the partial rope, the
 /// sigmoid output gate, the o_proj fold — is a 1:1-kernel op stated the
 /// same way in both texts.
@@ -1319,7 +1333,7 @@ mod tests {
         assert_eq!(
             kinds,
             [
-                "rmsnorm",          // mlp_norm (gemma fold)
+                "rmsnorm",          // mlp_norm (plain fold)
                 "matmul",           // router logits [Tokens, E]
                 "topk",             // launch_topk_softmax: idx + renormed weights
                 "matmul_per_token", // grouped gate_up over the selected experts
@@ -1548,7 +1562,7 @@ mod tests {
         assert_eq!(
             kinds,
             [
-                "rmsnorm",       // attn_norm (gemma fold)
+                "rmsnorm",       // attn_norm (plain fold)
                 "matmul",        // in_proj_qkv [Tokens, conv_dim]
                 "matmul",        // in_proj_z  [Tokens, v_dim]
                 "matmul",        // in_proj_a  [Tokens, Vh]
@@ -1793,12 +1807,12 @@ mod tests {
         assert_eq!(
             kinds,
             [
-                "rmsnorm",          // attn_norm (gemma fold)
+                "rmsnorm",          // attn_norm (plain fold)
                 "matmul",           // q_proj, 2x wide: [Tokens, 2*Hq]
                 "matmul",           // k_proj [Tokens, Hk]
                 "matmul",           // v_proj [Tokens, Hk]
                 "split_q_gate",     // per-head [query | gate] de-interleave
-                "rmsnorm_per_head", // q_norm (gemma fold)
+                "rmsnorm_per_head", // q_norm (plain fold)
                 "rmsnorm_per_head", // k_norm
                 "rope",             // partial: first rotary_dim channels
                 "kv_append",
@@ -1857,7 +1871,7 @@ mod tests {
 
     /// Dataflow and params of the gated attention: the interleaved split
     /// carries head geometry and halves the 2×-wide projection, the
-    /// per-head norms fold Gemma, rope is partial at the fixture's 64
+    /// per-head norms fold plainly, rope is partial at the fixture's 64
     /// channels, the output gate multiplies attention's output by the
     /// split's GATE leg, and o_proj lands the gated value on the residual.
     #[test]
@@ -1899,7 +1913,10 @@ mod tests {
             assert_eq!(shape_of(out), vec![Dim::Tokens, Dim::Const(2048)]);
         }
 
-        // Per-head norms: Gemma fold, head_dim 256, on the QUERY leg.
+        // Per-head norms: PLAIN fold, head_dim 256, on the QUERY leg. This
+        // said `Gemma` and it said it because the fixture did; see the
+        // generation's module doc for the checkpoint gains that overturned
+        // both.
         let per_head: Vec<_> = plan
             .ops
             .iter()
@@ -1908,7 +1925,7 @@ mod tests {
         assert_eq!(per_head.len(), 2);
         assert!(matches!(
             &per_head[0].kind,
-            OpKind::RmsnormPerHead { weight, head_dim: 256, variant: NormVariant::Gemma }
+            OpKind::RmsnormPerHead { weight, head_dim: 256, variant: NormVariant::Plain }
                 if weight == "layer.0.q_norm"
         ));
         assert_eq!(per_head[0].inputs, vec![qg_split.outputs[0]]);
@@ -2450,7 +2467,7 @@ mod tests {
     }
 
     /// The full-attention and hybrid traced forms survive serde — the new
-    /// kinds, the partial rope, the per-head Gemma variant — and, per the
+    /// kinds, the partial rope, the per-head norm variant — and, per the
     /// additive rule, none of the new vocabulary appears in any pre-hybrid
     /// plan's serialization: the seven existing goldens stay byte-identical.
     #[test]

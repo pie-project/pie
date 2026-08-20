@@ -28,7 +28,12 @@ impl Shell {
         let caps = super::transfer::Capabilities {
             has_linear_attn: self.has_linear_attn,
             kv_total_pages: pool.pages(),
-            rs_slots: 0,
+            // THE POOL'S OWN COUNT, not the literal `0` that was here. It is
+            // `plan_kv_copy` being called, which does not read this field --
+            // but `Capabilities` is one statement about what this shell can
+            // do, and a zero in it was a claim that there are no recurrent
+            // seats. There are, for every hybrid this backend now serves.
+            rs_slots: self.recurrent.as_ref().map_or(0, |r| r.shape().slots),
         };
         // ONE stride for the whole pool, or no copy at all.
         //
@@ -88,22 +93,70 @@ impl Shell {
 
     /// Move recurrent state between slots.
     ///
+    /// Forking a conversation whose layers are linear: `copy_kv` moves the
+    /// attention prefix and this moves the compressed one. A branch that took
+    /// the first without the second would attend over the right pages with a
+    /// history that never saw the prompt.
+    ///
+    /// Settled on return, like [`Self::copy_kv`] and for the same reason: the
+    /// move runs on the host.
+    ///
     /// # Errors
     ///
-    /// Always, today, and the refusal says why: no model this backend serves
-    /// has any recurrent state to move.
-    pub fn copy_state(&mut self, _desc: &driver_api::StateCopyPlan) -> Result<()> {
-        Err(Error::Unserved {
-            what: "copy_state",
-            message: "recurrent state is unreachable on this backend. It belongs to the \
-                      qwen3_5 family and its neighbours, whose rows this build has no \
-                      Metal text for — `load_model` asks each row before it stages, and \
-                      refuses there — so no model this backend serves has any state to \
-                      copy. `serve::transfer::plan_state_copy` and \
-                      `layout::LinearStateSlots` are planned and stored ahead of that \
-                      family being served, not behind it."
-                .to_string(),
-        })
+    /// A call before `load_model`; a checkpoint with no linear-attention
+    /// layers, which has no state to move; or a slot outside the seats the
+    /// pool was allocated with.
+    pub fn copy_state(&mut self, desc: &driver_api::StateCopyPlan) -> Result<()> {
+        // THE PREMISE THIS USED TO REFUSE ON WAS TRUE ONCE AND IS NOT NOW.
+        //
+        // The refusal said "no model this backend serves has any recurrent
+        // state to move ... whose rows this build has no Metal text for --
+        // `load_model` asks each row before it stages, and refuses there".
+        // That was accurate when it was written. It stopped being accurate
+        // the day the qwen3.5 forward path landed: both Qwen3.6 checkpoints
+        // now load, allocate a `pools::recurrent::Pool`, and generate --
+        // 27B agrees with `mlx_lm.generate` for sixty greedy tokens. The
+        // prose stayed, and a comment that was true when written is the most
+        // dangerous artifact here: nothing goes red when the world moves out
+        // from under one.
+        //
+        // So the capability is READ rather than asserted. `has_linear_attn`
+        // is `deployment.recurrent.is_some()`, set at load, and `rs_slots` is
+        // the pool's own count -- which is also what fixes the second half of
+        // the old bug, `copy_kv` passing a hardcoded `rs_slots: 0` into a
+        // planner that bounds-checks slots against it.
+        let Some(recurrent) = self.recurrent.as_ref() else {
+            return Err(Error::Unserved {
+                what: "copy_state",
+                message: "there is no recurrent-state pool. `load_model` allocates one only \
+                          for a deployment that states a recurrent stack, so this is a \
+                          checkpoint whose layers are all attention -- there is no \
+                          compressed history for a fork to take, and `copy_kv` moves all \
+                          of what this row remembers."
+                    .to_string(),
+            });
+        };
+        let caps = super::transfer::Capabilities {
+            has_linear_attn: self.has_linear_attn,
+            kv_total_pages: self.pool.as_ref().map_or(0, crate::pools::kv::Pool::pages),
+            rs_slots: recurrent.shape().slots,
+        };
+        let pairs =
+            super::transfer::plan_state_copy(desc, caps).map_err(|why| Error::Unserved {
+                what: "copy_state",
+                message: format!("{why:?}"),
+            })?;
+        // IN PLAN ORDER, and the same warning `copy_kv` carries applies: a
+        // chain reads a seat after an earlier pair has written it. The plan
+        // sequences; this applies.
+        for (src, dst) in pairs {
+            // SAFETY: the driver verbs are serialized against the fire path,
+            // and every fire this shell launches is waited for inside
+            // `Shell::launch` before it returns -- so nothing is reading
+            // either seat here.
+            unsafe { recurrent.copy_slot(src, dst)? };
+        }
+        Ok(())
     }
 
     /// Commit or release KV pages so the pool holds `target_pages`.
@@ -135,10 +188,25 @@ impl Shell {
         // zero: the pool would be trimmed to nothing on the first tick, and
         // every fire after it would read pages that are no longer mapped.
         //
-        // The other two are answered rather than refused. They have no
+        // The other two are answered rather than refused. Workspace has no
         // storage on this backend, so "resize the thing that holds nothing"
-        // is satisfied by doing nothing -- and refusing would make the trim
-        // task log a failure every tick for a pool it is right to ask about.
+        // is satisfied by doing nothing.
+        //
+        // THE RECURRENT POOL IS A DIFFERENT ANSWER THAT LOOKS THE SAME, and
+        // it used to be given for the wrong reason. The comment here said
+        // both of the other pools "have no storage on this backend", which
+        // stopped being true when the hybrids landed: `self.recurrent` is a
+        // real allocation for every Qwen3.6 row. Doing nothing is still
+        // correct, and now for the reason `pools::recurrent`'s own module doc
+        // states -- it is not a pager. A seat is held from a request's first
+        // token to its last, the count is advertised once at load through
+        // `rs_cache_slots`, and the trim task's target is derived from a
+        // high-water mark that knows nothing about who is still sitting.
+        // Honouring it would pull seats out from under live requests, which
+        // is worse than the silence it replaced.
+        //
+        // Refusing is not the alternative: it would make the trim task log a
+        // failure every tick for a pool it is right to ask about.
         if desc.pool_id != driver_api::PIE_ELASTIC_POOL_KV {
             return Ok(());
         }

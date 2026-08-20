@@ -1113,6 +1113,17 @@ pub unsafe fn act_x_wt_bf16(
     beta: f32,
 ) {
     let handle: cublasHandle_t = handle.cast::<cublasContext>();
+    // AN EMPTY RECTANGLE IS AN ANSWER, not a call. `m == 0` is a legal fire —
+    // a batch whose rows all landed elsewhere — and there is nothing to write,
+    // so every result it could have is already correct. cuBLASLt does not
+    // agree: `cublasLtMatmulAlgoGetHeuristic` divides by the row count while
+    // it picks a tile and raises SIGFPE, which kills the process instead of
+    // returning a status anyone could check. Asked before anything else so a
+    // zero-row fire costs nothing, and covering `n`/`k` too because the same
+    // heuristic reads all three.
+    if m <= 0 || n <= 0 || k <= 0 {
+        return;
+    }
     let path_trace = path_trace_take();
     if path_trace {
         let capture = cublas_stream(handle)
@@ -1291,6 +1302,11 @@ pub unsafe fn batched_act_x_wt_bf16(
     beta: f32,
 ) {
     if batch_count <= 0 {
+        return;
+    }
+    // The same empty rectangle its single-shot sibling refuses above, and for
+    // the same reason: the heuristic faults on a zero extent.
+    if m <= 0 || n <= 0 || k <= 0 {
         return;
     }
     let handle: cublasHandle_t = handle.cast::<cublasContext>();

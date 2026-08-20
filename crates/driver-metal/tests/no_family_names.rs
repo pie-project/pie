@@ -60,9 +60,11 @@ fn budget() -> BTreeMap<&'static str, usize> {
         // KV geometries, and an operator reading "this pool's layers have two
         // page sizes" needs to know which model does that.
         ("pools/kv.rs", 1),
-        // The same, for a control-path refusal that names where the real
-        // check lives.
-        ("serve/control.rs", 1),
+        // Zero, and it earned the zero. This was a `copy_state` refusal
+        // naming the model whose shape it could not carry; the pool copies
+        // the recurrent slot now, so the sentence that needed the name went
+        // with the refusal.
+        ("serve/control.rs", 0),
         // The kernel ABI's family-prefixed kind names — every mention is an
         // abbreviation, so this file was invisible until `PREFIXES` existed.
         // They name real per-architecture kernels (gemma4's PLE, gpt-oss's

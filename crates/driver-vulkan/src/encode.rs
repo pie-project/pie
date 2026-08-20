@@ -294,6 +294,29 @@ impl<R: Reflect> Encode for Encoder<'_, '_, R> {
 
         let mut buffers = Vec::with_capacity(args.len());
         let mut writes = Vec::with_capacity(args.len());
+        // THE LIVE HANDLE LIST, NOT THE SNAPSHOT `Encoder::new` WAS GIVEN.
+        // Binding the column mints a handle per operand and the planner
+        // copies that list out BEFORE it runs the body -- but a body that
+        // asks mints more, into the `Handles` the cell holds, and their
+        // indices point past the copy. The lookup below then answered
+        // `Refusal::Absent { what: "a buffer" }` for every fact a body reached
+        // through `ctx.ask`: the token ids, the positions table, the KV
+        // pages. `layout::embed_gather_mb` asks for the ids in its first line,
+        // so this was the first statement of every fire this driver planned.
+        //
+        // AND THE STAGED BLOCK IS LIVE FOR THE SAME REASON: `ctx.params()`
+        // goes through the same resolver, so a body that forwards its own run
+        // mints the block while it runs -- after the snapshot was taken.
+        //
+        // A probe encoder has no cell and keeps the snapshot, which is right:
+        // nothing can have minted anything. `driver-metal`'s planner carries
+        // this same pair of lines, for the same defect.
+        let live = self.answers.map(|(cell, _)| cell.borrow());
+        let bounds = live
+            .as_deref()
+            .map_or(self.buffers, crate::hold::Handles::bound);
+        let staged = live.as_deref().map(crate::hold::Handles::staged);
+        let block: &[u32] = staged.as_deref().unwrap_or(self.block);
         // Where the caller's scalar block goes in the DENSE list a descriptor
         // set is written from. A module that reads its parameters from a
         // storage buffer binds that buffer at an index its own ABI chooses --
@@ -319,8 +342,7 @@ impl<R: Reflect> Encode for Encoder<'_, '_, R> {
                     minted = Some(buffers.len());
                     continue;
                 }
-                let bound = self
-                    .buffers
+                let bound = bounds
                     .get(handle as usize)
                     .ok_or(Refusal::Absent { what: "a buffer" })?;
                 buffers.push(*bound);
@@ -337,8 +359,8 @@ impl<R: Reflect> Encode for Encoder<'_, '_, R> {
             // trace's scalar and `count` is the routine's own -- eight bytes,
             // and four of them would be a struct whose tail reads as zero,
             // which is a gather of no rows reporting success.
-            let mut held = Vec::with_capacity(self.block.len() + args.len() + 1);
-            held.extend_from_slice(self.block);
+            let mut held = Vec::with_capacity(block.len() + args.len() + 1);
+            held.extend_from_slice(block);
             held.extend(words(args));
             // A statement with nothing to say still gets one word: the shader
             // dereferences the pointer whether or not it reads a field, and a

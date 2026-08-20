@@ -114,7 +114,10 @@ where
     let (abort_handle, abort_registration) = AbortHandle::new_pair();
 
     tokio::spawn(async move {
-        let res: Result<(), ChannelOrIoError> = async move {
+        // Borrowed, not moved: the two sinks outlive the pump loop because
+        // CLOSING them is the graceful signal, and a moved sink is closed at a
+        // moment nobody chose.
+        let res: Result<(), ChannelOrIoError> = async {
             while let Some(msg) = transport_stream.next().await {
                 match msg? {
                     TwoWayMessage::Request(req) => server_sink.send(req).await?,
@@ -124,10 +127,41 @@ where
             Ok(())
         }
         .await;
-        if let Err(e) = res {
-            tracing::warn!("inbound mux error: {e}");
+        // The local halves learn the connection is over the only way tarpc
+        // reads as ordinary: their inbound stream ENDS. Dropped sinks do that.
+        drop(server_sink);
+        drop(client_sink);
+        match res {
+            // A clean EOF is the peer hanging up, which is what a peer does
+            // when it is finished. Aborting the outbound pump here is what
+            // turned every successful `pie run` into two lines of `tarpc:
+            // Requests stream errored out: could not ready the transport for
+            // writes` -- the abort dropped the response streams out from under
+            // a tarpc server that was still holding them, so a normal
+            // disconnect was reported as a write failure, after the answer had
+            // already printed. Let the pump end on its own: both streams
+            // finish once the halves above see their closed inbound, and the
+            // transport sink drops with them, which is the FIN.
+            Ok(()) => {}
+            // The local end went away first -- a shutdown aborting the serve
+            // task, or a link dropped by roster reconciliation. Expected, and
+            // logged at a level that says so. No abort: the sinks dropped
+            // above already end both outbound streams once the halves let go,
+            // and aborting instead of waiting is the same write-under-a-live-
+            // holder yank as the clean-EOF case, just rarer -- it needs the
+            // teardown to interleave with an in-flight frame. If a half really
+            // does outlive its partner, the connection still has a live user
+            // and closing it would be the wrong repair.
+            Err(ChannelOrIoError::Channel(e)) => {
+                tracing::debug!("mux half closed, tearing the link down: {e}");
+            }
+            // The transport itself failed. Nothing will drain, so stop the
+            // outbound pump rather than leave it writing into a dead socket.
+            Err(ChannelOrIoError::Io(e)) => {
+                tracing::warn!("inbound mux error: {e}");
+                abort_handle.abort();
+            }
         }
-        abort_handle.abort();
     });
 
     let outbound = Abortable::new(

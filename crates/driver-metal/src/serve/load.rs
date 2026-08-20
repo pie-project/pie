@@ -361,12 +361,52 @@ impl Shell {
             has_attn_page_mask: false,
             has_lora: false,
             model_site_summary: driver_api::ModelSiteSummary::default(),
-            device_geometry_port_mask: 0,
-            // No port is resolved on-device, so there is no per-step half to
-            // interleave: `launch` converts the whole frame's steps and then
-            // fires them. A `true` here would tell `pipeline::fire` that a slot
-            // chained behind an earlier slot reads a cell that exists by then.
-            resolves_geometry_per_step: false,
+            // The DECODE ENVELOPE's ports, claimed because `envelope::fill`
+            // resolves exactly these three: `EMBED_TOKENS` and `POSITIONS`
+            // are read off `driver::resolve`, the same backend-neutral copier
+            // wgpu and vulkan read theirs with, and `KV_LEN` is derived from
+            // the positions and CHECKED against the stated value rather than
+            // ignored.
+            //
+            // This read 0 for as long as that machinery was missing, and the
+            // 0 was honest then -- the engine answered it by folding the
+            // geometry on the host, which cannot know `EmbedTokens` and said
+            // so by name:
+            //
+            //     decode envelope on a driver without device geometry ports
+            //     (mask 0x0, needs 0x25): falling back to host-evaluated
+            //     serialized execution
+            //     ... EmbedTokens is not host-derivable: channel 0 has no
+            //     host-known value
+            //
+            // so the fix was to build the machinery, not to widen the claim.
+            //
+            // And it is not widened FURTHER, deliberately.
+            // `PIE_DEVICE_GEOMETRY_PORTS` names four more -- the pages, the
+            // CSR and the two halves of the write descriptor -- and
+            // `PIE_DEVICE_PORT_ATTN_MASK` a fifth. This driver has no
+            // consumer for the last three: `serve::launch` derives every
+            // row's write target from its position, and a custom attention
+            // mask reaches the Metal text through the region table's `MASK`
+            // bit rather than through `LaunchPlan::masks`. A claim is a
+            // promise to READ, so `envelope::fill` refuses that class by name
+            // instead, and the engine keeps sending it down a path that knows
+            // it is not served here.
+            device_geometry_port_mask: driver_api::PIE_DECODE_ENVELOPE_PORTS,
+            // TRUE, and it is a FACT about how `launch` drives a frame rather
+            // than a preference: a frame with any device-resolved member is
+            // driven a step at a time -- fill, encode, wait, run the step's
+            // programs -- before the next step is touched, because a decode
+            // envelope's tokens are the cells the step before it PUT. So a
+            // slot chained behind an earlier slot of the same frame reads a
+            // cell that slot's program has already written, which is what
+            // `pipeline::fire` reads this flag to decide.
+            //
+            // A frame of ordinary host-wire steps is still committed whole
+            // and waited for afterwards, which is where this backend's
+            // run-ahead comes from; the flag describes the harder case
+            // because that is the one the engine is asking about.
+            resolves_geometry_per_step: true,
             // The ceilings a scheduler batches under. Stated rather than
             // unbounded: a fire wider than this has no arena sized for it.
             max_forward_tokens: 4096,

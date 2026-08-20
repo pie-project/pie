@@ -310,6 +310,37 @@ fn vector_grid(head_dim: i32, q_heads: i32, rows: i32) -> Result<[u32; 3], Refus
     Ok([x, rows.unsigned_abs(), 1])
 }
 
+/// The paged decode shape: [`vector_grid`], with the key block on y.
+///
+/// `sdpa_paged.wgsl`'s decode arm is the one shader on this grid whose
+/// workgroup is not flat. It spends the invocations WebGPU guarantees beyond
+/// the head's pairs on KEYS -- `PIE_KB = 256 / PIE_PAIRS`, so eight at a
+/// 64-wide head and one at a 512-wide one -- because the arm dispatches one
+/// workgroup per query head and nothing else, and a 32-head decode was
+/// therefore asking a whole GPU for 1024 invocations.
+///
+/// The y EXTENT is multiplied by that block so the y GROUPS stay one per row,
+/// which is what the body reads `workgroup_id.y` as.
+/// `driver-wgpu::geometry`'s `Rule::SdpaVector` says the same thing from the
+/// module's own `@workgroup_size`, and the two are cross-checked.
+///
+/// # Errors
+///
+/// Whatever [`vector_grid`] refuses, and [`Refusal::Grid`] if the y product
+/// does not fit a `u32`.
+fn paged_decode_grid(head_dim: i32, q_heads: i32, rows: i32) -> Result<[u32; 3], Refusal> {
+    let g = vector_grid(head_dim, q_heads, rows)?;
+    // 512 / head_dim is 256 / (head_dim / 2), and `vector_grid` has already
+    // refused an odd head width, so the pairs divide 256 exactly for every
+    // instantiated point.
+    let keys = (512 / head_dim.unsigned_abs()).max(1);
+    let y = g[1].checked_mul(keys).ok_or(Refusal::Grid {
+        what: "rows * the decode key block",
+        at: i64::from(g[1]) * i64::from(keys),
+    })?;
+    Ok([g[0], y, g[2]])
+}
+
 /// The tiled shape: one 32 x 32 workgroup per (query head, block of 32 rows).
 ///
 /// The row count is rounded UP to whole tiles, which is what the `n_rows`
@@ -666,7 +697,7 @@ pub fn sdpa_paged_decode(
     let attention_mask_enabled = ctx.ask::<Tensor<u8>, keys::AttentionMaskEnabled>()?;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
-        Fire::at("attn/sdpa_paged.wgsl", PAGED_DECODE[head_point(*head_dim, &PAGED_DIMS)?]).apply(vector_grid(*head_dim, *q_heads, rows)?),
+        Fire::at("attn/sdpa_paged.wgsl", PAGED_DECODE[head_point(*head_dim, &PAGED_DIMS)?]).apply(paged_decode_grid(*head_dim, *q_heads, rows)?),
         &[
             queries.arg(),
             k_pages.arg_mut(),
@@ -736,7 +767,7 @@ pub fn sdpa_paged_decode_sink(
     let rows = ctx.ask::<i32, keys::Rows>()?;
     head_point(*head_dim, &[64])?;
     ctx.fire(
-        Fire::at("attn/sdpa_paged.wgsl", "sdpa_paged_decode_sink_bfloat16_d_64").apply(vector_grid(*head_dim, *q_heads, rows)?),
+        Fire::at("attn/sdpa_paged.wgsl", "sdpa_paged_decode_sink_bfloat16_d_64").apply(paged_decode_grid(*head_dim, *q_heads, rows)?),
         &[
             queries.arg(),
             k_pages.arg_mut(),

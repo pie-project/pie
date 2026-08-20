@@ -1981,7 +1981,23 @@ pub fn qmm_t_residual_fp16_precast(
     residual: In<Tensor<bf16>>,
     bm: Const<i32>,
     bn: Const<i32>) -> Result<(), Refusal> {
-    let k = residual.width;
+    // THE CONTRACTION IS THE ACTIVATION'S WIDTH, AND IT IS NOT THE RESIDUAL'S.
+    //
+    // This read `residual.width`, and a residual is the LAYER's stream: as
+    // wide as the hidden size, which is the width of this projection's OUTPUT
+    // and has nothing to do with the width of its input. The two coincide on
+    // every stack whose fused-residual projection is square -- qwen3.5's
+    // o_proj is 2048 into 2048, and that is the deployment this kernel was
+    // measured on -- so the wrong operand answered right and stayed.
+    //
+    // gpt-oss's o_proj is 4096 into 2880. The GEMM was told `K = 2880`, which
+    // is both a truncated contraction and, because `qmm_t_loaded_impl` starts
+    // each row of the activation at `x + y_row * k_len`, the wrong ROW STRIDE:
+    // every row but the first read from the middle of an earlier one. It only
+    // ever fired on a prefill long enough to take the batched arm, so the
+    // decode that every short prompt is stayed correct and the long prompt
+    // came back generic.
+    let k = half_in.width;
     let n = y.width;
     let m = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
@@ -2374,7 +2390,9 @@ pub fn qmm_t_strided_fp16_precast_residual(
     half_in: In<Tensor<f16>>,
     residual: In<Tensor<bf16>>,
     bm: Const<i32>) -> Result<(), Refusal> {
-    let k = residual.width;
+    // The same wrong operand [`qmm_t_residual_fp16_precast`] carried, and it
+    // is stated at length there.
+    let k = half_in.width;
     let n = y.width;
     // OUT OF THE STATEMENT'S OWN RUN, at the word HEAD's `Param<2>` named.
     // The run is the shader's struct layout, so no `Const` mark can name a
@@ -3262,6 +3280,67 @@ mod tests {
         assert_eq!(args[4], Out::<Tensor<bf16>>::new(Tensor::<bf16>::new(14)).arg(), "then the result");
         assert_eq!(fire.entrypoint, "affine_qmv_fast_bfloat16_gs_64_b_4");
         assert_eq!(fire.lanes, [32, 1024, 1], "one group per eight output rows");
+    }
+
+    /// A fused-residual GEMM contracts over its ACTIVATION and not over the
+    /// residual it adds.
+    ///
+    /// Both precast residual forms read `residual.width`. A residual is the
+    /// layer's stream, so it is as wide as this projection's OUTPUT -- which
+    /// is the same number as its input only where the projection is square.
+    /// qwen3.5's o_proj is 2048 into 2048 and this measured right there for
+    /// as long as it existed.
+    ///
+    /// gpt-oss's o_proj is 4096 into 2880, so the GEMM was handed `K = 2880`:
+    /// a contraction a third short, and -- because `qmm_t_loaded_impl` starts
+    /// each row of the activation at `x + y_row * k_len` -- a row stride that
+    /// had every row but the first reading out of the middle of an earlier
+    /// one. Only a prefill long enough to take the batched arm ever fired it,
+    /// so short prompts stayed fluent and long ones came back generic.
+    #[test]
+    fn a_fused_residual_gemm_contracts_over_its_activation() {
+        let seen = Seen::default();
+        seen.rows.set(64);
+        let half_in = || In { ptr: Tensor::<f16>::new(20), rows: 64, width: 4096 };
+        let residual = || In { ptr: Tensor::<bf16>::new(21), rows: 64, width: 2880 };
+        let y = || Out { ptr: Tensor::<bf16>::new(22), rows: 64, width: 2880 };
+        qmm_t_residual_fp16_precast(
+            &seen,
+            Const::new(Tensor::<u32>::new(10)),
+            Const::new(Tensor::<bf16>::new(11)),
+            Const::new(Tensor::<bf16>::new(12)),
+            y(),
+            half_in(),
+            residual(),
+            Const::new(32),
+            Const::new(32))
+        .expect("a launch");
+        qmm_t_strided_fp16_precast_residual(
+            &seen,
+            Const::new(Tensor::<u32>::new(10)),
+            Const::new(Tensor::<bf16>::new(11)),
+            Const::new(Tensor::<bf16>::new(12)),
+            y(),
+            half_in(),
+            residual(),
+            Const::new(32))
+        .expect("a launch");
+        let calls = seen.calls.borrow();
+        assert_eq!(calls.len(), 2, "both precast residual forms fired");
+        for (fire, args) in calls.iter() {
+            assert_eq!(
+                args[5],
+                ArgValue::I32(4096),
+                "`{}` contracts over the activation's 4096, not the residual's 2880",
+                fire.entrypoint
+            );
+            assert_eq!(
+                args[6],
+                ArgValue::I32(2880),
+                "`{}` writes the output's 2880",
+                fire.entrypoint
+            );
+        }
     }
 
     /// The wide matvec's grid counts groups of FOUR batch vectors and its

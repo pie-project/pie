@@ -599,11 +599,29 @@ pub fn metal_facts(
         // where MLX's reference for the same snapshot is seventy times
         // that.
         embed_scale: (f64::from(f.hidden) as f32).sqrt(),
-        // ZERO, which is "derive `1/sqrt(head_dim)`" -- and gemma-4's
-        // per-layer table already states `sm_scale: 1.0` because Q and K
-        // are normed per head before the dot. The Metal text derives from
-        // the layer's OWN width, which is the same reading.
-        attn_scale: 0.0,
+        // ONE, and stated rather than derived. This field READ 0.0 --
+        // the sentinel for "derive `1/sqrt(head_dim)`" -- under a
+        // comment that called the derivation "the same reading" as the
+        // per-layer table's `sm_scale: 1.0`. It is not the same reading
+        // and it is not the same NUMBER: a sliding layer would have
+        // divided every logit by 16 and a full layer by 22.6, on a
+        // family whose `q_norm`/`k_norm` have already divided by the
+        // thing the derivation divides by again. MLX's `gemma4_text`
+        // says `self.scale = 1.0` for every layer of every gemma-4, and
+        // the CUDA text in this same crate has said `sm_scale: 1.0`
+        // since it was written, with the reason spelled out at the top
+        // of this module.
+        //
+        // The cost of the wrong reading was INVISIBLE at position zero,
+        // which is why it survived the reference gate: with one key the
+        // softmax over a single logit is 1.0 at every temperature, so
+        // `one_token_at_position_zero_agrees_with_mlx` passed while
+        // generation produced English-shaped rubbish. Every position
+        // after the first attended at a temperature 16 to 22 times too
+        // HOT, which flattens the distribution toward uniform and hands
+        // the value path an average of the context instead of a lookup
+        // into it.
+        attn_scale: 1.0,
         per_layer_emb_dim: f.ple_dim,
         kv_shared_layers: f.kv_shared_layers,
         logit_softcap: f.logit_softcap,
@@ -614,6 +632,14 @@ pub fn metal_facts(
         activation: Activation::Geglu,
         // Two plain bases, both expressible; no rescaling ladder.
         rope_freq_table: false,
+        // TRUE, and it is the whole generation's: `rope_parameters`'
+        // `full_attention` arm states `rope_type: proportional` beside
+        // `partial_rotary_factor: 0.25`, so a full-attention head rotates 128
+        // of its 512 channels PAIRED ACROSS the head and not within the
+        // rotated slice. The sliding arm rotates all 256 of its own, where
+        // the two readings coincide -- which is why one flag covers the
+        // stack.
+        rope_proportional: true,
         // The per-layer window list every `*_at` reads to decide which
         // layers are full. Built from `is_full_attn`, the same helper
         // `layer_attention` uses, so the two cannot disagree.
@@ -643,11 +669,16 @@ pub fn trace(
     f: &Gemma4Facts,
     sliding_window: i32,
     class: model_ir::trace::FireClass,
+    layer_scalars: &[f32],
 ) -> model_ir::trace::ForwardPlan {
     let cuda = super::forward::facts::Gemma4CudaFacts {
         fused_qkv: true,
         gate_up_fused: true,
         kv_native_bf16: true,
+        // The LOAD's, like the three booleans above: `layer_scalar` is a
+        // per-layer `[1]` tensor, so only something that has opened the
+        // checkpoint can state it.
+        layer_scalars: layer_scalars.to_vec(),
         window_left: (0..f.layers)
             .map(|l| {
                 if f.is_full_attn(l) {
@@ -1316,7 +1347,70 @@ mod tests {
         );
     }
 
-    /// The shared gemma fixture must be off the default wherever EVERY
+    /// The two texts must attend at the SAME temperature, and for eight
+    /// months they did not.
+    ///
+    /// `metal_facts` read `attn_scale: 0.0`, which is the sentinel
+    /// `model_dsl::metal::sdpa` reads as "derive `1/sqrt(head_dim)`",
+    /// under a comment claiming the derivation was "the same reading" as
+    /// the per-layer table's `sm_scale: 1.0`. It is not the same number:
+    /// a sliding layer divided every logit by 16 and a full one by
+    /// 22.6, on the one family in this catalog whose `q_norm` and
+    /// `k_norm` have already applied the scaling.
+    ///
+    /// The defect was invisible to the reference gate, because with a
+    /// SINGLE key the softmax over one logit is 1.0 at any temperature
+    /// -- so a position-zero comparison against MLX agreed to the top-5
+    /// while generated text was English-shaped rubbish.
+    ///
+    /// Asserted as a RELATION between the two statements rather than
+    /// against a literal, because the number that matters is that CUDA's
+    /// table and the Metal facts say the same thing about the same row.
+    /// Over every shipped gemma-4, so a row added tomorrow is covered.
+    #[test]
+    fn the_metal_softmax_scale_is_the_one_the_per_layer_table_states() {
+        use crate::catalog::MetalBinding;
+        let bind = MetalBinding {
+            quant_group: 64,
+            quant_bits: 4,
+            router_quant_group: 0,
+            router_quant_bits: 0,
+            moe_mxfp4: false,
+            fuse_residual_gemv: true,
+            paged_multi_batch: true,
+            qmm_multi_batch: true,
+            add_bias: false,
+            fused_qk_rope: false,
+        };
+        for (name, f, mixture, sliding_window, k_eq_v) in [
+            ("gemma-4-e4b", Gemma4Facts::gemma_4_e4b(), None, 512, false),
+            ("gemma-4-31b", Gemma4Facts::gemma_4_31b(), None, 1024, true),
+            (
+                "gemma-4-26b-a4b",
+                Gemma4Facts::gemma_4_26b_a4b(),
+                Some(Gemma4Mixture::gemma_4_26b_a4b()),
+                1024,
+                true,
+            ),
+        ] {
+            let row = RowScalars {
+                mixture,
+                sliding_window,
+                norm_eps: NORM_EPS,
+                k_eq_v,
+            };
+            let d = deployment(&f, row.clone(), Deployed::single());
+            let m = super::metal_facts(&f, row, &bind);
+            assert!(
+                d.attention.iter().all(|a| a.sm_scale == 1.0),
+                "{name}: the per-layer table states 1.0 for every layer"
+            );
+            assert_eq!(
+                m.attn_scale, d.attention[0].sm_scale,
+                "{name}: the Metal text must not derive a scale this row STATES"
+            );
+        }
+    }
     /// gemma row is.
     ///
     /// `LlamaLikeMetalFacts::gemma_like()` is what the gemma4 Metal

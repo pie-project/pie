@@ -1137,6 +1137,34 @@ jobs:
           cargo build -p worker \
             --no-default-features --features driver-metal
 
+      # THE COMPOSITION ROOT, which every other backend's job builds and this
+      # one did not. `worker` is a library with no `[[bin]]`, so the step above
+      # never produced a runnable CLI; `pie`'s own `driver-metal` forwards to
+      # `worker/driver-metal` and this package is the only one with a binary.
+      # The wgpu job has said `cargo build -p pie --features driver-wgpu` since
+      # it was written, and vulkan's says the same -- Metal's absence was an
+      # omission and not a decision.
+      #
+      # What it costs to leave out is not hypothetical. This is the exact
+      # command that failed with `cannot find BootConfig in driver` after a
+      # commit deleted `pub mod boot;` from `engine/src/driver.rs` while
+      # `boot.rs`, its tests and its only consumer -- `backend/metal.rs` --
+      # all stayed. Nothing was red anywhere, because no job in this file
+      # compiled the seam that named it.
+      - name: cargo build (pie binary, driver-metal)
+        run: cargo build -p pie --features driver-metal
+
+      # And the template test, for the same reason the wgpu job runs its own:
+      # `it_names_the_driver_this_binary_actually_has` checks the `[driver]`
+      # block `pie config init` writes against the flavor the binary HAS, and
+      # its Metal arm is behind `#[cfg(feature = "driver-metal")]`. Without a
+      # build that turns the feature on, that arm is dead source and the
+      # assertion silently checks nothing. Its comment records what the hole
+      # cost the last time: Metal "came to be handed the dummy driver's block:
+      # it parsed perfectly and then generated random tokens."
+      - name: cargo test (pie, driver-metal template + seam)
+        run: cargo test -p pie --lib --features driver-metal
+
       # Both configurations again: a lint that only fires in one half is a
       # lint nobody sees.
       - name: cargo clippy (driver-metal, portable half)

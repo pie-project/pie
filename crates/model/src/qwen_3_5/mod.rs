@@ -19,6 +19,66 @@
 //!
 //! Chat: the qwen3 lineage's ChatML, stated per row rather than reached
 //! through `instruct::create`'s `_ =>` arm.
+//!
+//! **WHY EVERY NORM IN THIS GENERATION FOLDS PLAINLY, AND WHAT THE OTHER
+//! READING COST.**
+//!
+//! Every `norm_variant` in this module and in [`super::spec`] used to say
+//! [`NormVariant::Gemma`] — `xhat * (1 + w)` rather than `xhat * w` — and
+//! every one of those statements cited the SAME source: the legacy
+//! prototype's `qwen3_5_forward.cpp`, which launches
+//! `kernels::norm::rmsnorm_gemma_bf16`, and its mixture sibling's
+//! `uses_gemma_rmsnorm`. One C++ file, read once, repeated at fourteen
+//! sites, and never compared to a checkpoint.
+//!
+//! It is wrong, and three independent readings say so:
+//!
+//! - **The reference.** `mlx_lm.models.qwen3_5` builds `nn.RMSNorm` for
+//!   `input_layernorm`, `post_attention_layernorm` and `model.norm`, and
+//!   `qwen3_next.Qwen3NextAttention` builds it for `q_norm`/`k_norm`.
+//!   `nn.RMSNorm` multiplies by `w`. There is no `1 +` anywhere in the
+//!   family's MLX text.
+//! - **The weights.** A gemma-folded gain is trained from ZEROS and sits
+//!   near zero; a plain one is trained from ones and sits near one.
+//!   Qwen3.6-27B-4bit ships `layers.0.input_layernorm.weight` at mean
+//!   0.976 over [0.875, 1.195] and Qwen3.6-35B-A3B-4bit at mean 1.031
+//!   over [0.922, 1.328]. Every block norm, every q/k norm and the final
+//!   norm in both checkpoints reads the same way. Nothing here was
+//!   trained from zero.
+//! - **The arithmetic, against MLX, at position zero.** The gemma fold put
+//!   `rms_single_row`'s first row at `[-0.6758, -1.2813, 1.2734, ...]`
+//!   where MLX says `[-0.3466, -0.6265, 0.6162, ...]`, and
+//!   `x * inv * (1 + w)` reproduces the driver's row to the bf16 step.
+//!   That is the SECOND statement of the fire, so nothing downstream of it
+//!   was ever computed on this model.
+//!
+//! The consequence is the one the extra term implies. `xhat * (1 + w)` is
+//! `xhat * w + xhat`, so the wrong fold adds the raw normalized residual to
+//! every block's input and to the readout's. On Metal, Qwen3.6-35B-A3B-4bit
+//! answered "The capital of France is" with
+//! `esauspiel面cl,,觉得 in\u{fffd}   organ aither-('` and Qwen3.6-27B-4bit
+//! with `atinum)nn\n\n投\nführwright..thisenp -,`. Folded plainly, on the
+//! same weights and the same fire, both open
+//! `<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**` and
+//! go on to answer the question.
+//!
+//! `driver-metal/tests/device_real_weights.rs`'s
+//! `one_token_at_position_zero_agrees_with_mlx` is what holds it: it FAILED
+//! on both qwen3.6 rows against the `REFERENCES` table's MLX numbers — 27B
+//! top-3 `[2, 32850, 248045]` against MLX's `[2, 550, 760]` — and passes on
+//! both now, spans included. The rows had been in that table for weeks with
+//! nothing running them, which is the same NO MACHINE BUILDS THIS DRIVER
+//! story the whole seam keeps telling.
+//!
+//! What is NOT settled here is the 0.8B. `driver-wgpu`'s
+//! `which_fold_the_final_norm_applies_and_what_each_one_answers` reports
+//! `Qwen/Qwen3.5-0.8B-Base` shipping `mlp_norm` at mean 0.0855 and
+//! `attn_norm` at 0.2382 — gemma-shaped gains — while finding in the SAME
+//! file that its per-block norms fold plainly. Those two statements cannot
+//! both be true of one checkpoint and neither is measurable here: no 0.8B
+//! is staged on this machine. The rows below state what the checkpoints
+//! this workspace CAN read state, and a 0.8B that disagrees will have to
+//! say so with its own numbers.
 
 // `Arc` reaches this module only through `Variant::chat`, so the
 // import carries that method's gate. It used to ride along with
@@ -107,7 +167,7 @@ impl Qwen35 {
 /// = 0.25` of 256, RESOLVED — a row states the channel count, not the
 /// factor, because the factor is config parsing); the output-gated q
 /// bank is the family's shape; and every norm in the block folds
-/// Gemma's `(1 + w)`.
+/// PLAINLY — see this module's doc.
 const fn attn(hidden: u32, q_heads: u32, kv_heads: u32) -> Qwen35FullAttnFacts {
     Qwen35FullAttnFacts {
         hidden,
@@ -119,7 +179,7 @@ const fn attn(hidden: u32, q_heads: u32, kv_heads: u32) -> Qwen35FullAttnFacts {
         // so the load binds three projections and the trace writes three
         // matmuls.
         fused_qkv: false,
-        norm_variant: NormVariant::Gemma,
+        norm_variant: NormVariant::Plain,
     }
 }
 
@@ -140,7 +200,7 @@ const fn gdn(hidden: u32, key_heads: u32, value_heads: u32) -> Qwen35GdnFacts {
         // `PIE_QWEN35_FUSED_GDN_PROJ` is off by default: the checkpoint
         // ships four projections and the trace writes four matmuls.
         fused_in_proj: false,
-        norm_variant: NormVariant::Gemma,
+        norm_variant: NormVariant::Plain,
     }
 }
 
@@ -160,6 +220,8 @@ const fn gdn(hidden: u32, key_heads: u32, value_heads: u32) -> Qwen35GdnFacts {
 /// reaches the same front-end its siblings do, and the text-only `qwen3`
 /// generation next door does not.
 const ARCH: &str = "qwen3_5";
+
+
 
 /// The published context ceiling, shared by every row of the lineage.
 ///
@@ -202,7 +264,7 @@ pub const VARIANTS: &[Qwen35] = &[
             full_attn_interval: 4,
             vocab: 248_320,
             tied_embeddings: true,
-            norm_variant: NormVariant::Gemma,
+            norm_variant: NormVariant::Plain,
             attn: attn(1024, 8, 2),
             gdn: gdn(1024, 16, 16),
             mlp: Qwen35MlpKind::Dense { intermediate: 3584 },
@@ -219,7 +281,7 @@ pub const VARIANTS: &[Qwen35] = &[
             full_attn_interval: 4,
             vocab: 248_320,
             tied_embeddings: true,
-            norm_variant: NormVariant::Gemma,
+            norm_variant: NormVariant::Plain,
             attn: attn(2560, 16, 4),
             gdn: gdn(2560, 16, 32),
             mlp: Qwen35MlpKind::Dense { intermediate: 9216 },
@@ -236,7 +298,7 @@ pub const VARIANTS: &[Qwen35] = &[
             full_attn_interval: 4,
             vocab: 248_320,
             tied_embeddings: false,
-            norm_variant: NormVariant::Gemma,
+            norm_variant: NormVariant::Plain,
             attn: attn(4096, 16, 4),
             gdn: gdn(4096, 16, 32),
             mlp: Qwen35MlpKind::Dense {
@@ -257,7 +319,7 @@ pub const VARIANTS: &[Qwen35] = &[
             full_attn_interval: 4,
             vocab: 248_320,
             tied_embeddings: false,
-            norm_variant: NormVariant::Gemma,
+            norm_variant: NormVariant::Plain,
             attn: attn(2048, 16, 2),
             gdn: gdn(2048, 16, 32),
             mlp: Qwen35MlpKind::Moe(Qwen35MoeMlpFacts {
@@ -266,7 +328,7 @@ pub const VARIANTS: &[Qwen35] = &[
                 top_k: 8,
                 moe_intermediate: 512,
                 shared_expert_intermediate: 512,
-                norm_variant: NormVariant::Gemma,
+                norm_variant: NormVariant::Plain,
             }),
         },
         rope_theta: 1e7,
@@ -292,7 +354,7 @@ pub const VARIANTS: &[Qwen35] = &[
             full_attn_interval: 4,
             vocab: 248_320,
             tied_embeddings: false,
-            norm_variant: NormVariant::Gemma,
+            norm_variant: NormVariant::Plain,
             attn: attn(5120, 24, 4),
             gdn: gdn(5120, 16, 48),
             mlp: Qwen35MlpKind::Dense {

@@ -2000,6 +2000,7 @@ fn one_launch(symbol: &str) -> model_compiler::lower::Lowered {
         structural: Vec::new(),
         residue: Vec::new(),
         params: Vec::new(),
+        preps: Vec::new(),
         n_requests: 1,
         conds: Vec::new(),
         readout: None,
@@ -2140,6 +2141,15 @@ fn a_module_the_front_end_cannot_read_is_refused_by_the_entrypoint_that_named_it
 
     struct NotWgsl;
     impl driver_wgpu::serve::Modules for NotWgsl {
+        // THE FIRE PATH'S LOOKUP, which a body reaches through `Fire::at`.
+        // Same prose here as at `source` below: what is under test is what a
+        // front end does with text that is not WGSL, and both lookups have to
+        // hand it the same non-shading language for the refusal to be the
+        // one this names.
+        fn at(&self, _file: &str, _entrypoint: &str, _tier: Capability) -> Option<String> {
+            Some("this is prose, not a shading language".to_owned())
+        }
+
         fn source(&self, _entrypoint: &str, _tier: Capability) -> Option<String> {
             Some("this is prose, not a shading language".to_owned())
         }
@@ -2365,37 +2375,59 @@ fn the_first_ported_routine_runs_on_this_adapter_and_averages_two_streams() {
     let params_b = device.buffer(&params).expect("params");
 
     let mut pipelines = Pipelines::default();
-    let held = [&proj_b, &token_b, &out_b, &params_b];
+    // THE PARAMS BLOCK IS HANDLE ZERO, because `Handles` mints in ask order
+    // and `ctx.params()` is the first thing this body asks for. The operands
+    // the caller states are handles 1..3, so `held` is laid out to match.
+    let held = [&params_b, &proj_b, &token_b, &out_b];
+    // WHAT THE BODY ASKS FOR, ANSWERED. `Env` left the parameter list: the
+    // per-layer table is `ctx.params()` and the row count is
+    // `ctx.ask::<i32, keys::Rows>()`, so an encoder with nothing behind it
+    // refuses both. This is the `answering` channel `lowering::routine`'s
+    // `stating` is for, entered from a test instead of from a plan.
+    let handles = core::cell::RefCell::new(
+        driver_wgpu::lowering::hold::Handles::undivided(&[], &[]),
+    );
+    let facts = driver_wgpu::lowering::hold::facts(
+        "ple_combine_bfloat16",
+        // One row of `WORDS` elements: the body's `lanes` is `width * rows`,
+        // and the launch this test measures is the flat one it always was.
+        1,
+        driver_wgpu::dispatch::Geometry::default(),
+        1,
+        u32::try_from(WORDS).expect("fits"),
+        u32::try_from(WORDS).expect("fits"),
+    );
     let encoder = driver_wgpu::encode::Encoder::new(
         &device,
         &mut pipelines,
         &Embedded,
         Capability::Baseline,
         &held,
-    );
+    )
+    .answering(&handles, facts);
 
+    let width = i32::try_from(WORDS).expect("fits");
     kernels_wgpu::layout::ple_combine(
         &encoder,
-        // The two inputs and the result state their SLOTS now, and the
-        // per-layer embedding table is the FIRE's -- `Env`, because no
-        // statement places it as an operand. That marking is the read-side
-        // repair the arity checker was red for: `Provenance::Env` is what
-        // `arity_problem` skips.
-        kernels_wgpu::routine::In {
-            ptr: kernels_wgpu::routine::Buf(0),
+        // The marks are FAT now: an operand carries the rectangle the
+        // statement gave it, which is where the body reads its own pitch.
+        // `Width` came off 337 parameter lists exactly because the operand
+        // beside it already implied it.
+        kernels::In {
+            ptr: kernels_wgpu::routine::Tensor::new(1),
+            rows: 1,
+            width,
         },
-        kernels_wgpu::routine::In {
-            ptr: kernels_wgpu::routine::Buf(1),
+        kernels::In {
+            ptr: kernels_wgpu::routine::Tensor::new(2),
+            rows: 1,
+            width,
         },
-        kernels_wgpu::routine::Out {
-            ptr: kernels_wgpu::routine::BufMut(2),
+        kernels::Out {
+            ptr: kernels_wgpu::routine::Tensor::new(3),
+            rows: 1,
+            width,
         },
-        // The per-layer table is a `Block` and the two extents are `Ask`ed
-        // facts by name -- upstream retyped all three. The numbers are the
-        // same; the types say who SUPPLIES them.
-        kernels_wgpu::routine::Env::new(kernels_wgpu::routine::Buf(3)),
-        kernels_wgpu::routine::Env::new(i32::try_from(WORDS).expect("fits")),
-        kernels_wgpu::routine::Env::new(1),
     )
     .expect("the routine dispatches on this adapter");
 

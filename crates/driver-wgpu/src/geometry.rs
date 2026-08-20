@@ -535,9 +535,18 @@ pub fn lanes(rule: Rule, dims: Dims, module: Module) -> Result<[u32; 3], Ungeome
             // and `num_workgroups.y` as the row count -- so BOTH axes are
             // quantities the shader computes with and neither may be rounded.
             // Neither is: the division is exact on x because the workgroup
-            // width is the factor, and exact on y because the local size there
-            // is one.
-            [module.local.at(0) * dims.q_heads, rows, 1]
+            // width is the factor, and exact on y because the row count is
+            // multiplied by the local size there before being divided by it.
+            //
+            // That y factor is not always one. `sdpa_paged.wgsl`'s decode arm
+            // spends its second local axis on KEYS -- the block of the history
+            // one reduction serves -- so a workgroup is `PIE_PAIRS x PIE_KB`
+            // and the row still gets exactly one of them.
+            [
+                module.local.at(0) * dims.q_heads,
+                rows * module.local.at(1),
+                1,
+            ]
         }
         // The two rules Metal distinguishes and this backend cannot.
         //

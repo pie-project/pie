@@ -718,6 +718,16 @@ pub fn residual_add(x: &Val, residual: &Val) -> Val {
 /// `rope/rope.metal::neox_decode_bfloat16` (M=1) /
 /// `neox_mb_bfloat16` (M>1). One dispatch for q and k together,
 /// as the plan states it (`declared_dag.hpp`'s `Kind::Rope`).
+///
+/// `proportional` says which LADDER, and it is a third form beside the two
+/// this used to state. A geometric rotation pairs channel `i` with
+/// `i + rotary/2` and takes its exponent over the rotated slice; gemma-4's
+/// pairs `i` with `i + head_dim/2` and takes the exponent over the WHOLE
+/// head. Those are the same rotation when the rotary covers the head and a
+/// different one when it does not -- gemma-4's full-attention layers rotate
+/// 128 of 512, so the channels that move are `[0,63]` and `[256,319]` and
+/// not `[0,127]`, at frequencies four ladder steps apart from the ones the
+/// geometric form computes.
 pub fn rope(
     q: &Val,
     k: &Val,
@@ -727,10 +737,29 @@ pub fn rope(
     head_dim: u32,
     rotary_dim: u32,
     table: bool,
+    proportional: bool,
 ) -> (Val, Val) {
     (
-        rope_one(q, multi_batch, theta, scale, head_dim, rotary_dim, table),
-        rope_one(k, multi_batch, theta, scale, head_dim, rotary_dim, table),
+        rope_one(
+            q,
+            multi_batch,
+            theta,
+            scale,
+            head_dim,
+            rotary_dim,
+            table,
+            proportional,
+        ),
+        rope_one(
+            k,
+            multi_batch,
+            theta,
+            scale,
+            head_dim,
+            rotary_dim,
+            table,
+            proportional,
+        ),
     )
 }
 
@@ -758,6 +787,7 @@ fn rope_one(
     head_dim: u32,
     rotary_dim: u32,
     table: bool,
+    proportional: bool,
 ) -> Val {
     // IN PLACE, and the statement says so the way every other in-place
     // statement in the tree does: it declares BOTH halves and the routine
@@ -830,7 +860,28 @@ fn rope_one(
     } else {
         // ALWAYS the M>1 symbol, for the reason the table branch above
         // states: the class does not answer how many rows a fire has.
-        let stem = "neox_mb_bfloat16";
+        //
+        // WHICH LADDER is the other question, and for two years this text
+        // could only ask one of them. `neox_prop_mb_bfloat16` has existed in
+        // `rope/neox.metal` the whole time, `kernels-metal::rope` states its
+        // binding order, `driver-metal`'s routine table names it and
+        // `lowering::dispatch` has a test asserting it plans -- and this
+        // file, the only thing that can put it in a trace, named it ZERO
+        // times. So every gemma-4 rotated its full-attention heads on the
+        // geometric ladder over a quarter-head: the pair was `(i, i+64)`
+        // where the checkpoint means `(i, i+256)`, and the exponent divided
+        // by 64 where it means 512. Nothing refused, nothing NaN'd, and the
+        // model answered a prompt about the capital of France with
+        // `-p--r-r-c-c--f--ter---`.
+        //
+        // The same shape of gap as the routed MoE GEMM and the GDN prefill
+        // pair: a kernel with every seam behind it built and no text naming
+        // it, on a driver no CI machine compiles.
+        let stem = if proportional {
+            "neox_prop_mb_bfloat16"
+        } else {
+            "neox_mb_bfloat16"
+        };
         (
             stem.to_string(),
             // The rotation's scale, its log2 base and the head width. The
@@ -838,6 +889,10 @@ fn rope_one(
             // `rope_neox_geometric_body` -- and handing it theta rotates
             // by a frequency ladder wrong from the second channel on.
             // The rotary WIDTH last -- see the table form above.
+            //
+            // The proportional form takes the same four in the same order:
+            // it reads the head width where the geometric one reads the
+            // grid, so only the arithmetic differs and not the binding.
             vec![
                 scale.to_bits(),
                 theta.log2().to_bits(),

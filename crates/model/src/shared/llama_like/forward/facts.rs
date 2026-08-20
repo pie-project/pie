@@ -456,6 +456,29 @@ pub struct LlamaLikeMetalFacts {
     /// `Source::Named(<keys::RopeFrequencies as keys::Fact>::KEY)`.
     #[serde(default)]
     pub rope_freq_table: bool,
+    /// Whether the rotation's exponent and pairing are taken over the WHOLE
+    /// head rather than over the rotated slice.
+    ///
+    /// A partial rotary has two readings and the checkpoint picks one. The
+    /// ordinary one -- qwen3's, qwen3.6's -- rotates the leading `rotary`
+    /// channels as a head of that size: pair `i` with `i + rotary/2`, and let
+    /// the exponent run `0..1` across the slice. gemma-4's `rope_type:
+    /// proportional` rotates the leading `rotary` channels IN PLACE in a head
+    /// of the full width: pair `i` with `i + head_dim/2`, and let the exponent
+    /// run across the head so the slice only ever sees its first quarter. At
+    /// `head_dim: 512, rotary: 128` the channels that move are `[0,63]` and
+    /// `[256,319]`, and every frequency is four ladder steps off the other
+    /// reading's.
+    ///
+    /// Two symbols and not a parameter, because the two arithmetics are
+    /// written out separately in `rope/neox.metal` on purpose: folding them
+    /// into one body moved gemma-4's recorded continuation, the compiler's
+    /// contraction having changed under the same source-level formula.
+    /// `neox_prop_mb` is the batched one and reduces exactly to the geometric
+    /// form when the rotary covers the head, which is what a gemma-4 sliding
+    /// layer does -- so this is a fact of the MODEL and not of the layer.
+    #[serde(default)]
+    pub rope_proportional: bool,
     /// The SLIDING WINDOW each layer attends over, `-1` for none; empty means
     /// every layer is `-1`. Read through [`Self::window_left_at`].
     ///
@@ -522,6 +545,12 @@ impl LlamaLikeMetalFacts {
     pub fn gemma_like() -> Self {
         Self {
             activation: Activation::Geglu,
+            // The generation's rotation, and the one fact here that decides a
+            // SYMBOL rather than an argument: `neox_prop_mb_bfloat16` against
+            // `neox_mb_bfloat16`. A gemma text that read this fixture with the
+            // field at its default would trace the rotation every shipped
+            // gemma-4 row gets wrong.
+            rope_proportional: true,
             logit_softcap: 30.0,
             per_layer_emb_dim: 256,
             kv_shared_layers: 4,
@@ -532,6 +561,14 @@ impl LlamaLikeMetalFacts {
             // does -- so a fixture that left this false made the one text
             // that could exercise the branch fire the branch beside it.
             v_norm: true,
+            // ONE, which every shipped gemma-4 row states and no other
+            // family here does. Zero is not a smaller temperature, it is
+            // the SENTINEL that makes `llama_like_metal` derive
+            // `1/sqrt(head_dim)` -- and gemma-4's per-head `q_norm` and
+            // `k_norm` have already divided by that, so a derived scale
+            // divides twice. A fixture left at zero traced the one text
+            // that could exercise the stated scale with the derived one.
+            attn_scale: 1.0,
             // `sqrt(1024)`, the `hidden` both call sites pair this with. Zero is
             // a BRANCH: `llama_like_metal` reads `embed_scale > 0.0` and emits
             // `embed_gather` instead.
@@ -738,6 +775,9 @@ impl LlamaLikeMetalFacts {
             activation: Activation::SiluMul,
             // qwen3's ladder is a plain geometric series in `rope_theta`.
             rope_freq_table: false,
+            // And it rotates the whole head, where the two readings of a
+            // partial rotary coincide anyway.
+            rope_proportional: false,
             // qwen3 attends over the whole context at every layer.
             window_left: Vec::new(),
         }

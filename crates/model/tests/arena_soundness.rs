@@ -554,6 +554,8 @@ fn what_gemma_4_e2b_asks_for_at_one_row() {
                 fused_qkv: false,
                 gate_up_fused: false,
                 kv_native_bf16: true,
+                // A fixture states no checkpoint, so the landing scales by one.
+                layer_scalars: Vec::new(),
             },
             FireClass::Decode,
         );

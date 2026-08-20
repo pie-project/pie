@@ -403,6 +403,14 @@ const VISIBILITY: crate::device::Visibility = crate::device::Visibility::Device;
 /// The first dispatch that would not encode, which stops the fire: a partially
 /// encoded fire computes a prefix and leaves the rest of the arena holding
 /// whatever the last one left.
+// The two `eprintln!`s below are env-GATED diagnostics -- `PIE_METAL_TOUCHES`
+// and `PIE_METAL_BARRIER_COUNT` -- and they are the arbiter for a race the
+// hazard tracker cannot see. A span a statement touches but does not declare
+// is invisible to `dispatch.touches`, and no amount of reading the kernel
+// finds it; printing what each dispatch DECLARES beside whether the tracker
+// barriered is what settles it. Silent by default, so this is not output a
+// serving run ever produces.
+#[allow(clippy::print_stderr)]
 pub fn encode(
     encoder: &mut StepEncoder<'_>,
     table: &ArgumentTable,
@@ -468,8 +476,10 @@ pub fn encode(
         // declare is a race the tracker cannot see -- the failure looks like
         // a kernel that does not repeat, and no amount of reading the kernel
         // finds it. Two runs, one with this set, settle which it is.
-        if let Some(w) = &window {
-            if w.contains(&index) {
+        if let Some(w) = &window
+            && w.contains(&index)
+        {
+            {
                 let f = |set: &[Slice]| -> Vec<String> {
                     set.iter()
                         .map(|s| format!("{:#x}+{}", s.address, s.bytes))

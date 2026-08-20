@@ -406,6 +406,64 @@ fn routed_qmv_grid(rows: i32, out_vec_size: i32, slots: i32) -> Result<[u32; 3],
     ])
 }
 
+/// The routed matvec's two vector widths, which are ONE SLOT's and not one
+/// statement's.
+///
+/// The kernel walks a single expert per thread block: `in_vec_size` strides its
+/// weight rows and `out_vec_size` both strides the bank by expert and places
+/// the result, so both have to be one expert's numbers. The MARKS carry
+/// neither. `dsl::metal::routed_qmv` declares the matvec's value as `[Tokens,
+/// width * k]` -- `k` results end to end, which is the shape the elementwise
+/// activation between two of them must cover -- and its input, for the down
+/// projection, is another such run. So `x.width` and `y.width` are both `k`
+/// TIMES what this kernel means by a vector.
+///
+/// They were read straight off the marks, and the cost was total: at gemma-4's
+/// top-8 the bank was addressed `e * 8 * 704 * in_vec_size_w` bytes in, which
+/// is past the end of it for every expert but the zeroth, and the result was
+/// written eight rows apart into a buffer with one row per route. Both mixture
+/// checkpoints on this backend answered `inf` from the first routed matvec of
+/// layer 0 and NaN from every layer after it. The statement was already
+/// carrying the honest number for the input -- `x_slot_stride` IS one run,
+/// which is why `dsl::metal::routed_qmv` states it rather than reading the
+/// trailing dim -- so this reads that, and divides the output's by the slot
+/// count the same statement carries.
+///
+/// # Errors
+///
+/// [`Refusal::Empty`] for a non-positive width or slot count, and
+/// [`Refusal::Narrow`] for an output width the slot count does not divide --
+/// which is a text whose value shape and whose top-k disagree, not a rounding
+/// this could absorb.
+fn routed_qmv_widths(
+    x_slot_stride: i32,
+    y_width: i32,
+    slots: i32,
+) -> Result<(i32, i32), Refusal> {
+    if x_slot_stride <= 0 {
+        return Err(Refusal::Empty {
+            what: "x_slot_stride",
+        });
+    }
+    if y_width <= 0 {
+        return Err(Refusal::Empty {
+            what: "out_vec_size",
+        });
+    }
+    if slots <= 0 {
+        return Err(Refusal::Empty {
+            what: "slots_per_row",
+        });
+    }
+    if !y_width.unsigned_abs().is_multiple_of(slots.unsigned_abs()) {
+        return Err(Refusal::Narrow {
+            what: "an output width the slot count does not divide",
+            at: i64::from(y_width),
+        });
+    }
+    Ok((x_slot_stride, y_width / slots))
+}
+
 /// The routed GEMM's grid, at a `(tile_m, tile_n)` tile.
 ///
 /// EXACT division on both axes, refused rather than rounded. The shader has no
@@ -825,7 +883,7 @@ pub fn shared_expert_combine_strided(
 ///
 /// # Errors
 ///
-/// See [`routed_qmv_grid`].
+/// See [`routed_qmv_grid`] and [`routed_qmv_widths`].
 #[routine]
 pub fn qmv_routed(
     ctx: &Ctx<'_>,
@@ -842,14 +900,16 @@ pub fn qmv_routed(
     // and a slot is one, so `x_slot_stride` is the input's width, the row
     // stride is `k` of them, and `slots_per_row` is `k`.
     //
-    // `in_vec_size` and `out_vec_size` stood before them and correctly left:
-    // they are `x.width` and `y.width`, which the marks carry.
+    // `in_vec_size` and `out_vec_size` stood before them and left, and the
+    // note here said they were `x.width` and `y.width` "which the marks
+    // carry". They are NOT: a mark carries a whole statement's run and this
+    // kernel walks one slot of it. See `routed_qmv_widths`.
     x_slot_stride: Const<i32>,
     x_row_stride: Const<i32>,
     slots_per_row: Const<i32>,
     expert_ids: In<Tensor<i32>>) -> Result<(), Refusal> {
-    let in_vec_size = x.width;
-    let out_vec_size = y.width;
+    let (in_vec_size, out_vec_size) =
+        routed_qmv_widths(*x_slot_stride, y.width, *slots_per_row)?;
     let bias = ctx.absent()?;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
@@ -875,7 +935,7 @@ pub fn qmv_routed(
 ///
 /// # Errors
 ///
-/// See [`routed_qmv_grid`].
+/// See [`routed_qmv_grid`] and [`routed_qmv_widths`].
 #[routine]
 pub fn qmv_routed_bias(
     ctx: &Ctx<'_>,
@@ -893,14 +953,16 @@ pub fn qmv_routed_bias(
     // and a slot is one, so `x_slot_stride` is the input's width, the row
     // stride is `k` of them, and `slots_per_row` is `k`.
     //
-    // `in_vec_size` and `out_vec_size` stood before them and correctly left:
-    // they are `x.width` and `y.width`, which the marks carry.
+    // `in_vec_size` and `out_vec_size` stood before them and left, and the
+    // note here said they were `x.width` and `y.width` "which the marks
+    // carry". They are NOT: a mark carries a whole statement's run and this
+    // kernel walks one slot of it. See `routed_qmv_widths`.
     x_slot_stride: Const<i32>,
     x_row_stride: Const<i32>,
     slots_per_row: Const<i32>,
     expert_ids: In<Tensor<i32>>) -> Result<(), Refusal> {
-    let in_vec_size = x.width;
-    let out_vec_size = y.width;
+    let (in_vec_size, out_vec_size) =
+        routed_qmv_widths(*x_slot_stride, y.width, *slots_per_row)?;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
         Fire::at(QMV_FILE, "affine_qmv_routed_bias_bfloat16_gs_64_b_4").apply(Grid::of(routed_qmv_grid(rows, out_vec_size, *slots_per_row)?, SIMD_PAIR)),
@@ -933,7 +995,7 @@ pub fn qmv_routed_bias(
 ///
 /// # Errors
 ///
-/// See [`routed_qmv_grid`].
+/// See [`routed_qmv_grid`] and [`routed_qmv_widths`].
 #[routine]
 pub fn mxfp4_qmv_routed_bias(
     ctx: &Ctx<'_>,
@@ -950,15 +1012,17 @@ pub fn mxfp4_qmv_routed_bias(
     // and a slot is one, so `x_slot_stride` is the input's width, the row
     // stride is `k` of them, and `slots_per_row` is `k`.
     //
-    // `in_vec_size` and `out_vec_size` stood before them and correctly left:
-    // they are `x.width` and `y.width`, which the marks carry.
+    // `in_vec_size` and `out_vec_size` stood before them and left, and the
+    // note here said they were `x.width` and `y.width` "which the marks
+    // carry". They are NOT: a mark carries a whole statement's run and this
+    // kernel walks one slot of it. See `routed_qmv_widths`.
     x_slot_stride: Const<i32>,
     x_row_stride: Const<i32>,
     slots_per_row: Const<i32>,
     expert_ids: In<Tensor<i32>>) -> Result<(), Refusal> {
     let biases = ctx.absent()?;
-    let in_vec_size = x.width;
-    let out_vec_size = y.width;
+    let (in_vec_size, out_vec_size) =
+        routed_qmv_widths(*x_slot_stride, y.width, *slots_per_row)?;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     ctx.fire(
         Fire::at(QMV_FILE, "mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4").apply(Grid::of(routed_qmv_grid(rows, out_vec_size, *slots_per_row)?, SIMD_PAIR)),
@@ -1114,7 +1178,28 @@ pub fn mxfp4_qmm_t_routed_bias(
     tile_expert: In<Tensor<i32>>,
     tile_m: Const<i32>,
     tile_n: Const<i32>) -> Result<(), Refusal> {
-    let k = pad.width;
+    // THE CONTRACTION IS THE ACTIVATION'S WIDTH, AND IT IS NOT THE PAD'S.
+    //
+    // This read `pad.width`, and `pad` is the filler bound into the holes this
+    // entrypoint leaves at 2 and 8..=11 -- `model-dsl` rides `row_expert`
+    // there, an `i32` value ONE element wide, because a real buffer in a hole
+    // keeps the operand list the same length as the matvec's. So every fire of
+    // gpt-oss's routed GEMM was handed `K = 1` where the bank is 2880 wide,
+    // and the affine twins two routines above have always said `x.width`.
+    //
+    // What that cost is worse than a truncated dot product, because `K` is the
+    // ROW STRIDE as well as the loop bound: `qmm_t_cast_loaded_impl` starts
+    // its activation loader at `x + y_row * K`, so a tile at sorted row 160
+    // read from ELEMENT 160 of row zero instead of from row 160, and the
+    // answer for a (token, expert) pair moved whenever the sorted stack put it
+    // at a different offset. Adding a token to a prefill moves it. So does
+    // adding a SECOND REQUEST to the fire, which is why two conversations
+    // batched together did not prefill the way either of them prefills alone.
+    //
+    // It stayed hidden because the routed MATVEC arm, which is correct, is
+    // what a one-token decode selects; only a prefill wide enough to earn the
+    // GEMM ever asked this question.
+    let k = x.width;
     let n = y.width;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     let point = tile_point(*tile_m, *tile_n)?;
@@ -1230,6 +1315,78 @@ mod tests {
         fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
             self.calls.borrow_mut().push((fire, args.to_vec()));
             Ok(())
+        }
+    }
+
+    /// The routed GEMM contracts over the ACTIVATION's width, and not over
+    /// the width of the value riding its pad slot.
+    ///
+    /// `mxfp4_qmm_t_routed_bias` read `pad.width`, and `model-dsl` rides
+    /// `row_expert` there -- ONE element wide -- so gpt-oss's mixture ran
+    /// every routed projection with `K = 1` against a 2880-wide bank. `K` is
+    /// the activation's row stride as well as its loop bound, so a tile at
+    /// sorted row 160 read from element 160 of row zero: the answer for one
+    /// (token, expert) pair moved when anything moved that pair's place in
+    /// the sorted stack, which a longer prefill does and a second request in
+    /// the same fire does.
+    ///
+    /// The two affine forms beside it always said `x.width`, which is why
+    /// this asserts all three together.
+    #[test]
+    fn a_routed_gemm_contracts_over_the_activations_width() {
+        let seen = Seen::default();
+        seen.rows.set(32);
+        let x = || In { ptr: Tensor::<bf16>::new(4), rows: 32, width: 2880 };
+        let pad = || In { ptr: Tensor::<bf16>::new(99), rows: 32, width: 1 };
+        let y = || Out { ptr: Tensor::<bf16>::new(5), rows: 32, width: 32 };
+        qmm_t_routed(
+            &seen,
+            Const::new(Tensor::<u32>::new(1)),
+            Const::new(Tensor::<bf16>::new(2)),
+            Const::new(Tensor::<bf16>::new(3)),
+            x(),
+            y(),
+            pad(),
+            In::new(Tensor::<i32>::new(6)),
+            Const::new(64),
+            Const::new(4),
+            Const::new(32),
+            Const::new(32))
+        .expect("a launch");
+        qmm_t_routed_fp16(
+            &seen,
+            Const::new(Tensor::<u32>::new(1)),
+            Const::new(Tensor::<bf16>::new(2)),
+            Const::new(Tensor::<bf16>::new(3)),
+            x(),
+            y(),
+            pad(),
+            In::new(Tensor::<i32>::new(6)),
+            Const::new(32),
+            Const::new(32))
+        .expect("a launch");
+        mxfp4_qmm_t_routed_bias(
+            &seen,
+            Const::new(Tensor::<u32>::new(1)),
+            Const::new(Tensor::<u8>::new(2)),
+            x(),
+            pad(),
+            y(),
+            Const::new(Tensor::<bf16>::new(7)),
+            In::new(Tensor::<i32>::new(6)),
+            Const::new(32),
+            Const::new(32))
+        .expect("a launch");
+
+        let calls = seen.calls.borrow();
+        assert_eq!(calls.len(), 3, "three routed GEMMs fired");
+        for (fire, args) in calls.iter() {
+            assert_eq!(
+                args[5],
+                ArgValue::I32(2880),
+                "`{}` contracts over the activation's 2880 and not the pad's 1",
+                fire.entrypoint
+            );
         }
     }
 

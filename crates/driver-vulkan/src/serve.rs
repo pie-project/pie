@@ -1535,6 +1535,20 @@ pub fn plan_routine<'a, R: Resolve, M: Modules>(
             model_compiler::lower::Arg::Weight(_) => None,
         })
         .collect();
+    // The same numbers, kept PER ARGUMENT rather than compacted, because
+    // `Handles` indexes them the way `split` indexes `args` -- a weight holds
+    // a place there and carries no width, so dropping it shifts every operand
+    // after it. `Facts` wants the compacted list above (its two numbers are
+    // "the first widthed operand" and "the last"), and the binder wants this
+    // one; they are the same reading of the same slice at two shapes.
+    let arg_widths: Vec<i32> = args
+        .iter()
+        .map(|a| match a {
+            model_compiler::lower::Arg::Arena { width, .. }
+            | model_compiler::lower::Arg::Named { width, .. } => (*width).cast_signed(),
+            model_compiler::lower::Arg::Weight(_) => 0,
+        })
+        .collect();
     let (group, bits) = spelled.map_or((0, 0), |s| (s.group, s.bits));
     let facts = crate::hold::Facts {
         rows: launch.rows.end - launch.rows.start,
@@ -1582,7 +1596,7 @@ pub fn plan_routine<'a, R: Resolve, M: Modules>(
     // staged fact takes a handle. The binder's own borrow ends on this line,
     // so the two never overlap.
     let handles = core::cell::RefCell::new(crate::hold::Handles::new(
-        &bound, &ins, &outs, &weights, &params, resolver,
+        &bound, &arg_widths, &ins, &outs, &weights, &params, resolver,
     ));
     let values = crate::bind::bind(
         &routine.args,

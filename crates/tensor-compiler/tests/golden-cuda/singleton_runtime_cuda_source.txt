@@ -1,6 +1,6 @@
 # oracle dump: pie_cuda_driver::pipeline::generated::singleton_runtime_cuda_source
 # source of truth: compiler/codegen/src/cuda/ (the C++ oracle this was dumped from is deleted)
-# emitter_version: 21
+# emitter_version: 22
 # @runtime: bytes=46235 fnv1a64=0x7d926cdb88ba105b
 # cases: 1
 # REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above

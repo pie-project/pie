@@ -91,6 +91,18 @@ impl Holds for Held<'_, '_, '_> {
         self.o.output_read(n)
     }
 
+    // THE RECTANGLE BESIDE THE HANDLE. Without these two the shared binder's
+    // `shaped` falls back to a width of zero for every operand, and the first
+    // body that reads `x.width` refuses `Empty` -- which is what every fire
+    // this driver planned did, at its first `embed_gather`.
+    fn in_width(&self, n: usize) -> Result<i32, Refusal> {
+        self.o.in_width(n)
+    }
+
+    fn out_width(&self, n: usize) -> Result<i32, Refusal> {
+        self.o.out_width(n)
+    }
+
     fn weight(&mut self, n: usize) -> Result<u32, Refusal> {
         self.o.weight(n)
     }

@@ -343,23 +343,41 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // ── The GEMM ────────────────────────────────────────────────────────────────
 
-// K elements staged per pass. 16 and not 32 because the workgroup storage a
-// tile costs is `(BM + BN) * PIE_BK * 4` bytes and wgpu's downlevel default
-// caps that at 16352: BM=64/BN=64 at PIE_BK=32 is 16384, which is over by 32
-// bytes and fails at `create_shader_module` on exactly the devices this
-// backend exists for. At 16 the widest shape here (BM=128, BN=32) costs 10240.
-const PIE_BK = 16;
+// K elements staged per pass. The workgroup storage a tile costs is
+// `(BM + BN) * PIE_BK * 4` bytes and wgpu's downlevel default caps that at
+// 16352, so the wide shapes -- BM=64/BN=64, BM=128/BN=32 -- have to stage 16.
+// The narrow ones do not, and paying two barriers and a fresh staging pass for
+// every 16 columns of K when 32 fit is half the loop's overhead spent on
+// nothing: at (32, 32) the tile costs 8192 bytes at PIE_BK=32, and a 512-token
+// projection through K=2048 drops from 128 staging passes to 64.
+const PIE_BK = select(16, 32, PIE_BM + PIE_BN <= 127);
 // The workgroup is 32x2x2 = 128 invocations, matching the Vulkan body's shape.
 const PIE_LANES = 128u;
-// Output elements per lane. Integral for every declared (BM, BN): the smallest
-// tile is 16x16 = 256, and all ten shapes are multiples of 128.
-const PIE_ACC = PIE_BM * PIE_BN / 128;
 
-var<workgroup> xs: array<f32, PIE_BM * PIE_BK>;
-// Stored K-major (`ws[kk * BN + c]`) though it is read column-major, so that
-// consecutive lanes -- which hold consecutive `c` -- touch consecutive words in
+// A LANE OWNS FOUR COLUMNS, not one.
+//
+// Both staged slabs are read vectorised, which is what keeps the inner product
+// off the workgroup memory's throughput ceiling: four columns at a time makes
+// `ws` a vec4 whose index carries the lane in the SLOW position, so consecutive
+// lanes still touch consecutive words and nothing strides the banks, and four K
+// columns at a time makes `xs` a vec4 whose index does not carry the lane at
+// all. Five vector loads then retire sixteen multiplies where the scalar shape
+// spent thirty-two loads on them.
+//
+// The terms stay separate `+` operands rather than a `dot`: the accumulation
+// order is what the parity walk against the sibling backends compares.
+const PIE_BK4 = PIE_BK / 4;
+const PIE_BN4 = PIE_BN / 4;
+// vec4 accumulators per lane. Ceiling rather than a quotient because BM=16 with
+// BN=16 gives 64 of them across 128 lanes -- the only declared shape that does
+// not fill the workgroup, and the reason `r` is bounds-checked below.
+const PIE_ACCV = (PIE_BM * PIE_BN4 + 127) / 128;
+
+var<workgroup> xs: array<vec4<f32>, PIE_BM * PIE_BK4>;
+// Stored K-major (`ws[kk * BN4 + c4]`) though it is read column-major, so that
+// consecutive lanes -- which hold consecutive `c4` -- touch consecutive words in
 // the inner loop instead of striding by PIE_BK.
-var<workgroup> ws: array<f32, PIE_BN * PIE_BK>;
+var<workgroup> ws: array<vec4<f32>, PIE_BN4 * PIE_BK>;
 
 fn input_stride() -> u32 {
 //#if defined(PIE_STRIDED)
@@ -462,9 +480,9 @@ fn main(
     let k1 = u32(params.k);
 //#endif
 
-    var acc: array<f32, PIE_ACC>;
-    for (var a = 0u; a < u32(PIE_ACC); a = a + 1u) {
-        acc[a] = 0.0;
+    var acc: array<vec4<f32>, PIE_ACCV>;
+    for (var a = 0u; a < u32(PIE_ACCV); a = a + 1u) {
+        acc[a] = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
 
     // `k0` and `k1` come from the workgroup id and the uniform block and from
@@ -484,33 +502,48 @@ fn main(
         // of them to finish. On the first iteration this costs one barrier and
         // protects nothing, which is cheaper than proving it can be skipped.
         workgroupBarrier();
-        for (var e = local; e < u32(PIE_BM * PIE_BK); e = e + PIE_LANES) {
-            let r = e / u32(PIE_BK);
-            let kk = e - r * u32(PIE_BK);
-            var v = 0.0;
-            if kk < kn {
-                v = load_x(tile_row + r, kb + kk);
-            }
+        for (var e = local; e < u32(PIE_BM * PIE_BK4); e = e + PIE_LANES) {
+            let r = e / u32(PIE_BK4);
+            let k4 = (e - r * u32(PIE_BK4)) * 4u;
+            var v = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+            if k4 + 0u < kn { v.x = load_x(tile_row + r, kb + k4 + 0u); }
+            if k4 + 1u < kn { v.y = load_x(tile_row + r, kb + k4 + 1u); }
+            if k4 + 2u < kn { v.z = load_x(tile_row + r, kb + k4 + 2u); }
+            if k4 + 3u < kn { v.w = load_x(tile_row + r, kb + k4 + 3u); }
             xs[e] = v;
         }
-        for (var e = local; e < u32(PIE_BN * PIE_BK); e = e + PIE_LANES) {
-            let c = e / u32(PIE_BK);
-            let kk = e - c * u32(PIE_BK);
-            var v = 0.0;
+        for (var e = local; e < u32(PIE_BN4 * PIE_BK); e = e + PIE_LANES) {
+            let c4 = e / u32(PIE_BK);
+            let kk = e - c4 * u32(PIE_BK);
+            var v = vec4<f32>(0.0, 0.0, 0.0, 0.0);
             if kk < kn {
-                v = affine_value(tile_col + c, kb + kk);
+                let c = c4 * 4u;
+                v = vec4<f32>(
+                    affine_value(tile_col + c + 0u, kb + kk),
+                    affine_value(tile_col + c + 1u, kb + kk),
+                    affine_value(tile_col + c + 2u, kb + kk),
+                    affine_value(tile_col + c + 3u, kb + kk),
+                );
             }
-            ws[kk * u32(PIE_BN) + c] = v;
+            ws[kk * u32(PIE_BN4) + c4] = v;
         }
         workgroupBarrier();
 
-        for (var a = 0u; a < u32(PIE_ACC); a = a + 1u) {
+        for (var a = 0u; a < u32(PIE_ACCV); a = a + 1u) {
             let idx = local + a * PIE_LANES;
-            let r = idx / u32(PIE_BN);
-            let c = idx - r * u32(PIE_BN);
+            let r = idx / u32(PIE_BN4);
+            let c4 = idx - r * u32(PIE_BN4);
+            // The one shape whose lanes outnumber its rows. No barrier stands
+            // between here and the epilogue, so a lane may leave early.
+            if r >= u32(PIE_BM) { continue; }
             var s = acc[a];
-            for (var kk = 0u; kk < u32(PIE_BK); kk = kk + 1u) {
-                s = s + xs[r * u32(PIE_BK) + kk] * ws[kk * u32(PIE_BN) + c];
+            for (var k4 = 0u; k4 < u32(PIE_BK4); k4 = k4 + 1u) {
+                let xv = xs[r * u32(PIE_BK4) + k4];
+                let kk = k4 * 4u;
+                s = s + xv.x * ws[(kk + 0u) * u32(PIE_BN4) + c4]
+                      + xv.y * ws[(kk + 1u) * u32(PIE_BN4) + c4]
+                      + xv.z * ws[(kk + 2u) * u32(PIE_BN4) + c4]
+                      + xv.w * ws[(kk + 3u) * u32(PIE_BN4) + c4];
             }
             acc[a] = s;
         }
@@ -518,11 +551,16 @@ fn main(
         kb = kb + u32(PIE_BK);
     }
 
-    for (var a = 0u; a < u32(PIE_ACC); a = a + 1u) {
+    for (var a = 0u; a < u32(PIE_ACCV); a = a + 1u) {
         let idx = local + a * PIE_LANES;
-        let r = idx / u32(PIE_BN);
-        let c = idx - r * u32(PIE_BN);
-        write_out(tile_row + r, tile_col + c, acc[a], wg.z);
+        let r = idx / u32(PIE_BN4);
+        let c4 = idx - r * u32(PIE_BN4);
+        if r >= u32(PIE_BM) { continue; }
+        let c = c4 * 4u;
+        write_out(tile_row + r, tile_col + c + 0u, acc[a].x, wg.z);
+        write_out(tile_row + r, tile_col + c + 1u, acc[a].y, wg.z);
+        write_out(tile_row + r, tile_col + c + 2u, acc[a].z, wg.z);
+        write_out(tile_row + r, tile_col + c + 3u, acc[a].w, wg.z);
     }
 }
 //#endif

@@ -324,7 +324,14 @@ fn allowlists() -> Allowlists {
         // outside the contract writes this shift today. An empty list is the
         // statement that the exemption is unused, which is worth more than
         // the absence of a field.
-        shift: &[],
+        shift: &[
+            // A test-local LCG that takes its top 24 bits, not a keyed-stream
+            // transcription: `fa4_fires` needs deterministic bf16 inputs and
+            // the crate does not depend on `rand`. Same shift, and the only
+            // thing it shares with the contract is arithmetic — it draws from
+            // its own multiplier and never touches a PTIR stream.
+            "crates/kernels-cuda/tests/fa4_fires.rs",
+        ],
     }
 }
 

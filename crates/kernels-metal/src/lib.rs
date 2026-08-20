@@ -179,8 +179,53 @@ pub fn declared() -> Vec<kernels::routine::Declared> {
     ROUTINES
         .iter()
         .map(kernels::routine::Routine::declared)
+        .chain(ELSEWHERE.iter().copied())
         .collect()
 }
+
+/// The signatures behind [`DECLARED_ELSEWHERE`], written out by hand.
+///
+/// A name in [`DECLARED_ELSEWHERE`] resolves through [`kernel_of`] and then
+/// finds NO routine, and `model-ir`'s `stated_in` falls back to a permissive
+/// empty signature for one. That fallback is safe for the arity check it was
+/// written for -- `arity_problem` returns immediately on an empty arg list --
+/// and it is NOT safe for the other question the same lookup answers:
+/// `Stated::in_place` reads the aliasing off the `sources` column, and an
+/// empty column says a launch aliases nothing.
+///
+/// For `rms_rope` that answer is wrong and silently so. The kernel rotates
+/// the tensor it norms IN PLACE -- `x` is an `InOut` and the shader binds one
+/// buffer for both halves -- so the statement's result and its operand are
+/// one allocation. Read as aliasing nothing, `model-compiler` gives the
+/// result a region of its own, the fused dispatch writes over its INPUT
+/// region, and every consumer downstream reads the untouched region the
+/// planner handed out: `kv_append` appends the unnormed, unrotated keys and
+/// attention reads a slot the q projection never reached. Fluent and wrong,
+/// on a model that answers correctly the moment `fused_qk_rope` is off.
+///
+/// So the column is stated here rather than left to the fallback. It is the
+/// signature `kernels-vulkan`'s `norm::rms_rope` derives, copied field for
+/// field, and it leaves with the name when Metal grows the kernel.
+pub const ELSEWHERE: &[kernels::routine::Declared] = &[kernels::routine::Declared {
+    name: "rms_rope",
+    namespace: "norm",
+    args: &[kernels::Ty::Bf16sMut, kernels::Ty::Bf16s],
+    sources: &[
+        // `InOut<Tensor<bf16>>`: result 0 over operand 0, which is the whole
+        // point of the entry.
+        Some(kernels::Source::Alias(0, 0)),
+        Some(kernels::Source::Or(
+            &kernels::Source::Named("weight"),
+            &kernels::Source::Slot(kernels::Kind::Weight, 0),
+        )),
+    ],
+    whole: false,
+    depth_prefix_plan: false,
+    derived: &[
+        kernels::Derived { name: "x", nullable: false },
+        kernels::Derived { name: "w", nullable: false },
+    ],
+}];
 
 /// Every entrypoint this backend can dispatch, sorted. The set
 /// `scripts/metal-kernel-audit.py` compares against the shader tree.

@@ -27,6 +27,7 @@ use kernels_wgpu::routine::{ArgValue, Encode, Fire};
 
 use crate::binding::Bound;
 use crate::device::{Buffer, Device, Pipelines, Recorded};
+use crate::lowering::hold::Facts;
 use crate::serve::Modules;
 use kernels_wgpu::Capability;
 
@@ -37,7 +38,7 @@ use kernels_wgpu::Capability;
 /// of one call.
 pub struct Encoder<'a, M: Modules> {
     device: &'a Device,
-    /// `Pipelines::get` takes `&mut self` and [`Encode::dispatch`] takes
+    /// `Pipelines::get` takes `&mut self` and [`Encode::fire`] takes
     /// `&self`, because the machinery hands a body `&B::Ctx`. Interior
     /// mutability is the whole of the difference, and it is confined here.
     pipelines: RefCell<&'a mut Pipelines>,
@@ -47,6 +48,13 @@ pub struct Encoder<'a, M: Modules> {
     /// this: the caller decides what a buffer is, which is the same contract
     /// `crate::lowering` has always had.
     buffers: &'a [&'a Buffer],
+    /// WHAT THIS FIRE ANSWERS, for a body that asks.
+    ///
+    /// `None` on an encoder built to dispatch alone, which has no statement
+    /// behind it: a body that asks on one gets [`Refusal::Unstated`], which is
+    /// the honest answer rather than an invented zero. The shape is
+    /// `lowering::routine::Planner`'s, because the question is the same one.
+    answers: Option<(&'a RefCell<crate::lowering::hold::Handles<'a>>, Facts)>,
 }
 
 impl<'a, M: Modules> Encoder<'a, M> {
@@ -64,7 +72,22 @@ impl<'a, M: Modules> Encoder<'a, M> {
             modules,
             tier,
             buffers,
+            answers: None,
         }
+    }
+
+    /// The same encoder, able to ANSWER a body that asks.
+    ///
+    /// `handles` is a cell because ANSWERING MINTS: a staged fact takes a
+    /// handle, and the caller reads the same list back afterwards.
+    #[must_use]
+    pub fn answering(
+        mut self,
+        handles: &'a RefCell<crate::lowering::hold::Handles<'a>>,
+        facts: Facts,
+    ) -> Self {
+        self.answers = Some((handles, facts));
+        self
     }
 }
 
@@ -106,7 +129,11 @@ fn block(args: &[ArgValue]) -> Vec<u8> {
             out.push(0);
         }
         match a {
-            ArgValue::Buffer(_) => {}
+            // A HANDLE CONTRIBUTES NO BYTES, shaped or not. `Shaped` carries
+            // the rectangle a statement gave the operand, which the marks read
+            // and the uniform block does not — it is a `@group(0)` entry by
+            // the same rule `Buffer` is.
+            ArgValue::Buffer(_) | ArgValue::Shaped { .. } => {}
             ArgValue::I32(v) => out.extend_from_slice(&v.to_le_bytes()),
             ArgValue::U32(v) => out.extend_from_slice(&v.to_le_bytes()),
             ArgValue::F32(v) => out.extend_from_slice(&v.to_le_bytes()),
@@ -124,13 +151,29 @@ fn block(args: &[ArgValue]) -> Vec<u8> {
 }
 
 impl<M: Modules> Encode for Encoder<'_, M> {
-    fn dispatch(&self, fire: Fire<'_>, args: &[ArgValue]) -> Result<(), Refusal> {
+    // AN ENCODER ANSWERS THROUGH THE SAME BINDER THE COLUMN WENT THROUGH,
+    // exactly as `lowering::routine::Planner` does. `Env` left the parameter
+    // list, so a fact only the fire can answer is no longer bound into `args`
+    // before the body runs; the body asks, and this is `kernels::bind::one`
+    // entered at one argument instead of a list.
+    //
+    // `RefCell` because answering MINTS -- a staged fact takes a handle, which
+    // is a mutation of the handle vector -- and the body holds only a `&self`.
+    fn resolve(&self, ty: kernels::Ty, source: kernels::Source) -> Result<ArgValue, Refusal> {
+        let (handles, facts) = self.answers.ok_or(Refusal::Unstated {
+            what: "a fact, on an encoder with no fire behind it",
+        })?;
+        crate::lowering::bind::one(ty, source, &mut handles.borrow_mut(), facts)
+    }
+
+    fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Refusal> {
         // A body that had nothing to do should have refused; a zero here would
         // become `dispatch_workgroups(0, 1, 1)`, which is legal WebGPU that
         // runs nothing and reports success.
         if fire.lanes.contains(&0) {
-            return Err(Refusal::Empty {
+            return Err(Refusal::Grid {
                 what: "the lanes a routine asked for",
+                at: 0,
             });
         }
 
@@ -156,13 +199,20 @@ impl<M: Modules> Encode for Encoder<'_, M> {
 
         let mut bound = Vec::new();
         for a in args {
-            if let ArgValue::Buffer(h) = a {
-                let buffer = self
-                    .buffers
-                    .get(*h as usize)
-                    .ok_or(Refusal::Absent { what: "a buffer" })?;
-                bound.push(Bound::whole(*buffer));
-            }
+            // A `Shaped` HANDLE IS STILL A HANDLE — the rectangle beside it is
+            // what the marks read, and a dispatch binds the allocation. An
+            // `if let` over `Buffer` alone skipped every shaped operand
+            // silently, which is the defect `driver-vulkan` names at length.
+            let handle = match a {
+                ArgValue::Buffer(h) => *h,
+                ArgValue::Shaped { handle, .. } => *handle,
+                _ => continue,
+            };
+            let buffer = self
+                .buffers
+                .get(handle as usize)
+                .ok_or(Refusal::Absent { what: "a buffer" })?;
+            bound.push(Bound::whole(*buffer));
         }
         let uniform = block(args);
 

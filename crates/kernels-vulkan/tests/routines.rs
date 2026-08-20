@@ -84,7 +84,16 @@ impl Encode for Seen {
         Ok(match ty {
             T::Buf | T::BufMut | T::Bf16s | T::Bf16sMut | T::I32s | T::I32sMut | T::U32s
             | T::U32sMut | T::U8s | T::U8sMut | T::F32s | T::F32sMut => {
-                ArgValue::Buffer { handle: 900, writes: matches!(ty, T::BufMut | T::Bf16sMut | T::I32sMut | T::U32sMut | T::U8sMut | T::F32sMut) }
+                ArgValue::Buffer {
+                    handle: 900,
+                    writes: matches!(ty, T::BufMut | T::Bf16sMut | T::I32sMut | T::U32sMut | T::U8sMut | T::F32sMut),
+                    // A RECTANGLE, because an asked table is an operand like
+                    // any other now that `ArgValue` carries one variant: a
+                    // body that reads `.width` off what it asked for gets zero
+                    // otherwise, and zero is what every extent guard refuses.
+                    rows: 7,
+                    width: 1024,
+                }
             }
             T::I32 => ArgValue::I32(8),
             T::U32 | T::InPacked => ArgValue::U32(8),
@@ -125,8 +134,18 @@ fn stand_in(at: usize, ty: Ty) -> ArgValue {
         Ty::Buf | Ty::BufMut | Ty::Bf16s | Ty::Bf16sMut | Ty::I32s | Ty::I32sMut
         | Ty::U32s | Ty::U32sMut | Ty::U8s | Ty::U8sMut
         | Ty::F16s | Ty::F16sMut
-        | Ty::F32s | Ty::F32sMut => ArgValue::Shaped {
+        | Ty::F32s | Ty::F32sMut => ArgValue::Buffer {
             handle: at as u32,
+            writes: matches!(
+                ty,
+                Ty::BufMut
+                    | Ty::Bf16sMut
+                    | Ty::I32sMut
+                    | Ty::U32sMut
+                    | Ty::U8sMut
+                    | Ty::F16sMut
+                    | Ty::F32sMut
+            ),
             rows: 7,
             width: 1024,
         },
@@ -183,14 +202,13 @@ const RECIPE: &[(&str, &[(usize, i32)])] = &[
     ("neox_freqs_decode", &[(2, 128), (4, 128)]),
     ("neox_freqs_mb", &[(2, 128), (4, 128)]),
     // The fused norm+rope refuses the same shapes a rotation does and for the
-    // same reasons, so it needs the same kind of recipe: a 128-wide head, a
-    // 4096-wide row -- so 32 heads -- fully rotated, three tokens. `1` would
-    // be refused twice over, as an odd rotary and as a rotary wider than the
-    // head.
-    // `axis`, `row_pitch`, the width and the row count all left: the first
-    // two are the operand's own and the last two are the fire's. The rotary
-    // width is what the statement still carries.
-    ("rms_rope", &[(2, 128)]),
+    // same reasons -- but it has no scalar argument left to give a recipe FOR.
+    // `axis`, `row_pitch` and the rotary width are all fields of the
+    // `RmsRopeParams` struct the body forwards whole, read by index through
+    // `Ctx::param` rather than taken as marks, because a `Const` mark is
+    // derived onto the run by mark order and cannot name a word inside a
+    // struct. `Seen::resolve` above answers a `Slot(Param, n)` generically, so
+    // the shapes this recipe used to state arrive by that route instead.
     // `row_pitch` at 5, and it may not be narrower than the row.
     (
         "neox_strided",
@@ -581,7 +599,7 @@ fn a_body_passes_a_subsequence_of_the_arguments_its_signature_takes_in_order() {
     /// that makes the two sides comparable at all.
     fn handle_of(v: &ArgValue) -> Option<u32> {
         match *v {
-            ArgValue::Buffer { handle, .. } | ArgValue::Shaped { handle, .. } => Some(handle),
+            ArgValue::Buffer { handle, .. } => Some(handle),
             _ => None,
         }
     }
@@ -611,8 +629,7 @@ fn a_body_passes_a_subsequence_of_the_arguments_its_signature_takes_in_order() {
             let got_handles: Vec<(u32, bool)> = got
                 .iter()
                 .filter_map(|v| match *v {
-                    ArgValue::Buffer { handle, writes } => Some((handle, writes)),
-                    ArgValue::Shaped { handle, .. } => Some((handle, true)),
+                    ArgValue::Buffer { handle, writes, .. } => Some((handle, writes)),
                     _ => None,
                 })
                 .collect();

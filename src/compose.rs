@@ -92,6 +92,17 @@ pub async fn run_standalone(
     mut gateway: gateway::Config,
     worker: worker::Config,
 ) -> Result<StandaloneHandle> {
+    // Choose the process-wide TLS backend before any embedded role can build a
+    // client. Every HTTPS client here is reqwest's `rustls-no-provider`, so
+    // rustls declines to guess and the first `Client::builder().build()`
+    // PANICS until someone names one. A `pie serve` names it in `bootstrap`'s
+    // observability init -- but this function is the composition root for
+    // embedders that reach no `bootstrap` entry point at all (`tests/gpu`
+    // boots exactly this, and its boot smokes died in `reqwest::Client::new`
+    // before asserting anything about the driver they gate). Idempotent, so
+    // saying it twice in one process is a fact rather than a failure.
+    bootstrap::install_crypto_provider();
+
     // Embed the controller actor; one cloneable Handle drives both planes.
     let handle = controller::embed(controller);
     let control = EmbeddedControl(handle.clone());

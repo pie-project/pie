@@ -1256,6 +1256,12 @@ fn text_of(
         // that said `false` here does not get an error; it gets a text with no
         // bias in it, which is fluent and wrong.
         add_bias: true,
+        // `false`: only `driver-vulkan` carries `norm::rms_rope`, and
+        // `kernels-wgpu` has no body for it. Saying `true` here would plan a
+        // text this backend cannot fire. Unlike `add_bias` above, `false` is
+        // not a wrong answer quietly taken — the two texts compute the same
+        // thing and differ only in how many dispatches they take to say it.
+        fused_qk_rope: false,
     };
     let decode = row
         .trace(FireClass::Decode, Deployed::metal(&binding))

@@ -1221,7 +1221,7 @@ fn fire_prefill(
     // requests convolved the second over the first's tokens. They read the
     // table per row now, and the row where the seat changes is the request
     // boundary.
-    let slot_a = alloc_words(context, &vec![0u32; T_SCAN], "slot_ids");
+    let slot_a = alloc_words(context, &[0u32; T_SCAN], "slot_ids");
 
     let fill = |bind: &[(usize, u64)], wide: usize| -> Vec<BoundArg> {
         let mut args = vec![

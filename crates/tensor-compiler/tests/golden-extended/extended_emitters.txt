@@ -11,7 +11,7 @@
 # right, then re-pin with `PTIR_REGEN=1 cargo test -p pie-compiler-tests`.
 #
 # Where a kernel is digested, `bytes` and the hash cover what the *compiler*
-# generated: the hand-written device text under `compiler/codegen/runtime/` is
+# generated: the hand-written device text under `crates/tensor-compiler/runtime/` is
 # dropped first, so tuning a kernel does not re-pin every case. That the
 # emitters still splice those blocks in whole is
 # `every_live_device_file_is_spliced_into_a_kernel_verbatim`.
@@ -220,8 +220,8 @@ metal_fused: ok bytes=1196 fnv1a64=0x42118ddce705d530
 metal_grouped: ok bytes=4202 fnv1a64=0x059d30a3018d5e30
 === extended_transpose_cumsum#0 singleton#4
 region: library=1 library_op=3 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
-cuda_fused: err fused CUDA emitter requires a non-library generated region
-cuda_validate: ok=false error=fused CUDA emitter requires a non-library generated region
+cuda_fused: err generated region contains a non-generated boundary
+cuda_validate: ok=false error=generated region contains a non-generated boundary
 cuda_second_party: false
 metal_fused: ok bytes=1206 fnv1a64=0x8ab7618b1e1b72e0
 metal_grouped: ok bytes=4212 fnv1a64=0x261a5fe2ea744d70
@@ -241,8 +241,8 @@ metal_fused: ok bytes=1720 fnv1a64=0x13a77683b021f576
 metal_grouped: ok bytes=5195 fnv1a64=0xc7666b1f71c2746e
 === extended_transpose_cumsum#0 fused#1
 region: library=1 library_op=3 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
-cuda_fused: err fused CUDA emitter requires a non-library generated region
-cuda_validate: ok=false error=fused CUDA emitter requires a non-library generated region
+cuda_fused: err generated region contains a non-generated boundary
+cuda_validate: ok=false error=generated region contains a non-generated boundary
 cuda_second_party: false
 metal_fused: ok bytes=1206 fnv1a64=0x7d79852f414f97e5
 metal_grouped: ok bytes=4212 fnv1a64=0x5ea76087baedcbf9
@@ -430,8 +430,8 @@ metal_fused: ok bytes=910 fnv1a64=0x13f8eff2c962a10c
 metal_grouped: ok bytes=3252 fnv1a64=0x3412e7422189e7ca
 === extended_metal_identity#0 singleton#1
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
-cuda_fused: err fused CUDA emitter requires a non-library generated region
-cuda_validate: ok=false error=fused CUDA emitter requires a non-library generated region
+cuda_fused: err generated region contains a non-generated boundary
+cuda_validate: ok=false error=generated region contains a non-generated boundary
 cuda_second_party: false
 metal_fused: ok bytes=921 fnv1a64=0x114783df7106f5aa
 metal_grouped: ok bytes=3263 fnv1a64=0x8655da630e6a7c40
@@ -451,8 +451,8 @@ metal_fused: ok bytes=910 fnv1a64=0x13f8eff2c962a10c
 metal_grouped: ok bytes=3252 fnv1a64=0x3412e7422189e7ca
 === extended_metal_identity#0 fused#1
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
-cuda_fused: err fused CUDA emitter requires a non-library generated region
-cuda_validate: ok=false error=fused CUDA emitter requires a non-library generated region
+cuda_fused: err generated region contains a non-generated boundary
+cuda_validate: ok=false error=generated region contains a non-generated boundary
 cuda_second_party: false
 metal_fused: ok bytes=921 fnv1a64=0x114783df7106f5aa
 metal_grouped: ok bytes=3263 fnv1a64=0x8655da630e6a7c40
@@ -472,8 +472,8 @@ metal_fused: ok bytes=768 fnv1a64=0x964c346e599dcc87
 metal_grouped: ok bytes=2777 fnv1a64=0xd28f99648222eb09
 === extended_metal_discard#0 singleton#1
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
-cuda_fused: err fused CUDA emitter requires a non-library generated region
-cuda_validate: ok=false error=fused CUDA emitter requires a non-library generated region
+cuda_fused: err generated region contains a non-generated boundary
+cuda_validate: ok=false error=generated region contains a non-generated boundary
 cuda_second_party: false
 metal_fused: ok bytes=766 fnv1a64=0xcafea1994b4dd6d0
 metal_grouped: ok bytes=2775 fnv1a64=0x751a68bb076844be
@@ -486,8 +486,8 @@ metal_fused: ok bytes=768 fnv1a64=0x964c346e599dcc87
 metal_grouped: ok bytes=2777 fnv1a64=0xd28f99648222eb09
 === extended_metal_discard#0 fused#1
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
-cuda_fused: err fused CUDA emitter requires a non-library generated region
-cuda_validate: ok=false error=fused CUDA emitter requires a non-library generated region
+cuda_fused: err generated region contains a non-generated boundary
+cuda_validate: ok=false error=generated region contains a non-generated boundary
 cuda_second_party: false
 metal_fused: ok bytes=766 fnv1a64=0xcafea1994b4dd6d0
 metal_grouped: ok bytes=2775 fnv1a64=0x751a68bb076844be

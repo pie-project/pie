@@ -91,6 +91,12 @@ pub struct Prepared {
     value_count: u32,
     scratch_stride: u32,
     temporary_offset: u32,
+    /// Where each value sits in a lane's scratch, kept host-side so a trace can
+    /// read a value back without re-deriving the layout.
+    value_offsets: Vec<u32>,
+    /// The widest descriptor per value, which is what the offsets were laid
+    /// out against.
+    value_descriptors: Vec<ValueDesc>,
 }
 
 impl Prepared {
@@ -306,6 +312,11 @@ impl Prepared {
             .map(|&at| u32::try_from(at).unwrap_or(u32::MAX))
             .flat_map(u32::to_le_bytes)
             .collect();
+        let value_offsets: Vec<u32> = scratch_layout
+            .values
+            .iter()
+            .map(|&at| u32::try_from(at).unwrap_or(u32::MAX))
+            .collect();
         let mut offsets = alloc.alloc(offset_bytes.len().max(size_of::<u32>()))?;
         offsets.copy_from_host(&offset_bytes, stream)?;
 
@@ -351,6 +362,8 @@ impl Prepared {
             value_count,
             scratch_stride,
             temporary_offset,
+            value_offsets,
+            value_descriptors: descriptors,
         })
     }
 
@@ -539,6 +552,44 @@ impl Prepared {
         self.scratch.read_at(at, &mut out, stream)?;
         stream.synchronize()?;
         Ok(out)
+    }
+
+    /// Every value slot's head, after a fire, for one lane.
+    ///
+    /// WHAT EACH OP LEFT BEHIND. A slot no emitted op writes stays at the
+    /// `memset` above, and zeros are a legal float: a softmax over them is
+    /// uniform and the draw off it lands on token 0 without faulting. Reading
+    /// the slots back is the only way to tell that from a chain that ran.
+    pub fn trace_scratch(&self, lane: u32, stream: StreamRef<'_>) -> Result<()> {
+        for (value, (&offset, desc)) in self
+            .value_offsets
+            .iter()
+            .zip(self.value_descriptors.iter())
+            .enumerate()
+        {
+            let width = (desc.len as usize).min(8);
+            let unit = (desc.device_bytes() as usize / (desc.len as usize).max(1)).max(1);
+            let bytes = self.read_value(lane, offset, width * unit, stream)?;
+            let head: Vec<String> = bytes
+                .chunks_exact(unit)
+                .map(|raw| match (unit, desc.dtype) {
+                    (4, 0) => format!(
+                        "{:.4}",
+                        f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])
+                    ),
+                    (4, _) => format!("{}", i32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])),
+                    (1, _) => format!("{}", raw[0]),
+                    _ => format!("{raw:?}"),
+                })
+                .collect();
+            eprintln!(
+                "[val] {value} off={offset} len={} dtype={} {}",
+                desc.len,
+                desc.dtype,
+                head.join(",")
+            );
+        }
+        Ok(())
     }
 
     /// The lane records, which begin one header into the table.

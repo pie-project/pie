@@ -201,7 +201,8 @@ const ROOMS: &[&str] = &[
 /// parsed into a private facts struct, plus an enum of family names -- and it
 /// needed no GPU to be wrong.
 const PORTABLE: &[&str] = &[
-    "batch", "channel", "error", "layout", "loader", "lowering", "model",
+    "batch", "channel", "envelope", "error", "layout", "loader", "lowering",
+    "model",
 ];
 
 /// Does `line` name the module path `spelling`, as a whole path segment?

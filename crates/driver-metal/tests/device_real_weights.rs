@@ -467,6 +467,21 @@ const REFERENCES: &[Reference] = &[
     // row has no recurrent state" and so failed silently rather than loudly.
     // Both are fixed above; see `seats`.
     //
+    // WHAT THE PAIR FOUND, the day it first ran: both rows FAILED, and by
+    // the same defect. 27B's top-3 came back `[2, 32850, 248045]` against
+    // MLX's `[2, 550, 760]`, at POSITION ZERO -- where rope is the identity
+    // and attention has one key, so nothing position-dependent can be
+    // blamed. Bisecting `the_second_lane_stops_somewhere_and_this_says_where`
+    // against a hand-written MLX layer-0 dump put it on the SECOND statement
+    // of the fire: `rms_single_row` answered
+    // `[-0.6758, -1.2813, 1.2734, ...]` where MLX says
+    // `[-0.3466, -0.6265, 0.6162, ...]`, and `x * inv * (1 + w)` reproduces
+    // the driver's row to the bf16 step. Every `norm_variant` in
+    // `model::qwen_3_5` said `Gemma` on the authority of one legacy C++ file.
+    // Folded plainly both rows pass here, spans included, and both
+    // checkpoints then generate text that agrees with `mlx_lm`'s greedy
+    // sampler token for token over a 28-token prefill.
+    //
     // Both rows are UNCAPPED -- qwen states no `final_logit_softcapping` --
     // so nothing here is erased by `tanh` and every value is compared as
     // read. Both were taken in f32, which the `top` field's doc explains and
@@ -511,7 +526,7 @@ const REFERENCES: &[Reference] = &[
         ],
         // Ranks five and six are 0.035 apart -- a third of a bf16 ulp -- so
         // the depth scan claims four and leaves the fifth to the tie.
-        next: Some(8.972_200),
+        next: Some(8.972_2),
         span: (-9.349_568, 10.698_828),
         mid: [(4531, 6.860_312), (19916, 4.887_325), (42587, 2.478_823)],
         // The widest MODULE OUTPUT, not the widest residual: 5.26 is what
@@ -587,6 +602,128 @@ fn reference_taken_on(snapshot: &Path, model: &str) -> bool {
         );
     }
     taken
+}
+
+/// One checkpoint's measured MLX generation.
+///
+/// `prompt` is what MLX was ASKED, token for token, and it belongs beside the
+/// answer for the same reason `reference_taken_on` exists: a continuation is
+/// a measurement of a specific question, and comparing it against a driver
+/// that was asked a different one reports the rig as a defect.
+struct Generation {
+    /// The substring of the snapshot path that identifies the checkpoint.
+    model: &'static str,
+    /// The sentence in this tokenizer's spelling, with this model's BOS when
+    /// it has one and does not add it itself.
+    prompt: &'static [u32],
+    /// Four greedy tokens, each computed over the whole prefix.
+    continuation: &'static [u32],
+}
+
+/// **The measured MLX generations, one row per checkpoint.**
+///
+/// Taken with `mlx_lm.load`, the row's own sentence through
+/// `tokenizer.encode` (prepending `bos_token_id` when the encoding does not
+/// already start with it), then four `argmax` steps each over the FULL
+/// prefix -- never over a cache, so the reference shares no carryover
+/// assumption with the thing it checks. The procedure was qualified before
+/// it was trusted: run on `[128000, 9906]` it reproduces `0, 358, 2846,
+/// 12304`, the hand-taken llama reference this table replaces.
+///
+/// # Two things the taking of these rows found, and neither was in the driver
+///
+/// The first four attempts failed and both reasons were in the RIG and in the
+/// REFERENCE rather than in what they check.
+///
+/// Both qwen3.6 rows agreed for two turns and then ran a token behind. They
+/// are hybrids, and this gate called `run_keeping_arena` and never called the
+/// pool's `carry_forward` -- which `serve::launch` runs after every fire to
+/// make the plane a fire WROTE the plane the next fire READS. Every decode
+/// after the first convolved against the state the prefill saw. The gate
+/// does what the serving path does now, and both rows agree token for token.
+///
+/// Both gemma rows disagreed at the FIRST fire, before any KV was read back,
+/// and that was this rig cutting every layer's page span to `layer_bytes_at(0)`.
+/// gemma-4 pages TWO attention geometries -- `Shape::row_bytes` answers
+/// `None` rather than hand the first layer's stride out for all of them --
+/// so half the stack was described by the wrong length. Per-layer spans, and
+/// the first fire agrees.
+///
+/// # Why the prompt is a sentence and the margins are written down
+///
+/// A greedy gate is only as good as the reference's LEAD. `"Hello"` put
+/// gemma-4-31b on an exact tie -- `Hello` at 26.0 against ` Hello` at 26.0 --
+/// and it answered the other member, which is not a defect, it is the last
+/// bit of an accumulator. `"The capital of France is"` put the same
+/// checkpoint on a 0.25 lead between `<turn|>` and `\n\n` at step three.
+/// Every row states the margins its four steps were taken at, so a future
+/// red here can be read against them before anything is called a defect.
+const GENERATIONS: &[Generation] = &[
+    Generation {
+        model: "Llama-3.2-1B-Instruct-4bit",
+        prompt: &[128_000, 791, 6864, 315, 9822, 374],
+        continuation: &[12_366, 627, 791, 6864],
+        // Margins, top against second, at the four steps: 3.125/0.797/2.391/1.172.
+    },
+    Generation {
+        model: "gpt-oss-20b-MXFP4-Q4",
+        prompt: &[199_998, 976, 9029, 328, 10_128, 382],
+        continuation: &[12_650, 13, 623, 9029],
+        // Margins, top against second, at the four steps: 2.375/1.875/1.25/3.062.
+    },
+    Generation {
+        model: "Qwen3.6-27B-4bit",
+        prompt: &[760, 6511, 314, 9338, 369],
+        continuation: &[11_751, 13, 271, 248_068],
+        // Margins, top against second, at the four steps: 2.875/1.375/0.562/3.125.
+    },
+    Generation {
+        model: "Qwen3.6-35B-A3B-4bit",
+        prompt: &[760, 6511, 314, 9338, 369],
+        continuation: &[11_751, 11, 264, 3177],
+        // Margins, top against second, at the four steps: 2.062/0.25/0.75/3.125.
+    },
+    // A DIFFERENT SENTENCE, and the margins are why. Under the prompt every
+    // other row uses this checkpoint ends its turn at step three, where
+    // `<turn|>` leads `\n\n` by 0.25 -- and a quarter of a logit is not a
+    // fact about a driver, it is a coin the last bit of the accumulator
+    // flips. This prompt's tightest step leads by 3.125.
+    Generation {
+        model: "gemma-4-31b-it-4bit",
+        prompt: &[2, 17390, 104_264, 657, 496, 4022, 529],
+        continuation: &[236_743, 236_770, 236_771, 236_771],
+        // Margins, top against second, at the four steps: 3.125/5.0/8.625/10.875.
+    },
+    Generation {
+        model: "gemma-4-26b-a4b-it-4bit",
+        prompt: &[2, 818, 5279, 529, 7001, 563],
+        continuation: &[1623, 1133, 506, 45_518],
+        // Margins, top against second, at the four steps: 1.812/4.875/2.375/6.375.
+    },
+];
+
+/// The row [`GENERATIONS`] holds for this snapshot, or [`None`] with a skip.
+///
+/// The LONGEST match wins. Snapshot paths are substrings of one another --
+/// `gemma-4-26b-a4b-it-4bit` contains no shorter row today, but a
+/// `Qwen3.6-27B-4bit` row would match a hypothetical
+/// `Qwen3.6-27B-4bit-DWQ` and answer with the wrong continuation, which is
+/// exactly the failure `reference_taken_on` was written to prevent.
+fn generation_reference(snapshot: &Path) -> Option<&'static Generation> {
+    let path = snapshot.to_string_lossy().to_string();
+    let found = GENERATIONS
+        .iter()
+        .filter(|g| path.contains(g.model))
+        .max_by_key(|g| g.model.len());
+    if found.is_none() {
+        eprintln!(
+            "SKIP: no MLX generation has been measured for `{}`. Taking one \
+             is an `mlx_lm` load, four argmax steps over the growing prefix, \
+             and a row in `GENERATIONS`.",
+            snapshot.display()
+        );
+    }
+    found
 }
 
 /// WHICH MODEL a snapshot is, at what affine point, and in what shape.
@@ -1211,14 +1348,41 @@ fn stage_tables(
         req_of_token = vec![0; n as usize];
         positions = (0..n).collect();
     }
-    // ONE PAGE PER REQUEST, in request order, wide enough for the rows it
-    // holds. `page_size` is the pool's, and every step here is far inside it.
-    let pages_per_request = 1u32;
-    let each: Vec<u32> = (0..(requests as u32 * pages_per_request).max(n)).collect();
-    let indptr: Vec<u32> = (0..=requests as u32)
-        .map(|r| r * pages_per_request)
+    // ONE PAGE PER REQUEST WAS NOT ENOUGH, and the offset said so.
+    //
+    // `pages_per_request` was the literal `1` under "every step here is far
+    // inside it", while `kv_write_offset` was `position % page_size` and
+    // `kv_write_page` was the request's single page. Those two statements
+    // only agree while no request is longer than a page: at `page_size` the
+    // modulo WRAPS to zero and the write lands back at the top of the SAME
+    // page, overwriting the request's own first token, then its second. Not a
+    // refusal and not a NaN -- a KV cache that silently holds the last
+    // `page_size` tokens of a prefix at the positions of its first.
+    //
+    // The premise was true when written and is a page size away from false.
+    // `pool_shape(&dg, 16)` gives sixteen pages of the pool's own
+    // `page_size`, so this rig has the pages to spend; it was only ever
+    // handing out one. Now a request takes as many as its rows need, in one
+    // contiguous run, and the page a token writes to ADVANCES with its
+    // position the way `envelope::fill` makes it advance in the driver.
+    //
+    // Every gate in this file fires prefixes far shorter than a page, so
+    // `pages_per_request` is still 1 for all of them and none of their
+    // numbers move. This is what the rig would have needed the first time
+    // someone measured a prompt of any length.
+    let requests_eff = (requests as u32).max(1);
+    let longest = positions.iter().copied().max().map_or(0, |p| p + 1);
+    let pages_per_request = longest.div_ceil(page_size.max(1)).max(1);
+    let each: Vec<u32> = (0..(requests_eff * pages_per_request).max(n)).collect();
+    let indptr: Vec<u32> = (0..=requests_eff).map(|r| r * pages_per_request).collect();
+    // The request's FIRST page plus however many whole pages this position is
+    // past its start. With one page per request this is `req_of_token`, which
+    // is what it used to say outright.
+    let kv_write_page: Vec<u32> = req_of_token
+        .iter()
+        .zip(&positions)
+        .map(|(r, p)| r * pages_per_request + p / page_size.max(1))
         .collect();
-    let kv_write_page: Vec<u32> = req_of_token.clone();
     let w_off: Vec<u32> = positions.iter().map(|p| p % page_size.max(1)).collect();
     let inv_freq: Vec<u32> = freqs.iter().map(|f| f.to_bits()).collect();
     driver_metal::bind::tables::stage(
@@ -1299,7 +1463,7 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
             } else {
                 l.k.gpu_address()
             },
-            bytes: shape.layer_bytes_at(0),
+            bytes: shape.layer_bytes_at(u32::from(layer)),
         })
     };
 
@@ -1345,7 +1509,7 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
     // wrote answers zero and looks exactly like an attention that is broken.
     for l in 0..2.min(shape.layers) {
         let layer = pool.layer(l).expect("a layer");
-        let n = shape.layer_bytes_at(0) as usize;
+        let n = shape.layer_bytes_at(l) as usize;
         // SAFETY: the command buffer retired.
         let (k, v) = unsafe {
             (
@@ -1870,7 +2034,7 @@ fn bisect(class: FireClass) {
             } else {
                 l.k.gpu_address()
             },
-            bytes: shape.layer_bytes_at(0),
+            bytes: shape.layer_bytes_at(u32::from(layer)),
         })
     };
     let freqs = driver_metal::model::rope::table(&dg);
@@ -2262,7 +2426,7 @@ fn locate_first_nan(class: FireClass, step: &Step<'_>) {
                 } else {
                     l.k.gpu_address()
                 },
-                bytes: shape.layer_bytes_at(0),
+                bytes: shape.layer_bytes_at(u32::from(layer)),
             })
         };
         let mut live = Live {
@@ -2744,7 +2908,7 @@ fn one_token_at_position_zero_agrees_with_mlx() {
             } else {
                 l.k.gpu_address()
             },
-            bytes: shape.layer_bytes_at(0),
+            bytes: shape.layer_bytes_at(u32::from(layer)),
         })
     };
     let freqs = driver_metal::model::rope::table(&dg);
@@ -3096,7 +3260,7 @@ fn a_two_token_prefill_agrees_with_mlx() {
             } else {
                 l.k.gpu_address()
             },
-            bytes: shape.layer_bytes_at(0),
+            bytes: shape.layer_bytes_at(u32::from(layer)),
         })
     };
     let freqs = driver_metal::model::rope::table(&dg);
@@ -3262,7 +3426,7 @@ fn a_prefill_rotates_its_second_row() {
             } else {
                 l.k.gpu_address()
             },
-            bytes: shape.layer_bytes_at(0),
+            bytes: shape.layer_bytes_at(u32::from(layer)),
         })
     };
     let freqs = driver_metal::model::rope::table(&dg);
@@ -3433,7 +3597,7 @@ fn a_prefill_rotates_its_second_row_on_the_base_ladder() {
             } else {
                 l.k.gpu_address()
             },
-            bytes: shape.layer_bytes_at(0),
+            bytes: shape.layer_bytes_at(u32::from(layer)),
         })
     };
     let freqs = driver_metal::model::rope::table(&dg);
@@ -3597,10 +3761,27 @@ fn stage_prefill(
 /// that is right for the first token and wrong for the second — none of them
 /// show until a second fire reads what a first one wrote.
 ///
-/// MLX's greedy continuation from the same prompt is `0, 358, 2846, 12304`,
-/// computed by recomputing the WHOLE prefix at every step so that nothing is
-/// carried on the reference side. A KV bug here cannot hide in a shared
-/// assumption.
+/// MLX's greedy continuation from the same prompt is recomputed over the
+/// WHOLE prefix at every step, so that nothing is carried on the reference
+/// side. A KV bug here cannot hide in a shared assumption.
+///
+/// # It used to run on one checkpoint and skip for every model served
+///
+/// The reference was `0, 358, 2846, 12304` and nothing else, measured on
+/// Llama-3.2-1B-Instruct-4bit, and `reference_taken_on` skipped whenever
+/// `PIE_METAL_SMOKE_CHECKPOINT` named anything else -- which is every
+/// checkpoint this driver was brought up on. The skip was the RIGHT
+/// behaviour and the table was the missing half: a gate that cannot compare
+/// the model under test is a gate that reports nothing, and this is the only
+/// test here that reads a second fire against what a first one wrote.
+///
+/// [`GENERATIONS`] is that table. Every row was taken the same way, by the
+/// procedure `reference_taken_on` describes, and the prompt is stated beside
+/// the continuation because it is not the same prompt: `"Hello"` is one
+/// token for qwen, two for llama and gpt-oss, and gemma's tokenizer adds no
+/// BOS of its own. Without one gemma-4 answers `Hello Hello Hello Hello`,
+/// and a degenerate reference agrees with a driver that has forgotten how to
+/// attend.
 #[test]
 #[ignore = "needs PIE_METAL_SMOKE_CHECKPOINT; run with --include-ignored --test-threads=1"]
 fn a_generation_agrees_with_mlx_token_for_token() {
@@ -3608,10 +3789,9 @@ fn a_generation_agrees_with_mlx_token_for_token() {
         eprintln!("SKIP: set PIE_METAL_SMOKE_CHECKPOINT to an MLX snapshot");
         return;
     };
-    // The reference below is llama-3.2-1B-Instruct-4bit's, taken by hand.
-    if !reference_taken_on(&snapshot, "Llama-3.2-1B-Instruct-4bit") {
+    let Some(reference) = generation_reference(&snapshot) else {
         return;
-    }
+    };
     let Ok(context) = Context::new() else {
         eprintln!("SKIP: no Metal 4 device");
         return;
@@ -3645,17 +3825,21 @@ fn a_generation_agrees_with_mlx_token_for_token() {
             } else {
                 l.k.gpu_address()
             },
-            bytes: shape.layer_bytes_at(0),
+            // THIS LAYER'S, not layer zero's. A stack with two attention
+            // shapes has two page sizes -- `Shape::row_bytes` answers `None`
+            // rather than hand the first layer's out for all of them, and a
+            // span cut to the wrong length describes the wrong cache.
+            bytes: shape.layer_bytes_at(u32::from(layer)),
         })
     };
     let freqs = driver_metal::model::rope::table(&dg);
     let inv_freq: Vec<u32> = freqs.iter().map(|f| f.to_bits()).collect();
 
-    const MLX: [u32; 4] = [0, 358, 2846, 12304];
-    let mut seq: Vec<u32> = vec![128_000, 9906];
+    let mlx = reference.continuation;
+    let mut seq: Vec<u32> = reference.prompt.to_vec();
     let mut got: Vec<u32> = Vec::new();
 
-    for (turn, &want) in MLX.iter().enumerate() {
+    for (turn, &want) in mlx.iter().enumerate() {
         // The first fire is the PREFILL of the prompt; every one after is a
         // decode of the last token at its own position.
         let (tokens, first): (Vec<u32>, u32) = if turn == 0 {
@@ -3756,16 +3940,32 @@ fn a_generation_agrees_with_mlx_token_for_token() {
             .map(|(i, _)| i as u32)
             .expect("a readout has an argmax");
 
+        // WHAT THE SERVING PATH DOES AT THIS EXACT POINT.
+        //
+        // `serve::launch` calls this after every fire retires and this gate
+        // did not, which is only visible on a hybrid: the GDN layers write
+        // their convolution state into the WRITE plane and read it from the
+        // READ one, and `carry_forward` is what makes the plane a fire wrote
+        // the plane the next fire reads. Without it every decode after the
+        // first convolved against the state the PREFILL saw, so a qwen3.6
+        // agreed for as long as the difference had not accumulated and then
+        // ran a token behind -- reported as a driver defect by a rig that was
+        // missing a step the driver performs.
+        if let Some(rs) = rs.as_ref() {
+            // SAFETY: the fire has retired, so nothing is reading either plane.
+            unsafe { rs.pool.carry_forward() }.expect("the conv planes carry");
+        }
+
         eprintln!("turn {turn}: {next} (MLX {want})");
         got.push(next);
         seq.push(next);
     }
 
     assert_eq!(
-        got, MLX,
-        "the generation diverged from MLX. A first token that agrees and a \
-         second that does not is the KV carryover, which no single-fire gate \
-         reaches."
+        got, mlx,
+        "{} diverged from MLX. A first token that agrees and a second that \
+         does not is the KV carryover, which no single-fire gate reaches.",
+        reference.model
     );
 }
 
@@ -3834,7 +4034,7 @@ fn a_replayed_fire_over_real_weights_agrees_with_the_encoded_one() {
             } else {
                 l.k.gpu_address()
             },
-            bytes: shape.layer_bytes_at(0),
+            bytes: shape.layer_bytes_at(u32::from(layer)),
         })
     };
     let freqs = driver_metal::model::rope::table(&dg);
@@ -4218,7 +4418,7 @@ fn prefill_logits_on(
             } else {
                 l.k.gpu_address()
             },
-            bytes: shape.layer_bytes_at(0),
+            bytes: shape.layer_bytes_at(u32::from(layer)),
         })
     };
     let freqs = driver_metal::model::rope::table(dg);
@@ -4973,7 +5173,7 @@ fn attention_is_a_minority_of_a_long_prefill() {
                     } else {
                         l.k.gpu_address()
                     },
-                    bytes: shape.layer_bytes_at(0),
+                    bytes: shape.layer_bytes_at(u32::from(layer)),
                 })
             };
             let mut live = Live {
@@ -5158,7 +5358,7 @@ fn where_a_long_prefill_spends_its_time() {
                     } else {
                         l.k.gpu_address()
                     },
-                    bytes: shape.layer_bytes_at(0),
+                    bytes: shape.layer_bytes_at(u32::from(layer)),
                 })
             };
             let mut live = Live {
@@ -5388,7 +5588,7 @@ fn what_a_decode_costs_at_length() {
                 } else {
                     l.k.gpu_address()
                 },
-                bytes: shape.layer_bytes_at(0),
+                bytes: shape.layer_bytes_at(u32::from(layer)),
             })
         };
         let mut regions = driver_metal::device::Regions::new();
@@ -5481,7 +5681,7 @@ fn what_a_decode_costs_at_length() {
                 recordings: (replay && count == 1).then_some(recordings),
             };
             let submitted =
-                driver_metal::fire::run::submit(&mut machine, &lowered, geometry, &mut live)
+                driver_metal::fire::run::submit(&mut machine, lowered, geometry, &mut live)
                     .expect("the fire commits");
             let encoded = started.elapsed().as_secs_f64() * 1e3;
             machine
@@ -5705,7 +5905,7 @@ fn tier_one_prefill_then_decode() {
             } else {
                 l.k.gpu_address()
             },
-            bytes: shape.layer_bytes_at(0),
+            bytes: shape.layer_bytes_at(u32::from(layer)),
         })
     };
     let rs = Slabs::of(&context, row);
@@ -5745,11 +5945,10 @@ fn tier_one_prefill_then_decode() {
         // re-consumes 128 tokens into a memory that already holds 129, and
         // what that produced on Qwen3.6-35B-A3B was not a wrong answer but a
         // HANG -- "the GPU did not reach event 3 within 60000 ms".
-        if first == 0 {
-            if let Some(rs) = rs.as_ref() {
+        if first == 0
+            && let Some(rs) = rs.as_ref() {
                 rs.pool.clear_slot(0).expect("the seat clears");
             }
-        }
         let tokens: Vec<u32> = (0..count).map(|i| 1000 + (first + i) % 5000).collect();
         let positions: Vec<u32> = (first..first + count).collect();
         let step = Step {
@@ -5842,7 +6041,7 @@ fn tier_one_prefill_then_decode() {
             );
         }
         let submitted =
-            driver_metal::fire::run::submit(&mut machine, &lowered, geometry, &mut live)
+            driver_metal::fire::run::submit(&mut machine, lowered, geometry, &mut live)
                 .expect("the fire commits");
         machine
             .stepper
@@ -5991,7 +6190,7 @@ fn tier_one_prefill_then_decode() {
                 by_symbol.push((n, index, symbol));
             }
         }
-        by_symbol.sort_by(|a, b| b.0.cmp(&a.0));
+        by_symbol.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         // `PIE_BENCH_WINDOW=N` names the launches AROUND dispatch N, and
         // `PIE_BENCH_WINDOW=LO:HI` names a range of them, which is what
         // turns a `PIE_BENCH_CUT_PREFILL` bisect into an answer: the bisect
@@ -5999,7 +6198,7 @@ fn tier_one_prefill_then_decode() {
         // which layer that index is. Together they put the A3B wedge on
         // `sdpa_paged_tiled_bfloat16_d_256` at layer 31 -- see
         // `model::qwen_3_5::forward::metal`.
-        if let Some(spec) = std::env::var("PIE_BENCH_WINDOW").ok() {
+        if let Ok(spec) = std::env::var("PIE_BENCH_WINDOW") {
             let (lo, hi) = match spec.split_once(':') {
                 Some((a, b)) => (
                     a.parse::<usize>().unwrap_or(0),
@@ -6206,7 +6405,7 @@ fn where_a_decode_spends_its_time() {
                         } else {
                             l.k.gpu_address()
                         },
-                        bytes: shape.layer_bytes_at(0),
+                        bytes: shape.layer_bytes_at(u32::from(layer)),
                     })
                 };
                 let mut live = Live {
@@ -6299,7 +6498,7 @@ fn results_of(symbol: &str) -> usize {
     routine
         .args
         .iter()
-        .filter(|(ty, _)| ty.binds() == kernels::Binds::Writes)
+        .filter(|ty| ty.binds() == kernels::Binds::Writes)
         .count()
 }
 
@@ -6399,7 +6598,7 @@ fn locate_first_divergence(class: FireClass, step: &Step<'_>) {
                 } else {
                     l.k.gpu_address()
                 },
-                bytes: shape.layer_bytes_at(0),
+                bytes: shape.layer_bytes_at(u32::from(layer)),
             })
         };
         let mut live = Live {

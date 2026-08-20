@@ -378,12 +378,29 @@ impl Session {
                 stream,
             )?;
         }
+        // WHICH REGIONS ACTUALLY LAUNCH. A stage's region list is what the
+        // compile plane kept, not what the plan declared, so a region dropped
+        // there is invisible from every other vantage point: the values it
+        // would have written read back as the zeros `Prepared::build` wrote,
+        // and nothing faults. `.wiki/migration.md` §11.21.
+        let trace = std::env::var_os("PIE_TRACE_VALUES").is_some();
         for stage in compiled.stages.iter() {
             for region in stage.regions.iter() {
+                if trace {
+                    eprintln!(
+                        "[region] stage={:#x} region={} entry={}",
+                        stage.signature_hash,
+                        region.region_index,
+                        region.module.entry_name()
+                    );
+                }
                 prepared.launch_region(region, stream)?;
             }
         }
         stream.synchronize()?;
+        if trace {
+            prepared.trace_scratch(0, stream)?;
+        }
 
         let committed = prepared.committed(stream)?;
         let (taken, put) = (self.global(&sets.taken)?, self.global(&sets.put)?);

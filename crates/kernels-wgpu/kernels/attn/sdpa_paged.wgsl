@@ -271,9 +271,21 @@ fn dot_page(q_base: u32, page_base: u32, kv_head: i32, kp: i32) -> f32 {
 // One partial dot per lane. `PIE_PAIRS` is `PIE_HEAD_DIM / 2` and every
 // instantiated head dim is a power of two, so the tree halves exactly and
 // needs no odd-lane tail.
-var<workgroup> pie_sdpa_part: array<f32, PIE_PAIRS>;
+// Keys carried by one pass of the reduction, and the workgroup's y extent.
+//
+// WebGPU guarantees 256 invocations per workgroup, and `PIE_PAIRS` of them go
+// on the head dimension, so what is left is what can go on the KEYS: 8 at
+// d_64, 4 at d_128, 2 at d_256 and 1 at d_512, where the shape degenerates to
+// the one this arm had.
+const PIE_KB: u32 = 256u / PIE_PAIRS;
+var<workgroup> pie_sdpa_part: array<f32, PIE_KB * PIE_PAIRS>;
+// The value pairs of the block, staged so the accumulate can read a key it did
+// not load. Reading V before the reduction rather than after is the old body's
+// finding and is kept -- V does not depend on the score, and the reduction is a
+// long wait to start the load after.
+var<workgroup> pie_sdpa_vpart: array<vec2<f32>, PIE_KB * PIE_PAIRS>;
 
-fn decode_row(row: u32, q_head: u32, lane: u32, n_q_heads: u32) {
+fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32) {
     let d_out = lane * 2u;
     let req = req_of_token[row];
     let q_pos = position_ids[row];
@@ -349,35 +361,72 @@ fn decode_row(row: u32, q_head: u32, lane: u32, n_q_heads: u32) {
     var acc = vec2<f32>(0.0, 0.0);
     // Loop-invariant, and it was the first of two dependent loads per key.
     let page_base = kv_page_indptr[u32(req)];
-    for (var kp = start; kp <= q_pos; kp = kp + 1) {
-        // Uniform: every lane of this workgroup has the same row and the same
-        // position, so this `continue` skips the same iteration for all of
-        // them. That is what makes the reduction below legal.
-        if (!keeps(row, kp, q_pos, start)) { continue; }
-        let slot = page_slot_at(page_base, kp);
-        let k_base = (slot * u32(params.n_kv_heads) + u32(kv_head)) * PIE_HEAD_DIM;
-        // BOTH LOADS ISSUED BEFORE EITHER IS USED. `v_pair` does not depend on
-        // the score, and the score is a whole log-depth reduction away --
-        // `PIE_PAIRS` levels of `workgroupBarrier` -- so reading V afterwards
-        // made every iteration stall on memory twice where it can stall once.
-        // `kernels-metal` found the same shape behind a single `simd_sum` and
-        // measured 6 % of `sdpa_paged_decode`; here the wait is longer.
-        let v_pair = vec2<f32>(v_at(k_base + d_out), v_at(k_base + d_out + 1u));
-        pie_sdpa_part[lane] = params.scale * q_at(q_base + d_out) * k_at(k_base + d_out)
-            + params.scale * q_at(q_base + d_out + 1u) * k_at(k_base + d_out + 1u);
+    // ONE TREE FOR PIE_KB KEYS.
+    //
+    // The note above records this as measured and rejected -- 1.601 ms against
+    // 1.637 ms, "the barrier COUNT is not the cost" -- and that measurement is
+    // sound for the machine it was taken on. It was llvmpipe, where the note
+    // says why: a whole workgroup runs on one thread, so a barrier is close to
+    // a loop boundary. On a real GPU it is a rendezvous of every simdgroup in
+    // the workgroup, and this loop reached six of them PER KEY.
+    //
+    // Measured on an M4 with Llama-3.2-1B: decode ran at 72 tok/s against an
+    // 8-token context and 40.7 against 512, and the whole of that fall is this
+    // kernel. Eight keys to a tree does not change one multiply, one add or one
+    // online update -- the tree's shape and the order the keys update the
+    // running max are exactly as they were -- it just stops paying the
+    // rendezvous seven times out of eight.
+    var kp0 = start;
+    while (kp0 <= q_pos) {
+        let kn = min(i32(PIE_KB), q_pos + 1 - kp0);
+        // ONE KEY PER Y LANE. The block's keys are loaded and dotted at the
+        // same time rather than one after another, which is the whole point of
+        // the second workgroup axis: this kernel dispatches one workgroup per
+        // query head and nothing else, so at d_64 it had 32 x 32 = 1024
+        // invocations for the entire decode's attention.
+        //
+        // V is read here, before the reduction, which is the old body's finding
+        // and is kept: it does not depend on the score, and the reduction is a
+        // long wait to start the load after.
+        var part = 0.0;
+        var v_pair = vec2<f32>(0.0, 0.0);
+        if (i32(ky) < kn) {
+            let slot = page_slot_at(page_base, kp0 + i32(ky));
+            let k_base = (slot * u32(params.n_kv_heads) + u32(kv_head)) * PIE_HEAD_DIM;
+            v_pair = vec2<f32>(v_at(k_base + d_out), v_at(k_base + d_out + 1u));
+            part = params.scale * q_at(q_base + d_out) * k_at(k_base + d_out)
+                + params.scale * q_at(q_base + d_out + 1u) * k_at(k_base + d_out + 1u);
+        }
+        pie_sdpa_vpart[ky * PIE_PAIRS + lane] = v_pair;
+        pie_sdpa_part[ky * PIE_PAIRS + lane] = part;
         workgroupBarrier();
         for (var half = PIE_PAIRS >> 1u; half > 0u; half = half >> 1u) {
             if (lane < half) {
-                pie_sdpa_part[lane] = pie_sdpa_part[lane] + pie_sdpa_part[lane + half];
+                pie_sdpa_part[ky * PIE_PAIRS + lane] =
+                    pie_sdpa_part[ky * PIE_PAIRS + lane]
+                    + pie_sdpa_part[ky * PIE_PAIRS + lane + half];
             }
             workgroupBarrier();
         }
-        let score = pie_sdpa_part[0];
+        // Uniform: every lane of this workgroup has the same row and the same
+        // position, so a masked key is masked for all of them. That is what
+        // makes the reduction above legal, and it is why the mask is applied
+        // HERE and not as a `-inf` score -- a score equal to the running max
+        // contributes `exp(0)` to the denominator, and the running max starts
+        // at `-inf`.
+        for (var j = 0u; j < PIE_KB; j = j + 1u) {
+            let kp = kp0 + i32(j);
+            if (i32(j) < kn && keeps(row, kp, q_pos, start)) {
+                let step = pie_sdpa_online_update(pie_sdpa_part[j * PIE_PAIRS], max_score, sum_exp);
+                max_score = step.max_score;
+                sum_exp = step.sum_exp;
+                acc = acc * step.history_scale
+                    + step.score_scale * pie_sdpa_vpart[j * PIE_PAIRS + lane];
+            }
+        }
+        // The next block's partials overwrite what lane 0 was just read for.
         workgroupBarrier();
-        let step = pie_sdpa_online_update(score, max_score, sum_exp);
-        max_score = step.max_score;
-        sum_exp = step.sum_exp;
-        acc = acc * step.history_scale + step.score_scale * v_pair;
+        kp0 = kp0 + i32(PIE_KB);
     }
 //#if defined(PIE_WITH_SINK)
     let merged = pie_sdpa_merge_sink(sink_at(q_head), max_score, sum_exp);
@@ -388,7 +437,12 @@ fn decode_row(row: u32, q_head: u32, lane: u32, n_q_heads: u32) {
     var norm = acc;
     if (sum_exp != 0.0) { norm = acc / sum_exp; }
     let at = (o_base + d_out) >> 1u;
-    if (at < arrayLength(&out_)) { out_[at] = pie_pack_bf16(norm.x, norm.y); }
+    // Every y lane carried the same online-softmax state and the same
+    // accumulator -- the running max and sum are functions of the SCORES, which
+    // the whole workgroup shares -- so they all hold this answer and one writes
+    // it. The redundancy is eight fused multiply-adds against eight keys' worth
+    // of loads and a reduction.
+    if (ky == 0u && at < arrayLength(&out_)) { out_[at] = pie_pack_bf16(norm.x, norm.y); }
 }
 
 //#endif
@@ -501,13 +555,13 @@ fn main(
 
 //#else
 
-@compute @workgroup_size(PIE_PAIRS)
+@compute @workgroup_size(PIE_PAIRS, PIE_KB)
 fn main(
     @builtin(workgroup_id) wg: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(num_workgroups) groups: vec3<u32>,
 ) {
-    decode_row(wg.y, wg.x, lid.x, groups.x);
+    decode_row(wg.y, wg.x, lid.x, lid.y, groups.x);
 }
 
 //#endif

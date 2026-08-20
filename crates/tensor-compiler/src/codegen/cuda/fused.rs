@@ -17,6 +17,17 @@
 //!   logits intrinsic through nothing but reshapes reads the intrinsic's device
 //!   buffer straight, which makes both the intrinsic materialisation and the
 //!   reshapes redundant.
+//!
+//! Both analyses only ever elide a node whose value some *other* emission still
+//! produces — the alias, or `ptir_fast_argmax_intrinsic`'s direct read. There
+//! is no third: a `RegionKind::Library` region has no CUDA kernel of its own
+//! (`emit_cuda_stage` sends every region through this emitter, where Metal
+//! picks `emit_grouped_nucleus`), so a nucleus region's operands are ordinary
+//! scratch values that ordinary emitted ops must write. Eliding them on the
+//! grounds that "the library kernel reads the intrinsic" describes Metal, and
+//! costs a nonzero temperature every token: the slot stays zeroed, the softmax
+//! over it is uniform, and the draw returns token 0. `.wiki/migration.md`
+//! §11.21 is the account.
 
 use crate::codegen::error::{EmitError, EmitterKind, ValueLayoutSite};
 use alloc::format;
@@ -26,9 +37,7 @@ use alloc::vec::Vec;
 use core::fmt::Write as _;
 use tensor_ir::op::{IntrinsicId, intrinsic_tags, tags};
 
-use crate::plan::{
-    CompiledStage, Dimension, LANE_TABLE_ABI_VERSION, LibraryOp, NodeIndex, Region, RegionKind,
-};
+use crate::plan::{CompiledStage, Dimension, LANE_TABLE_ABI_VERSION, Region};
 
 use crate::codegen::op_view::{OpView, result_bases};
 use crate::codegen::slots::Slots;
@@ -264,87 +273,7 @@ pub fn emit_fused_region(
 
     let mut aliases = crate::codegen::alias::AliasTable::new();
     let direct = analyze_direct_argmax(stage, region, &bases);
-    let mut skipped = direct.skipped;
-
-    // A nucleus library region elsewhere in the stage reads the logits and the
-    // sampler state straight out of the lane's bf16 rows, so the nodes that
-    // would have materialized them here are redundant -- but only under the
-    // same two conditions the driver applies when it shrinks those value slots
-    // to four bytes (`fused_runtime.cuh` `resolves_to_logits_intrinsic` /
-    // `lone_generated_node`). Skipping a node the driver still budgets a full
-    // slot for leaves that slot unwritten: whatever the region emits next reads
-    // uninitialized scratch and publishes it. No fault, no failing test, just a
-    // wrong sample. The sibling analysis `analyze_direct_argmax` above has
-    // always checked its chain; this one did not.
-    let producer_of = |value: u32| -> Option<usize> {
-        region
-            .nodes
-            .iter()
-            .map(|node| node.index())
-            .chain(0..ops.len())
-            .find(|&node| value >= bases[node] && value < bases[node] + ops[node].results)
-    };
-    let produces_logits_intrinsic = |value: u32| -> bool {
-        producer_of(value).is_some_and(|node| {
-            let op = &ops[node];
-            op.tag == tags::INTRINSIC_VAL
-                && (op.intr == intrinsic_tags::LOGITS || op.intr == intrinsic_tags::MTP_LOGITS)
-        })
-    };
-    let resolves_to_logits_intrinsic = |value: u32| -> bool {
-        if produces_logits_intrinsic(value) {
-            return true;
-        }
-        producer_of(value).is_some_and(|node| {
-            let op = &ops[node];
-            op.tag == tags::RESHAPE && !op.args.is_empty() && produces_logits_intrinsic(op.args[0])
-        })
-    };
-    // The scale divide is folded into the nucleus kernel only when it is a
-    // region of its own; fused into a larger generated region it still runs and
-    // still writes a full tensor.
-    let mut lone_generated_node = vec![false; ops.len()];
-    for candidate in &stage.fused.regions {
-        if !matches!(candidate.kind, RegionKind::Library(_)) && candidate.nodes.len() == 1 {
-            lone_generated_node[candidate.nodes[0].index()] = true;
-        }
-    }
-    let in_region = |node: usize| region.nodes.contains(&NodeIndex(node as u32));
-
-    for candidate in &stage.fused.regions {
-        if !matches!(
-            candidate.kind,
-            RegionKind::Library(LibraryOp::NucleusSample)
-        ) || candidate.inputs.len() != 5
-        {
-            continue;
-        }
-        if resolves_to_logits_intrinsic(candidate.inputs[0])
-            && let Some(node) = producer_of(candidate.inputs[0])
-            && in_region(node)
-        {
-            skipped[node] = 1;
-        }
-        let Some(node) = producer_of(candidate.inputs[2]) else {
-            continue;
-        };
-        if !lone_generated_node[node] {
-            continue;
-        }
-        if in_region(node) {
-            skipped[node] = 1;
-        }
-        let op = &ops[node];
-        if op.tag == tags::DIV
-            && !op.args.is_empty()
-            && resolves_to_logits_intrinsic(op.args[0])
-            && let Some(reshape) = producer_of(op.args[0])
-            && ops[reshape].tag == tags::RESHAPE
-            && in_region(reshape)
-        {
-            skipped[reshape] = 1;
-        }
-    }
+    let skipped = direct.skipped;
 
     let mut source = singleton_runtime_source();
     source.push_str(PROLOGUE);

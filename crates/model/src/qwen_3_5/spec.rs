@@ -36,9 +36,12 @@ pub struct Qwen35MoeMlpFacts {
     /// is the qwen3_moe shape — the hand-written pass skips the whole
     /// shared block when the bind wired no `shared_*` pointers.
     pub shared_expert_intermediate: u32,
-    /// qwen3.5/3.6 use the Gemma `(1 + w)` fold
-    /// (`qwen3_5_moe_forward.cpp::uses_gemma_rmsnorm`: everything but plain
-    /// `qwen3_moe`).
+    /// qwen3.5/3.6 fold PLAINLY — `xhat * w`, the `nn.RMSNorm` reading.
+    ///
+    /// This said Gemma, on the authority of
+    /// `qwen3_5_moe_forward.cpp::uses_gemma_rmsnorm`. See this generation's
+    /// module doc for the three measurements that overturned it and for what
+    /// the other fold generated.
     pub norm_variant: NormVariant,
 }
 
@@ -58,7 +61,7 @@ impl Qwen35MoeMlpFacts {
             top_k: 8,
             moe_intermediate: 512,
             shared_expert_intermediate: 512,
-            norm_variant: NormVariant::Gemma,
+            norm_variant: NormVariant::Plain,
         }
     }
 }
@@ -90,10 +93,13 @@ pub struct Qwen35GdnFacts {
     /// behind `PIE_QWEN35_FUSED_GDN_PROJ` (default OFF), so the default trace
     /// writes four matmuls and the joined one two matmuls + two `SplitGdn`s.
     pub fused_in_proj: bool,
-    /// qwen3.5/3.6 use the Gemma `(1 + w)` fold for the block norms
-    /// (`kernels::norm::rmsnorm_gemma_bf16` on the pre-attention norm). The GATED
-    /// norm inside the block is not governed by this: its weight fold is
-    /// plain by kernel contract (`rmsnorm.hpp`).
+    /// qwen3.5/3.6 fold PLAINLY on the pre-attention norm — see this
+    /// generation's module doc. The GATED norm inside the block never read
+    /// this field either way: its weight fold is plain by kernel contract
+    /// (`rmsnorm.hpp`), which is the one norm here that was RIGHT while the
+    /// three around it were not, and `linear_attn.norm.weight` shipping at
+    /// 0.88 next to `input_layernorm.weight` at 0.98 is the tell that both
+    /// are the same fold.
     pub norm_variant: NormVariant,
 }
 
@@ -131,8 +137,13 @@ impl Qwen35GdnFacts {
     ///   bf16 GEMV `[16, 1024]` (= value_heads × hidden).
     /// * `driver-cuda/csrc/src/model/config.hpp:357` pins the conv window: 4.
     /// * `fused_in_proj: false` is the live default binding (see the field doc).
-    /// * `norm_variant: Gemma`: `qwen3_5_forward.cpp` launches
-    ///   `kernels::norm::rmsnorm_gemma_bf16` for every block norm.
+    /// * `norm_variant: Plain`. This said `Gemma` on the authority of
+    ///   `qwen3_5_forward.cpp` launching `kernels::norm::rmsnorm_gemma_bf16`,
+    ///   and no 0.8B is staged on this machine to check it against. What IS
+    ///   measurable — the two Qwen3.6 checkpoints, and `mlx_lm`'s
+    ///   `nn.RMSNorm` for the whole family — says plain, so the fixture
+    ///   states plain rather than disagreeing with the row of the same
+    ///   checkpoint next door. See this generation's module doc.
     pub fn qwen3_5_0_8b() -> Self {
         Self {
             hidden: 1024,
@@ -142,7 +153,7 @@ impl Qwen35GdnFacts {
             value_head_dim: 128,
             conv_kernel: 4,
             fused_in_proj: false,
-            norm_variant: NormVariant::Gemma,
+            norm_variant: NormVariant::Plain,
         }
     }
 }
@@ -155,7 +166,7 @@ impl Qwen35GdnFacts {
 /// (`kernels::layout::split_q_gate_bf16`), the output is multiplied by
 /// `sigmoid(gate)` (`sigmoid_gate_inplace_bf16` — no residual, not the
 /// shared-expert `SigmoidGateAdd`), rope is PARTIAL, and the per-head q/k norms
-/// fold Gemma-style over `N * heads` rows of `head_dim`. The qk-norm is not a
+/// fold plainly over `N * heads` rows of `head_dim`. The qk-norm is not a
 /// tri-state: `full_attn_layer_body` launches the pair unconditionally, so only
 /// the fold is a fact.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -178,9 +189,11 @@ pub struct Qwen35FullAttnFacts {
     /// whose "q" leg is the 2×-wide `[query | gate]` bank
     /// (`split_qkv_bf16(packed, qg, k, v, N, 2*Hq, Hk)`).
     pub fused_qkv: bool,
-    /// qwen3.5 folds `(1 + w)` on every norm of this block — the
-    /// pre-attention norm AND the per-head q/k norms
-    /// (`kernels::norm::rmsnorm_gemma_bf16` throughout `full_attn_layer_body`).
+    /// qwen3.5 folds PLAINLY on every norm of this block — the
+    /// pre-attention norm AND the per-head q/k norms. Qwen3.6-27B-4bit ships
+    /// `layers.3.self_attn.q_norm.weight` at mean 1.22 and `k_norm` at 1.21;
+    /// a gemma fold's gain is trained from zero. See this generation's
+    /// module doc.
     pub norm_variant: NormVariant,
 }
 
@@ -207,8 +220,9 @@ impl Qwen35FullAttnFacts {
     ///   derivation `max(2, 2·int(0.5·0.25·256))` and Metal's `rotary_dims`
     ///   both land on 64.
     /// * `fused_qkv: false` is the live default binding (see the field doc).
-    /// * `norm_variant: Gemma`: `full_attn_layer_body` launches
-    ///   `rmsnorm_gemma_bf16` for the block norm and both per-head q/k norms.
+    /// * `norm_variant: Plain`, for the reason
+    ///   [`Qwen35GdnFacts::qwen3_5_0_8b`] gives: the C++ this was pinned
+    ///   from is the one source the checkpoints contradict.
     pub fn qwen3_5_0_8b() -> Self {
         Self {
             hidden: 1024,
@@ -217,7 +231,7 @@ impl Qwen35FullAttnFacts {
             head_dim: 256,
             rotary_dim: 64,
             fused_qkv: false,
-            norm_variant: NormVariant::Gemma,
+            norm_variant: NormVariant::Plain,
         }
     }
 }
@@ -261,7 +275,7 @@ pub struct Qwen35HybridFacts {
     /// The lm_head weight is the embedding table (weight tying).
     pub tied_embeddings: bool,
     /// The fold of the FINAL norm (the per-block norms carry their own
-    /// variant inside the sub-facts; qwen3.5 folds Gemma everywhere).
+    /// variant inside the sub-facts; qwen3.5 folds PLAINLY everywhere).
     pub norm_variant: NormVariant,
     /// The full-attention layer kind.
     pub attn: Qwen35FullAttnFacts,
@@ -299,7 +313,7 @@ impl Qwen35HybridFacts {
             full_attn_interval: 4,
             vocab: 248_320,
             tied_embeddings: true,
-            norm_variant: NormVariant::Gemma,
+            norm_variant: NormVariant::Plain,
             attn: Qwen35FullAttnFacts::qwen3_5_0_8b(),
             gdn: Qwen35GdnFacts::qwen3_5_0_8b(),
             mlp: Qwen35MlpKind::Dense { intermediate: 3584 },
@@ -328,7 +342,7 @@ impl Qwen35HybridFacts {
             full_attn_interval: 4,
             vocab: 248_320,
             tied_embeddings: false,
-            norm_variant: NormVariant::Gemma,
+            norm_variant: NormVariant::Plain,
             attn: Qwen35FullAttnFacts {
                 hidden: 5120,
                 q_heads: 24,
@@ -336,7 +350,7 @@ impl Qwen35HybridFacts {
                 head_dim: 256,
                 rotary_dim: 64,
                 fused_qkv: false,
-                norm_variant: NormVariant::Gemma,
+                norm_variant: NormVariant::Plain,
             },
             gdn: Qwen35GdnFacts {
                 hidden: 5120,
@@ -346,7 +360,7 @@ impl Qwen35HybridFacts {
                 value_head_dim: 128,
                 conv_kernel: 4,
                 fused_in_proj: false,
-                norm_variant: NormVariant::Gemma,
+                norm_variant: NormVariant::Plain,
             },
             mlp: Qwen35MlpKind::Dense {
                 intermediate: 17_408,
@@ -423,6 +437,6 @@ mod tests {
         assert_eq!(m.top_k, 8);
         assert_eq!(m.moe_intermediate, 512);
         assert_eq!(m.shared_expert_intermediate, 512);
-        assert_eq!(m.norm_variant, NormVariant::Gemma);
+        assert_eq!(m.norm_variant, NormVariant::Plain);
     }
 }

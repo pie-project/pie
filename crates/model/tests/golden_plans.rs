@@ -748,6 +748,8 @@ fn gemma_4_e2b_cuda_decode() {
                 fused_qkv: true,
                 gate_up_fused: true,
                 kv_native_bf16: true,
+                // A fixture states no checkpoint, so the landing scales by one.
+                layer_scalars: Vec::new(),
             },
             FireClass::Decode,
         ),
@@ -766,6 +768,8 @@ fn gemma_4_e2b_cuda_prefill() {
                 fused_qkv: true,
                 gate_up_fused: true,
                 kv_native_bf16: true,
+                // A fixture states no checkpoint, so the landing scales by one.
+                layer_scalars: Vec::new(),
             },
             FireClass::Prefill,
         ),

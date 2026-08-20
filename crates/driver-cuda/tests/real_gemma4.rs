@@ -51,7 +51,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use driver_cuda::bind::abi::{KvCacheLayerView, KvCacheScheme};
-use driver_cuda::bind::{AttnCtx, AttnRegions, DispatchCtx, DispatchPlan, Frame, Resolver, run};
+use driver_cuda::bind::{
+    AttnCtx, AttnRegions, DispatchCtx, DispatchPlan, Frame, PrefillPlan, Resolver, run,
+};
 use driver_cuda::device::{Allocator, DeviceBuffer, OwnedStream};
 use driver_cuda::dtype::DType;
 use driver_cuda::fire::attention_workspace::{AttentionWorkspace, LiveStagingOps};
@@ -261,13 +263,27 @@ fn gemma4_matches_transformers_on_real_weights() {
     }
     // The LIVE cuda set: both banks fused (the join's budget admits
     // E2B), native bf16 pages on L40S.
-    let cuda = Gemma4CudaFacts::gemma_4_e4b_synthetic();
+    let mut cuda = Gemma4CudaFacts::gemma_4_e4b_synthetic();
+    // The checkpoint's per-layer `layer_scalar`, which the fixture cannot know
+    // and the landing needs: with the identity every logit saturates the
+    // softcap. Read the same way `serve/load.rs` reads it at load.
+    cuda.layer_scalars = layer_scalars(&ckpt, facts.layers);
     let plan = gemma4_cuda(&facts, &cuda, FireClass::Prefill);
     // A prefill: one request, TOKENS rows -- every row multi-token, which
     // is what `GuardPred::WindowOne` reads (graph.md §4.1).
     let rows: Vec<Row> = vec![Row { samples: true, multi_token: true, ..Row::default() }; TOKENS];
     let l = lower(&plan, &rows, Fire { captures_across_splits: false }).expect("lowers");
-    let dplan = DispatchPlan::new(&plan, &l);
+    // WITH THE BOOT'S ANSWER, not `Boot::default()`. `attn::write_kv_to_pages`
+    // is an `untraced!` declaration and `Boot::route` is what resolves it to
+    // `_bf16` or `_quantised`; a plan that states no KV dtype resolves it to
+    // neither and the walk refuses at launch 15 with `NoArm`. The cache this
+    // test builds below is `KvCacheScheme::Native` at `DType::Bf16`, so the
+    // fact is `Some(true)` and stating it here is what makes the two agree.
+    let dplan = DispatchPlan::with_boot(
+        &plan,
+        &l,
+        driver_cuda::bind::Boot { kv_native_bf16: Some(true) },
+    );
 
     let arena = alloc.alloc(l.arena_bytes).expect("arena");
     let frame = Frame { arena: arena.as_ptr(), arena_bytes: l.arena_bytes };
@@ -380,13 +396,34 @@ fn gemma4_matches_transformers_on_real_weights() {
 
     let mut sops = LiveStagingOps;
     let mut ws = AttentionWorkspace::allocate(&mut sops, 32 << 20, 16 << 20, 2).expect("ws");
+    // A RAISED PLAN, where this used to pass none. The sliding layers reach
+    // `attn::attention_flashinfer_prefill`, whose arm reads the plan handle
+    // off the fire — "nothing states the plan this fire did not raise" is its
+    // refusal — so a null handle is not the planless variant, it is no
+    // attention at all. Raised over the same three host CSRs the walk binds,
+    // at the sliding layers' own head dim; the full layers take the naive
+    // paged path and read none of this.
+    let mut pplan = PrefillPlan::new();
+    ws.begin_plan_update(&mut sops).expect("begin");
+    pplan.plan_prefill(
+        &qo_indptr_h,
+        &page_indptr_h,
+        &last_lens_h,
+        facts.q_heads as i32,
+        i32::from(facts.kv_heads as u16),
+        facts.head_dim as i32,
+        PAGE,
+        ws.view(),
+        raw_stream,
+        false,
+        -1,
+    );
+    ws.end_plan_update(&mut sops, raw_stream).expect("end");
 
     let attn = AttnCtx {
         decode_plan: core::ptr::null_mut(),
         decode_plan_full: core::ptr::null_mut(),
-        // No plan handle: the sliding layers' prefill is PLANLESS (it
-        // plans internally per fire) and the full layers' is naive.
-        prefill_plan: core::ptr::null_mut(),
+        prefill_plan: pplan.as_ptr(),
         workspace: ws.view(),
         prefill_workspace: ws.view(),
         layers,
@@ -638,38 +675,17 @@ fn gemma4_matches_transformers_on_real_weights() {
             y_at.0
         );
 
-        // The PLE relay, before and after the transpose: src `[N, L*D]`
-        // vs dst `[L, N, D]` — src row r chunk l must equal dst layer l
-        // row r, or the relay lies to every layer but 0.
-        let t = l
-            .launches
-            .iter()
-            .find(|x| l.kernels[x.kernel as usize] == "layout::transpose_bf16_nld_to_lnd")
-            .expect("the relay ran");
-        let (src_at, dst_at) =
-            match (&l.args[t.args.start as usize], &l.args[t.args.start as usize + 1]) {
-                (Arg::Arena { at: s, .. }, Arg::Arena { at: d, .. }) => (*s, *d),
-                other => panic!("the relay rides the arena, got {other:?}"),
-            };
-        let d = facts.ple_dim as usize;
-        let lcount = facts.layers as usize;
-        let bf = |off: usize| {
-            f32::from_bits(u32::from(u16::from_le_bytes([back[off], back[off + 1]])) << 16)
-        };
-        for layer in 0..lcount.min(3) {
-            let r = TOKENS - 1;
-            let src_off = src_at + ((r * lcount + layer) * d) * 2;
-            let dst_off = dst_at + ((layer * TOKENS + r) * d) * 2;
-            let sn: f32 = (0..d).map(|c| bf(src_off + c * 2).powi(2)).sum::<f32>().sqrt();
-            let dn: f32 = (0..d).map(|c| bf(dst_off + c * 2).powi(2)).sum::<f32>().sqrt();
-            eprintln!(
-                "relay layer {layer} row {r}: src norm={sn:.3} head=[{:.3},{:.3}] dst norm={dn:.3} head=[{:.3},{:.3}]",
-                bf(src_off),
-                bf(src_off + 2),
-                bf(dst_off),
-                bf(dst_off + 2)
-            );
-        }
+        // NO RELAY COMPARISON HERE. It used to read `layout::transpose_bf16_
+        // nld_to_lnd`'s two sides out of this post-run copy and report a
+        // 25-fold disagreement, which is not a defect and not even a
+        // measurement: the arena reuses that span, and `mlp::geglu_tanh_bf16`
+        // at launch 24 is the first of THIRTY-NINE later launches that write
+        // over it. Read at the moment it is written -- `GEMMA4_AB_TRACE`, which
+        // syncs after every launch and samples there -- the two sides agree to
+        // the bit, as a transpose must. The duplicate here survived because its
+        // numbers were plausible and pointed at gemma-4's one genuinely open
+        // question, so it read like a lead. It is deleted rather than fixed:
+        // `GEMMA4_AB_TRACE` already asks it honestly.
     }
 
     if std::env::var("GEMMA4_AB_LAYERS").is_ok() {

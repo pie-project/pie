@@ -352,8 +352,25 @@ pub fn gemma4_cuda(facts: &Gemma4Facts, cuda: &Gemma4CudaFacts, class: FireClass
                     &w.ple_norm,
                     &next.attn_norm,
                     hidden,
-                    // As above.
-                    1.0,
+                    // THE CHECKPOINT'S NUMBER, where this stated `1.0`. The
+                    // argument for the identity was that gemma-4's last layer
+                    // lands unfused through `norm_residual_add`, which applies
+                    // no scale, so the fused path must agree with it. The
+                    // premise is true and the conclusion does not follow: the
+                    // kernel applies `scale` to the SUM, and the epilogue
+                    // RMS-norms `y` immediately after the last landing, so a
+                    // uniform scale there is invisible and the two branches
+                    // agree whatever the last layer does. Every OTHER layer's
+                    // scale is visible, because the next layer adds an
+                    // unscaled contribution to a scaled stream.
+                    //
+                    // Measured: with the identity, the residual before the
+                    // final norm reaches norm 3227, every top logit saturates
+                    // the softcap at ~29.9 and HF's argmax is nowhere in our
+                    // top 8. With the checkpoint's scalars the residual is
+                    // 145, the top logit is 12.4 against HF's 13.0, and HF's
+                    // argmax is in our top 6.
+                    cuda.layer_scalars.get(l as usize).copied().unwrap_or(1.0),
                 );
                 y = landed;
                 normed = next_norm;

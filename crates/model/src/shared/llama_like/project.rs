@@ -784,6 +784,10 @@ pub fn metal_facts(
         // base. True for llama-3's piecewise rescaling and OLMo-3's YaRN,
         // which no `rope_theta` expresses.
         rope_freq_table: row.rope_rescaled,
+        // FALSE for every family this projection serves. The proportional
+        // reading of a partial rotary is gemma-4's alone, and it is stated
+        // where gemma-4's other rotations are -- `gemma_4::metal_facts`.
+        rope_proportional: false,
         // The window, as the per-layer list the text reads through
         // `window_left_at`. EMPTY when the row attends the whole
         // context, because empty is what the accessor reads as `-1`

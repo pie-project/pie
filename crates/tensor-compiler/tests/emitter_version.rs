@@ -72,7 +72,7 @@ use tensor_compiler::codegen::program::{Backend, emit_program};
 // output, not a judgement about whether a cache should be discarded; the
 // judgement was made and is recorded in the dumps.
 const PINNED: &[(&str, u16, u64)] = &[
-    ("cuda", 21, 0xc5b4_c70e_a9f1_b8bb),
+    ("cuda", 22, 0xfb7e_ee65_ae13_ee7b),
     ("metal", 36, 0x0f81_7250_caff_2a71),
 ];
 

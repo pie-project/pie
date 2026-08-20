@@ -118,6 +118,22 @@ fn load_model_takes_one_descriptor_because_this_backend_holds_one_model() {
 
     // And one descriptor gets as far as the checkpoint, which is the point:
     // the failure is now about the SNAPSHOT rather than about the seam.
+    //
+    // Asserted as that RELATION rather than against the loader's wording. It
+    // used to match the literal `[model] config`, which was the refusal a
+    // missing config file drew when this was written; the loader now looks
+    // for `model.safetensors[.index.json]` first and says so, and the test
+    // could not tell anyone -- `crates/engine/tests/metal_seam.rs` is behind
+    // `#![cfg(all(feature = "driver-metal", target_vendor = "apple"))]`, so
+    // the only machine that compiles it is a mac with the feature on, and no
+    // job in `ci.yml` had ever run on this branch to be that machine. The
+    // file did not even COMPILE: it still named `engine::driver::submission`
+    // and `backend::FrameLaunchOutcome`, two paths that moved into
+    // `driver_api` and are re-exported from `engine::driver` today.
+    //
+    // What the message must show is that the descriptor's own path reached
+    // the loader. Naming the directory is that, and it cannot be satisfied by
+    // the arity refusal above, which never sees a path.
     let why = format!(
         "{}",
         backend
@@ -125,9 +141,10 @@ fn load_model_takes_one_descriptor_because_this_backend_holds_one_model() {
             .expect_err("/nonesuch holds no checkpoint")
     );
     assert!(
-        why.contains("[model] config"),
+        why.contains("/nonesuch"),
         "model facts come from the descriptor the worker hands over, not from \
-         a checkpoint this seam re-normalizes: {why}"
+         a checkpoint this seam re-normalizes -- so the refusal should name \
+         the snapshot it was handed: {why}"
     );
 }
 
@@ -338,12 +355,12 @@ fn a_frame_reaches_the_device_through_the_seam() {
         sampling_indices: vec![1],
         ..::driver_api::plan::LaunchPlan::default()
     };
-    let frame = engine::driver::submission::FrameSubmission {
+    let frame = engine::driver::FrameSubmission {
         instance_ids: vec![1],
         kv_translation: vec![0],
         kv_translation_indptr: vec![0, 1],
         required_kv_pages: 1,
-        steps: vec![engine::driver::submission::StepSubmission {
+        steps: vec![engine::driver::StepSubmission {
             plan,
             roster_rows: vec![0],
             sub_batch_indptr: vec![0, 1],
@@ -367,11 +384,11 @@ fn a_frame_reaches_the_device_through_the_seam() {
     // so `Exhausted` or `Impossible` here would be the seam refusing rather
     // than the device being full.
     match backend.launch(&frame).expect("the frame launches") {
-        engine::driver::backend::FrameLaunchOutcome::Launched(_) => {}
-        engine::driver::backend::FrameLaunchOutcome::Exhausted => {
+        engine::driver::FrameLaunchOutcome::Launched(_) => {}
+        engine::driver::FrameLaunchOutcome::Exhausted => {
             panic!("one page did not fit a pool sized for hundreds")
         }
-        engine::driver::backend::FrameLaunchOutcome::Impossible => {
+        engine::driver::FrameLaunchOutcome::Impossible => {
             panic!("two tokens in one request is not an impossible frame")
         }
     }

@@ -361,3 +361,133 @@ fn a_buffer_outliving_its_pool_does_not_fault() {
     unsafe { held.contents().as_ptr().cast::<u32>().write(0x1234) };
     drop(held);
 }
+
+/// **A fork takes the compressed history with it.**
+///
+/// `Shell::copy_state` refused unconditionally, under prose saying "no model
+/// this backend serves has any recurrent state to move ... whose rows this
+/// build has no Metal text for". That sentence was true when it was written
+/// and stopped being true the day the qwen3.5 forward path landed: both
+/// Qwen3.6 checkpoints load, allocate one of these pools, and generate.
+///
+/// What the refusal cost is a FORK. A branch of a conversation takes its
+/// attention prefix through `copy_kv`, and for a linear-attention layer the
+/// whole prefix is compressed into a seat -- so a branch that could not copy
+/// the seat would attend over the right pages with a history that never saw
+/// the prompt. Not a refusal the guest could act on either: the seam answered
+/// `Unserved` and named a hole that had been filled.
+///
+/// Asserted over BOTH conv planes on purpose. `carry_forward` copies the
+/// write plane over the read one after the next fire, so a copy that moved
+/// only the read plane would be undone one step later -- which is the same
+/// argument `clear_slot` makes for zeroing both, and the reason that argument
+/// is worth a test is that the undo happens a fire after the mistake.
+#[test]
+fn a_forked_seat_carries_both_conv_planes_and_the_memory() {
+    let Some(context) = context() else {
+        println!("no Metal device; skipped");
+        return;
+    };
+    use driver_metal::layout::region::Region as _;
+    // Small, and shaped like a gated-DeltaNet layer rather than round: a
+    // square slot would hide an offset that multiplied the wrong extent.
+    let shape = driver_metal::layout::recurrent::Shape {
+        linear_layers: 2,
+        conv_dim: 8,
+        conv_k: 3,
+        v_heads: 2,
+        v_dim: 4,
+        k_dim: 6,
+        slots: 3,
+    };
+    let pool = driver_metal::pools::recurrent::Pool::allocate(&context, shape).expect("a pool");
+
+    let conv_slot = shape.conv_bytes_per_slot();
+    let state_slot = shape.state_bytes_per_slot();
+    let mark = |plane: &driver_metal::device::Allocation, offset: u64, bytes: u64, tag: u8| {
+        let pattern: Vec<u8> = (0..bytes).map(|i| tag.wrapping_add(i as u8)).collect();
+        // SAFETY: nothing has been encoded against this pool.
+        unsafe { plane.write(offset, &pattern) }.expect("the pattern fits");
+        pattern
+    };
+    let read = |plane: &driver_metal::device::Allocation, offset: u64, bytes: u64| -> Vec<u8> {
+        // SAFETY: shared storage, and no fire exists.
+        unsafe {
+            std::slice::from_raw_parts(
+                plane.contents().cast::<u8>().as_ptr().add(offset as usize),
+                bytes as usize,
+            )
+        }
+        .to_vec()
+    };
+
+    // Seat 2 is the one being forked FROM, and it is the last seat: a copy
+    // that read from the plane's base instead of the slot's offset would
+    // pass against seat 0 and fail here.
+    let mut want = Vec::new();
+    for l in 0..shape.linear_layers {
+        let layer = pool.layer(l).expect("a layer");
+        want.push((
+            mark(&layer.conv, shape.conv_offset(2), conv_slot, 0x10 + l as u8),
+            mark(&layer.new_conv, shape.conv_offset(2), conv_slot, 0x40 + l as u8),
+            mark(&layer.state, shape.state_offset(2), state_slot, 0x70 + l as u8),
+        ));
+    }
+
+    // SAFETY: no fire is reading either seat -- none has ever been encoded.
+    unsafe { pool.copy_slot(2, 0) }.expect("the seat forks");
+
+    for l in 0..shape.linear_layers {
+        let layer = pool.layer(l).expect("a layer");
+        let (conv, new_conv, state) = &want[l as usize];
+        assert_eq!(
+            &read(&layer.conv, shape.conv_offset(0), conv_slot),
+            conv,
+            "layer {l}: the read conv plane did not travel"
+        );
+        assert_eq!(
+            &read(&layer.new_conv, shape.conv_offset(0), conv_slot),
+            new_conv,
+            "layer {l}: the WRITE conv plane did not travel, so `carry_forward` \
+             would undo this copy one fire later"
+        );
+        assert_eq!(
+            &read(&layer.state, shape.state_offset(0), state_slot),
+            state,
+            "layer {l}: the DeltaNet memory did not travel"
+        );
+        // The seat nobody named is still the initial condition, which is what
+        // makes the copy a copy rather than a broadcast.
+        assert!(
+            read(&layer.conv, shape.conv_offset(1), conv_slot)
+                .iter()
+                .all(|&b| b == 0),
+            "layer {l}: seat 1 was written by a copy that did not name it"
+        );
+    }
+}
+
+/// A seat outside the pool is refused rather than written past the end.
+#[test]
+fn a_seat_the_pool_does_not_have_is_refused() {
+    let Some(context) = context() else {
+        println!("no Metal device; skipped");
+        return;
+    };
+    let shape = driver_metal::layout::recurrent::Shape {
+        linear_layers: 1,
+        conv_dim: 4,
+        conv_k: 2,
+        v_heads: 1,
+        v_dim: 2,
+        k_dim: 2,
+        slots: 2,
+    };
+    let pool = driver_metal::pools::recurrent::Pool::allocate(&context, shape).expect("a pool");
+    // SAFETY: no fire exists.
+    let err = unsafe { pool.copy_slot(0, 2) }.expect_err("seat 2 is past the pool");
+    assert!(
+        format!("{err}").contains('2'),
+        "the refusal does not name the seat: {err}"
+    );
+}

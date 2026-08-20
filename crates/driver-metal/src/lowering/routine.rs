@@ -167,12 +167,18 @@ impl<'r> Planner<'r> {
 ///
 /// [`Refusal::Unstated`] for a packed field, which this seam does not lay out
 /// yet — see the `InPacked` arm.
+/// What a laid-out argument run IS: the handles a dispatch binds, the slots
+/// its parameter block is described by, and the words of the block itself.
+/// Named because the tuple is three parallel statements about ONE run and a
+/// reader who meets it bare has to reconstruct which is which.
+type LaidOut = (Vec<BoundArg>, Vec<ParamSlot>, Vec<u32>);
+
 fn lay_out(
     values: &[ArgValue],
     types: &[Ty],
     handles: &[BoundArg],
     staged: Staged<'_>,
-) -> Result<(Vec<BoundArg>, Vec<ParamSlot>, Vec<u32>), Refusal> {
+) -> Result<LaidOut, Refusal> {
     let mut args = Vec::with_capacity(values.len());
     let mut params: Vec<u32> = Vec::new();
     let mut slots: Vec<ParamSlot> = Vec::new();
@@ -694,7 +700,6 @@ pub fn crossed(symbol: &str) -> Option<&'static Routine<Metal>> {
 /// `kernels_metal::KERNELS` reached every kernel this backend has, and every
 /// family has retired its rows, so a sweep keyed on the table now reaches
 /// nothing and says so by passing.
-#[must_use]
 pub fn stems() -> impl Iterator<Item = (&'static str, &'static Routine<Metal>)> {
     LIVE.iter().filter_map(|(name, stem)| Some((*stem, row(name)?)))
 }
@@ -723,6 +728,11 @@ pub const DARK: &[(&str, &str)] = &[(
 
 #[cfg(test)]
 mod tests {
+    // The argument-count sweep REPORTS its number: a floor that only says
+    // "above 500" cannot tell a reader the column moved from 900 to 572, and
+    // that migration is exactly what the assertion above it is about.
+    #![allow(clippy::print_stdout)]
+
     use super::*;
 
     /// A launch that stages no scalars and mints no packed block.

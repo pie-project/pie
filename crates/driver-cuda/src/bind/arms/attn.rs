@@ -52,6 +52,19 @@ pub static ARMS: &[Bound] = &[
     // `attn::write_kv_to_pages`, is resolved once at load. Envelope planes bind
     // as they stand, null included -- see the null rule above.
     Bound::derived("attn::write_kv_to_pages_bf16"),
+    // The declaration itself, so the registry mentions the name model texts
+    // state. It carries no arm because nothing ever fires this spelling:
+    // `Boot::route` resolves it to one of the two rows above at load, and
+    // `dispatch` binds the ROUTED row's own symbol. Listing it is what tells a
+    // reader the absence is routing rather than an omission.
+    Bound {
+        symbol: "attn::write_kv_to_pages",
+        arm: None,
+        unbound: Some(
+            "nothing: it is an `untraced!` declaration the boot's KV storage choice \
+             resolves to `_bf16` or `_quantised` before any fire names it",
+        ),
+    },
     // `keys::KvSchemeByte`/`KvStorageDtype` arrive as `i32` and the launcher
     // rebuilds the byte: `KvScheme` is a backend type, not a fact.
     Bound::derived("attn::write_kv_to_pages_quantised"),

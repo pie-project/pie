@@ -137,7 +137,7 @@ const _: () = {
     // reason beats an illegal address that poisons the context and surfaces
     // on an unrelated kernel's module load.
     assert!(armed == 138);
-    assert!(refused == 31);
+    assert!(refused == 32);
     assert!(driver == 3);
 };
 

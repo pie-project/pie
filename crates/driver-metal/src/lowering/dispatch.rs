@@ -448,6 +448,13 @@ impl Touches {
 ///
 /// A fire binds the same weight and the same table over and over, and the sets
 /// this feeds are scanned linearly.
+/// Its only consumer is `bind::encode::Hazards::note`, and `bind` is behind
+/// `metal-4` while this module is portable — so in the portable half nothing
+/// calls this and `dead_code` is right about it. Stated as a conditional
+/// allowance rather than silenced outright, because "unused in the half that
+/// has no device" and "unused" are different facts and only the first one is
+/// true here.
+#[cfg_attr(not(feature = "metal-4"), allow(dead_code))]
 pub(crate) fn merge(set: &mut Vec<Slice>, slice: Slice) {
     if slice.address == 0 || slice.bytes == 0 {
         return;
@@ -737,8 +744,10 @@ fn plan_routine<'a, S: Resolver>(
     // Only for a single dispatch. A body may state two -- a two-pass
     // reduction is two entrypoints over one statement -- and then neither is
     // "the" symbol the trace named.
-    if let [only] = plan.as_slice() {
-        if only.symbol != symbol {
+    if let [only] = plan.as_slice()
+        && only.symbol != symbol
+    {
+        {
             return Err(Undispatchable::Misspelled {
                 symbol: symbol.clone(),
                 op: launch.op,

@@ -408,38 +408,39 @@ impl Ctx<'_> {
         }
     }
 
-    /// An RMS norm at the fold THE FACTS STATE, which for this family is
-    /// gemma's `(1 + w)`.
+    /// An RMS norm at the fold THE FACTS STATE, which for this family is the
+    /// PLAIN `xhat * w`.
     ///
     /// This text used to hardcode [`NormVariant::Plain`] and say so: *"qwen3.5
     /// states `Plain` everywhere, unlike its CUDA text's comment"*. The facts
     /// disagreed with it in the same tree -- every `Qwen35*Facts` fixture
-    /// carries `norm_variant: Gemma`, and `Qwen35GdnFacts`'s own doc cites
-    /// `qwen3_5_forward.cpp` launching `rmsnorm_gemma_bf16` for every block
-    /// norm -- so one of the two was wrong and the field was dead either way.
+    /// carried `norm_variant: Gemma` -- so the hardcode was deleted in favour
+    /// of the field, and the field was the half that was wrong. THE HARDCODE
+    /// HAD BEEN RIGHT. What is kept here is the argument that overturned it,
+    /// because every clause of it was checkable and none of it was checked:
     ///
-    /// Three measurements say which, and none of them is a reading of anyone's
-    /// source:
+    /// - *"A plain norm's gain is trained from ones and stays near one; a
+    ///   gemma norm's is trained from ZEROS."* True, and it is the whole test.
+    ///   It was applied to Qwen3.5-0.8B-Base -- `mlp_norm` at mean 0.0855,
+    ///   `attn_norm` at 0.2382 -- and to no checkpoint this workspace can
+    ///   stage. Qwen3.6-27B-4bit ships `layers.0.input_layernorm.weight` at
+    ///   mean 0.976 and Qwen3.6-35B-A3B-4bit at 1.031. The same reasoning, run
+    ///   on the checkpoints actually served, gives the opposite answer.
+    /// - *"`linear_attn.norm.weight`, the gated-DeltaNet output gain, ships at
+    ///   0.96-0.99 -- near one, and it is the one norm here that does not come
+    ///   through this function."* It ships at 0.88 here, beside an
+    ///   `input_layernorm` at 0.98. Two gains a tenth apart were read as two
+    ///   different folds.
+    /// - *"Folded plainly, this model replies a SPACE to every prompt."* On
+    ///   this backend it is the gemma fold that produced the contentless
+    ///   answer, and not a space but salad:
+    ///   `atinum)nn\n\n投\nführwright..thisenp -,` on 27B. Plainly, both
+    ///   qwen3.6 rows open `<think>\nHere's a thinking process:` and answer.
     ///
-    /// - **The weights.** A plain norm's gain is trained from ones and stays
-    ///   near one; a gemma norm's is trained from ZEROS because the fold
-    ///   supplies the one. Qwen3.5-0.8B-Base ships `layer.0.mlp_norm` at mean
-    ///   0.0855 and `layer.0.attn_norm` at 0.2382, with `q_norm` and `k_norm`
-    ///   carrying negative channels outright. Multiplied directly, channels at
-    ///   ±0.01 come out with OPPOSITE SIGNS where `1 + w` has them both at
-    ///   nearly one.
-    /// - **The sibling that is genuinely plain.** `linear_attn.norm.weight`,
-    ///   the gated-DeltaNet output gain, ships at 0.96-0.99 -- near one, and it
-    ///   is the one norm here that does not come through this function.
-    ///   `gated_rms.wgsl` has no `plus_one` and needs none.
-    /// - **The answer.** Folded plainly, this model replies a SPACE to every
-    ///   prompt, with comma, period and newline behind it. Folded as gemma, on
-    ///   the same weights and the same fire, "The capital of France is Paris.
-    ///   The capital of France is" replies ` Paris` at the top of the
-    ///   distribution.
-    ///
-    /// `driver-wgpu`'s `which_fold_the_final_norm_applies_and_what_each_one_answers`
-    /// holds the third and prints both.
+    /// The measurement none of those three is: `mlx_lm.models.qwen3_5` builds
+    /// `nn.RMSNorm`, and `one_token_at_position_zero_agrees_with_mlx` fails on
+    /// both qwen3.6 rows under the gemma fold and passes under the plain one.
+    /// See this generation's module doc.
     fn norm(&self, x: &Val, l: Option<u32>, name: &str, row: u32) -> Val {
         let w = NormW {
             name: match l {
@@ -482,6 +483,9 @@ fn full_attn(c: &Ctx<'_>, l: u32, f: &Qwen35FullAttnFacts, y: &Val) -> Val {
         1.0,
         f.head_dim,
         f.rotary_dim,
+        false,
+        // qwen3.5 reads its partial rotary the ordinary way: the slice is a
+        // head of its own size. `rope_type: proportional` is gemma-4's.
         false,
     );
     let kv = Kv::at(x.trace(), l);

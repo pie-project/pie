@@ -679,9 +679,15 @@ pub fn gdn_core_recurrent_slotted(
 /// binding order, and a body that copied one into the other would write the
 /// pitch where the parameter block goes.
 ///
-/// Both are [`Env`]: `row_pitch` is the prefill scratch layout's widest
-/// tensor in activation elements (`gdn_prep.metal:329`) and `n_scan` is the
-/// fire's token count. Neither is a number a text states.
+/// Both are [`Env`]: `row_pitch` is `mixed`'s own row -- the in-projection's
+/// width in activation elements, which is what the shader indexes it by
+/// (`gdn_prep.metal:393`) and nothing else. NOT "the widest tensor in the
+/// prefill scratch layout", which this said until the layout stopped having
+/// one: `pre_gate` is WIDER than `mixed` wherever a stack's value width
+/// reaches its key width -- qwen3-next asks 2*Hv + Hv*Dv = 8320 floats of it
+/// against a conv_dim of 8192 -- so every scratch row is packed at its own
+/// width and only `mixed` is measured by this number. `n_scan` is the fire's
+/// token count. Neither is a number a text states.
 ///
 /// # Errors
 ///
@@ -772,13 +778,17 @@ pub fn gdn_prep_prefill(
 /// `params` into slot 6 and hand the scan its own geometry where it reads q.
 ///
 /// `pad` is [`Buf`]: nothing dereferences it, and a read-only handle is the
-/// weakest claim that can fill a slot.
+/// weakest claim that can fill a slot. NOTHING READS ITS SHAPE EITHER -- see
+/// the body's note on `row_pitch`, which used to and is the reason this
+/// sentence is now two.
 ///
 /// # Errors
 ///
 /// [`Refusal::Narrow`] from [`scan_point`] for a tiling the shader tree does
 /// not carry, and [`Refusal::Empty`] from [`scan_grid`] for a zero extent or
-/// from the two prefill scalars, as [`gdn_prep_prefill`].
+/// from the two prefill scalars, as [`gdn_prep_prefill`] -- except that
+/// `row_pitch` here is `pre_q`'s row and not `mixed`'s, because `mixed` is
+/// not an operand this entrypoint has.
 ///
 /// The tiling is checked FIRST: an entrypoint Metal has no `[[host_name]]`
 /// for makes `newFunctionWithName:` return nil at run time, inside a fire,
@@ -802,7 +812,33 @@ pub fn gdn_core_recurrent_prefill(
     let rstate = ctx.ask::<Tensor<f32>, keys::RecurrentState>()?;
     let params = ctx.params()?;
     let slot_ids = ctx.ask::<Tensor<u32>, keys::RecurrentSlots>()?;
-    let row_pitch = pad.width;
+    // `row_pitch` RIDES SLOT 12 AND THIS SHADER NEVER READS IT
+    // (`gdn_prep.metal:533`). Every row the scan walks is packed at its own
+    // width and the kernel reckons all three off the parameter block --
+    // `qk_pitch = Hv*Dk`, `g_pitch = 2*Hv + Hv*Dv`, `o_pitch = Hv*Dv`. The
+    // operand exists because the numbering is [`gdn_core_recurrent`]'s and a
+    // Metal argument table is a contiguous run, not because anything reads it.
+    //
+    // It said `pad.width`, which is the shape of dependency `232892260`
+    // named: a routine reading a fact off an operand that does not carry it.
+    // `pad` is the FILLER for this entrypoint's five holes -- "nothing
+    // dereferences it, and a read-only handle is the weakest claim that can
+    // fill a slot" -- so its width is whatever a text happened to place at
+    // input 0. MEASURED, on Qwen3.6-27B through `model-dsl`, which pads with
+    // `mixed`: `pad.width` is 10240, the in-projection's `conv_dim`, and
+    // `pre_q.width` is 6144 = Hv*Dk = 48*128. `device_gdn.rs`'s harness fills
+    // the same holes with `core_out` instead, whose row is Hv*Dv. Different
+    // numbers, one dispatch, one answer -- which is the measurement that this
+    // operand is not a pitch anybody reads.
+    //
+    // The refusal below is what made that matter. An operand whose statement
+    // gives no width answers zero -- a weight binds `width: 0` by
+    // construction, and `Holds::in_width` falls back to it -- so a text that
+    // filled the holes with such a value would make EVERY prefill scan on
+    // that stack refuse `Empty { row_pitch }`, over a number no shader reads.
+    // So it is stated from `pre_q`, which this kernel does read, and read at
+    // exactly this pitch.
+    let row_pitch = pre_q.width;
     let n_scan = ctx.ask::<i32, keys::Rows>()?;
     // THE TILING, READ OUT OF THE STATEMENT'S OWN RUN. These were
     // `Param<11, i32>` and `Param<12, i32>` -- words of the struct this body
@@ -962,6 +998,11 @@ mod tests {
     /// `T_SCAN` and `ROW_PITCH` there.
     const N_SCAN: i32 = 5;
     const ROW_PITCH: i32 = 1100;
+    /// What the scan's FILLER slot happens to be as wide as, which is not a
+    /// pitch and is deliberately not [`ROW_PITCH`]. On Qwen3.6-27B the two
+    /// really do differ -- `model-dsl` pads with `mixed`, 10240 wide, against
+    /// a `pre_q` row of 6144 -- so this fixture keeps them apart too.
+    const PAD_WIDTH: i32 = 1717;
 
     /// A decode core dispatches the grid `device_gdn.rs` fires.
     ///
@@ -1277,6 +1318,75 @@ mod tests {
         );
     }
 
+    /// THE SCAN'S `row_pitch` IS A ROW IT READS, NOT THE FILLER'S.
+    ///
+    /// This body said `let row_pitch = pad.width`, which is the dependency
+    /// `232892260` named twice over: a routine taking a fact off an operand
+    /// that does not carry it. `pad` is the handle bound into the five holes
+    /// this entrypoint leaves at slots 0, 1, 4, 5 and 9 -- `model-dsl` fills
+    /// them with `mixed`, `device_gdn.rs`'s harness with `core_out`, and the
+    /// routine's own doc says nothing dereferences it. So the number stated
+    /// at slot 12 was whichever tensor a caller happened to put at input 0.
+    ///
+    /// The shader never reads that scalar (`gdn_prep.metal:533`: every row is
+    /// packed at its own width and all three pitches are reckoned off the
+    /// parameter block), so the wrong value cost no answer. The REFUSAL cost
+    /// one: `row_pitch <= 0` refuses the fire, and an operand whose statement
+    /// gives no width answers zero, so a text that filled the holes with such
+    /// a value would have stopped every hybrid prefill on this backend over a
+    /// number no kernel reads.
+    ///
+    /// Asserted as the relation rather than against a literal: the scalar at
+    /// slot 12 follows `pre_q`'s row and does NOT follow the pad's, with the
+    /// two widths held apart so that one answer cannot pass for the other.
+    #[test]
+    fn the_scans_row_pitch_follows_pre_q_and_not_whatever_fills_its_holes() {
+        let seen = Seen::default();
+        // Same fire twice, changing ONLY the filler's width.
+        scan_with(&seen, DV, 32, 4, PAD_WIDTH, ROW_PITCH).expect("a launch");
+        scan_with(&seen, DV, 32, 4, PAD_WIDTH * 3, ROW_PITCH).expect("a launch");
+        // And once more, changing only `pre_q`'s.
+        scan_with(&seen, DV, 32, 4, PAD_WIDTH, ROW_PITCH + 64).expect("a launch");
+
+        let calls = seen.calls.borrow();
+        let pitch_of = |call: &Call| call.1[12];
+        assert_eq!(
+            pitch_of(&calls[0]),
+            pitch_of(&calls[1]),
+            "the pad's width is not the scan's pitch, and tripling it must \
+             move nothing"
+        );
+        assert_ne!(
+            pitch_of(&calls[0]),
+            pitch_of(&calls[2]),
+            "`pre_q`'s row is, and widening it must move exactly it"
+        );
+        assert_eq!(pitch_of(&calls[2]), ArgValue::I32(ROW_PITCH + 64));
+        assert_ne!(
+            pitch_of(&calls[0]),
+            ArgValue::I32(PAD_WIDTH),
+            "and the filler's width is not what reached slot 12"
+        );
+    }
+
+    /// A scan whose `pre_q` states no row is refused, and the refusal names
+    /// `row_pitch` rather than the operand.
+    ///
+    /// Zero is what [`kernels::bind`] answers for an operand a statement
+    /// carries no width for, so this is the shape a malformed statement
+    /// arrives in. It is refused BEFORE the dispatch for the reason every
+    /// extent in this family is: a fire that runs nothing reports success and
+    /// leaves `core_out` holding the last token's answer.
+    #[test]
+    fn a_scan_whose_pre_q_states_no_row_is_refused_by_name() {
+        let seen = Seen::default();
+        assert_eq!(
+            scan_with(&seen, DV, 32, 4, PAD_WIDTH, 0),
+            Err(Refusal::Empty { what: "row_pitch" })
+        );
+        assert!(seen.calls.borrow().is_empty(), "and it was never encoded");
+    }
+
     /// One slot map, three slots.
     ///
     /// `slot_ids` is buffer 12 in `gdn_core_slotted`, 13 in `gdn_prep_slotted`
@@ -1505,12 +1615,27 @@ mod tests {
     /// The scan, with the pad handle a number no real buffer in these tests
     /// takes, so a slot holding it is unmistakable.
     ///
-    /// `n_scan` and `row_pitch` are fixed at [`N_SCAN`] and [`ROW_PITCH`]
-    /// (the body reads the first off `pad.width` and the second off the
-    /// probe's `Rows`, and no test here varies either), while `lanes` and
-    /// `vrows` are this function's own parameters, set on the probe before
-    /// firing because [`gdn_core_recurrent_prefill`] asks for both.
+    /// `n_scan` is fixed at [`N_SCAN`] (the body reads it off the probe's
+    /// `Rows`) and `row_pitch` rides `pre_q`'s own `width`, exactly as the
+    /// body reads it. The pad is given a DIFFERENT width -- one no pitch in
+    /// this family could be -- so that a body that went back to reading the
+    /// filler's shape is a failing assertion rather than a passing one.
+    /// `lanes` and `vrows` are this function's own parameters, set on the
+    /// probe before firing because [`gdn_core_recurrent_prefill`] asks for
+    /// both.
     fn scan(seen: &Seen, v_dim: i32, lanes: i32, vrows: i32) -> Result<(), Refusal> {
+        scan_with(seen, v_dim, lanes, vrows, PAD_WIDTH, ROW_PITCH)
+    }
+
+    /// [`scan`], with the two operand widths said out loud.
+    fn scan_with(
+        seen: &Seen,
+        v_dim: i32,
+        lanes: i32,
+        vrows: i32,
+        pad_width: i32,
+        pre_q_width: i32,
+    ) -> Result<(), Refusal> {
         seen.rows.set(N_SCAN);
         seen.v_dim.set(v_dim);
         seen.lanes.set(lanes);
@@ -1526,9 +1651,9 @@ mod tests {
         }
         gdn_core_recurrent_prefill(
             seen,
-            In { ptr: Tensor::<bf16>::new(90), rows: 0, width: ROW_PITCH },
+            In { ptr: Tensor::<bf16>::new(90), rows: 0, width: pad_width },
             Out::new(Tensor::<bf16>::new(3)),
-            In::new(Tensor::<f32>::new(6)),
+            In { ptr: Tensor::<f32>::new(6), rows: 0, width: pre_q_width },
             In::new(Tensor::<f32>::new(7)),
             In::new(Tensor::<f32>::new(8)))
     }

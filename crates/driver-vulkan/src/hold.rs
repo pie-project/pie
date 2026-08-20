@@ -215,6 +215,25 @@ pub struct Handles<'a, 'h> {
     weights: &'h [usize],
     /// What the launch bound, in the trace's order.
     args: &'h [Bound<'a>],
+    /// Elements per row of each of those, in the SAME order, and zero for the
+    /// ones that have none.
+    ///
+    /// THE HALF A `Bound` DOES NOT CARRY. A [`Bound`] is a buffer, an offset
+    /// and a length; the rectangle over it is stated by the lowering's `Arg`,
+    /// which this driver drops on the way in. That was invisible while a
+    /// signature's marks were plain buffers, and stopped being invisible when
+    /// `Tensor<E>` began carrying its own width: `kernels::bind`'s `shaped`
+    /// asks a backend for the width beside the handle, this one answered
+    /// `Unstated`, the binder read the default and bound EVERY operand at
+    /// width zero -- so the first body to read `out.width` refused `Empty`,
+    /// which is every fire this driver has ever planned.
+    ///
+    /// A weight's entry is zero and that is not a hole: its extents are the
+    /// checkpoint's and a statement does not restate them. `driver-wgpu`
+    /// carries the lowering's `Arg` slice itself and reads the same number off
+    /// it; the shape here is a projection of that, because this driver's
+    /// `Handles` is built from `Bound`s rather than from `Arg`s.
+    widths: &'h [i32],
     /// The statement's own scalar run.
     params: &'h [Option<u32>],
     /// What answers for the things the STATEMENT does not carry: a fire's
@@ -231,6 +250,7 @@ impl<'a, 'h> Handles<'a, 'h> {
     #[must_use]
     pub fn new(
         args: &'h [Bound<'a>],
+        widths: &'h [i32],
         ins: &'h [usize],
         outs: &'h [usize],
         weights: &'h [usize],
@@ -246,6 +266,7 @@ impl<'a, 'h> Handles<'a, 'h> {
             outs,
             weights,
             args,
+            widths,
             params,
             resolver,
         }
@@ -313,6 +334,42 @@ impl<'a, 'h> Handles<'a, 'h> {
     pub fn weight(&mut self, i: usize) -> Result<u32, Refusal> {
         let at = self.weights.get(i).copied();
         self.pick(at, "a weight the statement does not name")
+    }
+
+    /// Elements per row of the statement's `i`-th INPUT.
+    ///
+    /// Asked beside [`Self::input`] rather than instead of it: a `Tensor<E>`
+    /// mark is a handle AND a rectangle, so the shared binder puts both
+    /// questions to a backend. See [`Handles::widths`] for what answering only
+    /// the first one cost.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Absent`] when the statement carries no such input, the same
+    /// refusal [`Self::input`] gives for the same index.
+    pub fn in_width(&self, i: usize) -> Result<i32, Refusal> {
+        self.width_at(
+            self.ins.get(i).copied(),
+            "an input the statement does not carry",
+        )
+    }
+
+    /// The same, for the statement's `i`-th RESULT. See [`Self::in_width`].
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Absent`] when the statement declares no such result.
+    pub fn out_width(&self, i: usize) -> Result<i32, Refusal> {
+        self.width_at(
+            self.outs.get(i).copied(),
+            "a result the statement does not carry",
+        )
+    }
+
+    /// One operand's row width, by its place in the launch's arguments.
+    fn width_at(&self, at: Option<usize>, what: &'static str) -> Result<i32, Refusal> {
+        let at = at.ok_or(Refusal::Absent { what })?;
+        self.widths.get(at).copied().ok_or(Refusal::Absent { what })
     }
 
     /// One of the FIRE's tables: the token ids, the positions, the sampled
@@ -591,26 +648,30 @@ pub fn split(args: &[Arg], results: usize) -> (Vec<usize>, Vec<usize>, Vec<usize
 
 /// How many of a routine's WRITABLE operands the STATEMENT supplies.
 ///
-/// [`split`]'s `results` is meant to be this number, and for ninety-eight
-/// routines it is exactly the count of writable types in the signature. For two
-/// it is not, and the difference is not cosmetic: it silently swallowed every
-/// paged decode.
+/// [`split`]'s `results` is meant to be this number, and it is exactly the
+/// count of writable types in the signature -- for all hundred of them.
+///
+/// # The two that used to be subtracted, and why they no longer are
 ///
 /// `attn::kv_append` and `attn::kv_append_paged` write the KV cache, and the
-/// cache is not an operand the trace carries -- the arm draws it from the POOL
-/// with [`Handles::kv`]. The rows that used to state these two said so, by
-/// naming `Source::KvKeys` and `Source::KvValues` where every other result
-/// named `Out(n)`, so the table path counted ZERO outputs for them. The
-/// routine signature cannot say it: `Provenance` distinguishes `Trace` from
-/// `Env` and a writable operand the driver supplies is neither.
+/// cache is not an operand the trace carries: the body draws it from the POOL.
+/// While that draw was a MARK, the pair's signatures counted two writable
+/// types the statement does not supply, and this function subtracted two to
+/// get back to the statement's own count.
 ///
-/// So it is stated here, which is the same place the row's `Source` column
-/// lived -- driver-side, beside the arm that does the drawing.
+/// Both bodies ask for the cache now -- `ctx.ask::<_, keys::KvKeys>()`, which
+/// is a fact and not an argument -- so neither signature has a writable type
+/// in it at all. The subtraction was left in place across that move and was
+/// then taking two from ZERO: `attempt to subtract with overflow`, on the
+/// driver lane, at the first `kv_append` of every fire. A debug build panicked
+/// and a release build would have wrapped to `usize::MAX`, which `split` clamps
+/// with `results.min(widthed.len())` -- so it would have handed BOTH inputs to
+/// `outs`, left `ins` empty, and refused `Absent` at `o.input(0)`. That is
+/// exactly the failure the subtraction was added to fix, arrived at from the
+/// other side.
 ///
-/// The failure this fixes: both statements carry two INPUTS and no output, so
-/// counting two results made [`split`] hand both inputs to `outs` and leave
-/// `ins` empty. `o.input(0)` then refused `Absent`, every `kv_append_paged`
-/// rectangle was unplannable, and thirty-seven device tests went red at once.
+/// `driver-wgpu`'s `results` is this function without the special case, and
+/// has been since its bodies started asking. There is no case left to state.
 ///
 /// # Why it asks [`kernels::Ty::binds`] rather than testing `Ty::BufMut`
 ///
@@ -621,19 +682,11 @@ pub fn split(args: &[Arg], results: usize) -> (Vec<usize>, Vec<usize>, Vec<usize
 /// been the second such case. The classification is `kernels`' to make, once.
 #[must_use]
 pub fn traced_results(routine: &kernels_vulkan::routine::Routine) -> usize {
-    let declared = routine
+    routine
         .args
         .iter()
         .filter(|ty| ty.binds() == kernels::Binds::Writes)
-        .count();
-    // Named by ROUTINE rather than by entrypoint, because the fact is about
-    // where the cache comes from and every instantiation of these two draws it
-    // the same way.
-    let from_the_pool = match routine.name {
-        "kv_append" | "kv_append_paged" => 2,
-        _ => 0,
-    };
-    declared - from_the_pool
+        .count()
 }
 
 // THE ARMS STOOD HERE: seventy-nine functions, one per crossed kernel,
@@ -1517,14 +1570,19 @@ mod tests {
         );
     }
 
-    /// The two routines whose results the POOL supplies are counted as taking
-    /// none from the statement.
+    /// The two routines whose results the POOL supplies STATE none.
     ///
-    /// The regression this pins: `traced_results` returning the raw `BufMut`
-    /// count made `split` hand `kv_append_paged`'s two INPUTS to `outs`, so
-    /// `o.input(0)` refused `Absent` and every paged decode was unplannable.
-    /// It is invisible in a signature -- both counts are two -- so it is
-    /// checked against the numbers rather than against the shape.
+    /// Both write the KV cache and neither takes it as an operand: the bodies
+    /// ask for it (`ctx.ask::<_, keys::KvKeys>()`), which is a fact and not an
+    /// argument, so there is no writable type in either signature to discount.
+    ///
+    /// The regression this pins is the discount that outlived the marks.
+    /// `traced_results` subtracted two for this pair on the grounds that their
+    /// signatures counted two writable buffers the statement does not supply;
+    /// after the draw became an ask, the count it subtracted from was ZERO and
+    /// the subtraction panicked the driver lane at the first `kv_append` of
+    /// every fire. Asserting the signature's own count is what makes the
+    /// discount's absence checkable rather than assumed.
     #[test]
     fn a_result_the_pool_supplies_is_not_a_result_the_statement_carries() {
         for name in ["kv_append", "kv_append_paged"] {
@@ -1538,8 +1596,8 @@ mod tests {
                     .iter()
                     .filter(|ty| ty.binds() == kernels::Binds::Writes)
                     .count(),
-                2,
-                "`{name}` states two mutable buffers"
+                0,
+                "`{name}` asks for both cache planes, so it states no mutable buffer"
             );
             assert_eq!(
                 traced_results(r),
@@ -1549,16 +1607,15 @@ mod tests {
         }
     }
 
-    /// Every OTHER routine takes its results from the statement.
+    /// EVERY routine takes its results from the statement.
     ///
-    /// The exception list is a list, so it can grow silently wrong. This says
-    /// the exceptions are the only exceptions.
+    /// There is no exception list any more, and that is the claim: a discount
+    /// naming routines by name is a list that can grow silently wrong, and the
+    /// one this crate carried did -- it kept subtracting after the routines it
+    /// named stopped stating what it subtracted.
     #[test]
-    fn every_other_routines_results_are_the_ones_it_declares() {
+    fn every_routines_results_are_the_ones_it_declares() {
         for r in kernels_vulkan::routines() {
-            if matches!(r.name, "kv_append" | "kv_append_paged") {
-                continue;
-            }
             let declared = r
                 .args
                 .iter()
@@ -1567,7 +1624,7 @@ mod tests {
             assert_eq!(
                 traced_results(r),
                 declared,
-                "`{}` is not on the exception list and must be counted whole",
+                "`{}` must be counted whole",
                 r.name
             );
         }

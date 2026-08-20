@@ -7,7 +7,9 @@
 use crate::codegen::error::{EmitError, RegionForm, ValueLayoutSite};
 use crate::codegen::wellformed::{ops_valid, region_ranges_valid, value_types_valid};
 
-use crate::plan::{CompiledStage, Region, RegionKind, ScheduleTemplate, library_op_for_tag};
+use crate::plan::{
+    CompiledStage, LibraryOp, Region, RegionKind, library_op_for_tag,
+};
 use tensor_ir::op::Op;
 use tensor_ir::registry::Stage;
 use tensor_ir::types::DType;
@@ -95,12 +97,42 @@ pub fn second_party_region_supported(stage: &CompiledStage, region: &Region) -> 
 /// everything emission refuses has to be refused here too — a region that
 /// passes analysis and then fails emission reaches the driver as an error
 /// kernel instead of a tier-0 fallback.
+///
+/// A `RegionKind::Library` region is NOT refused for being one. `Library` says
+/// the plan RECOGNIZED a dataflow a backend may have a kernel for, not that
+/// every backend has it: Metal's `grouped_library` returns `None` for the ones
+/// it has not written and falls through to its generated emitter, and this
+/// backend has written none at all. Refusing them here emitted nothing for the
+/// region, the driver read `Slot::Refused` as "the host declined on purpose"
+/// and skipped it, and the sampler's whole chain silently never ran — every
+/// nonzero temperature published token 0. What actually decides emittability is
+/// the per-node check below, which is unchanged: a multi-op lift like
+/// `NucleusSample` wraps ordinary ops and emits, while a single-op lift wraps
+/// the library op itself and still does not. `.wiki/migration.md` §11.21.
 pub fn validate_generated_region(stage: &CompiledStage, region: &Region) -> Result<(), EmitError> {
-    if matches!(region.kind, RegionKind::Library(_))
-        || region.schedule == ScheduleTemplate::Library
-        || region.nodes.is_empty()
-    {
+    if region.nodes.is_empty() {
         return Err(EmitError::FusedRequiresGeneratedRegion);
+    }
+    // A library CLAIM still has to be true. Nothing downstream re-derives it —
+    // a backend that owns the kernel takes the plan's word — so a generated
+    // region relabelled `Library(Scan)` would be emitted here as the ordinary
+    // ops it holds and launched there as a scan over them. The single-op lifts
+    // are a tag lookup; `NucleusSample` is the one multi-op lift, and its
+    // arity is what `compile::nucleus` builds (13 nodes, and the plain
+    // `[logits, top_p, state]` or the temperature-folded five).
+    if let RegionKind::Library(claimed) = region.kind {
+        let honest = if claimed == LibraryOp::NucleusSample {
+            region.nodes.len() == 13
+                && (region.inputs.len() == 3 || region.inputs.len() == 5)
+                && region.outputs.len() == 1
+        } else {
+            region.nodes.len() == 1
+                && library_op_for_tag(stage.normalized.ops[region.nodes[0].index()].tag())
+                    == Some(claimed)
+        };
+        if !honest {
+            return Err(EmitError::FusedRequiresGeneratedRegion);
+        }
     }
     value_types_valid(stage)?;
     ops_valid(stage, ValueLayoutSite::CudaFusedStage)?;

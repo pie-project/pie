@@ -326,12 +326,29 @@ fn per_head_row_rotating(
 pub fn rms_rope(
     ctx: &Ctx<'_>,
     x: InOut<Tensor<bf16>>,
-    w: Const<Tensor<bf16>>,
-    rotary: Const<i32>) -> Result<(), Refusal> {
+    w: Const<Tensor<bf16>>) -> Result<(), Refusal> {
     let params = ctx.params()?;
     let position = ctx.ask::<Tensor<i32>, keys::Positions>()?;
-    let axis = x.width;
-    let row_pitch = x.width;
+    // THE STRUCT'S OWN FIELDS, BY INDEX, and that is what this routine has
+    // instead of marks. The body forwards `ctx.params()` whole, so the run is
+    // `RmsRopeParams` read by FIELD -- and a `Const<i32>` mark is derived onto
+    // the run by the order the marks appear, which put the one this routine
+    // used to declare on `params[0]`. That word is `eps`, so the rotary width
+    // this grid was built from was a float's bit pattern: `Narrow { what:
+    // "rotary", at: 897988541 }` at the first q-norm of every fire.
+    //
+    // `axis` and `row_pitch` were read off the rectangle instead, which is the
+    // same mistake in the other direction. They are equal only when a row
+    // holds ONE norm, and this kernel exists for the case where it does not:
+    // qwen3 norms 16 heads of 128 across a 2048-wide row, and `x.width` for
+    // both terms made `heads` exactly 1 -- fifteen heads left unnormed and
+    // unrotated, with the dispatch reporting success.
+    //
+    // `Ctx::param` is the sanctioned way to reach past the marks, and its doc
+    // names this exact case: one run serving two readers, the other a struct.
+    let axis = ctx.param(1)?;
+    let row_pitch = ctx.param(5)?;
+    let rotary = ctx.param(6)?;
     let rows = ctx.ask::<i32, keys::Rows>()?;
     // The head count is `row_pitch / axis` and BOTH terms are read off the
     // params run rather than one off the run and one off the rectangle. They
@@ -340,7 +357,7 @@ pub fn rms_rope(
     // indexing by one and a launch sized by the other.
     let heads = if axis > 0 { row_pitch / axis } else { 0 };
     ctx.fire(
-        Fire::at(crate::routine::module_path("rms_rope_bfloat16", ctx.best()), "rms_rope_bfloat16").apply(per_head_row_rotating(heads, rows, *rotary, axis)?),
+        Fire::at(crate::routine::module_path("rms_rope_bfloat16", ctx.best()), "rms_rope_bfloat16").apply(per_head_row_rotating(heads, rows, rotary, axis)?),
         // Four operands and NO scalars. Everything this kernel takes rides
         // the block, which `driver-vulkan`'s `encode` mints as the
         // statement's whole params run -- so the nine fields of
