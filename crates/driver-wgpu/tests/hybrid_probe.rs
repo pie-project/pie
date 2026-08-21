@@ -8330,7 +8330,10 @@ fn whether_the_logits_are_the_readout_of_the_state_the_fire_produced() {
                 arenas.push((*at, *width as usize * *bytes as usize));
             }
             Arg::Weight(n) => weights.push(n.clone()),
-            Arg::Named { .. } => {}
+            // Neither is a RECTANGLE this probe can read back: a named
+            // value is bound by the backend rather than placed in the arena,
+            // and a raise is a host aggregate with no row width at all.
+            Arg::Named { .. } | Arg::Raised { .. } => {}
         }
     }
     println!(
@@ -9443,7 +9446,10 @@ fn whether_the_tied_readout_ranks_the_same_at_four_bits_and_at_sixteen() {
         match a {
             Arg::Arena { at, width, bytes } => arenas.push((*at, *width as usize * *bytes as usize)),
             Arg::Weight(n) => weights.push(n.clone()),
-            Arg::Named { .. } => {}
+            // Neither is a RECTANGLE this probe can read back: a named
+            // value is bound by the backend rather than placed in the arena,
+            // and a raise is a host aggregate with no row width at all.
+            Arg::Named { .. } | Arg::Raised { .. } => {}
         }
     }
     let (Some((o, stride)), Some(stem)) = (arenas.first().copied(), weights.first().cloned()) else {
@@ -9741,9 +9747,13 @@ fn whether_the_rotation_turns_the_dimensions_it_is_supposed_to() {
 
 /// WHICH FOLD THE FINAL NORM APPLIES, AND WHICH ONE THIS CHECKPOINT WANTS.
 ///
-/// `Qwen35HybridFacts::qwen3_5_0_8b` states `norm_variant: NormVariant::Gemma`,
-/// and Gemma's RMSNorm is not the usual one: it scales by `1 + w` rather than
-/// by `w`. That difference is invisible to every check in this file.
+/// Gemma's RMSNorm is not the usual one: it scales by `1 + w` rather than by
+/// `w`. `Qwen35HybridFacts::qwen3_5_0_8b` USED to state `NormVariant::Gemma`
+/// and now states `Plain` -- `model/src/qwen_3_5/spec.rs` gives the evidence
+/// on both sides -- so this test's job is unchanged and its expected answer is
+/// not: it measures which fold the device applied, whichever one the facts
+/// currently ask for. That difference is invisible to every other check in
+/// this file.
 /// `whether_the_logits_are_the_readout_of_the_state_the_fire_produced` starts
 /// FROM the normalized state and asks whether the readout of it is right, so a
 /// state normalized the wrong way is not a disagreement there -- it is a
@@ -9808,7 +9818,10 @@ fn which_fold_the_final_norm_applies_and_what_each_one_answers() {
         match x {
             Arg::Arena { at, width, bytes } => a.push((*at, *width as usize * *bytes as usize)),
             Arg::Weight(n) => w.push(n.clone()),
-            Arg::Named { .. } => {}
+            // Neither is a RECTANGLE this probe can read back: a named
+            // value is bound by the backend rather than placed in the arena,
+            // and a raise is a host aggregate with no row width at all.
+            Arg::Named { .. } | Arg::Raised { .. } => {}
         }
     }
     let ([(in_at, in_w), (out_at, out_w)], [stem]) = (a[..].try_into().unwrap_or([(0, 0); 2]), &w[..])
@@ -10089,8 +10102,23 @@ fn whether_the_instruct_checkpoint_leaves_the_whitespace_basin_too() {
 /// This one needs neither. `rms_norm_gain` packs `RmsParams` field for field --
 /// `eps, axis_size, w_stride, plus_one, gain` -- into the launch's `params`,
 /// so the fold is a NUMBER in the traced plan and can be read straight out of
-/// it. Reverting `Ctx::norm` to `NormVariant::Plain` turns every one of these
-/// to zero, and this test says so in under a second.
+/// it, in under a second.
+///
+/// # It pins the EQUIVALENCE, not the fold
+///
+/// The first draft asserted `NormVariant::Gemma` and `plus_one == 1` outright,
+/// and went red when `Qwen35HybridFacts::qwen3_5_0_8b` moved to `Plain` -- see
+/// `model/src/qwen_3_5/spec.rs`, which says the `Gemma` reading rested on
+/// `qwen3_5_forward.cpp` launching `rmsnorm_gemma_bf16` with no 0.8B staged to
+/// check it, while the two measurable Qwen3.6 checkpoints and `mlx_lm`'s
+/// `nn.RMSNorm` for the whole family say plain.
+///
+/// A test that has to be edited every time that reading is revisited is a test
+/// that will be edited WITHOUT being thought about. So it asserts the thing
+/// that is true either way: whatever the facts state, every `rms_single_row`
+/// in the plan states the SAME, and no statement disagrees with its
+/// neighbours. A `Ctx::norm` that ignored the facts, or folded some norms and
+/// not others, fails this whichever variant is the right one.
 ///
 /// It also pins the split, which is the part an argument would get wrong: the
 /// gated-DeltaNet's output gain is genuinely plain and does NOT come through
@@ -10101,12 +10129,10 @@ fn whether_the_instruct_checkpoint_leaves_the_whitespace_basin_too() {
 #[test]
 fn every_norm_in_the_plan_folds_the_way_the_facts_state() {
     let facts = Qwen35HybridFacts::qwen3_5_0_8b();
-    assert_eq!(
-        facts.norm_variant,
-        model_ir::trace::NormVariant::Gemma,
-        "the fixture itself changed; this test pins the PLAN against the facts, \
-         so decide which is right before making them agree"
-    );
+    let want = match facts.norm_variant {
+        model_ir::trace::NormVariant::Gemma => 1,
+        model_ir::trace::NormVariant::Plain => 0,
+    };
     let plan = hybrid_plan(&facts);
     // `RmsParams`: eps, axis_size, w_stride, plus_one, gain.
     const PLUS_ONE: usize = 3;
@@ -10124,13 +10150,15 @@ fn every_norm_in_the_plan_folds_the_way_the_facts_state() {
         }
         let name = weights.first().cloned().unwrap_or_default();
         match params.get(PLUS_ONE) {
-            Some(1) => folded += 1,
+            Some(got) if *got == want => folded += 1,
             other => plain.push((name, *other.unwrap_or(&u32::MAX))),
         }
     }
     println!(
-        "\n  {folded} `rms_single_row` statements fold as gemma, {} do not, \
-         and {gated} `gated_rms` statements are plain by construction",
+        "\n  the facts state {:?}, so `plus_one` should be {want} everywhere: \
+         {folded} `rms_single_row` statements agree, {} do not, and {gated} \
+         `gated_rms` statements are plain by construction",
+        facts.norm_variant,
         plain.len()
     );
     for (name, got) in plain.iter().take(8) {
@@ -10138,10 +10166,11 @@ fn every_norm_in_the_plan_folds_the_way_the_facts_state() {
     }
     assert!(
         plain.is_empty(),
-        "{} norm statements do not fold: {:?}. `Qwen35HybridFacts` states \
-         `NormVariant::Gemma` and this checkpoint's gains are trained from zero, \
-         so multiplying by `w` directly makes the model answer a space to every \
-         prompt.",
+        "{} norm statements disagree with the facts they were lowered from: \
+         {:?}. The variant is a property of the CHECKPOINT, so a plan that \
+         folds some of its norms and not others is wrong under either reading \
+         -- and if the gains are trained from zero, the ones that do not fold \
+         multiply by `w` directly and answer a space to every prompt.",
         plain.len(),
         &plain[..plain.len().min(8)]
     );
@@ -10967,6 +10996,13 @@ fn what_carrying_the_convolution_windows_back_costs() {
 /// Both readings are kept because the first one is what the three numbers
 /// suggest and the fourth is what refutes it. Anyone reaching for fusion
 /// should benchmark the fused core first.
+///
+/// RETIRED WITH `kernels-wgpu`'s TEST TREE. That name is a record of a
+/// measurement now, not a live proof: the crate lost `tests/` and every
+/// in-file `mod tests` when the three shader planes moved their numbers to
+/// the fire that reads them, and nothing in this workspace re-runs it. What
+/// it reported is still why the sentence above says what it says; what is
+/// gone is the thing that would notice if it stopped being true.
 #[test]
 #[ignore = "times a real checkpoint; run explicitly"]
 fn whether_a_decode_costs_by_the_fire_or_by_the_launch() {

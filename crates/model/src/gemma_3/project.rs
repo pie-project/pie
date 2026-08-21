@@ -637,6 +637,7 @@ mod tests {
     fn binding() -> MetalBinding {
         MetalBinding {
             qmm_partial_rows: false,
+            qmm_fp16_precast: true,
             qmm_tile: None,
             quant_group: 64,
             quant_bits: 4,
@@ -734,6 +735,7 @@ mod tests {
         let f = shape();
         let b = MetalBinding {
             qmm_partial_rows: false,
+            qmm_fp16_precast: true,
             qmm_tile: None,
             quant_group: 128,
             quant_bits: 8,

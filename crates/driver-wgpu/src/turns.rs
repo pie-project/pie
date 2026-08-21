@@ -425,6 +425,13 @@ pub struct Serving<'a> {
     /// Run it where one exists; it is the last thing owed on this change. Note the matvec is FLAT to four rows —
     /// one workgroup carries `PIE_MT = 4` of them and reads the weights once
     /// — and rises with the row groups after.
+    ///
+    /// RETIRED WITH `kernels-wgpu`'s TEST TREE. That name is a record of a
+    /// measurement now, not a live proof: the crate lost `tests/` and every
+    /// in-file `mod tests` when the three shader planes moved their numbers to
+    /// the fire that reads them, and nothing in this workspace re-runs it. What
+    /// it reported is still why the sentence above says what it says; what is
+    /// gone is the thing that would notice if it stopped being true.
     pub prefill: &'a ForwardPlan,
     /// The model's shape, for the launch rules that need it.
     pub geometry: Geometry,
@@ -753,6 +760,36 @@ impl Serving<'_> {
         // starting without the isolated bench wired up to confirm it, and
         // NOT reachable from inside `driver-wgpu` alone, which is what the
         // earlier "the next lever is fusion" line failed to say.
+        //
+        // # THE BENCH THIS ASKED FOR NOW EXISTS, AND HERE IS THE PRICE LIST
+        //
+        // `what_a_decode_costs_at_length` steps `Fire::prefix` across the
+        // whole plan and reads a straight line: a 512-key qwen3-0.6b decode on
+        // an Apple M4 Pro is 480 rectangles and 9.665 ms, against 0.276 ms for
+        // a fire that records none of them. **19.6 microseconds a rectangle,
+        // and the number does not vary with what the rectangle computes** --
+        // every block of thirty costs 0.45 to 0.75 ms wherever it sits, and no
+        // rectangle in a layer stands out. The same test's prefill sibling is
+        // 984 microseconds a rectangle, which is what a rectangle doing work
+        // looks like.
+        //
+        // So a fused pair keeps its arithmetic and saves only the FLOOR, which
+        // the split-K note prices at ~13 us of that 19.6. At 28 layers:
+        //
+        // ```text
+        //   fusion            rects/layer   removed    saved      of 9.665 ms
+        //   q||k||v                     2        56   0.73 ms           7.5 %
+        //   gate||up                    1        28   0.36 ms           3.8 %
+        //   rope q + rope k             2        56   0.73 ms           7.5 %
+        //   rmsnorm into its qmv        2        56   0.73 ms           7.5 %
+        //   ------------------------------------------------------------------
+        //   all four                    7       196   2.55 ms          26.4 %
+        // ```
+        //
+        // 99.8 tok/s becomes about 135. That is the honest size of the whole
+        // fusion program on this machine, and no single one of them is worth
+        // an afternoon on its own -- which is the thing the list above could
+        // not say before there was a bench.
         //
         // And not this threshold. Moving it only trades one bad regime for
         // the other: below 4 rows a step is qmv with three quarters of its

@@ -1573,6 +1573,63 @@ mod tests {
         );
     }
 
+    /// The second point a routine states is a point this build can read.
+    ///
+    /// # Why the refusal exists at all
+    ///
+    /// A `Stated` names the entrypoint its dispatch fires, and for every
+    /// routine but one that name IS the plan's symbol — the shell already
+    /// reflected it, so binding needs no lookup. The split decode broke that:
+    /// `sdpa_paged_decode` states a `_split_` pass and a `_merge_` pass, and
+    /// the merge's uniform block is not the split's. Binding the second pass
+    /// against the first one's declaration is how an extra scalar landed four
+    /// bytes past the end of a struct the two never shared, so `plan` now
+    /// reflects a second point by name — and a name it cannot read is
+    /// `Unplanned::NoPoint`.
+    ///
+    /// # What this asserts
+    ///
+    /// Both directions, because one alone proves nothing here. That the
+    /// refusal is NOT reachable for the point the tree actually states: if
+    /// the merge pass were misspelled, or left the table, or moved behind a
+    /// capability this reflection does not ask for, every split decode would
+    /// refuse at plan time and the message below is what a user would see.
+    /// And that it IS raised, and names the point, for a spelling no text
+    /// states — the same `map_err` the planner runs, so a refusal that
+    /// stopped carrying its point would show up as an empty name.
+    #[test]
+    fn a_second_point_a_routine_states_is_one_this_build_can_read() {
+        let merge = "sdpa_paged_decode_merge_bfloat16_d_128";
+        crate::reflect::point(merge).unwrap_or_else(|why| {
+            panic!(
+                "`{merge}` is the split decode's second pass and this build \
+                 cannot read it: {why}. Every paged decode refuses at plan \
+                 time in that state"
+            )
+        });
+
+        // And the other direction, through the planner's own conversion
+        // rather than by constructing the variant, so the point travels the
+        // way it travels there.
+        let absent = "sdpa_paged_decode_merge_bfloat16_d_129";
+        let refusal = crate::reflect::point(absent)
+            .map_err(|why| Unplanned::NoPoint {
+                point: absent,
+                why: why.to_string(),
+            })
+            .expect_err("a point no text states is unreadable");
+        assert!(
+            matches!(refusal, Unplanned::NoPoint { point, .. } if point == absent),
+            "an unreadable point refuses as something other than `NoPoint`, \
+             or under a different name: {refusal}"
+        );
+        assert!(
+            refusal.to_string().contains(absent),
+            "the refusal does not name the point it could not read, which is \
+             the only thing that makes it actionable: {refusal}"
+        );
+    }
+
     fn sample_launch() -> Launch {
         Launch {
             kernel: 0,

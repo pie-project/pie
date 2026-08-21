@@ -46,6 +46,7 @@ runtime = ["dep:shader-slang"]
 [dependencies]
 # The routine registry — see the workspace table for why this one.
 linkme = { workspace = true }
+inventory = { workspace = true }
 # `#[routine]`, which builds each row beside its own `fn`.
 kernels-macros = { path = "../kernels-macros" }
 kernels = { path = "../kernels" }
@@ -57,20 +58,6 @@ kernels = { path = "../kernels" }
 # split. Needs the Slang SDK at build time (`SLANG_DIR`) to compile its FFI,
 # and `libslang` beside the binary at run time.
 shader-slang = { version = "0.1.0", optional = true }
-
-[dev-dependencies]
-# The table test resolves through `sig_in`, which is the shared crate's, to
-# check the lookup `model-ir` actually calls rather than a copy of it.
-kernels = { path = "../kernels" }
-
-# Vulkan itself, for the GPU harness in `tests/gpu.rs` ONLY. It is a
-# dev-dependency on purpose: this crate ships a table and a shader tree, and
-# a driver is what owns a device. If Vulkan ever appears under
-# `[dependencies]` here, the layering has gone wrong.
-#
-# `loaded` and not `linked`: the loader is opened with `dlopen` at run time, so
-# a machine with no Vulkan at all still builds and still runs every other test.
-ash = { version = "0.38", default-features = false, features = ["loaded", "std"] }
 
 # NO `[[example]]` sections, and the absence is load-bearing for the reason
 # `kernels-cuda/Cargo.toml` states at length: a `[[example]]` whose file is

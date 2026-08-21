@@ -241,15 +241,32 @@ fn o_base_for(row: u32, q_head: u32, n_q_heads: u32) -> u32 {
 //#endif
 }
 
-fn dot_page(q_base: u32, page_base: u32, kv_head: i32, kp: i32) -> f32 {
-    let slot = page_slot_at(page_base, kp);
-    let k_base = (slot * u32(params.n_kv_heads) + u32(kv_head)) * PIE_HEAD_DIM;
+fn dot_row(q_base: u32, k_base: u32) -> f32 {
     var acc = 0.0;
-    for (var d = 0u; d < PIE_HEAD_DIM; d = d + 1u) {
-        // Scale per term, where `kernels-metal` and `kernels-vulkan` put it.
-        // Hoisting it out of the loop is a different rounding, and a parity
-        // walk between backends compares numbers.
-        acc = acc + params.scale * q_at(q_base + d) * k_at(k_base + d);
+    // A WORD at a time, which is two channels, and NOT a different sum.
+    //
+    // `q_at(i)` and `k_at(i)` each load `buf[i >> 1]` and then select a half,
+    // so a scalar loop over `PIE_HEAD_DIM` issues two loads per channel and
+    // loads every word TWICE -- 512 loads at `d_128` where 128 would do. Both
+    // bases are a multiple of `PIE_HEAD_DIM` and that is even, so a word is
+    // exactly two consecutive channels of one row and the halves are the even
+    // and odd channel in that order.
+    //
+    // The two multiply-adds below are kept as two SEPARATE `acc = acc + ...`
+    // statements in the original order. Folding them into one expression
+    // would associate the pair before the running sum, which is a different
+    // f32 rounding, and this kernel's answers are walked against
+    // `kernels-metal` and `kernels-vulkan` NUMBER BY NUMBER. The scale stays
+    // per term for the same reason -- hoisting it out is also a rounding.
+    let q_word = q_base >> 1u;
+    let k_word = k_base >> 1u;
+    for (var w = 0u; w < PIE_PAIRS; w = w + 1u) {
+        let q = queries[q_word + w];
+        let k = k_pages[k_word + w];
+        acc = acc + params.scale
+            * pie_bf16_to_f32(q & 0xffffu) * pie_bf16_to_f32(k & 0xffffu);
+        acc = acc + params.scale
+            * pie_bf16_to_f32(q >> 16u) * pie_bf16_to_f32(k >> 16u);
     }
     return acc;
 }
@@ -468,6 +485,29 @@ fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32, sp: u32
     var acc = vec2<f32>(0.0, 0.0);
     // Loop-invariant, and it was the first of two dependent loads per key.
     let page_base = kv_page_indptr[u32(req)];
+    // AND IT BOUGHT NOTHING MEASURABLE HERE, which is worth writing down.
+    //
+    // The same three edits on the TILED arm took a 512-row prefill from 571 ms
+    // to 445. On this arm, `what_a_decode_costs_at_length` reads 10.092 ms
+    // before and 10.017 ms after, one sitting -- under 1%, which is this
+    // harness's noise. The reason is that a decode at 512 keys is not this
+    // kernel: one row against 512 keys is a thousandth of the prefill's key
+    // work, while the 196 projection dispatches and the per-fire cost are
+    // unchanged. It is kept because it is strictly fewer loads for identical
+    // answers, and because the decode's share of the token GROWS with the
+    // context -- the note above measures exactly that at 2048 -- but nobody
+    // should expect a number from it at 512.
+    //
+    // THIS LANE'S TWO QUERY CHANNELS, ONCE.
+    //
+    // `d_out` is `lane * 2` and `q_base` is a multiple of `PIE_HEAD_DIM`, so
+    // this pair is one word and the lane needs the same word for every key it
+    // ever touches. It was re-read inside the key loop, twice -- `q_at` loads
+    // `queries[i >> 1]` and selects a half, so a pair is two loads of one
+    // word -- which is `2 * keys` loads of a value that does not change.
+    let q_word = queries[(q_base + d_out) >> 1u];
+    let q_lo = pie_bf16_to_f32(q_word & 0xffffu);
+    let q_hi = pie_bf16_to_f32(q_word >> 16u);
     // ONE TREE FOR PIE_KB KEYS.
     //
     // The note above records this as measured and rejected -- 1.601 ms against
@@ -511,9 +551,16 @@ fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32, sp: u32
             if (i32(q) < kn) {
                 let slot = page_slot_at(page_base, kp0 + i32(q));
                 let k_base = (slot * u32(params.n_kv_heads) + u32(kv_head)) * PIE_HEAD_DIM;
-                v_pair = vec2<f32>(v_at(k_base + d_out), v_at(k_base + d_out + 1u));
-                part = params.scale * q_at(q_base + d_out) * k_at(k_base + d_out)
-                    + params.scale * q_at(q_base + d_out + 1u) * k_at(k_base + d_out + 1u);
+                // ONE word each, where this was six loads for three words.
+                // The two products and their sum are associated exactly as
+                // the scalar form associated them, so no answer moves.
+                let at = (k_base + d_out) >> 1u;
+                let v_word = v_pages[at];
+                let k_word = k_pages[at];
+                v_pair = vec2<f32>(
+                    pie_bf16_to_f32(v_word & 0xffffu), pie_bf16_to_f32(v_word >> 16u));
+                part = params.scale * q_lo * pie_bf16_to_f32(k_word & 0xffffu)
+                    + params.scale * q_hi * pie_bf16_to_f32(k_word >> 16u);
             }
             v_keep[r] = v_pair;
             pie_sdpa_part[q * PIE_PAIRS + lane] = part;
@@ -624,9 +671,77 @@ fn decode_row(row: u32, q_head: u32, lane: u32, ky: u32, n_q_heads: u32, sp: u32
 
 // How many output pairs one x-lane of a tile owns.
 //
-// The tile is 32 lanes wide on x and a row has `PIE_PAIRS` pairs, so a lane
-// takes every 32nd one: 1 at `d_64`, 2 at `d_128`, 4 at `d_256`, 8 at `d_512`.
-const PIE_LANE_PAIRS: u32 = PIE_PAIRS / 32u;
+// LANES PER ROW, on the channel axis: a row has `PIE_PAIRS` pairs and a lane
+// takes every `PIE_TX`th one. Every one of them walks the whole key
+// history and every one of them computes the SAME `dot_page`, so this number
+// is the redundancy factor on the dot -- and the dot is 128 multiply-adds a
+// key at `d_128` against the two the accumulator costs.
+//
+// It was 32 by inheritance: the group is `(32, 8)` because 32 is a subgroup
+// and 8 is what 256 invocations leave. Nothing about the arithmetic wanted
+// it. Lowering it trades registers for that redundancy -- a lane holds
+// `PIE_LANE_PAIRS` `vec2<f32>` accumulators, so halving the lanes doubles
+// them -- and the trade is decided by measurement, not by counting.
+//
+// The row axis stays 32 wide whatever this is: the TILE is 32 rows, which the
+// `rr < 32u` sweep below and the host's `ceil(n_rows / 32)` in y both state,
+// and it does not move with the lane extents. `PIE_TX * PIE_TY <= 256` and
+// `PIE_TY <= 32` together bound this from below at 8 while the group stays
+// full; below that the group is smaller than 256, which is legal and which
+// the sweep covers.
+//
+// Swept at 512 prefill rows of qwen3-0.6b, Apple M4 Pro, `--release`, one
+// sitting, `what_a_prefill_costs_at_length` (see `driver-wgpu/tests/serving.rs`):
+//
+// ```text
+//   PIE_TX      ms     tok/s
+//       32    3037       169
+//       16    1665       307
+//        8    1028       498
+//        4     750       683
+//        2     571       897
+//        1     595       860
+// ```
+//
+// Re-taken after `dot_page` went word-at-a-time, which halved that loop's
+// loads and moved the whole curve: 1 and 2 now READ THE SAME, 445 ms against
+// 541 at 4. 2 is kept because it is the optimum on both sweeps and because
+// the tie at 1 is a tie rather than a win.
+//
+// Monotone from 32 down to 2 and then back up, which is what a redundancy
+// traded against a register file should look like: every halving of the lanes
+// halves the `dot_page` work and doubles `PIE_LANE_PAIRS`, and at 1 the
+// accumulator finally costs more than the dot it saved. **5.3x**, and the
+// per-row cost turns from rising to flat.
+//
+// EVERY CELL BUT `32` AND `2` IN THE FIRST VERSION OF THIS TABLE WAS AN
+// ARTEFACT, and the artefact read 1623 tok/s -- nearly twice the real
+// optimum -- so it is worth stating how. `apply` hands a `Fire` LANES and the
+// `Fire` divides by the module's own `@workgroup_size`; `kernels-wgpu`'s
+// `tiled_lanes` is a SECOND copy of the arithmetic below and it was not moved
+// with it. A host saying 2 against a shader saying 8 asks for a quarter of
+// the query heads, so three quarters of the attention was never computed --
+// fast, and wrong, and only wrong in the heads. `arena`'s workgroup census is
+// what caught it (16,332,666 against 16,338,066) after
+// `the_tiled_gemm_answers...` had already failed at 216% of peak. The two
+// copies now agree by construction and the sweep above was re-taken with both
+// ends moved together; `32` reproduces the pre-existing 3037 ms exactly,
+// which is what says the new numbers are the same measurement.
+//
+// Derived from the head dim rather than flat, and the bound is the
+// ACCUMULATOR: a lane holds `PIE_LANE_PAIRS` `vec2<f32>` live across the
+// whole key loop, so this floors at 2 -- the measured optimum, and the whole
+// story at `d_64` and `d_128` -- and rises only once 32 pairs a lane would be
+// exceeded. That gives 2, 2, 8, 16 at `d_64`, `d_128`, `d_256`, `d_512`.
+// Only `d_128` is measured; the wider two are an extrapolation of the shape
+// above and the first Qwen-class checkpoint at `d_256` should re-take it.
+const PIE_TX: u32 = max(2u, PIE_PAIRS / 32u);
+// 32 rows is the most the group covers, and 256 invocations is the most
+// WebGPU guarantees; the smaller of the two wins. At `d_128` this is a
+// 64-invocation group, which is legal and which the sweep says is faster than
+// the full one it replaced.
+const PIE_TY: u32 = min(32u, 256u / PIE_TX);
+const PIE_LANE_PAIRS: u32 = PIE_PAIRS / PIE_TX;
 
 // Every pair one lane owns, over ONE walk of the keys.
 //
@@ -672,19 +787,71 @@ fn compute_lane(row: u32, q_head: u32, lane: u32, n_q_heads: u32) {
 
     // Loop-invariant, and it was the first of two dependent loads per key.
     let page_base = kv_page_indptr[u32(req)];
+    // THE PAGE, HELD ACROSS THE KEYS THAT SHARE IT.
+    //
+    // `page_slot_at` divides by the page size and then loads
+    // `kv_page_indices[page_base + page_ix]`, and that load's address depends
+    // on the loop variable, so it is a dependent round trip. It was made
+    // TWICE per key here -- once inside `dot_page` for the key row and once
+    // again below for the value row, which compute the SAME `slot` from the
+    // same arguments. This loop walks `kp` upward one at a time, so the page
+    // index changes once every `params.page_size` keys and the physical page
+    // is otherwise a constant: 2 divides and 2 dependent loads a key become
+    // one divide and, at a 32-entry page, one load every 32.
+    //
+    // K and V share the row: both `dot_page`'s `k_base` and the `v_row` below
+    // were `(slot * n_kv_heads + kv_head) * PIE_HEAD_DIM`, so it is computed
+    // once now and the dot takes the row rather than the position.
+    //
+    // **AND IT IS WORTH NOTHING MEASURABLE**, which is the second time this
+    // idea has been tried and the first time it has been priced properly.
+    // `what_a_prefill_costs_at_length` reads 445.0 ms before and 443.3 after,
+    // one sitting -- 0.4%, inside this harness's spread. The note in the
+    // decode arm above records the same finding from a single noisy sample
+    // and reverted on it; this keeps the change instead, because it is
+    // strictly fewer divides and fewer dependent loads for identical answers
+    // and because the reason it buys nothing is now known rather than
+    // guessed: the page table is a few hundred bytes and every one of the 32
+    // rows of every group walks it in the same order, so it is resident after
+    // the first row and the "dependent round trip" is an L1 hit.
+    //
+    // The lesson is about the model of the machine, not the code. What costs
+    // in this loop is Q and K streaming from GLOBAL, 256 keys x 64 words x
+    // two lanes a row with no reuse across the 32 rows of a group that all
+    // read the SAME keys. That is a workgroup-memory change, and it is the
+    // one thing left in here that is worth an afternoon.
+    var page_held = 0xffffffffu;
+    var page_phys = 0u;
     for (var kp = start; kp <= q_pos; kp = kp + 1) {
         if (!keeps(row, kp, q_pos, start)) { continue; }
+//#if defined(PIE_PAGE_SIZE) && PIE_PAGE_SIZE == 32
+        let page_ix = u32(kp) >> 5u;
+        let page_off = u32(kp) & 31u;
+        let page_len = 32u;
+//#else
+        let page_ix = u32(kp / params.page_size);
+        let page_off = u32(kp % params.page_size);
+        let page_len = u32(params.page_size);
+//#endif
+        if (page_ix != page_held) {
+            page_held = page_ix;
+            page_phys = kv_page_indices[page_base + page_ix];
+        }
+        let slot = page_phys * page_len + page_off;
+        let v_row = (slot * u32(params.n_kv_heads) + u32(kv_head)) * PIE_HEAD_DIM;
         // ONE dot for every pair this lane owns, which is the whole point.
-        let step = pie_sdpa_online_update(
-            dot_page(q_base, page_base, kv_head, kp), max_score, sum_exp);
+        let step = pie_sdpa_online_update(dot_row(q_base, v_row), max_score, sum_exp);
         max_score = step.max_score;
         sum_exp = step.sum_exp;
-        let slot = page_slot_at(page_base, kp);
-        let v_row = (slot * u32(params.n_kv_heads) + u32(kv_head)) * PIE_HEAD_DIM;
         for (var p = 0u; p < PIE_LANE_PAIRS; p = p + 1u) {
-            let d_out = (lane + p * 32u) * 2u;
+            let d_out = (lane + p * PIE_TX) * 2u;
+            // ONE load for the pair. `d_out` is even by construction, so both
+            // halves live in `v_pages[(v_row + d_out) >> 1]` and the two
+            // `v_at` calls this replaced fetched the same word twice.
+            let vw = v_pages[(v_row + d_out) >> 1u];
             acc[p] = acc[p] * step.history_scale
-                + step.score_scale * vec2<f32>(v_at(v_row + d_out), v_at(v_row + d_out + 1u));
+                + step.score_scale
+                    * vec2<f32>(pie_bf16_to_f32(vw & 0xffffu), pie_bf16_to_f32(vw >> 16u));
         }
     }
 //#if defined(PIE_WITH_SINK)
@@ -693,7 +860,7 @@ fn compute_lane(row: u32, q_head: u32, lane: u32, n_q_heads: u32) {
 //#endif
 
     for (var p = 0u; p < PIE_LANE_PAIRS; p = p + 1u) {
-        let d_out = (lane + p * 32u) * 2u;
+        let d_out = (lane + p * PIE_TX) * 2u;
         var norm = acc[p];
 //#if defined(PIE_WITH_SINK)
         norm = norm * merged.output_scale;
@@ -712,14 +879,14 @@ fn compute_lane(row: u32, q_head: u32, lane: u32, n_q_heads: u32) {
 // arithmetic -- `ceil(n_rows / 32)` in y -- exactly as `kernels-vulkan` states
 // it. Nothing in this arm barriers, so the `continue` below is a skip and not a
 // hang.
-@compute @workgroup_size(32, 8)
+@compute @workgroup_size(PIE_TX, PIE_TY)
 fn main(
     @builtin(workgroup_id) wg: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(num_workgroups) groups: vec3<u32>,
 ) {
     let q_head = wg.x;
-    for (var rr = lid.y; rr < 32u; rr = rr + 8u) {
+    for (var rr = lid.y; rr < 32u; rr = rr + PIE_TY) {
         let row = wg.y * 32u + rr;
         if (row >= u32(params.n_rows)) { continue; }
         compute_lane(row, q_head, lid.x, groups.x);

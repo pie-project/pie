@@ -933,15 +933,6 @@ fact!(/// The statement's zeroth scalar, read as a float.
 // / `Says` type-level arithmetic were six types and five markers between them;
 // each is one line here, and `Env<T, K>` reads all of them.
 
-fact!(/// Every scalar the statement carries, staged end to end and bound
-    /// as one buffer — what `Block<Buf>` used to spell.
-    ///
-    /// A NAME AND NOT A SHAPE: the block is the params CHANNEL, which is why
-    /// this is `Slot(Kind::Params, 0)` rather than a `Named`. `Env<Buf,
-    /// keys::Params>` says the binder supplies it AND which of the binder's
-    /// buffers it is, which is the whole of what the wrapper said.
-    Params = "params" => Source::Slot(crate::Kind::Params, 0) => *const u8);
-
 fact!(/// The optional operand this routine leaves ABSENT — `Null<T>`'s source.
     ///
     /// The one source that needs no resolver: the answer is the absence.
@@ -1053,6 +1044,275 @@ fact!(
     /// NOT [`SmScale`] and not [`RopeScale`]: this is a dequantiser's, and
     /// the three were all spelled `scale` at a param slot.
     DequantScale = "dequant.scale" => Source::Named("dequant.scale") => f32);
+
+// ── §M  THE DRIVER-OWNED PLANES A BARE POINTER USED TO SPELL ──────────────
+//
+// Every key below replaces a parameter that carried NO mark and therefore no
+// source: `bind()` refused each one with `Refusal::Unstated { what: "an
+// argument whose signature does not say where it comes from" }`, and the
+// signature was the thing that did not say.
+//
+// A MARK WAS THE WRONG REPAIR FOR ALL OF THEM, and `moe.rs`'s own note on the
+// six batched-GEMM pointer arrays is the reason: *"Driver-owned workspace, not
+// trace values [...] declaring them as results would free them (liveness) too
+// early."* An `Out` mark is a claim the ALLOCATOR reads, so marking a buffer
+// the driver carved and a LATER statement still reads shortens its life to one
+// fire. These are asked for instead, which states where the value comes from
+// without claiming the trace owns it.
+
+// ── The MoE legs' driver workspace ──
+//
+// Two builders fill these — `moe::build_moe_ptrs_aligned_bf16` and the
+// nemotron pair in `ssm.rs` — and `moe::moe_grouped_gemm_bf16` reads them back
+// from inside its own body, one statement later. That gap is the liveness the
+// note above is about.
+
+fact!(/// The per-expert UP/GATE weight pointer table, host-filled.
+    ///
+    /// A table and not a bank: `WeightExpertPtrs` is the same shape for a
+    /// routed matmul that names one, and nemotron needs two.
+    MoeUpWeightPtrs = "moe.up_weight_ptrs" => Source::Named("moe.up_weight_ptrs") => *const *const core::ffi::c_void);
+
+fact!(/// The per-expert DOWN weight pointer table. See [`MoeUpWeightPtrs`].
+    MoeDownWeightPtrs = "moe.down_weight_ptrs" => Source::Named("moe.down_weight_ptrs") => *const *const core::ffi::c_void);
+
+fact!(/// The decode leg's first intermediate, `[routes, 2 * intermediate]`.
+    MoeExpertUp = "moe.expert_up" => Source::Named("moe.expert_up") => *mut core::ffi::c_void);
+
+fact!(/// The decode leg's activation buffer, `[routes, intermediate]`.
+    MoeExpertAct = "moe.expert_act" => Source::Named("moe.expert_act") => *mut core::ffi::c_void);
+
+fact!(/// The decode leg's per-route output, `[routes, hidden]`.
+    MoeExpertOut = "moe.expert_out" => Source::Named("moe.expert_out") => *mut core::ffi::c_void);
+
+fact!(/// The aligned leg's first staging rectangle, padded to `block_size`.
+    MoeAlignedUp = "moe.aligned_up" => Source::Named("moe.aligned_up") => *mut core::ffi::c_void);
+
+fact!(/// The aligned leg's activation rectangle. See [`MoeAlignedUp`].
+    MoeAlignedAct = "moe.aligned_act" => Source::Named("moe.aligned_act") => *mut core::ffi::c_void);
+
+fact!(/// The aligned leg's output rectangle. See [`MoeAlignedUp`].
+    MoeAlignedOut = "moe.aligned_out" => Source::Named("moe.aligned_out") => *mut core::ffi::c_void);
+
+fact!(/// The UP GEMM's `A` pointer array — one address per block-row.
+    MoeAUpPtrs = "moe.a_up_ptrs" => Source::Named("moe.a_up_ptrs") => *mut *const core::ffi::c_void);
+
+fact!(/// The UP GEMM's `B` pointer array. See [`MoeAUpPtrs`].
+    MoeBUpPtrs = "moe.b_up_ptrs" => Source::Named("moe.b_up_ptrs") => *mut *const core::ffi::c_void);
+
+fact!(/// The UP GEMM's `C` pointer array, written through. See [`MoeAUpPtrs`].
+    MoeCUpPtrs = "moe.c_up_ptrs" => Source::Named("moe.c_up_ptrs") => *mut *mut core::ffi::c_void);
+
+fact!(/// The DOWN GEMM's `A` pointer array. See [`MoeAUpPtrs`].
+    MoeADownPtrs = "moe.a_down_ptrs" => Source::Named("moe.a_down_ptrs") => *mut *const core::ffi::c_void);
+
+fact!(/// The DOWN GEMM's `B` pointer array. See [`MoeAUpPtrs`].
+    MoeBDownPtrs = "moe.b_down_ptrs" => Source::Named("moe.b_down_ptrs") => *mut *const core::ffi::c_void);
+
+fact!(/// The DOWN GEMM's `C` pointer array, written through. See [`MoeAUpPtrs`].
+    MoeCDownPtrs = "moe.c_down_ptrs" => Source::Named("moe.c_down_ptrs") => *mut *mut core::ffi::c_void);
+
+fact!(/// The per-route router weight the decode leg scatters, `[n * top_k]`.
+    MoeRouteWeights = "moe.route_weights" => Source::Named("moe.route_weights") => *mut f32);
+
+fact!(/// The SHARED expert's gate/up bank, null where a text has no shared
+    /// expert — the rewrite in `build_moe_ptrs_aligned_bf16` is what makes
+    /// the null safe.
+    MoeSharedGateUpBase = "moe.shared_gate_up_base" => Source::Named("moe.shared_gate_up_base") => *const core::ffi::c_void);
+
+fact!(/// The SHARED expert's down bank. See [`MoeSharedGateUpBase`].
+    MoeSharedDownBase = "moe.shared_down_base" => Source::Named("moe.shared_down_base") => *const core::ffi::c_void);
+
+// ── deepseek_v4's SECOND cache ──
+//
+// `driver-cuda/src/pools/compressed_plane_cache.rs` allocates all three, one
+// `TensorSpec` per layer. The pool existed before these keys did, which is why
+// the routines that read it took bare pointers: the resource was there and
+// nothing named it.
+
+fact!(/// The compressed KV pages — deepseek_v4's second cache, indexed
+    /// through the ORDINARY plan's page tables.
+    Dsv4CompKvPages = "dsv4.comp_kv_pages" => Source::Named("dsv4.comp_kv_pages") => *mut core::ffi::c_void);
+
+fact!(/// The in-progress compression accumulator, `coff * head_dim` wide.
+    Dsv4StateKv = "dsv4.state_kv" => Source::Named("dsv4.state_kv") => *const core::ffi::c_void);
+
+fact!(/// The per-slot importance scores the boundary pass writes.
+    Dsv4StateScore = "dsv4.state_score" => Source::Named("dsv4.state_score") => *const core::ffi::c_void);
+
+fact!(/// The absolute-position embedding table, a LOAD-TIME constant and not
+    /// a fire's plane — nullable, and the only operand of the gather that is.
+    Dsv4Ape = "dsv4.ape" => Source::Named("dsv4.ape") => *const f32);
+
+// ── The quantised KV envelope, written ──
+//
+// `KvEnvMin`/`KvEnvMax` are the READ side and are `*const u16`. The three
+// `layout.rs` envelope routines WRITE the same two planes, and a `*const` key
+// cannot say so.
+
+fact!(/// The dequant envelope FLOOR, as the envelope passes write it.
+    /// [`KvEnvMin`] is the same plane read.
+    KvEnvMinOut = "kv.k_env_min_out" => Source::Named("kv.k_env_min_out") => *mut core::ffi::c_void);
+
+fact!(/// The dequant envelope CEILING, written. See [`KvEnvMinOut`].
+    KvEnvMaxOut = "kv.k_env_max_out" => Source::Named("kv.k_env_max_out") => *mut core::ffi::c_void);
+
+// ── The compacted page CSR ──
+//
+// `attn::compact_page_csr` reads one plan's page tables and writes another's.
+// The destination is the driver's scratch, not a result any statement declares.
+
+fact!(/// The scratch counters the CSR compaction accumulates into.
+    CompactScratchCounts = "compact.scratch_counts" => Source::Named("compact.scratch_counts") => *mut u32);
+
+fact!(/// The compacted page-index array.
+    CompactPageIndicesOut = "compact.page_indices_out" => Source::Named("compact.page_indices_out") => *mut u32);
+
+fact!(/// The compacted page-indptr array. See [`CompactPageIndicesOut`].
+    CompactPageIndptrOut = "compact.page_indptr_out" => Source::Named("compact.page_indptr_out") => *mut u32);
+
+fact!(/// The compacted last-page-length array. See [`CompactPageIndicesOut`].
+    CompactLastPageLensOut = "compact.last_page_lens_out" => Source::Named("compact.last_page_lens_out") => *mut u32);
+
+fact!(/// Where `attn::attn_score_fold_heads` writes its per-page maxima.
+    AttnScoreFolded = "attn.score_folded" => Source::Named("attn.score_folded") => *mut f32);
+
+// ── The grouped GEMM's pointer arrays ──
+//
+// `gemm::grouped_act_x_wt_bf16` is reached from `gemm/lora.rs`, which builds
+// these by pointer arithmetic into its own device slab. Its own note said so:
+// *"not a statement operand"*.
+
+fact!(/// The grouped GEMM's per-group activation pointers, on the DEVICE.
+    GemmActPtrs = "gemm.act_ptrs_dev" => Source::Named("gemm.act_ptrs_dev") => *const *const core::ffi::c_void);
+
+fact!(/// The grouped GEMM's per-group weight pointers. See [`GemmActPtrs`].
+    GemmWeightPtrs = "gemm.w_ptrs_dev" => Source::Named("gemm.w_ptrs_dev") => *const *const core::ffi::c_void);
+
+fact!(/// The grouped GEMM's per-group output pointers. See [`GemmActPtrs`].
+    GemmOutPtrs = "gemm.y_ptrs_dev" => Source::Named("gemm.y_ptrs_dev") => *const *mut core::ffi::c_void);
+
+fact!(/// The one HOST array of the four: per-group row counts, which
+    /// `cublasGemmGroupedBatchedEx` reads on the host side.
+    GemmMArrayHost = "gemm.m_array_host" => Source::Named("gemm.m_array_host") => *const i32);
+
+fact!(/// LoRA's `x @ A` intermediate, carved by the driver and read back by
+    /// the correction's second GEMM.
+    LoraXaScratch = "lora.xa_scratch" => Source::Named("lora.xa_scratch") => *mut core::ffi::c_void);
+
+fact!(/// The MTP pending-hidden slab, written. [`RecurrentState`] is the same
+    /// store under its generic name; this one is the qwen-3.5 MTP view.
+    MtpPendingHidden = "mtp.pending_hidden" => Source::Named("mtp.pending_hidden") => *mut core::ffi::c_void);
+
+// ── §L  THE SCALARS `#[unbound]` USED TO STAND FOR ────────────────────────
+//
+// Sixty-four parameters carried `#[unbound]` — *"nothing supplies this and the
+// signature says so"* — and the attribute was honest about the tree as it
+// stood: `Env<T, keys::Unstated>` before it, a fake key for a real absence.
+//
+// It is the POINTER story one type over. Where a plane could be asked for by
+// name once a key existed, so can a number; what kept these unstated was that
+// no key named them, not that nothing knows them. The ones a RECTANGLE already
+// answers — a row count, a hidden width, a stream multiplier — are read off
+// the operands instead and appear nowhere below, because a fact the signature
+// already carries does not need a name.
+//
+// `Const` WAS THE OTHER CANDIDATE AND IS REFUSED, for the reason
+// `attn::attention_compressed_paged_bf16` states in its own body: *"a `Const`
+// mark PROMISES the statement carries the number at its slot in the params
+// run; where nothing states one the promise breaks at the fire, not at the
+// type."* An ask is the weaker and truer claim.
+
+fact!(/// deepseek_v4's compression stride: one entry per `ratio` positions.
+    Dsv4Ratio = "dsv4.ratio" => Source::Named("dsv4.ratio") => i32);
+
+fact!(/// How many positions the compression accumulator spans. See
+    /// [`Dsv4StateKv`], whose width is `coff * head_dim`.
+    Dsv4Coff = "dsv4.coff" => Source::Named("dsv4.coff") => i32);
+
+fact!(/// The DSA indexer's rotary width, which is not the head's.
+    DsaRopeDim = "dsa.rope_dim" => Source::Named("dsa.rope_dim") => i32);
+
+fact!(/// The hyper-connection residual's epsilon.
+    ///
+    /// NOT [`RmsEps`]: `dsv4_hc.cuh` norms the MIX and the two are separate
+    /// numbers in the checkpoint.
+    HcEps = "hc.eps" => Source::Named("hc.eps") => f32);
+
+fact!(/// The post-mix blend weight the hyper-connection prologue applies.
+    HcPostAlpha = "hc.post_alpha" => Source::Named("hc.post_alpha") => f32);
+
+fact!(/// How many Sinkhorn normalisation passes the combine matrix takes.
+    HcSinkhornIters = "hc.sinkhorn_iters" => Source::Named("hc.sinkhorn_iters") => i32);
+
+fact!(/// Weights per quantisation group along `K` — the checkpoint's, not a
+    /// fire's. `KvBlockSize` is the same idea for the KV cache.
+    QuantGroupSize = "quant.group_size" => Source::Named("quant.group_size") => i32);
+
+fact!(/// mRoPE's TEMPORAL section width.
+    MropeSectionT = "rope.mrope_section_t" => Source::Named("rope.mrope_section_t") => i32);
+
+fact!(/// mRoPE's HEIGHT section width. See [`MropeSectionT`].
+    MropeSectionH = "rope.mrope_section_h" => Source::Named("rope.mrope_section_h") => i32);
+
+fact!(/// mRoPE's WIDTH section. See [`MropeSectionT`].
+    MropeSectionW = "rope.mrope_section_w" => Source::Named("rope.mrope_section_w") => i32);
+
+fact!(/// Bytes between one lane's keep-mask row and the next, in the CSR
+    /// compaction's input.
+    CompactKeepStride = "compact.keep_stride" => Source::Named("compact.keep_stride") => u32);
+
+fact!(/// The padded block-row ceiling the aligned MoE leg sorts into.
+    MoeMaxBlocks = "moe.max_blocks" => Source::Named("moe.max_blocks") => i32);
+
+fact!(/// Rows per padded block. See [`MoeMaxBlocks`].
+    MoeBlockSize = "moe.block_size" => Source::Named("moe.block_size") => i32);
+
+fact!(/// How many of [`MoeMaxBlocks`] carry ROUTED experts; the rest are the
+    /// shared expert's, and a text without one sets this to the ceiling.
+    MoeRoutedBlocks = "moe.routed_blocks" => Source::Named("moe.routed_blocks") => i32);
+
+fact!(/// The MoE leg's model width. Not [`Width`], which is the fire's.
+    MoeHidden = "moe.hidden" => Source::Named("moe.hidden") => i32);
+
+fact!(/// One expert's intermediate width.
+    MoeIntermediate = "moe.intermediate" => Source::Named("moe.intermediate") => i32);
+
+fact!(/// Rows in the per-expert scale plane the transpose walks.
+    MoeScaleRows = "moe.scale_rows" => Source::Named("moe.scale_rows") => i32);
+
+fact!(/// Quantisation groups per row of that plane. See [`MoeScaleRows`].
+    MoeScaleGroups = "moe.scale_groups" => Source::Named("moe.scale_groups") => i32);
+
+fact!(/// Groups in a grouped GEMM — `cublasGemmGroupedBatchedEx`'s count.
+    GemmGroupCount = "gemm.group_count" => Source::Named("gemm.group_count") => i32);
+
+fact!(/// The GEMM's accumulate weight: `0.0` overwrites the result plane and
+    /// `1.0` adds to it.
+    ///
+    /// A number the SYMBOL decides, which is what `Lit` is for — but the
+    /// symbols that decide it are reached through ONE routine here, so the
+    /// choice belongs to whoever dispatched rather than to the row.
+    GemmBeta = "gemm.beta" => Source::Named("gemm.beta") => f32);
+
+fact!(/// SiLU's beta on the gated MLP's ACTIVE half.
+    ///
+    /// Beside [`GluAlpha`] and [`GluLimit`], which are the same block's other
+    /// two numbers: `Deployment::mlp_gate` carries all three per fire.
+    MlpSituBeta = "mlp.situ_beta" => Source::Named("mlp.situ_beta") => f32);
+
+fact!(/// The blend applied to the LINEAR half. See [`MlpSituBeta`].
+    MlpSituLinearBeta = "mlp.situ_linear_beta" => Source::Named("mlp.situ_linear_beta") => f32);
+
+fact!(/// MLA's non-rotary query width. [`HeadDim`] is the whole head.
+    MlaQkNopeDim = "mla.qk_nope_dim" => Source::Named("mla.qk_nope_dim") => i32);
+
+fact!(/// MLA's VALUE head width, which the absorb pair reads apart from the
+    /// query's. See [`MlaQkNopeDim`].
+    MlaVHeadDim = "mla.v_head_dim" => Source::Named("mla.v_head_dim") => i32);
+
+fact!(/// The compressed latent's rank — MLA's whole point.
+    MlaKvLoraRank = "mla.kv_lora_rank" => Source::Named("mla.kv_lora_rank") => i32);
 
 #[cfg(test)]
 mod tests {

@@ -170,14 +170,32 @@ pub struct Request {
     pub path: PathBuf,
     /// The kernel function to build a pipeline for.
     pub function: String,
+    /// The line that makes `function` exist in `path`, or empty if the file
+    /// already declares it. See [`kernels::routine::Fire::stamp`].
+    pub stamp: String,
 }
 
 impl Request {
-    /// A request for `function` out of `path`.
+    /// A request for `function` out of `path`, which the file declares itself.
     pub fn new(path: impl Into<PathBuf>, function: impl Into<String>) -> Self {
         Self {
             path: path.into(),
             function: function.into(),
+            stamp: String::new(),
+        }
+    }
+
+    /// A request for `function` out of `path`, stamped into existence by
+    /// `stamp`.
+    pub fn stamped(
+        path: impl Into<PathBuf>,
+        function: impl Into<String>,
+        stamp: impl Into<String>,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            function: function.into(),
+            stamp: stamp.into(),
         }
     }
 }
@@ -193,11 +211,25 @@ impl Request {
 /// sources are kept rather than discarded after the read. The C++ reads every
 /// file twice for this -- once to compute the key and once to compile -- and
 /// the two reads are not guaranteed to see the same bytes.
+///
+/// # The stamps land HERE, and that is the whole of the mechanism
+///
+/// A source that declares its own instantiations is a source that states a
+/// lattice the host also states. Appending [`Request::stamp`] to the resolved
+/// text is what lets the `.metal` state only what it CAN stamp and the host
+/// state which points it reaches.
+///
+/// This one place serves both readers downstream, which is why it is this
+/// place: [`Batch::key`] hashes the resolved text, so a load reaching a
+/// different set of points keys to a different archive by construction, and
+/// `build_library` compiles the same text, so what was keyed is what was
+/// built. Appending anywhere later would have split those two apart.
 #[derive(Debug)]
 pub struct Batch {
     /// Distinct paths, in first-seen order.
     paths: Vec<PathBuf>,
-    /// The resolved source of each path, or why it could not be read.
+    /// The resolved source of each path, with its requests' stamps appended,
+    /// or why it could not be read.
     sources: Vec<Result<String>>,
     /// For each request, its index into `paths`.
     library: Vec<usize>,
@@ -224,6 +256,7 @@ impl Batch {
         let mut sources: Vec<Result<String>> = Vec::new();
         let mut library = Vec::with_capacity(requests.len());
         let mut functions = Vec::with_capacity(requests.len());
+        let mut stamps: Vec<Vec<&str>> = Vec::new();
         for request in requests {
             let index = paths.iter().position(|p| *p == request.path);
             let index = match index {
@@ -231,11 +264,35 @@ impl Batch {
                 None => {
                     paths.push(request.path.clone());
                     sources.push(read(&request.path));
+                    stamps.push(Vec::new());
                     paths.len() - 1
                 }
             };
             library.push(index);
             functions.push(request.function.clone());
+            if !request.stamp.is_empty() {
+                stamps[index].push(request.stamp.as_str());
+            }
+        }
+        // SORTED AND DEDUPLICATED, because the text is the LIBRARY's and the
+        // order requests arrived in is not. Two loads reaching the same points
+        // by different routes would otherwise compile character-different
+        // sources -- two archives, two compiles, for one set of pipelines.
+        // Deduplicating is not a tidiness either: a file stamped twice for one
+        // point is a redefinition, and the compile fails.
+        for (index, mut lines) in stamps.into_iter().enumerate() {
+            if lines.is_empty() {
+                continue;
+            }
+            lines.sort_unstable();
+            lines.dedup();
+            if let Ok(source) = &mut sources[index] {
+                source.push('\n');
+                for line in lines {
+                    source.push_str(line);
+                    source.push('\n');
+                }
+            }
         }
         Self {
             paths,
@@ -562,6 +619,111 @@ mod batch_tests {
 
     fn requests(pairs: &[(&str, &str)]) -> Vec<Request> {
         pairs.iter().map(|(p, f)| Request::new(*p, *f)).collect()
+    }
+
+    fn stamped(triples: &[(&str, &str, &str)]) -> Vec<Request> {
+        triples
+            .iter()
+            .map(|(p, f, s)| Request::stamped(*p, *f, *s))
+            .collect()
+    }
+
+    #[test]
+    fn a_stamp_is_appended_to_the_source_that_needs_it() {
+        let batch = Batch::load_with(
+            &stamped(&[("a.metal", "k", "STAMP_k(\"k\")")]),
+            files(&[("a.metal", "template void k();")]),
+        );
+        let Some(Ok(text)) = batch.source(0) else {
+            panic!("the source read")
+        };
+        assert!(text.starts_with("template void k();"), "{text}");
+        assert!(text.contains("STAMP_k(\"k\")"), "{text}");
+    }
+
+    #[test]
+    fn every_request_on_one_file_gets_its_stamp_into_that_one_library() {
+        // A file is a translation unit and the batch reads it once, so two
+        // points in one file are two stamps in ONE text -- the case the
+        // append has to get right and the reason it happens after the read
+        // rather than during it.
+        let batch = Batch::load_with(
+            &stamped(&[
+                ("a.metal", "k32", "STAMP(\"k32\", 32)"),
+                ("a.metal", "k64", "STAMP(\"k64\", 64)"),
+            ]),
+            files(&[("a.metal", "BODY")]),
+        );
+        assert_eq!(batch.paths().len(), 1, "one file, one library");
+        let Some(Ok(text)) = batch.source(0) else {
+            panic!("the source read")
+        };
+        assert!(text.contains("STAMP(\"k32\", 32)"), "{text}");
+        assert!(text.contains("STAMP(\"k64\", 64)"), "{text}");
+    }
+
+    #[test]
+    fn the_stamped_text_is_what_the_key_is_taken_over() {
+        // The point of appending inside `load_with`: a load reaching a
+        // different set of points is a different archive by construction. If
+        // the stamps went in after the key, two point sets would share one
+        // archive and the second would be served the first one's pipelines.
+        let one = Batch::load_with(
+            &stamped(&[("a.metal", "k", "STAMP(\"k\", 32)")]),
+            files(&[("a.metal", "BODY")]),
+        );
+        let other = Batch::load_with(
+            &stamped(&[("a.metal", "k", "STAMP(\"k\", 64)")]),
+            files(&[("a.metal", "BODY")]),
+        );
+        assert_ne!(one.key(0), other.key(0));
+    }
+
+    #[test]
+    fn the_same_points_key_alike_whatever_order_they_arrived_in() {
+        // The stamps are the LIBRARY's text and the request order is not, so
+        // they are sorted. Without it the same two points reached by two
+        // routes would compile two character-different sources: two archives
+        // and two compiles for one set of pipelines.
+        let forward = Batch::load_with(
+            &stamped(&[("a.metal", "k", "STAMP(\"k\")"), ("a.metal", "j", "STAMP(\"j\")")]),
+            files(&[("a.metal", "BODY")]),
+        );
+        let backward = Batch::load_with(
+            &stamped(&[("a.metal", "k", "STAMP(\"k\")"), ("a.metal", "j", "STAMP(\"j\")")]),
+            files(&[("a.metal", "BODY")]),
+        );
+        assert_eq!(forward.source(0).unwrap().as_ref().unwrap(), backward.source(0).unwrap().as_ref().unwrap());
+        let a = Batch::load_with(
+            &stamped(&[("a.metal", "k", "S(\"k\")"), ("a.metal", "j", "S(\"j\")")]),
+            files(&[("a.metal", "BODY")]),
+        );
+        let b = Batch::load_with(
+            &stamped(&[("a.metal", "j", "S(\"j\")"), ("a.metal", "k", "S(\"k\")")]),
+            files(&[("a.metal", "BODY")]),
+        );
+        assert_eq!(a.source(0).unwrap().as_ref().unwrap(), b.source(0).unwrap().as_ref().unwrap());
+    }
+
+    #[test]
+    fn one_point_asked_for_twice_is_stamped_once() {
+        // A redefinition is a compile error, not a duplicate line.
+        let batch = Batch::load_with(
+            &stamped(&[("a.metal", "k", "STAMP(\"k\")"), ("a.metal", "k", "STAMP(\"k\")")]),
+            files(&[("a.metal", "BODY")]),
+        );
+        let Some(Ok(text)) = batch.source(0) else {
+            panic!("the source read")
+        };
+        assert_eq!(text.matches("STAMP(\"k\")").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn an_unstamped_request_leaves_its_source_alone() {
+        // Every other `.metal` in the tree and every other backend. The empty
+        // stamp is not a special case here, it just appends nothing.
+        let batch = Batch::load_with(&requests(&[("a.metal", "k")]), files(&[("a.metal", "BODY")]));
+        assert!(matches!(batch.source(0), Some(Ok(text)) if text == "BODY"));
     }
 
     #[test]

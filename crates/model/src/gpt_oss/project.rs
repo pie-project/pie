@@ -538,6 +538,7 @@ mod tests {
         let f = f20b();
         let bind = crate::catalog::MetalBinding {
             qmm_partial_rows: false,
+            qmm_fp16_precast: true,
             qmm_tile: None,
             quant_group: 64,
             quant_bits: 4,
@@ -604,6 +605,7 @@ mod tests {
         // of a deployment nobody loads.
         let bind = crate::catalog::MetalBinding {
             qmm_partial_rows: false,
+            qmm_fp16_precast: true,
             qmm_tile: None,
             quant_group: 64,
             quant_bits: 4,
@@ -649,6 +651,7 @@ mod tests {
         let f = f20b();
         let bind = crate::catalog::MetalBinding {
             qmm_partial_rows: false,
+            qmm_fp16_precast: true,
             qmm_tile: None,
             quant_group: 64,
             quant_bits: 4,

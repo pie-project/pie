@@ -1,8 +1,12 @@
 //! The two family-aware offline paths, end to end on real files.
 //!
-//! `build` authors the serve contract, materializes it through the
-//! streaming executor and the disk spool, and writes the *runtime* tensors —
-//! the fused QKV banks are the proof, because no checkpoint ships one.
+//! `build` authors the serve contract, materializes it through the streaming
+//! executor and the disk spool, and writes the *runtime* tensors under the
+//! backend's naming. It used to write fused QKV banks too, and those were what
+//! proved a rewrite had happened; `build_policy` authors `Projections::InPlace`
+//! for every backend now -- a fusion is a view, and a file has no pointers --
+//! so the banks are asserted ABSENT here and the rewrite is proved from the
+//! artifact's own metadata instead.
 //! `import` on an F32 snapshot exercises the same spool from the other
 //! side: the decoded set is the whole model, which is exactly the case the
 //! spool exists for, and the artifact must hold the BF16 the engine reads.
@@ -104,8 +108,26 @@ fn write_snapshot(dir: &Path, dtype: &str) {
     .expect("write config");
 }
 
-/// build writes runtime tensors: the fused banks exist, their views
-/// exist, and every digest verifies.
+/// build writes the serve contract's tensors, and NOT the fused banks.
+///
+/// # It used to assert the banks, and that was the old contract
+///
+/// This test named `model.layers.0.self_attn.qkv_proj.fused.weight` and
+/// `model.layers.1.mlp.gate_up_proj.fused.weight` and required them present,
+/// on the reading that a build emits runtime layout and CUDA's runtime layout
+/// is fused. `build_policy` in `src/ops/model/build.rs` authors
+/// `Projections::InPlace` for every backend now, and its doc is where the
+/// reasoning lives -- the short version being that a fusion is a VIEW, so
+/// persisting it persists the bank AND the projections that alias it, which
+/// on Qwen3-0.6B was 56 extra tensors, 587 MB of file and 560 MiB of resident
+/// VRAM for a concatenation measured at no difference.
+///
+/// So the assertion inverts rather than relaxes. The projections must be
+/// there, under their checkpoint names, because that is what the load path
+/// joins from -- and the banks must be ABSENT, because their presence is the
+/// defect. Requiring the absence is what makes this a gate rather than a
+/// deletion: a backend that starts persisting a fusion again fails here and
+/// says so, which is what the old assertion did in the other direction.
 #[test]
 fn build_materializes_the_serve_contract() {
     let staging = tempfile::tempdir().expect("staging");
@@ -118,9 +140,9 @@ fn build_materializes_the_serve_contract() {
         quant: None,
         fp8_native: false,
         moe: None,
-        // The flag's own default. This test asserts CUDA's fused-bank names
-        // below, which is the layout `cuda` authors -- Metal's schemas produce
-        // in-place projections under MLX names instead.
+        // The flag's own default. `cuda` is what selects HF naming below --
+        // Metal's and Vulkan's schemas rename for MLX's binder instead. It no
+        // longer selects a fused layout, because no backend's BUILD does.
         backend: "cuda".to_string(),
         out: Some(artifact.clone()),
         dry_run: false,
@@ -130,15 +152,28 @@ fn build_materializes_the_serve_contract() {
 
     let parsed = parse_checkpoint(&artifact).expect("parse artifact");
     let names: Vec<&str> = parsed.weights().map(|t| t.name.as_str()).collect();
-    // The bank no checkpoint ships, and the per-projection views into it.
+    // The projections the load path joins from, under HF names, plus the
+    // untied head this row states so that the tied path is not the only one a
+    // cheap test covers.
     for expected in [
-        "model.layers.0.self_attn.qkv_proj.fused.weight",
         "model.layers.0.self_attn.q_proj.weight",
-        "model.layers.1.mlp.gate_up_proj.fused.weight",
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.self_attn.v_proj.weight",
         "model.layers.1.mlp.gate_proj.weight",
+        "model.layers.1.mlp.up_proj.weight",
         "lm_head.weight",
     ] {
         assert!(names.contains(&expected), "{expected} missing: {names:?}");
+    }
+    // And the banks are NOT here. `build_policy`'s rule stated as a test: a
+    // build must not materialize a tensor that another materialized tensor is
+    // a view of.
+    for bank in names.iter().filter(|n| n.contains(".fused.")) {
+        panic!(
+            "`{bank}` is a fused bank the projections alias, and a file has no \
+             pointers -- persisting it writes the same bytes twice. See \
+             `build_policy` in src/ops/model/build.rs. All of: {names:?}"
+        );
     }
     // The spool left nothing behind.
     assert!(
@@ -191,24 +226,36 @@ fn import_streams_a_fully_decoded_model_through_the_spool() {
 
 /// A BUILT artifact is still the model it was built from.
 ///
-/// The open question this settles. `build` rewrites a checkpoint into
-/// runtime layout — it emits fused banks no checkpoint ships — so the
-/// worry was that the rewrite destroys the thing identity is matched
-/// against, leaving an `-optimized.zt` that can never be identified and
+/// The open question this settles. `build` rewrites a checkpoint into runtime
+/// layout, so the worry was that the rewrite destroys the thing identity is
+/// matched against, leaving a built artifact that can never be identified and
 /// therefore never served without an operator naming it.
 ///
-/// It does not, and the reason is structural rather than lucky. A
-/// manifest states the rows a MODEL has and `Manifest::check` walks
-/// only those, so a tensor the model does not mention cannot fault:
-/// the fused bank is invisible to the match. And the fusion is a
-/// VIEW — `q_proj.weight` still exists, at its checkpoint extents,
-/// aliasing into the bank — so every row the manifest does ask about is
-/// still there to answer.
+/// It does not, and the reason is structural rather than lucky. A manifest
+/// states the rows a MODEL has and `Manifest::check` walks only those, so a
+/// tensor the model does not mention cannot fault; and every row it does ask
+/// about is a checkpoint-named projection that the rewrite leaves at its
+/// checkpoint extents.
 ///
-/// Both halves are load-bearing. If a future backend fused DESTRUCTIVELY
-/// (dropping the views) this test is what fails, and the fix would be
-/// for `build` to write the id it identified into the artifact rather
-/// than for identification to learn about banks.
+/// # What the rewrite is, now that it is not a fusion
+///
+/// This test used to prove it was looking at a REWRITTEN artifact by finding
+/// `qkv_proj.fused.weight` in it -- "the bank is the proof, as it is next
+/// door". `build_policy` authors `Projections::InPlace` for every backend now
+/// and no bank is written, so that proof is gone and the test would otherwise
+/// have become vacuous: a plain copy of the snapshot would pass it.
+///
+/// The replacement is the artifact's own header. A `.zt` built by this command
+/// carries a `pie.model/1` descriptor and a source-encoding summary that a
+/// converted snapshot does not, so "this went through `build`" is asked of the
+/// metadata rather than inferred from a tensor name -- which is the more
+/// direct question anyway, and one that does not move when a layout decision
+/// does.
+///
+/// If a future backend fused DESTRUCTIVELY -- writing a bank and dropping the
+/// projections -- this test is what fails, and the fix would be for `build` to
+/// write the id it identified into the artifact rather than for identification
+/// to learn about banks.
 #[test]
 fn a_built_artifact_still_identifies_as_the_row_it_was_built_from() {
     let staging = tempfile::tempdir().expect("staging");
@@ -229,12 +276,14 @@ fn a_built_artifact_still_identifies_as_the_row_it_was_built_from() {
     .expect("build failed");
 
     let meta = parse_checkpoint(&artifact).expect("parse artifact");
-    // Not vacuous: this is the REWRITTEN artifact, not a checkpoint that
-    // happened to be copied. The bank is the proof, as it is next door.
+    // Not vacuous: this is the artifact `build` wrote, not the snapshot it was
+    // given. The snapshot is safetensors with no `__meta__/` namespace at all,
+    // so a metadata object existing is the rewrite having happened.
+    let objects: Vec<&str> = meta.meta_objects().map(|o| o.name.as_str()).collect();
     assert!(
-        meta.weights()
-            .any(|t| t.name == "model.layers.0.self_attn.qkv_proj.fused.weight"),
-        "no fusion happened, so this asserts nothing about the rewrite"
+        !objects.is_empty(),
+        "the artifact carries no `__meta__/` objects, so this is not something \
+         `build` wrote and the test asserts nothing about the rewrite"
     );
     let row = model::catalog::identify(&meta, &model::catalog::Override::None)
         .expect("a built artifact is still identifiable");

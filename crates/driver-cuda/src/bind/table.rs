@@ -1519,6 +1519,13 @@ mod tests {
         // AND THE SYMBOL THAT WAS BLOCKED ON ONE MISSING ANSWER: its second
         // output is `Out<1, f16>` now rather than an optional argument.
         assert!(crossed("norm::rmsnorm_bf16_with_fp16"));
+        // AND THE THREE WITH THE MOST TO LOSE FROM THE `#[unbound]` SWEEP,
+        // one per shape of parameter it retired: a YaRN scheme's two scalar
+        // factors, a compressed-cache program's whole geometry, and an
+        // AltUp correction's coefficient bank.
+        assert!(crossed("rope::rope_yarn_bf16"));
+        assert!(crossed("attn::attention_compressed_paged_bf16"));
+        assert!(crossed("norm::altup_correct_bf16"));
         // And a name no backend has.
         assert!(!crossed("not_a_kernel"));
 
@@ -1544,9 +1551,37 @@ mod tests {
         // the prose said *"the join's foreign operands"* and the pair form
         // (`deepseek_v4.rs`'s `swiglu_clamp_pair`) states gate and up as two
         // ordinary operands, which is what its column reads.
+        //
+        // 143 -> 165 WITH THE END OF `#[unbound]`. The attribute is a
+        // parameter saying *"nothing states me"* -- the sentence without a
+        // fake key -- and `route` cannot bind a symbol that holds one, so
+        // every routine carrying one sat in `Route::Unbound`. There is not a
+        // single `#[unbound]` left in `kernels-cuda/src`: the marks gave each
+        // of those parameters a key, and twenty-two symbols crossed in one
+        // move. By family, and none was lost:
+        //
+        // `attn` nine -- `attention_compressed_paged_bf16`, the two
+        // `dsa_index_*` ropes, the four `dsv4_*` compressed-cache
+        // programs and the two `mtp_*` hidden shifts.
+        // `norm` three -- `altup_correct_bf16` and the two `hc_*_postprocess`.
+        // `rope` three -- `qk_rmsnorm_mrope_bf16`, `rope_write_kv_bf16` and
+        // `rope_yarn_bf16`, whose `low_freq_factor`/`high_freq_factor` were
+        // the last thing in this driver that had to name llama-3 out loud.
+        // `mlp` two (`situ_bf16` and its chunked form), `quant` two (the
+        // WNA16 decode pair), `ssm` two (the two nemotron MoE pointer
+        // builders) and `moe` one (`transpose_expert_scales_u8`).
+        //
+        // WHAT CROSSING DOES NOT SAY is that a fire of one of these
+        // succeeds. `route` binds on the parameter having a SOURCE; whether
+        // this driver answers that source is a different question and
+        // `kernels/tests/every_plane_is_answered` is where it is asked. It
+        // currently names fifty §M keys `kernels-cuda` asks for and
+        // `driver-cuda` answers nowhere, and several of them are on the
+        // symbols listed above. The two counts moving in opposite directions
+        // is the migration being half done, not either census being wrong.
         let n = kernels_cuda::sigs().iter().filter(|s| crossed(s.symbol)).count();
         assert_eq!(
-            n, 143,
+            n, 165,
             "{n} declared symbols are crossed onto the derived column. \
              Crossing one changes how a real fire is planned, so the count \
              moves only on purpose."

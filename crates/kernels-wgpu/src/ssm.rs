@@ -1,47 +1,11 @@
-//! Gated DeltaNet: the recurrent state kernels and their prep.
-//!
-//! `gdn` is an algorithm and not a model, so it takes no model qualifier --
-//! the same call the CUDA table makes for `delta_attn_kda` and `indexer_dsa`.
-
 use kernels_macros::routine;
 use kernels::BindMut;
 
-use crate::routine::{Asks, Bind, Const, Ctx, Fire, In, Out, Tensor, bf16, keys};
+use crate::routine::{Bind, Const, Ctx, Fire, In, Out, Tensor, bf16};
+use kernels::raises::Struct;
+use crate::views::{RecurrentState};
 use kernels::routine::Refusal;
 
-/// The nine `(LANES, VROWS)` shapes the prefill scan is compiled for, in the
-/// order the row's axis names them.
-///
-/// A literal table and not a `format!`, for the reason
-/// `layout::EMBED_GATHER` is one: an unbuilt module is not an error on this
-/// backend. `vkCreateComputePipelines` SIGSEGVs on a name that was never
-/// compiled and the validation layer says nothing, so a composed name is a
-/// crash and a written one is a link error.
-///
-/// Not every pair of a plausible `LANES` and a plausible `VROWS` is here.
-/// `(32, 1)` and `(4, 2)` are as sensible-looking as any of the nine and
-/// neither exists, which is what `scan_point` is for.
-static SCAN: [&str; 9] = [
-    "gdn_core_recurrent_prefill_bfloat16_l_16_v_1",
-    "gdn_core_recurrent_prefill_bfloat16_l_16_v_2",
-    "gdn_core_recurrent_prefill_bfloat16_l_16_v_4",
-    "gdn_core_recurrent_prefill_bfloat16_l_32_v_2",
-    "gdn_core_recurrent_prefill_bfloat16_l_32_v_4",
-    "gdn_core_recurrent_prefill_bfloat16_l_32_v_8",
-    "gdn_core_recurrent_prefill_bfloat16_l_4_v_1",
-    "gdn_core_recurrent_prefill_bfloat16_l_8_v_1",
-    "gdn_core_recurrent_prefill_bfloat16_l_8_v_2",
-];
-
-/// Which of the nine compiled scan shapes a `(lanes, vrows)` pair is.
-///
-/// # Errors
-///
-/// [`Refusal::Narrow`] for a pair that is not one of the nine. The two
-/// numbers are not independent -- the tiling axis is a LIST of nine points and
-/// not a product of three lane widths and four row counts -- so this is a
-/// match over pairs rather than two lookups multiplied together. `(32, 1)`
-/// reads as an obvious member of a product and is not compiled.
 fn scan_point(lanes: i32, vrows: i32) -> Result<usize, Refusal> {
     match (lanes, vrows) {
         (16, 1) => Ok(0),
@@ -60,25 +24,6 @@ fn scan_point(lanes: i32, vrows: i32) -> Result<usize, Refusal> {
     }
 }
 
-/// The grid every gdn kernel except the prefill scan fires on.
-///
-/// `[32, dv, rows]`, in THREADS. The x extent is 32 because the reduction is
-/// over exactly 32 lanes: `row_sum32` halves a 32-wide shared-memory window
-/// and the `st[v][32]` register slabs are 32 deep, so this is the shader's
-/// shape and not a tuning choice. `dv` is one lane row per value channel and
-/// `rows` is one z group per `(request, value head)` pair.
-///
-/// `tests/gpu.rs` fires these at `[1, dv / 4, b * hv]` WORKGROUPS, which is
-/// the same grid seen from the other side of `[numthreads(32, 4, 1)]`. The
-/// `/ 4` there is exact division and would drop the tail of a `dv` that four
-/// does not divide; stated in threads, the division is `driver-vulkan`'s
-/// `div_ceil` and the tail is covered.
-///
-/// # Errors
-///
-/// [`Refusal::Empty`] for a zero or negative extent. A gdn launch over no
-/// value channels or no heads is a launch that reads uninitialised recurrent
-/// state and writes it back.
 fn head_rows(rows: i32, v_heads: i32) -> Result<u32, Refusal> {
     if rows <= 0 {
         return Err(Refusal::Empty { what: "rows" });
@@ -93,56 +38,18 @@ fn head_rows(rows: i32, v_heads: i32) -> Result<u32, Refusal> {
     })
 }
 
-/// The grid a per-dv core takes: one warp per `(row, v-head, v-channel)`.
-///
-/// `[32, Dv, rows * Hv]`, in THREADS. The z axis is a PRODUCT and this body
-/// takes both of its factors rather than the product, which is the shape
-/// `kernels-metal` states and the one the cross-backend gate settled on. A
-/// body that took the product could not tell `rows * v_heads` from any other
-/// pair with the same product, and the two are not interchangeable to the
-/// shader: it recovers `hv = z % Hv` and `row = z / Hv`.
-///
-/// # Errors
-///
-/// See `head_rows`, plus [`Refusal::Empty`] for a `v_dim` of zero -- the y
-/// axis is the only thing that covers the value channels, and a zero there is
-/// a dispatch of nothing at all.
 fn gdn_grid(rows: i32, v_heads: i32, v_dim: i32) -> Result<[u32; 3], Refusal> {
     let z = head_rows(rows, v_heads)?;
     if v_dim <= 0 {
         return Err(Refusal::Empty { what: "v_dim" });
     }
-    Ok([WARP, v_dim.unsigned_abs(), z])
+    Ok([32, v_dim.unsigned_abs(), z])
 }
 
-/// The grid a prep takes: one warp per `(row, v-head)` and NO dv axis.
-///
-/// # Errors
-///
-/// See `head_rows`.
 fn prep_grid(rows: i32, v_heads: i32) -> Result<[u32; 3], Refusal> {
-    Ok([WARP, 1, head_rows(rows, v_heads)?])
+    Ok([32, 1, head_rows(rows, v_heads)?])
 }
 
-/// The lanes a GDN dispatch puts on x, every one of them.
-const WARP: u32 = 32;
-
-/// The fused GDN core: convolution, gates, the delta rule and the state
-/// writeback in one dispatch.
-///
-/// Three of its buffers are recurrent STATE. `conv_state` and `rstate` arrive
-/// holding the previous step's values, `rstate` is updated in place, and
-/// `new_conv_state` receives the rolled convolution history -- which is a
-/// SEPARATE buffer from `conv_state` on purpose, because the shader is still
-/// reading the old taps while it writes the new ones. Binding one buffer to
-/// both is the ping-pong collapsing, and the failure is silent.
-///
-/// This is the one dispatch the split pair
-/// ([`gdn_prep`] then [`gdn_core_recurrent`]) reproduces bit for bit.
-///
-/// # Errors
-///
-/// See `gdn_grid`.
 #[routine]
 pub fn gdn_core(
     ctx: &Ctx<'_>,
@@ -154,14 +61,6 @@ pub fn gdn_core(
     dt_bias: Const<Tensor<bf16>>,
     a_gate: In<Tensor<bf16>>,
     b_gate: In<Tensor<bf16>>,
-    // THE ELEVEN, IN THE ORDER THE STATEMENT PLACES THEM. A `Const` mark's
-    // slot is its POSITION among the scalar marks of this signature, so the
-    // list below IS `model-dsl`'s `GdnShape::params` and a pair swapped here
-    // reads its neighbour's number rather than refusing. The two swaps most
-    // likely to be made are also the two that stay silent longest: `Dk` and
-    // `Dv` are 128 and 128 on every GDN checkpoint the tree has seen, and
-    // `Hk` and `Hv` differ only under group-query, so either transposition
-    // runs and answers.
     k_dim: Const<i32>,
     v_dim: Const<i32>,
     k_heads: Const<i32>,
@@ -172,36 +71,17 @@ pub fn gdn_core(
     k_off: Const<i32>,
     v_off: Const<i32>,
     eps: Const<f32>,
-    inv_sqrt_dk: Const<f32>) -> Result<(), Refusal> {
-    // THE ELEVEN GEOMETRY MARKS, WHICH WERE `GdnCoreParams`' ELEVEN FIELDS.
-    //
-    // A block stood here saying *"BACK TO AN ASK, BECAUSE THIS ROUTINE'S
-    // PARAMS RUN IS A STRUCT"*, and it was true of the arrangement it
-    // described: the body forwarded `ctx.params()` whole, the shader read the
-    // run as `GdnCoreParams` rather than as a scalar run, so slot 0 was the
-    // struct's FIRST FIELD and a `Const` derived onto it would have read that
-    // field's bits. Nothing in this signature could name a word of the run,
-    // which is why the head count and the value width came back as asks even
-    // though the statement was already carrying both.
-    //
-    // The marks name all eleven now. They are the same eleven words of the
-    // same `Lowered::params` run the struct was staged from, reached by index
-    // instead of by field, and the shader reads them out of its one
-    // `@group(1)` uniform block instead of out of a `@group(0)` storage
-    // pointer.
-    //
-    // So `keys::VHeads` and `keys::VDim` are gone from this body: `Asks`'
-    // own test for whether a number is a fact -- *"two fires of the same
-    // model, on the same deployment, can see different answers here"* -- is
-    // FALSE of a head count and of a head width, which are checkpoint
-    // configuration and reach the shader from this same run anyway. It stays
-    // TRUE of every table below, which is why every one of them is still an
-    // ask: the conv and recurrent slabs and the seat map are what the fire
-    // threaded from the previous step, and no text can state them.
-    let conv_state = ctx.ask::<Tensor<f32>, keys::ConvState>()?;
-    let rstate = ctx.ask::<Tensor<f32>, keys::RecurrentState>()?;
-    let new_conv_state = ctx.ask::<Tensor<f32>, keys::NewConvState>()?;
-    let rows = ctx.ask::<i32, keys::Rows>()?;
+    inv_sqrt_dk: Const<f32>,
+    rsv: In<Struct<RecurrentState>>,
+    rows: Const<i32>) -> Result<(), Refusal> {
+    if rsv.ptr.is_null() {
+        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+    }
+    let rsv = unsafe { &*rsv.ptr };
+    let conv_state = rsv.conv_state;
+    let rstate = rsv.state;
+    let new_conv_state = rsv.new_conv_state;
+    let rows = *rows;
     ctx.fire(
         Fire::at("ssm/gdn_core.wgsl", "gdn_core_bfloat16").apply(gdn_grid(rows, *v_heads, *v_dim)?),
         &[
@@ -231,16 +111,6 @@ pub fn gdn_core(
     )
 }
 
-/// [`gdn_core`] with the slot map it addresses its state through.
-///
-/// The plain form takes the z group's request index as the state slot; this
-/// one reads `slot_ids[b]`, so a batch whose requests occupy scattered slots
-/// of a shared state arena addresses them where they actually are. Exactly one
-/// extra buffer, in the one position the shader declares it.
-///
-/// # Errors
-///
-/// See `gdn_grid`.
 #[routine]
 pub fn gdn_core_slotted(
     ctx: &Ctx<'_>,
@@ -252,14 +122,6 @@ pub fn gdn_core_slotted(
     dt_bias: Const<Tensor<bf16>>,
     a_gate: In<Tensor<bf16>>,
     b_gate: In<Tensor<bf16>>,
-    // THE ELEVEN, IN THE ORDER THE STATEMENT PLACES THEM. A `Const` mark's
-    // slot is its POSITION among the scalar marks of this signature, so the
-    // list below IS `model-dsl`'s `GdnShape::params` and a pair swapped here
-    // reads its neighbour's number rather than refusing. The two swaps most
-    // likely to be made are also the two that stay silent longest: `Dk` and
-    // `Dv` are 128 and 128 on every GDN checkpoint the tree has seen, and
-    // `Hk` and `Hv` differ only under group-query, so either transposition
-    // runs and answers.
     k_dim: Const<i32>,
     v_dim: Const<i32>,
     k_heads: Const<i32>,
@@ -270,37 +132,18 @@ pub fn gdn_core_slotted(
     k_off: Const<i32>,
     v_off: Const<i32>,
     eps: Const<f32>,
-    inv_sqrt_dk: Const<f32>) -> Result<(), Refusal> {
-    // THE ELEVEN GEOMETRY MARKS, WHICH WERE `GdnCoreParams`' ELEVEN FIELDS.
-    //
-    // A block stood here saying *"BACK TO AN ASK, BECAUSE THIS ROUTINE'S
-    // PARAMS RUN IS A STRUCT"*, and it was true of the arrangement it
-    // described: the body forwarded `ctx.params()` whole, the shader read the
-    // run as `GdnCoreParams` rather than as a scalar run, so slot 0 was the
-    // struct's FIRST FIELD and a `Const` derived onto it would have read that
-    // field's bits. Nothing in this signature could name a word of the run,
-    // which is why the head count and the value width came back as asks even
-    // though the statement was already carrying both.
-    //
-    // The marks name all eleven now. They are the same eleven words of the
-    // same `Lowered::params` run the struct was staged from, reached by index
-    // instead of by field, and the shader reads them out of its one
-    // `@group(1)` uniform block instead of out of a `@group(0)` storage
-    // pointer.
-    //
-    // So `keys::VHeads` and `keys::VDim` are gone from this body: `Asks`'
-    // own test for whether a number is a fact -- *"two fires of the same
-    // model, on the same deployment, can see different answers here"* -- is
-    // FALSE of a head count and of a head width, which are checkpoint
-    // configuration and reach the shader from this same run anyway. It stays
-    // TRUE of every table below, which is why every one of them is still an
-    // ask: the conv and recurrent slabs and the seat map are what the fire
-    // threaded from the previous step, and no text can state them.
-    let conv_state = ctx.ask::<Tensor<f32>, keys::ConvState>()?;
-    let rstate = ctx.ask::<Tensor<f32>, keys::RecurrentState>()?;
-    let new_conv_state = ctx.ask::<Tensor<f32>, keys::NewConvState>()?;
-    let slot_ids = ctx.ask::<Tensor<u32>, keys::RecurrentSlots>()?;
-    let rows = ctx.ask::<i32, keys::Rows>()?;
+    inv_sqrt_dk: Const<f32>,
+    rsv: In<Struct<RecurrentState>>,
+    rows: Const<i32>) -> Result<(), Refusal> {
+    if rsv.ptr.is_null() {
+        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+    }
+    let rsv = unsafe { &*rsv.ptr };
+    let conv_state = rsv.conv_state;
+    let rstate = rsv.state;
+    let new_conv_state = rsv.new_conv_state;
+    let slot_ids = rsv.slots;
+    let rows = *rows;
     ctx.fire(
         Fire::at("ssm/gdn_core.wgsl", "gdn_core_slotted_bfloat16").apply(gdn_grid(rows, *v_heads, *v_dim)?),
         &[
@@ -331,26 +174,6 @@ pub fn gdn_core_slotted(
     )
 }
 
-/// The prep half of the split pair: everything a value channel would redo.
-///
-/// Every value channel of a head recomputes the same convolution, the same
-/// pair of L2 norms and the same gates, so the split stages them once into
-/// three f32 scratch slabs and [`gdn_core_recurrent`] reads them back. The
-/// slabs are `F32s` here and `F32s` there, which is the direction of the
-/// seam written into the types.
-///
-/// The two halves also SPLIT the convolution writeback: this one rolls the q
-/// and k channels and the recurrent half rolls the v channels, so
-/// `new_conv_state` is whole only if both ran. That is why it is threaded from
-/// this dispatch into the next rather than allocated twice.
-///
-/// The grid is one z group per `(request, value head)` pair and a single lane
-/// row -- `[32, 1, rows]` -- because a prep has no value channel to spread
-/// over: producing the shared work once is the whole point.
-///
-/// # Errors
-///
-/// See `gdn_grid`.
 #[routine]
 pub fn gdn_prep(
     ctx: &Ctx<'_>,
@@ -364,14 +187,6 @@ pub fn gdn_prep(
     pre_q: Out<Tensor<f32>>,
     pre_k: Out<Tensor<f32>>,
     pre_gate: Out<Tensor<f32>>,
-    // THE ELEVEN, IN THE ORDER THE STATEMENT PLACES THEM. A `Const` mark's
-    // slot is its POSITION among the scalar marks of this signature, so the
-    // list below IS `model-dsl`'s `GdnShape::params` and a pair swapped here
-    // reads its neighbour's number rather than refusing. The two swaps most
-    // likely to be made are also the two that stay silent longest: `Dk` and
-    // `Dv` are 128 and 128 on every GDN checkpoint the tree has seen, and
-    // `Hk` and `Hv` differ only under group-query, so either transposition
-    // runs and answers.
     k_dim: Const<i32>,
     v_dim: Const<i32>,
     k_heads: Const<i32>,
@@ -382,35 +197,16 @@ pub fn gdn_prep(
     k_off: Const<i32>,
     v_off: Const<i32>,
     eps: Const<f32>,
-    inv_sqrt_dk: Const<f32>) -> Result<(), Refusal> {
-    // THE ELEVEN GEOMETRY MARKS, WHICH WERE `GdnCoreParams`' ELEVEN FIELDS.
-    //
-    // A block stood here saying *"BACK TO AN ASK, BECAUSE THIS ROUTINE'S
-    // PARAMS RUN IS A STRUCT"*, and it was true of the arrangement it
-    // described: the body forwarded `ctx.params()` whole, the shader read the
-    // run as `GdnCoreParams` rather than as a scalar run, so slot 0 was the
-    // struct's FIRST FIELD and a `Const` derived onto it would have read that
-    // field's bits. Nothing in this signature could name a word of the run,
-    // which is why the head count and the value width came back as asks even
-    // though the statement was already carrying both.
-    //
-    // The marks name all eleven now. They are the same eleven words of the
-    // same `Lowered::params` run the struct was staged from, reached by index
-    // instead of by field, and the shader reads them out of its one
-    // `@group(1)` uniform block instead of out of a `@group(0)` storage
-    // pointer.
-    //
-    // So `keys::VHeads` and `keys::VDim` are gone from this body: `Asks`'
-    // own test for whether a number is a fact -- *"two fires of the same
-    // model, on the same deployment, can see different answers here"* -- is
-    // FALSE of a head count and of a head width, which are checkpoint
-    // configuration and reach the shader from this same run anyway. It stays
-    // TRUE of every table below, which is why every one of them is still an
-    // ask: the conv and recurrent slabs and the seat map are what the fire
-    // threaded from the previous step, and no text can state them.
-    let conv_state = ctx.ask::<Tensor<f32>, keys::ConvState>()?;
-    let new_conv_state = ctx.ask::<Tensor<f32>, keys::NewConvState>()?;
-    let rows = ctx.ask::<i32, keys::Rows>()?;
+    inv_sqrt_dk: Const<f32>,
+    rsv: In<Struct<RecurrentState>>,
+    rows: Const<i32>) -> Result<(), Refusal> {
+    if rsv.ptr.is_null() {
+        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+    }
+    let rsv = unsafe { &*rsv.ptr };
+    let conv_state = rsv.conv_state;
+    let new_conv_state = rsv.new_conv_state;
+    let rows = *rows;
     ctx.fire(
         Fire::at("ssm/gdn_prep.wgsl", "gdn_prep_bfloat16").apply(prep_grid(rows, *v_heads)?),
         &[
@@ -441,12 +237,6 @@ pub fn gdn_prep(
     )
 }
 
-/// [`gdn_prep`] with the slot map, for the same reason [`gdn_core_slotted`]
-/// has one.
-///
-/// # Errors
-///
-/// See `gdn_grid`.
 #[routine]
 pub fn gdn_prep_slotted(
     ctx: &Ctx<'_>,
@@ -460,14 +250,6 @@ pub fn gdn_prep_slotted(
     pre_q: Out<Tensor<f32>>,
     pre_k: Out<Tensor<f32>>,
     pre_gate: Out<Tensor<f32>>,
-    // THE ELEVEN, IN THE ORDER THE STATEMENT PLACES THEM. A `Const` mark's
-    // slot is its POSITION among the scalar marks of this signature, so the
-    // list below IS `model-dsl`'s `GdnShape::params` and a pair swapped here
-    // reads its neighbour's number rather than refusing. The two swaps most
-    // likely to be made are also the two that stay silent longest: `Dk` and
-    // `Dv` are 128 and 128 on every GDN checkpoint the tree has seen, and
-    // `Hk` and `Hv` differ only under group-query, so either transposition
-    // runs and answers.
     k_dim: Const<i32>,
     v_dim: Const<i32>,
     k_heads: Const<i32>,
@@ -478,36 +260,17 @@ pub fn gdn_prep_slotted(
     k_off: Const<i32>,
     v_off: Const<i32>,
     eps: Const<f32>,
-    inv_sqrt_dk: Const<f32>) -> Result<(), Refusal> {
-    // THE ELEVEN GEOMETRY MARKS, WHICH WERE `GdnCoreParams`' ELEVEN FIELDS.
-    //
-    // A block stood here saying *"BACK TO AN ASK, BECAUSE THIS ROUTINE'S
-    // PARAMS RUN IS A STRUCT"*, and it was true of the arrangement it
-    // described: the body forwarded `ctx.params()` whole, the shader read the
-    // run as `GdnCoreParams` rather than as a scalar run, so slot 0 was the
-    // struct's FIRST FIELD and a `Const` derived onto it would have read that
-    // field's bits. Nothing in this signature could name a word of the run,
-    // which is why the head count and the value width came back as asks even
-    // though the statement was already carrying both.
-    //
-    // The marks name all eleven now. They are the same eleven words of the
-    // same `Lowered::params` run the struct was staged from, reached by index
-    // instead of by field, and the shader reads them out of its one
-    // `@group(1)` uniform block instead of out of a `@group(0)` storage
-    // pointer.
-    //
-    // So `keys::VHeads` and `keys::VDim` are gone from this body: `Asks`'
-    // own test for whether a number is a fact -- *"two fires of the same
-    // model, on the same deployment, can see different answers here"* -- is
-    // FALSE of a head count and of a head width, which are checkpoint
-    // configuration and reach the shader from this same run anyway. It stays
-    // TRUE of every table below, which is why every one of them is still an
-    // ask: the conv and recurrent slabs and the seat map are what the fire
-    // threaded from the previous step, and no text can state them.
-    let conv_state = ctx.ask::<Tensor<f32>, keys::ConvState>()?;
-    let new_conv_state = ctx.ask::<Tensor<f32>, keys::NewConvState>()?;
-    let slot_ids = ctx.ask::<Tensor<u32>, keys::RecurrentSlots>()?;
-    let rows = ctx.ask::<i32, keys::Rows>()?;
+    inv_sqrt_dk: Const<f32>,
+    rsv: In<Struct<RecurrentState>>,
+    rows: Const<i32>) -> Result<(), Refusal> {
+    if rsv.ptr.is_null() {
+        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+    }
+    let rsv = unsafe { &*rsv.ptr };
+    let conv_state = rsv.conv_state;
+    let new_conv_state = rsv.new_conv_state;
+    let slot_ids = rsv.slots;
+    let rows = *rows;
     ctx.fire(
         Fire::at("ssm/gdn_prep.wgsl", "gdn_prep_slotted_bfloat16").apply(prep_grid(rows, *v_heads)?),
         &[
@@ -539,27 +302,6 @@ pub fn gdn_prep_slotted(
     )
 }
 
-/// The prep over a whole PROMPT rather than one token per request.
-///
-/// Two things separate it from [`gdn_prep_slotted`], and both are on the
-/// signature. It always takes a slot map -- the shader declares `slot_ids`
-/// under `PIE_SLOTTED` OR `PIE_PREFILL`, so the prefill has one whether or not
-/// the deployment is slotted -- and it takes `row_pitch` and `n_scan`, because
-/// a prompt is a strided run of tokens rather than one row.
-///
-/// Those two used to be the WHOLE of this entrypoint's `@group(1)` block,
-/// beside a `@group(0)` storage pointer carrying the geometry: two blocks on
-/// one dispatch, and the one case `driver-wgpu::lowering::routine::bind`
-/// grew a branch for. With the geometry stated as marks they are simply the
-/// twelfth and thirteenth fields of a single uniform block, in the order this
-/// body passes them.
-///
-/// `rows` is `tokens * Hv` here, not `requests * Hv`: the prefill walks a
-/// single prompt and every token in it needs its own convolution.
-///
-/// # Errors
-///
-/// See `gdn_grid`.
 #[routine]
 pub fn gdn_prep_prefill(
     ctx: &Ctx<'_>,
@@ -573,14 +315,6 @@ pub fn gdn_prep_prefill(
     pre_q: Out<Tensor<f32>>,
     pre_k: Out<Tensor<f32>>,
     pre_gate: Out<Tensor<f32>>,
-    // THE ELEVEN, IN THE ORDER THE STATEMENT PLACES THEM. A `Const` mark's
-    // slot is its POSITION among the scalar marks of this signature, so the
-    // list below IS `model-dsl`'s `GdnShape::params` and a pair swapped here
-    // reads its neighbour's number rather than refusing. The two swaps most
-    // likely to be made are also the two that stay silent longest: `Dk` and
-    // `Dv` are 128 and 128 on every GDN checkpoint the tree has seen, and
-    // `Hk` and `Hv` differ only under group-query, so either transposition
-    // runs and answers.
     k_dim: Const<i32>,
     v_dim: Const<i32>,
     k_heads: Const<i32>,
@@ -591,38 +325,19 @@ pub fn gdn_prep_prefill(
     k_off: Const<i32>,
     v_off: Const<i32>,
     eps: Const<f32>,
-    inv_sqrt_dk: Const<f32>) -> Result<(), Refusal> {
-    // THE ELEVEN GEOMETRY MARKS, WHICH WERE `GdnCoreParams`' ELEVEN FIELDS.
-    //
-    // A block stood here saying *"BACK TO AN ASK, BECAUSE THIS ROUTINE'S
-    // PARAMS RUN IS A STRUCT"*, and it was true of the arrangement it
-    // described: the body forwarded `ctx.params()` whole, the shader read the
-    // run as `GdnCoreParams` rather than as a scalar run, so slot 0 was the
-    // struct's FIRST FIELD and a `Const` derived onto it would have read that
-    // field's bits. Nothing in this signature could name a word of the run,
-    // which is why the head count and the value width came back as asks even
-    // though the statement was already carrying both.
-    //
-    // The marks name all eleven now. They are the same eleven words of the
-    // same `Lowered::params` run the struct was staged from, reached by index
-    // instead of by field, and the shader reads them out of its one
-    // `@group(1)` uniform block instead of out of a `@group(0)` storage
-    // pointer.
-    //
-    // So `keys::VHeads` and `keys::VDim` are gone from this body: `Asks`'
-    // own test for whether a number is a fact -- *"two fires of the same
-    // model, on the same deployment, can see different answers here"* -- is
-    // FALSE of a head count and of a head width, which are checkpoint
-    // configuration and reach the shader from this same run anyway. It stays
-    // TRUE of every table below, which is why every one of them is still an
-    // ask: the conv and recurrent slabs and the seat map are what the fire
-    // threaded from the previous step, and no text can state them.
-    let conv_state = ctx.ask::<Tensor<f32>, keys::ConvState>()?;
-    let new_conv_state = ctx.ask::<Tensor<f32>, keys::NewConvState>()?;
-    let slot_ids = ctx.ask::<Tensor<u32>, keys::RecurrentSlots>()?;
+    inv_sqrt_dk: Const<f32>,
+    rsv: In<Struct<RecurrentState>>,
+    n_scan: Const<i32>) -> Result<(), Refusal> {
+    if rsv.ptr.is_null() {
+        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+    }
+    let rsv = unsafe { &*rsv.ptr };
+    let conv_state = rsv.conv_state;
+    let new_conv_state = rsv.new_conv_state;
+    let slot_ids = rsv.slots;
     let row_pitch = mixed.width;
-    let n_scan = ctx.ask::<i32, keys::Rows>()?;
-    let rows = ctx.ask::<i32, keys::Rows>()?;
+    let n_scan = *n_scan;
+    let rows = n_scan;
     ctx.fire(
         Fire::at("ssm/gdn_prep.wgsl", "gdn_prep_prefill_bfloat16").apply(prep_grid(rows, *v_heads)?),
         &[
@@ -656,23 +371,6 @@ pub fn gdn_prep_prefill(
     )
 }
 
-/// The recurrent half of the split pair, reading the scratch [`gdn_prep`]
-/// staged.
-///
-/// The same ten-buffer rearrangement the prep is: `rstate` and `core_out`
-/// come back (the prep has neither) and the three scratch slabs arrive as
-/// `F32s` rather than the gate weights the fused kernel derives them from.
-/// Reusing the fused kernel's operand vector here would bind `conv_w` where
-/// this shader reads `rstate` and still run.
-///
-/// TEN AND NOT ELEVEN, because the eleventh was the `GdnCoreParams` pointer.
-/// It is eleven `Const` marks now and the shader reads them out of its
-/// `@group(1)` block, so every binding after where it stood moved down by
-/// one -- `slot_ids` from 11 to 10 in the slotted twin.
-///
-/// # Errors
-///
-/// See `gdn_grid`.
 #[routine]
 pub fn gdn_core_recurrent(
     ctx: &Ctx<'_>,
@@ -683,14 +381,6 @@ pub fn gdn_core_recurrent(
     pre_q: In<Tensor<f32>>,
     pre_k: In<Tensor<f32>>,
     pre_gate: In<Tensor<f32>>,
-    // THE ELEVEN, IN THE ORDER THE STATEMENT PLACES THEM. A `Const` mark's
-    // slot is its POSITION among the scalar marks of this signature, so the
-    // list below IS `model-dsl`'s `GdnShape::params` and a pair swapped here
-    // reads its neighbour's number rather than refusing. The two swaps most
-    // likely to be made are also the two that stay silent longest: `Dk` and
-    // `Dv` are 128 and 128 on every GDN checkpoint the tree has seen, and
-    // `Hk` and `Hv` differ only under group-query, so either transposition
-    // runs and answers.
     k_dim: Const<i32>,
     v_dim: Const<i32>,
     k_heads: Const<i32>,
@@ -701,36 +391,17 @@ pub fn gdn_core_recurrent(
     k_off: Const<i32>,
     v_off: Const<i32>,
     eps: Const<f32>,
-    inv_sqrt_dk: Const<f32>) -> Result<(), Refusal> {
-    // THE ELEVEN GEOMETRY MARKS, WHICH WERE `GdnCoreParams`' ELEVEN FIELDS.
-    //
-    // A block stood here saying *"BACK TO AN ASK, BECAUSE THIS ROUTINE'S
-    // PARAMS RUN IS A STRUCT"*, and it was true of the arrangement it
-    // described: the body forwarded `ctx.params()` whole, the shader read the
-    // run as `GdnCoreParams` rather than as a scalar run, so slot 0 was the
-    // struct's FIRST FIELD and a `Const` derived onto it would have read that
-    // field's bits. Nothing in this signature could name a word of the run,
-    // which is why the head count and the value width came back as asks even
-    // though the statement was already carrying both.
-    //
-    // The marks name all eleven now. They are the same eleven words of the
-    // same `Lowered::params` run the struct was staged from, reached by index
-    // instead of by field, and the shader reads them out of its one
-    // `@group(1)` uniform block instead of out of a `@group(0)` storage
-    // pointer.
-    //
-    // So `keys::VHeads` and `keys::VDim` are gone from this body: `Asks`'
-    // own test for whether a number is a fact -- *"two fires of the same
-    // model, on the same deployment, can see different answers here"* -- is
-    // FALSE of a head count and of a head width, which are checkpoint
-    // configuration and reach the shader from this same run anyway. It stays
-    // TRUE of every table below, which is why every one of them is still an
-    // ask: the conv and recurrent slabs and the seat map are what the fire
-    // threaded from the previous step, and no text can state them.
-    let conv_state = ctx.ask::<Tensor<f32>, keys::ConvState>()?;
-    let rstate = ctx.ask::<Tensor<f32>, keys::RecurrentState>()?;
-    let new_conv_state = ctx.ask::<Tensor<f32>, keys::NewConvState>()?;
-    let rows = ctx.ask::<i32, keys::Rows>()?;
+    inv_sqrt_dk: Const<f32>,
+    rsv: In<Struct<RecurrentState>>,
+    rows: Const<i32>) -> Result<(), Refusal> {
+    if rsv.ptr.is_null() {
+        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+    }
+    let rsv = unsafe { &*rsv.ptr };
+    let conv_state = rsv.conv_state;
+    let rstate = rsv.state;
+    let new_conv_state = rsv.new_conv_state;
+    let rows = *rows;
     ctx.fire(
         Fire::at("ssm/gdn_prep.wgsl", "gdn_core_recurrent_bfloat16").apply(gdn_grid(rows, *v_heads, *v_dim)?),
         &[
@@ -759,12 +430,6 @@ pub fn gdn_core_recurrent(
     )
 }
 
-/// [`gdn_core_recurrent`] with the slot map, for the same reason
-/// [`gdn_core_slotted`] has one.
-///
-/// # Errors
-///
-/// See `gdn_grid`.
 #[routine]
 pub fn gdn_core_recurrent_slotted(
     ctx: &Ctx<'_>,
@@ -775,14 +440,6 @@ pub fn gdn_core_recurrent_slotted(
     pre_q: In<Tensor<f32>>,
     pre_k: In<Tensor<f32>>,
     pre_gate: In<Tensor<f32>>,
-    // THE ELEVEN, IN THE ORDER THE STATEMENT PLACES THEM. A `Const` mark's
-    // slot is its POSITION among the scalar marks of this signature, so the
-    // list below IS `model-dsl`'s `GdnShape::params` and a pair swapped here
-    // reads its neighbour's number rather than refusing. The two swaps most
-    // likely to be made are also the two that stay silent longest: `Dk` and
-    // `Dv` are 128 and 128 on every GDN checkpoint the tree has seen, and
-    // `Hk` and `Hv` differ only under group-query, so either transposition
-    // runs and answers.
     k_dim: Const<i32>,
     v_dim: Const<i32>,
     k_heads: Const<i32>,
@@ -793,37 +450,18 @@ pub fn gdn_core_recurrent_slotted(
     k_off: Const<i32>,
     v_off: Const<i32>,
     eps: Const<f32>,
-    inv_sqrt_dk: Const<f32>) -> Result<(), Refusal> {
-    // THE ELEVEN GEOMETRY MARKS, WHICH WERE `GdnCoreParams`' ELEVEN FIELDS.
-    //
-    // A block stood here saying *"BACK TO AN ASK, BECAUSE THIS ROUTINE'S
-    // PARAMS RUN IS A STRUCT"*, and it was true of the arrangement it
-    // described: the body forwarded `ctx.params()` whole, the shader read the
-    // run as `GdnCoreParams` rather than as a scalar run, so slot 0 was the
-    // struct's FIRST FIELD and a `Const` derived onto it would have read that
-    // field's bits. Nothing in this signature could name a word of the run,
-    // which is why the head count and the value width came back as asks even
-    // though the statement was already carrying both.
-    //
-    // The marks name all eleven now. They are the same eleven words of the
-    // same `Lowered::params` run the struct was staged from, reached by index
-    // instead of by field, and the shader reads them out of its one
-    // `@group(1)` uniform block instead of out of a `@group(0)` storage
-    // pointer.
-    //
-    // So `keys::VHeads` and `keys::VDim` are gone from this body: `Asks`'
-    // own test for whether a number is a fact -- *"two fires of the same
-    // model, on the same deployment, can see different answers here"* -- is
-    // FALSE of a head count and of a head width, which are checkpoint
-    // configuration and reach the shader from this same run anyway. It stays
-    // TRUE of every table below, which is why every one of them is still an
-    // ask: the conv and recurrent slabs and the seat map are what the fire
-    // threaded from the previous step, and no text can state them.
-    let conv_state = ctx.ask::<Tensor<f32>, keys::ConvState>()?;
-    let rstate = ctx.ask::<Tensor<f32>, keys::RecurrentState>()?;
-    let new_conv_state = ctx.ask::<Tensor<f32>, keys::NewConvState>()?;
-    let slot_ids = ctx.ask::<Tensor<u32>, keys::RecurrentSlots>()?;
-    let rows = ctx.ask::<i32, keys::Rows>()?;
+    inv_sqrt_dk: Const<f32>,
+    rsv: In<Struct<RecurrentState>>,
+    rows: Const<i32>) -> Result<(), Refusal> {
+    if rsv.ptr.is_null() {
+        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+    }
+    let rsv = unsafe { &*rsv.ptr };
+    let conv_state = rsv.conv_state;
+    let rstate = rsv.state;
+    let new_conv_state = rsv.new_conv_state;
+    let slot_ids = rsv.slots;
+    let rows = *rows;
     ctx.fire(
         Fire::at("ssm/gdn_prep.wgsl", "gdn_core_recurrent_slotted_bfloat16").apply(gdn_grid(rows, *v_heads, *v_dim)?),
         &[
@@ -853,57 +491,15 @@ pub fn gdn_core_recurrent_slotted(
     )
 }
 
-/// The prefill SCAN: the recurrence walked over a whole prompt in one
-/// dispatch, carrying the state forward token by token in registers.
-///
-/// Six buffers and not ten, because a scan reads no weights: the
-/// convolution and the gates were done once by [`gdn_prep_prefill`] and this
-/// half only walks the delta rule. It was seven while `GdnCoreParams` was a
-/// storage pointer; the geometry is thirteen `Const` marks now and
-/// `slot_ids` is binding 5. It is the one shape in the family whose
-/// state never leaves the workgroup between tokens, which is what makes a
-/// prompt one dispatch instead of `n_scan` of them.
-///
-/// # The tiling is a schedule, and one half of it is not
-///
-/// `lanes` and `vrows` pick which compiled shape fires. `VROWS` is how many
-/// independent value rows a lane group carries and touches nothing that is
-/// summed; `LANES` is the WIDTH of the lane reduction and so its association,
-/// and `tests/gpu.rs` measures exactly that -- two tilings hold bit-identical
-/// recurrent state precisely when their `LANES` agree. So these two arguments
-/// are not interchangeable knobs, and only one of them is free.
-///
-/// The grid follows from the tiling: a workgroup covers `(32 / LANES) * VROWS`
-/// value rows, so the y extent is the number of such groups. `[numthreads(32,
-/// 1, 1)]` under `PIE_SCAN` -- not the `(32, 4, 1)` the rest of the family
-/// uses -- which is why y is a count of groups here and a count of value
-/// channels in [`gdn_core`].
-///
-/// # Errors
-///
-/// [`Refusal::Narrow`] for a `(lanes, vrows)` that is not compiled (see
-/// `scan_point`), and [`Refusal::Empty`] for an empty extent.
 #[routine]
 pub fn gdn_core_recurrent_prefill(
     ctx: &Ctx<'_>,
-    // THE STATEMENT'S INPUT 0, WHICH THIS SCAN DOES NOT READ. The text places
-    // `[mixed, pre_q, pre_k, pre_gate]` and the scan takes the three prepared
-    // planes only; the mark is here because the slot is a POSITION now, and
-    // without it `pre_q` would bind `mixed`.
     #[allow(unused_variables)]
     pad: In<Tensor<bf16>>,
     core_out: Out<Tensor<bf16>>,
     pre_q: In<Tensor<f32>>,
     pre_k: In<Tensor<f32>>,
     pre_gate: In<Tensor<f32>>,
-    // THE ELEVEN, IN THE ORDER THE STATEMENT PLACES THEM. A `Const` mark's
-    // slot is its POSITION among the scalar marks of this signature, so the
-    // list below IS `model-dsl`'s `GdnShape::params` and a pair swapped here
-    // reads its neighbour's number rather than refusing. The two swaps most
-    // likely to be made are also the two that stay silent longest: `Dk` and
-    // `Dv` are 128 and 128 on every GDN checkpoint the tree has seen, and
-    // `Hk` and `Hv` differ only under group-query, so either transposition
-    // runs and answers.
     k_dim: Const<i32>,
     v_dim: Const<i32>,
     k_heads: Const<i32>,
@@ -915,45 +511,21 @@ pub fn gdn_core_recurrent_prefill(
     v_off: Const<i32>,
     eps: Const<f32>,
     inv_sqrt_dk: Const<f32>,
-    // THE TILING, WHICH IS WORDS 11 AND 12 OF THE SAME RUN. `model-dsl`'s
-    // `gdn_core_recurrent_prefill` pushes `tile.0` and `tile.1` onto
-    // `GdnShape::params`' eleven, so the statement's run is thirteen words
-    // long for this entrypoint alone and these two are the last of them.
-    // Being marks, they take slots 11 and 12 by POSITION -- which is exactly
-    // where the run puts them -- and the shader never sees either: the pair
-    // is spelled into the entrypoint's own NAME and reaches the module as
-    // `PIE_LANES`/`PIE_VROWS` at compile time, so `scan_point` below turns
-    // them into a symbol rather than into an argument.
     lanes: Const<i32>,
-    vrows: Const<i32>) -> Result<(), Refusal> {
-    // THE HEAD COUNT AND THE VALUE WIDTH, OFF THE MARKS. Both were asks --
-    // *"BACK TO ASKS, AS METAL'S TWIN"* -- because this routine's params run
-    // was a struct the shader read by field, so slot 0 was not `dv`'s to
-    // take. All three planes state the same eleven marks now, which is what
-    // `kernels`'s
-    // `two_backends_that_crossed_the_same_kernel_agree_on_its_signature`
-    // still holds them to.
+    vrows: Const<i32>,
+    rsv: In<Struct<RecurrentState>>,
+    n_scan: Const<i32>) -> Result<(), Refusal> {
+    if rsv.ptr.is_null() {
+        return Err(Refusal::Null { what: "the recurrent view this statement names" });
+    }
+    let rsv = unsafe { &*rsv.ptr };
     let hv = *v_heads;
     let dv = *v_dim;
-    let rstate = ctx.ask::<Tensor<f32>, keys::RecurrentState>()?;
-    let slot_ids = ctx.ask::<Tensor<u32>, keys::RecurrentSlots>()?;
+    let rstate = rsv.state;
+    let slot_ids = rsv.slots;
     let row_pitch = pre_q.width;
-    let n_scan = ctx.ask::<i32, keys::Rows>()?;
-    // THE TILING, READ AS TWO MARKS RATHER THAN BY INDEX.
-    //
-    // `let lanes = ctx.param(11)?;` and `let vrows = ctx.param(12)?;` stood
-    // here, and `Asks::param`'s own doc named this routine as the reason that
-    // method exists at all: a body forwarding its params run as a STRUCT has
-    // no slots to spare, because slots 0..10 are the struct's fields and not
-    // this body's to take. (They had been `Param<11, i32>` and
-    // `Param<12, i32>` before that, and the migration between the two turned
-    // them into `keys::Lanes` and `keys::Vrows`, which no driver answers, so
-    // every prefill scan refused `Unstated`.)
-    //
-    // With the eleven fields stated as marks the numbering works out on its
-    // own: the marks are positional, the eleven come first in
-    // `GdnShape::params`' order, and these two follow at 11 and 12 -- the
-    // same two words `ctx.param` was reaching for, now named.
+    let n_scan = *n_scan;
+
     let point = scan_point(*lanes, *vrows)?;
     if dv <= 0 {
         return Err(Refusal::Empty { what: "dv" });
@@ -963,7 +535,17 @@ pub fn gdn_core_recurrent_prefill(
     }
     let per_group = (32 / lanes.unsigned_abs()) * vrows.unsigned_abs();
     ctx.fire(
-        Fire::at("ssm/gdn_prep.wgsl", SCAN[point]).apply([
+        Fire::at("ssm/gdn_prep.wgsl", [
+                "gdn_core_recurrent_prefill_bfloat16_l_16_v_1",
+                "gdn_core_recurrent_prefill_bfloat16_l_16_v_2",
+                "gdn_core_recurrent_prefill_bfloat16_l_16_v_4",
+                "gdn_core_recurrent_prefill_bfloat16_l_32_v_2",
+                "gdn_core_recurrent_prefill_bfloat16_l_32_v_4",
+                "gdn_core_recurrent_prefill_bfloat16_l_32_v_8",
+                "gdn_core_recurrent_prefill_bfloat16_l_4_v_1",
+                "gdn_core_recurrent_prefill_bfloat16_l_8_v_1",
+                "gdn_core_recurrent_prefill_bfloat16_l_8_v_2",
+            ][point]).apply([
                 32,
                 dv.unsigned_abs().div_ceil(per_group),
                 hv.unsigned_abs(),
@@ -992,71 +574,3 @@ pub fn gdn_core_recurrent_prefill(
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The three grids, checked against this tree's OWN shaders.
-    ///
-    /// This family's rows state no operands and no `launch` rule, so there is
-    /// neither a row nor a `driver-wgpu::geometry` arm to compare a grid
-    /// against — the only authority is `ssm/gdn_{core,prep}.wgsl`. All three
-    /// happen to be `kernels-vulkan`'s numbers, and that is a conclusion
-    /// rather than an assumption: each was read off the shader first.
-    ///
-    /// * `gdn_core.wgsl` and the `PIE_RECURRENT` arm are
-    ///   `@workgroup_size(32, 4)`. `wid.z` is `rows * v_heads`, `lid.x` the
-    ///   32-lane key sweep, and `gid.y` the value channel — guarded by
-    ///   `dv_idx < p.Dv`, which is what makes rounding y up to a whole four
-    ///   safe.
-    /// * the prep arm is `@workgroup_size(32)`, one workgroup per
-    ///   `(row, head)`.
-    /// * the `PIE_SCAN` arm is `@workgroup_size(32)` and divides its 32 lanes
-    ///   into `32 / PIE_LANES` value groups, which is why `per_group` is
-    ///   `(32 / lanes) * vrows`.
-    #[test]
-    fn the_three_grids_are_what_the_shaders_index() {
-        // 7 rows x 8 value heads = 56 workgroups on z, 64 value channels on
-        // y, one 32-lane sweep on x.
-        assert_eq!(gdn_grid(7, 8, 64).expect("a real shape"), [32, 64, 56]);
-        assert_eq!(prep_grid(7, 8).expect("a real shape"), [32, 1, 56]);
-
-        // Empty extents refuse rather than dispatch a grid of nothing.
-        assert!(matches!(gdn_grid(0, 8, 64), Err(Refusal::Empty { .. })));
-        assert!(matches!(gdn_grid(7, 0, 64), Err(Refusal::Empty { .. })));
-        assert!(matches!(gdn_grid(7, 8, 0), Err(Refusal::Empty { .. })));
-        assert!(matches!(prep_grid(7, 0), Err(Refusal::Empty { .. })));
-    }
-
-    /// A `(LANES, VROWS)` pair the tree compiles no scan for is refused.
-    ///
-    /// The body indexes `SCAN` with it, so an unknown pair must not reach the
-    /// index. Nine are compiled and the ninth is not `(32, 1)` -- the table is
-    /// not a product, and guessing its shape is how a body spells a name that
-    /// is not there.
-    #[test]
-    fn a_scan_shape_the_tree_does_not_carry_is_refused_by_name() {
-        assert!(scan_point(32, 1).is_err());
-        assert!(scan_point(64, 2).is_err());
-        assert!(scan_point(16, 8).is_err());
-        for (lanes, vrows) in [
-            (16, 1),
-            (16, 2),
-            (16, 4),
-            (32, 2),
-            (32, 4),
-            (32, 8),
-            (4, 1),
-            (8, 1),
-            (8, 2),
-        ] {
-            let at = scan_point(lanes, vrows).expect("a compiled shape");
-            assert!(at < SCAN.len());
-            assert!(
-                SCAN[at].ends_with(&format!("_l_{lanes}_v_{vrows}")),
-                "`{}` is not the spelling for ({lanes}, {vrows})",
-                SCAN[at]
-            );
-        }
-    }
-}

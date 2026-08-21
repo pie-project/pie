@@ -155,13 +155,19 @@ pub(crate) fn derive_sites(plan: &ForwardPlan) -> Vec<Site> {
     let mut expert_params: Vec<(u32, u32)> = Vec::new();
 
     for op in &plan.ops {
-        let OpKind::Matmul {
-            selector: Some(selector),
-            ..
-        } = op.kind
-        else {
+        // The expert-indexed grouped GEMM, by ITS SYMBOL: the semantic
+        // `Matmul { selector }` retired with the no-ask contract, and the
+        // selector convention survives as the statement's LAST input.
+        let OpKind::Launch { kernel, .. } = &op.kind else {
             continue;
         };
+        if kernel != "moe::moe_grouped_gemm_bf16" {
+            continue;
+        }
+        let selector = *op
+            .inputs
+            .last()
+            .unwrap_or_else(|| panic!("{}: a grouped GEMM states a selector", plan.family));
         let producer = plan
             .ops
             .iter()
@@ -173,12 +179,20 @@ pub(crate) fn derive_sites(plan: &ForwardPlan) -> Vec<Site> {
                     plan.family
                 )
             });
-        let OpKind::TopK { k } = producer.kind else {
+        let OpKind::Launch { kernel: producer_kernel, params, .. } = &producer.kind else {
             panic!(
-                "{}: selector value {selector} produced by {:?}, not TopK",
+                "{}: selector value {selector} produced by {:?}, not the router top-k",
                 plan.family, producer.kind
             );
         };
+        assert_eq!(
+            producer_kernel, "moe::topk_softmax_bf16",
+            "{}: selector value {selector} produced by `{producer_kernel}`, not the router top-k",
+            plan.family
+        );
+        let k = *params
+            .first()
+            .unwrap_or_else(|| panic!("{}: the top-k statement carries k", plan.family));
         let logits = *producer
             .inputs
             .first()

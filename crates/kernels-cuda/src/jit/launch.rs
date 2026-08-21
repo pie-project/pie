@@ -5,20 +5,8 @@ use cudarc::driver::sys as dr;
 use crate::jit::Launch;
 use crate::jit::Error;
 
-/// What a launch may ask for in dynamic shared memory before anyone has asked
-/// the driver for more.
 const DEFAULT_DYNAMIC_SMEM: u32 = 48 * 1024;
 
-/// Issue one launch.
-///
-/// Always `cuLaunchKernelEx`: it is the form that can carry the cooperative
-/// attribute, and it is the same call for a launch that does not.
-///
-/// # Safety
-///
-/// `function` must be a live entry point of a loaded module, `slots` one
-/// pointer per kernel parameter each addressing a cell of the parameter's
-/// exact type, and `stream` a live stream. **Nothing checks any of it.**
 pub unsafe fn issue(
     function: dr::CUfunction,
     launch: Launch,
@@ -50,7 +38,6 @@ pub unsafe fn issue(
         numAttrs: n as core::ffi::c_uint,
     };
 
-    // SAFETY: the caller's obligations, forwarded. `config` outlives the call.
     let code = unsafe {
         dr::cuLaunchKernelEx(
             std::ptr::addr_of!(config),
@@ -66,16 +53,9 @@ pub unsafe fn issue(
     }
 }
 
-/// `cuFuncSetAttribute`, once per (device, entry point), above the high-water
-/// mark already granted.
-///
-/// Keyed by function ADDRESS, which is sound only because a module is never
-/// unloaded: the driver reuses addresses, so an eviction would make this memo
-/// answer for a different kernel.
 fn raise_dynamic_smem_cap(function: dr::CUfunction, bytes: u32) -> Result<(), Error> {
     let mut device: dr::CUdevice = 0;
-    // SAFETY: `device` is a live out-parameter and the call reads the calling
-    // thread's current context.
+
     let code = unsafe { dr::cuCtxGetDevice(&raw mut device) };
     if code != dr::CUresult::CUDA_SUCCESS {
         return Err(Error::Driver {
@@ -91,7 +71,7 @@ fn raise_dynamic_smem_cap(function: dr::CUfunction, bytes: u32) -> Result<(), Er
     {
         return Ok(());
     }
-    // SAFETY: `function` came from a loaded module and outlives the call.
+
     let code = unsafe {
         dr::cuFuncSetAttribute(
             function,
@@ -113,6 +93,5 @@ fn raise_dynamic_smem_cap(function: dr::CUfunction, bytes: u32) -> Result<(), Er
     Ok(())
 }
 
-/// Every (device, entry point) granted more than the default, and how much.
 static GRANTED: std::sync::Mutex<Vec<((dr::CUdevice, usize), u32)>> =
     std::sync::Mutex::new(Vec::new());

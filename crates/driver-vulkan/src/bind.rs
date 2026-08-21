@@ -107,15 +107,6 @@ impl Holds for Held<'_, '_, '_> {
         self.o.weight(n)
     }
 
-    fn params_block(&mut self) -> u32 {
-        // VULKAN HAS NO PARAMS BLOCK to bind. Its scalars ride a push
-        // constant range the encoder packs from the bound list, so the block
-        // a metal or wgpu signature names as an operand is not an operand
-        // here at all -- and a routine that names one gets this driver's
-        // unbound placeholder, which is what `Handles::params_block` has
-        // always returned.
-        self.o.params_block()
-    }
 
     fn param(&self, n: usize) -> Result<i32, Refusal> {
         self.o.param(n)

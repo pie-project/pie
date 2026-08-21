@@ -1616,7 +1616,9 @@ fn tokenizer_path(source: &Source) -> Option<PathBuf> {
 /// a tie as the ABSENCE of that name (`crates/model/src/catalog.rs`), so the
 /// artifact is refused by the one row that describes it:
 ///
-///     matches no catalog row: qwen3-0.6b: unexpected lm_head
+/// ```text
+/// matches no catalog row: qwen3-0.6b: unexpected lm_head
+/// ```
 ///
 /// with every other name and every extent agreeing. Carrying the duplicate
 /// through therefore costs the artifact its identity, and the weight it buys

@@ -374,14 +374,14 @@ impl ScoreOps for LiveScoreOps {
             "attn_score_fold_heads_dev",
             attn_score_fold_heads(
                 &ctx_on(self.stream),
-                raw,
-                score_indptr_d,
-                kv_page_indptr_d,
-                kv_last_page_lens_d,
+                kernels::routine::In { ptr: raw, rows: 0, width: 0 },
+                kernels::routine::In { ptr: score_indptr_d, rows: 0, width: 0 },
+                kernels::routine::In { ptr: kv_page_indptr_d, rows: 0, width: 0 },
+                kernels::routine::In { ptr: kv_last_page_lens_d, rows: 0, width: 0 },
                 page_size,
                 num_requests,
                 num_q_heads,
-                folded,
+                kernels::routine::Out { ptr: folded, rows: 0, width: 0 },
             ),
         );
     }

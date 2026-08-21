@@ -227,7 +227,19 @@ fn the_sharded_quantized_layer_lowers() {
     ];
     let out = lower(&plan, &rows, Fire::default())
         .expect("a sharded, quantized layer lowers like any other");
-    assert!(out.launches.len() >= 8);
+    // Eight is the number of ROWS above, not a measurement of this lowering,
+    // which emits 10. Reading the plan's row count back out of its output is
+    // a floor that can only say "at least one launch per layer" -- true of
+    // almost any lowering, and silent about the two that are not per-layer.
+    // It also carried no message at all, so a failure said `assertion failed`
+    // and named a length.
+    assert_eq!(
+        out.launches.len(),
+        10,
+        "a sharded, quantized layer lowered to {} launches, not 10 -- eight \
+         per-layer and two that are not",
+        out.launches.len()
+    );
     let buffers = Buffers::assign(&plan, &rows);
     assert!(buffers.bytes > 0, "and gets an arena");
 }

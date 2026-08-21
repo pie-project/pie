@@ -465,7 +465,27 @@ rust-version = "1.91"
 # is an `rlib` (no `staticlib` a foreign linker would half-swallow), and the
 # collection was measured surviving `lto = "thin"`, `lto = "fat"`,
 # `strip = "symbols"` and `--gc-sections`.
+#
+# IT DOES NOT REACH `wasm32-unknown-unknown`, and that is why the crate below
+# is here beside it. A distributed slice is a link SECTION whose bounds the
+# linker is asked for, and the wasm object format offers no such facility, so
+# `linkme` refuses the target by name: "distributed_slice is not implemented
+# for this platform" (dtolnay/linkme#86 -- not an omission, a missing
+# primitive). `driver-wgpu/tests/browser.rs` claims the kernel table reaches a
+# browser, so a plane with no table there would be that claim quietly ending.
 linkme = "0.3"
+# THE SAME REGISTRY, FOR WASM ONLY. `inventory` collects by running a
+# constructor per row before `main` -- on this target through
+# `__wasm_call_ctors` -- and builds a linked list the first read walks.
+#
+# That is strictly worse than a link section on every count the note above
+# gives: it costs life-before-main, it turns a link-time constant into a
+# run-time initialisation, and it is a list rather than a contiguous slice.
+# It is used ONLY where the better mechanism does not exist. `#[routine]`
+# emits a `linkme` row on every target with a linker to ask and an
+# `inventory` row on wasm, both behind the same `cfg`, so no target carries
+# two rows for one `fn` and none carries zero.
+inventory = "0.3"
 ztensor = "2.1.1"
 ztensor-compat = "2.1.1"
 

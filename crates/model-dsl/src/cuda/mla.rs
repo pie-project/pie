@@ -51,9 +51,32 @@ builder! {
 
 
     /// `kernels::attn::dsa_index_knorm_rope_bf16`.
-    pub fn dsa_index_knorm_rope(idx_k: &Val, head_dim: u32) -> Val {
+    ///
+    /// THE NORM IS A LAYERNORM, so it takes a weight AND a bias, and both
+    /// are operands rather than facts. The kernel
+    /// (`attn/dsa_indexer.cuh`'s `index_knorm_rope`) subtracts the row mean
+    /// before scaling and its last statement is
+    /// `row[d] = x * w[d] + b[d]` -- two banks it dereferences per element,
+    /// not one bank and a constant. A statement that places neither leaves
+    /// the arm binding whatever the two weight slots happen to hold.
+    ///
+    /// They arrive by NAME because the DSA indexer's tensors have no
+    /// spelling in any manifest: `glm_5/project.rs` says why, and says it
+    /// about this exact group of weights -- the checkpoint's own names for
+    /// the indexer are not written down anywhere in this tree, so a
+    /// manifest row for one would be a guess that turns a matching
+    /// checkpoint into a `Fault::Missing`. `tests/seam_names.rs` records
+    /// them as names no builder can yet emit, which is where this pair
+    /// goes too.
+    pub fn dsa_index_knorm_rope(
+        idx_k: &Val,
+        k_norm_weight: &str,
+        k_norm_bias: &str,
+        head_dim: u32,
+    ) -> Val {
         symbol: "attn::dsa_index_knorm_rope_bf16",
         on: idx_k,
+        weights: [k_norm_weight, k_norm_bias],
         inputs: [idx_k],
         out: [Dim::Tokens, Dim::Const(head_dim)] as BF16,
         made: "the norm+rope produces its value",

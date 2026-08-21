@@ -706,6 +706,10 @@ impl LlamaLikeMetalFacts {
     pub fn synthetic() -> Self {
         Self {
             qmm_partial_rows: false,
+            // g64/b4, which is the one codec `affine_qmm_t_fp16_precast` is
+            // stamped at -- so the synthetic deployment takes the staged
+            // path, as every MLX checkpoint in this catalog does.
+            qmm_fp16_precast: true,
             fuse_residual_gemv: true,
             paged_multi_batch: true,
             qmm_multi_batch: true,
@@ -730,10 +734,6 @@ impl LlamaLikeMetalFacts {
                 axis: 0,
                 zero_point: true,
             },
-            // g64/b4, which is the one codec `affine_qmm_t_fp16_precast` is
-            // stamped at -- so the synthetic deployment takes the staged
-            // path, as every MLX checkpoint in this catalog does.
-            qmm_fp16_precast: true,
             // FALSE for the generic row, which is llama's answer and not a
             // placeholder: this family's routed checkpoint reordered a
             // next-layer top-k under half rounding. `gemma_like` overrides

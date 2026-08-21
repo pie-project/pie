@@ -32,6 +32,7 @@ native = []
 [dependencies]
 # The routine registry — see the workspace table for why this one.
 linkme = { workspace = true }
+inventory = { workspace = true }
 # `#[routine]`, which builds each row beside its own `fn`.
 kernels-macros = { path = "../kernels-macros" }
 kernels = { path = "../kernels" }

@@ -310,6 +310,11 @@ fn the_catalog_actually_lowers_on_cuda() {
             }
         }
     }
+    // A FLOOR ON PURPOSE, twice. It reads 102 lowerings and 59,866 launches
+    // against 20 and 1,000 -- sixty times the slack on the second. Both
+    // subjects move with any change to any family's graph, which is work
+    // this file is not about and should not fail on. What they catch is a
+    // walk that stopped early, and for that the distance is the point.
     assert!(
         lowered >= 20 && launches >= 1_000,
         "the sweep lowered {lowered} plan(s) and {launches} launch(es); it is \

@@ -21,6 +21,8 @@ pub struct TraceBuilder {
     region_dests: Vec<Vec<ValueId>>,
     /// Whether layer-tagged ops participate in the depth-window axis.
     depth_axis: bool,
+    /// Runtime values this trace names, in mint order ([`RuntimeBinding`]).
+    runtime: Vec<RuntimeBinding>,
 }
 
 impl TraceBuilder {
@@ -35,6 +37,7 @@ impl TraceBuilder {
             value_region_depth: 0,
             region_dests: Vec::new(),
             depth_axis: false,
+            runtime: Vec::new(),
         }
     }
 
@@ -76,6 +79,11 @@ impl TraceBuilder {
             v.raised.as_deref().unwrap_or_default()
         );
         v.shape.clone()
+    }
+
+    /// One value's dtype, for a statement whose result mirrors its operand.
+    pub fn value_dtype(&self, id: ValueId) -> DType {
+        self.values[id as usize].dtype
     }
 
     /// Whether `id` is a raise rather than a tensor. See [`ValueInfo::raised`].
@@ -229,30 +237,6 @@ impl TraceBuilder {
         }
     }
 
-    /// Fold `rhs += residual` into the just-recorded plain matmul when
-    /// that matmul produced `rhs`.
-    pub fn try_fold_residual(&mut self, rhs: ValueId, residual: ValueId) -> bool {
-        let Some(op) = self.ops.last_mut() else {
-            return false;
-        };
-        let foldable = matches!(
-            &op.kind,
-            OpKind::Matmul {
-                beta_one: false,
-                selector: None,
-                ..
-            }
-        ) && op.outputs == [rhs];
-        if !foldable {
-            return false;
-        }
-        let OpKind::Matmul { beta_one, .. } = &mut op.kind else {
-            unreachable!("matched above");
-        };
-        *beta_one = true;
-        op.inputs.push(residual);
-        true
-    }
 
     /// Mint one TENSOR value. A raise is minted by [`Self::push_prep`], which
     /// is the only op that publishes one.
@@ -269,6 +253,73 @@ impl TraceBuilder {
     /// Declare a fragment parameter: a value no op of this trace produces.
     pub fn input(&mut self, shape: Shape, dtype: DType) -> ValueId {
         self.value(shape, dtype)
+    }
+
+    /// `residual += rhs` folded into the producing GEMM when the last op is a
+    /// `from` launch producing `rhs`: the kernel swaps to `to` (the beta-one
+    /// symbol) and takes the residual as an extra operand. The generalised
+    /// form of what `OpKind::Matmul::beta_one` said before the retirement.
+    pub fn try_fold_beta(
+        &mut self,
+        rhs: ValueId,
+        residual: ValueId,
+        from: &str,
+        to: &str,
+    ) -> bool {
+        if self.value_region_depth > 0 {
+            return false;
+        }
+        let Some(op) = self.ops.last_mut() else {
+            return false;
+        };
+        if op.outputs != vec![rhs] {
+            return false;
+        }
+        let OpKind::Launch { kernel, .. } = &mut op.kind else {
+            return false;
+        };
+        if kernel != from {
+            return false;
+        }
+        *kernel = to.to_string();
+        op.inputs.push(residual);
+        true
+    }
+
+    /// Mint the value of one runtime OBJECT — a driver-owned view out of
+    /// `kernels::runtime`'s vocabulary (`"kv_cache"`, `"recurrent_state"`).
+    ///
+    /// Raise-shaped: no rectangle, no dtype, resolved by NAME at bind. The
+    /// statements that read it take it as an operand, positionally, exactly
+    /// as they take what a [`Self::push_prep`] raised — this is the resident
+    /// half of the same channel.
+    pub fn runtime_object(&mut self, name: &str, layer: Option<u32>) -> ValueId {
+        if let Some(b) = self.runtime.iter().find(|b| b.name == name && b.layer == layer) {
+            return b.value;
+        }
+        let id = self.values.len() as ValueId;
+        self.values.push(ValueInfo::raise(name));
+        self.runtime.push(RuntimeBinding { name: name.to_string(), layer, value: id });
+        id
+    }
+
+    /// Mint one runtime TENSOR — a per-fire stream the driver stages
+    /// (`"positions"`, `"qo_indptr"`). A real tensor with rows and a dtype;
+    /// the lowering leaves it backend-bound (`Buffers::NAMED`) and the
+    /// driver answers the name.
+    pub fn runtime_tensor(
+        &mut self,
+        name: &str,
+        layer: Option<u32>,
+        shape: Shape,
+        dtype: DType,
+    ) -> ValueId {
+        if let Some(b) = self.runtime.iter().find(|b| b.name == name && b.layer == layer) {
+            return b.value;
+        }
+        let id = self.value(shape, dtype);
+        self.runtime.push(RuntimeBinding { name: name.to_string(), layer, value: id });
+        id
     }
 
     fn push(
@@ -299,195 +350,19 @@ impl TraceBuilder {
         outputs
     }
 
-    pub fn embed(&mut self, weight: &str, hidden: u32) -> ValueId {
-        self.push(
-            OpKind::Embed {
-                weight: weight.to_string(),
-            },
-            vec![],
-            vec![(Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)],
-        )[0]
-    }
 
-    pub fn matmul(&mut self, x: ValueId, weight: &str, out_width: u32) -> ValueId {
-        self.matmul_inner(x, weight, out_width, false)
-    }
 
-    /// Residual-accumulate matmul: `out += x @ w^T`.
-    pub fn matmul_add(
-        &mut self,
-        x: ValueId,
-        weight: &str,
-        residual: ValueId,
-        out_width: u32,
-    ) -> ValueId {
-        let out = self.matmul_inner(x, weight, out_width, true);
-        // The residual is an input even though lowering is one GEMM.
-        self.ops
-            .last_mut()
-            .expect("matmul_inner pushed")
-            .inputs
-            .push(residual);
-        out
-    }
 
-    fn matmul_inner(
-        &mut self,
-        x: ValueId,
-        weight: &str,
-        out_width: u32,
-        beta_one: bool,
-    ) -> ValueId {
-        let rows = self.values[x as usize].shape.0[0];
-        self.push(
-            OpKind::Matmul {
-                weight: weight.to_string(),
-                beta_one,
-                selector: None,
-            },
-            vec![x],
-            vec![(Shape(vec![rows, Dim::Const(out_width)]), DType::BF16)],
-        )[0]
-    }
 
-    /// Expert-indexed matmul. `selector` is a [`Self::topk`] value
-    /// `[Tokens, k]` choosing `{e}` per token; output is
-    /// `[Tokens, k, out_width]`.
-    pub fn matmul_per_token(
-        &mut self,
-        x: ValueId,
-        weight_template: &str,
-        selector: ValueId,
-        out_width: u32,
-    ) -> ValueId {
-        assert!(
-            weight_template.contains("{e}"),
-            "per-token matmul weight must be a template with an {{e}} slot, got {weight_template:?}"
-        );
-        assert_eq!(
-            self.values[selector as usize].dyn_axis,
-            Some(DynAxis::PerToken),
-            "per-token matmul selector must be a dyn PerToken value"
-        );
-        let rows = self.values[x as usize].shape.0[0];
-        let k = self.values[selector as usize].shape.0[1];
-        self.push(
-            OpKind::Matmul {
-                weight: weight_template.to_string(),
-                beta_one: false,
-                selector: Some(selector),
-            },
-            // Selector content is consumed, and is the last input by convention.
-            vec![x, selector],
-            vec![(Shape(vec![rows, k, Dim::Const(out_width)]), DType::BF16)],
-        )[0]
-    }
 
-    pub fn rmsnorm(&mut self, x: ValueId, weight: &str, variant: NormVariant) -> ValueId {
-        let shape = self.values[x as usize].shape.clone();
-        self.push(
-            OpKind::Rmsnorm {
-                weight: weight.to_string(),
-                variant,
-            },
-            vec![x],
-            vec![(shape, DType::BF16)],
-        )[0]
-    }
 
-    pub fn add_bias(&mut self, x: ValueId, weight: &str) -> ValueId {
-        let shape = self.values[x as usize].shape.clone();
-        self.push(
-            OpKind::AddBias {
-                weight: weight.to_string(),
-            },
-            vec![x],
-            vec![(shape, DType::BF16)],
-        )[0]
-    }
 
-    pub fn rmsnorm_per_head(
-        &mut self,
-        x: ValueId,
-        weight: &str,
-        head_dim: u32,
-        variant: NormVariant,
-    ) -> ValueId {
-        let shape = self.values[x as usize].shape.clone();
-        self.push(
-            OpKind::RmsnormPerHead {
-                weight: weight.to_string(),
-                head_dim,
-                variant,
-            },
-            vec![x],
-            vec![(shape, DType::BF16)],
-        )[0]
-    }
 
-    pub fn split_qkv(
-        &mut self,
-        packed: ValueId,
-        q_width: u32,
-        kv_width: u32,
-    ) -> (ValueId, ValueId, ValueId) {
-        let rows = self.values[packed as usize].shape.0[0];
-        let out = self.push(
-            OpKind::SplitQkv { q_width, kv_width },
-            vec![packed],
-            vec![
-                (Shape(vec![rows, Dim::Const(q_width)]), DType::BF16),
-                (Shape(vec![rows, Dim::Const(kv_width)]), DType::BF16),
-                (Shape(vec![rows, Dim::Const(kv_width)]), DType::BF16),
-            ],
-        );
-        (out[0], out[1], out[2])
-    }
 
-    /// Rope mutates Q and K in place; SSA-wise it produces two new values.
-    pub fn rope(&mut self, q: ValueId, k: ValueId, kind: RopeKind) -> (ValueId, ValueId) {
-        self.rope_inner(q, k, kind, None)
-    }
 
-    /// Partial rotary: only the first `rotary_dim` channels of each head rotate.
-    pub fn rope_partial(
-        &mut self,
-        q: ValueId,
-        k: ValueId,
-        kind: RopeKind,
-        rotary_dim: u32,
-    ) -> (ValueId, ValueId) {
-        self.rope_inner(q, k, kind, Some(rotary_dim))
-    }
 
-    fn rope_inner(
-        &mut self,
-        q: ValueId,
-        k: ValueId,
-        kind: RopeKind,
-        partial: Option<u32>,
-    ) -> (ValueId, ValueId) {
-        let q_shape = self.values[q as usize].shape.clone();
-        let k_shape = self.values[k as usize].shape.clone();
-        let out = self.push(
-            OpKind::Rope { kind, partial },
-            vec![q, k],
-            vec![(q_shape, DType::BF16), (k_shape, DType::BF16)],
-        );
-        (out[0], out[1])
-    }
 
-    pub fn kv_append(&mut self, layer: u32, k: ValueId, v: ValueId) {
-        self.push(OpKind::KvAppend { layer }, vec![k, v], vec![]);
-    }
 
-    pub fn attention(&mut self, layer: u32, q: ValueId, q_width: u32) -> ValueId {
-        self.push(
-            OpKind::Attention { layer },
-            vec![q],
-            vec![(Shape(vec![Dim::Tokens, Dim::Const(q_width)]), DType::BF16)],
-        )[0]
-    }
 
     /// Record a stated kernel launch ([`OpKind::Launch`]).
     pub fn launch(
@@ -548,217 +423,17 @@ impl TraceBuilder {
         )
     }
 
-    /// Halve the trailing gate‖up dim; leading dims are preserved.
-    pub fn swiglu(&mut self, packed: ValueId, inter: u32) -> ValueId {
-        let mut shape = self.values[packed as usize].shape.clone();
-        *shape.0.last_mut().expect("swiglu input has a trailing dim") = Dim::Const(inter);
-        self.push(
-            OpKind::Swiglu { inter },
-            vec![packed],
-            vec![(shape, DType::BF16)],
-        )[0]
-    }
 
-    /// Router top-k returns `(indices, weights)`, both `[Tokens, k]`;
-    /// indices are [`DynAxis::PerToken`].
-    pub fn topk(&mut self, logits: ValueId, k: u32) -> (ValueId, ValueId) {
-        let rows = self.values[logits as usize].shape.0[0];
-        let out = self.push(
-            OpKind::TopK { k },
-            vec![logits],
-            vec![
-                (Shape(vec![rows, Dim::Const(k)]), DType::I32),
-                (Shape(vec![rows, Dim::Const(k)]), DType::F32),
-            ],
-        );
-        self.values[out[0] as usize].dyn_axis = Some(DynAxis::PerToken);
-        (out[0], out[1])
-    }
 
-    /// Collapse `x` `[Tokens, k, d]` with weights `[Tokens, k]`.
-    /// Operand order: weights, then values.
-    pub fn weighted_sum(&mut self, weights: ValueId, x: ValueId) -> ValueId {
-        let x_shape = &self.values[x as usize].shape.0;
-        let (rows, d) = (x_shape[0], x_shape[2]);
-        let k = match self.values[weights as usize].shape.0[1] {
-            Dim::Const(k) => k,
-            other => panic!("weighted_sum weights must have a Const k dim, got {other:?}"),
-        };
-        self.push(
-            OpKind::WeightedSum { k },
-            vec![weights, x],
-            vec![(Shape(vec![rows, d]), DType::BF16)],
-        )[0]
-    }
 
-    /// Shared-expert landing. Operand order: fresh value, gate, base stream.
-    pub fn sigmoid_gate_add(&mut self, x: ValueId, gate: ValueId, base: ValueId) -> ValueId {
-        let shape = self.values[base as usize].shape.clone();
-        self.push(
-            OpKind::SigmoidGateAdd,
-            vec![x, gate, base],
-            vec![(shape, DType::BF16)],
-        )[0]
-    }
 
-    /// Split packed `[rows, w0 + w1]` at `w0`.
-    pub fn split_gdn(&mut self, packed: ValueId, width0: u32, width1: u32) -> (ValueId, ValueId) {
-        let rows = self.values[packed as usize].shape.0[0];
-        let out = self.push(
-            OpKind::SplitGdn { width0, width1 },
-            vec![packed],
-            vec![
-                (Shape(vec![rows, Dim::Const(width0)]), DType::BF16),
-                (Shape(vec![rows, Dim::Const(width1)]), DType::BF16),
-            ],
-        );
-        (out[0], out[1])
-    }
 
-    /// Interleaved per-head `[query | gate]` split; not a row split.
-    pub fn split_q_gate(
-        &mut self,
-        packed: ValueId,
-        heads: u32,
-        head_dim: u32,
-    ) -> (ValueId, ValueId) {
-        let rows = self.values[packed as usize].shape.0[0];
-        match self.values[packed as usize].shape.0[1] {
-            Dim::Const(w) if w == 2 * heads * head_dim => {}
-            other => panic!("split_q_gate input width {other:?} must be 2 * {heads} * {head_dim}"),
-        }
-        let half = Shape(vec![rows, Dim::Const(heads * head_dim)]);
-        let out = self.push(
-            OpKind::SplitQGate { heads, head_dim },
-            vec![packed],
-            vec![(half.clone(), DType::BF16), (half, DType::BF16)],
-        );
-        (out[0], out[1])
-    }
 
-    pub fn sigmoid_gate_mul(&mut self, x: ValueId, gate: ValueId) -> ValueId {
-        let shape = self.values[x as usize].shape.clone();
-        assert_eq!(
-            shape, self.values[gate as usize].shape,
-            "sigmoid_gate_mul operands must share a shape"
-        );
-        self.push(
-            OpKind::SigmoidGateMul,
-            vec![x, gate],
-            vec![(shape, DType::BF16)],
-        )[0]
-    }
 
-    /// Shape-preserving depthwise causal conv1d against per-request state.
-    pub fn causal_conv1d(
-        &mut self,
-        layer: u32,
-        qkv: ValueId,
-        weight: &str,
-        bias: Option<&str>,
-        kernel: u32,
-    ) -> ValueId {
-        let shape = self.values[qkv as usize].shape.clone();
-        self.push(
-            OpKind::CausalConv1d {
-                weight: weight.to_string(),
-                bias: bias.map(str::to_string),
-                layer,
-                kernel,
-            },
-            vec![qkv],
-            vec![(shape, DType::BF16)],
-        )[0]
-    }
 
-    /// Post-conv GDN prep outputs `(q, k, v, g, beta)` in that order.
-    /// Inputs are `[qkv, a, b]`; q/k are `[Tokens, key_heads, key_dim]`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn gdn_prep(
-        &mut self,
-        qkv: ValueId,
-        a: ValueId,
-        b: ValueId,
-        a_log: &str,
-        dt_bias: &str,
-        key_heads: u32,
-        key_dim: u32,
-        value_heads: u32,
-        value_dim: u32,
-    ) -> (ValueId, ValueId, ValueId, ValueId, ValueId) {
-        let rows = self.values[qkv as usize].shape.0[0];
-        let qk = Shape(vec![rows, Dim::Const(key_heads), Dim::Const(key_dim)]);
-        let out = self.push(
-            OpKind::GdnPrep {
-                a_log: a_log.to_string(),
-                dt_bias: dt_bias.to_string(),
-            },
-            vec![qkv, a, b],
-            vec![
-                (qk.clone(), DType::F32),
-                (qk, DType::F32),
-                (
-                    Shape(vec![rows, Dim::Const(value_heads), Dim::Const(value_dim)]),
-                    DType::F32,
-                ),
-                (Shape(vec![rows, Dim::Const(value_heads)]), DType::F32),
-                (Shape(vec![rows, Dim::Const(value_heads)]), DType::F32),
-            ],
-        );
-        (out[0], out[1], out[2], out[3], out[4])
-    }
 
-    pub fn gated_delta(
-        &mut self,
-        layer: u32,
-        q: ValueId,
-        k: ValueId,
-        v: ValueId,
-        g: ValueId,
-        beta: ValueId,
-    ) -> ValueId {
-        let shape = self.values[v as usize].shape.clone();
-        self.push(
-            OpKind::GatedDelta { layer },
-            vec![q, k, v, g, beta],
-            vec![(shape, DType::F32)],
-        )[0]
-    }
 
-    /// Per-head f32 core norm, gated and flattened to gate's bf16 shape.
-    pub fn rmsnorm_gated(&mut self, x: ValueId, gate: ValueId, weight: &str) -> ValueId {
-        let x_elems: u32 = self.values[x as usize].shape.0[1..]
-            .iter()
-            .map(|d| match d {
-                Dim::Const(c) => *c,
-                other => panic!("rmsnorm_gated x must have Const head dims, got {other:?}"),
-            })
-            .product();
-        let gate_shape = self.values[gate as usize].shape.clone();
-        match gate_shape.0[1] {
-            Dim::Const(w) if w == x_elems => {}
-            other => {
-                panic!("rmsnorm_gated gate width {other:?} must equal x's flattened {x_elems}")
-            }
-        }
-        self.push(
-            OpKind::RmsnormGated {
-                weight: weight.to_string(),
-            },
-            vec![x, gate],
-            vec![(gate_shape, DType::BF16)],
-        )[0]
-    }
 
-    /// Post-norm residual landing. Operand order: fresh value, residual stream.
-    pub fn residual_add(&mut self, x: ValueId, residual: ValueId) -> ValueId {
-        let shape = self.values[residual as usize].shape.clone();
-        self.push(
-            OpKind::ResidualAdd,
-            vec![x, residual],
-            vec![(shape, DType::BF16)],
-        )[0]
-    }
 
     /// Window `x` along its leading dim; output shape drops that dim.
     pub fn select(&mut self, x: ValueId, index: u32) -> ValueId {
@@ -796,6 +471,7 @@ impl TraceBuilder {
             ops: self.ops,
             depth_window: self.depth_axis,
             seams: self.seams,
+            runtime: self.runtime,
         };
         // Load-time signature and seam checks.
         let mut problems = crate::kernels::check_plan(&plan);

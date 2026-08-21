@@ -479,12 +479,6 @@ impl<'a> Handles<'a> {
         self.take(bound)
     }
 
-    /// The same, written.
-    pub fn state_mut(&mut self, slice: Option<Slice>) -> u32 {
-        let bound = slice.map_or(NOTHING, |slice| BoundArg { slice, width: 0 });
-        self.take(bound)
-    }
-
     /// The statement's scalars, as the one packed struct a kernel reads them
     /// through.
     ///

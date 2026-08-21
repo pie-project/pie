@@ -105,9 +105,6 @@ impl Holds for Held<'_, '_> {
         self.o.out_width(n)
     }
 
-    fn params_block(&mut self) -> u32 {
-        self.o.params_block()
-    }
 
     fn param(&self, n: usize) -> Result<i32, Refusal> {
         self.o.param(n)

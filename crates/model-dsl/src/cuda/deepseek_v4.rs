@@ -26,9 +26,30 @@ builder! {
 
     /// `norm::hc_pre_postprocess_bf16`: returns `(post_mix, comb_mix, layer_input)`.
     /// `comb_mix` is a per-token `[K, K]` sinkhorn-normalized matrix.
-    pub fn hc_pre(mixes: &Val, residual: &Val, hc_mult: u32, hidden: u32) -> (Val, Val, Val) {
+    ///
+    /// THE MIX IS AFFINE BEFORE IT IS A TRANSPORT PLAN, and `scale` and
+    /// `base` are what makes it so. `norm/dsv4_hc.cuh` reads them as
+    /// `[3]` and `[2M + M*M]` and its first act is
+    /// `mixes · scale + base` -- three learned gains, one per band of the
+    /// mix row, and a bias per entry of it. Two banks, dereferenced per
+    /// token, and the statement placed neither: the arm bound whatever the
+    /// two weight slots happened to hold.
+    ///
+    /// Trace names, like `attn_sink` and `router_bias` in the same family
+    /// and for the reason `deepseek_v4/project.rs` gives about those two:
+    /// no witnessed checkpoint spells them, and a manifest row for a name
+    /// nobody has seen is a guess wearing a measurement's clothes.
+    pub fn hc_pre(
+        mixes: &Val,
+        residual: &Val,
+        scale: &str,
+        base: &str,
+        hc_mult: u32,
+        hidden: u32,
+    ) -> (Val, Val, Val) {
         symbol: "norm::hc_pre_postprocess_bf16",
         on: mixes,
+        weights: [scale, base],
         inputs: [mixes, residual],
         outs: [
             [Dim::Tokens, Dim::Const(hc_mult)] as F32,
@@ -57,9 +78,15 @@ builder! {
 
 
     /// `norm::hc_head_postprocess_bf16`: collapse K streams for readout.
-    pub fn hc_head(mixes: &Val, residual: &Val, hidden: u32) -> Val {
+    ///
+    /// The same affine pair as [`hc_pre`], one band narrower: the head
+    /// gates are `M` independent sigmoids rather than a transport plan, so
+    /// `scale` is `[1]` and `base` is `[M]`. Both are still read per token
+    /// and both are still weights.
+    pub fn hc_head(mixes: &Val, residual: &Val, scale: &str, base: &str, hidden: u32) -> Val {
         symbol: "norm::hc_head_postprocess_bf16",
         on: mixes,
+        weights: [scale, base],
         inputs: [mixes, residual],
         out: [Dim::Tokens, Dim::Const(hidden)] as BF16,
         made: "the collapse produces its value",

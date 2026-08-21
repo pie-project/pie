@@ -1,4 +1,16 @@
 //! Backend-neutral DSL operations plus shared statement idioms.
+//!
+//! # Every statement is a launch now
+//!
+//! The tier-1 fns below used to record semantic `OpKind`s and leave a table
+//! in `model-compiler/lower/semantics.rs` to decide what runs. The no-ask
+//! contract retires that: each fn states THE symbol — the same
+//! backend-neutral name the three shader tables and CUDA's all declare
+//! (`shader_backends_agree` holds them equal) — and carries every number the
+//! routine's swept signature marks as `Const`, in that signature's order.
+//! A backend-less description trace states the same symbols; `check_plan`
+//! skips families with no backend, and the engine's site derivation matches
+//! the symbol string instead of an op kind.
 
 use super::*;
 
@@ -12,38 +24,18 @@ pub fn select(x: &Val, index: u32) -> Val {
     }
 }
 
-/// Dense records semantic matmul; quantized records launch plus scale/zero weights.
+/// Dense states `gemm::act_x_w` (a driver op — cuBLAS answers it);
+/// quantized records its launch plus scale/zero weights. The residual fold
+/// (`+=`) swaps the symbol to `gemm::act_x_w_acc` — see `AddAssign`.
 pub fn matmul(x: &Val, w: &MatW) -> Val {
-    let id = match w.gemm_symbol() {
-        None => x.t.with(w.layer, |b| b.matmul(x.id, &w.name, w.width)),
-        Some(symbol) => {
-            let mut weights = vec![w.name.clone()];
-            weights.extend(w.scale_names());
-            let shape = Shape(vec![Dim::Tokens, Dim::Const(w.width)]);
-            let outs = x.t.with(w.layer, |b| {
-                b.launch(
-                    symbol,
-                    weights,
-                    None,
-                    vec![x.id],
-                    vec![(shape, DType::BF16)],
-                )
-            });
-            outs[0]
-        }
+    let (symbol, mut weights) = match w.gemm_symbol() {
+        None => ("gemm::act_x_w", vec![w.name.clone()]),
+        Some(symbol) => (symbol, vec![w.name.clone()]),
     };
-    Val {
-        t: x.t.clone(),
-        id,
-        layer: w.layer,
-    }
-}
-
-/// Semantic row/per-head RMSNorm; `w.per_head` selects convention.
-pub fn rmsnorm(x: &Val, w: &NormW) -> Val {
-    let id = x.t.with(w.layer, |b| match w.per_head {
-        None => b.rmsnorm(x.id, &w.name, w.variant),
-        Some(head_dim) => b.rmsnorm_per_head(x.id, &w.name, head_dim, w.variant),
+    weights.extend(w.scale_names());
+    let shape = Shape(vec![Dim::Tokens, Dim::Const(w.width)]);
+    let id = x.t.with(w.layer, |b| {
+        b.launch(symbol, weights, None, vec![x.id], vec![(shape, DType::BF16)])[0]
     });
     Val {
         t: x.t.clone(),
@@ -52,8 +44,29 @@ pub fn rmsnorm(x: &Val, w: &NormW) -> Val {
     }
 }
 
-pub fn add_bias(x: &Val, w: &MatW) -> Val {
-    let id = x.t.with(w.layer, |b| b.add_bias(x.id, &w.name));
+/// Row/per-head RMSNorm. `norm::rmsnorm{,_gemma}_bf16`'s params run is
+/// `[per_head_dim, eps]` — the swept signature's order; `0` is the plain
+/// (whole-row) reading, and the epsilon is the handle's, which is the
+/// forward's, which is the checkpoint's.
+pub fn rmsnorm(x: &Val, w: &NormW) -> Val {
+    let symbol = if w.variant.is_plain() {
+        "norm::rmsnorm_bf16"
+    } else {
+        "norm::rmsnorm_gemma_bf16"
+    };
+    let params = vec![w.per_head.unwrap_or(0), w.eps.to_bits()];
+    let id = x.t.with(w.layer, |b| {
+        let shape = b.value_shape(x.id);
+        let dtype = b.value_dtype(x.id);
+        b.launch_with_params(
+            symbol,
+            vec![w.name.clone()],
+            None,
+            params,
+            vec![x.id],
+            vec![(shape, dtype)],
+        )[0]
+    });
     Val {
         t: x.t.clone(),
         id,
@@ -61,18 +74,134 @@ pub fn add_bias(x: &Val, w: &MatW) -> Val {
     }
 }
 
+/// `norm::add_bias_bf16`: `x[r, :] += bias`, in place.
+pub fn add_bias(x: &Val, w: &MatW) -> Val {
+    let id = x.t.with(w.layer, |b| {
+        let shape = b.value_shape(x.id);
+        let dtype = b.value_dtype(x.id);
+        b.launch(
+            "norm::add_bias_bf16",
+            vec![w.name.clone()],
+            None,
+            vec![x.id],
+            vec![(shape, dtype)],
+        )[0]
+    });
+    Val {
+        t: x.t.clone(),
+        id,
+        layer: w.layer,
+    }
+}
+
+/// `attn::split_qkv_bf16`: packed `[N, q + 2kv]` into three.
 pub fn split_qkv(x: &Val, q_width: u32, kv_width: u32) -> (Val, Val, Val) {
-    let (q, k, v) = x.t.with(x.layer, |b| b.split_qkv(x.id, q_width, kv_width));
+    let outs = x.t.with(x.layer, |b| {
+        b.launch(
+            "attn::split_qkv_bf16",
+            vec![],
+            None,
+            vec![x.id],
+            vec![
+                (Shape(vec![Dim::Tokens, Dim::Const(q_width)]), DType::BF16),
+                (Shape(vec![Dim::Tokens, Dim::Const(kv_width)]), DType::BF16),
+                (Shape(vec![Dim::Tokens, Dim::Const(kv_width)]), DType::BF16),
+            ],
+        )
+    });
     let mk = |id| Val {
         t: x.t.clone(),
         id,
         layer: x.layer,
     };
-    (mk(q), mk(k), mk(v))
+    (mk(outs[0]), mk(outs[1]), mk(outs[2]))
 }
 
-pub fn rope(q: &Val, k: &Val, kind: RopeKind) -> (Val, Val) {
-    let (qo, ko) = q.t.with(q.layer, |b| b.rope(q.id, k.id, kind));
+/// The numbers `rope::rope_bf16`'s swept signature marks `Const`, in its
+/// order: `[num_q_heads, num_kv_heads, head_dim, theta, interleaved]`. The
+/// positions stream is minted by name — `dsl::runtime` is the veneer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RopeShape {
+    pub num_q_heads: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub theta: f32,
+    pub interleaved: bool,
+}
+
+/// `rope::rope_bf16`, in place over q and k.
+pub fn rope(q: &Val, k: &Val, kind: RopeKind, n: RopeShape) -> (Val, Val) {
+    assert!(
+        matches!(kind, RopeKind::Standard),
+        "yarn rope is a tier-2 statement; state its own symbol"
+    );
+    let params = vec![
+        n.num_q_heads,
+        n.num_kv_heads,
+        n.head_dim,
+        n.theta.to_bits(),
+        u32::from(n.interleaved),
+    ];
+    let (qo, ko) = q.t.with(q.layer, |b| {
+        let positions = b.runtime_tensor(
+            "positions",
+            None,
+            Shape(vec![Dim::Tokens]),
+            DType::I32,
+        );
+        let q_shape = b.value_shape(q.id);
+        let k_shape = b.value_shape(k.id);
+        let outs = b.launch_with_params(
+            "rope::rope_bf16",
+            vec![],
+            None,
+            params,
+            vec![q.id, k.id, positions],
+            vec![(q_shape, DType::BF16), (k_shape, DType::BF16)],
+        );
+        (outs[0], outs[1])
+    });
+    let mk = |id| Val {
+        t: q.t.clone(),
+        id,
+        layer: q.layer,
+    };
+    (mk(qo), mk(ko))
+}
+
+/// `rope::rope_partial_bf16`: params `[rotary_dim, head_dim, theta]`.
+pub fn rope_partial(
+    q: &Val,
+    k: &Val,
+    kind: RopeKind,
+    rotary_dim: u32,
+    head_dim: u32,
+    theta: f32,
+) -> (Val, Val) {
+    assert!(
+        matches!(kind, RopeKind::Standard),
+        "yarn rope is a tier-2 statement; state its own symbol"
+    );
+    let params = vec![rotary_dim, head_dim, theta.to_bits()];
+    let (qo, ko) = q.t.with(q.layer, |b| {
+        let positions = b.runtime_tensor(
+            "positions",
+            None,
+            Shape(vec![Dim::Tokens]),
+            DType::I32,
+        );
+        let q_shape = b.value_shape(q.id);
+        let k_shape = b.value_shape(k.id);
+        let outs = b.launch_with_params(
+            "rope::rope_partial_bf16",
+            vec![],
+            None,
+            params,
+            vec![q.id, k.id, positions],
+            vec![(q_shape, DType::BF16), (k_shape, DType::BF16)],
+        );
+        (outs[0], outs[1])
+    });
     let mk = |id| Val {
         t: q.t.clone(),
         id,
@@ -95,6 +224,7 @@ pub fn logits_epilogue(
     tied_embeddings: bool,
     vocab: u32,
     logit_softcap: bool,
+    norm_eps: f32,
 ) {
     let normed = cuda::rmsnorm(
         y,
@@ -103,6 +233,7 @@ pub fn logits_epilogue(
             variant: norm_variant,
             per_head: None,
             layer: None,
+            eps: norm_eps,
         },
     );
     let logits = lm_head_tied(t, &normed, tied_embeddings, vocab);
@@ -209,8 +340,19 @@ pub fn dense_gated_mlp(
     matmul(&activated, down_w)
 }
 
+/// Description-trace statement: no backend declares a fused packed swiglu
+/// as fixed behaviour, so a lowered text states its own symbol and this
+/// `canon::` form appears only in backend-less description traces.
 pub fn swiglu(x: &Val, inter: u32) -> Val {
-    let id = x.t.with(x.layer, |b| b.swiglu(x.id, inter));
+    let id = x.t.with(x.layer, |b| {
+        b.launch(
+            "canon::swiglu",
+            vec![],
+            None,
+            vec![x.id],
+            vec![(Shape(vec![Dim::Tokens, Dim::Const(inter)]), DType::BF16)],
+        )[0]
+    });
     Val {
         t: x.t.clone(),
         id,
@@ -218,9 +360,19 @@ pub fn swiglu(x: &Val, inter: u32) -> Val {
     }
 }
 
-/// Semantic paged attention over `kv` layer cache.
+/// Description-trace paged attention over `kv`'s layer cache. Lowered texts
+/// state their attention kernel as their own launch; this `canon::` form is
+/// the backend-less description's.
 pub fn attention(q: &Val, kv: &Kv, q_width: u32) -> Val {
-    let id = q.t.with(Some(kv.l), |b| b.attention(kv.l, q.id, q_width));
+    let id = q.t.with(Some(kv.l), |b| {
+        b.launch(
+            "canon::attention",
+            vec![],
+            Some(StateRef { store: StateStore::KvCache, layer: kv.l }),
+            vec![q.id],
+            vec![(Shape(vec![Dim::Tokens, Dim::Const(q_width)]), DType::BF16)],
+        )[0]
+    });
     Val {
         t: q.t.clone(),
         id,
@@ -228,10 +380,17 @@ pub fn attention(q: &Val, kv: &Kv, q_width: u32) -> Val {
     }
 }
 
-/// Expert-bank matmul; `selector` indexes `{e}` slots.
+/// Expert-bank matmul: `moe::moe_grouped_gemm_bf16`, the selector as the
+/// LAST input — the convention the retired `Matmul::selector` recorded.
 pub fn matmul_per_token(x: &Val, w: &MatW, selector: &Val) -> Val {
     let id = x.t.with(w.layer, |b| {
-        b.matmul_per_token(x.id, &w.name, selector.id, w.width)
+        b.launch(
+            "moe::moe_grouped_gemm_bf16",
+            vec![w.name.clone()],
+            None,
+            vec![x.id, selector.id],
+            vec![(Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16)],
+        )[0]
     });
     Val {
         t: x.t.clone(),
@@ -240,22 +399,45 @@ pub fn matmul_per_token(x: &Val, w: &MatW, selector: &Val) -> Val {
     }
 }
 
-/// Router top-k returns `(indices, weights)`.
+/// Router top-k: `moe::topk_softmax_bf16`, `(indices, weights)` in that
+/// order, `k` on the params run.
 pub fn topk(logits: &Val, k: u32) -> (Val, Val) {
-    let (idx, w) = logits.t.with(logits.layer, |b| b.topk(logits.id, k));
+    let outs = logits.t.with(logits.layer, |b| {
+        b.launch_with_params(
+            "moe::topk_softmax_bf16",
+            vec![],
+            None,
+            vec![k],
+            vec![logits.id],
+            vec![
+                (Shape(vec![Dim::Tokens, Dim::Const(k)]), DType::I32),
+                (Shape(vec![Dim::Tokens, Dim::Const(k)]), DType::F32),
+            ],
+        )
+    });
     let mk = |id| Val {
         t: logits.t.clone(),
         id,
         layer: logits.layer,
     };
-    (mk(idx), mk(w))
+    (mk(outs[0]), mk(outs[1]))
 }
 
-/// Operand order is builder order: weights, then value.
+/// `moe::token_batched_weighted_sum_bf16`; operand order: weights, value.
 pub fn weighted_sum(weights: &Val, x: &Val) -> Val {
-    let id = weights
-        .t
-        .with(weights.layer, |b| b.weighted_sum(weights.id, x.id));
+    let id = weights.t.with(weights.layer, |b| {
+        let shape = match b.value_shape(x.id).0.as_slice() {
+            [Dim::Tokens, _, d] => Shape(vec![Dim::Tokens, *d]),
+            other => Shape(other.to_vec()),
+        };
+        b.launch(
+            "moe::token_batched_weighted_sum_bf16",
+            vec![],
+            None,
+            vec![weights.id, x.id],
+            vec![(shape, DType::BF16)],
+        )[0]
+    });
     Val {
         t: weights.t.clone(),
         id,
@@ -263,10 +445,18 @@ pub fn weighted_sum(weights: &Val, x: &Val) -> Val {
     }
 }
 
-/// Operand order: gated value, gate, base.
+/// `mlp::sigmoid_dot_scalar_gate_add_bf16`; operands: value, gate, base.
 pub fn sigmoid_gate_add(x: &Val, gate: &Val, base: &Val) -> Val {
-    let id =
-        x.t.with(x.layer, |b| b.sigmoid_gate_add(x.id, gate.id, base.id));
+    let id = x.t.with(x.layer, |b| {
+        let shape = b.value_shape(base.id);
+        b.launch(
+            "mlp::sigmoid_dot_scalar_gate_add_bf16",
+            vec![],
+            None,
+            vec![x.id, gate.id, base.id],
+            vec![(shape, DType::BF16)],
+        )[0]
+    });
     Val {
         t: x.t.clone(),
         id,
@@ -274,8 +464,18 @@ pub fn sigmoid_gate_add(x: &Val, gate: &Val, base: &Val) -> Val {
     }
 }
 
+/// `mlp::sigmoid_gate_inplace_bf16`: `x *= sigmoid(gate)`.
 pub fn sigmoid_gate_mul(x: &Val, gate: &Val) -> Val {
-    let id = x.t.with(x.layer, |b| b.sigmoid_gate_mul(x.id, gate.id));
+    let id = x.t.with(x.layer, |b| {
+        let shape = b.value_shape(x.id);
+        b.launch(
+            "mlp::sigmoid_gate_inplace_bf16",
+            vec![],
+            None,
+            vec![x.id, gate.id],
+            vec![(shape, DType::BF16)],
+        )[0]
+    });
     Val {
         t: x.t.clone(),
         id,
@@ -283,44 +483,73 @@ pub fn sigmoid_gate_mul(x: &Val, gate: &Val) -> Val {
     }
 }
 
-/// GDN split returns widths `(w0, w1)`.
+/// GDN two-way split at `w0`. `layout::split_gdn_bf16`.
 pub fn split_gdn(x: &Val, w0: u32, w1: u32) -> (Val, Val) {
-    let (a, b) = x.t.with(x.layer, |b| b.split_gdn(x.id, w0, w1));
+    let outs = x.t.with(x.layer, |b| {
+        b.launch(
+            "layout::split_gdn_bf16",
+            vec![],
+            None,
+            vec![x.id],
+            vec![
+                (Shape(vec![Dim::Tokens, Dim::Const(w0)]), DType::BF16),
+                (Shape(vec![Dim::Tokens, Dim::Const(w1)]), DType::BF16),
+            ],
+        )
+    });
     let mk = |id| Val {
         t: x.t.clone(),
         id,
         layer: x.layer,
     };
-    (mk(a), mk(b))
+    (mk(outs[0]), mk(outs[1]))
 }
 
-/// Interleaved per-head split returns `(query, gate)`.
+/// Interleaved per-head `[query | gate]` split: `layout::split_q_gate_bf16`,
+/// `head_dim` on the params run (the swept signature's one `Const`).
 pub fn split_q_gate(x: &Val, heads: u32, head_dim: u32) -> (Val, Val) {
-    let (q, gate) = x.t.with(x.layer, |b| b.split_q_gate(x.id, heads, head_dim));
+    let w = heads * head_dim;
+    let outs = x.t.with(x.layer, |b| {
+        b.launch_with_params(
+            "layout::split_q_gate_bf16",
+            vec![],
+            None,
+            vec![head_dim],
+            vec![x.id],
+            vec![
+                (Shape(vec![Dim::Tokens, Dim::Const(w)]), DType::BF16),
+                (Shape(vec![Dim::Tokens, Dim::Const(w)]), DType::BF16),
+            ],
+        )
+    });
     let mk = |id| Val {
         t: x.t.clone(),
         id,
         layer: x.layer,
     };
-    (mk(q), mk(gate))
+    (mk(outs[0]), mk(outs[1]))
 }
 
-/// Partial rope rotates first `rotary_dim` channels per head.
-pub fn rope_partial(q: &Val, k: &Val, kind: RopeKind, rotary_dim: u32) -> (Val, Val) {
-    let (qo, ko) =
-        q.t.with(q.layer, |b| b.rope_partial(q.id, k.id, kind, rotary_dim));
-    let mk = |id| Val {
-        t: q.t.clone(),
-        id,
-        layer: q.layer,
-    };
-    (mk(qo), mk(ko))
-}
-
-/// Depthwise conv uses `w.layer` as tag and conv-state key.
+/// Depthwise causal conv with fused SiLU: `ssm::causal_conv1d_update_batched_bf16`
+/// on the decode reading; the conv-state slab is the layer's runtime object.
+/// Params `[conv_dim, kernel]` — the swept `c`/`k` Consts, in order.
 pub fn causal_conv1d(x: &Val, w: &ConvW) -> Val {
+    let mut weights = vec![w.name.clone()];
+    weights.extend(w.bias.clone());
     let id = x.t.with(Some(w.layer), |b| {
-        b.causal_conv1d(w.layer, x.id, &w.name, w.bias.as_deref(), w.kernel)
+        let shape = b.value_shape(x.id);
+        let conv_dim = match shape.0.as_slice() {
+            [_, Dim::Const(c)] => *c,
+            _ => 0,
+        };
+        b.launch_with_params(
+            "ssm::causal_conv1d_update_batched_bf16",
+            weights,
+            Some(StateRef { store: StateStore::RecurrentState, layer: w.layer }),
+            vec![conv_dim, w.kernel],
+            vec![x.id],
+            vec![(shape, DType::BF16)],
+        )[0]
     });
     Val {
         t: x.t.clone(),
@@ -329,7 +558,9 @@ pub fn causal_conv1d(x: &Val, w: &ConvW) -> Val {
     }
 }
 
-/// Returns `(q, k, v, g, beta)`; geometry params define per-head layouts.
+/// Returns `(q, k, v, g, beta)`: `ssm::qwen_gdn_post_conv_prep_bf16`,
+/// params `[key_heads, key_dim, value_heads, value_dim]` in the swept
+/// signature's order.
 pub fn gdn_prep(
     qkv: &Val,
     a: &Val,
@@ -340,17 +571,20 @@ pub fn gdn_prep(
     value_heads: u32,
     value_dim: u32,
 ) -> (Val, Val, Val, Val, Val) {
-    let out = qkv.t.with(Some(w.layer), |bld| {
-        bld.gdn_prep(
-            qkv.id,
-            a.id,
-            b.id,
-            &w.a_log,
-            &w.dt_bias,
-            key_heads,
-            key_dim,
-            value_heads,
-            value_dim,
+    let outs = qkv.t.with(Some(w.layer), |bld| {
+        bld.launch_with_params(
+            "ssm::qwen_gdn_post_conv_prep_bf16",
+            vec![w.a_log.clone(), w.dt_bias.clone()],
+            None,
+            vec![key_heads, key_dim, value_heads, value_dim],
+            vec![qkv.id, a.id, b.id],
+            vec![
+                (Shape(vec![Dim::Tokens, Dim::Const(key_heads * key_dim)]), DType::F32),
+                (Shape(vec![Dim::Tokens, Dim::Const(key_heads * key_dim)]), DType::F32),
+                (Shape(vec![Dim::Tokens, Dim::Const(value_heads * value_dim)]), DType::F32),
+                (Shape(vec![Dim::Tokens, Dim::Const(value_heads)]), DType::F32),
+                (Shape(vec![Dim::Tokens, Dim::Const(value_heads)]), DType::F32),
+            ],
         )
     });
     let mk = |id| Val {
@@ -358,13 +592,21 @@ pub fn gdn_prep(
         id,
         layer: Some(w.layer),
     };
-    (mk(out.0), mk(out.1), mk(out.2), mk(out.3), mk(out.4))
+    (mk(outs[0]), mk(outs[1]), mk(outs[2]), mk(outs[3]), mk(outs[4]))
 }
 
-/// GDN recurrence over `rs` layer state.
+/// GDN recurrence over `rs`'s layer state. Description form (`canon::`);
+/// a lowered text states its own recurrence launch.
 pub fn gated_delta(rs: &Rs, q: &Val, k: &Val, v: &Val, g: &Val, beta: &Val) -> Val {
     let id = rs.t.with(Some(rs.l), |b| {
-        b.gated_delta(rs.l, q.id, k.id, v.id, g.id, beta.id)
+        let shape = b.value_shape(v.id);
+        b.launch(
+            "canon::gated_delta",
+            vec![],
+            Some(StateRef { store: StateStore::RecurrentState, layer: rs.l }),
+            vec![q.id, k.id, v.id, g.id, beta.id],
+            vec![(shape, DType::F32)],
+        )[0]
     });
     Val {
         t: rs.t.clone(),
@@ -373,10 +615,20 @@ pub fn gated_delta(rs: &Rs, q: &Val, k: &Val, v: &Val, g: &Val, beta: &Val) -> V
     }
 }
 
-/// Gated RMSNorm: reads only `w.name` and `w.layer`; fold is plain.
+/// Gated RMSNorm: `norm::rmsnorm_gated_fp32_in_bf16`, params `[eps,
+/// per_head_dim]` — the swept signature's order (eps first on this one).
 pub fn rmsnorm_gated(x: &Val, gate: &Val, w: &NormW) -> Val {
-    let id =
-        x.t.with(w.layer, |b| b.rmsnorm_gated(x.id, gate.id, &w.name));
+    let id = x.t.with(w.layer, |b| {
+        let shape = b.value_shape(gate.id);
+        b.launch_with_params(
+            "norm::rmsnorm_gated_fp32_in_bf16",
+            vec![w.name.clone()],
+            None,
+            vec![w.eps.to_bits(), w.per_head.unwrap_or(0)],
+            vec![x.id, gate.id],
+            vec![(shape, DType::BF16)],
+        )[0]
+    });
     Val {
         t: x.t.clone(),
         id,
@@ -386,13 +638,22 @@ pub fn rmsnorm_gated(x: &Val, gate: &Val, w: &NormW) -> Val {
 
 
 impl std::ops::AddAssign<Val> for Val {
-    /// Fold `y += matmul` to beta-one when possible; otherwise residual-add.
+    /// Fold `y += matmul` into the GEMM's beta (`gemm::act_x_w` becomes
+    /// `gemm::act_x_w_acc` and takes the residual); otherwise state
+    /// `norm::residual_add_bf16`.
     fn add_assign(&mut self, rhs: Val) {
         let folded_or_added = rhs.t.with(rhs.layer, |b| {
-            if b.try_fold_residual(rhs.id, self.id) {
+            if b.try_fold_beta(rhs.id, self.id, "gemm::act_x_w", "gemm::act_x_w_acc") {
                 rhs.id
             } else {
-                b.residual_add(rhs.id, self.id)
+                let shape = b.value_shape(self.id);
+                b.launch(
+                    "norm::residual_add_bf16",
+                    vec![],
+                    None,
+                    vec![rhs.id, self.id],
+                    vec![(shape, DType::BF16)],
+                )[0]
             }
         });
         self.id = folded_or_added;

@@ -417,30 +417,8 @@ builder! {
     }
 }
 
-/// Row RMSNorm variant selected by [`NormW`].
-/// Per-head falls through to the semantic path because `head_dim` has no launch slot here.
+/// Row RMSNorm variant selected by [`NormW`]. One statement either way:
+/// params `[per_head_dim, eps]` per the swept signature, `0` for whole-row.
 pub fn rmsnorm(x: &Val, w: &NormW) -> Val {
-    let id = x.t.with(w.layer, |b| match w.per_head {
-        // Per-head is handle-selected; callers need not branch.
-        Some(head_dim) => b.rmsnorm_per_head(x.id, &w.name, head_dim, w.variant),
-        None => {
-            let symbol = match w.variant {
-                NormVariant::Gemma => "norm::rmsnorm_gemma_bf16",
-                _ => "norm::rmsnorm_bf16",
-            };
-            let shape = b.value_shape(x.id);
-            b.launch(
-                symbol,
-                vec![w.name.clone()],
-                None,
-                vec![x.id],
-                vec![(shape, DType::BF16)],
-            )[0]
-        }
-    });
-    Val {
-        t: x.t.clone(),
-        id,
-        layer: w.layer,
-    }
+    crate::rmsnorm(x, w)
 }

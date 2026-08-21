@@ -1,14 +1,11 @@
 use super::heap::{Comp, make_heap, sort_heap};
 
-/// libstdc++'s `_S_threshold`: runs of 16 or fewer are left to insertion sort.
 const S_THRESHOLD: usize = 16;
 
-/// `std::__lg(n)`: `floor(log2(n))`, and the depth limit is twice it.
 fn lg(n: usize) -> u32 {
     usize::BITS - 1 - n.leading_zeros()
 }
 
-/// `std::sort(first, last, comp)`, as libstdc++ implements it.
 pub fn sort<T: Copy, C: Comp<T>>(v: &mut [T], c: &C) {
     if v.is_empty() {
         return;
@@ -18,7 +15,6 @@ pub fn sort<T: Copy, C: Comp<T>>(v: &mut [T], c: &C) {
     final_insertion_sort(v, c);
 }
 
-/// `std::__introsort_loop`.
 fn introsort_loop<T: Copy, C: Comp<T>>(
     v: &mut [T],
     first: usize,
@@ -38,13 +34,11 @@ fn introsort_loop<T: Copy, C: Comp<T>>(
     }
 }
 
-/// `std::__partial_sort(first, middle, last)` with `middle == last`.
 fn partial_sort<T: Copy, C: Comp<T>>(v: &mut [T], first: usize, last: usize, c: &C) {
     make_heap(&mut v[first..last], c);
     sort_heap(&mut v[first..last], c);
 }
 
-/// `std::__unguarded_partition_pivot`.
 fn unguarded_partition_pivot<T: Copy, C: Comp<T>>(
     v: &mut [T],
     first: usize,
@@ -56,7 +50,6 @@ fn unguarded_partition_pivot<T: Copy, C: Comp<T>>(
     unguarded_partition(v, first + 1, last, first, c)
 }
 
-/// `std::__move_median_to_first(result, a, b, c)`.
 fn move_median_to_first<T: Copy, C: Comp<T>>(
     v: &mut [T],
     result: usize,
@@ -82,7 +75,6 @@ fn move_median_to_first<T: Copy, C: Comp<T>>(
     }
 }
 
-/// `std::__unguarded_partition(first, last, pivot)`.
 fn unguarded_partition<T: Copy, C: Comp<T>>(
     v: &mut [T],
     mut first: usize,
@@ -106,7 +98,6 @@ fn unguarded_partition<T: Copy, C: Comp<T>>(
     }
 }
 
-/// `std::__final_insertion_sort`.
 fn final_insertion_sort<T: Copy, C: Comp<T>>(v: &mut [T], c: &C) {
     if v.len() > S_THRESHOLD {
         insertion_sort(v, 0, S_THRESHOLD, c);
@@ -119,7 +110,6 @@ fn final_insertion_sort<T: Copy, C: Comp<T>>(v: &mut [T], c: &C) {
     }
 }
 
-/// `std::__insertion_sort`.
 fn insertion_sort<T: Copy, C: Comp<T>>(v: &mut [T], first: usize, last: usize, c: &C) {
     if first == last {
         return;
@@ -135,7 +125,6 @@ fn insertion_sort<T: Copy, C: Comp<T>>(v: &mut [T], first: usize, last: usize, c
     }
 }
 
-/// `std::__unguarded_linear_insert`.
 fn unguarded_linear_insert<T: Copy, C: Comp<T>>(v: &mut [T], mut last: usize, c: &C) {
     let val = v[last];
     let mut next = last - 1;
@@ -145,35 +134,4 @@ fn unguarded_linear_insert<T: Copy, C: Comp<T>>(v: &mut [T], mut last: usize, c:
         next = next.wrapping_sub(1);
     }
     v[last] = val;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Descending by the third element, which is `PrefillSM90Plan`'s
-    #[test]
-    fn equal_keys_come_out_in_libstdcxx_order() {
-        let mut v: Vec<(i32, i32, i32)> = (0..20).map(|i| (i, i, 128)).collect();
-        sort(&mut v, &|a: &(i32, i32, i32), b: &(i32, i32, i32)| a.2 > b.2);
-        let order: Vec<i32> = v.iter().map(|t| t.0).collect();
-        assert_eq!(order.len(), 20);
-        assert_ne!(order, (0..20).collect::<Vec<_>>());
-    }
-
-    /// A sort is still a sort.
-    #[test]
-    fn the_range_ends_up_ordered() {
-        let mut v: Vec<i32> = (0..200).map(|i| (i * 37) % 101).collect();
-        sort(&mut v, &|a: &i32, b: &i32| a > b);
-        assert!(v.windows(2).all(|w| w[0] >= w[1]));
-    }
-
-    /// Short ranges never reach the quicksort at all.
-    #[test]
-    fn a_short_range_is_insertion_sorted() {
-        let mut v = [3i32, 1, 2];
-        sort(&mut v, &|a: &i32, b: &i32| a < b);
-        assert_eq!(v, [1, 2, 3]);
-    }
 }

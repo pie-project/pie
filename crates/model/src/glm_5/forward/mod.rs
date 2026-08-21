@@ -43,6 +43,13 @@ struct Glm5LayerW {
     idx_wq_b: MatW,
     idx_wk: MatW,
     idx_weights: MatW,
+    /// The indexer's own LayerNorm, and it is a PAIR because the kernel
+    /// subtracts the row mean before scaling and adds a bias after -- see
+    /// `dsl::cuda::dsa_index_knorm_rope`. Trace names like the three
+    /// projections above, for the reason `project.rs` gives about all of
+    /// them at once.
+    idx_k_norm_weight: String,
+    idx_k_norm_bias: String,
     dense_gate: MatW,
     dense_up: MatW,
     dense_down: MatW,
@@ -79,6 +86,8 @@ impl Glm5LayerW {
             idx_wq_b: m("idx_wq_b", f.dsa.index_n_heads * f.dsa.index_head_dim),
             idx_wk: m("idx_wk", f.dsa.index_head_dim),
             idx_weights: m("idx_weights_proj", f.dsa.index_n_heads),
+            idx_k_norm_weight: w("idx_k_norm"),
+            idx_k_norm_bias: w("idx_k_norm_bias"),
             dense_gate: m("dense_gate_proj", f.dense_intermediate),
             dense_up: m("dense_up_proj", f.dense_intermediate),
             dense_down: m("dense_down_proj", f.hidden),
@@ -131,7 +140,12 @@ pub fn glm5_cuda(facts: &Glm5Facts, class: FireClass) -> ForwardPlan {
             );
             let idx_k = dsl::cuda::gemm_xwt(&x, &w.idx_wk.name, facts.dsa.index_head_dim);
             let idx_w = dsl::cuda::gemm_xwt(&q_a_n, &w.idx_weights.name, facts.dsa.index_n_heads);
-            let idx_k = dsl::cuda::dsa_index_knorm_rope(&idx_k, facts.dsa.index_head_dim);
+            let idx_k = dsl::cuda::dsa_index_knorm_rope(
+                &idx_k,
+                &w.idx_k_norm_weight,
+                &w.idx_k_norm_bias,
+                facts.dsa.index_head_dim,
+            );
             let idx_q = dsl::cuda::dsa_index_q_rope(
                 &idx_q,
                 facts.dsa.index_n_heads,

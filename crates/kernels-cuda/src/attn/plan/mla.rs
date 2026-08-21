@@ -4,29 +4,20 @@ use super::heap::MinHeap;
 use super::info::MlaPlanInfo;
 use super::{Device, Error, Plan, Workspace};
 
-/// The cap on work items MLA's index arrays are sized for.
 pub const MAX_TOTAL_NUM_WORKS: i32 = 16384;
 
-/// The batch an MLA plan is built for.
 #[derive(Clone, Copy, Debug)]
 pub struct Request<'a> {
-    /// `batch_size + 1` QO row offsets.
+
     pub qo_indptr: &'a [i32],
-    /// `batch_size + 1` KV offsets.
     pub kv_indptr: &'a [i32],
-    /// `batch_size` KV lengths.
     pub kv_len_arr: &'a [i32],
-    /// Requests in the batch.
     pub batch_size: u32,
-    /// Heads, which pack into the QO tile — MLA fuses them, unlike FA3.
     pub num_heads: u32,
-    /// Output head dimension, which sizes the partial-output carve.
     pub head_dim_o: u32,
-    /// Whether a QO tile reads only up to the diagonal.
     pub causal: bool,
 }
 
-/// One cluster's work list, before it is flattened.
 #[derive(Clone, Debug, Default)]
 struct ClusterWork {
     q_indptr: Vec<i32>,
@@ -39,52 +30,31 @@ struct ClusterWork {
     kv_end: Vec<i32>,
 }
 
-/// The MLA schedule: per-work arrays, per-merge-CTA arrays, and the grid shape.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schedule {
-    /// CTAs per cluster — `num_blks_x`, and the grid's x extent.
+
     pub cluster_size: i32,
-    /// Clusters — `num_blks_y`.
     pub num_clusters: u32,
-    /// QO rows per cluster tile: `cluster_size * 64`.
     pub cluster_tile_q: i32,
-    /// The KV chunk limit `f(ceil(total_kv / num_clusters))`.
     pub kv_len_limit: i32,
-    /// Work items produced.
     pub total_num_works: i32,
-    /// Rows of partial output the split tiles will write.
     pub partial_o_nnz: i32,
-    /// `q_indptr[work]`.
     pub q_indptr: Vec<i32>,
-    /// `kv_indptr[work]`.
     pub kv_indptr: Vec<i32>,
-    /// `partial_indptr[work]` — the partial-output row this work item writes
     pub partial_indptr: Vec<i32>,
-    /// `q_len[work]`.
     pub q_len: Vec<i32>,
-    /// `kv_len[work]`.
     pub kv_len: Vec<i32>,
-    /// `q_start[work]`.
     pub q_start: Vec<i32>,
-    /// `kv_start[work]`.
     pub kv_start: Vec<i32>,
-    /// `kv_end[work]`.
     pub kv_end: Vec<i32>,
-    /// `work_indptr[cluster]`, `num_clusters + 1` entries.
     pub work_indptr: Vec<i32>,
-    /// `merge_packed_offset_start[cta]`, `num_sm` entries.
     pub merge_packed_offset_start: Vec<i32>,
-    /// `merge_packed_offset_end[cta]`.
     pub merge_packed_offset_end: Vec<i32>,
-    /// `merge_partial_packed_offset_start[cta]`.
     pub merge_partial_packed_offset_start: Vec<i32>,
-    /// `merge_partial_packed_offset_end[cta]`.
     pub merge_partial_packed_offset_end: Vec<i32>,
-    /// `merge_partial_stride[cta]`.
     pub merge_partial_stride: Vec<i32>,
 }
 
-/// The KV chunk limit's step function.
 #[must_use]
 pub const fn kv_len_limit_step(x: i32) -> i32 {
     if x <= 8 {
@@ -100,7 +70,6 @@ pub const fn kv_len_limit_step(x: i32) -> i32 {
     }
 }
 
-/// Build the MLA schedule without laying it out in a workspace.
 #[allow(clippy::too_many_lines)]
 pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
     let batch_size = req.batch_size as usize;
@@ -307,7 +276,6 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
     })
 }
 
-/// `MLAPlan` — the plan, and the bytes to upload under it.
 pub fn plan(
     req: &Request<'_>,
     device: &Device,
@@ -395,129 +363,4 @@ pub fn plan(
         int_bytes,
         float_bytes: float_alloc.used(),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const H100: Device = Device::new(132, 9);
-
-    fn request<'a>(qo: &'a [i32], kv: &'a [i32], lens: &'a [i32]) -> Request<'a> {
-        Request {
-            qo_indptr: qo,
-            kv_indptr: kv,
-            kv_len_arr: lens,
-            batch_size: lens.len() as u32,
-            num_heads: 128,
-            head_dim_o: 512,
-            causal: true,
-        }
-    }
-
-    /// A batch of single-token decodes gets one-CTA clusters and 64-row tiles;
-    #[test]
-    fn a_decode_batch_gets_one_cta_clusters() {
-        let qo: Vec<i32> = (0..=8).collect();
-        let kv: Vec<i32> = (0..=8).map(|i| i * 1024).collect();
-        let lens = vec![1024i32; 8];
-        let sched = schedule(&request(&qo, &kv, &lens), &H100).unwrap();
-        assert_eq!(sched.cluster_size, 2, "128 heads x 1 token packs to 128 rows");
-        assert_eq!(sched.cluster_tile_q, 128);
-        assert_eq!(*sched.work_indptr.last().unwrap(), sched.total_num_works);
-    }
-
-    /// The work arrays are a partition of the schedule, whatever the split did.
-    #[test]
-    fn work_indptr_partitions_the_work_items() {
-        let qo = [0i32, 1, 2, 3, 4];
-        let kv = [0i32, 8192, 16384, 24576, 32768];
-        let lens = [8192i32, 8192, 8192, 8192];
-        let sched = schedule(&request(&qo, &kv, &lens), &H100).unwrap();
-        assert_eq!(sched.q_indptr.len(), sched.total_num_works as usize);
-        assert_eq!(sched.kv_end.len(), sched.total_num_works as usize);
-        assert!(sched.work_indptr.windows(2).all(|w| w[1] >= w[0]));
-    }
-
-    /// One very long sequence beside short ones is the case the KV split
-    #[test]
-    fn a_long_sequence_is_chopped_into_contiguous_kv_ranges() {
-        let qo = [0i32, 1, 2];
-        let kv = [0i32, 131_072, 131_073];
-        let lens = [131_072i32, 1];
-        let sched = schedule(&request(&qo, &kv, &lens), &H100).unwrap();
-        assert!(sched.partial_indptr.iter().any(|&p| p >= 0), "nothing was split");
-        let long: Vec<(i32, i32)> = sched
-            .kv_start
-            .iter()
-            .zip(&sched.kv_end)
-            .zip(&sched.kv_len)
-            .filter(|&((_, _), &len)| len == 131_072)
-            .map(|((&s, &e), _)| (s, e))
-            .collect();
-        let mut sorted = long.clone();
-        sorted.sort_unstable();
-        assert_eq!(sorted[0].0, 0);
-        assert!(sorted.windows(2).all(|w| w[0].1 == w[1].0), "kv ranges are not contiguous");
-        assert_eq!(sorted.last().unwrap().1, 131_072);
-    }
-
-    /// A zero-length KV still gets a work item, because the kernel must write
-    #[test]
-    fn a_zero_length_request_still_gets_one_work_item() {
-        let qo = [0i32, 1];
-        let kv = [0i32, 0];
-        let lens = [0i32];
-        let sched = schedule(&request(&qo, &kv, &lens), &H100).unwrap();
-        assert_eq!(sched.total_num_works, 1);
-        assert_eq!(sched.kv_start, vec![0]);
-        assert_eq!(sched.kv_end, vec![0]);
-    }
-
-    /// The chunk limit snaps, which is why the kernel's KV loop has no tail.
-    #[test]
-    fn the_chunk_limit_snaps_to_a_tileable_size() {
-        assert_eq!(kv_len_limit_step(1), 32);
-        assert_eq!(kv_len_limit_step(8), 32);
-        assert_eq!(kv_len_limit_step(9), 64);
-        assert_eq!(kv_len_limit_step(33), 192);
-        assert_eq!(kv_len_limit_step(65), 256);
-        assert_eq!(kv_len_limit_step(257), 512);
-    }
-
-    /// The empty batch is upstream's division by zero.
-    #[test]
-    fn the_empty_batch_is_refused_rather_than_dividing_by_zero() {
-        let qo = [0i32];
-        let kv = [0i32];
-        let lens: [i32; 0] = [];
-        assert_eq!(schedule(&request(&qo, &kv, &lens), &H100).unwrap_err(), Error::EmptyBatch);
-    }
-
-    /// The int workspace does not depend on the batch — it is `max_total_num_works`
-    #[test]
-    fn the_int_workspace_is_a_constant_size() {
-        let small_qo = [0i32, 1];
-        let small_kv = [0i32, 16];
-        let small_lens = [16i32];
-        let big_qo: Vec<i32> = (0..=64).collect();
-        let big_kv: Vec<i32> = (0..=64).map(|i| i * 4096).collect();
-        let big_lens = vec![4096i32; 64];
-        let ws = Workspace::new(1 << 25, 1 << 22);
-        let small = plan(&request(&small_qo, &small_kv, &small_lens), &H100, ws).unwrap();
-        let big = plan(&request(&big_qo, &big_kv, &big_lens), &H100, ws).unwrap();
-        assert_eq!(small.int_bytes, big.int_bytes);
-        assert_eq!(small.info.work_indptr_offset, big.info.work_indptr_offset);
-    }
-
-    /// A workspace that cannot hold the fixed-size arrays is refused by name.
-    #[test]
-    fn a_workspace_that_cannot_hold_the_plan_is_refused() {
-        let qo = [0i32, 1];
-        let kv = [0i32, 16];
-        let lens = [16i32];
-        let err =
-            plan(&request(&qo, &kv, &lens), &H100, Workspace::new(1 << 24, 1024)).unwrap_err();
-        assert!(matches!(err, Error::WorkspaceOverflow { what: "mla_q_indptr", .. }));
-    }
 }

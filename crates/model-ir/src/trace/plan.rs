@@ -18,6 +18,24 @@ pub struct ForwardPlan {
     /// Every seam the text stated ([`SeamStatement`]), in text order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub seams: Vec<SeamStatement>,
+    /// Every runtime value the text names, in mint order: the driver-owned
+    /// objects and per-fire streams whose names come out of
+    /// `kernels::runtime`'s vocabulary. The driver's resolver answers each
+    /// by name; the lowering leaves each `Buffers::NAMED`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime: Vec<RuntimeBinding>,
+}
+
+/// One runtime value: which name answers it, and for which layer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeBinding {
+    /// The vocabulary name (`"kv_cache"`, `"positions"`, ...).
+    pub name: String,
+    /// The layer whose instance is meant, where the object is per-layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<u32>,
+    /// The trace value the binding answers.
+    pub value: ValueId,
 }
 
 fn is_false(b: &bool) -> bool {

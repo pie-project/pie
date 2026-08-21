@@ -657,7 +657,13 @@ pub fn metal_facts(
         // and the escape hatch its doc names is this field.
         qmm_tile: bind.qmm_tile.unwrap_or(QMM_TILE),
         qmm_partial_rows: bind.qmm_partial_rows,
-        qmm_fp16_precast: qmm_fp16_precast(bind.quant_group, bind.quant_bits),
+        // THE BUILD'S PERMISSION AND THE CODEC'S, CONJOINED. The codec test
+        // alone is not enough: the staged symbol exists at one codec, but a
+        // backend whose GEMM does not read back what the cast wrote is wrong
+        // at that codec too, and `driver-wgpu` is one. See
+        // `MetalBinding::qmm_fp16_precast`.
+        qmm_fp16_precast: bind.qmm_fp16_precast
+            && qmm_fp16_precast(bind.quant_group, bind.quant_bits),
         // False at the codec that would allow it. See the fact: this family's
         // routed checkpoint reordered a next-layer top-k under half rounding
         // in `llama_numerics_test`, and a reordered top-k is a different
@@ -1126,6 +1132,7 @@ mod tests {
     fn binding(group: u32, bits: u32) -> MetalBinding {
         MetalBinding {
             qmm_partial_rows: false,
+            qmm_fp16_precast: true,
             qmm_tile: None,
             quant_group: group,
             quant_bits: bits,
@@ -1430,6 +1437,7 @@ mod tests {
         let plain = binding(64, 4);
         let mixed = MetalBinding {
             qmm_partial_rows: false,
+            qmm_fp16_precast: true,
             qmm_tile: None,
             moe_mxfp4: true,
             ..binding(64, 4)

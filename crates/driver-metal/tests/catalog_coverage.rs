@@ -97,6 +97,19 @@ const AT_METAL: MetalBinding = driver_metal::model::binding::ANY_ENCODING;
 fn deployable() -> Vec<(&'static dyn catalog::Variant, Deployment)> {
     catalog::catalog()
         .iter()
+        // NOT THE TEST ROWS, and the reason is that this file's numbers must
+        // not depend on who else is in the build. `model`'s `test-rows`
+        // feature adds a row its own catalog calls "a row that is not a
+        // model"; nothing in `driver-metal` asks for the feature, but cargo
+        // UNIFIES features across a workspace build, so `cargo test
+        // --workspace` handed this census one more row than `cargo test -p
+        // driver-metal` did and the two disagreed about a constant.
+        //
+        // Filtering by the prefix rather than by the `cfg` is deliberate:
+        // `a_shipped_catalog_has_no_test_rows` is what keeps the prefix
+        // meaningful, and a `cfg` here would have to be repeated at every
+        // count below.
+        .filter(|row| !row.id().starts_with("test-"))
         .filter_map(|row| row.deployment(Deployed::single()).ok().map(|d| (*row, d)))
         .collect()
 }
@@ -175,17 +188,33 @@ fn an_ordinary_row_projects_a_geometry_and_an_extraordinary_one_may_refuse() {
     // a feature gate flipped, a `catalog()` that returns an empty slice —
     // passes every assertion above in silence, which is the exact failure
     // `mod_audit.rs` and `layering.rs` both guard their own scans against.
-    assert!(
-        served + refused > 10,
-        "only {} rows deployed at all; this gate is not reading the catalog",
+    // FIFTY-THREE ROWS, FORTY-TWO OF THEM SERVED.
+    //
+    // This was `served + refused > 10` and `served > 0`, which is five times
+    // below the census and catches only the empty-slice case the comment
+    // above describes. The failure it could not see is the one worth seeing:
+    // a row moving from SERVED to REFUSED. That is a model this backend used
+    // to project and no longer does, and it changes neither the deployment
+    // count nor the fact that something is still served, so both floors held
+    // while the backend lost a family.
+    //
+    // Both numbers move when the catalog does, which is a deliberate act --
+    // adding a model is a commit that should say so here too.
+    assert_eq!(
+        served + refused,
+        53,
+        "the catalog is {} rows deployed; this gate expects 53. A model \
+         added or retired moves it.",
         served + refused
     );
-    assert!(
-        served > 0,
-        "no catalog row projects a Metal geometry — this backend serves \
-         nothing and every device test below it is measuring an empty set"
+    assert_eq!(
+        served, 42,
+        "{served} of the {} deployed rows project a Metal geometry and this \
+         gate expects 42. A FALL here with the total unchanged is a row that \
+         stopped projecting -- a model this backend used to serve and now \
+         refuses by name -- which is the regression neither floor could see.",
+        served + refused
     );
-    eprintln!("{served} rows project a geometry, {refused} are refused by name");
 }
 
 /// What is EXTRAORDINARY about a deployment, or `None` if nothing is.
@@ -391,6 +420,7 @@ fn the_text_this_driver_runs_is_the_text_the_row_states() {
         AT_METAL,
         MetalBinding {
             qmm_partial_rows: false,
+            qmm_fp16_precast: true,
             qmm_tile: None,
             quant_group: 128,
             quant_bits: 8,

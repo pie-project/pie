@@ -560,6 +560,15 @@ fn every_symbol_is_an_instantiated_point_and_not_a_bare_stem() {
     // `(file, entrypoint)` pairs the families state, which is what
     // `device_kernels.rs` builds a pipeline for. A symbol that is not one of
     // them is a symbol no pipeline can be built from.
+    //
+    // What counts as stated moved once and moved back. `930fee2cb` put the
+    // quantised forms on STAMPS -- `quant/qmm_t.metal` carries a `#define`
+    // the host asks to be stamped rather than spelling out a product of
+    // entry points -- and for a few hours this test failed on five qmm
+    // symbols, because the census read the FILE and a stamped point is
+    // declared by nothing until a fire asks. `75e4d9699` taught it to count
+    // the host's points too. The census is the right question again; it was
+    // briefly the wrong one, and the difference was five names.
     let census: BTreeSet<String> = kernels_metal::entrypoints().into_iter().collect();
     let mut faults: Vec<String> = Vec::new();
     for text in texts() {
@@ -570,10 +579,15 @@ fn every_symbol_is_an_instantiated_point_and_not_a_bare_stem() {
                 }
                 // A stem, or a point that was never instantiated: the same
                 // failure at the device either way, so the report shows what
-                // the census DOES carry for the routine that claims it.
+                // the census DOES carry near the name. Both directions: a
+                // stem is SHORTER than the points that instantiate it, and a
+                // misspelled point is LONGER than the stem it meant. Only the
+                // first was looked for, so every failure of the second kind
+                // reported `[]` -- which is what the qmm failures printed,
+                // and it is the case the reader most needs the neighbours for.
                 let near: Vec<&String> = census
                     .iter()
-                    .filter(|e| e.starts_with(symbol.as_str()))
+                    .filter(|e| e.starts_with(symbol.as_str()) || symbol.starts_with(e.as_str()))
                     .take(4)
                     .collect();
                 faults.push(format!(
@@ -665,11 +679,23 @@ fn every_shipped_entrypoint_is_crossed_or_carries_an_excuse() {
         stranded.join("\n  ")
     );
 
-    // The census is pinned by two sibling crates and by `entrypoints.rs`; it
-    // is restated here because THIS assertion is only worth its name if it
-    // ran over all of them. A `crossed` that started answering `Some` for
-    // everything would pass the loop above in silence; a census that shrank
-    // to nothing would too.
+    // The census is restated here because THIS assertion is only worth its
+    // name if it ran over all of it. A `crossed` that started answering
+    // `Some` for everything would pass the loop above in silence; a census
+    // that shrank to nothing would too.
+    //
+    // It read 265 for a few hours on 2026-08-20 and the dip is worth
+    // keeping. `930fee2cb` moved the quantised forms off declared points
+    // and onto stamps, and the census counted the FILE -- so 216 points
+    // that a fire can still spell stopped being counted, while every one of
+    // them remained real. `75e4d9699` taught it to count the host's stamped
+    // points as well as the file's declared ones, and it is 481 again.
+    //
+    // Nothing about the shipped set changed in either direction. The number
+    // moved twice because what "shipped" MEANT was being rebuilt underneath
+    // it, which is exactly the circumstance a pinned census exists for: it
+    // is the only reason anyone re-established that all 481 still resolve
+    // and none is stranded, on either side of the move.
     assert_eq!(shipped.len(), 481, "the census moved");
 }
 
@@ -922,8 +948,9 @@ fn shader_slots(
     file: &str,
     stem: &str,
     entry: &str,
+    routine: &str,
 ) -> Option<BTreeMap<usize, &'static str>> {
-    let params = param_list(root, file, stem, entry)?;
+    let params = param_list(root, file, stem, entry, routine)?;
     let mut slots = BTreeMap::new();
     let mut rest = params.as_str();
     while let Some(i) = rest.find("[[buffer(") {
@@ -981,11 +1008,45 @@ const PRIMITIVE: &[&str] = &[
 /// which is the shape every widening so far has had, and the reason to keep
 /// widening: the named kernels hold, the unnamed ones are where the faults
 /// have been sitting unread.
-fn param_list(root: &std::path::Path, file: &str, stem: &str, entry: &str) -> Option<String> {
+fn param_list(
+    root: &std::path::Path,
+    file: &str,
+    stem: &str,
+    entry: &str,
+    routine: &str,
+) -> Option<String> {
     let src = std::fs::read_to_string(root.join(file)).ok()?;
-    macro_param_list(&src, stem, 0)
+    stamp_macro(&src, routine)
+        .or_else(|| macro_param_list(&src, stem, 0))
         .or_else(|| quoted_macro(&src, stem).and_then(|f| declaration(&src, &f)))
         .or_else(|| host_name_alias(&src, entry).and_then(|f| declaration(&src, &f)))
+}
+
+/// The template a `PIE_STAMP_<routine>` macro instantiates.
+///
+/// This link did not exist before `930fee2cb`. A stamped point is declared by
+/// nothing until a fire asks for it, so the only text tying the routine
+/// `qmm_t_bias` to a parameter list is the `#define PIE_STAMP_qmm_t_bias`
+/// that names the template it stamps — and it has to be tried FIRST, because
+/// the fallbacks below resolve by name similarity and the file is full of
+/// near-misses. `quant/qmm_t.metal` declares both `affine_qmm_t_aligned_bias`
+/// (dense, eight buffers, what the stamp actually instantiates) and
+/// `affine_qmm_t_bias_fp16_precast` (`x` at buffer 12, thirteen), and without
+/// this step the stem landed on the second and reported the routine as
+/// binding eight slots into a kernel declaring thirteen. Both numbers were
+/// right about different kernels, which is the failure a name-similarity
+/// lookup produces and cannot diagnose.
+fn stamp_macro(src: &str, routine: &str) -> Option<String> {
+    let at = src.find(&format!("#define PIE_STAMP_{routine}("))?;
+    let body = &src[at..];
+    // The macro's own `void` names the template; its parameters are bare
+    // types, so the list has to come from the template's definition.
+    let after = body.find("void ")? + "void ".len();
+    let template: String = body[after..]
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    declaration(src, &template)
 }
 
 /// The parameter list of `void <name>(..)`, taking the first that names its
@@ -1516,7 +1577,7 @@ fn every_routine_agrees_with_the_shader_its_stem_names() {
             .iter()
             .rposition(|(_, ty)| ty != "InPacked")
             .map_or(0, |at| at + 1);
-        let Some(shader) = shader_slots(&root, file, symbol, entry) else {
+        let Some(shader) = shader_slots(&root, file, symbol, entry, routine.name) else {
             unresolved.push(format!(
                 "  {symbol} -> `{}`: nothing in {file} declares buffers under \
                  `{symbol}`, under the shortest entry it claims (`{entry}`), \
@@ -1847,7 +1908,19 @@ fn prefill_tiles_the_attention_decode_walks_row_by_row() {
         );
         checked += 1;
     }
-    assert!(checked >= 8, "every text is asked, not a subset: {checked}");
+    // NINE, STATED. This was `>= 8` and `texts()` returns nine, so the floor
+    // has been one short of its subject for however long the ninth text has
+    // existed -- and a floor one below the count is a floor that would not
+    // notice a text being dropped. Every census in this file that was written
+    // as a floor has now been measured and found loose by exactly this much
+    // or more.
+    assert_eq!(
+        checked, 9,
+        "every text is asked, not a subset. A text added or removed is fine \
+         and this number moves with it; a text that stops being ASKED, \
+         because it was filtered out upstream or returned early, shows up \
+         only here."
+    );
 }
 // ── A test that was here, and the stronger one it duplicated ─────────────
 //

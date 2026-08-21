@@ -88,9 +88,6 @@ pub trait Holds {
     /// [`Refusal::Absent`] when the statement carries no such operand.
     fn weight(&mut self, n: usize) -> Result<u32, Refusal>;
 
-    /// The block the statement's own scalars ride in, for a body that takes
-    /// them as one buffer rather than one at a time.
-    fn params_block(&mut self) -> u32;
 
     /// The statement's `n`th scalar.
     ///
@@ -226,7 +223,6 @@ pub fn one<V: ShaderValue, H: Holds + ?Sized>(
         // reader taking `rows` off a weight would get this batch's token
         // count for a bank that has none.
         Source::Slot(Kind::Weight, n) => handle(ty, h.weight(n.into())?),
-        Source::Slot(Kind::Params, _) => Ok(V::buffer(h.params_block())),
         // THE CARRIER SAYS WHICH READING. `Param<2, f32>` and `ParamF32<2>`
         // name the same scalar and differ only in how its bits are read.
         // Refusing the first spelling was a real defect, not a hypothetical.

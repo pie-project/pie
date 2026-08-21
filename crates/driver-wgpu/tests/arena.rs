@@ -698,7 +698,19 @@ fn every_arena_offset_a_real_lowering_assigns_is_bindable() {
             let symbol = &low.kernels[launch.kernel as usize];
             let declared = &mods[symbol];
             let module = driver_wgpu::geometry::Module::loaded(symbol, declared);
-            let planned = driver_wgpu::dispatch::plan_one(
+            // `plan_all` AND NOT `plan_one`. A rectangle is one statement and
+            // may be more than one dispatch: `attn`'s split decode cuts a
+            // row's key range into slices and merges them, which is two
+            // entrypoints over one launch. `plan_one` refuses that by name
+            // (`Undispatchable::Multiple`) and this walk would have counted
+            // the refusal as a defect in a corpus that has none.
+            //
+            // Each pass is asked the question separately, because each pass
+            // binds its own block: a merge that offered no scalars to a module
+            // that reads them is the same silent bind-group rejection as a
+            // single-pass launch doing it, and asking only the first would
+            // have stopped seeing half of the split fleet.
+            let planned = driver_wgpu::dispatch::plan_all(
                 low,
                 launch,
                 Built { module, declared },
@@ -710,31 +722,33 @@ fn every_arena_offset_a_real_lowering_assigns_is_bindable() {
                 *geometry,
             )
             .unwrap_or_else(|why| panic!("{name}: `{symbol}` plans a rectangle: {why}"));
-            match planned.params {
-                Params::Block {
-                    ref bytes,
-                    at: ParamSlot::Uniform,
-                } => {
-                    carrying += 1;
-                    blocks.insert(u32::try_from(bytes.len()).expect("a block of a few words"));
-                }
-                // A STORAGE block is a buffer in `@group(0)`, placed by the
-                // arena at an offset the walk above already holds to 256. It
-                // is not this question.
-                Params::Block {
-                    at: ParamSlot::Storage(_),
-                    ..
-                } => {}
-                // A module that reads a block and a dispatch that offers none
-                // is a bind group `wgpu` rejects at encode, and it would reach
-                // this file as a block of zero bytes rather than as a refusal.
-                Params::None => {
-                    if !declared.uniform_offsets.is_empty() {
-                        silent.push(format!(
-                            "{name}: `{symbol}` offers no scalars against a module that \
+            for pass in &planned {
+                match pass.params {
+                    Params::Block {
+                        ref bytes,
+                        at: ParamSlot::Uniform,
+                    } => {
+                        carrying += 1;
+                        blocks.insert(u32::try_from(bytes.len()).expect("a block of a few words"));
+                    }
+                    // A STORAGE block is a buffer in `@group(0)`, placed by the
+                    // arena at an offset the walk above already holds to 256. It
+                    // is not this question.
+                    Params::Block {
+                        at: ParamSlot::Storage(_),
+                        ..
+                    } => {}
+                    // A module that reads a block and a dispatch that offers none
+                    // is a bind group `wgpu` rejects at encode, and it would reach
+                    // this file as a block of zero bytes rather than as a refusal.
+                    Params::None => {
+                        if !declared.uniform_offsets.is_empty() {
+                            silent.push(format!(
+                                "{name}: `{symbol}` offers no scalars against a module that \
                              reads {} of them",
-                            declared.uniform_offsets.len()
-                        ));
+                                declared.uniform_offsets.len()
+                            ));
+                        }
                     }
                 }
             }
@@ -799,16 +813,23 @@ fn every_arena_offset_a_real_lowering_assigns_is_bindable() {
 /// dispatchable compute module, so a symbol that is in the table and whose
 /// WGSL does not parse fails here rather than at a fire.
 ///
-/// It is a smaller number than the table's 481 because a lowering is not yet
+/// It is a smaller number than the table's 489 because a lowering is not yet
 /// the whole of a fire -- `Lowered::residue` holds the statements that still
 /// run without a rectangle. What it measures is the part that HAS crossed, and
 /// that part is fully served.
 #[test]
 fn every_symbol_a_real_text_launches_has_a_module() {
     let table: BTreeSet<String> = kernels_wgpu::entrypoints().into_iter().collect();
+    // 481 -> 489 AS A FAMILY CROSSED. `kernels-wgpu` pins the same number from
+    // the owning side in its `tests/entrypoints.rs`, and `reflect.rs`'s census
+    // sweep pins it from this crate's; all three move together and a
+    // disagreement is settled at the table. It is repeated here because this
+    // walk needs a DENOMINATOR -- the sentence below is about the corpus being
+    // a fraction of the table, and a fraction of an unpinned number says
+    // nothing.
     assert_eq!(
         table.len(),
-        481,
+        489,
         "the table states a different set of names"
     );
 
@@ -873,23 +894,32 @@ fn every_symbol_a_real_text_launches_has_a_module() {
         unreadable.len(),
         unreadable.join("\n  ")
     );
+    // `REACHES` AND `SPLIT` TOGETHER ARE THE DESCRIPTION. Every launched
+    // symbol is classified by exactly one of them: `REACHES` says how a
+    // single-dispatch statement's operands account against its module, and
+    // `SPLIT` names the statements that plan into more than one module and
+    // therefore have no single account to give. The union is what "this file
+    // describes it" means, and a symbol in NEITHER is a statement nobody has
+    // looked at -- which is the whole reason both are enumerations.
+    let described = |s: &str| REACHES.iter().any(|(n, _)| *n == s) || SPLIT.contains(&s);
     let undescribed: Vec<&str> = launched
         .iter()
-        .filter(|s| !REACHES.iter().any(|(n, _)| n == *s))
         .map(std::string::String::as_str)
+        .filter(|s| !described(s))
         .collect();
     let stale: Vec<&str> = REACHES
         .iter()
         .map(|(n, _)| *n)
+        .chain(SPLIT.iter().copied())
         .filter(|n| !launched.iter().any(|s| s == n))
         .collect();
     assert_eq!(
         launched.len(),
-        REACHES.len(),
+        REACHES.len() + SPLIT.len(),
         "the texts launch {} distinct symbols and this file describes {}; \
          launched but undescribed: {undescribed:?}; described but never launched: {stale:?}",
         launched.len(),
-        REACHES.len()
+        REACHES.len() + SPLIT.len()
     );
     // Every launched symbol at every tier that HAS a source, pinned because
     // the loop above passes vacuously for a tier that has none -- and the
@@ -1031,6 +1061,26 @@ enum Reaches {
 /// Transcribed, so that a text that starts launching something new, or a
 /// shader that changes its binding count, is a failure here rather than a
 /// surprise in a fire.
+/// The statements this driver plans as more than one dispatch.
+///
+/// One entry, and it is `attn`'s split decode. `sdpa_paged_decode` cuts a
+/// row's key range into eight slices so that a fire too narrow to fill this
+/// GPU has workgroups to spare, writes a partial and a log-sum-exp per slice,
+/// and then merges them -- `_split_` and then `_merge_`, two entrypoints over
+/// one launch.
+///
+/// It is written down here rather than inferred because splitting is a
+/// DRIVER's decision about its own occupancy and not a property of the
+/// statement: the same trace is one dispatch on a machine with fewer cores
+/// and on any backend that does not split. A statement that starts splitting
+/// should therefore fail this list until somebody says so on purpose, which
+/// is the same rule `REACHES` states for itself.
+///
+/// `sdpa_paged_decode_sink` is NOT here: it is a complete unsplit kernel and
+/// still names one module. That asymmetry is real and is why this is a list
+/// and not a prefix test.
+const SPLIT: &[&str] = &["sdpa_paged_decode_bfloat16_d_128"];
+
 const REACHES: &[(&str, Reaches)] = &[
     // The 8-bit rungs, which the texts started launching when upstream added
     // them. Same shape as the 4-bit pair below and described separately
@@ -1053,8 +1103,16 @@ const REACHES: &[(&str, Reaches)] = &[
         // VALUE, because the subtraction that produced it saturated at zero --
         // the same trap `BodyDeclines` was added for, on the other axis. Now
         // it does.
+        //
+        // BlockDeclines(2) -> (1) WHEN THE TILED GEMM LEARNED ITS ROW COUNT.
+        // `qmm_t.wgsl`'s `Params` ends with `m` now so that `write_out` can
+        // return on `row >= m` and a partial tile can be rounded up instead of
+        // refused -- see `geometry.rs`'s `Rule::Qmm` arm. That is one more word
+        // the body reads, so one fewer word the statement carries that the block
+        // declines. The four stated marks did not move; the uniform came up to
+        // meet them.
         "affine_qmm_t_bfloat16_gs_64_b_8_bm_32_bn_32",
-        Reaches::BlockDeclines(2),
+        Reaches::BlockDeclines(1),
     ),
     ("affine_qmv_fast_bfloat16_gs_64_b_8", Reaches::Uniform),
     // THE DENSE PROJECTIONS MOVED TO THE PRECAST PATH. Upstream's "metal: run
@@ -1067,14 +1125,20 @@ const REACHES: &[(&str, Reaches)] = &[
     // On this backend `_fp16_precast` is fp16 STORAGE and an fp32 multiply --
     // `quant/qmm_t.wgsl`'s header says so at length -- because WebGPU's
     // matrix-unit feature is deliberately outside this crate's tier list. Same
-    // bindings either way, which is why all three are `Uniform`.
+    // bindings either way, which is why these two read alike.
+    //
+    // `Uniform` -> `RunGrows(1)` FOR THE SAME REASON THE ROW ABOVE MOVED. The
+    // tiled GEMM's `Params` gained `m`, so the body's run is one word longer
+    // than the statement's -- and `RunGrows` is the right side of the ledger
+    // for it: the driver supplies the extra word from the fire, which is
+    // where a row count comes from. It is not the statement's to state.
     (
         "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
-        Reaches::Uniform,
+        Reaches::RunGrows(1),
     ),
     (
         "affine_qmm_t_residual_fp16_precast_bfloat16_gs_64_b_4_bm_32_bn_32",
-        Reaches::Uniform,
+        Reaches::RunGrows(1),
     ),
     // `RunGrows(0)` and not `Uniform`: the statement carries THREE scalars --
     // `model-dsl::metal::cast_qmm_input` states `[k, k, k]` -- and the body
@@ -1110,7 +1174,10 @@ const REACHES: &[(&str, Reaches)] = &[
     // recently, which made it the one operand-less row a real plan could name.
     // Now it says where its buffers go, and its unread `biases` slot is the
     // same kind of gap -- the codec has no bias plane, so nothing fills it.
-    ("mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4", Reaches::RunGrows(2)),
+    (
+        "mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4",
+        Reaches::RunGrows(2),
+    ),
     // The BATCHED routed pair, which the texts started launching when upstream
     // added `Qwen35MetalFacts::moe_tile` -- the opt-in that turns a MoE
     // prefill's expert banks from one matvec per row into a tiled GEMM.
@@ -1211,10 +1278,12 @@ const REACHES: &[(&str, Reaches)] = &[
     ("kv_append_paged_bfloat16", Reaches::DriverSupplies(4)),
     // Eight each: the cache's two sides, the page indices and their indptr,
     // the positions, the request map and the two mask tables.
-    (
-        "sdpa_paged_decode_bfloat16_d_128",
-        Reaches::DriverSupplies(8),
-    ),
+    // `sdpa_paged_decode_bfloat16_d_128` STOOD HERE, as
+    // `DriverSupplies(8)`, until it began to split. It is in `SPLIT` above
+    // now: a statement planned as two modules has no single account to
+    // reach one by, and the per-pass balance check is what covers it
+    // instead. The sink below is the same family and does not split, which
+    // is why the row shape is still worth reading.
     (
         "sdpa_paged_decode_sink_bfloat16_d_64",
         Reaches::DriverSupplies(8),
@@ -1315,7 +1384,7 @@ fn what_the_plan_states_and_what_the_module_binds_account_for_each_other() {
             // full account of a corpus it had thrown part of away.
             let routine = driver_wgpu::lowering::routine::armed(symbol)
                 .unwrap_or_else(|| panic!("`{symbol}` is armed: nothing plans without a routine"));
-            let d = driver_wgpu::dispatch::plan_one(
+            let mut passes = driver_wgpu::dispatch::plan_all(
                 low,
                 launch,
                 Built { module, declared },
@@ -1327,6 +1396,51 @@ fn what_the_plan_states_and_what_the_module_binds_account_for_each_other() {
                 *geometry,
             )
             .unwrap_or_else(|why| panic!("{text}: `{symbol}` plans a rectangle: {why}"));
+
+            // A SPLIT LAUNCH IS NOT ONE ACCOUNT, and this is where that stops
+            // being a detail. `Reaches` compares what the STATEMENT states --
+            // its operand count, its aliases, its scalar run -- against what
+            // ONE module declares, and a split decode is two modules over one
+            // statement: the split pass takes a scratch buffer the statement
+            // never mentions and the merge pass reads that scratch instead of
+            // the cache. There is no single number the pair reaches its
+            // module by, because there is no single module.
+            //
+            // So the classification is skipped for them and the BALANCE is
+            // not. That is the stronger of the two claims anyway -- every
+            // pass fills its own module's bindings exactly, with its own
+            // holes -- and it is asked here against each pass's own
+            // `Declared` rather than the statement symbol's.
+            //
+            // The list is pinned rather than inferred for the same reason
+            // `REACHES` is an enumeration: a statement that starts splitting
+            // is a driver decision somebody made, and it should fail here
+            // until it is written down.
+            if passes.len() > 1 {
+                assert!(
+                    SPLIT.contains(&symbol.as_str()),
+                    "{text}: `{symbol}` planned {} passes and this file \
+                     describes it as a single dispatch",
+                    passes.len()
+                );
+                for pass in &passes {
+                    let own = driver_wgpu::reflect::entrypoint(&pass.symbol, Capability::Baseline)
+                        .unwrap_or_else(|why| panic!("no module for `{}`: {why}", pass.symbol));
+                    let filled = pass.buffers.len() + usize::from(pass.block_at.is_some());
+                    if filled + own.holes() != own.bindings as usize {
+                        wrong.push(format!(
+                            "{text}: `{symbol}`'s pass `{}` fills {filled} of its \
+                             module's {} bindings and leaves {} unread, which does \
+                             not balance",
+                            pass.symbol,
+                            own.bindings,
+                            own.holes()
+                        ));
+                    }
+                }
+                continue;
+            }
+            let d = passes.remove(0);
 
             let params = launch.params.end - launch.params.start;
             // An IN-PLACE routine binds one buffer for two of the plan's args:
@@ -1748,7 +1862,9 @@ fn an_arena_one_byte_short_of_what_the_plan_placed_refuses_what_runs_off_it() {
 /// `kernels_wgpu::KERNELS` is empty; there is no row to compare, and the
 /// question moved rather than closed -- the row's `operands` column is now the
 /// argument list a body passes, and `routine::state` is where it is read. The
-/// walk is over ALL 7224 rectangles now instead of the 1136 that had rows.
+/// walk is over ALL 7224 rectangles now instead of the 1136 that had rows, and
+/// over the 7376 DISPATCHES they plan into -- a split decode is two
+/// entrypoints over one statement and each has its own block to place.
 #[test]
 fn every_launchs_scalars_land_where_its_module_reads_them() {
     let all = geometric();
@@ -1765,6 +1881,9 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
     let mut module_alone = 0u64;
     let mut body_alone = 0u64;
     let mut eight_byte = 0u64;
+    // Every module any PASS names, which is a superset of `mods`: the split
+    // decode's two entrypoints are named by no statement.
+    let mut passed: BTreeMap<String, Declared> = BTreeMap::new();
 
     for (text, low, geometry) in &all {
         let buf = Placeholder(low.arena_bytes as u64);
@@ -1790,7 +1909,19 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
                 eight_byte += 1;
             }
 
-            let planned = driver_wgpu::dispatch::plan_one(
+            // `plan_all`, AND EACH PASS AGAINST ITS OWN MODULE. A split
+            // decode is two entrypoints over one statement, and the two do
+            // not read the same block -- the split pass takes the partition
+            // count and the merge pass takes how many partials to fold. So
+            // `declared` above, which is the STATEMENT symbol's module, is
+            // the right one to open the launch with and the wrong one to
+            // hold either pass's scalars against.
+            //
+            // `stated_by` returns one `Stated` per dispatch in the same
+            // order, which is what makes the zip below meaningful rather
+            // than a coincidence: pass `i`'s packed run is compared with pass
+            // `i`'s module and with nothing else.
+            let planned = driver_wgpu::dispatch::plan_all(
                 low,
                 launch,
                 Built { module, declared },
@@ -1801,8 +1932,29 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
                 },
                 *geometry,
             );
-            match planned {
-                Ok(d) => match d.params {
+            let passes: Vec<_> = match planned {
+                Ok(list) => list,
+                Err(why) => {
+                    owed.insert(format!("{symbol}: {why}"));
+                    Vec::new()
+                }
+            };
+            for (d, state) in passes.iter().zip(states.iter().flatten()) {
+                // MEMOISED. `reflect::entrypoint` expands the `//#include`
+                // tree and hands it to `naga`, and this walk asks once per
+                // dispatch over seven thousand of them; without the cache the
+                // test took two minutes and spent all of it re-parsing the
+                // same forty modules.
+                let declared = passed
+                    .entry(d.symbol.to_owned())
+                    .or_insert_with(|| {
+                        driver_wgpu::reflect::entrypoint(d.symbol, Capability::Baseline)
+                            .unwrap_or_else(|why| panic!("no module for `{}`: {why}", d.symbol))
+                    })
+                    .clone();
+                let declared = &declared;
+                let symbol = &d.symbol;
+                match d.params {
                     Params::Block {
                         ref bytes,
                         at: ParamSlot::Uniform,
@@ -1833,25 +1985,23 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
                         // for offset. Collected rather than asserted in place
                         // so a disagreement names every symbol it holds for and
                         // not just the first rectangle to reach it.
-                        for state in states.iter().flatten() {
-                            let packed = packed_offsets(&state.scalars);
-                            if declared.uniform_offsets.starts_with(&packed) {
-                                if packed.len() == declared.uniform_offsets.len() {
-                                    whole_struct += 1;
-                                } else {
-                                    short.insert(format!(
-                                        "{symbol}: passes {} of {} fields",
-                                        packed.len(),
-                                        declared.uniform_offsets.len()
-                                    ));
-                                }
+                        let packed = packed_offsets(&state.scalars);
+                        if declared.uniform_offsets.starts_with(&packed) {
+                            if packed.len() == declared.uniform_offsets.len() {
+                                whole_struct += 1;
                             } else {
-                                misplaced.insert(format!(
-                                    "{symbol}: packs its scalars at {packed:?} and the \
-                                     module reads them at {:?}",
-                                    declared.uniform_offsets
+                                short.insert(format!(
+                                    "{symbol}: passes {} of {} fields",
+                                    packed.len(),
+                                    declared.uniform_offsets.len()
                                 ));
                             }
+                        } else {
+                            misplaced.insert(format!(
+                                "{symbol}: packs its scalars at {packed:?} and the \
+                                 module reads them at {:?}",
+                                declared.uniform_offsets
+                            ));
                         }
                     }
                     Params::Block {
@@ -1895,9 +2045,6 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
                             declared.uniform_offsets.len()
                         );
                     }
-                },
-                Err(why) => {
-                    owed.insert(format!("{symbol}: {why}"));
                 }
             }
 
@@ -1942,16 +2089,24 @@ fn every_launchs_scalars_land_where_its_module_reads_them() {
             short.iter().cloned().collect::<Vec<_>>().join("\n  ")
         );
     }
-    // Every rectangle takes exactly one of the three shapes, and the total is
-    // the corpus. Stated as an identity against a number pinned in four other
-    // walks rather than as three literals: the split between uniform and
+    // Every DISPATCH takes exactly one of the three shapes. Stated as an
+    // identity rather than as three literals: the split between uniform and
     // storage is a property of which shaders declare a block where, and moves
-    // whenever a kernel's ABI does, but a rectangle that took NO shape would be
-    // a rectangle this walk silently dropped.
+    // whenever a kernel's ABI does, but a dispatch that took NO shape would be
+    // one this walk silently dropped.
+    //
+    // 7224 -> 7376, AND THE 152 ARE NOT NEW RECTANGLES. The corpus is still
+    // 7224 launches -- the number the other walks in this file pin -- and 152
+    // of them are the split decode, which plans two dispatches over one
+    // statement. A parameter block belongs to a MODULE and each pass has its
+    // own, so this walk counts passes where the others count launches. The
+    // difference between the two is exactly the extra passes, which is the
+    // arithmetic worth writing down: if it ever is not, either a launch
+    // stopped planning or a pass stopped being counted.
     assert_eq!(
         uniform + storage + bare,
-        7224,
-        "a different number of launches take each parameter shape"
+        7376,
+        "a different number of dispatches take each parameter shape"
     );
     // And the shape that occurs occurs, or a branch that never runs is passing
     // for the same reason an absent one would.
@@ -2077,6 +2232,10 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
     let mut lost_sentinels: BTreeSet<String> = BTreeSet::new();
     let mut foreign: BTreeSet<String> = BTreeSet::new();
     let mut arena_bound = 0u32;
+    // Every module any PASS names, memoised: `reflect::entrypoint` expands an
+    // include tree and hands it to `naga`, and this walk asks once per
+    // dispatch over seven thousand of them.
+    let mut passed: BTreeMap<String, Declared> = BTreeMap::new();
 
     for (text, low, geometry) in &all {
         let buf = Placeholder(low.arena_bytes as u64);
@@ -2103,236 +2262,267 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
             let plain = driver_wgpu::binding::bind(low, launch, arena, &store, STRICTEST_ALIGNMENT)
                 .expect("the statement's operands bind against the arena that holds them");
 
-            match driver_wgpu::dispatch::plan_one(
+            // `plan_all`, AND EVERY PASS WALKED. A rectangle is one statement
+            // and may be more than one dispatch -- the split decode cuts a
+            // key range into slices and merges them -- so `plan_one` refused
+            // 152 of this corpus's 7224 launches by name and the walk counted
+            // the refusal as though the statement had no plan.
+            //
+            // `planned` still counts LAUNCHES, which is what makes it
+            // comparable with `launches` above; the per-pass work below runs
+            // once per dispatch. Each pass is held against ITS OWN module,
+            // because a split pass and a merge pass declare different binding
+            // sets and neither is the statement symbol's.
+            match driver_wgpu::dispatch::plan_all(
                 low,
                 launch,
                 Built { module, declared },
                 sources,
                 *geometry,
             ) {
-                Ok(d) => {
+                Ok(passes) => {
                     planned += 1;
-                    // A grid with a zero in it runs nothing and reports
-                    // success, which is the failure this crate refuses
-                    // hardest. `plan_one` is supposed to have caught it.
-                    assert!(
-                        !d.groups.contains(&0),
-                        "{text}: `{symbol}` planned a grid of {:?}",
-                        d.groups
-                    );
-                    for (widest, got) in widest_grid.iter_mut().zip(d.groups) {
-                        *widest = (*widest).max(got);
-                    }
-                    workgroups +=
-                        u64::from(d.groups[0]) * u64::from(d.groups[1]) * u64::from(d.groups[2]);
-
-                    // The same launch against a geometry of ZEROS, which is the
-                    // nastiest input a caller can hand this seam. None gets
-                    // through, and the measured reason is not `plan_one`'s
-                    // empty-grid check but the row overrides: a head-shaped row
-                    // STATES its head width and head count, so the zeros are
-                    // replaced before a rule sees them, and the rows that do
-                    // not state them refuse geometrically instead. So this
-                    // block does not witness that check; it witnesses that no
-                    // real rectangle can be driven to an empty grid from
-                    // outside.
-                    if let Ok(hollow) = driver_wgpu::dispatch::plan_one(
-                        low,
-                        launch,
-                        Built { module, declared },
-                        sources,
-                        Geometry::default(),
-                    ) {
+                    for (pass, d) in passes.iter().enumerate() {
+                        let declared = &passed
+                            .entry(d.symbol.to_owned())
+                            .or_insert_with(|| {
+                                driver_wgpu::reflect::entrypoint(d.symbol, Capability::Baseline)
+                                    .unwrap_or_else(|why| {
+                                        panic!("no module for `{}`: {why}", d.symbol)
+                                    })
+                            })
+                            .clone();
+                        // A grid with a zero in it runs nothing and reports
+                        // success, which is the failure this crate refuses
+                        // hardest. `plan_one` is supposed to have caught it.
                         assert!(
-                            !hollow.groups.contains(&0),
-                            "{text}: `{symbol}` planned {:?} from a geometry of zeros",
-                            hollow.groups
+                            !d.groups.contains(&0),
+                            "{text}: `{symbol}` planned a grid of {:?}",
+                            d.groups
                         );
-                    } else {
-                        refused_hollow += 1;
-                    }
-
-                    // AND THE SEAM MOVED, so the hollow case has to move with
-                    // it. A head width used to reach a body through
-                    // `Facts::head_dim`, and a geometry of zeros was therefore
-                    // the way to hand one nothing. It is a `Const<i32>` now --
-                    // the checkpoint's, which the STATEMENT carries -- so the
-                    // fire's zeros no longer reach it and the block above stops
-                    // witnessing anything for that family.
-                    //
-                    // What a caller can still hand it nothing THROUGH is the
-                    // params run, so that is zeroed here. A body that divides
-                    // by its stated width, or sizes a group by it, must refuse
-                    // rather than dispatch an empty grid.
-                    let mut hollowed = low.clone();
-                    hollowed.params = vec![0; low.params.len()];
-                    if let Ok(hollow) = driver_wgpu::dispatch::plan_one(
-                        &hollowed,
-                        launch,
-                        Built { module, declared },
-                        sources,
-                        Geometry::default(),
-                    ) {
-                        assert!(
-                            !hollow.groups.contains(&0),
-                            "{text}: `{symbol}` planned {:?} from a statement \
-                             of zeros",
-                            hollow.groups
-                        );
-                    } else {
-                        refused_hollow += 1;
-                    }
-
-                    // THE POOL'S NUMBERS REACH THE SHADER. A body may pass
-                    // a number that belongs to the POOL rather than to the
-                    // statement -- the KV page size, the cache's two strides,
-                    // the attention mask's -- and `Handles::fire_number` is
-                    // where an arm asks for one. The walk's own resolver
-                    // answers `None` to every number, so all of them read as
-                    // zero in `d`; the SAME rectangle planned against a
-                    // resolver with recognisable answers is what says which
-                    // ones arrived and where.
-                    //
-                    // A wrong stride is not an error. It is attention reading
-                    // the wrong offsets and returning numbers.
-                    let Ok(told) = driver_wgpu::dispatch::plan_one(
-                        low,
-                        launch,
-                        Built { module, declared },
-                        Sources {
-                            arena,
-                            resolver: &sentinels,
-                            min_offset: STRICTEST_ALIGNMENT,
-                        },
-                        *geometry,
-                    ) else {
-                        lost_sentinels.insert(format!(
-                            "{symbol}: plans against a resolver that answers nothing \
-                             and refuses one that answers everything"
-                        ));
-                        continue;
-                    };
-                    for which in [
-                        FireNumber::KvPageSize,
-                        FireNumber::KvHeadStride,
-                        FireNumber::KvSeqStride,
-                        FireNumber::AttentionMaskStride,
-                    ] {
-                        if !carries(&told.params, sentinel(which)) {
-                            continue;
+                        for (widest, got) in widest_grid.iter_mut().zip(d.groups) {
+                            *widest = (*widest).max(got);
                         }
-                        pool_numbers += 1;
-                        numbers_seen.insert(which);
-                        // The word is the POOL's and nothing in the statement
-                        // carries it, so it cannot have come from the run: the
-                        // same rectangle planned against a resolver that
-                        // answers nothing has a zero where this word is. That
-                        // is what makes the hit above evidence of a resolver
-                        // call rather than of a coincidence in the scalars.
-                        assert!(
-                            !carries(&d.params, sentinel(which)),
-                            "{text}: `{symbol}` hands the shader {which:?}'s sentinel \
+                        workgroups += u64::from(d.groups[0])
+                            * u64::from(d.groups[1])
+                            * u64::from(d.groups[2]);
+
+                        // The same launch against a geometry of ZEROS, which is the
+                        // nastiest input a caller can hand this seam. None gets
+                        // through, and the measured reason is not `plan_one`'s
+                        // empty-grid check but the row overrides: a head-shaped row
+                        // STATES its head width and head count, so the zeros are
+                        // replaced before a rule sees them, and the rows that do
+                        // not state them refuse geometrically instead. So this
+                        // block does not witness that check; it witnesses that no
+                        // real rectangle can be driven to an empty grid from
+                        // outside.
+                        if let Some(hollow) = driver_wgpu::dispatch::plan_all(
+                            low,
+                            launch,
+                            Built { module, declared },
+                            sources,
+                            Geometry::default(),
+                        )
+                        .ok()
+                        .and_then(|list| list.into_iter().nth(pass))
+                        {
+                            assert!(
+                                !hollow.groups.contains(&0),
+                                "{text}: `{symbol}` planned {:?} from a geometry of zeros",
+                                hollow.groups
+                            );
+                        } else {
+                            refused_hollow += 1;
+                        }
+
+                        // AND THE SEAM MOVED, so the hollow case has to move with
+                        // it. A head width used to reach a body through
+                        // `Facts::head_dim`, and a geometry of zeros was therefore
+                        // the way to hand one nothing. It is a `Const<i32>` now --
+                        // the checkpoint's, which the STATEMENT carries -- so the
+                        // fire's zeros no longer reach it and the block above stops
+                        // witnessing anything for that family.
+                        //
+                        // What a caller can still hand it nothing THROUGH is the
+                        // params run, so that is zeroed here. A body that divides
+                        // by its stated width, or sizes a group by it, must refuse
+                        // rather than dispatch an empty grid.
+                        let mut hollowed = low.clone();
+                        hollowed.params = vec![0; low.params.len()];
+                        if let Some(hollow) = driver_wgpu::dispatch::plan_all(
+                            &hollowed,
+                            launch,
+                            Built { module, declared },
+                            sources,
+                            Geometry::default(),
+                        )
+                        .ok()
+                        .and_then(|list| list.into_iter().nth(pass))
+                        {
+                            assert!(
+                                !hollow.groups.contains(&0),
+                                "{text}: `{symbol}` planned {:?} from a statement \
+                             of zeros",
+                                hollow.groups
+                            );
+                        } else {
+                            refused_hollow += 1;
+                        }
+
+                        // THE POOL'S NUMBERS REACH THE SHADER. A body may pass
+                        // a number that belongs to the POOL rather than to the
+                        // statement -- the KV page size, the cache's two strides,
+                        // the attention mask's -- and `Handles::fire_number` is
+                        // where an arm asks for one. The walk's own resolver
+                        // answers `None` to every number, so all of them read as
+                        // zero in `d`; the SAME rectangle planned against a
+                        // resolver with recognisable answers is what says which
+                        // ones arrived and where.
+                        //
+                        // A wrong stride is not an error. It is attention reading
+                        // the wrong offsets and returning numbers.
+                        let Some(told) = driver_wgpu::dispatch::plan_all(
+                            low,
+                            launch,
+                            Built { module, declared },
+                            Sources {
+                                arena,
+                                resolver: &sentinels,
+                                min_offset: STRICTEST_ALIGNMENT,
+                            },
+                            *geometry,
+                        )
+                        .ok()
+                        .and_then(|list| list.into_iter().nth(pass)) else {
+                            lost_sentinels.insert(format!(
+                                "{symbol}: plans against a resolver that answers nothing \
+                             and refuses one that answers everything"
+                            ));
+                            continue;
+                        };
+                        for which in [
+                            FireNumber::KvPageSize,
+                            FireNumber::KvHeadStride,
+                            FireNumber::KvSeqStride,
+                            FireNumber::AttentionMaskStride,
+                        ] {
+                            if !carries(&told.params, sentinel(which)) {
+                                continue;
+                            }
+                            pool_numbers += 1;
+                            numbers_seen.insert(which);
+                            // The word is the POOL's and nothing in the statement
+                            // carries it, so it cannot have come from the run: the
+                            // same rectangle planned against a resolver that
+                            // answers nothing has a zero where this word is. That
+                            // is what makes the hit above evidence of a resolver
+                            // call rather than of a coincidence in the scalars.
+                            assert!(
+                                !carries(&d.params, sentinel(which)),
+                                "{text}: `{symbol}` hands the shader {which:?}'s sentinel \
                              even when the resolver answers nothing, so the word did \
                              not come from the pool"
-                        );
-                    }
+                            );
+                        }
 
-                    match d.params {
-                        Params::Block {
-                            at: ParamSlot::Uniform,
-                            ref bytes,
-                        } => {
-                            uniform += 1;
-                            // A uniform block takes NO place in the `@group(0)`
-                            // list -- it is a bind group of its own -- so a
-                            // dispatch that recorded one here would shift every
-                            // storage entry after it, and `wgpu` would accept
-                            // the set if the kinds happened to line up.
-                            assert_eq!(
-                                d.block_at, None,
-                                "{text}: `{symbol}` puts its uniform block in the \
+                        match d.params {
+                            Params::Block {
+                                at: ParamSlot::Uniform,
+                                ref bytes,
+                            } => {
+                                uniform += 1;
+                                // A uniform block takes NO place in the `@group(0)`
+                                // list -- it is a bind group of its own -- so a
+                                // dispatch that recorded one here would shift every
+                                // storage entry after it, and `wgpu` would accept
+                                // the set if the kinds happened to line up.
+                                assert_eq!(
+                                    d.block_at, None,
+                                    "{text}: `{symbol}` puts its uniform block in the \
                                  storage group"
-                            );
-                            assert_eq!(bytes.len(), declared.uniform_bytes as usize);
-                        }
-                        Params::Block {
-                            at: ParamSlot::Storage(at),
-                            ref bytes,
-                        } => {
-                            storage += 1;
-                            assert!(!bytes.is_empty());
-                            assert!(
-                                at < declared.bindings,
-                                "{text}: `{symbol}` puts its block at {at} of {}",
-                                declared.bindings
-                            );
-                            // The DENSE index, which is what a bind group is
-                            // written from: a slot the body leaves empty takes
-                            // no entry. They agree on every module in this
-                            // tree, and this is where that is measured rather
-                            // than assumed.
-                            assert_eq!(
-                                d.block_at,
-                                Some(at as usize),
-                                "{text}: `{symbol}`'s block is binding {at} and \
+                                );
+                                assert_eq!(bytes.len(), declared.uniform_bytes as usize);
+                            }
+                            Params::Block {
+                                at: ParamSlot::Storage(at),
+                                ref bytes,
+                            } => {
+                                storage += 1;
+                                assert!(!bytes.is_empty());
+                                assert!(
+                                    at < declared.bindings,
+                                    "{text}: `{symbol}` puts its block at {at} of {}",
+                                    declared.bindings
+                                );
+                                // The DENSE index, which is what a bind group is
+                                // written from: a slot the body leaves empty takes
+                                // no entry. They agree on every module in this
+                                // tree, and this is where that is measured rather
+                                // than assumed.
+                                assert_eq!(
+                                    d.block_at,
+                                    Some(at as usize),
+                                    "{text}: `{symbol}`'s block is binding {at} and \
                                  entry {:?} of the group",
-                                d.block_at
-                            );
+                                    d.block_at
+                                );
+                            }
+                            Params::None => {}
                         }
-                        Params::None => {}
-                    }
 
-                    // The operands, PLUS the slot a parameter struct takes,
-                    // PLUS the slots the body leaves empty, are the module's
-                    // whole binding set. `driver-vulkan` asserts the same sum
-                    // with its holes SUBTRACTED, and that is a Vulkan
-                    // coincidence rather than a rule: there a hole is an
-                    // undeclared number, here it is a declared binding this
-                    // entry point does not read, and `wgpu` validates a group
-                    // against its layout entry for entry either way.
-                    let block = usize::from(d.block_at.is_some());
-                    let empty = declared.holes();
-                    assert_eq!(
-                        d.buffers.len() + block + empty,
-                        declared.bindings as usize,
-                        "{text}: `{symbol}` bound {} plus {block} plus {empty} for \
+                        // The operands, PLUS the slot a parameter struct takes,
+                        // PLUS the slots the body leaves empty, are the module's
+                        // whole binding set. `driver-vulkan` asserts the same sum
+                        // with its holes SUBTRACTED, and that is a Vulkan
+                        // coincidence rather than a rule: there a hole is an
+                        // undeclared number, here it is a declared binding this
+                        // entry point does not read, and `wgpu` validates a group
+                        // against its layout entry for entry either way.
+                        let block = usize::from(d.block_at.is_some());
+                        let empty = declared.holes();
+                        assert_eq!(
+                            d.buffers.len() + block + empty,
+                            declared.bindings as usize,
+                            "{text}: `{symbol}` bound {} plus {block} plus {empty} for \
                          {} bindings",
-                        d.buffers.len(),
-                        declared.bindings
-                    );
+                            d.buffers.len(),
+                            declared.bindings
+                        );
 
-                    // AND EVERY ARENA BUFFER IT BOUND IS ONE OF THIS LAUNCH'S
-                    // OWN OPERANDS, at exactly the range `binding::bind`
-                    // places it.
-                    //
-                    // The claim the retired fallback used to make, moved to
-                    // the plane the operands now travel on. An arm asks for
-                    // its operands by position -- `Handles::input(0)`,
-                    // `output(0)` -- and a body then orders them for its
-                    // shader; a mis-indexed ask binds a real tensor of the
-                    // right length to the wrong slot, and no shape check
-                    // anywhere notices, because these are storage buffers of
-                    // matching extent.
-                    //
-                    // Told apart from the driver's own resources by BUFFER:
-                    // the arena is `Placeholder(low.arena_bytes)` and every
-                    // stand-in is `Placeholder(GENEROUS)`, and `Placeholder`
-                    // compares by value. So a weight, a fire table or the KV
-                    // cache is not this question and is skipped, and what is
-                    // left is the statement's own activations.
-                    for bound in &d.buffers {
-                        if *bound.buffer() != buf {
-                            continue;
-                        }
-                        arena_bound += 1;
-                        if !plain.contains(bound) {
-                            foreign.insert(format!(
-                                "{symbol}: binds {} bytes at {} of the arena, which is \
+                        // AND EVERY ARENA BUFFER IT BOUND IS ONE OF THIS LAUNCH'S
+                        // OWN OPERANDS, at exactly the range `binding::bind`
+                        // places it.
+                        //
+                        // The claim the retired fallback used to make, moved to
+                        // the plane the operands now travel on. An arm asks for
+                        // its operands by position -- `Handles::input(0)`,
+                        // `output(0)` -- and a body then orders them for its
+                        // shader; a mis-indexed ask binds a real tensor of the
+                        // right length to the wrong slot, and no shape check
+                        // anywhere notices, because these are storage buffers of
+                        // matching extent.
+                        //
+                        // Told apart from the driver's own resources by BUFFER:
+                        // the arena is `Placeholder(low.arena_bytes)` and every
+                        // stand-in is `Placeholder(GENEROUS)`, and `Placeholder`
+                        // compares by value. So a weight, a fire table or the KV
+                        // cache is not this question and is skipped, and what is
+                        // left is the statement's own activations.
+                        for bound in &d.buffers {
+                            if *bound.buffer() != buf {
+                                continue;
+                            }
+                            arena_bound += 1;
+                            if !plain.contains(bound) {
+                                foreign.insert(format!(
+                                    "{symbol}: binds {} bytes at {} of the arena, which is \
                                  not one of the {} operands the statement carries",
-                                bound.len(),
-                                bound.offset(),
-                                plain.len()
-                            ));
+                                    bound.len(),
+                                    bound.offset(),
+                                    plain.len()
+                                ));
+                            }
                         }
                     }
                 }
@@ -2615,8 +2805,22 @@ fn every_rectangle_of_every_real_plan_becomes_a_dispatch_or_a_named_refusal() {
         // a lane. That halves the K loop's trip count inside a group and
         // changes no grid, so this number is blind to it -- which is the right
         // shape: this counts dispatched work, not work per lane.
+        //
+        // UP BY 3,188,864 WHEN THE PAGED DECODE SPLIT, and this rise is the
+        // point of the change rather than a cost of it. `sdpa_paged_decode`
+        // is two dispatches now: `_split_` cuts a row's key range into eight
+        // slices so that a fire with more query heads than the GPU has cores
+        // still has workgroups to hand it, and `_merge_` folds the eight
+        // partials back. Eight times the attention groups plus a cheap merge
+        // pass, over 152 rectangles.
+        //
+        // This total counts DISPATCHED WORKGROUPS and not work, and the
+        // distinction is the whole reason a split is worth making: each of
+        // the eight covers an eighth of the key range, so the arithmetic is
+        // the same arithmetic spread over more groups. A number that measured
+        // work would not have moved at all.
         workgroups,
-        13_149_202,
+        16_338_066,
         "the plans dispatch a different amount of work"
     );
     // The third dimension is a prefill's rows, and only the paged decodes put
@@ -2750,18 +2954,17 @@ fn every_arm_naming_a_pool_number_is_handed_that_number_and_not_another() {
         // exists at `_d_64` alone and `sdpa_vector_decode_swa` at `_d_256` and
         // `_d_512`, so any single number refuses one of them -- and a refusal
         // here is a body this sweep never ran.
-        let scalars: Vec<u32> = match symbol.rsplit_once("_d_").and_then(|(_, d)| {
-            d.split('_').next().and_then(|d| d.parse::<u32>().ok())
-        }) {
+        let scalars: Vec<u32> = match symbol
+            .rsplit_once("_d_")
+            .and_then(|(_, d)| d.split('_').next().and_then(|d| d.parse::<u32>().ok()))
+        {
             // AT THE SLOT EACH FAMILY READS IT FROM, which is not the same
             // slot. `sdpa_vector_decode` takes `[scale, head_dim, q_heads]`;
             // the `swa` and `sink` forms put a WINDOW between the scale and
             // the width, so theirs is at 2. A run of one number everywhere
             // would state a window of 256 and a q-head count to match.
             Some(d) => {
-                let at = usize::from(
-                    symbol.contains("_swa") || symbol.contains("_sink"),
-                ) + 1;
+                let at = usize::from(symbol.contains("_swa") || symbol.contains("_sink")) + 1;
                 let mut run = scalars.clone();
                 run[at] = d;
                 // AND THE HEAD COUNT THAT GOES WITH IT. The query row this
@@ -2800,24 +3003,16 @@ fn every_arm_naming_a_pool_number_is_handed_that_number_and_not_another() {
                 })
                 .unwrap_or(taken)
         };
-        let free = driver_wgpu::lowering::bind::bind(
-            routine.args,
-            routine.sources,
-            &mut open,
-            facts,
-        )
-        .ok()
-        .map(|taken| fired_scalars(taken, open));
+        let free =
+            driver_wgpu::lowering::bind::bind(routine.args, routine.sources, &mut open, facts)
+                .ok()
+                .map(|taken| fired_scalars(taken, open));
         let mut walled =
             driver_wgpu::lowering::hold::Handles::with_numbers(&args, results, &scalars, &paged);
-        let held = driver_wgpu::lowering::bind::bind(
-            routine.args,
-            routine.sources,
-            &mut walled,
-            facts,
-        )
-        .ok()
-        .map(|taken| fired_scalars(taken, walled));
+        let held =
+            driver_wgpu::lowering::bind::bind(routine.args, routine.sources, &mut walled, facts)
+                .ok()
+                .map(|taken| fired_scalars(taken, walled));
         if free.is_none() && held.is_none() {
             continue;
         }
@@ -2989,6 +3184,16 @@ fn position(args: &[ArgValue], word: u32) -> Option<usize> {
 /// exists — two answers computed by different code, in different crates, that
 /// have to agree for every count. A predicate that admitted one row too many
 /// or one too few fails on the count it got wrong, by number.
+///
+/// # And the two have since stopped needing to agree
+///
+/// `qmm_t.wgsl` takes its row count in `Params` now and discards the
+/// overhang, so `Rule::Qmm` rounds a partial tile up instead of refusing it —
+/// the geometry has a grid for every row count and the halves of the sweep no
+/// longer mirror each other. The GEMM half is unchanged and is still the
+/// claim that matters; the GEMV half became a LEDGER of the counts the text's
+/// predicate withholds from a path that could now take them, which is a gap
+/// in `GuardPred::TokensMultipleOf` and not in this driver.
 #[test]
 fn every_row_count_the_guard_sends_to_the_gemm_has_a_grid() {
     let facts = LlamaLikeFacts::qwen3_0_6b();
@@ -3010,6 +3215,10 @@ fn every_row_count_the_guard_sends_to_the_gemm_has_a_grid() {
         .unwrap_or_else(|e| panic!("`{symbol}` is a module this build has: {e}"));
 
     let mut gemm_counts = Vec::new();
+    // Row counts the guard sends to the MATVEC that the GEMM could have
+    // taken. Empty until the tiled GEMM learned to round a partial tile up;
+    // see the ledger under the sweep.
+    let mut withheld = Vec::new();
     for rows in 1..=4 * tile {
         let low = lowered(&facts, &metal, FireClass::Prefill, rows)
             .unwrap_or_else(|| panic!("qwen3 lowers at {rows} rows"));
@@ -3033,17 +3242,62 @@ fn every_row_count_the_guard_sends_to_the_gemm_has_a_grid() {
                 grid.unwrap_err()
             );
         } else {
-            // The other direction, so this is not one claim checked against
-            // itself: a count the guard KEEPS from the GEMM is a count the
-            // geometry would have refused. If they ever both say yes here, the
-            // guard has become needlessly narrow rather than wrong.
+            // THE OTHER DIRECTION USED TO BE A REFUSAL AND IS NOW A GAP.
+            //
+            // This asserted `grid.is_err()`: a count the guard kept from the
+            // GEMM was a count the geometry would have refused anyway, so the
+            // two agreed and neither was doing the other's work. That held
+            // while `Rule::Qmm` raised `PartialTile`.
+            //
+            // It does not any more. `qmm_t.wgsl` takes its row count in
+            // `Params` and `write_out` returns on `row >= m`, so the arm
+            // rounds a partial tile up and every row count from 1 to four
+            // tiles has a grid. The geometry stopped refusing; the TEXT's
+            // guard did not stop withholding.
+            //
+            // So the claim is inverted rather than dropped. The grid must
+            // exist -- if it ever does not, the round-up regressed and this
+            // says so on the count it broke on -- and the count is recorded
+            // as work the driver could take and the text does not offer.
+            withheld.push(rows);
             assert!(
-                grid.is_err(),
-                "{rows} rows took the GEMV arm, but the GEMM's grid exists for \
-                 it -- the guard is refusing work it could do"
+                grid.is_ok(),
+                "{rows} rows took the GEMV arm and the GEMM has no grid for it \
+                 either: {:?}. The tiled GEMM is supposed to round a partial \
+                 tile up now",
+                grid.unwrap_err()
             );
         }
     }
+
+    // AND THE GAP IS EXACTLY THE NON-MULTIPLES, which is the useful form for
+    // it to be in.
+    //
+    // `GuardPred::TokensMultipleOf(bm)` is the text's predicate and it is a
+    // modulus, so it withholds thirty-one prompt lengths in thirty-two from
+    // the tiled path and sends them to the matvec instead. `geometry.rs`'s
+    // `Rule::Qmm` arm records what that cost when the refusal was real: a
+    // 496-token prefill read 529.2 tok/s against 512's 1238.1, and 1187.2
+    // once the bound was in place.
+    //
+    // The bound IS in place here, on the driver's side. What has not moved is
+    // the predicate, and it is not this crate's to move -- the guard is
+    // evaluated in `model_compiler::lower` from a `GuardPred` a shared text
+    // states, so relaxing it is a change every backend takes at once and one
+    // that needs the other two drivers to round up first. `driver-metal` and
+    // `driver-vulkan` still raise `PartialTile`.
+    //
+    // This list is therefore a LEDGER of that gap rather than a complaint
+    // about it. When the predicate relaxes, `withheld` empties and this
+    // assertion is the thing that notices.
+    assert_eq!(
+        withheld,
+        (1..=4 * tile)
+            .filter(|rows| !rows.is_multiple_of(tile))
+            .collect::<Vec<_>>(),
+        "the guard withholds a different set of row counts than the \
+         non-multiples of its tile"
+    );
 
     // And the set is the multiples of the tile, stated as a list rather than
     // as a rule, because a rule here would be the predicate agreeing with

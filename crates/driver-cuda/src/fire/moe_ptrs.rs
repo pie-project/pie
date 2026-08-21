@@ -304,11 +304,11 @@ pub unsafe fn build<M: DeviceMemory>(
         arrays.a_dn.cast::<*const bf16>(),
         arrays.b_dn.cast::<*const bf16>(),
         arrays.c_dn.cast::<*mut bf16>(),
+        kernels::routine::Const { v: banks.shared_gate_up.cast::<bf16>() },
+        kernels::routine::Const { v: banks.shared_down.cast::<bf16>() },
         bounds.max_blocks,
         bounds.block_size,
         bounds.routed_blocks,
-        banks.shared_gate_up.cast::<bf16>(),
-        banks.shared_down.cast::<bf16>(),
     );
     match fired {
         Ok(()) => Built::Ready(arrays),

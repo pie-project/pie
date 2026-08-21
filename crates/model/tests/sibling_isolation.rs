@@ -53,10 +53,13 @@ fn generations() -> Vec<String> {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| !not_a_generation.contains(&n.as_str()))
         .collect();
-    assert!(
-        names.len() >= 15,
-        "found {} generation modules; the layout moved and this guard is \
-         looking in the wrong place",
+    // 21, and `common_is_thin.rs` counts the same directories behind the
+    // same `>= 15`. One subject, two copies of one floor, six of slack each.
+    assert_eq!(
+        names.len(),
+        21,
+        "found {} generation modules, not 21; a generation arrived or left, \
+         or the layout moved and this guard is looking in the wrong place",
         names.len()
     );
     names.sort();

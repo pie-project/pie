@@ -42,6 +42,7 @@ use std::collections::BTreeSet;
 /// The binding `tests/catalog_backends.rs` traces every row against.
 const BINDING: MetalBinding = MetalBinding {
     qmm_partial_rows: false,
+    qmm_fp16_precast: true,
     qmm_tile: None,
     quant_group: 64,
     quant_bits: 4,
@@ -174,6 +175,14 @@ fn every_name_a_metal_text_asks_for_is_one_the_mlx_map_answers() {
     );
 
     let traced = names_metal_traces_ask_for();
+    // A FLOOR ON PURPOSE, and the widest gap in this sweep: it reads 5,596
+    // and asks for twenty. The subject is every traced name across every
+    // model, which moves whenever a layer count or a family's graph moves,
+    // so a census here would be re-measured without being read and would
+    // teach the next person that the number means nothing. Twenty catches
+    // the walk producing nothing, which at this scale is the only failure
+    // it can have; the size is written here so nobody re-measures it to
+    // discover that.
     assert!(
         traced.len() >= 20,
         "the Metal texts named only {} tensors, which is too few for this \

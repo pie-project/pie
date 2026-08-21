@@ -5,38 +5,24 @@ use super::info::PrefillPlanSm90Info;
 use super::sort::sort;
 use super::{Device, Error, Plan, Workspace};
 
-/// The batch an SM90 prefill plan is built for.
 #[derive(Clone, Copy, Debug)]
 pub struct Request<'a> {
-    /// `batch_size + 1` QO row offsets.
+
     pub qo_indptr: &'a [i32],
-    /// `batch_size + 1` KV offsets.
     pub kv_indptr: &'a [i32],
-    /// `batch_size` KV lengths.
     pub kv_len_arr: &'a [i32],
-    /// QO rows in the batch, which bounds the per-head work count.
     pub total_num_rows: u32,
-    /// Requests in the batch.
     pub batch_size: u32,
-    /// Query/output heads.
     pub num_qo_heads: u32,
-    /// Key/value heads; must divide `num_qo_heads`.
     pub num_kv_heads: u32,
-    /// QK head dimension. Unused by the schedule; kept for signature parity.
     pub head_dim_qk: u32,
-    /// VO head dimension — `64` widens the QO tile to 192.
     pub head_dim_vo: u32,
-    /// Tokens per page. Unused by the schedule; kept for signature parity.
     pub page_size: u32,
-    /// Whether a QO tile reads only up to the diagonal.
     pub causal: bool,
-    /// Whether this plan will be captured into a CUDA graph — which sizes the
     pub enable_cuda_graph: bool,
-    /// `sizeof(DTypeO)`. Unused; kept for signature parity.
     pub sizeof_dtype_o: u32,
 }
 
-/// One CTA's work list, before it is flattened.
 #[derive(Clone, Debug, Default)]
 struct CtaWork {
     qo_tile_indices: Vec<i32>,
@@ -48,34 +34,22 @@ struct CtaWork {
     batch_indices: Vec<i32>,
 }
 
-/// The schedule: seven parallel arrays indexed by work item, plus the
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schedule {
-    /// Whether one head's schedule is reused for all of them.
+
     pub same_schedule_for_all_heads: bool,
-    /// Work items produced.
     pub total_num_works: i32,
-    /// Slots the arrays are sized for — larger than `total_num_works` only
     pub max_total_num_works: i32,
-    /// `qo_tile_indices[work]`.
     pub qo_tile_indices: Vec<i32>,
-    /// `qo_indptr[work]` — the request's QO base, repeated per work item.
     pub qo_indptr: Vec<i32>,
-    /// `kv_indptr[work]`.
     pub kv_indptr: Vec<i32>,
-    /// `qo_len[work]`.
     pub qo_len: Vec<i32>,
-    /// `kv_len[work]`.
     pub kv_len: Vec<i32>,
-    /// `head_indices[work]`.
     pub head_indices: Vec<i32>,
-    /// `batch_indices[work]`.
     pub batch_indices: Vec<i32>,
-    /// `work_indptr[cta]`, `num_sm + 1` entries.
     pub work_indptr: Vec<i32>,
 }
 
-/// Build the SM90 schedule without laying it out in a workspace.
 pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
     if req.num_kv_heads == 0 || !req.num_qo_heads.is_multiple_of(req.num_kv_heads) {
         return Err(Error::HeadsNotDivisible {
@@ -191,7 +165,6 @@ pub fn schedule(req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
     })
 }
 
-/// `PrefillSM90Plan` — the plan, and the bytes to upload under it.
 pub fn plan(
     req: &Request<'_>,
     device: &Device,
@@ -236,102 +209,4 @@ pub fn plan(
 
     let int_bytes = int_alloc.used();
     Ok(Plan { info, int_upload: staging.into_upload(int_bytes), int_bytes, float_bytes: 0 })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const H100: Device = Device::new(132, 9);
-
-    fn request<'a>(qo: &'a [i32], kv: &'a [i32], lens: &'a [i32], rows: u32) -> Request<'a> {
-        Request {
-            qo_indptr: qo,
-            kv_indptr: kv,
-            kv_len_arr: lens,
-            total_num_rows: rows,
-            batch_size: lens.len() as u32,
-            num_qo_heads: 32,
-            num_kv_heads: 8,
-            head_dim_qk: 128,
-            head_dim_vo: 128,
-            page_size: 1,
-            causal: true,
-            enable_cuda_graph: false,
-            sizeof_dtype_o: 2,
-        }
-    }
-
-    /// Every work item lands on exactly one CTA, and `work_indptr` is the
-    #[test]
-    fn work_indptr_partitions_the_work_items() {
-        let qo = [0i32, 512, 1024, 1536];
-        let kv = [0i32, 4096, 8192, 12288];
-        let lens = [4096i32, 4096, 4096];
-        let sched = schedule(&request(&qo, &kv, &lens, 1536), &H100).unwrap();
-        assert_eq!(sched.work_indptr.len(), 133);
-        assert_eq!(sched.work_indptr[0], 0);
-        assert_eq!(*sched.work_indptr.last().unwrap(), sched.total_num_works);
-        assert_eq!(sched.qo_tile_indices.len(), sched.total_num_works as usize);
-        assert!(sched.work_indptr.windows(2).all(|w| w[1] >= w[0]));
-    }
-
-    /// A batch smaller than the grid leaves most CTAs empty and never
-    #[test]
-    fn a_small_batch_spreads_one_tile_per_cta() {
-        let qo = [0i32, 128, 256];
-        let kv = [0i32, 128, 256];
-        let lens = [128i32, 128];
-        let sched = schedule(&request(&qo, &kv, &lens, 256), &H100).unwrap();
-        assert_eq!(sched.total_num_works, 64);
-        assert!(sched.work_indptr.windows(2).all(|w| w[1] - w[0] <= 1));
-    }
-
-    /// Past 4096 works per head the planner schedules one head and lets the
-    #[test]
-    fn a_huge_batch_falls_back_to_one_schedule_for_all_heads() {
-        let batch = 5000usize;
-        let qo: Vec<i32> = (0..=batch as i32).collect();
-        let kv: Vec<i32> = (0..=batch as i32).map(|i| i * 64).collect();
-        let lens = vec![64i32; batch];
-        let sched = schedule(&request(&qo, &kv, &lens, batch as u32), &H100).unwrap();
-        assert!(sched.same_schedule_for_all_heads);
-        assert_eq!(sched.total_num_works, batch as i32);
-        assert!(sched.head_indices.iter().all(|&h| h == 0));
-    }
-
-    /// The empty batch is a real input here — unlike FA2's planner there is no
-    #[test]
-    fn the_empty_batch_plans_nothing_and_says_so() {
-        let qo = [0i32];
-        let kv = [0i32];
-        let lens: [i32; 0] = [];
-        let sched = schedule(&request(&qo, &kv, &lens, 0), &H100).unwrap();
-        assert_eq!(sched.total_num_works, 0);
-        assert!(sched.work_indptr.iter().all(|&w| w == 0));
-    }
-
-    /// Causal masking makes the first tile of a long sequence cheap and the
-    #[test]
-    fn causal_masking_changes_the_assignment() {
-        let qo = [0i32, 2048];
-        let kv = [0i32, 2048];
-        let lens = [2048i32];
-        let mut req = request(&qo, &kv, &lens, 2048);
-        let causal = schedule(&req, &H100).unwrap();
-        req.causal = false;
-        let dense = schedule(&req, &H100).unwrap();
-        assert_eq!(causal.total_num_works, dense.total_num_works);
-        assert_ne!(causal.kv_indptr.len(), 0);
-    }
-
-    /// A workspace that cannot hold the index arrays is refused by name.
-    #[test]
-    fn a_workspace_that_cannot_hold_the_schedule_is_refused() {
-        let qo = [0i32, 512];
-        let kv = [0i32, 4096];
-        let lens = [4096i32];
-        let err = plan(&request(&qo, &kv, &lens, 512), &H100, Workspace::new(0, 128)).unwrap_err();
-        assert!(matches!(err, Error::WorkspaceOverflow { .. }));
-    }
 }

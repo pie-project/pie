@@ -1,17 +1,3 @@
-//! Publish `kernels/` to the Metal shell, and stage the one shader that is
-//! generated rather than written.
-//!
-//! There is no compile step here, and that is not an omission. Metal shaders
-//! are compiled at RUN time — the driver builds pipeline state objects from
-//! `.metal` source it reads out of `PIE_METAL_KERNELS_DIR`, which defaults to
-//! this directory. So the CUDA side's `native` feature drives nvcc over a
-//! hundred translation units and this one copies a file: the asymmetry is
-//! between the two toolchains, not between the two crates' jobs.
-//!
-//! What `native` gates is the staging below, which reads out of
-//! `tensor-compiler`. Without it this crate is the signature table and a
-//! directory of shaders.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -21,13 +7,6 @@ fn main() {
 
     let kernels = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernels");
 
-    // One key and one DIRECTORY: `PIE_METAL_KERNELS_DIR_DEFAULT`, a path baked
-    // into the binary for the RUNTIME shader compiler to read `.metal` out of.
-    // The `*_params.h` a shader and its host caller must agree on sit inside
-    // that tree, in `kernels/<family>/`, because `.metal` files `#include` them
-    // directly and `driver-metal`'s `layout::shader` splices them in by hand —
-    // Metal's runtime compiler resolves no includes of its own. The Rust half
-    // of each is a mirrored `#[repr(C)]` struct with a `size_of` assertion.
     println!("cargo:kernels_dir={}", kernels.display());
 
     emit_entrypoints(&kernels);
@@ -39,49 +18,11 @@ fn main() {
     stage_rng_preamble(&kernels);
 }
 
-// ── WHAT THE SHADER TREE STAMPS, EXPANDED ─────────────────────────────────
-//
-// `tests/entrypoints.rs`'s header names the hole this closes:
-//
-//   The shader half of the comparison needed a C preprocessor -- the axis
-//   product lives in `instantiate_*` macros and nothing else writes it down --
-//   so it arrived as a committed `entrypoints.generated.txt` that
-//   `scripts/metal-kernel-audit.py` wrote... That artifact is deleted, and
-//   with it the only hermetic view a `cargo test` had of what the shaders
-//   instantiate. NOTHING COMPARES THEM NOW, IN A TEST OR OUT OF ONE.
-//
-// The Vulkan and WGSL siblings kept their half because there a variant is
-// DECLARED on a `// pie:instantiate` line, so the set is a parse. Here it is a
-// macro expansion, and that was read as needing a C preprocessor.
-//
-// IT NEEDS FAR LESS THAN ONE, AND THAT IS MEASURED. Over the whole tree there
-// is no `##` token pasting, no `#if`, no conditional anything, and nesting is
-// at most two deep. Four rules produce the names:
-//
-//   1. read `#define instantiate_X(a, b, c)` for its parameter names;
-//   2. in the body's `host_name(..)`, join string literals with `#param`
-//      stringifications and with bare `param`s whose ARGUMENT is a literal;
-//   3. substitute at each `instantiate_X(1, 2, 3)` call;
-//   4. if the body calls another `instantiate_*`, do it again.
-//
-// Rule 2's last clause is easy to miss and is not decorative:
-// `instantiate_sdpa_paged_impl(fn, name, ..)` takes `fn` as a string LITERAL
-// and `name` as an identifier to stringify, in one `host_name(fn "_" #name
-// "_d_" #d)`. Thirteen entrypoints hang off it, and a first version of this
-// that handled only `#param` lost every one of them.
-//
-// WHAT IT MUST NOT DO IS GUESS. A call naming a macro with no visible
-// definition, or one whose arity does not match, fails the build -- because a
-// name that silently leaves the set is a set that agrees with everything,
-// which is the state the header above describes.
-
-/// One `#define instantiate_*(..)`: its parameters and its body.
 struct Stamp {
     params: Vec<String>,
     body: String,
 }
 
-/// Write `entrypoints.rs`: every `(file, entrypoint)` the shader tree stamps.
 fn emit_entrypoints(kernels: &Path) {
     let mut files: Vec<PathBuf> = Vec::new();
     walk(kernels, &mut files);
@@ -116,7 +57,6 @@ fn emit_entrypoints(kernels: &Path) {
     std::fs::write(out.join("entrypoints.rs"), generated).expect("OUT_DIR is writable");
 }
 
-/// Every `.metal` and `.h` under `dir`.
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.filter_map(Result::ok) {
@@ -129,13 +69,7 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Every entrypoint name `text` stamps.
-///
-/// # Panics
-///
-/// On an `instantiate_*` call this cannot read.
 fn expand(text: &str, file: &str) -> Vec<String> {
-    // Line continuations first: a `#define` body is one logical line.
     let joined = text.replace("\\\n", " ");
     let mut names = Vec::new();
     let mut stamps: BTreeMap<String, Stamp> = BTreeMap::new();
@@ -157,31 +91,8 @@ fn expand(text: &str, file: &str) -> Vec<String> {
         );
     }
 
-    // A DIRECTLY DECLARED KERNEL, and an explicit `host_name("..")`, are the
-    // whole answer for the files that write them out rather than stamping.
-    //
-    // The declaration is matched over the whole text and not line by line:
-    // `moe/route.metal` writes `[[kernel]] void combine_sorted(` with the
-    // attribute on the line above, and seven entrypoints sit behind that
-    // spelling. A `template [[host_name(..)]] [[kernel]] void` is NOT one of
-    // these -- its name is the `host_name`, which the scan below takes -- so
-    // the match requires the `[[kernel]]` to be preceded by a `;`, a `}` or
-    // the file's start rather than by `]]`.
     for (at, _) in joined.match_indices("kernel]] void ").chain(joined.match_indices("kernel void "))
     {
-        // A DIRECTLY DECLARED entrypoint: `kernel void name(` or
-        // `[[kernel]] void name(`, on its own rather than as the tail of a
-        // `template [[host_name(..)]]`.
-        //
-        // Three things are excluded and each for its own reason.
-        //
-        // * Inside a `#define`: that is a STAMP, and reading it here takes the
-        //   TEMPLATE's identifier (`attn_gate`) rather than the point it
-        //   stamps (`gate_bfloat16`).
-        // * After a `]]` that is a `host_name`: the name is the `host_name`,
-        //   which the scan below takes.
-        // * `template <...>` before it: a template DEFINITION is not an
-        //   entrypoint until something instantiates it.
         let line_start = joined[..at].rfind('\n').map_or(0, |i| i + 1);
         let line_head = joined[line_start..at].trim_start();
         if line_head.starts_with('#') {
@@ -189,22 +100,11 @@ fn expand(text: &str, file: &str) -> Vec<String> {
         }
         let before = joined[..at].trim_end();
         if before.ends_with("host_name") || before.contains("host_name(") && {
-            // Only the NEAREST `host_name(` matters, and only if it is on this
-            // declaration rather than an earlier one.
             before.rfind("host_name(").is_some_and(|h| h > line_start.saturating_sub(1))
         } {
             continue;
         }
-        // A template DEFINITION is not an entrypoint until something
-        // instantiates it, and its `template <..>` head sits ABOVE the
-        // `[[kernel]] void` it introduces -- on the line above, or two above
-        // when the parameter list wraps, which `affine_qmm_t_aligned`'s does.
-        //
-        // Sixty-eight names hang on this: each definition's own identifier
-        // (`attn_gate`, `affine_qmm_t_aligned`) against the points its
-        // `instantiate_*` stamps (`gate_bfloat16`, `affine_qmm_t_bfloat16_..`).
-        // Scanning back to the previous statement boundary is what makes the
-        // wrap irrelevant.
+
         if line_head.starts_with("template") || preceded_by_template(&joined[..line_start]) {
             continue;
         }
@@ -216,7 +116,7 @@ fn expand(text: &str, file: &str) -> Vec<String> {
             }
         }
     }
-    // The literal `host_name("..")`s, outside a `#define` for the same reason.
+
     for line in joined.lines() {
         if line.trim_start().starts_with('#') {
             continue;
@@ -224,8 +124,6 @@ fn expand(text: &str, file: &str) -> Vec<String> {
         names.extend(literal_host_names(line));
     }
 
-    // The calls, expanded until nothing is left. The tree nests twice; the cap
-    // is a guard against a cycle rather than a limit.
     let mut calls: Vec<(String, Vec<String>)> =
         joined.lines().filter_map(call_at_column_zero).collect();
     for _ in 0..8 {
@@ -273,14 +171,6 @@ fn expand(text: &str, file: &str) -> Vec<String> {
     names
 }
 
-/// Whether the declaration starting after `head` is introduced by a
-/// `template <..>` head.
-///
-/// Walks BACK over whole lines while the angle brackets are still unbalanced,
-/// which is what makes a wrapped parameter list irrelevant:
-/// `affine_qmm_t_aligned`'s spans two lines and `qmm_t_aligned_half_impl`'s
-/// spans two as well. Stopping at the first `;` or `}` keeps the walk inside
-/// one declaration.
 fn preceded_by_template(head: &str) -> bool {
     let mut depth = 0i32;
     for line in head.lines().rev() {
@@ -292,8 +182,7 @@ fn preceded_by_template(head: &str) -> bool {
         if line.starts_with("template") {
             return true;
         }
-        // Balanced again without meeting a `template`, or a statement ended:
-        // this declaration has no template head.
+
         if depth <= 0 || line.ends_with(';') || line.ends_with('}') {
             return false;
         }
@@ -301,7 +190,6 @@ fn preceded_by_template(head: &str) -> bool {
     false
 }
 
-/// The `host_name("literal")` spellings on one line -- no macro involved.
 fn literal_host_names(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = line;
@@ -314,7 +202,6 @@ fn literal_host_names(line: &str) -> Vec<String> {
     out
 }
 
-/// The raw `host_name(..)` argument texts inside a macro body.
 fn host_name_patterns(body: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = body;
@@ -341,13 +228,6 @@ fn host_name_patterns(body: &str) -> Vec<String> {
     out
 }
 
-/// One `host_name(..)` pattern with its parameters substituted.
-///
-/// Three token shapes and no others, which is what the tree writes: a string
-/// literal, a `#param` stringification, and a bare `param` whose argument is
-/// itself a literal. Anything else answers `None`, which DROPS the name -- so
-/// a fourth shape appearing is a missing entrypoint rather than a wrong one,
-/// and `every_stamped_name_is_one_a_body_can_fire` is what catches it.
 fn compose(pattern: &str, sub: &BTreeMap<&str, &str>) -> Option<String> {
     let bytes = pattern.as_bytes();
     let mut out = String::new();
@@ -372,9 +252,7 @@ fn compose(pattern: &str, sub: &BTreeMap<&str, &str>) -> Option<String> {
                 .find(|c: char| !c.is_alphanumeric() && c != '_')
                 .unwrap_or(rest.len());
             let value = sub.get(&rest[..end])?;
-            // A bare parameter contributes only when its ARGUMENT is a
-            // literal; an identifier argument is a type or a number the name
-            // does not carry.
+
             if !value.starts_with('"') {
                 return None;
             }
@@ -387,14 +265,6 @@ fn compose(pattern: &str, sub: &BTreeMap<&str, &str>) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-/// An `instantiate_*(..)` call that stands alone on a line.
-///
-/// A `#define instantiate_X(a, b)` line begins with `#`, so trimming and
-/// testing for the name is enough -- until a body is joined onto its own
-/// `#define` by the line-continuation pass, which is why the caller filters
-/// `#` FIRST. Without that the definition reads as a call of itself with its
-/// parameter NAMES as arguments, and every `#param` composes to the parameter
-/// rather than to a value: `gate_` instead of `gate_bfloat16`.
 fn call_at_column_zero(line: &str) -> Option<(String, Vec<String>)> {
     let trimmed = line.trim();
     if trimmed.starts_with('#') || !trimmed.starts_with("instantiate_") {
@@ -405,7 +275,6 @@ fn call_at_column_zero(line: &str) -> Option<(String, Vec<String>)> {
     Some((name.trim().to_owned(), split_args(args)))
 }
 
-/// The `instantiate_*(..)` calls inside a macro body.
 fn nested_calls(body: &str) -> Vec<(String, Vec<String>)> {
     let mut out = Vec::new();
     let mut rest = body;
@@ -423,18 +292,10 @@ fn nested_calls(body: &str) -> Vec<(String, Vec<String>)> {
     out
 }
 
-/// A macro argument list, split on top-level commas.
 fn split_args(args: &str) -> Vec<String> {
     args.split(',').map(|a| a.trim().to_owned()).filter(|a| !a.is_empty()).collect()
 }
 
-/// `ptir_rng.generated.metal` is `tensor-compiler`'s: the host emitter
-/// generates it, and it is committed once, over there.
-///
-/// It has to sit BESIDE the hand-written shaders anyway, because Metal's
-/// runtime shader compiler does no filesystem include lookup — the driver
-/// splices this preamble into the source text it hands the compiler. Copying
-/// is how the two stay in lockstep; a second committed copy is how they stop.
 fn stage_rng_preamble(kernels: &Path) {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -450,9 +311,7 @@ fn stage_rng_preamble(kernels: &Path) {
             src.display()
         )
     });
-    // Only write on a real difference: an unconditional write would restamp
-    // the mtime every build and re-trigger the `rerun-if-changed=kernels`
-    // above, which is a build that never settles.
+
     if std::fs::read(&dst).ok().as_deref() != Some(text.as_slice()) {
         std::fs::write(&dst, &text)
             .unwrap_or_else(|e| panic!("cannot stage {}: {e}", dst.display()));

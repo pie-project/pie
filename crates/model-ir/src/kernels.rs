@@ -520,28 +520,11 @@ pub fn in_place_pairs(plan: &ForwardPlan, kernel: &str) -> Vec<(u32, u32)> {
 
 /// Which outputs a semantic op writes over which inputs.
 ///
-/// Takes no backend by claim, not convenience: these follow from what the
-/// kind means, so a backend that disagreed would not be implementing it.
+/// RETIRED with the semantic vocabulary: every statement is a
+/// [`OpKind::Launch`] now, and aliasing comes off the routine's own column
+/// ([`in_place_pairs`]). Kept because `Select` still launches nothing and
+/// callers still ask; it answers empty for everything.
 pub fn semantic_in_place(kind: &OpKind) -> &'static [(u32, u32)] {
-    match kind {
-        // Rope rotates in place; the trace's SSA names for rotated q and k
-        // are two names for one buffer.
-        OpKind::Rope { .. } => &[(0, 0), (1, 1)],
-        // `C = A·Bᵀ + C`, so C is read as well as written and the residual it
-        // folds must be C. Only when folded.
-        OpKind::Matmul { beta_one: true, .. } => &[(0, 1)],
-        // `attn_out *= sigmoid(gate)`; the gate is read-only.
-        OpKind::SigmoidGateMul => &[(0, 0)],
-        // `x[r, :] += bias`, and the kernel has no destination parameter.
-        OpKind::AddBias { .. } => &[(0, 0)],
-        // `stream += branch`: the arms take a destination and an addend with
-        // no separate source. `norm::residual_add_bf16`'s row says the same,
-        // but rows are consulted only for `OpKind::Launch`, so without this
-        // `alias_owners` lets the sum land wherever the arena pointed.
-        //
-        // Safe for a backend whose kernel is not in place: elementwise
-        // `out[i] = in0[i] + in1[i]` still holds when `out` aliases `in0`.
-        OpKind::ResidualAdd => &[(0, 0)],
-        _ => &[],
-    }
+    let _ = kind;
+    &[]
 }

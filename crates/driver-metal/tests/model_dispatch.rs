@@ -382,13 +382,20 @@ fn a_fire_compiles_each_of_its_symbols_once_however_often_it_names_them() {
         needed.len(),
         dispatches.len()
     );
-    let symbols: BTreeSet<&str> = needed.iter().map(|(_, s)| *s).collect();
+    // A POINT IS THE SYMBOL AND ITS STAMP. This asserted that no symbol
+    // appears twice, which was the same claim while a name could only mean
+    // the one body its file declared. A stamped family breaks that: the stamp
+    // is the line that MAKES the symbol exist, so one name under two stamps
+    // is two bodies and belongs in the list twice. The uniqueness that still
+    // has to hold is the triple's -- a repeat of it is a pipeline compiled
+    // twice, which is what this list exists to prevent.
+    let points: BTreeSet<(&str, &str)> = needed.iter().map(|(_, s, t)| (*s, *t)).collect();
     assert_eq!(
-        symbols.len(),
+        points.len(),
         needed.len(),
-        "a symbol appears twice in the compile list"
+        "a point appears twice in the compile list"
     );
-    for (file, symbol) in &needed {
+    for (file, symbol, _) in &needed {
         assert!(
             file.ends_with(".metal"),
             "`{symbol}` states `{file}`, which is not a shader"

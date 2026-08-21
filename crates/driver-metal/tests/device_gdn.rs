@@ -417,6 +417,7 @@ fn fire(
     let dispatch = Dispatch {
         symbol: entrypoint,
         file: "ssm/gdn_core.metal",
+        stamp: "",
         // Threads, not groups: one simdgroup per `(row, v-head, v-channel)`,
         // four of them to a threadgroup over the `dv` axis.
         grid: [32, DV as u32, (ROWS * HV) as u32],
@@ -613,6 +614,7 @@ fn fire_pair(
         Dispatch {
             symbol: &prep_sym,
             file: "ssm/gdn_prep.metal",
+            stamp: "",
             // One simdgroup per `(row, v-head)`: the q/k path computed exactly
             // once, where the fused kernel computes it once per `dv` TILE.
             grid: [32, 1, (ROWS * HV) as u32],
@@ -627,6 +629,7 @@ fn fire_pair(
         Dispatch {
             symbol: &rec_sym,
             file: "ssm/gdn_prep.metal",
+            stamp: "",
             grid: [32, DV as u32, (ROWS * HV) as u32],
             threadgroup: [32, 4, 1],
             touches: Touches::everything(&fill(&rec_bind, rec_wide)),
@@ -1208,6 +1211,7 @@ fn fire_fused_one(
     let dispatch = Dispatch {
         symbol: "gdn_core_bfloat16",
         file: "ssm/gdn_core.metal",
+        stamp: "",
         grid: [32, DV as u32, HV as u32],
         threadgroup: [32, 4, 1],
         touches: Touches::everything(&args),
@@ -1352,6 +1356,7 @@ fn fire_prefill(
         Dispatch {
             symbol: "gdn_prep_prefill_bfloat16",
             file: "ssm/gdn_prep.metal",
+            stamp: "",
             grid: [32, 1, (T_SCAN * HV) as u32],
             threadgroup: [32, 1, 1],
             touches: Touches::everything(&fill(&prep_bind, 26)),
@@ -1366,6 +1371,7 @@ fn fire_prefill(
         Dispatch {
             symbol: &scan_sym,
             file: "ssm/gdn_prep.metal",
+            stamp: "",
             grid: [32, grid_y, HV as u32],
             threadgroup: [32, 1, 1],
             touches: Touches::everything(&fill(&scan_bind, 24)),

@@ -1107,7 +1107,16 @@ fn embedded_opts_for_device(base_opts: &DriverOptions, device: String) -> Driver
 /// the caller asked for a measurement this backend does not have, and refusing
 /// the boot over it would be worse than doing the ordinary thing.
 fn apply_embedded_calibration(options: &mut DriverOptions, calibrate: bool) {
+    // ONE VARIANT OR SEVERAL, depending on the feature list. `if let` is
+    // how this reads "the CUDA options, if these are them", and in a build
+    // whose only driver is CUDA there is nothing else it could be -- so the
+    // pattern is irrefutable there and refutable everywhere else. The `if`
+    // is kept because the other builds need it.
     #[cfg(feature = "_driver-cuda")]
+    #[allow(
+        irrefutable_let_patterns,
+        reason = "`DriverOptions` has one variant in a CUDA-only build"
+    )]
     if let DriverOptions::CudaNative(opts) = options {
         opts.calibrate_planner = calibrate;
     }
@@ -1118,6 +1127,10 @@ fn apply_embedded_calibration(options: &mut DriverOptions, calibrate: bool) {
 
 fn apply_embedded_verbose(options: &mut DriverOptions, verbose: bool) {
     #[cfg(feature = "_driver-cuda")]
+    #[allow(
+        irrefutable_let_patterns,
+        reason = "`DriverOptions` has one variant in a CUDA-only build"
+    )]
     if let DriverOptions::CudaNative(opts) = options {
         opts.verbose = verbose;
     }
@@ -1141,6 +1154,13 @@ fn cuda_rank_options(
     let mut rank_opts = Vec::with_capacity(group.len());
     for &rank_driver_idx in group {
         let rank_driver = group_driver(m, group_idx, rank_driver_idx)?;
+        // The wildcard is unreachable in a CUDA-only build and the only
+        // arm that catches a metal or vulkan option set in any other, which
+        // is the same asymmetry `apply_embedded_calibration` explains.
+        #[allow(
+            unreachable_patterns,
+            reason = "`DriverOptions` has one variant in a CUDA-only build"
+        )]
         match base_opts {
             DriverOptions::CudaNative(opts) => {
                 let mut o = opts.clone();

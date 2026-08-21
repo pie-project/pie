@@ -173,25 +173,25 @@ fn every_declared_entrypoint_builds_a_pipeline_on_this_device() {
             Ok(pso) => {
                 // What the BODY will ask for. Most routines derive a
                 // threadgroup from facts this test has none of; the
-                // attention families fix theirs outright, as two
-                // constants, and those are what a shader alone can be
-                // checked against.
+                // attention families fix theirs outright, and those are
+                // what a shader alone can be checked against.
                 //
-                // The numbers are imported rather than mirrored. A
-                // literal here would go stale the day the body retunes,
-                // and it would go stale silently in the safe direction --
-                // a test that admits 1024 while the body launches 1088.
+                // The two numbers are the ones `kernels-metal`'s `attn`
+                // fires spell at each `Fire::at`: 128 for the matrix-unit
+                // tiling, whose shader declares
+                // `max_total_threads_per_threadgroup(128)`, and 1024 for
+                // every scalar single-pass and tiled form.
                 let Some(routine) = driver_metal::lowering::routine::crossed(entry) else {
                     continue;
                 };
-                let wants = match routine.name {
-                    "sdpa_paged_mma" | "sdpa_paged_mma_sink" => kernels_metal::attn::MMA_GROUP[0],
+                let wants: u32 = match routine.name {
+                    "sdpa_paged_mma" | "sdpa_paged_mma_sink" => 128,
                     "sdpa_paged_decode"
                     | "sdpa_paged_decode_sink"
                     | "sdpa_paged_tiled"
                     | "sdpa_paged_tiled_sink"
                     | "sdpa_vector_decode"
-                    | "sdpa_vector_decode_swa" => kernels_metal::attn::BIG_GROUP[0],
+                    | "sdpa_vector_decode_swa" => 1024,
                     _ => continue,
                 };
                 let admits = pso.maxTotalThreadsPerThreadgroup() as u32;

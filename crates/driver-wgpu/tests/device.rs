@@ -350,11 +350,15 @@ fn agrees(got: &[f32], want: &[f32], what: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `RmsParams` as `norm/rms.wgsl` declares it: five words at binding 3.
+/// `RmsParams` as `norm/rms.wgsl` declares it: five words of `@group(1)`
+/// UNIFORM, passed as [`Device::run`]'s `uniform` and not as a fourth buffer.
 ///
-/// A STORAGE block and not the uniform one, which is what the row means by
-/// `params: Buf` — a struct is a struct, and moving it into `@group(1)` would be
-/// changing the kernel's ABI from the driver.
+/// It used to be a storage block at `@group(0) @binding(3)`, and this doc used
+/// to say that moving it into `@group(1)` would be changing the kernel's ABI
+/// from the driver. The kernel moved it itself, and bindings 4 and 5 -- the
+/// residual and its scale -- closed up to 3 and 4 behind it, because a
+/// declared-and-unfilled slot is a bind group `driver-wgpu` cannot build.
+/// `rms_single_row_bfloat16` therefore binds THREE buffers: x, w, out.
 fn rms_params(eps: f32, axis: u32, w_stride: u32, plus_one: u32, gain: f32) -> Vec<u8> {
     let mut out = Vec::with_capacity(20);
     out.extend_from_slice(&eps.to_le_bits_le());
@@ -419,7 +423,7 @@ fn an_adapter_opens_and_reports_what_it_offers() {
     println!("unreachable  {:?}", device.unreachable());
     println!(
         "downlevel    the guaranteed floor is {} storage buffers per stage",
-        kernels_wgpu::DOWNLEVEL_STORAGE_BUFFERS
+        8
     );
 
     assert!(
@@ -438,7 +442,7 @@ fn an_adapter_opens_and_reports_what_it_offers() {
     assert!(limits.storage_offset >= 1 && limits.storage_offset <= 256);
     assert!(limits.uniform_offset >= 1 && limits.uniform_offset <= 256);
     assert!(limits.workgroups_per_dimension >= 65535);
-    assert!(limits.storage_buffers >= kernels_wgpu::DOWNLEVEL_STORAGE_BUFFERS);
+    assert!(limits.storage_buffers >= 8);
 }
 
 /// The launch rule for a kernel whose family has RETIRED its rows.
@@ -503,9 +507,7 @@ fn a_norm_computes_what_its_closed_form_says() {
     let x = device.buffer(&x_bytes).expect("x");
     let w = device.buffer(&w_bytes).expect("w");
     let out = device.buffer(&vec![0u8; x_bytes.len()]).expect("out");
-    let params = device
-        .buffer(&rms_params(eps, WIDTH, 1, 0, 1.0))
-        .expect("params");
+    let params = rms_params(eps, WIDTH, 1, 0, 1.0);
 
     let groups = driver_wgpu::device::groups_for(
         &device,
@@ -524,13 +526,8 @@ fn a_norm_computes_what_its_closed_form_says() {
     device
         .run(
             pipeline,
-            &[
-                Bound::whole(&x),
-                Bound::whole(&w),
-                Bound::whole(&out),
-                Bound::whole(&params),
-            ],
-            &[],
+            &[Bound::whole(&x), Bound::whole(&w), Bound::whole(&out)],
+            &params,
             groups,
         )
         .expect("the norm ran");
@@ -710,9 +707,7 @@ fn one_pass_and_one_submission_each_agree_over_a_chained_plan() {
     let x = device.buffer(&x_bytes).expect("x");
     let w = device.buffer(&w_bytes).expect("w");
     let residual = device.buffer(&r_bytes).expect("residual");
-    let params = device
-        .buffer(&rms_params(1e-6, WIDTH, 1, 0, 1.0))
-        .expect("params");
+    let params = rms_params(1e-6, WIDTH, 1, 0, 1.0);
 
     let norm_grid = driver_wgpu::device::groups_for(
         &device,
@@ -763,10 +758,9 @@ fn one_pass_and_one_submission_each_agree_over_a_chained_plan() {
         let x: &'static Buffer = Box::leak(Box::new(x.clone()));
         let w: &'static Buffer = Box::leak(Box::new(w.clone()));
         let r: &'static Buffer = Box::leak(Box::new(residual.clone()));
-        let p: &'static Buffer = Box::leak(Box::new(params.clone()));
         // Stage k reads the arena it did NOT write and writes the other, so no
         // dispatch binds one allocation both ways.
-        let bounds: Vec<[Bound<'static, Buffer>; 4]> = (0..stages)
+        let bounds: Vec<[Bound<'static, Buffer>; 3]> = (0..stages)
             .map(|k| {
                 let input = if k == 0 {
                     Bound::whole(x)
@@ -777,9 +771,9 @@ fn one_pass_and_one_submission_each_agree_over_a_chained_plan() {
                 };
                 let out = if k % 2 == 0 { at(a, k) } else { at(b, k) };
                 if k % 2 == 0 {
-                    [input, Bound::whole(w), out, Bound::whole(p)]
+                    [input, Bound::whole(w), out]
                 } else {
-                    [input, Bound::whole(r), out, Bound::whole(p)]
+                    [input, Bound::whole(r), out]
                 }
             })
             .collect();
@@ -788,8 +782,11 @@ fn one_pass_and_one_submission_each_agree_over_a_chained_plan() {
             .enumerate()
             .map(|(k, bound)| Recorded {
                 pipeline: if k % 2 == 0 { norm } else { add },
-                buffers: if k % 2 == 0 { &bound[..] } else { &bound[..3] },
-                uniform: &[],
+                buffers: &bound[..],
+                // The norm's five words are `@group(1)` uniform now; the add
+                // takes none, and a body handed a block it does not declare is
+                // a refusal, so only the even stages carry one.
+                uniform: if k % 2 == 0 { &params } else { &[] },
                 groups: if k % 2 == 0 { norm_grid } else { add_grid },
             })
             .collect();
@@ -870,6 +867,13 @@ fn one_pass_and_one_submission_each_agree_over_a_chained_plan() {
 /// Both halves: [`Device::check`] names it, with the two bindings and the two
 /// offsets; [`Device::run_all`] shadows the read side and produces the right
 /// numbers.
+///
+/// RETIRED WITH `kernels-wgpu`'s TEST TREE. That name is a record of a
+/// measurement now, not a live proof: the crate lost `tests/` and every
+/// in-file `mod tests` when the three shader planes moved their numbers to
+/// the fire that reads them, and nothing in this workspace re-runs it. What
+/// it reported is still why the sentence above says what it says; what is
+/// gone is the thing that would notice if it stopped being true.
 #[test]
 fn an_arena_bound_both_ways_is_diagnosed_by_name_and_run_anyway() {
     let Some((device, _held)) = adapter() else {
@@ -976,9 +980,7 @@ fn an_undershot_grid_leaves_the_last_row_holding_its_sentinel() {
     let (w_bytes, _) = pack(&spread(WIDTH as usize, 61));
     let x = device.buffer(&x_bytes).expect("x");
     let w = device.buffer(&w_bytes).expect("w");
-    let params = device
-        .buffer(&rms_params(1e-6, WIDTH, 1, 0, 1.0))
-        .expect("params");
+    let params = rms_params(1e-6, WIDTH, 1, 0, 1.0);
     let out = device
         .buffer(&SENTINEL.to_le_bytes().repeat(x_bytes.len() / 4))
         .expect("out");
@@ -987,13 +989,8 @@ fn an_undershot_grid_leaves_the_last_row_holding_its_sentinel() {
     device
         .run(
             pipeline,
-            &[
-                Bound::whole(&x),
-                Bound::whole(&w),
-                Bound::whole(&out),
-                Bound::whole(&params),
-            ],
-            &[],
+            &[Bound::whole(&x), Bound::whole(&w), Bound::whole(&out)],
+            &params,
             [ROWS - 1, 1, 1],
         )
         .expect("an undershot grid is legal and reports success");
@@ -1205,56 +1202,88 @@ fn every_refusal_is_a_named_error_and_not_a_panic() {
     let pipeline = cache.get(&device, name, tier, &source).expect("it builds");
 
     let small = device.buffer(&[0u8; 64]).expect("a small buffer");
-    let params = device
-        .buffer(&rms_params(1e-6, WIDTH, 1, 0, 1.0))
-        .expect("params");
-    let four = [
+    let params = rms_params(1e-6, WIDTH, 1, 0, 1.0);
+    let three = [
         Bound::whole(&small),
         Bound::whole(&small),
         Bound::whole(&small),
-        Bound::whole(&params),
     ];
 
     // Bindings: a set short of the layout. `wgpu` would also refuse this, at
     // `create_bind_group`, with a message about an entry count.
     assert_eq!(
-        device.run(pipeline, &four[..3], &[], [1, 1, 1]),
+        device.run(pipeline, &three[..2], &params, [1, 1, 1]),
         Err(Failed::Bindings {
-            module: 4,
-            bound: 3
+            module: 3,
+            bound: 2
         })
     );
 
-    // Params: a uniform block offered where the module declares none. There is
-    // nowhere to put it, and binding it into `@group(0)` would shift every
-    // storage entry after it.
+    // Params, in the direction this kernel can now be wrong in: the block it
+    // declares, offered SHORT. WGSL bounds-checks a uniform the same way it
+    // does a storage block, so the missing `axis_size` would read as ZERO, and
+    // a zero axis is a plausible number that norms a row by nothing.
     assert_eq!(
-        device.run(pipeline, &four, &[0u8; 16], [1, 1, 1]),
+        device.run(pipeline, &three, &[0u8; 16], [1, 1, 1]),
+        Err(Failed::Params {
+            needs: 20,
+            given: 16
+        })
+    );
+
+    // And the other direction, which needs a different kernel now that this
+    // one declares a block: a uniform offered where the module declares none.
+    // There is nowhere to put it, and binding it into `@group(0)` would shift
+    // every storage entry after it.
+    let (add_src, add_tier) =
+        pick(&Embedded, "residual_add_bfloat16", Capability::Baseline).expect("the tree holds it");
+    // Its OWN cache, because `Pipelines::get` takes `&mut self` and the norm's
+    // pipeline is borrowed from `cache` for the whole of this test.
+    let mut add_cache = Pipelines::new();
+    let add = add_cache
+        .get(&device, "residual_add_bfloat16", add_tier, &add_src)
+        .expect("it builds");
+    assert_eq!(
+        device.run(add, &three, &[0u8; 16], [1, 1, 1]),
         Err(Failed::Params {
             needs: 0,
             given: 16
         })
     );
 
-    // Short: the parameter struct bound with fewer bytes than it reads. The
-    // quiet one -- WGSL bounds-checks, so the missing `axis_size` would read as
-    // ZERO, and a zero axis is a plausible number that norms a row by nothing.
+    // Short: a STORAGE block bound with fewer bytes than it reads, which is a
+    // different check from `Params` -- that one guards `@group(1)`, this one
+    // guards a fixed-size struct sitting among the storage bindings.
+    //
+    // It takes `sample/argmax.wgsl` to reach, because `norm/rms.wgsl` no
+    // longer has one: `ArgmaxParams` is `{ vocab: u32, n_eos: u32, eos_ids:
+    // array<u32, 8> }`, forty bytes at binding 2, and it stayed in `@group(0)`
+    // exactly so the two scalars ride beside the eos list rather than being
+    // split across two groups.
+    let (arg_src, arg_tier) =
+        pick(&Embedded, "argmax_logits_bfloat16", Capability::Baseline).expect("the tree holds it");
+    // Its OWN cache, because `Pipelines::get` takes `&mut self` and the norm's
+    // pipeline is borrowed from `cache` for the whole of this test.
+    let mut argmax_cache = Pipelines::new();
+    let argmax = argmax_cache
+        .get(&device, "argmax_logits_bfloat16", arg_tier, &arg_src)
+        .expect("it builds");
     let stub = device.buffer(&[0u8; 16]).expect("a short block");
     assert_eq!(
         device.run(
-            pipeline,
+            argmax,
             &[
                 Bound::whole(&small),
                 Bound::whole(&small),
-                Bound::whole(&small),
                 Bound::whole(&stub),
+                Bound::whole(&small),
             ],
             &[],
             [1, 1, 1]
         ),
         Err(Failed::Short {
-            binding: 3,
-            needs: 20,
+            binding: 2,
+            needs: 40,
             given: 16
         })
     );
@@ -1262,7 +1291,7 @@ fn every_refusal_is_a_named_error_and_not_a_panic() {
     // Empty: a grid of zero. Legal WebGPU, always a defect -- it runs nothing,
     // reports success, and leaves the output holding whatever it held.
     assert_eq!(
-        device.run(pipeline, &four, &[], [1, 0, 1]),
+        device.run(pipeline, &three, &params, [1, 0, 1]),
         Err(Failed::Empty { groups: [1, 0, 1] })
     );
 
@@ -1271,8 +1300,8 @@ fn every_refusal_is_a_named_error_and_not_a_panic() {
     assert_eq!(
         device.run(
             pipeline,
-            &four,
-            &[],
+            &three,
+                &params,
             [limits.workgroups_per_dimension + 1, 1, 1]
         ),
         Err(Failed::PastLimit {
@@ -1313,9 +1342,8 @@ fn every_refusal_is_a_named_error_and_not_a_panic() {
             Bound::whole(&wrong),
             Bound::whole(&small),
             Bound::whole(&small),
-            Bound::whole(&params),
         ],
-        &[],
+        &params,
         [1, 1, 1],
     );
     match refused {
@@ -1403,7 +1431,7 @@ fn the_rows_a_floor_adapter_could_not_bind_are_named() {
         .into_iter()
         .filter(|name| {
             driver_wgpu::reflect::entrypoint(name, Capability::Baseline)
-                .is_ok_and(|d| d.bindings > kernels_wgpu::DOWNLEVEL_STORAGE_BUFFERS)
+                .is_ok_and(|d| d.bindings > 8)
         })
         .collect();
     assert!(
@@ -1415,7 +1443,7 @@ fn the_rows_a_floor_adapter_could_not_bind_are_named() {
     );
     println!(
         "at the guaranteed {} storage buffers, {} entrypoints are unreachable: {:?}",
-        kernels_wgpu::DOWNLEVEL_STORAGE_BUFFERS,
+        8,
         over.len(),
         over,
     );
@@ -1914,6 +1942,13 @@ fn the_fallback_knob_reaches_the_second_adapter_through_open() {
 /// Run it on both: `cargo test ... builds_a_pipeline_on_this_adapter` and again with
 /// `PIE_WGPU_FALLBACK=1`. A row that builds on one and not the other is the
 /// portability defect this backend exists to not have.
+///
+/// RETIRED WITH `kernels-wgpu`'s TEST TREE. That name is a record of a
+/// measurement now, not a live proof: the crate lost `tests/` and every
+/// in-file `mod tests` when the three shader planes moved their numbers to
+/// the fire that reads them, and nothing in this workspace re-runs it. What
+/// it reported is still why the sentence above says what it says; what is
+/// gone is the thing that would notice if it stopped being true.
 #[test]
 fn every_entrypoint_in_the_tree_builds_a_pipeline_on_this_adapter() {
     let Some((device, _held)) = adapter() else {
@@ -1997,6 +2032,10 @@ fn one_launch(symbol: &str) -> model_compiler::lower::Lowered {
         args: vec![model_compiler::lower::Arg::Weight(
             "model.layers.0.mlp.down_proj.weight".to_owned(),
         )],
+        // Zero is "no opinion", which is what a weight has: it is not measured
+        // in rows of the batch, so there is nothing for a backend to override
+        // the launch's own rectangle with.
+        arg_rows: vec![0],
         structural: Vec::new(),
         residue: Vec::new(),
         params: Vec::new(),
@@ -2269,7 +2308,7 @@ fn the_four_ways_a_read_out_is_refused_each_say_which() {
     }
 
     // 2. A range that runs off the arena the LOWERING sized.
-    match driver_wgpu::serve::logits(&device, &arena, &with(Some(readout(0, 4, 64, 4), &[]), 256)) {
+    match driver_wgpu::serve::logits(&device, &arena, &with(Some(readout(0, 4, 64, 4)), 256), &[]) {
         Err(driver_wgpu::serve::Unread::PastArena { at, extent, arena }) => {
             assert_eq!((at, extent, arena), (0, 1024, 256));
         }
@@ -2280,7 +2319,7 @@ fn the_four_ways_a_read_out_is_refused_each_say_which() {
     //    everything else is a plan this reader cannot honour, and guessing
     //    would read two elements as one.
     for odd in [1u32, 3, 8] {
-        match driver_wgpu::serve::logits(&device, &arena, &with(Some(readout(0, 1, 4, odd), &[]), 256)) {
+        match driver_wgpu::serve::logits(&device, &arena, &with(Some(readout(0, 1, 4, odd)), 256), &[]) {
             Err(driver_wgpu::serve::Unread::Width(b)) => assert_eq!(b, odd),
             other => panic!("expected `Width({odd})`, got {other:?}"),
         }
@@ -2290,7 +2329,7 @@ fn the_four_ways_a_read_out_is_refused_each_say_which() {
     //    bigger than the buffer it was handed passes the range check above and
     //    is refused here instead.
     let refused =
-        driver_wgpu::serve::logits(&device, &arena, &with(Some(readout(0, 4, 256, 4), &[]), 1 << 20));
+        driver_wgpu::serve::logits(&device, &arena, &with(Some(readout(0, 4, 256, 4)), 1 << 20), &[]);
     match refused {
         Err(driver_wgpu::serve::Unread::Refused(why)) => assert!(
             !why.to_string().is_empty(),
@@ -2431,6 +2470,12 @@ fn the_first_ported_routine_runs_on_this_adapter_and_averages_two_streams() {
             rows: 1,
             width,
         },
+        // The scale came OFF the params block and onto the signature. It is
+        // still the same word 0 of the same uniform run once the binder has
+        // packed it -- `params` above is built by hand for exactly that
+        // reason -- but the routine now states it rather than trusting the
+        // caller to have laid it out.
+        kernels::routine::Const { v: inv_sqrt2 },
     )
     .expect("the routine dispatches on this adapter");
 
@@ -2494,6 +2539,13 @@ fn the_first_ported_routine_runs_on_this_adapter_and_averages_two_streams() {
 /// [`an_arena_bound_both_ways_is_diagnosed_by_name_and_run_anyway`] is its
 /// other half: the same two ranges, one binding declared `read`, refused and
 /// then shadowed.
+///
+/// RETIRED WITH `kernels-wgpu`'s TEST TREE. That name is a record of a
+/// measurement now, not a live proof: the crate lost `tests/` and every
+/// in-file `mod tests` when the three shader planes moved their numbers to
+/// the fire that reads them, and nothing in this workspace re-runs it. What
+/// it reported is still why the sentence above says what it says; what is
+/// gone is the thing that would notice if it stopped being true.
 #[test]
 fn two_read_write_bindings_into_one_buffer_are_legal() {
     let Some((device, _held)) = adapter() else {

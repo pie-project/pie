@@ -73,6 +73,7 @@ fn the_bias_lands_on_every_row_and_on_the_right_column() {
     let dispatch = Dispatch {
         symbol: "add_bias_bfloat16",
         file: "norm/add_bias.metal",
+        stamp: "",
         // `LaunchRule::RouteRows`: the column is `tid.x` because the bias is
         // broadcast and the column has to be recoverable from the invocation.
         grid: [WIDTH, ROWS, 1],

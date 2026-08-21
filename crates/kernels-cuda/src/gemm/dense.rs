@@ -18,30 +18,16 @@ use cudarc::runtime::sys::{
     cudaStreamIsCapturing, cudaStreamNonBlocking, cudaStreamSynchronize,
 };
 
-// `get_device_properties` STOOD HERE, and it stood in `driver-cuda`'s
-// `bind/quant_gemm.rs` as well -- two private copies of one `#[cfg]` pair,
-// byte-identical in the body, because the two callers were in different
-// crates and neither could see the other. The quantised router's descent put
-// them in one directory and the duplicate had to answer for itself. It is
-// `jit::device::properties` now, which is the module whose subject is the
-// device facilities a body needs that are not a launch.
-
 use super::gemv::gemv_bf16;
 
-/// `cublasComputeType_t bf16_compute_type() { return CUBLAS_COMPUTE_32F; }`.
 const COMPUTE: cublasComputeType_t = cublasComputeType_t::CUBLAS_COMPUTE_32F;
 
-/// `CUBLAS_GEMM_DEFAULT_TENSOR_OP` — the pin every call starts with.
 const ALGO_TENSOR_OP: cublasGemmAlgo_t = cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP;
 
-/// `CUBLAS_GEMM_DEFAULT` — the un-pinned retry. See [`act_x_wt_bf16`]'s
 const ALGO_DEFAULT: cublasGemmAlgo_t = cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT;
 
-/// `gemm.cpp:92` — `cublaslt_bf16_workspace_bytes()`, 64 MiB.
 const LT_WORKSPACE_BYTES: usize = 64 * 1024 * 1024;
 
-/// `gemm.cpp:85` — throw on a non-success status.
-/// `check`, for the cuBLASLt handle's own status type.
 fn check_lt(status: lt::cublasStatus_t, what: &str) {
     assert!(
         status == lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS,
@@ -53,19 +39,16 @@ fn check(status: cublasStatus_t, what: &str) {
     assert!(status == cublasStatus_t::CUBLAS_STATUS_SUCCESS, "cuBLAS error ({status:?}): {what}");
 }
 
-/// Clears a sticky CUDA error, the C++'s bare `cudaGetLastError();`.
 fn clear_error() {
     let _ = unsafe { cudaGetLastError() };
 }
 
-/// The device this thread is bound to, or 0.
 fn current_device() -> i32 {
     let mut dev: i32 = 0;
     let _ = unsafe { cudaGetDevice(&raw mut dev) };
     dev
 }
 
-/// `gemm.cpp:195` — the handle's stream, or `None` if cuBLAS will not say.
 fn cublas_stream(handle: cublasHandle_t) -> Option<*mut c_void> {
     let mut stream: cudarc::cublas::sys::cudaStream_t = std::ptr::null_mut();
     if unsafe { cublasGetStream_v2(handle, &raw mut stream) }
@@ -77,7 +60,6 @@ fn cublas_stream(handle: cublasHandle_t) -> Option<*mut c_void> {
     }
 }
 
-/// `cudaStreamIsCapturing`, with a failed query reported as "unknown".
 fn capture_status(stream: *mut c_void) -> Option<cudaStreamCaptureStatus> {
     let mut status = cudaStreamCaptureStatus::cudaStreamCaptureStatusNone;
     if unsafe { cudaStreamIsCapturing(stream.cast(), &raw mut status) } != cudaError::cudaSuccess {
@@ -87,18 +69,16 @@ fn capture_status(stream: *mut c_void) -> Option<cudaStreamCaptureStatus> {
     Some(status)
 }
 
-/// The cuBLASLt handle and shared workspace for one device.
 struct Bf16LtCtx {
     handle: lt::cublasLtHandle_t,
     workspace: *mut c_void,
     workspace_bytes: usize,
 }
 
-// SAFETY: `handle` and `workspace` are device-side resources reached only
 unsafe impl Send for Bf16LtCtx {}
 
 impl Bf16LtCtx {
-    /// `gemm.cpp:130` — `ensure()`. Idempotent; both halves are separately
+
     fn ensure(&mut self) {
         if self.handle.is_null() {
             check_lt(unsafe { lt::cublasLtCreate(&raw mut self.handle) }, "cublasLtCreate");
@@ -114,7 +94,6 @@ impl Bf16LtCtx {
     }
 }
 
-/// The three fields of this device's [`Bf16LtCtx`], copied out.
 fn lt_ctx() -> (lt::cublasLtHandle_t, *mut c_void, usize) {
     static CTXS: OnceLock<Mutex<HashMap<i32, Bf16LtCtx>>> = OnceLock::new();
     let mut map = CTXS
@@ -130,7 +109,6 @@ fn lt_ctx() -> (lt::cublasLtHandle_t, *mut c_void, usize) {
     (ctx.handle, ctx.workspace, ctx.workspace_bytes)
 }
 
-/// The descriptors for one `(M, N, K)`, plus every algorithm the heuristic
 struct Bf16LtPlan {
     op_desc: lt::cublasLtMatmulDesc_t,
     a_desc: lt::cublasLtMatrixLayout_t,
@@ -139,13 +117,12 @@ struct Bf16LtPlan {
     heuristics: Vec<lt::cublasLtMatmulHeuristicResult_t>,
 }
 
-// SAFETY: the four descriptors are opaque cuBLASLt handles, never
 unsafe impl Send for Bf16LtPlan {}
-// SAFETY: as above — shared access is read-only after `build_lt_plan`.
+
 unsafe impl Sync for Bf16LtPlan {}
 
 impl Drop for Bf16LtPlan {
-    /// Reverse of creation, matching `gemm.cpp:168-173`.
+
     fn drop(&mut self) {
         unsafe {
             if !self.c_desc.is_null() {
@@ -164,7 +141,6 @@ impl Drop for Bf16LtPlan {
     }
 }
 
-/// Which returned cuBLASLt heuristic a shape prefers.
 fn lt_algo_index_for_shape(n: i32, k: i32) -> i32 {
     if k < 2048 && n >= 12288 {
         return 2;
@@ -184,7 +160,6 @@ fn lt_algo_index_for_shape(n: i32, k: i32) -> i32 {
     5
 }
 
-/// The narrowest output width at which the Lt ladder is worth taking.
 fn lt_min_n(k: i32) -> i32 {
     if k >= 4096 {
         return 32768;
@@ -198,14 +173,12 @@ fn lt_min_n(k: i32) -> i32 {
     }
 }
 
-/// `gemm.cpp:236-238` — the other three gates on the Lt ladder. `MAX_N == 0`
 const LT_MIN_K: i32 = 1024;
-/// See [`LT_MIN_K`]. M=1 is the GEMV's shape, not Lt's.
+
 const LT_MIN_M: i32 = 2;
-/// See [`LT_MIN_K`].
+
 const LT_MAX_N: i32 = 0;
 
-/// One `cublasLtMatmul`. `true` iff the status was success.
 #[allow(clippy::too_many_arguments)]
 fn run_lt_algo(
     plan: &Bf16LtPlan,
@@ -220,7 +193,7 @@ fn run_lt_algo(
     let alpha = 1.0f32;
     let (handle, ctx_ws, ctx_ws_bytes) = lt_ctx();
     let (ws, ws_bytes) = workspace.unwrap_or((ctx_ws, ctx_ws_bytes));
-    // SAFETY: descriptors belong to `plan`, which outlives the call; the four
+
     let status = unsafe {
         lt::cublasLtMatmul(
             handle,
@@ -244,7 +217,6 @@ fn run_lt_algo(
     status == lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS
 }
 
-/// [`run_lt_algo`] against the stream `cublas_handle` is bound to.
 #[allow(clippy::too_many_arguments)]
 fn run_lt_plan(
     plan: &Bf16LtPlan,
@@ -260,7 +232,6 @@ fn run_lt_plan(
     run_lt_algo(plan, std::ptr::from_ref(algo), stream, act, w, y, beta, workspace)
 }
 
-/// `gemm.cpp:296` — create the descriptors for a shape and ask cuBLASLt which
 fn build_lt_plan(m: i32, n: i32, k: i32) -> Option<Arc<Bf16LtPlan>> {
     let (handle, _, workspace_bytes) = lt_ctx();
     let mut plan = Bf16LtPlan {
@@ -391,7 +362,6 @@ fn build_lt_plan(m: i32, n: i32, k: i32) -> Option<Arc<Bf16LtPlan>> {
     Some(Arc::new(plan))
 }
 
-/// `gemm.cpp:370` — the plan for a shape, built once and shared.
 fn lt_plan_for(m: i32, n: i32, k: i32) -> Option<Arc<Bf16LtPlan>> {
     static PLANS: OnceLock<Mutex<HashMap<(i32, i32, i32, i32), Arc<Bf16LtPlan>>>> = OnceLock::new();
     let key = (current_device(), m, n, k);
@@ -407,7 +377,6 @@ fn lt_plan_for(m: i32, n: i32, k: i32) -> Option<Arc<Bf16LtPlan>> {
     Some(Arc::clone(map.entry(key).or_insert(plan)))
 }
 
-/// `gemm.cpp:384` — the Lt ladder: preferred index first, then every other
 fn gemm_bf16_lt(
     cublas_handle: cublasHandle_t,
     act: *const c_void,
@@ -441,10 +410,8 @@ fn gemm_bf16_lt(
     false
 }
 
-/// A candidate must beat the incumbent by this much to displace it; anything
 const TACTIC_MARGIN: f32 = 0.98;
 
-/// `gemm.cpp:466` — which family a tactic names. The integers are ON DISK, in
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GemmKind {
     GemmEx = 0,
@@ -453,7 +420,7 @@ enum GemmKind {
 }
 
 impl GemmKind {
-    /// The disk's integer back to a kind. `None` for anything outside the
+
     fn from_i32(v: i32) -> Option<Self> {
         match v {
             0 => Some(Self::GemmEx),
@@ -463,7 +430,6 @@ impl GemmKind {
         }
     }
 
-    /// The three spellings `PIE_GEMM_TUNE_LOG` prints.
     fn label(self) -> &'static str {
         match self {
             Self::GemmEx => "gemmex",
@@ -473,14 +439,12 @@ impl GemmKind {
     }
 }
 
-/// `gemm.cpp:469` — one candidate: a family and, for `Lt`, an index into the
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DenseTactic {
     kind: GemmKind,
     algo: i32,
 }
 
-/// `gemm.cpp:474` — the classic path, `cublasGemmEx` with the tensor-op pin.
 fn run_gemm_ex(
     handle: cublasHandle_t,
     act: *const c_void,
@@ -492,7 +456,7 @@ fn run_gemm_ex(
     beta: f32,
 ) -> bool {
     let alpha = 1.0f32;
-    // SAFETY: the caller's device pointers, of the extents its own contract
+
     let status = unsafe {
         cublasGemmEx(
             handle,
@@ -519,7 +483,6 @@ fn run_gemm_ex(
     status == cublasStatus_t::CUBLAS_STATUS_SUCCESS
 }
 
-/// `gemm.cpp:485` — run `t` on `handle`'s stream.
 #[allow(clippy::too_many_arguments)]
 fn run_dense_tactic(
     handle: cublasHandle_t,
@@ -535,31 +498,7 @@ fn run_dense_tactic(
     lt_workspace: Option<(*mut c_void, usize)>,
     bias: *const c_void,
 ) -> bool {
-    // `&& t.kind != GemmKind::Gemv` IS GONE, AND DELETING `gemv_bf16`'s
-    // `bias` IS WHAT REQUIRED IT.
-    //
-    // The exemption was honest while it lasted: every OTHER tactic refused
-    // a non-null bias because it had nowhere to put one, and `Gemv` was
-    // exempt because it did -- it forwarded the pointer straight into
-    // `gemv_bf16`'s fourth argument. *"Refuses a non-null bias for every
-    // tactic BUT this one, which is why the parameter exists"*, as `gemv.rs`
-    // put it.
-    //
-    // §3.9 deleted that argument, so the reason for the exemption is gone
-    // and only the exemption would have been left. THAT IS THE DANGEROUS
-    // RESIDUE OF A DELETION AND IT IS NOT THE DELETION'S OWN FILE. A
-    // non-null bias with `GemmKind::Gemv` would have gone from FORWARDED to
-    // SILENTLY DROPPED, still returning `true`, still reporting the tactic
-    // ran -- and the caller would have got an unbiased result reported as a
-    // biased one.
-    //
-    // Behaviour-neutral today, which is the only reason it is a one-line
-    // change rather than a bug report: both call sites (`dense.rs`'s tuner
-    // and its capture path) pass `std::ptr::null()`, so no branch changes
-    // for any input the tree produces. It is the FUTURE caller this stops,
-    // and the deletion is what made it possible to stop cheaply -- with the
-    // parameter gone there is no longer any way to express a bias here, so
-    // refusing one is now the whole truth rather than a policy.
+
     if !bias.is_null() {
         return false;
     }
@@ -571,18 +510,15 @@ fn run_dense_tactic(
             let Some(stream) = cublas_stream(handle) else {
                 return false;
             };
-            // SAFETY: the tuner's arena, live across the launch.
+
             let ctx = unsafe { crate::jit::Ctx::on(stream) };
-            // `Weight(w)`, because the leg's parameter is `Weight<..>` now
-            // (`gemv.rs:53`) and this is the call the mark describes: `w`
-            // arrives here as `act_x_wt_bf16`'s named bank and goes on as
-            // one.
+
             gemv_bf16(
                 &ctx,
                 kernels::Const { v: w },
                 kernels::In { ptr: act, rows: 0, width: k },
                 kernels::Out { ptr: y, rows: 0, width: n },
-                beta,
+                kernels::Const { v: beta },
             )
             .is_ok()
         }
@@ -600,7 +536,6 @@ fn run_dense_tactic(
     }
 }
 
-/// Everything the probes need that must not end up in a captured graph.
 struct DenseTuneArena {
     stream: *mut c_void,
     start: cudaEvent_t,
@@ -643,7 +578,7 @@ impl Drop for DenseTuneArena {
 }
 
 impl DenseTuneArena {
-    /// An arena with nothing acquired. Every failure path in [`Self::init`]
+
     fn empty() -> Self {
         Self {
             stream: std::ptr::null_mut(),
@@ -658,7 +593,6 @@ impl DenseTuneArena {
         }
     }
 
-    /// `gemm.cpp:565` — acquire everything, or answer `false` having acquired
     fn init(&mut self, caller: cublasHandle_t, m: i32, n: i32, k: i32) -> bool {
         let act_bytes = (m as usize) * (k as usize) * 2;
         let y_bytes = (m as usize) * (n as usize) * 2;
@@ -712,7 +646,6 @@ impl DenseTuneArena {
     }
 }
 
-/// `gemm.cpp:606` — elapsed time of the fastest of seven runs, or `None` if
 fn time_dense_tactic(
     arena: &DenseTuneArena,
     t: DenseTactic,
@@ -780,7 +713,6 @@ fn time_dense_tactic(
     best
 }
 
-/// `gemm.cpp:653` — the ballot.
 fn dense_candidates(
     plan: Option<&Bf16LtPlan>,
     m: i32,
@@ -809,13 +741,11 @@ fn dense_candidates(
     out
 }
 
-/// `tuning_cache.hpp:34` — mixes `v` into hash `h`.
 #[must_use]
 pub const fn tuning_hash(h: u64, v: u64) -> u64 {
     h ^ (v.wrapping_add(0x9e37_79b9_7f4a_7c15).wrapping_add(h << 6).wrapping_add(h >> 2))
 }
 
-/// `gemm.cpp:713` — the cache key for a dense shape.
 fn dense_key(m: i32, n: i32, k: i32, beta: f32) -> u64 {
     let mut h = 0u64;
     h = tuning_hash(h, m as u64);
@@ -825,7 +755,6 @@ fn dense_key(m: i32, n: i32, k: i32, beta: f32) -> u64 {
     h
 }
 
-/// The C++'s `TuningCache`, for this one file's use.
 struct DiskCache {
     signature: String,
     path: Option<PathBuf>,
@@ -892,7 +821,6 @@ impl DiskCache {
     }
 }
 
-/// `cache_root.hpp`'s derivation, carried because that header is deleted too:
 fn cache_path(name: &str) -> Option<PathBuf> {
     if let Some(xdg) = std::env::var("XDG_CACHE_HOME").ok().filter(|s| !s.is_empty()) {
         return Some(Path::new(&xdg).join("pie").join(name));
@@ -903,7 +831,6 @@ fn cache_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// `gemm.cpp:676` — `# pie-dense-gemm v1 sm<major><minor> cublas=<n> dev=<name>`.
 fn dense_cache_signature() -> String {
     let mut device: i32 = 0;
     if unsafe { cudaGetDevice(&raw mut device) } != cudaError::cudaSuccess {
@@ -920,20 +847,16 @@ fn dense_cache_signature() -> String {
     format!("# pie-dense-gemm v1 sm{}{} cublas={version} dev={name}", prop.major, prop.minor)
 }
 
-/// The tactic file's basename. Unchanged from the C++, so a machine that has
 const CACHE_FILE: &str = "dense_gemm.txt";
 
-/// `gemm.cpp:693` — the per-device memo, the recurrence counter and the disk.
 struct DenseGemmTuner {
     chosen: HashMap<u64, DenseTactic>,
     seen: HashMap<u64, i32>,
     disk: DiskCache,
 }
 
-/// Ceiling on how many shapes will ever be measured, so a workload with an
 const MAX_TUNED_SHAPES: usize = 1024;
 
-/// The per-device tuner map.
 fn with_tuner<R>(f: impl FnOnce(&mut DenseGemmTuner) -> R) -> R {
     static TUNERS: OnceLock<Mutex<HashMap<i32, DenseGemmTuner>>> = OnceLock::new();
     let mut map = TUNERS
@@ -948,13 +871,11 @@ fn with_tuner<R>(f: impl FnOnce(&mut DenseGemmTuner) -> R) -> R {
     f(tuner)
 }
 
-/// `PIE_GEMM_TUNE_LOG`, read once per process.
 fn tune_log() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("PIE_GEMM_TUNE_LOG").is_some())
 }
 
-/// `gemm.cpp:725` — measure every candidate and pick one.
 fn tune_dense(
     caller: cublasHandle_t,
     plan: Option<&Bf16LtPlan>,
@@ -1011,7 +932,6 @@ fn tune_dense(
     best
 }
 
-/// `gemm.cpp:775` — choose (and on first sight of a shape, measure) the kernel
 fn dense_tactic_for(
     caller: cublasHandle_t,
     w: *const c_void,
@@ -1072,14 +992,12 @@ fn dense_tactic_for(
     (plan, tactic)
 }
 
-/// `gemm.cpp:849` — side-effect-free peek at the tuner's verdict.
 #[must_use]
 pub fn dense_tactic_is_gemv(m: i32, n: i32, k: i32, beta: f32) -> bool {
     let key = dense_key(m, n, k, beta);
     with_tuner(|tuner| tuner.chosen.get(&key).is_some_and(|t| t.kind == GemmKind::Gemv))
 }
 
-/// One line per dense bf16 GEMM naming the shape, the capture status and the
 fn path_trace_take() -> bool {
     use std::sync::atomic::{AtomicI32, Ordering};
     static ON: OnceLock<bool> = OnceLock::new();
@@ -1093,14 +1011,6 @@ fn path_trace_take() -> bool {
     BUDGET.fetch_sub(1, Ordering::Relaxed) > 0
 }
 
-/// `gemm::act_x_wt_bf16` — `y[M, N] = act[M, K] @ W[N, K]^T + beta * y`.
-///
-/// # Safety
-///
-/// `act`, `w` and `y` must address `M*K`, `N*K` and `M*N` live bf16 elements
-/// and outlive the launch — which is asynchronous on the handle's stream, so
-/// "outlive" ends at the next synchronisation and not at this call's return.
-/// `handle` must be a live `cublasHandle_t`.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn act_x_wt_bf16(
     handle: *mut c_void,
@@ -1113,14 +1023,7 @@ pub unsafe fn act_x_wt_bf16(
     beta: f32,
 ) {
     let handle: cublasHandle_t = handle.cast::<cublasContext>();
-    // AN EMPTY RECTANGLE IS AN ANSWER, not a call. `m == 0` is a legal fire —
-    // a batch whose rows all landed elsewhere — and there is nothing to write,
-    // so every result it could have is already correct. cuBLASLt does not
-    // agree: `cublasLtMatmulAlgoGetHeuristic` divides by the row count while
-    // it picks a tile and raises SIGFPE, which kills the process instead of
-    // returning a status anyone could check. Asked before anything else so a
-    // zero-row fire costs nothing, and covering `n`/`k` too because the same
-    // heuristic reads all three.
+
     if m <= 0 || n <= 0 || k <= 0 {
         return;
     }
@@ -1170,14 +1073,14 @@ pub unsafe fn act_x_wt_bf16(
     }
 
     if m == 1 && beta == 0.0 {
-        // SAFETY: the caller's matrices, live across the launch.
+
         if let Some(stream) = cublas_stream(handle)
             && gemv_bf16(
                 &unsafe { crate::jit::Ctx::on(stream) },
                 kernels::Const { v: w },
                 kernels::In { ptr: act, rows: 0, width: k },
                 kernels::Out { ptr: y, rows: 0, width: n },
-                0.0,
+                kernels::Const { v: 0.0 },
             )
             .is_ok()
         {
@@ -1201,7 +1104,7 @@ pub unsafe fn act_x_wt_bf16(
     }
 
     let alpha = 1.0f32;
-    // SAFETY: the caller's obligation, above.
+
     let status = unsafe {
         cublasGemmEx(
             handle,
@@ -1263,7 +1166,6 @@ pub unsafe fn act_x_wt_bf16(
     check(status, &format!("cublasGemmEx[bf16] M={m} N={n} K={k}"));
 }
 
-/// Whether `cublasGemmGroupedBatchedEx` can serve a shape, per device.
 fn grouped_support(key: u64) -> Option<bool> {
     static KNOWN: OnceLock<Mutex<HashMap<(i32, u64), bool>>> = OnceLock::new();
     let map = KNOWN
@@ -1273,7 +1175,6 @@ fn grouped_support(key: u64) -> Option<bool> {
     map.get(&(current_device(), key)).copied()
 }
 
-/// Records what [`grouped_support`] could not answer. `emplace`, not
 fn store_grouped_support(key: u64, supported: bool) {
     static KNOWN: OnceLock<Mutex<HashMap<(i32, u64), bool>>> = OnceLock::new();
     let mut map = KNOWN
@@ -1283,12 +1184,6 @@ fn store_grouped_support(key: u64, supported: bool) {
     map.entry((current_device(), key)).or_insert(supported);
 }
 
-/// `gemm::batched_act_x_wt_bf16` — per-batch `act`/`W`/`y` pointers, all
-///
-/// # Safety
-///
-/// The three pointer arrays are **device** arrays of `batch_count` device
-/// pointers each, and cuBLAS does not consume them synchronously.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn batched_act_x_wt_bf16(
     handle: *mut c_void,
@@ -1304,8 +1199,7 @@ pub unsafe fn batched_act_x_wt_bf16(
     if batch_count <= 0 {
         return;
     }
-    // The same empty rectangle its single-shot sibling refuses above, and for
-    // the same reason: the heuristic faults on a zero extent.
+
     if m <= 0 || n <= 0 || k <= 0 {
         return;
     }
@@ -1328,7 +1222,7 @@ pub unsafe fn batched_act_x_wt_bf16(
         let ldb = [k];
         let ldc = [n];
         let group_size = [batch_count];
-        // SAFETY: the caller's obligation. One group, so every array is one
+
         let status = unsafe {
             cublasGemmGroupedBatchedEx(
                 handle,
@@ -1360,7 +1254,7 @@ pub unsafe fn batched_act_x_wt_bf16(
             return;
         }
     }
-    // SAFETY: as above.
+
     let status = unsafe {
         cublasGemmBatchedEx(
             handle,
@@ -1413,14 +1307,6 @@ pub unsafe fn batched_act_x_wt_bf16(
     }
 }
 
-/// `gemm::act_x_wt_bf16_out_fp32` — one `cublasGemmEx`, bf16 in, fp32 out.
-///
-/// # Safety
-///
-/// `act` and `w` must address `M*K` and `N*K` live bf16 elements, `y` must
-/// address `M*N` live floats, and all three must outlive the launch — which
-/// is asynchronous on the handle's stream, so "outlive" ends at the next
-/// synchronisation and not at this call's return.
 pub unsafe fn act_x_wt_bf16_out_fp32(
     handle: *mut c_void,
     act: *const c_void,
@@ -1432,7 +1318,7 @@ pub unsafe fn act_x_wt_bf16_out_fp32(
 ) {
     let alpha = 1.0f32;
     let beta = 0.0f32;
-    // SAFETY: the caller's obligation, above. The handle is the engine's,
+
     let status = unsafe {
         cublasGemmEx(
             handle.cast::<cublasContext>(),
@@ -1459,29 +1345,6 @@ pub unsafe fn act_x_wt_bf16_out_fp32(
     check(status, &format!("cublasGemmEx[bf16->fp32] M={m} N={n} K={k}"));
 }
 
-/// `gemm::grouped_act_x_wt_bf16` — one `cublasGemmGroupedBatchedEx`.
-///
-/// # Safety
-///
-/// The three pointer arrays must be **DEVICE** arrays of `group_count` device
-/// addresses, and `m_array_host` a **host** array of `group_count` row counts.
-/// The split is real and is cuBLAS's: the scalar arrays (`m`/`n`/`k`, the
-/// leading dimensions, alpha and beta, the group sizes) are read on the host,
-/// and the `Aarray`/`Barray`/`Carray` pointer arrays are dereferenced on the
-/// device like every other batched form.
-///
-/// This said HOST for the pointer arrays, and said cuBLAS "reads them on the
-/// host for the grouped form". It does not. Handing it host addresses is
-/// `cudaErrorIllegalAddress` at the next synchronize on CUDA 13 / sm_120 --
-/// measured, not inferred, and the same call is clean when the arrays are
-/// staged to the device. It evidently went unpunished on whatever card
-/// recorded `tests/oracle/gemm_service/golden.txt`, since those rows hash to
-/// real products rather than to the untouched output buffer, which is what
-/// let a wrong sentence survive as a correct-looking one.
-///
-/// The only caller that matters already gets this right: `lora.rs` passes a
-/// slot in `staged.ptr_slab`, whose own doc calls it "the device pointer
-/// slab". The names were the bug, not the behaviour.
 pub unsafe fn grouped_act_x_wt_bf16(
     handle: *mut c_void,
     act_ptrs_dev: *const *const c_void,
@@ -1500,7 +1363,7 @@ pub unsafe fn grouped_act_x_wt_bf16(
     let transa = vec![cublasOperation_t::CUBLAS_OP_T; groups];
     let transb = vec![cublasOperation_t::CUBLAS_OP_N; groups];
     let m_arr = vec![n; groups];
-    // SAFETY: `m_array_host` is a host array of `group_count` ints, per the
+
     let n_arr = unsafe { std::slice::from_raw_parts(m_array_host, groups) }.to_vec();
     let k_arr = vec![k; groups];
     let lda = vec![k; groups];
@@ -1510,7 +1373,6 @@ pub unsafe fn grouped_act_x_wt_bf16(
     let alpha = vec![1.0f32; groups];
     let beta_values = vec![beta; groups];
 
-    // SAFETY: every array above is `group_count` long and lives across the
     let status = unsafe {
         cublasGemmGroupedBatchedEx(
             handle.cast::<cublasContext>(),

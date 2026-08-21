@@ -51,10 +51,13 @@ fn family_names() -> Vec<String> {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|name| !not_a_generation.contains(&name.as_str()))
         .collect();
-    assert!(
-        names.len() >= 15,
-        "found {} generation directories under src/; the layout moved and \
-         this guard is now looking in the wrong place",
+    // 21, the same count `sibling_isolation.rs` walks. Both said `>= 15`.
+    assert_eq!(
+        names.len(),
+        21,
+        "found {} generation directories under src/, not 21; a generation \
+         arrived or left, or the layout moved and this guard is now looking \
+         in the wrong place",
         names.len()
     );
     // Directories are generations (`llama_3`, `qwen_3_5`), so the bare vendor

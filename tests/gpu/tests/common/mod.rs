@@ -262,38 +262,58 @@ pub fn mtp_draft_tokens(default_k: u32) -> u32 {
         .unwrap_or(default_k)
 }
 
-/// Standalone TOML for the **dummy** driver: fabricates everything the portable
-/// driver reads from weights (no GPU, no 20 GB load, ~instant boot), so it
-/// exercises the *driver-agnostic* client edge (connect → add_program →
-/// launch → forward round-trip) without CUDA. `vocab_size`/`arch_name` are
-/// supplied so the driver doesn't read `config.json`; `hf_repo` still points at
-/// the snapshot for the tokenizer the runtime registers.
-pub fn dummy_standalone_toml(hf_repo: &str) -> String {
-    format!(
-        "         [server]\n\
-         port = 0\n\
-         \n\
-         [model]\n\
-         name = \"qwen3\"\n\
-         model = \"{hf_repo}\"\n\
-         \n\
-         [driver]\n\
-         type = \"dummy\"\n\
-         device = [\"cpu\"]\n\
-         \n\
-         vocab_size = 151936\n\
-         arch_name = \"qwen3\"\n"
-    )
-}
-
-/// Boot the embedded standalone with the **dummy** driver (no GPU). Fast repro
-/// harness for the driver-agnostic client edge (e.g. the chunked-`add_program`
-/// session-bridge path).
-pub async fn boot_dummy() -> Result<pie::StandaloneHandle> {
-    let snapshot = resolve_qwen3_snapshot()?;
-    let (controller, gateway, worker) = derive_standalone(&dummy_standalone_toml(&snapshot))?;
-    run_standalone(controller, gateway, worker).await
-}
+// ── The dummy driver, and the three gates that stood on it ─────────────
+//
+// `dummy_standalone_toml` and `boot_dummy` STOOD HERE. They fabricated
+// everything a portable driver reads from weights -- no GPU, no 20 GB load,
+// near-instant boot -- so a gate could exercise the driver-AGNOSTIC client
+// edge (connect -> add_program -> launch -> forward round-trip) on a machine
+// with no CUDA and no artifact.
+//
+// The driver they named is deleted. `DriverKind` accepts `cuda_native`,
+// `metal`, `vulkan` and `wgpu` and nothing else, so `type = "dummy"` no longer
+// parses -- `worker::config` refuses it before a boot is attempted, and there
+// is no driverless boot left anywhere in this tree. That is a decision made
+// upstream and recorded in this crate's `Cargo.toml`: *"there is no fallback:
+// the dummy driver these no-GPU diagnostics used to run against is deleted, so
+// a build with neither feature reaches no device."* These helpers were what
+// that sentence had not finished removing.
+//
+// THREE gates rested on them, and they went three different ways, which is
+// worth writing down because "the dummy driver is gone" is not by itself an
+// answer to what a gate was measuring.
+//
+// * `dummy_add_program` -- the chunked-`add_program` session-bridge deadlock
+//   repro -- took `boot_vulkan()` and is `vulkan_add_program` now. What it
+//   measures is the gateway/worker turn model under a ~12 MB upload, which is
+//   driver-agnostic; it only ever wanted the CHEAPEST boot, and on a machine
+//   with no CUDA the Vulkan driver is that. It costs an artifact env var it
+//   did not use to need, which is the whole price.
+//
+// * tests/boot_smoke.rs and tests/boot_artifact.rs, in the root `pie` package,
+//   are DELETED -- named without backticks because they are not there to be
+//   opened, which is the rule `model-loader`'s citation gate enforces. Both
+//   booted the standalone against a synthetic snapshot -- a 256-token
+//   byte-level BPE and a four-byte `embed_tokens` tensor --
+//   which only the dummy load planner ever accepted. A real driver cannot
+//   serve four bytes, so there was no config to repoint them at: their subject
+//   was the fabricating driver itself.
+//
+//   They are not replaced so much as already covered from both sides. The
+//   end-to-end half -- convert a checkpoint, boot from the artifact alone,
+//   round-trip a turn through the real client edge -- is what
+//   `vulkan_chat_completion_e2e` and `vulkan_two_conversations` in this
+//   directory do, against a real model on a real device. The artifact half --
+//   that the objects written under `__meta__/` come back out of a `.zt` by
+//   name and rebuild the same tokenizer -- is `tests/artifact_tokenizer.rs`,
+//   which asserts it directly and needs no boot at all.
+//
+//   What is genuinely lost is that those two ran in a plain `cargo test` with
+//   no GPU and no env var, and the gates that took over do not: they are
+//   `#[ignore]`d and want `PIE_VULKAN_ARTIFACT`. That is a real reduction in
+//   what CI notices on a machine with no device, and it is stated here rather
+//   than discovered later. It is the cost of the dummy driver's deletion, not
+//   of this edit.
 
 // ── Client submit (golf) ────────────────────────────────────────────────────
 //

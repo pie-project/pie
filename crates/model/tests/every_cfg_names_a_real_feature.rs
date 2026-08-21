@@ -55,7 +55,7 @@
 //! deleted `forward` gate in prose and describing a mistake is how it
 //! stays fixed.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// The workspace root: `crates/` has a parent, and the parent has
@@ -193,10 +193,17 @@ fn every_cfg_names_a_feature_its_crate_declares() {
     let root = workspace_root();
     let mut found = Vec::new();
     manifests(&root, &mut found);
+    // A FLOOR ON PURPOSE. It reads 77 and ten is nowhere near that, which
+    // in most of this sweep would be the whole complaint -- but the subject
+    // here is how many crates the workspace has, and crates arrive and
+    // leave in ordinary work that has nothing to do with cfg spelling. A
+    // census would fail every reorganisation and be raised without being
+    // read, which is worse than a floor that admits what it is. The only
+    // failure this walk HAS is finding nothing, and ten catches that.
     assert!(
         found.len() >= 10,
         "found only {} manifests under {}, so this walk found nothing to \
-         check",
+         check (it read 77 when the floor was last measured)",
         found.len(),
         root.display()
     );
@@ -234,6 +241,9 @@ fn every_cfg_names_a_feature_its_crate_declares() {
         }
     }
 
+    // A FLOOR ON PURPOSE. 735 cfg attributes across the workspace, and any
+    // line anyone writes can change it, so the only honest reading is that
+    // the walk found the tree.
     assert!(
         checked >= 50,
         "only {checked} `feature = \"...\"` sites were examined, which is \
@@ -487,6 +497,9 @@ fn every_workflow_feature_names_a_feature_its_package_declares() {
         }
     }
     assert!(
+        // 76 features declared, and crates arrive and leave in ordinary work.
+        // The named key is the real assertion; the count is the empty-scan
+        // guard beside it.
         declared.contains_key("model") && declared.len() >= 10,
         "read {} packages, which is not this workspace",
         declared.len()
@@ -554,11 +567,16 @@ fn every_workflow_feature_names_a_feature_its_package_declares() {
         }
     }
 
-    assert!(
-        checked >= 10,
-        "only {checked} feature names were checked across {} workflow \
-         files, so this scan is not reading the cargo commands it thinks \
-         it is",
+    // 45 feature names across the workflow files, behind a 10. The subject
+    // is what CI asks cargo for, which changes only when somebody edits a
+    // workflow on purpose, so the count is a fact this file can hold rather
+    // than a floor it has to guess under.
+    assert_eq!(
+        checked, 45,
+        "{checked} feature names were checked across {} workflow files, not \
+         45. If a workflow gained or lost a `--features`, say so here; if \
+         the number collapsed, this scan is not reading the cargo commands \
+         it thinks it is",
         files.len()
     );
     assert!(
@@ -604,5 +622,160 @@ fn the_workflow_scan_reads_a_wrapped_cargo_line() {
     assert!(
         none.is_empty(),
         "a flag was read as a feature name: {none:?}"
+    );
+}
+
+/// A test file behind a feature no CI command enables runs zero tests.
+///
+/// `#![cfg(feature = "contract")]` at the top of a test file is not a
+/// gate on an assertion; it is a gate on the file's EXISTENCE. Under
+/// `cargo test -p model` the binary still builds, still links, and still
+/// reports -- `0 passed; 0 failed; 0 filtered out` -- which is the same
+/// line a passing empty suite prints and the same line nobody reads.
+///
+/// Six files in this crate carry that attribute and `contract` is not a
+/// default feature. One workflow step named ONE of them (`seam_names`,
+/// added for a reason of its own), and `cargo test --workspace` runs with
+/// default features, so the other five never executed in any job --
+/// forty-two of the aspect's forty-five tests, thirty of them in
+/// `family_contracts.rs`. They were
+/// COMPILED, by the `cargo check --features contract` steps, which is why
+/// this went unseen: the thing that rots in an unrun test is the
+/// assertion, and a check never reads one.
+///
+/// This is the lesson the `kernel vocabulary audit` step already carries
+/// in its own comment -- "a check nobody runs is indistinguishable from a
+/// check that passes" -- arriving a second time through a different door.
+/// So the check is mechanical now rather than remembered: name a feature
+/// in a test file's `#![cfg]` and some `cargo test` in the workflows must
+/// enable it and must reach that file.
+#[test]
+fn every_feature_that_gates_a_test_file_is_one_ci_runs_the_file_under() {
+    let root = workspace_root();
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+
+    // stem -> the feature its `#![cfg]` demands.
+    let mut gated: BTreeMap<String, String> = BTreeMap::new();
+    for entry in std::fs::read_dir(&dir).expect("crates/model/tests exists").flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // Only the file-level form, which is the one that empties a binary.
+        // An inner `#[cfg]` on a single test is a different statement.
+        for line in text.lines().take_while(|l| !l.contains("#[test]")) {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("#![cfg(feature = \"") else {
+                continue;
+            };
+            let Some(feature) = rest.split('"').next() else {
+                continue;
+            };
+            let stem = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            gated.insert(stem, feature.to_string());
+        }
+    }
+    assert!(
+        gated.len() >= 3,
+        "found {} feature-gated test files, so this scan is not reading \
+         crates/model/tests -- it found {:?}",
+        gated.len(),
+        gated
+    );
+
+    // A default feature is enabled by every command that does not turn it
+    // off, and no workflow spells it with `--features`, so reading the
+    // manifest is the only way to see that `chat` is already covered.
+    let manifest = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+        .expect("crates/model/Cargo.toml is readable");
+    let defaults: BTreeSet<String> = manifest
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("default = ["))
+        .map(|rest| {
+            rest.trim_end_matches(']')
+                .split(',')
+                .map(|w| w.trim().trim_matches('"').to_string())
+                .filter(|w| !w.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !defaults.is_empty(),
+        "no `default = [...]` found in crates/model/Cargo.toml, so this test \
+         cannot tell which features a plain `cargo test` already enables"
+    );
+
+    // feature -> what a `cargo test` enabling it actually reaches. `None`
+    // is the whole crate; a set is the `--test` targets that command named.
+    let mut reached: BTreeMap<String, Option<BTreeSet<String>>> = BTreeMap::new();
+    for file in workflows(&root) {
+        let Ok(yaml) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        for (_, command) in shell_commands(&yaml) {
+            if !command.contains("cargo test") {
+                continue;
+            }
+            let (packages, features) = packages_and_features(&command);
+            // `--workspace` names no package and unifies features across
+            // everything, so it counts for this crate too.
+            let ours = packages.iter().any(|p| p == "model") || command.contains("--workspace");
+            if !ours {
+                continue;
+            }
+            let targets: BTreeSet<String> = command
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .filter(|w| w[0] == "--test")
+                .map(|w| w[1].to_string())
+                .collect();
+            let mut enabled: BTreeSet<String> = features.into_iter().collect();
+            if !command.contains("--no-default-features") {
+                enabled.extend(defaults.iter().cloned());
+            }
+            for feature in enabled {
+                let entry = reached.entry(feature).or_insert(Some(BTreeSet::new()));
+                match (entry.as_mut(), targets.is_empty()) {
+                    // A whole-crate run subsumes every narrower one.
+                    (_, true) => *entry = None,
+                    (Some(seen), false) => seen.extend(targets.iter().cloned()),
+                    (None, false) => {}
+                }
+            }
+        }
+    }
+
+    let mut unrun = Vec::new();
+    for (stem, feature) in &gated {
+        match reached.get(feature) {
+            None => unrun.push(format!(
+                "tests/{stem}.rs is gated on `{feature}` and no `cargo test` \
+                 in any workflow enables that feature at all"
+            )),
+            Some(None) => {}
+            Some(Some(seen)) if seen.contains(stem) => {}
+            Some(Some(seen)) => unrun.push(format!(
+                "tests/{stem}.rs is gated on `{feature}`, and the only \
+                 `cargo test` enabling `{feature}` names {seen:?} with \
+                 `--test`, so this file's binary is built, runs zero tests, \
+                 and prints the same line a passing suite prints"
+            )),
+        }
+    }
+    assert!(
+        unrun.is_empty(),
+        "{} feature-gated test file(s) execute in no job:\n  {}\n\nEither \
+         widen a `cargo test` step to the whole crate, name the file with \
+         `--test`, or delete the file -- but a gate nothing opens is not a \
+         gate.",
+        unrun.len(),
+        unrun.join("\n  ")
     );
 }

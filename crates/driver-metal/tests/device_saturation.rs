@@ -242,6 +242,7 @@ fn fire(
     let dispatch = Dispatch {
         symbol,
         file,
+        stamp: "",
         grid: [n, 1, 1],
         threadgroup: [n.min(32), 1, 1],
         // Conservative, as a positional row's would be: this fixture drives

@@ -18,8 +18,10 @@ pub mod jit;
 
 // The facts a launcher can name, as types rather than as words. One fact,
 // one type, one spelling of it in the whole tree.
+pub mod canon;
 pub mod keys;
 pub mod raises;
+pub mod runtime;
 
 // The shader backends' operand vocabulary, written once: closed and identical
 // in metal, vulkan and wgpu, generic over `shader::ShaderValue`. Not CUDA's.
@@ -319,8 +321,8 @@ pub struct Axis {
     /// Exactly one is present in any entrypoint the axis reaches.
     ///
     /// A point MAY be `""`, for an axis whose default specialisation adds no
-    /// text. Two orderings are load-bearing, and [`KernelSig::covers`] checks
-    /// them rather than asserting them:
+    /// text. Two orderings are load-bearing, and [`KernelSig::covers_point`]
+    /// checks them rather than asserting them:
     ///
     /// * the empty point goes LAST, because matching is first-wins and an
     ///   empty suffix matches everything;
@@ -853,6 +855,24 @@ pub trait Derivation {
     const ASKED: &'static [&'static str] = &[];
 }
 
+/// The routine's call surface, on the marker `#[routine]` emits.
+///
+/// What `Derivation` is to the BINDER, this is to the AUTHOR: `model-dsl`'s
+/// `fire::<R>` reads `Sig` to derive the whole statement — which arguments
+/// are operands, which are weights, which land in the params run, in
+/// signature order — so a routine added to a plane is a routine the DSL can
+/// state, with no wrapper written and no list appended to. The symbol a
+/// trace spells is `{NAMESPACE}::{NAME}`.
+pub trait Signature {
+    /// What a trace prefixes the name with. See [`routine::namespace`].
+    const NAMESPACE: &'static str;
+    /// The trace name: the `fn`'s, plus its instantiation (`rmsnorm_bf16`).
+    const NAME: &'static str;
+    /// The marks, in signature order, instantiated — the `Ctx` parameter
+    /// dropped. A tuple of `In<..> / Out<..> / Const<..> / InOut<..>`.
+    type Sig;
+}
+
 /// Is this source the named fact `key`, in a `const` context?
 ///
 /// `Source::Named` CANNOT BE MATCHED IN A CONST: `matches!` on a `&str` is
@@ -900,13 +920,6 @@ pub enum Kind {
     /// the driver held a name-to-arithmetic table to get them back; the
     /// statement carries the number instead.
     ParamF32,
-    /// The staged parameter BLOCK: every scalar the statement carries, laid
-    /// out end to end and bound as one buffer.
-    ///
-    /// A shader plane stages this where CUDA passes scalars individually,
-    /// which is why the kind exists here and nowhere in the CUDA rows. There
-    /// is one per launch, so the index is always zero.
-    Params,
     /// The `i`-th FOREIGN value the join collected for this statement.
     ///
     /// nemotron's mamba block wires values ACROSS statements, none of which
@@ -1071,6 +1084,8 @@ pub struct KernelSig {
     /// See [`routine::Routine::driver`], including for why the column's shape
     /// cannot be read for this.
     pub driver: bool,
+    /// The tier-1 role this routine claims. See [`routine::Routine::canon`].
+    pub canon: Option<&'static str>,
 }
 
 // `lacks` IS NOT SURPLUS -- ITS READER IS MISSING. Zero readers, fourteen
@@ -1082,16 +1097,6 @@ pub struct KernelSig {
 // also has `Scores` and `PageMaskSink`, so a grep cannot attribute a hit.
 
 impl KernelSig {
-    /// Does `symbol` name this row — as the kernel itself, or at one point of
-    /// its axes?
-    ///
-    /// Both are legitimate: a model text states the KERNEL, a driver or audit
-    /// the POINT. Nothing BETWEEN them resolves -- the axes are peeled from
-    /// the END, so a half-spelled name is refused rather than rounded.
-    pub fn covers(&self, symbol: &str) -> bool {
-        self.symbol == symbol || self.covers_point(symbol)
-    }
-
     /// `symbol` is this row at one point of its axes — not the bare base.
     ///
     /// Order is the whole implementation: the axes are declared in the order a

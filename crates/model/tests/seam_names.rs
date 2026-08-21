@@ -379,16 +379,39 @@ const NOT_YET_WIRED: &[(&str, &[&str])] = &[
     // MLA and the latent cache: three families, one shape. `kv_b_proj`
     // and `q_a_norm` are the latent projection's two halves and all
     // three name them.
+    // AND SIX HYPER-CONNECTION NAMES, which are this family's alone. Every
+    // `hc_pre` and the one `hc_head` reads an affine pair -- a `scale` and
+    // a `base` the kernel dereferences per token -- and a layer states two
+    // pre-mixes, one before its attention and one before its MLP, so the
+    // pairs do not share. The head's is not layer-scoped because the
+    // collapse runs once for the whole tower.
+    //
+    // Trace names on the same footing as `attn_sink` and `router_bias`
+    // above: no witnessed checkpoint spells them, so `project.rs` claims
+    // none of them in the manifest and they are owed here instead.
     ("deepseek_v4", &[
+        "hc_head_base",
+        "hc_head_scale",
         "layer.*.attn_sink",
         "layer.*.expert.{e}.down",
         "layer.*.expert.{e}.gate_up",
+        "layer.*.hc_attn_base",
+        "layer.*.hc_attn_scale",
+        "layer.*.hc_mlp_base",
+        "layer.*.hc_mlp_scale",
         "layer.*.kv_norm",
         "layer.*.router_bias",
     ]),
+    // The DSA indexer's LayerNorm joins its three projections, and for the
+    // reason `glm_5/project.rs` gives about all five at once: the
+    // checkpoint's spelling for anything under the indexer is not written
+    // down in this tree. The norm is a PAIR because the kernel subtracts
+    // the row mean and adds a bias -- `w[d]` and `b[d]`, both per element.
     ("glm5", &[
         "layer.*.expert.{e}.down",
         "layer.*.expert.{e}.gate_up",
+        "layer.*.idx_k_norm",
+        "layer.*.idx_k_norm_bias",
         "layer.*.idx_weights_proj",
         "layer.*.idx_wk",
         "layer.*.idx_wq_b",

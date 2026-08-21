@@ -171,13 +171,32 @@ fn rows() -> Vec<(&'static str, Arc<dyn Instruct>)> {
     let tok = tokenizer();
     let rows: Vec<_> = catalog::catalog()
         .iter()
+        // NOT THE TEST ROWS. `model`'s `test-rows` feature adds a row its
+        // own catalog calls "a row that is not a model", and cargo unifies
+        // features across a workspace build -- so this census read 59 under
+        // `cargo test --workspace` and 58 under `cargo test -p model`,
+        // failing with a message about a fleet change when the fleet had
+        // not moved. The same filter, for the same reason, sits in
+        // `advertised_matches_what_is_shipped` and in `driver-metal`'s
+        // `catalog_coverage`; `a_shipped_catalog_has_no_test_rows` is what
+        // keeps the prefix meaningful.
+        .filter(|row| !row.id().starts_with("test-"))
         .map(|row| (row.id(), row.chat(tok.clone())))
         .collect();
-    assert!(
-        rows.len() >= 50,
-        "the catalog reports {} rows, so this file is walking a list that \
-         has lost most of itself and every assertion below is passing \
-         vacuously",
+    // The catalog's own census, and the only place in the crate that keeps
+    // it. Three files walk this list and each carried its own `>= 50`,
+    // copied, guarding three differently-sized things -- this one the whole
+    // catalog at 58, `advertised_matches_what_is_shipped` the 53 that
+    // deploy. Two numbers five apart behind one identical floor is how a
+    // copied guard hides that it is guarding something else.
+    assert_eq!(
+        rows.len(),
+        58,
+        "the catalog reports {} rows, not 58. A row added or retired is a \
+         fleet change and belongs in a commit message; if this file is \
+         instead reading a list that has lost most of itself, every \
+         assertion below it is passing vacuously, which is what the floor \
+         this replaced was watching for and all it could see.",
         rows.len()
     );
     rows

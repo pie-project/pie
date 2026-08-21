@@ -234,6 +234,13 @@
 //! command buffer — `src -> scratch`, `scratch -> dst` — which is two transfers
 //! instead of one and is why the scratch is shared across a whole page move
 //! rather than allocated per copy.
+//!
+//! RETIRED WITH `kernels-wgpu`'s TEST TREE. That name is a record of a
+//! measurement now, not a live proof: the crate lost `tests/` and every
+//! in-file `mod tests` when the three shader planes moved their numbers to
+//! the fire that reads them, and nothing in this workspace re-runs it. What
+//! it reported is still why the sentence above says what it says; what is
+//! gone is the thing that would notice if it stopped being true.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -3094,6 +3101,29 @@ impl Pipelines {
     #[must_use]
     pub fn built(&self) -> usize {
         self.built.len()
+    }
+
+    /// The symbols this cache has EXPANDED, whether or not they were compiled.
+    ///
+    /// [`Self::built_symbols`]'s superset, and the two are not equal: a fire
+    /// reads a module for every symbol its LOWERING names and builds a
+    /// pipeline only for the ones a guard lets dispatch. A plan carrying both
+    /// arms of the decode-attention switch reads three and fires two.
+    #[must_use]
+    pub fn read_symbols(&self) -> std::collections::BTreeSet<&str> {
+        self.read.keys().map(|(s, _)| s.as_str()).collect()
+    }
+
+    /// The symbols this cache has COMPILED.
+    ///
+    /// A symbol here that is not in [`Self::read_symbols`] is the drift the
+    /// two keys can suffer -- they are keyed on the REQUESTED tier and the
+    /// LANDED one, which differ whenever an adapter asks for a tier the tree
+    /// has no variant of -- and it means a pipeline was built from a module
+    /// nobody reflected.
+    #[must_use]
+    pub fn built_symbols(&self) -> std::collections::BTreeSet<&str> {
+        self.built.keys().map(|(s, _)| s.as_str()).collect()
     }
 
     /// The pipeline for `entrypoint` at `tier`, building it from `source` if it

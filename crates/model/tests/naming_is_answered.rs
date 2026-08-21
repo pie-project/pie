@@ -100,9 +100,17 @@ fn every_row_either_authors_mlx_differently_or_refuses_in_words() {
     let hf = authored_under(Naming::Hf);
     let mlx = authored_under(Naming::Mlx);
     assert_eq!(hf.len(), mlx.len());
-    assert!(
-        hf.len() >= 40,
-        "the catalog has {} rows, which is too few for this walk to mean anything",
+    // The catalog census, third copy. `chat_surface_is_answered` keeps it at
+    // 58 and `advertised_matches_what_is_shipped` keeps 58 minus five; this
+    // file had the same number behind a 40 and its message even says so --
+    // "the catalog has {} rows" -- while allowing eighteen of them to leave
+    // without a word. Three walks over one list, three private floors, and
+    // no two of them agreeing on what a healthy size looks like.
+    assert_eq!(
+        hf.len(),
+        58,
+        "the catalog has {} rows, not 58. Move this with the census in \
+         `chat_surface_is_answered.rs`; they are the same list.",
         hf.len()
     );
 

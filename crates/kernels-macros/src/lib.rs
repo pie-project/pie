@@ -179,10 +179,17 @@ pub fn routine(attr: TokenStream, item: TokenStream) -> TokenStream {
     // SYNTAX and hangs on the marker type this attribute also emits. So the
     // attribute, which has both in hand, attaches it -- and `Stated::derived`
     // downstream is what tells `arity_problem` which operands are optional.
-    let with_column = quote!(
-        .derived(<#base as ::kernels::Derivation>::DERIVED)
-        .asking(<#base as ::kernels::Derivation>::ASKED)
-    );
+    let with_column = match &spec.canon {
+        Some(role) => quote!(
+            .derived(<#base as ::kernels::Derivation>::DERIVED)
+            .asking(<#base as ::kernels::Derivation>::ASKED)
+            .canon(#role)
+        ),
+        None => quote!(
+            .derived(<#base as ::kernels::Derivation>::DERIVED)
+            .asking(<#base as ::kernels::Derivation>::ASKED)
+        ),
+    };
     // The module the `fn` is written in, unless the attribute says otherwise.
     // See `Spec::namespace` for the one file that says otherwise and why.
     let ns = match &spec.namespace {
@@ -205,6 +212,34 @@ pub fn routine(attr: TokenStream, item: TokenStream) -> TokenStream {
             namespace = #ns
             #(, #facts)*
         )#with_column)
+    };
+
+    // THE CALL SURFACE, ON THE MARKER. `Sig` is the parameter types in
+    // signature order with the `Ctx` parameter dropped and the generics
+    // instantiated -- the tuple `model-dsl`'s `fire::<R>` reads to derive the
+    // whole statement, which is what makes a routine added here a routine the
+    // DSL can state with no wrapper written. An uncolumned row has no marks,
+    // so it states no `Signature`.
+    let signature = if uncolumned {
+        quote!()
+    } else {
+        let params: Vec<syn::Type> = f
+            .sig
+            .inputs
+            .iter()
+            .skip(1) // ctx
+            .filter_map(|a| match a {
+                FnArg::Typed(t) => Some(substituted(&t.ty, &f.sig.generics, &spec.generics)),
+                FnArg::Receiver(_) => None,
+            })
+            .collect();
+        quote! {
+            impl ::kernels::Signature for #base {
+                const NAMESPACE: &'static str = #ns;
+                const NAME: &'static str = #trace;
+                type Sig = (#(#params,)*);
+            }
+        }
     };
 
     let doc = format!(
@@ -239,6 +274,8 @@ pub fn routine(attr: TokenStream, item: TokenStream) -> TokenStream {
             const ASKED: &'static [&'static str] = #asked_list;
         }
 
+        #signature
+
         // THE ROW, BESIDE THE `fn`, AND REGISTERED BY EXISTING.
         //
         // `#[distributed_slice]` puts it in a link section the linker gathers,
@@ -253,9 +290,24 @@ pub fn routine(attr: TokenStream, item: TokenStream) -> TokenStream {
         //
         // `crate::Plane` is the backend, aliased by each kernels crate, so
         // this attribute serves all four rather than naming CUDA's.
+        //
+        // TWO MECHANISMS, ONE ROW, NEVER BOTH AT ONCE. `linkme` cannot serve
+        // `wasm32-unknown-unknown` -- there is no link section whose bounds a
+        // linker will report -- and `driver-wgpu`'s browser gate requires the
+        // table to exist there. So on wasm the row is submitted to
+        // `inventory` instead, which collects through a constructor run by
+        // `__wasm_call_ctors`. The two `cfg`s are exact complements and are
+        // the same pair the DECLARATION side wears in each kernels crate, so
+        // a routine registers exactly once on every target. Enumerate through
+        // the plane's `rows()`, which is the seam that hides which of the two
+        // answered.
+        #[cfg(not(target_family = "wasm"))]
         #[::linkme::distributed_slice(crate::ROUTINES)]
         #[allow(non_upper_case_globals)]
         static #row: ::kernels::routine::Routine<crate::Plane> = #row_expr;
+
+        #[cfg(target_family = "wasm")]
+        ::inventory::submit! { crate::Registered(#row_expr) }
     }
     .into()
 }
@@ -278,14 +330,19 @@ struct Spec {
     /// bare identifier; a row registers where its `fn` is written now, so the
     /// namespace has to be said where the `fn` is.
     namespace: Option<String>,
+    /// `canon = rmsnorm` — the tier-1 role this routine claims. Lands on the
+    /// row as `.canon("rmsnorm")`, where `kernels::canon::is_role` refuses a
+    /// name outside the closed list at build time.
+    canon: Option<String>,
 }
 
 impl Spec {
     fn parse(attr: proc_macro2::TokenStream) -> Result<Self, Error> {
         let (mut generics, mut facts) = (Vec::new(), Vec::new());
         let mut namespace = None;
+        let mut canon = None;
         if attr.is_empty() {
-            return Ok(Self { generics, facts, namespace });
+            return Ok(Self { generics, facts, namespace, canon });
         }
         let parsed = syn::parse2::<Args>(attr)?;
         for a in parsed.0 {
@@ -302,9 +359,10 @@ impl Spec {
                 }
                 Arg::Generic(t) => generics.push(t),
                 Arg::Namespace(ns) => namespace = Some(ns),
+                Arg::Canon(role) => canon = Some(role),
             }
         }
-        Ok(Self { generics, facts, namespace })
+        Ok(Self { generics, facts, namespace, canon })
     }
 
     /// `rmsnorm` + `[bf16]` -> `rmsnorm_bf16`.
@@ -357,11 +415,14 @@ enum Arg {
     /// `namespace = "attn"` — the prefix a TRACE spells, where it is not the
     /// module the `fn` lives in.
     Namespace(String),
+    /// `canon = rmsnorm` — the tier-1 role this routine claims.
+    Canon(String),
 }
 
-/// One `namespace = "..."`, or a bare item.
+/// One `namespace = "..."`, one `canon = role`, or a bare item.
 enum Item {
     Namespace(syn::LitStr),
+    Canon(syn::Ident),
     Bare(syn::Type),
 }
 
@@ -369,14 +430,17 @@ impl syn::parse::Parse for Item {
     fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
         if input.peek(syn::Ident) && input.peek2(syn::Token![=]) {
             let key: syn::Ident = input.parse()?;
-            if key != "namespace" {
-                return Err(syn::Error::new(
-                    key.span(),
-                    "the only keyed argument is `namespace = \"..\"`",
-                ));
-            }
             let _: syn::Token![=] = input.parse()?;
-            return Ok(Self::Namespace(input.parse()?));
+            if key == "namespace" {
+                return Ok(Self::Namespace(input.parse()?));
+            }
+            if key == "canon" {
+                return Ok(Self::Canon(input.parse()?));
+            }
+            return Err(syn::Error::new(
+                key.span(),
+                "the keyed arguments are `namespace = \"..\"` and `canon = role`",
+            ));
         }
         Ok(Self::Bare(input.parse()?))
     }
@@ -391,6 +455,7 @@ impl syn::parse::Parse for Args {
         for item in raw {
             match item {
                 Item::Namespace(lit) => named.push(Arg::Namespace(lit.value())),
+                Item::Canon(id) => named.push(Arg::Canon(id.to_string())),
                 Item::Bare(t) => items.push(t),
             }
         }
@@ -696,3 +761,76 @@ fn param_name(pt: &PatType) -> Result<String, Error> {
 
 
 
+
+/// `ty`, with the `fn`'s type parameters replaced by their instantiations.
+///
+/// `In<Tensor<T>>` under `#[routine(bf16)]` is `In<Tensor<bf16>>` — the type
+/// `Signature::Sig` states, because the marker is per-instantiation and
+/// carries no generics of its own. Positional: the `fn`'s type params map to
+/// the attribute's bare types in order, which is the same rule `Spec::body`
+/// applies when it writes `#base::<#(#g),*>`.
+fn substituted(ty: &Type, generics: &syn::Generics, subs: &[syn::Type]) -> Type {
+    let names: Vec<String> = generics
+        .type_params()
+        .map(|p| p.ident.to_string())
+        .collect();
+    if names.is_empty() || subs.is_empty() {
+        return ty.clone();
+    }
+    fn walk(ty: &Type, names: &[String], subs: &[syn::Type]) -> Type {
+        match ty {
+            Type::Path(p) => {
+                // A bare `T` IS the parameter: replace the whole type.
+                if p.qself.is_none()
+                    && p.path.segments.len() == 1
+                    && p.path.segments[0].arguments.is_none()
+                    && let Some(i) =
+                        names.iter().position(|n| p.path.segments[0].ident == n)
+                    && let Some(sub) = subs.get(i)
+                {
+                    return sub.clone();
+                }
+                let mut p = p.clone();
+                for seg in &mut p.path.segments {
+                    if let syn::PathArguments::AngleBracketed(args) = &mut seg.arguments {
+                        for a in &mut args.args {
+                            if let syn::GenericArgument::Type(t) = a {
+                                *t = walk(t, names, subs);
+                            }
+                        }
+                    }
+                }
+                Type::Path(p)
+            }
+            Type::Reference(r) => {
+                let mut r = r.clone();
+                r.elem = Box::new(walk(&r.elem, names, subs));
+                Type::Reference(r)
+            }
+            Type::Ptr(r) => {
+                let mut r = r.clone();
+                r.elem = Box::new(walk(&r.elem, names, subs));
+                Type::Ptr(r)
+            }
+            Type::Tuple(t) => {
+                let mut t = t.clone();
+                for e in &mut t.elems {
+                    *e = walk(e, names, subs);
+                }
+                Type::Tuple(t)
+            }
+            Type::Array(a) => {
+                let mut a = a.clone();
+                a.elem = Box::new(walk(&a.elem, names, subs));
+                Type::Array(a)
+            }
+            Type::Slice(sl) => {
+                let mut sl = sl.clone();
+                sl.elem = Box::new(walk(&sl.elem, names, subs));
+                Type::Slice(sl)
+            }
+            other => other.clone(),
+        }
+    }
+    walk(ty, &names, subs)
+}

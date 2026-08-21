@@ -14588,7 +14588,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.0.idx_k_norm",
+            "layer.0.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -14957,7 +14961,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.1.idx_k_norm",
+            "layer.1.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -15326,7 +15334,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.2.idx_k_norm",
+            "layer.2.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -15695,7 +15707,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.3.idx_k_norm",
+            "layer.3.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -16188,7 +16204,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.4.idx_k_norm",
+            "layer.4.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -16681,7 +16701,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.5.idx_k_norm",
+            "layer.5.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -17174,7 +17198,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.6.idx_k_norm",
+            "layer.6.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -17667,7 +17695,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.7.idx_k_norm",
+            "layer.7.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -18160,7 +18192,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.8.idx_k_norm",
+            "layer.8.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -18653,7 +18689,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.9.idx_k_norm",
+            "layer.9.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -19146,7 +19186,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.10.idx_k_norm",
+            "layer.10.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -19639,7 +19683,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.11.idx_k_norm",
+            "layer.11.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -20132,7 +20180,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.12.idx_k_norm",
+            "layer.12.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -20625,7 +20677,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.13.idx_k_norm",
+            "layer.13.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -21118,7 +21174,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.14.idx_k_norm",
+            "layer.14.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -21611,7 +21671,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.15.idx_k_norm",
+            "layer.15.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -22104,7 +22168,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.16.idx_k_norm",
+            "layer.16.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -22597,7 +22665,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.17.idx_k_norm",
+            "layer.17.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -23090,7 +23162,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.18.idx_k_norm",
+            "layer.18.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -23583,7 +23659,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.19.idx_k_norm",
+            "layer.19.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -24076,7 +24156,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.20.idx_k_norm",
+            "layer.20.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -24569,7 +24653,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.21.idx_k_norm",
+            "layer.21.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -25062,7 +25150,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.22.idx_k_norm",
+            "layer.22.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -25555,7 +25647,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.23.idx_k_norm",
+            "layer.23.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -26048,7 +26144,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.24.idx_k_norm",
+            "layer.24.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -26541,7 +26641,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.25.idx_k_norm",
+            "layer.25.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -27034,7 +27138,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.26.idx_k_norm",
+            "layer.26.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -27527,7 +27635,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.27.idx_k_norm",
+            "layer.27.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -28020,7 +28132,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.28.idx_k_norm",
+            "layer.28.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -28513,7 +28629,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.29.idx_k_norm",
+            "layer.29.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -29006,7 +29126,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.30.idx_k_norm",
+            "layer.30.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -29499,7 +29623,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.31.idx_k_norm",
+            "layer.31.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -29992,7 +30120,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.32.idx_k_norm",
+            "layer.32.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -30485,7 +30617,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.33.idx_k_norm",
+            "layer.33.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -30978,7 +31114,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.34.idx_k_norm",
+            "layer.34.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -31471,7 +31611,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.35.idx_k_norm",
+            "layer.35.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -31964,7 +32108,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.36.idx_k_norm",
+            "layer.36.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -32457,7 +32605,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.37.idx_k_norm",
+            "layer.37.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -32950,7 +33102,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.38.idx_k_norm",
+            "layer.38.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -33443,7 +33599,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.39.idx_k_norm",
+            "layer.39.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -33936,7 +34096,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.40.idx_k_norm",
+            "layer.40.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -34429,7 +34593,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.41.idx_k_norm",
+            "layer.41.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -34922,7 +35090,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.42.idx_k_norm",
+            "layer.42.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -35415,7 +35587,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.43.idx_k_norm",
+            "layer.43.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -35908,7 +36084,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.44.idx_k_norm",
+            "layer.44.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [
@@ -36401,7 +36581,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "attn::dsa_index_knorm_rope_bf16"
+          "kernel": "attn::dsa_index_knorm_rope_bf16",
+          "weights": [
+            "layer.45.idx_k_norm",
+            "layer.45.idx_k_norm_bias"
+          ]
         }
       },
       "inputs": [

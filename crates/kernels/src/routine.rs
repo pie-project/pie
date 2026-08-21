@@ -458,21 +458,6 @@ pub trait Asks<B: Backend>: Answers<B> {
         C::unpack(&v, 0)
     }
 
-    /// The statement's whole scalar run, as the one buffer a kernel that reads
-    /// a struct takes.
-    ///
-    /// What `Env<Buf, keys::Params>` spelled at 97 signatures. It is not a
-    /// fact and never was: the block is the statement's own params run, staged
-    /// by the driver because six of this tree's shader modules read their
-    /// parameters out of a storage block rather than a push range.
-    ///
-    /// # Errors
-    ///
-    /// [`Refusal::Unstated`] on a plane that stages no such block — which is
-    /// CUDA, where scalars are passed one at a time.
-    fn params(&self) -> Result<B::Value, Refusal> {
-        self.resolve(Ty::Buf, crate::Source::Slot(crate::Kind::Params, 0))
-    }
 
     /// The statement's `n`-th scalar, read as an `i32`.
     ///
@@ -592,6 +577,27 @@ pub struct Fire {
     pub smem: u32,
     /// The launch needs every block resident at once. CUDA's only.
     pub cooperative: bool,
+    /// The text that makes [`Self::entrypoint`] EXIST in [`Self::file`].
+    ///
+    /// Empty means the file already declares it, which is every point on
+    /// every plane but the ones a host stamps. On CUDA it is empty by nature
+    /// rather than by default: NVRTC lowers a template-id on ask, so there
+    /// `entrypoint` IS the instantiation and there is nothing left to state.
+    /// The compiled-artifact planes have no source to append to at all.
+    ///
+    /// # Why the HOST says it
+    ///
+    /// Because the host is the only party that knows which points a load
+    /// reaches. A `.metal` that enumerates its own instantiations is stating
+    /// a lattice the host also states, and the two copies then need a third
+    /// thing to compare them -- which is what `kernels-metal/build.rs` was,
+    /// and what the entrypoint census fixtures were. A stamp composed BY the
+    /// same function that composes the name cannot disagree with it.
+    ///
+    /// It is one line of the file's own language -- a `PIE_STAMP_*(..)` call,
+    /// whose `#define` holds the device signature so the ABI stays written
+    /// once, in the file that owns it.
+    pub stamp: &'static str,
 }
 
 impl Fire {
@@ -606,7 +612,15 @@ impl Fire {
             group: [0, 0, 0],
             smem: 0,
             cooperative: false,
+            stamp: "",
         }
+    }
+
+    /// This fire, carrying the line that makes its point exist.
+    #[must_use]
+    pub const fn stamp(mut self, stamp: &'static str) -> Self {
+        self.stamp = stamp;
+        self
     }
 
     /// This fire, in the translation unit called `unit` rather than the one
@@ -2676,6 +2690,13 @@ pub struct Routine<B: Backend> {
     /// resolver reading only the column would bind the operands correctly and
     /// run a different implementation.
     pub driver: bool,
+    /// The tier-1 role this routine CLAIMS, out of [`crate::canon::ROLES`].
+    ///
+    /// `Some("rmsnorm")` is what lets `dsl::rmsnorm(..)` resolve to this
+    /// symbol without a per-backend table in the DSL: tier membership is the
+    /// routine's own declaration, stated as `#[routine(canon = rmsnorm)]`.
+    /// `None` is tier-2 — the symbol is reached only by name.
+    pub canon: Option<&'static str>,
 }
 
 /// The first path segment after the crate root, out of a `module_path!()`.
@@ -2837,6 +2858,16 @@ impl<B: Backend> Routine<B> {
         self
     }
 
+    /// This routine claims a tier-1 role. See [`Routine::canon`]; the name
+    /// must be in [`crate::canon::ROLES`], and the assertion makes a typo a
+    /// build failure at the row rather than an unreachable routine.
+    #[must_use]
+    pub const fn canon(mut self, role: &'static str) -> Self {
+        assert!(crate::canon::is_role(role), "not a role `canon.rs` closes over");
+        self.canon = Some(role);
+        self
+    }
+
     /// This routine, with its source column STATED rather than derived.
     ///
     /// # For rows that have no signature to derive one from
@@ -2905,6 +2936,8 @@ pub struct Declared {
     /// the marks, on a wrapper; the carrier says it now, and this is how it
     /// reaches a reader outside the crate.
     pub derived: &'static [crate::Derived],
+    /// The tier-1 role this routine claims. See [`Routine::canon`].
+    pub canon: Option<&'static str>,
 }
 
 impl Declared {
@@ -2929,6 +2962,7 @@ impl<B: Backend> Routine<B> {
             whole: self.whole,
             depth_prefix_plan: self.depth_prefix_plan,
             derived: self.derived,
+            canon: self.canon,
         }
     }
 }
@@ -3014,6 +3048,7 @@ macro_rules! untraced {
             asked: &[],
             no_join: false,
             driver: false,
+            canon: None,
         }
         $(.$fact($($value)?))*
     }};
@@ -3049,6 +3084,7 @@ macro_rules! untraced {
             asked: &[],
             no_join: false,
             driver: false,
+            canon: None,
         }
         $(.$fact($($value)?))*
     }};
@@ -3102,6 +3138,7 @@ macro_rules! routine {
             asked: &[],
             no_join: false,
             driver: false,
+            canon: None,
         }
         $(.$fact($($value)?))*
     }};
@@ -3129,6 +3166,7 @@ macro_rules! routine {
             asked: &[],
             no_join: false,
             driver: false,
+            canon: None,
         }
         $(.$fact($($value)?))*
     }};
@@ -3157,6 +3195,7 @@ macro_rules! routine {
             asked: &[],
             no_join: false,
             driver: false,
+            canon: None,
         }
         $(.$fact($($value)?))*
     }};

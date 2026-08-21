@@ -71,6 +71,16 @@ pub trait Raise: 'static {
     /// object is read through a borrow rather than moved. A bound that forced
     /// either would exclude the first two types this trait exists for.
     type Value: 'static;
+
+    /// The object lives across fires, driver-allocated, rather than being
+    /// raised per fire by a stated prep.
+    ///
+    /// `false` is the raise (this trait's original subject). `true` is a
+    /// RESIDENT object — the KV cache, the recurrent slabs — declared with
+    /// [`crate::resident!`], whose name must appear in
+    /// [`crate::runtime::TIER1`] when every backend answers it, or beside the
+    /// plane's kernels when only one does.
+    const RESIDENT: bool = false;
 }
 
 /// THE CARRIER: one raised object, by reference.
@@ -155,6 +165,33 @@ macro_rules! raise {
         impl $crate::raises::Raise for $name {
             const KEY: &'static str = $key;
             type Value = $value;
+        }
+    };
+}
+
+/// Declare a RESIDENT runtime object — [`raise!`]'s twin for objects that
+/// live across fires, driver-allocated.
+///
+/// ```ignore
+/// resident!(KvCache = "kv_cache" => crate::PagedKvView);
+/// ```
+///
+/// Identity in `kernels` ([`crate::runtime::TIER1`] holds the names every
+/// backend must answer), carrier in the plane (the `$value` is the plane's
+/// own view struct), answer in the driver — the split
+/// [`crate::raises`]' preamble documents, extended from per-fire to
+/// resident. `In<Struct<KvCache>>` then binds like any raise operand.
+#[macro_export]
+macro_rules! resident {
+    ($(#[$m:meta])* $name:ident = $key:literal => $value:ty) => {
+        $(#[$m])*
+        #[derive(Clone, Copy, Debug)]
+        pub struct $name;
+
+        impl $crate::raises::Raise for $name {
+            const KEY: &'static str = $key;
+            type Value = $value;
+            const RESIDENT: bool = true;
         }
     };
 }

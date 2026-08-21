@@ -537,10 +537,11 @@ pub fn metal_facts(
         moe_repr: bind.moe_mxfp4.then_some(WeightRepr::Mxfp4Marlin),
         moe_bits: 4,
         qmm_tile: crate::shared::llama_like::project::QMM_TILE,
-        qmm_fp16_precast: crate::shared::llama_like::project::qmm_fp16_precast(
-            bind.quant_group,
-            bind.quant_bits,
-        ),
+        qmm_fp16_precast: bind.qmm_fp16_precast
+            && crate::shared::llama_like::project::qmm_fp16_precast(
+                bind.quant_group,
+                bind.quant_bits,
+            ),
         routed_qmm_fp16: crate::shared::llama_like::project::qmm_fp16_precast(
             bind.quant_group,
             bind.quant_bits,
@@ -1327,6 +1328,7 @@ mod tests {
         };
         let bind = MetalBinding {
             qmm_partial_rows: false,
+            qmm_fp16_precast: true,
             qmm_tile: None,
             quant_group: 64,
             quant_bits: 4,
@@ -1378,6 +1380,7 @@ mod tests {
         use crate::catalog::MetalBinding;
         let bind = MetalBinding {
             qmm_partial_rows: false,
+            qmm_fp16_precast: true,
             qmm_tile: None,
             quant_group: 64,
             quant_bits: 4,
@@ -1456,6 +1459,7 @@ mod tests {
         // compare the fixture against a gemma nobody ships.
         let bind = crate::catalog::MetalBinding {
             qmm_partial_rows: false,
+            qmm_fp16_precast: true,
             qmm_tile: None,
             quant_group: 64,
             quant_bits: 4,
@@ -1558,6 +1562,7 @@ mod tests {
             },
             &MetalBinding {
                 qmm_partial_rows: false,
+                qmm_fp16_precast: true,
                 qmm_tile: None,
                 quant_group: 64,
                 quant_bits: 4,

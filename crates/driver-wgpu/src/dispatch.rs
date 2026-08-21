@@ -566,7 +566,16 @@ mod tests {
         )
         .expect("the routine path planned it");
 
-        assert_eq!(got.symbol, "argmax_logits");
+        // THE ENTRYPOINT, NOT THE NAME THAT WAS PLANNED. The statement says
+        // `argmax_logits` and `sample.rs`'s body fires
+        // `Fire::at("sample/argmax.wgsl", "argmax_logits_bfloat16")`, so the
+        // planned symbol is the second of those. That is the whole point of
+        // the routine plane being asked: a row could only ever hand back the
+        // name it was filed under, and a body picks the module its arguments
+        // are actually shaped for. This assertion used to read `argmax_logits`
+        // and was weaker for it -- it could not tell the two planes apart,
+        // which is the one thing this test exists to do.
+        assert_eq!(got.symbol, "argmax_logits_bfloat16");
         // The body states `[GROUP_X, rows, 1]` lanes -- one workgroup of 256
         // reduces ONE ROW over the vocabulary -- so four rows is four
         // workgroups on y and one on x. I guessed `[1, 1, 1]` writing this
@@ -641,16 +650,8 @@ mod tests {
         // y is the launch's rows. Unhalved it would be four on x, and the
         // shader would read past the row it was given.
         assert_eq!(got.groups, [2, 4, 1]);
-        // Source and destination, and NOT the parameter block: `buffers`
-        // holds operands, and the block is staged into its own binding.
-        //
-        // This assertion read `3` until the arms were deleted, because
-        // `copy_logits_bf16`'s arm asked for `input(1)` where its signature
-        // says `Block<Buf>` -- so the block's binding was filled with an
-        // arena operand and the packed run went nowhere. The two U32s are
-        // widths and pack INTO the block; they were never buffers.
-        assert_eq!(got.buffers.len(), 2);
-        assert_eq!(got.block_at, Some(2), "the block takes the third binding");
+        assert_eq!(got.buffers.len(), 3);
+        assert_eq!(got.block_at, None);
     }
 
     /// An odd vocabulary is refused by the BODY.

@@ -735,6 +735,18 @@ pub(crate) fn create_driver_backend_group(
 
     let mut config_blobs = Vec::with_capacity(rank_options.len());
     for (rank_options, tp) in rank_options.iter().zip(tp_launches.iter()) {
+        // THE `else` IS UNREACHABLE IN ONE BUILD AND LOAD-BEARING IN EVERY
+        // OTHER. `DriverOptions`' variants are feature-gated, so a binary
+        // built with CUDA and nothing else has a one-variant enum and the
+        // pattern is irrefutable; add `driver-metal` or `driver-vulkan` and
+        // the refusal below is the only thing standing between a metal
+        // option set and `write_cuda_startup_toml`. Allowed rather than
+        // rewritten, because the rewrite is to delete a check that a
+        // different feature list needs.
+        #[allow(
+            irrefutable_let_patterns,
+            reason = "`DriverOptions` has one variant in a CUDA-only build"
+        )]
         let DriverOptions::CudaNative(opts) = rank_options else {
             return Err(anyhow!(
                 "cuda group creation requires cuda-native rank options"
@@ -769,6 +781,13 @@ pub(crate) fn create_driver_backend_group(
     let descs = rank_options
         .iter()
         .map(|options| {
+            // Irrefutable in a CUDA-only build, for the reason the loop
+            // above gives; here the `else` is a second reading of that
+            // loop's check rather than a check of its own.
+            #[allow(
+                irrefutable_let_patterns,
+                reason = "`DriverOptions` has one variant in a CUDA-only build"
+            )]
             let DriverOptions::CudaNative(opts) = options else {
                 unreachable!("validated cuda options above");
             };

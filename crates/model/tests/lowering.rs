@@ -1711,11 +1711,17 @@ const SEMANTIC_CENSUS: &[&str] = &[
 #[test]
 fn the_census_reads_the_function_it_claims_to() {
     let found = semantic_symbols();
-    assert!(
-        found.len() >= 12,
-        "the scan of `semantic()` found {} symbols, which is fewer than the \
-         arms that function visibly has -- the parse has probably lost its \
-         anchor. Found: {found:?}",
+    // The doc above argues for a floor here, and the argument holds -- an
+    // exact symbol proves the shape, this proves the walk did not stop. It
+    // just did not have to be a LOOSE one: the scan reads 19 and the floor
+    // said 12, so seven arms could stop being seen while the number that
+    // exists to prove the walk kept walking said nothing. An arm arriving in
+    // `semantic()` is somebody's decision and can be somebody's edit here.
+    assert_eq!(
+        found.len(),
+        19,
+        "the scan of `semantic()` found {} symbols, not 19 -- either an arm \
+         arrived or the parse has lost its anchor. Found: {found:?}",
         found.len()
     );
     assert!(

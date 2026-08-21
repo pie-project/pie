@@ -1063,15 +1063,13 @@ fn mla_absorb(
         kernels::routine::In<kernels_cuda::routine::Tensor<c_void>>,
         kernels::routine::Const<kernels_cuda::routine::Tensor<c_void>>,
         kernels::routine::Out<kernels_cuda::routine::Tensor<c_void>>,
-        // THE FOUR EXTENTS, AND NO ROW COUNT. `rows` was `Env<keys::Rows>` and
-        // the arm built one by hand; the routine asks its context for the
-        // fire's token count now. The four that remain are the absorb's own
-        // head geometry, which no operand's rectangle spells -- each absorb
-        // takes the WHOLE `kv_b_proj` bank and slices it itself.
-        i32,
-        i32,
-        i32,
-        i32,
+        // THE FOUR EXTENTS THE STATEMENT CARRIES, as `Const` marks now: the
+        // routine reads `.v` off each and asks its context only for the row
+        // count.
+        kernels::routine::Const<i32>,
+        kernels::routine::Const<i32>,
+        kernels::routine::Const<i32>,
+        kernels::routine::Const<i32>,
     ) -> Result<(), kernels_cuda::Refusal>,
 ) -> Result<(), DispatchRefusal> {
     if spec.n_in < 1 || spec.n_out < 1 || b.args.len() < spec.n_in + spec.n_out + 1 {
@@ -1102,7 +1100,9 @@ fn mla_absorb(
                 .to_string(),
         });
     }
-    let p = |i: usize| i32::try_from(spec.params[i]).unwrap_or(i32::MAX);
+    let p = |i: usize| kernels::routine::Const {
+        v: i32::try_from(spec.params[i]).unwrap_or(i32::MAX),
+    };
     // SAFETY: `ctx.stream` is this fire's and outlives the launch, and
     // `ctx.cublas` is the engine's handle with that same stream bound.
     let cx = unsafe {
@@ -1466,13 +1466,13 @@ pub fn dispatch<R: Resolver>(
                     &jit,
                     (*state).staged(),
                     i32::from(bound.layers.start),
-                    x.ptr.cast_const(),
+                    kernels::routine::In { ptr: x.ptr.cast_const(), rows: 0, width: 0 },
                     i32::try_from(x.width).expect("hidden"),
                     i32::try_from(q.width).expect("q width"),
                     i32::try_from(v.width).expect("v width"),
-                    q.ptr,
-                    v.ptr,
-                    scratch,
+                    kernels::routine::Out { ptr: q.ptr, rows: 0, width: 0 },
+                    kernels::routine::Out { ptr: v.ptr, rows: 0, width: 0 },
+                    kernels::routine::Out { ptr: scratch, rows: 0, width: 0 },
                 )
             };
             if let Err(why) = fired {

@@ -47,7 +47,6 @@
 
 #include "common/bf16.slang"
 #include "common/reduce.slang"
-#include "norm/rms_params.slang"
 
 #ifndef N_READS
 #define N_READS 4
@@ -57,15 +56,22 @@
 
 PIE_BUFFER_RW(0, x);
 PIE_BUFFER_RO(1, w);
-PIE_PARAMS(2, RmsRopeParams, p);
-[[vk::binding(3)]] StructuredBuffer<int> position;
+struct Push {
+    float eps;
+    uint axis_size;
+    uint w_stride;
+    uint plus_one;
+    float gain;
+    uint row_pitch;
+    uint rotary;
+    float scale;
+    float base_or_mscale;
+};
+[[vk::push_constant]] ConstantBuffer<Push> pc;
+[[vk::binding(2)]] StructuredBuffer<int> position;
 #if defined(PIE_FREQS)
-[[vk::binding(4)]] StructuredBuffer<float> inv_freq;
+[[vk::binding(3)]] StructuredBuffer<float> inv_freq;
 #endif
-
-// No push block. Everything this kernel takes rides `RmsRopeParams`, for the
-// reason that header states: a launch's scalars go in a push range or in a
-// parameter buffer and not both, and this kernel needs a struct either way.
 
 /// The gain at element `i`, in float, and the same convention `rms.slang`
 /// states: gemma stores every RMSNorm weight as `w` and applies it as
@@ -73,8 +79,8 @@ PIE_PARAMS(2, RmsRopeParams, p);
 /// `add(weight, 1.0f)` in float and a parity walk has to make the same
 /// choice.
 float gain_at(uint i) {
-    float wv = PIE_LOAD(w[p.w_stride * i]);
-    return p.gain * (p.plus_one != 0u ? (1.0 + wv) : wv);
+    float wv = PIE_LOAD(w[pc.w_stride * i]);
+    return pc.gain * (pc.plus_one != 0u ? (1.0 + wv) : wv);
 }
 
 /// The angle for rotary pair `i`, in whichever of the three schedules this
@@ -88,13 +94,13 @@ float theta_at(uint i, uint half_rot, int at) {
     // when the rotation covers the whole head, which is exactly the case a
     // partial rotary breaks, so the two spellings are kept apart here as they
     // are in `neox.slang`.
-    float d = 2.0 * float(i) / float(p.axis_size);
-    return p.scale * float(at) * exp2(-d * p.base_or_mscale);
+    float d = 2.0 * float(i) / float(pc.axis_size);
+    return pc.scale * float(at) * exp2(-d * pc.base_or_mscale);
 #elif defined(PIE_FREQS)
-    return p.scale * float(at) * inv_freq[i];
+    return pc.scale * float(at) * inv_freq[i];
 #else
     float d = float(i) / float(half_rot);
-    return p.scale * float(at) * exp2(-d * p.base_or_mscale);
+    return pc.scale * float(at) * exp2(-d * pc.base_or_mscale);
 #endif
 }
 
@@ -113,8 +119,8 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     // holds `n_head` per-head rows packed `axis_size` apart, and the next
     // token is a uniform `row_pitch` away. One grid axis cannot carry both
     // terms, which is why there are two.
-    uint base = row * p.row_pitch + head * p.axis_size;
-    uint axis_size = p.axis_size;
+    uint base = row * pc.row_pitch + head * pc.axis_size;
+    uint axis_size = pc.axis_size;
     uint span = uint(PIE_GROUP_X) * uint(N_READS);
     uint lid = local.x;
 
@@ -133,9 +139,9 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             }
         }
     }
-    float inv = pie_inv_rms(acc, axis_size, p.eps);
+    float inv = pie_inv_rms(acc, axis_size, pc.eps);
 
-    uint rot = p.rotary;
+    uint rot = pc.rotary;
     uint half_rot = rot / 2u;
 
     // The rotation, one thread per PAIR. A pair's two channels are `half_rot`
@@ -151,7 +157,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         float c = cos(th);
         float s = sin(th);
 #if defined(PIE_FREQS)
-        float out_scale = p.base_or_mscale;
+        float out_scale = pc.base_or_mscale;
 #else
         float out_scale = 1.0;
 #endif

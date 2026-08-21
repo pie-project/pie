@@ -144,9 +144,6 @@ impl Holds for Held<'_, '_> {
         at(self.o.weight(n)?)
     }
 
-    fn params_block(&mut self) -> u32 {
-        at(self.o.params_block()).unwrap_or_default()
-    }
 
     fn param(&self, n: usize) -> Result<i32, Refusal> {
         self.o.param(n)
@@ -525,7 +522,32 @@ mod tests {
         // this test BELOW is still what says so -- it binds every routine
         // `kernels_wgpu::routines()` carries, so a fact that stopped being
         // answered refuses there by name instead of quietly landing here.
-        const UNHEARD: usize = 98;
+        // 98 -> 96, AND NEITHER OF THE TWO IS A PORT. `GdnConvK`
+        // ("gdn.conv_k") and `GdnNumGroups` ("gdn.n_groups") left
+        // `kernels::keys` outright, so they are two fewer facts in the mint
+        // rather than two more this binder answers -- the population shrank
+        // under the numerator.
+        //
+        // The mint gained one in the same window, `AttnScratch`
+        // ("attn_scratch"), the workspace a SPLIT decode leaves its partial
+        // softmax states in. It does not land here because `named` answers it:
+        // splitting a key range is a decision this backend makes about its own
+        // occupancy, so the fact is the fire's and the binder is exactly who
+        // should be supplying it. Had it been minted and left unanswered this
+        // would read 97 and the split decode would refuse `Unstated`.
+        // 96 -> 155, AND THE FIFTY-NINE ARE THE SAME FIFTY-NINE. The CUDA
+        // mark migration minted §M of `kernels::keys` in one commit, and
+        // every name that arrived there arrives here: `moe.up_weight_ptrs`,
+        // `moe.expert_up`, `moe.aligned_up` and their neighbours are the
+        // per-expert pointer tables and staging rectangles a CUDA MoE leg
+        // hands its kernels. Checked by name rather than by subtraction --
+        // the added set and the newly unheard set are the same set, so the
+        // rise is entirely population and this binder forgot nothing.
+        //
+        // They will stay unheard. A pointer table is a thing a driver that
+        // dispatches by raw pointer needs a name for; wgpu binds buffers by
+        // group and index, and there is no wgpu routine that could ask.
+        const UNHEARD: usize = 154;
         println!("facts minted but not heard by this binder: {}", unheard.len());
         for one in &unheard {
             println!("  {one}");

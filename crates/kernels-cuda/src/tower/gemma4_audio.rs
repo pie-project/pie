@@ -1,15 +1,3 @@
-//! The gemma-4 AUDIO tower's host walk — the USM/Conformer encoder.
-//!
-//! Log-mel features in, soft-token embedding rows out: an SSCP conv stack
-//! subsamples (time, freq), twelve conformer blocks run (macaron half-FFN,
-//! chunked-local attention, depthwise causal conv, half-FFN, RMSNorm),
-//! `output_proj` widens 1024 -> 1536, and a shared embedder projects to the
-//! text width.
-//!
-//! The depthwise causal conv reuses the SSM kernel
-//! `ssm::causal_conv1d_prefill_noact_bf16`. Unlike `super::gemma4_vision`, this
-//! tower's RMSNorm is the plain `vision::k_rms_bf16` at `<<<N, 256>>>`, with no
-//! 512->256 fold.
 
 use std::ffi::c_void;
 
@@ -18,30 +6,20 @@ use crate::{ssm, vision};
 
 use super::{Refused, Result, Scratch, Stream, call, read_raw_span};
 
-/// The subject of every refusal in this file, stated once.
 const WHO: &str = "gemma4_audio";
 
-/// A clipped linear's five slots: `[w, imin, imax, omin, omax]`.
-///
-/// The clamp bounds are nullable device pointers to single bf16 elements; a
-/// null bound is an open side. They are never read on the host, which would
-/// synchronise per linear per layer.
 #[derive(Clone, Copy, Debug)]
 pub struct Clip {
-    /// The weight matrix, `[out, in]` bf16.
+
     pub w: *const c_void,
-    /// Input clamp floor, or null.
     pub imin: *const c_void,
-    /// Input clamp ceiling, or null.
     pub imax: *const c_void,
-    /// Output clamp floor, or null.
     pub omin: *const c_void,
-    /// Output clamp ceiling, or null.
     pub omax: *const c_void,
 }
 
 impl Clip {
-    /// Five consecutive slots.
+
     fn of(t: &[*const c_void]) -> Self {
         Self {
             w: t[0],
@@ -53,21 +31,17 @@ impl Clip {
     }
 }
 
-/// One macaron feed-forward half: twelve consecutive slots.
 #[derive(Clone, Copy, Debug)]
 pub struct Ffn {
-    /// Pre-norm scale.
+
     pub pre_ln: *const c_void,
-    /// Post-norm scale.
     pub post_ln: *const c_void,
-    /// Up projection, `[4*hidden, hidden]`.
     pub fc1: Clip,
-    /// Down projection, `[hidden, 4*hidden]`.
     pub fc2: Clip,
 }
 
 impl Ffn {
-    /// Twelve consecutive slots.
+
     fn of(t: &[*const c_void]) -> Self {
         Self {
             pre_ln: t[0],
@@ -78,100 +52,57 @@ impl Ffn {
     }
 }
 
-/// One conformer block's tensors, in the stride-62 table's order.
 #[derive(Clone, Copy, Debug)]
 pub struct Layer {
-    /// The first macaron half-FFN.
+
     pub ff1: Ffn,
-    /// The second macaron half-FFN.
     pub ff2: Ffn,
-    /// Pre-attention norm scale.
     pub norm_pre_attn: *const c_void,
-    /// Post-attention norm scale.
     pub norm_post_attn: *const c_void,
-    /// Query projection.
     pub q: Clip,
-    /// Key projection.
     pub k: Clip,
-    /// Value projection.
     pub v: Clip,
-    /// Attention output projection.
     pub post: Clip,
-    /// `relative_k_proj.weight`, `[H*hd, hidden]` — NOT a clipped linear.
     pub relative_k: *const c_void,
-    /// `[head_dim]`, softplus-gated.
     pub per_dim_scale: *const c_void,
-    /// The conv module's pre-norm scale.
     pub lconv_pre_ln: *const c_void,
-    /// The conv module's post-conv norm scale.
     pub lconv_conv_norm: *const c_void,
-    /// `linear_start`, `[2*hidden, hidden]`, feeding the GLU.
     pub lconv_start: Clip,
-    /// `linear_end`, `[hidden, hidden]`.
     pub lconv_end: Clip,
-    /// `[hidden, 1, conv_kernel]`, causal, left-padded by `k-1`.
     pub depthwise_conv: *const c_void,
-    /// The block's final norm scale.
     pub norm_out: *const c_void,
 }
 
-/// The tower's weights and its scalars — `AudioRawWeights`.
 #[derive(Clone, Debug)]
 pub struct Weights {
-    /// SSCP layer 0 conv weight, `[c0, 1, 3, 3]`.
+
     pub sscp0_conv: *const c_void,
-    /// SSCP layer 0 LayerNorm scale, `[c0]`.
     pub sscp0_norm: *const c_void,
-    /// SSCP layer 1 conv weight, `[c1, c0, 3, 3]`.
     pub sscp1_conv: *const c_void,
-    /// SSCP layer 1 LayerNorm scale, `[c1]`.
     pub sscp1_norm: *const c_void,
-    /// `input_proj_linear.weight`, `[hidden, (c0/4)*c1]`.
     pub sscp_input_proj: *const c_void,
-    /// One entry per conformer block.
     pub layers: Vec<Layer>,
-    /// `output_proj` weight, `[out_proj_dims, hidden]`.
     pub output_proj_w: *const c_void,
-    /// `output_proj` bias, `[out_proj_dims]`.
     pub output_proj_b: *const c_void,
-    /// `embedding_projection.weight`, `[text_hidden, out_proj_dims]`.
     pub embed_proj: *const c_void,
-    /// Tower width. The walk refuses anything but 1024.
     pub hidden: i32,
-    /// Attention heads. The walk refuses anything but 8.
     pub heads: i32,
-    /// The depthwise causal conv's kernel.
     pub conv_kernel: i32,
-    /// Mel bins per frame — the SSCP's input frequency extent.
     pub n_mel: i32,
-    /// SSCP layer 0's output channels.
     pub sscp_ch0: i32,
-    /// SSCP layer 1's output channels.
     pub sscp_ch1: i32,
-    /// The encoder's output width.
     pub out_proj_dims: i32,
-    /// The text model's width — the projected row's.
     pub text_hidden: i32,
-    /// Attention chunk size. Carried, not read: see [`Walk::new`].
     pub chunk_size: i32,
-    /// Attention left context; `max_past = context_left - 1`.
     pub context_left: i32,
-    /// Attention right context. Carried, not read.
     pub context_right: i32,
-    /// The attention logit cap fed to `tanh`.
     pub logit_cap: f32,
-    /// The macaron residual weight.
     pub residual_weight: f32,
-    /// RMSNorm epsilon.
     pub eps: f32,
 }
 
 impl Weights {
-    /// Rebuild the tower's weights from the flat pointer table.
-    ///
-    /// Slot order is `model::shared::tower_names::audio_layers`'s. A table
-    /// shorter than `depth * slots_per_layer` is refused: a slot past the
-    /// end is another layer's pointer.
+
     #[allow(clippy::too_many_arguments)]
     pub fn from_flat(
         head: [*const c_void; 8],
@@ -266,7 +197,6 @@ impl Weights {
         })
     }
 
-    /// Set the attention context horizons — `context_left`, `context_right`.
     #[must_use]
     pub fn with_context(mut self, left: i32, right: i32) -> Self {
         self.context_left = left;
@@ -275,38 +205,23 @@ impl Weights {
     }
 }
 
-/// Every shape the walk derives, computed and refused once.
 struct Walk {
-    /// Tower width, `w.hidden`.
+
     hd: i32,
-    /// Attention heads, `w.heads`.
     nh: i32,
-    /// `hidden / heads`.
     head_dim: i32,
-    /// `4 * hidden`, the FFN's inner width.
     im: i32,
-    /// Rows after subsampling — `T2`, and the caller's `out_len`.
     n: i32,
-    /// SSCP intermediate time extent.
     t1: i32,
-    /// SSCP intermediate frequency extent.
     f1: i32,
-    /// SSCP output frequency extent.
     f2: i32,
-    /// `(head_dim^-0.5) / ln 2`.
     q_scale: f32,
-    /// `ln(1 + e) / ln 2`.
     k_scale: f32,
-    /// `max_past + 1` — the relative-position table's row count.
     pp: i32,
 }
 
 impl Walk {
-    /// Derive the walk's shapes, with two refusals.
-    ///
-    /// `chunk_size` and `context_right` are not read: at chunk 12 / past 12 /
-    /// future 0 the mask is a plain causal sliding window. They stay on
-    /// [`Weights`] so a changed checkpoint stays visible.
+
     fn new(w: &Weights, n_frames: i32, n_mel: i32, out_len: i32) -> Result<Self> {
         let (hd, nh) = (w.hidden, w.heads);
         if hd != 1024 || nh != 8 {
@@ -316,7 +231,7 @@ impl Walk {
             ));
         }
         let head_dim = hd / nh;
-        // `Conv2d(k3, s2, p1)`'s output extent, applied twice along each axis.
+
         let cdim = |n: i32| (n - 1) / 2 + 1;
         if n_frames <= 0 || n_mel <= 0 {
             return Err(Refused::new(
@@ -346,13 +261,11 @@ impl Walk {
             f2,
             q_scale,
             k_scale,
-            // `past = context_left - 1`; `P = past + 1`.
             pp: w.context_left,
         })
     }
 }
 
-/// A row-major element count as the `usize` an `Elementwise` row wants.
 fn elems(what: &str, rows: i32, width: i32) -> Result<usize> {
     let r = usize::try_from(rows).map_err(|_| Refused::new(WHO, format!("{what}: rows")))?;
     let c = usize::try_from(width).map_err(|_| Refused::new(WHO, format!("{what}: width")))?;
@@ -360,7 +273,6 @@ fn elems(what: &str, rows: i32, width: i32) -> Result<usize> {
         .ok_or_else(|| Refused::new(WHO, format!("{what}: element count overflowed")))
 }
 
-/// RMSNorm over each row's `width`, `weight` nullable (null = parameterless).
 fn rms(
     x: *const c_void,
     weight: *const c_void,
@@ -375,7 +287,6 @@ fn rms(
     })
 }
 
-/// `y[N, Out] = x[N, Kin] @ w[Out, Kin]^T`.
 fn matmul(
     x: *const c_void,
     w: *const c_void,
@@ -390,7 +301,6 @@ fn matmul(
     })
 }
 
-/// Clamp `n` elements of `x` into `[lo, hi]` (either bound nullable).
 fn clamp(
     x: *const c_void,
     o: *mut c_void,
@@ -404,8 +314,6 @@ fn clamp(
     })
 }
 
-/// The clipped linear: `clamp(x) -> xc`, `matmul(xc, c.w) -> out`, then
-/// `clamp(out)` in place (reads and writes the same buffer).
 #[allow(clippy::too_many_arguments)]
 fn clin(
     x: *const c_void,
@@ -429,45 +337,25 @@ fn clin(
     )
 }
 
-/// The arena the walk writes through.
 struct Arena {
-    /// `[N, Hd]` — the residual stream.
+
     h: *mut c_void,
-    /// `[N, Hd]` — a normalised copy of `h`.
     hn: *mut c_void,
-    /// `[N, IM]` — clipped-linear input staging, sized for the FFN's `4*hidden`.
     xc: *mut c_void,
-    /// `[N, IM]` — the FFN's inner activations.
     ffmid: *mut c_void,
-    /// `[N, Hd]` — the FFN's output before the residual.
     ffout: *mut c_void,
-    /// `[N, Hd]` — queries.
     q: *mut c_void,
-    /// `[N, Hd]` — keys.
     k: *mut c_void,
-    /// `[N, Hd]` — values.
     v: *mut c_void,
-    /// `[N, Hd]` — the attention output.
     attn: *mut c_void,
-    /// `[N, Hd]` — the conv module's GLU output.
     glu: *mut c_void,
-    /// `[N, Hd]` — the depthwise conv's output.
     conv: *mut c_void,
-    /// `[N, Hd]` — the scratch every residual branch folds through.
     tmp: *mut c_void,
-    /// `[N, 2*Hd]` — `linear_start`'s output, the GLU's input.
     start: *mut c_void,
-    /// `[P, Hd]` — the shared sinusoidal relative-position encoding.
     pe: *mut c_void,
-    /// `[P, Hd]` — `relative_k_proj(pe)`, per layer.
     relk: *mut c_void,
 }
 
-/// The tower's forward pass over one clip.
-///
-/// `features` is the clip's log-mel plane as bytes (f32, `[n_frames, n_mel]`,
-/// padding already stripped), so the host never divides a byte offset by the
-/// element size; `out_proj` receives `[out_len, text_hidden]` bf16.
 #[allow(clippy::too_many_lines)]
 pub fn run(
     w: &Weights,
@@ -483,8 +371,6 @@ pub fn run(
     let (opd, txt, eps) = (w.out_proj_dims, w.text_hidden, w.eps);
     let mut scratch = Scratch::new();
 
-    // Features arrive f32 and the tower runs bf16, so the upload is followed
-    // by one cast; the cast's source is float whatever the destination type.
     let (t0, f0) = (n_frames, n_mel);
     let mel = elems("mel plane", t0, f0)?;
     if features.len() < mel * 4 {
@@ -502,8 +388,6 @@ pub fn run(
     call("vision::k_f32_to_bf16_bf16", stream, |ctx| {
         vision::k_f32_to_bf16_bf16(ctx, f32d.cast_const(), feat, mel)
     })?;
-    // No sync here: the upload, the cast and every launch below are ordered on
-    // one stream, and the host reads nothing until `encode` copies the rows back.
 
     let (c0ch, c1ch) = (w.sscp_ch0, w.sscp_ch1);
     let (t1, f1, t2, f2) = (g.t1, g.f1, n, g.f2);
@@ -547,7 +431,6 @@ pub fn run(
         stream,
     )?;
 
-    // Flatten `[C1,T2,F2]` -> `[T2, F2*C1]`, then `input_proj`.
     let flat_w = f2
         .checked_mul(c1ch)
         .ok_or_else(|| Refused::new(WHO, "flattened SSCP width overflowed"))?;
@@ -556,8 +439,6 @@ pub fn run(
         vision::k_sscp_flatten_bf16(ctx, c1.cast_const(), flat, c1ch, t2, f2)
     })?;
 
-    // Every buffer the loop needs is allocated once, outside it: twelve blocks
-    // reuse one arena, so the footprint is a function of `N`, not depth.
     let a = Arena {
         h: scratch.bf16(elems("hidden", n, hd)?)?,
         hn: scratch.bf16(elems("hidden (normed)", n, hd)?)?,
@@ -585,8 +466,6 @@ pub fn run(
         stream,
     )?;
 
-    // `pe` is shared across layers; `relative_k_proj` differs per layer, so
-    // `relk` is recomputed inside the loop and `pe` is not.
     call("vision::k_rel_pos_enc_bf16", stream, |ctx| {
         vision::k_rel_pos_enc_bf16(ctx, a.pe, g.pp, hd)
     })?;
@@ -606,7 +485,7 @@ pub fn run(
         clin(a.hn.cast_const(), a.q, a.xc, &layer.q, n, hd, hd, stream)?;
         clin(a.hn.cast_const(), a.k, a.xc, &layer.k, n, hd, hd, stream)?;
         clin(a.hn.cast_const(), a.v, a.xc, &layer.v, n, hd, hd, stream)?;
-        // Scales `q` and `k` in place, which is why both are `*mut`.
+
         call("vision::k_qkv_scale_bf16", stream, |ctx| {
             vision::k_qkv_scale_bf16(
                 ctx,
@@ -620,7 +499,7 @@ pub fn run(
                 g.k_scale,
             )
         })?;
-        // `relative_k_proj(pe) -> relk`: a plain matmul, not a clipped linear.
+
         matmul(
             a.pe.cast_const(),
             layer.relative_k,
@@ -690,12 +569,11 @@ pub fn run(
             2 * hd,
             stream,
         )?;
-        // `hd` is the output width, half of `start`'s.
+
         call("vision::k_glu_bf16", stream, |ctx| {
             vision::k_glu_bf16(ctx, a.start.cast_const(), a.glu, n, hd)
         })?;
-        // `bias` and `state_out` are null here. The guard stays because an
-        // empty grid is not a refusal, and `Walk::new` already refused `n <= 0`.
+
         let k = w.conv_kernel;
         if n > 0 && hd > 0 && k > 0 {
             call("ssm::causal_conv1d_prefill_noact_bf16", stream, |ctx| {
@@ -712,8 +590,7 @@ pub fn run(
                 )
             })?;
         }
-        // The `clamp(±finfo_max)` HF applies here is a no-op in bf16 range, so
-        // it is deliberately skipped, not omitted.
+
         rms(
             a.conv.cast_const(),
             layer.lconv_conv_norm,
@@ -759,50 +636,31 @@ pub fn run(
         )
     })?;
 
-    // A parameterless RMSNorm: the weight is null, which is what
-    // `Gemma4MultimodalEmbedder` is.
     let en = scratch.bf16(elems("embedder", n, opd)?)?;
     rms(enc.cast_const(), core::ptr::null(), en, n, opd, eps, stream)?;
     matmul(en.cast_const(), w.embed_proj, out_proj, n, opd, txt, stream)?;
 
-    // Synchronise before `scratch` frees on the drop below: the launches above
-    // still hold its pointers.
     stream.synchronize()?;
     drop(scratch);
     Ok(())
 }
 
-/// One SSCP stage's inputs and extents.
 struct SscpStage {
-    /// The stage's input, channels-first.
+
     src: *const c_void,
-    /// The conv weight, `[out_ch, in_ch, 3, 3]`.
     conv_w: *const c_void,
-    /// The LayerNorm scale, `[out_ch]`.
     norm_w: *const c_void,
-    /// `[out_ch, t_out, f_out]` — the conv's output, channels-first.
     chw: *mut c_void,
-    /// `[t_out, f_out, out_ch]` — the same values, channels-last.
     chlast: *mut c_void,
-    /// Input channels.
     in_ch: i32,
-    /// Input time extent.
     t_in: i32,
-    /// Input frequency extent.
     f_in: i32,
-    /// Output channels.
     out_ch: i32,
-    /// Output time extent.
     t_out: i32,
-    /// Output frequency extent.
     f_out: i32,
-    /// RMSNorm/LayerNorm epsilon.
     eps: f32,
 }
 
-/// `conv -> channels-last -> LayerNorm+ReLU -> channels-first`: the transpose
-/// pair exists because LayerNorm is over the channel axis, conv output
-/// channels-first.
 fn sscp(s: SscpStage, stream: Stream<'_>) -> Result<()> {
     call("vision::k_conv2d_s2_bf16", stream, |ctx| {
         vision::k_conv2d_s2_bf16(
@@ -819,8 +677,7 @@ fn sscp(s: SscpStage, stream: Stream<'_>) -> Result<()> {
             s.f_out,
         )
     })?;
-    // The rows are the `T*F` spatial positions with the channel axis as the
-    // width; the norm reads and writes `chlast` in place.
+
     let rows = s
         .t_out
         .checked_mul(s.f_out)
@@ -848,22 +705,18 @@ fn sscp(s: SscpStage, stream: Stream<'_>) -> Result<()> {
     })
 }
 
-/// `y += x` over `n` elements, `y` both read and written.
 fn add(y: *mut c_void, x: *const c_void, n: usize, stream: Stream<'_>) -> Result<()> {
     call("vision::k_add_bf16", stream, |ctx| {
         vision::k_add_bf16(ctx, y, x, n)
     })
 }
 
-/// SiLU over `n` elements, in place.
 fn silu(x: *mut c_void, n: usize, stream: Stream<'_>) -> Result<()> {
     call("vision::k_silu_bf16", stream, |ctx| {
         vision::k_silu_bf16(ctx, x.cast_const(), x, n)
     })
 }
 
-/// The macaron half-FFN: `rms -> clin(fc1) -> silu -> clin(fc2) -> rms -> axpy`,
-/// over `ffmid` at `[N, 4*hidden]` and `ffout` at `[N, hidden]`.
 fn ffn(
     g: &Walk,
     a: &Arena,
@@ -887,26 +740,19 @@ fn ffn(
         stream,
     )?;
     rms(a.ffout.cast_const(), f.post_ln, a.ffout, n, hd, eps, stream)?;
-    // `h += RW * ffout`, the macaron half-step's residual weight.
+
     let count = elems("ffn residual", n, hd)?;
     call("vision::k_axpy_bf16", stream, |ctx| {
         vision::k_axpy_bf16(ctx, a.h, a.ffout.cast_const(), residual_weight, count)
     })
 }
 
-/// Frames after subsampling: `floor((n-1)/2)+1` applied twice.
 #[must_use]
 pub fn subsampled_len(n_frames: i32) -> i32 {
     let conv = |n: i32| (n + 2 - 3) / 2 + 1;
     conv(conv(n_frames))
 }
 
-/// The encode-ABI entry: host log-mel features in, host bf16 rows out.
-///
-/// One clip per iteration, each with its own arena and synchronised before the
-/// next, because the output rows are read back to the host between clips.
-/// `features` is the whole feature plane as bytes and `feature_byte_indptr`
-/// cuts it.
 pub fn encode(
     w: &Weights,
     features: &[u8],
@@ -974,9 +820,7 @@ pub fn encode(
         )?;
         let begin = rows_written * row_bytes;
         let end = begin + rows_u * row_bytes;
-        // SAFETY: `projected` is `rows * text_hidden` bf16 elements of this
-        // arena, live until `scratch` drops below, and `end - begin` is
-        // exactly that many bytes.
+
         unsafe { read_raw_span(projected.cast_const(), &mut output_rows[begin..end], stream)? };
         stream.synchronize()?;
         drop(scratch);

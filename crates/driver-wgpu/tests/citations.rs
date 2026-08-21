@@ -396,11 +396,20 @@ fn no_source_file_carries_a_conflict_marker() {
 #[test]
 fn every_proof_these_crates_cite_by_name_can_be_found() {
     let (names, vocabulary) = defined();
+    // A FLOOR ON PURPOSE, and worth saying why when its sibling below is not.
+    // This counts the distinct first words of `#[test]` names, so its subject
+    // is prose that moves whenever anyone writes a test with a new verb --
+    // pinning it would fail on a correct addition, every time, and a gate
+    // that cries on correct work is one somebody deletes. It reads 27 as
+    // this is written. Eight is not near that and does not need to be: the
+    // only thing it can catch is the scan finding nothing at all, which is
+    // the only failure a vocabulary this loose HAS.
     assert!(
         vocabulary.len() >= 8,
         "only {} first-words were collected from `#[test]` functions, which is \
          too few for the filter to mean anything — the scan is not finding the \
-         tests. Vocabulary: {vocabulary:?}",
+         tests. It read 27 when this floor was last measured. Vocabulary: \
+         {vocabulary:?}",
         vocabulary.len(),
     );
 
@@ -477,13 +486,13 @@ fn every_proof_these_crates_cite_by_name_can_be_found() {
     );
 }
 
-/// Which refusals a test names, and which thirty-three it does not.
+/// Which refusals a test names, and which twenty-three it does not.
 ///
 /// `device.rs` gives the principle, about `Failed` and its by-value
 /// comparison: "a test that asserts WHICH refusal came back is the only way
 /// an alignment failure stays distinguishable from a length one."
 ///
-/// It is a principle this crate mostly keeps — **seventy-six of ninety-nine**
+/// It is a principle this crate mostly keeps — **seventy-seven of one hundred**
 /// refusal variants are named in a test — and nothing measured the rest. A
 /// refusal nothing names is one whose condition could be inverted, or whose
 /// message could describe a different fault, with every suite still green: it
@@ -605,7 +614,7 @@ fn every_refusal_this_crate_builds_is_one_a_test_names() {
     // refusals are only ever named in one.
     let mut named = String::new();
     for file in suites.iter().chain(&sources) {
-        // NOT this file. `UNNAMED` below is thirty-eight string literals, so
+        // NOT this file. `UNNAMED` below is twenty-three string literals, so
         // counting it would have every refusal "named in a test" by the very
         // census that says they are not -- which is exactly what happened the
         // first time this ran, and the empty result is what gave it away.
@@ -634,11 +643,20 @@ fn every_refusal_this_crate_builds_is_one_a_test_names() {
             refusals.push(format!("{enum_name}::{variant}"));
         }
     }
-    assert!(
-        refusals.len() >= 90,
-        "only {} refusal variants were parsed, so this is not reading the \
-         declarations it thinks it is",
-        refusals.len()
+    // PINNED, not floored. This was `>= 90` against a hundred, which is a
+    // gate with ten variants of slack in the one direction that matters: a
+    // refusal the code can still return but no test names is exactly what
+    // this file exists to catch, and ten of them could go without a word.
+    // A floor only guards the collapse of the PARSER; the census guards the
+    // census. Both readings are wanted, so the number is the count.
+    assert_eq!(
+        refusals.len(),
+        100,
+        "the refusal census moved. If variants were added, name them in a \
+         test and raise this; if they were removed, say which in the commit \
+         and lower it. If it collapsed to a handful, the parser has stopped \
+         reading the declarations it thinks it is, which is what the floor \
+         this replaced was for and is the only reading a floor gave."
     );
 
     // And the SELECTOR is checked, because it is a naming convention and this
@@ -721,8 +739,8 @@ fn every_refusal_this_crate_builds_is_one_a_test_names() {
     // less coverage than there is. Here the sentence fails.
     assert_eq!(
         (refusals.len(), refusals.len() - unnamed.len()),
-        (99, 76),
-        "this test's own doc says seventy-six of ninety-nine refusal variants \
+        (100, 77),
+        "this test's own doc says seventy-seven of one hundred refusal variants \
          are named by a test. Update the sentence with the number."
     );
 }

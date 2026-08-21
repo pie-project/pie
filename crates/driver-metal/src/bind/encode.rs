@@ -240,19 +240,21 @@ impl Pipelines {
         compiler: &Compiler,
         dispatches: &[Dispatch<'_>],
     ) -> Result<()> {
-        let wanted: Vec<(&'static str, &str)> = pipelines_needed(dispatches)
+        let wanted: Vec<(&'static str, &str, &'static str)> = pipelines_needed(dispatches)
             .into_iter()
-            .filter(|(_, symbol)| !self.built.contains_key(*symbol))
+            .filter(|(_, symbol, _)| !self.built.contains_key(*symbol))
             .collect();
         if wanted.is_empty() {
             return Ok(());
         }
         let requests: Vec<Request> = wanted
             .iter()
-            .map(|(file, symbol)| Request::new(self.root.join(file), *symbol))
+            .map(|(file, symbol, stamp)| {
+                Request::stamped(self.root.join(file), *symbol, *stamp)
+            })
             .collect();
         let compiled = compiler.compile_batch(context, &requests);
-        for ((_, symbol), built) in wanted.iter().zip(compiled.pipelines) {
+        for ((_, symbol, _), built) in wanted.iter().zip(compiled.pipelines) {
             self.built.insert((*symbol).to_string(), built?);
         }
         Ok(())

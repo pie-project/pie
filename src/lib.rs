@@ -1,11 +1,14 @@
-//! `pie-bin` library shim — exposes the composition-root seam so the standalone
-//! boot smoke can drive it. **No logic lives here**; `main.rs` is a thin shell
-//! over these modules and `run_standalone` is the one public composition seam.
+//! `pie-bin` library shim — exposes the composition-root seam so a boot gate can
+//! drive it. **No logic lives here**; `main.rs` is a thin shell over these
+//! modules and `run_standalone` is the one public composition seam.
 //!
 //! This is the composition root, not a role crate — its `[lib]` exists purely to
-//! make the single compose seam testable (`tests/boot_smoke.rs` → green
-//! once golf's P5a `compose.rs` overlays), which is distinct from the worker's
+//! make the single compose seam testable, which is distinct from the worker's
 //! old lib+bin anti-pattern (a *role* crate flipping identity by feature).
+//!
+//! The gate it was written for was tests/boot_smoke.rs, deleted with the dummy
+//! driver it booted; the seam is driven by the Vulkan gates in `tests/gpu/`
+//! now, which call the same `run_standalone` against a real device.
 
 pub mod compose;
 pub mod derive;

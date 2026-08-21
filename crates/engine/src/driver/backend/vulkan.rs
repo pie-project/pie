@@ -1026,6 +1026,7 @@ fn text_of(
     // the same constant for the same reason.
     let binding = model::catalog::MetalBinding {
         qmm_partial_rows: false,
+        qmm_fp16_precast: true,
         qmm_tile: None,
         quant_group: 64,
         quant_bits: 4,
@@ -1348,6 +1349,7 @@ kv_pages = 64
         use model::catalog::Deployed;
         let binding = model::catalog::MetalBinding {
             qmm_partial_rows: false,
+            qmm_fp16_precast: true,
             qmm_tile: None,
             quant_group: 64,
             quant_bits: 4,

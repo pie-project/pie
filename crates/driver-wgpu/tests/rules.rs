@@ -270,6 +270,15 @@ fn the_sibling_gates_this_port_has_no_twin_for_are_named() {
     /// what a list like this is for.
     const NO_TWIN: &[(&str, &str)] = &[
         (
+            "add_program",
+            "not a gap: that gate is a DIAGNOSTIC for the client edge and its \
+             own header says it does not care about the driver — it picked \
+             the sibling only because that is the cheapest boot on a machine \
+             with no CUDA. A wgpu twin would boot a second driver to measure \
+             the same chunked upload through the same gateway, and every wgpu \
+             gate already carries a program over that edge to get started",
+        ),
+        (
             "boot_smoke",
             "covered: all four wgpu gates boot the same standalone through \
              `common::boot_wgpu`, so a boot that stopped working fails every \
@@ -392,6 +401,13 @@ fn the_sibling_gates_this_port_has_no_twin_for_are_named() {
 /// crate, so its own half of this check (`the_body_asks_for_the_elementwise_grid`)
 /// compares against a transcribed `width * rows`. This one compares against
 /// the function that decides it.
+///
+/// RETIRED WITH `kernels-wgpu`'s TEST TREE. That name is a record of a
+/// measurement now, not a live proof: the crate lost `tests/` and every
+/// in-file `mod tests` when the three shader planes moved their numbers to
+/// the fire that reads them, and nothing in this workspace re-runs it. What
+/// it reported is still why the sentence above says what it says; what is
+/// gone is the thing that would notice if it stopped being true.
 #[test]
 fn the_first_ported_routine_asks_for_the_grid_its_row_asked_for() {
     use driver_wgpu::geometry::{Dims, Module, Rule, groups};
@@ -423,15 +439,7 @@ fn the_first_ported_routine_asks_for_the_grid_its_row_asked_for() {
             _ty: kernels::Ty,
             source: kernels::Source,
         ) -> Result<ArgValue, kernels::routine::Refusal> {
-            // One fact and the PARAMS BLOCK: this body asks for nothing
-            // else. `ctx.params()` resolves `Slot(Kind::Params, 0)` -- the
-            // packed scalar run, which reaches a shader as a buffer -- and a
-            // probe that refused it never reached the dispatch this test
-            // measures.
             match source {
-                kernels::Source::Slot(kernels::Kind::Params, _) => {
-                    Ok(ArgValue::Buffer(0))
-                }
                 kernels::Source::Named(key)
                     if key == <kernels::keys::Rows as kernels::keys::Fact>::KEY =>
                 {

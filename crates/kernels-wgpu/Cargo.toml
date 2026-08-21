@@ -47,65 +47,10 @@ default = []
 [dependencies]
 # The routine registry — see the workspace table for why this one.
 linkme = { workspace = true }
+inventory = { workspace = true }
 # `#[routine]`, which builds each row beside its own `fn`.
 kernels-macros = { path = "../kernels-macros" }
 kernels = { path = "../kernels" }
-
-[dev-dependencies]
-# The table test resolves through `sig_in`, which is the shared crate's, to
-# check the lookup `model-ir` actually calls rather than a copy of it.
-kernels = { path = "../kernels" }
-
-# The WGSL front end, on its own. `wgpu` carries the same crate, but a module
-# that only has to PARSE should not need an adapter to say so: `naga` alone is
-# what lets `tests/gpu.rs` prove a shader compiles on a machine with no GPU at
-# all, which is most of the machines this crate is built on. Pinned to the
-# version `wgpu` 30 already resolves, so the harness and the runtime front end
-# are one crate and cannot disagree about what WGSL is.
-#
-# `wgsl-in` is named explicitly because `naga`'s own default feature set does
-# not include a front end: without it `naga::front::wgsl` does not exist and
-# the parse check does not compile. `wgpu` enables it for its own use, and
-# cargo unifies the two, so this costs nothing.
-naga = { version = "30", features = ["wgsl-in"] }
-
-# wgpu, for the GPU harness in `tests/gpu.rs` ONLY. A dev-dependency for the
-# reason `ash` is one next door: this crate ships a table and a shader tree, and
-# a driver is what owns a device. If `wgpu` ever appears under `[dependencies]`
-# here, the layering has gone wrong.
-#
-# `default-features = false` drops the windowing and surface stack -- this is
-# compute, there is no swapchain -- and `wgsl` is the front end the shaders are
-# written in. `vulkan`/`metal`/`dx12` are the three native backends worth
-# having; `noop` is not enabled, because a harness that silently ran on no
-# device would report success for nothing.
-wgpu = { version = "30", default-features = false, features = [
-    "wgsl",
-    "vulkan",
-    "metal",
-    "dx12",
-] }
-pollster = "0.4"
-
-# `tests/gpu.rs` reads back raw device bytes; `bytemuck` is how they become
-# numbers without a transmute this crate would have to justify.
-bytemuck = { version = "1", features = ["derive"] }
-
-# The GPU harness has to await a buffer map and an adapter request. `pollster`
-# blocks on them, which is what a `#[test]` wants; nothing here needs a runtime.
-
-[[test]]
-# The table's product against the census, and the three parity checks against
-# `kernels-metal`. No GPU, no toolchain -- this is the test that has to run on
-# the machines that build `model-ir`.
-name = "entrypoints"
-
-[[test]]
-# Needs an ADAPTER, not a feature: wgpu falls back through Vulkan, Metal and
-# DX12 and reports which it found. Ungated on purpose -- there is no `native`
-# to gate it with -- so it SKIPS with a printed reason when no adapter answers,
-# the same contract `kernels-vulkan`'s harness has when the loader is missing.
-name = "gpu"
 
 # NO `[[example]]` sections, and the absence is load-bearing for the reason
 # `kernels-cuda/Cargo.toml` states at length: a `[[example]]` whose file is

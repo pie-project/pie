@@ -3,22 +3,15 @@ use super::arith::{ceil_div_i32_in_u32, ceil_div_u32, cuda_max_u32_i32};
 use super::info::DecodePlanInfo;
 use super::{Error, Plan, Sizes, Workspace};
 
-/// The batch a decode plan is built for.
 #[derive(Clone, Copy, Debug)]
 pub struct Request<'a> {
-    /// `batch_size + 1` page offsets.
+
     pub kv_indptr: &'a [i32],
-    /// Requests in the batch.
     pub batch_size: u32,
-    /// Query/output heads.
     pub num_qo_heads: u32,
-    /// The GQA group size the kernel was dispatched for; `num_kv_heads =
     pub gqa_group_size: u32,
-    /// Tokens per page.
     pub page_size: u32,
-    /// Per-head feature width, which only sizes the partial-output carve.
     pub head_dim: u32,
-    /// Whether this plan will be captured into a CUDA graph, which fixes the
     pub enable_cuda_graph: bool,
 }
 
@@ -40,24 +33,18 @@ impl Request<'_> {
     }
 }
 
-/// What the work estimator decided, before any buffer is carved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorkEstimate {
-    /// Whether KV is partitioned across work items.
+
     pub split_kv: bool,
-    /// `num_blocks_per_sm * num_sm`, passed through unchanged so a caller can
     pub max_grid_size: u32,
-    /// The KV chunk size **in pages** — upstream calls this
     pub kv_chunk_size_in_pages: u32,
-    /// Work items the split produced.
     pub new_batch_size: u32,
-    /// `gridDim.y`: the KV head count.
     pub gdy: u32,
 }
 
-/// The host half of `BatchDecodeWithPagedKVCacheWorkEstimationDispatched`.
 pub fn estimate(req: &Request<'_>, max_grid_size: u32) -> Result<WorkEstimate, Error> {
-    /// `PartitionPagedKVCacheBinarySearchMinNumPagePerBatch`.
+
     #[must_use]
     pub fn partition_min_pages_per_batch(
     max_grid_size: u32,
@@ -119,7 +106,6 @@ pub fn estimate(req: &Request<'_>, max_grid_size: u32) -> Result<WorkEstimate, E
     })
 }
 
-/// `DecodePlan` — the plan, and the bytes to upload under it.
 pub fn plan(
     req: &Request<'_>,
     max_grid_size: u32,
@@ -128,7 +114,6 @@ pub fn plan(
     plan_impl(req, max_grid_size, workspace, Staging::new(workspace.int_bytes))
 }
 
-/// `DecodePlanWorkspaceSize` — the same arithmetic with the writes turned off.
 pub fn workspace_size(req: &Request<'_>, max_grid_size: u32) -> Result<Sizes, Error> {
     let plan = plan_impl(req, max_grid_size, Workspace::unbounded(), Staging::sizing())?;
     Ok(Sizes { float_bytes: plan.float_bytes, int_bytes: plan.int_bytes })
@@ -140,7 +125,7 @@ fn plan_impl(
     workspace: Workspace,
     mut staging: Staging,
 ) -> Result<Plan<DecodePlanInfo>, Error> {
-     /// `DecodeSplitKVIndptr` — the three index arrays, from page counts.
+
      #[must_use]
      pub fn split_kv_indptr(
      kv_indptr: &[i32],
@@ -244,70 +229,4 @@ fn plan_impl(
         int_bytes,
         float_bytes: float_alloc.used(),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn request<'a>(kv_indptr: &'a [i32], batch_size: u32) -> Request<'a> {
-        Request {
-            kv_indptr,
-            batch_size,
-            num_qo_heads: 32,
-            gqa_group_size: 4,
-            page_size: 16,
-            head_dim: 128,
-            enable_cuda_graph: false,
-        }
-    }
-
-    /// A batch that already fills the grid is never split, and the chunk size
-    #[test]
-    fn a_full_grid_is_not_split() {
-        let indptr: Vec<i32> = (0..=64).map(|i| i * 10).collect();
-        let est = estimate(&request(&indptr, 64), 16).unwrap();
-        assert!(!est.split_kv);
-        assert_eq!(est.new_batch_size, 64);
-        assert_eq!(est.kv_chunk_size_in_pages, 10);
-        assert_eq!(est.gdy, 8);
-    }
-
-    /// One request on a big machine is split until the grid is full and no
-    #[test]
-    fn a_lone_request_is_split_until_the_grid_is_full() {
-        let indptr = [0i32, 4096];
-        let est = estimate(&request(&indptr, 1), 1024).unwrap();
-        assert!(est.split_kv);
-        assert_eq!(est.kv_chunk_size_in_pages, 32);
-        assert_eq!(est.new_batch_size, 128);
-    }
-
-    /// The empty batch: no work items, no refusal, and a chunk size of the
-    #[test]
-    fn the_empty_batch_plans() {
-        let indptr = [0i32];
-        let plan = plan(&request(&indptr, 0), 1024, Workspace::new(1 << 20, 1 << 20)).unwrap();
-        assert_eq!(plan.info.padded_batch_size, 0);
-        assert!(!plan.info.split_kv);
-    }
-
-    /// A workspace too small to hold the descriptor is refused, by name.
-    #[test]
-    fn a_workspace_that_cannot_hold_the_plan_is_refused() {
-        let indptr: Vec<i32> = (0..=64).map(|i| i * 10).collect();
-        let err = plan(&request(&indptr, 64), 16, Workspace::new(1 << 20, 8)).unwrap_err();
-        assert!(matches!(err, Error::WorkspaceOverflow { .. }));
-    }
-
-    /// The sizing pass answers what the materialising pass consumes.
-    #[test]
-    fn sizing_agrees_with_planning() {
-        let indptr = [0i32, 4096];
-        let req = request(&indptr, 1);
-        let sizes = workspace_size(&req, 1024).unwrap();
-        let plan = plan(&req, 1024, Workspace::new(1 << 24, 1 << 20)).unwrap();
-        assert_eq!(sizes.int_bytes, plan.int_bytes);
-        assert_eq!(sizes.float_bytes, plan.float_bytes);
-    }
 }

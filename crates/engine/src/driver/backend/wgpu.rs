@@ -1287,8 +1287,61 @@ fn text_of(
         router_quant_group: 0,
         router_quant_bits: 0,
         moe_mxfp4: false,
+        // `false`, AGAINST `LlamaLikeMetalFacts::synthetic()`, WHICH IS THE
+        // ONLY REASON THE TILED GEMM ANSWERS AT ALL ON THIS BACKEND.
+        //
+        // The staged path is a pre-pass -- `cast_qmm_input` narrows the bf16
+        // activation to f16 into `half_in` -- and the GEMM then reads
+        // `half_in` instead of `x`. On this backend it does not read back what
+        // the cast wrote, and the measurement is unambiguous: same prompt,
+        // same shell, this one fact flipped.
+        //
+        // ```text
+        //   precast=true    120.4% of the row's peak, 134533/151936 logits
+        //   precast=false     0.9% of the row's peak,      0/151936 logits
+        // ```
+        //
+        // Perturbing one token of a 480-token prompt says what shape of wrong
+        // it is: the staged GEMM's readout row responds 28.38 to token 0 and
+        // 0.00 to every position from 256 on, where the matvec responds
+        // everywhere and most at the last token (13.81). It is reading rows
+        // that are not the rows it was given.
+        //
+        // WHERE TO LOOK WHEN SOMEONE FIXES IT. Two candidates, neither ruled
+        // out here: `quant/qmm_t.wgsl` declares `half_in` at `@binding(5)` in
+        // one arm and `@binding(4)` in the other, and the DSL emits the
+        // STRIDED cast (`cast_qmm_input_strided_bfloat16_to_float16`, writing
+        // at `row * row_stride + col`) while a non-strided GEMM reads
+        // `input_stride() = params.k`. Either disagreement produces exactly
+        // this: row 0 right and every row after it fetched from the wrong
+        // offset.
+        //
+        // Turning it off also deletes work. The cast is 112 fires a step on
+        // the prefill lane, which `llama_like/forward/mod.rs` had already
+        // guarded down for costing 0.03-0.16 ms a step while nothing read it
+        // at batch eight; here nothing reads it at all.
+        qmm_fp16_precast: false,
         fuse_residual_gemv: true,
         paged_multi_batch: true,
+        // `true`, AND THE FP16 PRECAST BELOW IS WHY IT CAN BE.
+        //
+        // It was `false` for one commit, because the tiled GEMM answered a row
+        // that did not depend on the prompt's last tokens: the same prompt
+        // fired twice with only its LAST token changed came back IDENTICAL at
+        // n = 32, 64 and 96 -- and degenerate, `1494` eight times -- while
+        // n = 16 and 31, which the projections' guard sends to the matvec,
+        // differed. A causal model's last row attends to the last token, so
+        // that is not a near miss, it is the wrong row.
+        //
+        // It was not the GEMM. `kernels-wgpu`'s
+        // `a_tiled_gemm_agrees_over_every_tile_shape_and_quantization_point`
+        // agrees with a host reference over all nine tiles and six codecs at
+        // m = 32, 64 and 33 alike, so the arithmetic and the tiling are right
+        // at an aligned row count and a ragged one. What was wrong was the
+        // buffer it read: with `qmm_fp16_precast` off the same comparison on
+        // qwen3-0.6b reads 0.9% of the row's peak where the staged path reads
+        // 120.4%, and both of `driver-wgpu/tests/serving.rs`'s two
+        // family-agreement tests pass.
         qmm_multi_batch: true,
         // `true`, as `driver-vulkan`'s seam says it and `driver-metal`'s
         // constant does not: `binding::scalars`' `derived` closure answers

@@ -55,6 +55,19 @@ struct Dsv4LayerW {
     dense_up: MatW,
     dense_down: MatW,
     router: MatW,
+    /// THE HYPER-CONNECTION'S OWN AFFINE, TWICE: a layer reads a mix of the
+    /// streams before its attention and again before its MLP, and each read
+    /// is a separate `hc_pre` with its own learned `scale` and `base`. Four
+    /// names, not two, because the two reads are two mixes -- sharing one
+    /// pair would make the MLP's transport plan the attention's.
+    ///
+    /// Trace names with no witnessed checkpoint spelling, exactly like
+    /// `attn_sink` and `router_bias`; `project.rs` says why none of them is
+    /// in the manifest.
+    hc_attn_scale: String,
+    hc_attn_base: String,
+    hc_mlp_scale: String,
+    hc_mlp_base: String,
 }
 
 impl Dsv4LayerW {
@@ -88,6 +101,10 @@ impl Dsv4LayerW {
             dense_up: m("dense_up_proj", f.dense_intermediate),
             dense_down: m("dense_down_proj", f.hidden),
             router: m("router", f.moe.num_experts),
+            hc_attn_scale: w("hc_attn_scale"),
+            hc_attn_base: w("hc_attn_base"),
+            hc_mlp_scale: w("hc_mlp_scale"),
+            hc_mlp_base: w("hc_mlp_base"),
         }
     }
 }
@@ -122,7 +139,14 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
             // input and the two mixes `hc_post` will need to write back.
             let normed_f32 =
                 dsl::cuda::hc_rmsnorm_to_f32(&streams, facts.hidden);
-            let (x, post_mix, comb_mix) = dsl::cuda::hc_pre(&normed_f32, &streams, k, facts.hidden);
+            let (x, post_mix, comb_mix) = dsl::cuda::hc_pre(
+                &normed_f32,
+                &streams,
+                &w.hc_attn_scale,
+                &w.hc_attn_base,
+                k,
+                facts.hidden,
+            );
 
             // Q through its latent, then a per-head norm with NO gamma —
             // the reference's `q *= rsqrt(...)`, which is a different
@@ -182,7 +206,14 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
 
             // ── MLP / MoE, over the same rank-K residual ─────────────
             let normed_f32 = dsl::cuda::hc_rmsnorm_to_f32(&streams, facts.hidden);
-            let (m, post_mix, comb_mix) = dsl::cuda::hc_pre(&normed_f32, &streams, k, facts.hidden);
+            let (m, post_mix, comb_mix) = dsl::cuda::hc_pre(
+                &normed_f32,
+                &streams,
+                &w.hc_mlp_scale,
+                &w.hc_mlp_base,
+                k,
+                facts.hidden,
+            );
 
             let out = if !facts.is_moe_layer(l) {
                 dsl::dense_gated_mlp(
@@ -229,7 +260,17 @@ pub fn dsv4_cuda(facts: &Dsv4Facts, class: FireClass) -> ForwardPlan {
         }
 
         // The streams fold into one.
-        let y = dsl::cuda::hc_head(&streams, &streams, facts.hidden);
+        // NOT LAYER-SCOPED, and that is the collapse being one statement
+        // for the whole tower rather than one per layer: it runs once, after
+        // the loop, so its affine pair belongs to the model and carries no
+        // `layer.{l}.` prefix.
+        let y = dsl::cuda::hc_head(
+            &streams,
+            &streams,
+            "hc_head_scale",
+            "hc_head_base",
+            facts.hidden,
+        );
         dsl::logits_epilogue(t, &y, NormVariant::Plain, false, facts.vocab, false);
     })
 }

@@ -396,8 +396,25 @@ jobs:
       #
       # It needs `contract` because it reaches the
       # descriptor schema `HfConfig` lives in.
-      - name: weight-name seam (a trace name a checkpoint can never answer)
-        run: cargo test -p model --features contract --test seam_names
+      #
+      # THIS RAN ONE FILE UNTIL NOW, and the aspect it enables has six.
+      # `contract` is not a default feature and `cargo test --workspace`
+      # above runs with defaults, so the other five built their binaries,
+      # reported `0 passed; 0 failed; 0 filtered out`, and executed
+      # forty-two tests in no job at all -- thirty of them in
+      # `family_contracts.rs`. The `cargo check --features contract` steps
+      # near the top compiled every one of them, which is exactly why this
+      # lasted: what rots in an unrun test is the ASSERTION, and a check
+      # never reads one. Same lesson as the kernel vocabulary audit below,
+      # through a different door.
+      #
+      # So the step is the aspect now rather than one file of it. It
+      # re-runs the default half as well, which is duplicated work and
+      # cheaper than a second binary's worth of argument about it.
+      # `every_cfg_names_a_real_feature.rs` fails if a `#![cfg(feature)]`
+      # test file is ever again left with no command that reaches it.
+      - name: model contract aspect (weight-name seam, load contracts, name maps)
+        run: cargo test -p model --features contract
 
       # driver-cuda is excluded from the two sweeps above because it has no
       # default feature and refuses to build until one of `cuda-12` / `cuda-13`

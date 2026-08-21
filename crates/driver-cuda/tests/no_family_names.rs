@@ -47,45 +47,31 @@ fn budget() -> BTreeMap<&'static str, usize> {
         // qwen3-vl walk was deleted with no caller. A driver that holds no
         // walk needs no permission to name one.
         //
-        // An arm registry maps a trace SYMBOL to the `fn` that arms it, so
-        // its content is the trace's own vocabulary, not the driver
-        // learning an architecture. Quoted symbols do not count
-        // (`without_trace_symbols`); what these budgets ever capped was the
-        // Rust-side half of the same pair, plus family names in the
-        // `unbound:` prose. The ratchet may legitimately rise here, since
-        // arming a new kernel adds a mention -- but a `GemmaFacts` dropped
-        // into one of these files is still exactly this test's quarry, and
-        // the per-file count catches it regardless of the directory's
-        // normal traffic.
+        // AND THE ARM BUDGETS ARE GONE THE SAME WAY, which is the second
+        // time this table has recorded a directory rather than a permission.
         //
-        // All five are ZERO, kept explicit rather than dropped, because a
-        // deleted line is a permission the next file to want it inherits
-        // for free. They fell to zero in two moves: the arms crossed to
-        // derived rows (`rmsnorm_gemma_arm` and its call site went with
-        // them), and the `unbound:` reasons were cut to one clause each,
-        // which took out the prose naming gemma-4's fused landing,
-        // gemma_3n's AltUp fixture and deepseek_v4's compressed cache.
-        ("bind/arms/attn.rs", 0),
-        ("bind/arms/layout.rs", 0),
-        ("bind/arms/mlp.rs", 0),
-        ("bind/arms/norm.rs", 0),
-        ("bind/arms/ssm.rs", 0),
-        // The one that is not zero, and it is a fact's NAME rather than a
-        // branch: `rope::rope_yarn_bf16` is unbound on llama-3's
-        // `low_freq_factor`/`high_freq_factor`, and a refusal that will not
-        // say whose scheme it wants is not worth printing.
-        ("bind/arms/rope.rs", 1),
-        // Two, and both are a MEASUREMENT's provenance rather than a branch.
-        // The two MXFP4 decode rows are unbound on a per-expert pointer array
-        // nothing in this tree builds; the reason names gpt-oss because that
-        // is the export `compute-sanitizer` was run against to establish the
-        // kernel really indexes `packed_ptrs[expert]`, and names qwen3.5
-        // because `build_moe_ptrs_aligned` is ITS statement-side builder and a
-        // reader who did not know that would go looking for a bug in it. A
-        // refusal that cannot say what was measured, on what, is a refusal
-        // nobody can act on. Neither mention reaches a dispatch decision:
-        // both arms are `arm: None`.
-        ("bind/arms/quant.rs", 2),
+        // `bind/arms/` was thirteen files and 173 hand-written rows; seven of
+        // them were budgeted here -- `attn.rs`, `layout.rs`, `mlp.rs`,
+        // `norm.rs` and `ssm.rs` at zero, `rope.rs` at one and `quant.rs` at
+        // two. The directory is deleted: the rows are derived from the
+        // routine column now and what remains of the routing is
+        // `bind/route.rs` and `bind/table.rs`.
+        //
+        // The two non-zero ones are worth naming on the way out, because
+        // neither was a branch and a reader who finds their subject again
+        // should know what it was allowed to be. `rope.rs`'s one was a
+        // fact's NAME -- `rope::rope_yarn_bf16` unbound on llama-3's
+        // `low_freq_factor`/`high_freq_factor`, since a refusal that will not
+        // say whose scheme it wants is not worth printing. `quant.rs`'s two
+        // were a MEASUREMENT's provenance: the MXFP4 decode rows named
+        // gpt-oss because that is the export `compute-sanitizer` was run
+        // against, and qwen3.5 because `build_moe_ptrs_aligned` is its
+        // statement-side builder. Both arms were `arm: None`.
+        //
+        // Nothing inherits those permissions. The files that replaced them
+        // are budgeted at nothing, which is to say they are not in this
+        // table, which is to say a family name appearing in either is
+        // exactly this test's quarry.
         // Zero, kept explicit rather than dropped: its three mentions were
         // `ffi::pie_k_gemm_act_x_wt_bf16` call sites, now
         // `use crate::fire::gemm::act_x_wt_bf16;` -- neither spelling

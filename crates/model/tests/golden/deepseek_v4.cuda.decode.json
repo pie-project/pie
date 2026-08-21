@@ -2345,7 +2345,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::hc_pre_postprocess_bf16"
+          "kernel": "norm::hc_pre_postprocess_bf16",
+          "weights": [
+            "layer.0.hc_attn_scale",
+            "layer.0.hc_attn_base"
+          ]
         }
       },
       "inputs": [
@@ -2726,7 +2730,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::hc_pre_postprocess_bf16"
+          "kernel": "norm::hc_pre_postprocess_bf16",
+          "weights": [
+            "layer.0.hc_mlp_scale",
+            "layer.0.hc_mlp_base"
+          ]
         }
       },
       "inputs": [
@@ -2834,7 +2842,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::hc_pre_postprocess_bf16"
+          "kernel": "norm::hc_pre_postprocess_bf16",
+          "weights": [
+            "layer.1.hc_attn_scale",
+            "layer.1.hc_attn_base"
+          ]
         }
       },
       "inputs": [
@@ -3215,7 +3227,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::hc_pre_postprocess_bf16"
+          "kernel": "norm::hc_pre_postprocess_bf16",
+          "weights": [
+            "layer.1.hc_mlp_scale",
+            "layer.1.hc_mlp_base"
+          ]
         }
       },
       "inputs": [
@@ -3361,7 +3377,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::hc_pre_postprocess_bf16"
+          "kernel": "norm::hc_pre_postprocess_bf16",
+          "weights": [
+            "layer.2.hc_attn_scale",
+            "layer.2.hc_attn_base"
+          ]
         }
       },
       "inputs": [
@@ -3742,7 +3762,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::hc_pre_postprocess_bf16"
+          "kernel": "norm::hc_pre_postprocess_bf16",
+          "weights": [
+            "layer.2.hc_mlp_scale",
+            "layer.2.hc_mlp_base"
+          ]
         }
       },
       "inputs": [
@@ -3888,7 +3912,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::hc_pre_postprocess_bf16"
+          "kernel": "norm::hc_pre_postprocess_bf16",
+          "weights": [
+            "layer.3.hc_attn_scale",
+            "layer.3.hc_attn_base"
+          ]
         }
       },
       "inputs": [
@@ -4269,7 +4297,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::hc_pre_postprocess_bf16"
+          "kernel": "norm::hc_pre_postprocess_bf16",
+          "weights": [
+            "layer.3.hc_mlp_scale",
+            "layer.3.hc_mlp_base"
+          ]
         }
       },
       "inputs": [
@@ -4415,7 +4447,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::hc_pre_postprocess_bf16"
+          "kernel": "norm::hc_pre_postprocess_bf16",
+          "weights": [
+            "layer.4.hc_attn_scale",
+            "layer.4.hc_attn_base"
+          ]
         }
       },
       "inputs": [
@@ -4796,7 +4832,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::hc_pre_postprocess_bf16"
+          "kernel": "norm::hc_pre_postprocess_bf16",
+          "weights": [
+            "layer.4.hc_mlp_scale",
+            "layer.4.hc_mlp_base"
+          ]
         }
       },
       "inputs": [
@@ -4942,7 +4982,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::hc_pre_postprocess_bf16"
+          "kernel": "norm::hc_pre_postprocess_bf16",
+          "weights": [
+            "layer.5.hc_attn_scale",
+            "layer.5.hc_attn_base"
+          ]
         }
       },
       "inputs": [
@@ -5323,7 +5367,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::hc_pre_postprocess_bf16"
+          "kernel": "norm::hc_pre_postprocess_bf16",
+          "weights": [
+            "layer.5.hc_mlp_scale",
+            "layer.5.hc_mlp_base"
+          ]
         }
       },
       "inputs": [
@@ -5455,7 +5503,11 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "norm::hc_head_postprocess_bf16"
+          "kernel": "norm::hc_head_postprocess_bf16",
+          "weights": [
+            "hc_head_scale",
+            "hc_head_base"
+          ]
         }
       },
       "inputs": [

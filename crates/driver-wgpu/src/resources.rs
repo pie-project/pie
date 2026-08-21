@@ -1143,7 +1143,7 @@ impl Pool {
     /// nothing and zeroing it is only the allocation's own honesty.
     ///
     /// Sized from the WIDEST fire that will take the split, which is what
-    /// `attn::PIE_SPLIT_BELOW` caps: rows times query heads under that bound,
+    /// the split fire caps: rows times query heads under 128,
     /// times the splits, times a state of a running maximum, a denominator
     /// and one accumulator per channel. A fire wider than the bound runs the
     /// unsplit kernel and reads none of this.

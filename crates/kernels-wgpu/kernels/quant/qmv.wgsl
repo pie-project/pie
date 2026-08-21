@@ -487,9 +487,37 @@ struct BlockM {
 // row's activations at a time, so the eight unpacked vectors are the only
 // thing held across.
 //
-// The order the products reach each accumulator is `block_dot1`'s, k
-// ascending, so a row summed here and the same row summed alone agree bit
-// for bit.
+// # THE ORDER IS `block_dot1`'s AND THE ANSWER IS STILL NOT THE SAME
+//
+// The products reach each accumulator k ascending, exactly as they do in
+// `block_dot1`. This used to conclude from that "a row summed here and the
+// same row summed alone agree bit for bit", and it is FALSE: order is not
+// the whole of the arithmetic. This body holds twice the accumulators and
+// twice the activations live across the unpack, so the backend contracts a
+// different subset of its `a + b * c` into fused multiply-adds, and a fused
+// product rounds once where an unfused one rounds twice.
+//
+// Measured at two bf16 ulps on about five outputs in a hundred thousand, and
+// only at a projection as wide as an lm head -- 0 of 8192, 1 of 16384, 7 of
+// 151936, a flat rate rather than a threshold. It matters because
+// `reduce_store` picks this arm by ROW COUNT: an even batch is summed here
+// throughout and the tail of an odd one is summed by `block_dot1`, so a
+// conversation's logits depend on how many OTHER conversations were batched
+// with it. Twenty-eight layers turn five in a hundred thousand into 139561 of
+// 151936 logits differing by 0.79% of the row's peak, same argmax.
+//
+// `driver-wgpu`'s `a_seats_answer_does_not_depend_on_how_many_seats_fired_
+// with_it` is that fact with the parity sweep that found it, and its
+// `BATCH_SPREAD` is the bound. There is no kernel-level test to point at:
+// `kernels-wgpu` has no `tests/` any more.
+//
+// Exactness is available and was measured: calling `block_dot1` twice here
+// makes every row count agree bit for bit and costs 13-20% of the matvec at
+// m = 8 and above (`how_long_a_decodes_kernels_take`, 1024x1024 on an M4 Pro:
+// 0.034 ms against 0.041 at m = 8, 1.636 against 1.856 at m = 512). It was
+// not taken, because the matvec is where a batched decode spends its time and
+// two ulps is not an error -- but it is the remedy if a deployment ever needs
+// its answers not to depend on its own batching.
 struct BlockM2 {
     a0: vec4<f32>,
     a1: vec4<f32>,

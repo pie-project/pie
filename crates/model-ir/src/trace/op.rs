@@ -11,104 +11,65 @@ use serde::{Deserialize, Serialize};
 /// One operation of the traced form.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum OpKind {
-    /// Token ids -> hidden rows, via the embedding table.
-    Embed { weight: String },
-    /// `out = act @ weight^T (+ beta * out)`; `beta_one` folds the residual
-    /// accumulate into cuBLAS. With `selector` set, `weight` is a template
-    /// whose `{e}` a per-token `[Tokens, k]` expert assignment resolves, and
-    /// the selector is the op's last input.
-    Matmul {
-        weight: String,
-        beta_one: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        selector: Option<ValueId>,
-    },
-    /// Row RMSNorm over the trailing dim.
-    Rmsnorm {
-        weight: String,
-        variant: NormVariant,
-    },
-    /// `x[r, :] += bias` over `[rows, width]`. Sits after the lora
-    /// correction and before norms/rope.
-    AddBias { weight: String },
-    /// Per-head RMSNorm of packed `[rows, heads * head_dim]` Q or K.
-    /// `variant` folds the weight as on [`OpKind::Rmsnorm`]: `Plain`
-    /// multiplies `w`, `Gemma` folds `(1 + w)`.
-    RmsnormPerHead {
-        weight: String,
-        head_dim: u32,
-        #[serde(default, skip_serializing_if = "NormVariant::is_plain")]
-        variant: NormVariant,
-    },
-    /// Split packed QKV `[rows, q + 2kv]` into Q, K, V (three results).
-    SplitQkv { q_width: u32, kv_width: u32 },
-    /// Rotary embedding applied in place to Q and K (two operands).
-    /// `partial` rotates only the leading `rotary_dim` channels of each head,
-    /// as a resolved channel count — not HF's `partial_rotary_factor`.
-    Rope {
-        kind: RopeKind,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        partial: Option<u32>,
-    },
-    /// Append this fire's K/V rows to the layer's paged cache.
-    KvAppend { layer: u32 },
-    /// Paged attention over the layer's cache. Opaque in a semantic trace; a
-    /// lowered one states its kernel as an [`OpKind::Launch`].
-    Attention { layer: u32 },
-    /// SwiGLU over packed `[rows, 2 * inter]` gate‖up.
-    Swiglu { inter: u32 },
-    /// Gather the sampled rows and project to logits.
+    // ── RETIRED WIRE POSITIONS ──────────────────────────────────────────
+    //
+    // The semantic vocabulary lived here: `Embed`, `Matmul`, `Rmsnorm`, ...
+    // — twenty-two ops that said what a statement MEANS and left a driver
+    // table to decide what runs. The no-ask contract retires them: a tier-1
+    // statement is a [`OpKind::Launch`] whose symbol the DSL resolved
+    // through `kernels::canon` at trace time (or spelled as `canon::<role>`
+    // in a backend-less description trace). The stubs hold the wire
+    // positions — discriminants are ABI, append-only, never reused.
+    #[doc(hidden)]
+    Retired0,
+    #[doc(hidden)]
+    Retired1,
+    #[doc(hidden)]
+    Retired2,
+    #[doc(hidden)]
+    Retired3,
+    #[doc(hidden)]
+    Retired4,
+    #[doc(hidden)]
+    Retired5,
+    #[doc(hidden)]
+    Retired6,
+    #[doc(hidden)]
+    Retired7,
+    #[doc(hidden)]
+    Retired8,
+    #[doc(hidden)]
+    Retired9,
+    /// Gather the sampled rows and project to logits. STRUCTURAL, like
+    /// [`OpKind::Select`]: the lowering's readout/epilogue machinery owns it
+    /// (`Buffers::assign`'s epilogue gather), so it survives the semantic
+    /// retirement — a launch could not say "these rows are the readout".
     LmHead { weight: String },
-    /// `residual += x`. A separate op because the norm between the projection
-    /// GEMM and the add makes `beta=1` impossible.
-    ResidualAdd,
+    #[doc(hidden)]
+    Retired11,
     /// `x[index]` along the leading dim. Launches nothing: `Buffers` gives
     /// its value an offset into the source's.
     Select { index: u32 },
-    /// Router top-k over per-token logits, softmaxed and renormalized.
-    /// Results are expert indices (`[Tokens, k]` i32, [`DynAxis::PerToken`])
-    /// then weights, in that order.
-    TopK { k: u32 },
-    /// Per-token combine of the k routed expert outputs:
-    /// `out[t] = sum_j w[t, j] * x[t, j, :]`, `[Tokens, k, d]` → `[Tokens, d]`.
-    WeightedSum { k: u32 },
-    /// `out = base + sigmoid(gate) * x`, the scalar per-token gate broadcast
-    /// over the hidden dim. Operands are `[x, gate, base]`: fresh value
-    /// first, the stream it lands on last.
-    SigmoidGateAdd,
-    /// Split a packed `[rows, w0 + w1]` value at `w0` into two, for the GDN
-    /// in-projection. Two-way, unlike [`OpKind::SplitQkv`].
-    SplitGdn { width0: u32, width1: u32 },
-    /// Depthwise causal conv1d over the packed `[rows, conv_dim]` qkv with
-    /// fused SiLU. `weight` names the conv binding, under which the driver
-    /// binds both the conv weight and its bias; `kernel` is the window width;
-    /// `layer` picks the per-request conv-state slab it advances.
-    CausalConv1d {
-        weight: String,
-        bias: Option<String>,
-        layer: u32,
-        kernel: u32,
-    },
-    /// The post-conv GDN prep: unpacks `[q_raw|k_raw|v_raw]`, L2-normalizes
-    /// q/k into compact per-head fp32, converts v to fp32, and folds `a`/`b`
-    /// with `a_log`/`dt_bias` into log-decay `g` and mixing `beta`. The GQA
-    /// `repeat_interleave` of q/k is no op here: the recurrence kernels index
-    /// the compact layout directly.
-    GdnPrep { a_log: String, dt_bias: String },
-    /// Folds this fire's tokens into the layer's per-request recurrent state,
-    /// producing `[Tokens, Vh, Vd]` f32 from operands `[q, k, v, g, beta]`.
-    GatedDelta { layer: u32 },
-    /// Per (row, head), `out = w * rmsnorm(x) * silu(gate)` over the trailing
-    /// head dim of the rank-3 f32 core output, flattened to the gate's bf16
-    /// shape. Not a [`NormVariant`], since gating adds an operand.
-    RmsnormGated { weight: String },
-    /// The interleaved per-head `[query | gate]` split of qwen3.5's 2×-wide
-    /// gated q projection: `q[n, h*d + i] = packed[n, h*2d + i]`,
-    /// `gate[n, h*d + i] = packed[n, h*2d + d + i]`. Not a row split.
-    SplitQGate { heads: u32, head_dim: u32 },
-    /// `out = x * sigmoid(gate)`, qwen3.5's output gate before o_proj. No
-    /// residual and no landing, unlike [`OpKind::SigmoidGateAdd`].
-    SigmoidGateMul,
+    #[doc(hidden)]
+    Retired13,
+    #[doc(hidden)]
+    Retired14,
+    #[doc(hidden)]
+    Retired15,
+    #[doc(hidden)]
+    Retired16,
+    #[doc(hidden)]
+    Retired17,
+    #[doc(hidden)]
+    Retired18,
+    #[doc(hidden)]
+    Retired19,
+    #[doc(hidden)]
+    Retired20,
+    #[doc(hidden)]
+    Retired21,
+    #[doc(hidden)]
+    Retired22,
     /// A stated kernel launch, which only a lowered trace carries. `kernel`
     /// is the driver's launcher symbol, resolved through a name→launcher
     /// registry so the ABI stops growing per kernel.
@@ -217,11 +178,23 @@ impl PeelWindow {
 /// store is fixed slabs advanced in place — which is why RS fires run solo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StateStore {
-    /// The paged KV cache (`KvAppend` writes, `Attention` reads).
+    /// The paged KV cache.
     KvCache,
-    /// The GDN conv-window and recurrent-state slabs; `CausalConv1d` and
-    /// `GatedDelta` each read and advance their half.
+    /// The GDN conv-window and recurrent-state slabs.
     RecurrentState,
+}
+
+impl StateStore {
+    /// The `kernels::runtime` name this store answers to — the identity the
+    /// driver's resolver is keyed by. The enum is the WIRE form; the name is
+    /// the vocabulary's.
+    #[must_use]
+    pub fn runtime_name(&self) -> &'static str {
+        match self {
+            StateStore::KvCache => "kv_cache",
+            StateStore::RecurrentState => "recurrent_state",
+        }
+    }
 }
 
 /// The state an op addresses, derived by [`OpKind::state_ref`].
@@ -237,15 +210,7 @@ impl OpKind {
     /// How the planner learns a trace touches state without name-matching.
     pub fn state_ref(&self) -> Option<StateRef> {
         match *self {
-            OpKind::KvAppend { layer } | OpKind::Attention { layer, .. } => Some(StateRef {
-                store: StateStore::KvCache,
-                layer,
-            }),
             OpKind::Launch { state, .. } => state,
-            OpKind::CausalConv1d { layer, .. } | OpKind::GatedDelta { layer } => Some(StateRef {
-                store: StateStore::RecurrentState,
-                layer,
-            }),
             _ => None,
         }
     }

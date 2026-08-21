@@ -157,6 +157,7 @@ pub const fn build_kernels_at(
 ) -> MetalBinding {
     MetalBinding {
         qmm_partial_rows: false,
+        qmm_fp16_precast: true,
         qmm_tile: None,
         quant_group,
         quant_bits,

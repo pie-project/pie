@@ -452,15 +452,15 @@ pub fn lanes(rule: Rule, dims: Dims, module: Module) -> Result<[u32; 3], Ungeome
         // groups, so no threads ran, its buffer kept the zeros it was
         // allocated with, and every routed token was combined under
         // `sigmoid(0) = 0.5` instead of its own gate.
-        // FOUR ROWS TO A WORKGROUP on x, which `driver-vulkan`'s same arm
-        // does not do. `quant/qmv.wgsl`'s `PIE_MT` gives one workgroup four
-        // activation rows against the eight output columns whose weights it
-        // already read, so the extent is the quartered row count -- and
-        // `kernels-wgpu::quant::qmv_grid` is handed `quarters(vecs)` for the
-        // same reason. The Slang module has no such tiling; changing this arm
-        // there would ask for a quarter of the workgroups its shader needs.
+        // ROWS TO A WORKGROUP on x, which `driver-vulkan`'s same arm does
+        // not do. `quant/qmv.wgsl` gives one workgroup two activation rows
+        // against the eight output columns whose weights it already read, so
+        // the extent is the halved row count -- and `kernels-wgpu`'s own
+        // `quant::qmv_grid` halves `vecs` for the same reason, at the same
+        // literal. The Slang module has no such tiling; changing this arm
+        // there would ask for half the workgroups its shader needs.
         Rule::Qmv => [
-            module.local.at(0) * rows.div_ceil(kernels_wgpu::quant::PIE_MT.unsigned_abs()),
+            module.local.at(0) * rows.div_ceil(2),
             dims.width.div_ceil(4),
             1,
         ],
@@ -1561,10 +1561,30 @@ mod tests {
     /// crossed bodies that dispatch through `attn`'s `vector_grid`, fired at
     /// every head width the tree compiles. A body picks its entrypoint by
     /// indexing a literal spelling table with the fire's head width and
-    /// REFUSES a width it was not compiled for, so the eleven entrypoints
+    /// REFUSES a width it was not compiled for, so the fifteen entrypoints
     /// pinned at the bottom are the whole decode fleet as the bodies can reach
     /// it -- and a body that stops naming one fails that list rather than
     /// quietly shrinking the sweep.
+    ///
+    /// ## A paged decode is two dispatches now
+    ///
+    /// It was eleven entrypoints when this was written because each body
+    /// named exactly one. `sdpa_paged_decode` is split-K since: it fires
+    /// `_split_`, which partitions the key range eight ways and writes a
+    /// partial and a log-sum-exp per partition, and then `_merge_`, which
+    /// folds the eight into the row. Four widths times two passes is the
+    /// four extra names.
+    ///
+    /// Both passes are held to every claim here, which is the useful part. A
+    /// merge compiled for a different head width than its split, or laid out
+    /// on a flatter grid, reads the partials at the wrong stride and returns
+    /// a number rather than a refusal. The only thing the two are allowed to
+    /// differ on is the z extent, because that axis IS the partition count
+    /// and `Rule::SdpaVector` -- a (head, row) rule -- does not model it.
+    ///
+    /// `sdpa_paged_decode_sink` is deliberately not split and still names one
+    /// module. That asymmetry is the reason the check is written as "one pass
+    /// or a split and a merge" rather than pinned at two.
     ///
     /// This is the check that would catch the divergence being undone. A
     /// shader author who "fixed" `PIE_PAIRS` to `PIE_HEAD_DIM` would make
@@ -1641,50 +1661,104 @@ mod tests {
                 let Ok(stated) = fired(&symbol, firing(&symbol, rows, 128, fire), &scalars) else {
                     continue;
                 };
-                assert_eq!(
-                    stated.len(),
-                    1,
-                    "`{symbol}` is one decode dispatch, and it stated {}",
+                // ONE DISPATCH OR TWO, and the second is not a surprise: a
+                // paged decode is split-K now. `sdpa_paged_decode_*` fires
+                // `_split_`, which reduces each of eight key ranges into a
+                // partial and a log-sum-exp, and then `_merge_`, which folds
+                // the eight back into one row. Every claim below is made of
+                // BOTH, because a two-pass decode whose second pass reads a
+                // different head width or a flatter grid than its first is
+                // exactly the drift this test is for.
+                assert!(
+                    (1..=2).contains(&stated.len()),
+                    "`{symbol}` stated {} dispatches; a decode is one pass or \
+                     a split and a merge",
                     stated.len()
                 );
-                let name = stated[0].entrypoint.clone();
-                let declared =
-                    crate::reflect::entrypoint(&name, kernels_wgpu::Capability::Baseline)
-                        .unwrap_or_else(|e| panic!("`{name}`, which `{symbol}`'s body named: {e}"));
-                let module = Module::loaded(&name, &declared);
+                let split = stated.len() == 2;
                 assert_eq!(
-                    suffix_value(&name, "_d_"),
-                    Some(head_dim),
-                    "`{symbol}` fired at a {head_dim}-wide head and its body \
-                     named `{name}`, which selects another module"
+                    split,
+                    stated[0].entrypoint.contains("_split_"),
+                    "`{symbol}`: two dispatches means a split first, one means \
+                     no split at all -- `{}` is neither",
+                    stated[0].entrypoint
                 );
-                assert_eq!(
-                    module.local.at(0) * 2,
-                    head_dim,
-                    "`{name}` declares a workgroup of {:?} for a {head_dim}-wide head",
-                    declared.local
-                );
+                if split {
+                    assert!(
+                        stated[1].entrypoint.contains("_merge_"),
+                        "`{symbol}` split into `{}` and then `{}`, which does \
+                         not fold it back",
+                        stated[0].entrypoint,
+                        stated[1].entrypoint
+                    );
+                }
 
-                // And the rule says the same thing from the other side: the
-                // body's own extent, and `Rule::SdpaVector`'s, computed apart.
                 let d = Dims {
                     rows,
                     q_heads,
                     head_dim,
                     ..dims()
                 };
-                assert_eq!(
-                    stated[0].lanes,
-                    lanes(Rule::SdpaVector, d, module).unwrap_or_else(|e| panic!("`{name}`: {e}")),
-                    "`{name}`: the body's extent and `Rule::SdpaVector`'s are \
-                     the same shape reached twice, and they have parted"
-                );
-                assert_eq!(
-                    groups(Rule::SdpaVector, d, module).unwrap_or_else(|e| panic!("`{name}`: {e}")),
-                    [q_heads, rows, 1],
-                    "`{name}`: one workgroup per (head, row), exactly"
-                );
-                reached.push(name);
+                for (pass, state) in stated.iter().enumerate() {
+                    let name = state.entrypoint.clone();
+                    let declared =
+                        crate::reflect::entrypoint(&name, kernels_wgpu::Capability::Baseline)
+                            .unwrap_or_else(|e| {
+                                panic!("`{name}`, which `{symbol}`'s body named: {e}")
+                            });
+                    let module = Module::loaded(&name, &declared);
+                    assert_eq!(
+                        suffix_value(&name, "_d_"),
+                        Some(head_dim),
+                        "`{symbol}` fired at a {head_dim}-wide head and its body \
+                         named `{name}`, which selects another module"
+                    );
+                    assert_eq!(
+                        module.local.at(0) * 2,
+                        head_dim,
+                        "`{name}` declares a workgroup of {:?} for a {head_dim}-wide head",
+                        declared.local
+                    );
+
+                    // And the rule says the same thing from the other side: the
+                    // body's own extent, and `Rule::SdpaVector`'s, computed apart.
+                    //
+                    // ON X AND Y ONLY. `Rule::SdpaVector` is a (head, row)
+                    // grid and knows nothing about split-K, so the split
+                    // pass's z carries the partition count and the rule's is
+                    // 1. That is a real difference and not a drift -- the two
+                    // agree about the shape they are both describing, which
+                    // is the plane the row is laid out in.
+                    let rule_lanes = lanes(Rule::SdpaVector, d, module)
+                        .unwrap_or_else(|e| panic!("`{name}`: {e}"));
+                    assert_eq!(
+                        state.lanes[..2],
+                        rule_lanes[..2],
+                        "`{name}`: the body's extent and `Rule::SdpaVector`'s are \
+                         the same shape reached twice, and they have parted"
+                    );
+                    let partitions = state.lanes[2];
+                    if split && pass == 0 {
+                        assert!(
+                            partitions > 1,
+                            "`{name}` is the split pass and partitioned the key \
+                             range {partitions} ways, which is not a split"
+                        );
+                    } else {
+                        assert_eq!(
+                            partitions, 1,
+                            "`{name}` is not a split pass and must not carry a \
+                             z extent"
+                        );
+                    }
+                    assert_eq!(
+                        groups(Rule::SdpaVector, d, module)
+                            .unwrap_or_else(|e| panic!("`{name}`: {e}")),
+                        [q_heads, rows, 1],
+                        "`{name}`: one workgroup per (head, row), exactly"
+                    );
+                    reached.push(name);
+                }
             }
         }
 
@@ -1692,11 +1766,15 @@ mod tests {
         assert_eq!(
             reached,
             [
-                "sdpa_paged_decode_bfloat16_d_128",
-                "sdpa_paged_decode_bfloat16_d_256",
-                "sdpa_paged_decode_bfloat16_d_512",
-                "sdpa_paged_decode_bfloat16_d_64",
+                "sdpa_paged_decode_merge_bfloat16_d_128",
+                "sdpa_paged_decode_merge_bfloat16_d_256",
+                "sdpa_paged_decode_merge_bfloat16_d_512",
+                "sdpa_paged_decode_merge_bfloat16_d_64",
                 "sdpa_paged_decode_sink_bfloat16_d_64",
+                "sdpa_paged_decode_split_bfloat16_d_128",
+                "sdpa_paged_decode_split_bfloat16_d_256",
+                "sdpa_paged_decode_split_bfloat16_d_512",
+                "sdpa_paged_decode_split_bfloat16_d_64",
                 "sdpa_vector_decode_bfloat16_d_128",
                 "sdpa_vector_decode_bfloat16_d_256",
                 "sdpa_vector_decode_bfloat16_d_64",
@@ -1833,6 +1911,13 @@ mod tests {
     /// loudly as a module that starts being one. That is what said the fix had
     /// landed -- `these are listed as known-defective and are not` -- in the
     /// same run that proved it.
+    ///
+    /// RETIRED WITH `kernels-wgpu`'s TEST TREE. That name is a record of a
+    /// measurement now, not a live proof: the crate lost `tests/` and every
+    /// in-file `mod tests` when the three shader planes moved their numbers to
+    /// the fire that reads them, and nothing in this workspace re-runs it. What
+    /// it reported is still why the sentence above says what it says; what is
+    /// gone is the thing that would notice if it stopped being true.
     #[test]
     fn no_module_reads_a_grid_axis_its_rule_leaves_flat() {
         // ENTRYPOINTS whose module reads an axis its body flattens -- the
@@ -2276,15 +2361,69 @@ mod tests {
         );
     }
 
-    /// A GEMM at a row count no tile divides refuses rather than substituting.
+    /// A GEMM at a row count no tile divides ROUNDS UP, and does not
+    /// substitute a shape.
+    ///
+    /// This asserted the refusal until `qmm_t.wgsl` learned its row count.
+    /// `Params` ends with `m` now and `write_out` returns on `row >= m`, so
+    /// the last tile computes and discards instead of storing over whatever
+    /// the arena put next; the `Rule::Qmm` arm says so at length and this is
+    /// the check for it.
+    ///
+    /// The refusal is still the right answer for a driver whose GEMM stores
+    /// its overhang, which is why `Ungeometric::PartialTile` remains a
+    /// variant and why `driver-metal` and `driver-vulkan` still raise it.
+    /// What must NOT come back is a matvec grid: `affine_qmm_t` reads its
+    /// tile from the grid, so substituting one points the body at a tiling
+    /// that is not there and a two-token prefill returns entirely NaN.
     #[test]
-    fn a_partial_tile_refuses() {
+    fn a_partial_tile_rounds_up() {
         let ragged = Dims { rows: 13, ..dims() };
         let m = Module::named("affine_qmm_t_bfloat16_bm_16_bn_16", [32, 2, 2]);
+        let grid = groups(Rule::Qmm, ragged, m).expect("a ragged GEMM launches");
+        // `groups` reports WORKGROUPS, so the y extent is the tile count
+        // itself: thirteen rows over a 16-row tile is ONE tile, not none and
+        // not two. The overhang is the kernel's to discard now.
+        assert_eq!(grid[1], 1);
+        // A whole tile at the same size is the same grid, which is the claim
+        // "rounds up" actually makes -- and the tile is still the MODULE's
+        // rather than a substituted one, or the width would have moved off x.
         assert_eq!(
-            groups(Rule::Qmm, ragged, m),
-            Err(Ungeometric::PartialTile { rows: 13, tile: 16 })
+            grid,
+            groups(Rule::Qmm, Dims { rows: 16, ..dims() }, m).expect("a whole tile launches"),
+            "thirteen rows and sixteen are the same single tile"
         );
+        // And one row past it is two tiles, so the rounding is a ceiling and
+        // not a floor that silently drops the overhang instead of computing
+        // and discarding it.
+        assert_eq!(
+            groups(Rule::Qmm, Dims { rows: 17, ..dims() }, m).expect("seventeen rows launch")[1],
+            2
+        );
+
+        // AND NO RULE IN THIS DRIVER RAISES THE REFUSAL ANY MORE, which is
+        // the claim the rename is really making and the one worth sweeping
+        // for. `Rule::Qmm` was the only arm that produced
+        // `Ungeometric::PartialTile`; asserting that the arm stopped is a
+        // check on one arm, while asserting that NOTHING produces it is a
+        // check on the driver -- and it is what keeps the variant honest
+        // while it stays declared for `driver-metal` and `driver-vulkan`.
+        //
+        // Row counts one through two whole tiles, over every launch rule,
+        // against a module whose tile is real. A rule that reintroduced a
+        // modulus refusal would be caught on the first count that is not a
+        // multiple of it, by name.
+        for &rule in kernels::LaunchRule::ALL {
+            for rows in 1..=32 {
+                let d = Dims { rows, ..dims() };
+                assert!(
+                    !matches!(groups(rule, d, m), Err(Ungeometric::PartialTile { .. })),
+                    "`{rule:?}` refuses {rows} rows with `Ungeometric::PartialTile`, \
+                     and no rule in this driver is supposed to: the tiled GEMM \
+                     discards its overhang now"
+                );
+            }
+        }
     }
 
     /// A rectangle of no rows still launches one.
@@ -2378,10 +2517,11 @@ mod tests {
             // -- a probe too coarse to see the thing it was built for, which
             // is the failure mode a ledger like this is most likely to have.
             //
-            // Not 1 against 64 either: a GEMM refuses a partial tile, so
-            // `Qmm` at one row is `PartialTile { rows: 1, tile: 32 }` and the
-            // sweep panicked before it compared anything. Both counts are
-            // whole tiles for every tile size in this file.
+            // Not 1 against 64 either. A GEMM rounds a partial tile up now,
+            // so one row and 32 are the SAME grid and `Qmm` would have looked
+            // row-independent for the second time in one ledger. Both counts
+            // being whole tiles for every tile size in this file is what
+            // keeps the comparison about the rule and not about rounding.
             let one = lanes(rule, Dims { rows: 32, ..base }, m).expect("thirty-two rows");
             let many = lanes(rule, Dims { rows: 64, ..base }, m).expect("sixty-four rows");
             let grew = one != many;

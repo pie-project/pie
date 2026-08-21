@@ -126,6 +126,12 @@ pub struct NormW {
     pub variant: NormVariant,
     pub per_head: Option<u32>,
     pub layer: Option<u32>,
+    /// The epsilon THIS NORM's statements carry, on the handle because a
+    /// handle is how `model/src/{family}/forward` — which owns every value a
+    /// statement needs — hands one to the DSL. It rides the params run as
+    /// its bits; an unstated epsilon is a zero, and a zero epsilon divides
+    /// an all-zero row by nothing.
+    pub eps: f32,
 }
 
 #[derive(Clone)]
@@ -141,8 +147,15 @@ impl Kv {
     }
 
     pub fn append(&self, k: &Val, v: &Val) {
-        self.t
-            .with(Some(self.l), |b| b.kv_append(self.l, k.id, v.id));
+        self.t.with(Some(self.l), |b| {
+            b.launch(
+                "attn::write_kv_to_pages",
+                vec![],
+                Some(StateRef { store: StateStore::KvCache, layer: self.l }),
+                vec![k.id, v.id],
+                vec![],
+            );
+        });
     }
 }
 
@@ -288,12 +301,7 @@ impl M {
     }
 
     pub fn embed(&self) -> Val {
-        let id = self.t.with(None, |b| b.embed("embed", self.f.hidden));
-        Val {
-            t: self.t.clone(),
-            id,
-            layer: None,
-        }
+        embed_with(&self.t, "embed", self.f.hidden, self.f.vocab)
     }
 
     pub fn layer(&self, l: u32) -> Layer {
@@ -454,13 +462,35 @@ pub fn input(t: &Trace, hidden: u32) -> Val {
     }
 }
 
-pub fn embed_with(t: &Trace, weight: &str, hidden: u32) -> Val {
-    let id = t.with(None, |b| b.embed(weight, hidden));
+/// `layout::embed_bf16`: the token-id stream is minted by name and the
+/// vocab rides the params run — the swept signature's appended pair.
+pub fn embed_with(t: &Trace, weight: &str, hidden: u32, vocab: u32) -> Val {
+    let id = t.with(None, |b| {
+        let token_ids = b.runtime_tensor(
+            "token_ids",
+            None,
+            Shape(vec![Dim::Tokens]),
+            DType::I32,
+        );
+        b.launch_with_params(
+            weight_launch::EMBED,
+            vec![weight.to_string()],
+            None,
+            vec![vocab],
+            vec![token_ids],
+            vec![(Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)],
+        )[0]
+    });
     Val {
         t: t.clone(),
         id,
         layer: None,
     }
+}
+
+/// The tier-1 symbols `ops.rs` and the handles state; named once.
+pub mod weight_launch {
+    pub const EMBED: &str = "layout::embed_bf16";
 }
 
 pub fn lm_head_at(t: &Trace, x: &Val, weight: &str, vocab: u32) -> Val {
@@ -475,6 +505,75 @@ pub fn lm_head_at(t: &Trace, x: &Val, weight: &str, vocab: u32) -> Val {
 /// Resolve tied embedding here so each family cannot forget the fact.
 pub fn lm_head_tied(t: &Trace, x: &Val, tied: bool, vocab: u32) -> Val {
     lm_head_at(t, x, if tied { "embed" } else { "lm_head" }, vocab)
+}
+
+/// The runtime vocabulary's veneer: every driver-owned value a text may
+/// name, minted here and answered by the driver's resolver at bind. The
+/// names are `kernels::runtime`'s (identity in the floor crate, carrier in
+/// the plane, answer in the driver); this module is only the authoring
+/// surface's spelling of them.
+pub mod runtime {
+    use super::*;
+
+    fn tensor(t: &Trace, name: &str, shape: Shape, dtype: DType) -> Val {
+        let id = t.with(None, |b| b.runtime_tensor(name, None, shape, dtype));
+        Val { t: t.clone(), id, layer: None }
+    }
+
+    /// Per-token absolute positions, `[Tokens]` i32.
+    pub fn positions(t: &Trace) -> Val {
+        tensor(t, "positions", Shape(vec![Dim::Tokens]), DType::I32)
+    }
+
+    /// The fire's token ids, `[Tokens]` i32.
+    pub fn token_ids(t: &Trace) -> Val {
+        tensor(t, "token_ids", Shape(vec![Dim::Tokens]), DType::I32)
+    }
+
+    /// Which request each token row belongs to, `[Tokens]` i32.
+    pub fn request_of_token(t: &Trace) -> Val {
+        tensor(t, "request_of_token", Shape(vec![Dim::Tokens]), DType::I32)
+    }
+
+    /// The query-window CSR, `[Requests + 1]` i32 (stated as `[Requests]`;
+    /// the driver stages the +1 row the CSR convention implies).
+    pub fn qo_indptr(t: &Trace) -> Val {
+        tensor(t, "qo_indptr", Shape(vec![Dim::Requests]), DType::I32)
+    }
+
+    /// Row-validity mask, `[Tokens]` i32.
+    pub fn row_valid(t: &Trace) -> Val {
+        tensor(t, "row_valid", Shape(vec![Dim::Tokens]), DType::I32)
+    }
+
+    /// Rows the fire samples, `[Requests]` i32.
+    pub fn sampling_indices(t: &Trace) -> Val {
+        tensor(t, "sampling_indices", Shape(vec![Dim::Requests]), DType::I32)
+    }
+
+    /// First-token flags, `[Requests]` i32.
+    pub fn first_token(t: &Trace) -> Val {
+        tensor(t, "first_token", Shape(vec![Dim::Requests]), DType::I32)
+    }
+
+    /// The layer's paged-KV view — an OBJECT, not a tensor: resolved by
+    /// name, read by the routine through `In<Struct<KvCache>>`.
+    pub fn kv_cache(t: &Trace, l: u32) -> Val {
+        let id = t.with(Some(l), |b| b.runtime_object("kv_cache", Some(l)));
+        Val { t: t.clone(), id, layer: Some(l) }
+    }
+
+    /// The layer's recurrent-state view (slab + conv half).
+    pub fn recurrent(t: &Trace, l: u32) -> Val {
+        let id = t.with(Some(l), |b| b.runtime_object("recurrent_state", Some(l)));
+        Val { t: t.clone(), id, layer: Some(l) }
+    }
+
+    /// The custom-mask view; null/false inside when the fire has none.
+    pub fn attention_mask(t: &Trace) -> Val {
+        let id = t.with(None, |b| b.runtime_object("attention_mask", None));
+        Val { t: t.clone(), id, layer: None }
+    }
 }
 
 pub mod cuda;

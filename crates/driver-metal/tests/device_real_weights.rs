@@ -1973,25 +1973,29 @@ fn a_real_checkpoints_weights_produce_finite_varied_activations() {
     // ── THE PER-TOKEN AXIS ──
     //
     // Four lanes decoded four different tokens, so the readout should hold
-    // four different rows. It holds ONE: 128256 of 513024 values non-zero,
-    // which is exactly one row of a 128256-wide vocabulary, and rows one
-    // through three are zero all the way through.
+    // four different rows, and it does. The assertion below demands four and
+    // this file passes it.
     //
-    // Measured 2026-08-10, and it is the largest remaining gap between this
-    // executor and a model that answers. Nothing about it is a grid: every
-    // launch states `rows 0..4`, `qmv_mb` puts the row on `grid.x` and
+    // IT USED TO HOLD ONE, and the diagnosis stood here: 128256 of 513024
+    // values non-zero, exactly one row of a 128256-wide vocabulary, rows one
+    // through three zero all the way through. Nothing about it was a grid --
+    // every launch states `rows 0..4`, `qmv_mb` puts the row on `grid.x` and
     // `qmv_fast_impl` reads it there (`y += tid.x * out_vec_size`), and the
-    // dispatches come out `[128, 512, 1]` over `[32, 2, 1]` -- four
-    // threadgroups on x, one per row. All 227 launches plan and none has an
-    // empty grid.
+    // dispatches came out `[128, 512, 1]` over `[32, 2, 1]`, four
+    // threadgroups on x, one per row. The paragraph ended "pinned at one, and
+    // the number to want is four".
     //
-    // So the arithmetic is right and the rows still do not appear, which
-    // means the next thing to look at is what the FIRST statement writes:
-    // every later row being zero is what a gather that emitted one row looks
-    // like four launches downstream. Reading between dispatches is the
-    // instrument that settles it and this file does not have one yet.
+    // It was pinned at four in the same commit that wrote it (`4dccee7a6`,
+    // 2026-08-09), so the narration has contradicted the assertion three
+    // lines below it since the day both arrived. A reader who trusted the
+    // prose would have believed this executor still answers one token for
+    // four; the gate has demanded four the whole time.
     //
-    // Pinned at one, and the number to want is four.
+    // What the paragraph is still worth is the SHAPE of the failure, which
+    // is why it is kept rather than deleted: every later row being zero is
+    // what a gather that emitted one row looks like four launches
+    // downstream, and that is the reading to reach for if this ever falls
+    // again. It is a description of a fixed defect and says so.
     let lanes = {
         let row = &read[at..end];
         let stride = row.len() / 4;
@@ -4700,6 +4704,7 @@ fn the_batched_gemm_answers_what_the_matvec_answers() {
     // difference between the two answers cannot be a different deployment.
     let unbatched = MetalBinding {
         qmm_partial_rows: false,
+        qmm_fp16_precast: true,
         qmm_tile: None,
         qmm_multi_batch: false,
         ..observed
@@ -7175,6 +7180,7 @@ fn a_tie_at_the_last_expert_is_where_the_two_spellings_part() {
     }
     let unbatched = MetalBinding {
         qmm_partial_rows: false,
+        qmm_fp16_precast: true,
         qmm_tile: None,
         qmm_multi_batch: false,
         ..observed

@@ -60,6 +60,7 @@ fn the_split_puts_every_channel_where_its_width_says() {
     let dispatch = Dispatch {
         symbol: "split_qkv_bf16",
         file: "attn/split_qkv.metal",
+        stamp: "",
         grid: [PACKED, ROWS, 1],
         threadgroup: [256, 1, 1],
         // One dispatch, so nothing to order against.

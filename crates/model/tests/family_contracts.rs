@@ -1563,9 +1563,13 @@ fn an_mlx_checkpoint_is_not_requantized_by_int4() {
             tensor.encoding
         );
     }
-    assert!(
-        seen >= 7,
-        "fixture should carry every projection, saw {seen}"
+    // "Every projection" is seven, and seven is what it sees, so the floor
+    // had no slack downward -- but it had all of it upward, and an eighth
+    // projection arriving is exactly the thing "every" would need to hear
+    // about. The word in the message wanted an equality.
+    assert_eq!(
+        seen, 7,
+        "fixture should carry every projection and no more, saw {seen}"
     );
 }
 

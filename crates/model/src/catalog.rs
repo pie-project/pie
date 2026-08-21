@@ -211,6 +211,30 @@ pub struct MetalBinding {
     ///
     /// [`qmm_tile`]: MetalBinding::qmm_tile
     pub qmm_partial_rows: bool,
+    /// May this backend stage the GEMM's activation through f16?
+    ///
+    /// A PERMISSION, conjoined in `metal_facts` with the codec test
+    /// [`project::qmm_fp16_precast`] rather than replacing it: the staged
+    /// symbol is stamped at one codec only, so a backend saying `true` at any
+    /// other names a symbol that does not exist and the declaration is
+    /// refused. Saying `false` is always safe -- the GEMM reads the bf16
+    /// activation directly, which is what every non-staged codec already
+    /// does.
+    ///
+    /// `true` everywhere it is not stated, because staging is what the
+    /// catalog's MLX checkpoints expect.
+    ///
+    /// `driver-wgpu` says `false`, and it is not a preference. Its GEMM does
+    /// not read back what `cast_qmm_input` wrote: staged, the tiled family
+    /// and the matvec family part by 120.4% of the logit row's peak on
+    /// qwen3-0.6b and the daemon answers a row that does not move when the
+    /// prompt's last token changes; unstaged, they part by 0.9% and it does.
+    /// `engine::driver::backend::wgpu` carries the measurement and the two
+    /// places to look when someone repairs it.
+    ///
+    /// [`project::qmm_fp16_precast`]:
+    ///     crate::shared::llama_like::project::qmm_fp16_precast
+    pub qmm_fp16_precast: bool,
     /// The affine quantisation group width the staged tensors carry.
     ///
     /// Asked of the load, which reads it off the TENSORS. This said it was

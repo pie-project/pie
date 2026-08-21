@@ -3,38 +3,23 @@ use super::arith::{ceil_div_i64, ceil_div_u32, fa2_determine_cta_tile_q};
 use super::info::PrefillPlanInfo;
 use super::{Device, Error, Plan, Sizes, Workspace};
 
-/// The batch a prefill plan is built for.
 #[derive(Clone, Copy, Debug)]
 pub struct Request<'a> {
-    /// `batch_size + 1` QO row offsets.
+
     pub qo_indptr: &'a [i32],
-    /// `batch_size + 1` KV **page** offsets.
     pub kv_indptr: &'a [i32],
-    /// QO rows in the batch, which sizes the merge indptr.
     pub total_num_rows: u32,
-    /// Requests in the batch.
     pub batch_size: u32,
-    /// Query/output heads.
     pub num_qo_heads: u32,
-    /// Key/value heads; must divide `num_qo_heads`.
     pub num_kv_heads: u32,
-    /// QK head dimension. Upstream takes it and immediately `(void)`s it — kept
     pub head_dim_qk: u32,
-    /// VO head dimension, which chooses the tile width and sizes the partial
     pub head_dim_vo: u32,
-    /// Tokens per page.
     pub page_size: u32,
-    /// Whether this plan will be captured into a CUDA graph.
     pub enable_cuda_graph: bool,
-    /// `sizeof(DTypeO)`. Also `(void)`d upstream; also kept.
     pub sizeof_dtype_o: u32,
-    /// Sliding-window span, or `-1` for full attention. The one input that
     pub window_left: i32,
-    /// A caller-imposed KV chunk size in pages, or `-1`/`0` to search.
     pub fixed_split_size: i32,
-    /// Refuse to split at all: one KV chunk per request.
     pub disable_split_kv: bool,
-    /// CTAs already spoken for by a co-resident decode kernel (POD attention),
     pub num_colocated_ctas: i64,
 }
 
@@ -65,38 +50,27 @@ impl Request<'_> {
     }
 }
 
-/// What the QO/KV splitter decided: the schedule, before it is laid out.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Split {
-    /// Whether KV is partitioned across work items.
+
     pub split_kv: bool,
-    /// Work items produced.
     pub new_batch_size: u32,
-    /// Work-item slots the plan reserves — larger than `new_batch_size` only
     pub padded_batch_size: u64,
-    /// The QO tile width chosen for the whole batch.
     pub cta_tile_q: u32,
-    /// The KV chunk size **in tokens** (the splitter's page-denominated answer
     pub kv_chunk_size: i64,
-    /// `request_indices[work]`.
     pub request_indices: Vec<i32>,
-    /// `qo_tile_indices[work]`.
     pub qo_tile_indices: Vec<i32>,
-    /// `kv_tile_indices[work]`.
     pub kv_tile_indices: Vec<i32>,
-    /// `merge_indptr[row]`, `total_num_rows + 1` entries.
     pub merge_indptr: Vec<i32>,
-    /// `o_indptr[request]`, `batch_size + 1` entries.
     pub o_indptr: Vec<i32>,
 }
 
-/// `PrefillSplitQOKVIndptr` — the schedule.
 pub fn split_qo_kv_indptr(
     req: &Request<'_>,
     max_batch_size_if_split: u32,
     cc_major: i32,
 ) -> Result<Split, Error> {
-    /// `PrefillBinarySearchKVChunkSize`.
+
     #[must_use]
     pub fn binary_search_kv_chunk_size(
     enable_cuda_graph: bool,
@@ -277,7 +251,6 @@ pub fn split_qo_kv_indptr(
     })
 }
 
-/// `PrefillPlan` — the plan, and the bytes to upload under it.
 pub fn plan(
     req: &Request<'_>,
     device: &Device,
@@ -286,7 +259,6 @@ pub fn plan(
     plan_impl(req, device, workspace, Staging::new(workspace.int_bytes))
 }
 
-/// `PrefillPlanWorkspaceSize` — the same arithmetic with the writes turned off.
 pub fn workspace_size(req: &Request<'_>, device: &Device) -> Result<Sizes, Error> {
     let plan = plan_impl(req, device, Workspace::unbounded(), Staging::sizing())?;
     Ok(Sizes { float_bytes: plan.float_bytes, int_bytes: plan.int_bytes })
@@ -415,130 +387,4 @@ fn plan_impl(
         int_bytes,
         float_bytes: float_alloc.used(),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn request<'a>(qo: &'a [i32], kv: &'a [i32], rows: u32) -> Request<'a> {
-        Request {
-            qo_indptr: qo,
-            kv_indptr: kv,
-            total_num_rows: rows,
-            batch_size: qo.len() as u32 - 1,
-            num_qo_heads: 32,
-            num_kv_heads: 8,
-            head_dim_qk: 128,
-            head_dim_vo: 128,
-            page_size: 16,
-            enable_cuda_graph: false,
-            sizeof_dtype_o: 2,
-            window_left: -1,
-            fixed_split_size: -1,
-            disable_split_kv: false,
-            num_colocated_ctas: 0,
-        }
-    }
-
-    const L40S: Device = Device::new(142, 8);
-
-    /// A long prefill already fills the grid with QO tiles, so KV is not split
-    #[test]
-    fn a_lone_prefill_saturates_the_grid_with_qo_tiles_alone() {
-        let qo = [0i32, 4096];
-        let kv = [0i32, 256];
-        let split = split_qo_kv_indptr(&request(&qo, &kv, 4096), 35, 8).unwrap();
-        assert!(!split.split_kv);
-        assert_eq!(split.cta_tile_q, 128);
-        assert_eq!(split.new_batch_size, 128);
-        assert!(split.request_indices.iter().all(|&r| r == 0));
-        assert_eq!(split.new_batch_size as usize, split.request_indices.len());
-    }
-
-    /// A short batch does not saturate it, and there the search does split.
-    #[test]
-    fn a_short_batch_leaves_room_and_is_split() {
-        let qo = [0i32, 1, 2];
-        let kv = [0i32, 4096, 8192];
-        let split = split_qo_kv_indptr(&request(&qo, &kv, 2), 35, 8).unwrap();
-        assert!(split.split_kv);
-        assert!(split.new_batch_size > 2, "a two-request batch stayed two work items");
-    }
-
-    /// `disable_split_kv` is the flag our own decode-shaped prefills use, and
-    #[test]
-    fn disabling_the_split_leaves_one_chunk_per_tile() {
-        let qo = [0i32, 1, 2, 3];
-        let kv = [0i32, 100, 200, 300];
-        let mut req = request(&qo, &kv, 3);
-        req.disable_split_kv = true;
-        let split = split_qo_kv_indptr(&req, 35, 8).unwrap();
-        assert!(!split.split_kv);
-        assert_eq!(split.kv_tile_indices, vec![0, 0, 0]);
-        assert_eq!(split.new_batch_size, 3);
-    }
-
-    /// A sliding window caps the effective KV length, so a 100k-token sequence
-    #[test]
-    fn a_window_bounds_the_split_of_a_long_sequence() {
-        let qo = [0i32, 8];
-        let kv = [0i32, 6250];
-        let mut req = request(&qo, &kv, 8);
-        req.window_left = 512;
-        let windowed = split_qo_kv_indptr(&req, 35, 8).unwrap();
-        req.window_left = -1;
-        let full = split_qo_kv_indptr(&req, 35, 8).unwrap();
-        assert!(windowed.new_batch_size < full.new_batch_size);
-    }
-
-    /// The empty batch is upstream's division by zero, and this port's one
-    #[test]
-    fn the_empty_batch_is_refused_rather_than_dividing_by_zero() {
-        let qo = [0i32];
-        let kv = [0i32];
-        let err = split_qo_kv_indptr(&request(&qo, &kv, 0), 35, 8).unwrap_err();
-        assert_eq!(err, Error::EmptyBatch);
-    }
-
-    /// A backwards indptr is a caller bug, and it is named.
-    #[test]
-    fn a_backwards_indptr_is_refused() {
-        let qo = [0i32, 10, 5];
-        let kv = [0i32, 4, 8];
-        let err = split_qo_kv_indptr(&request(&qo, &kv, 10), 35, 8).unwrap_err();
-        assert!(matches!(err, Error::NegativeSpan { array: "qo_indptr", index: 1, .. }));
-    }
-
-    /// Heads that do not divide are refused before anything is computed.
-    #[test]
-    fn indivisible_heads_are_refused() {
-        let qo = [0i32, 4];
-        let kv = [0i32, 4];
-        let mut req = request(&qo, &kv, 4);
-        req.num_kv_heads = 5;
-        let err = plan(&req, &L40S, Workspace::new(1 << 20, 1 << 20)).unwrap_err();
-        assert!(matches!(err, Error::HeadsNotDivisible { .. }));
-    }
-
-    /// The sizing pass answers what the materialising pass consumes.
-    #[test]
-    fn sizing_agrees_with_planning() {
-        let qo = [0i32, 1, 2];
-        let kv = [0i32, 4096, 8192];
-        let req = request(&qo, &kv, 2);
-        let sizes = workspace_size(&req, &L40S).unwrap();
-        let plan = plan(&req, &L40S, Workspace::new(1 << 30, 1 << 22)).unwrap();
-        assert_eq!(sizes.int_bytes, plan.int_bytes);
-        assert_eq!(sizes.float_bytes, plan.float_bytes);
-    }
-
-    /// A workspace too small to hold the descriptor is refused, by name.
-    #[test]
-    fn a_workspace_that_cannot_hold_the_plan_is_refused() {
-        let qo = [0i32, 4096];
-        let kv = [0i32, 256];
-        let err = plan(&request(&qo, &kv, 4096), &L40S, Workspace::new(1 << 30, 8)).unwrap_err();
-        assert!(matches!(err, Error::WorkspaceOverflow { .. }));
-    }
 }

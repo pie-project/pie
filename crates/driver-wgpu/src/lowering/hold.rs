@@ -213,6 +213,13 @@ pub fn facts(
 /// ORDER a body asks in is the order the driver binds — which is the whole
 /// point, and is what `every_routine_binds_a_buffer_for_every_binding_its_
 /// module_declares` measures against the shader.
+///
+/// RETIRED WITH `kernels-wgpu`'s TEST TREE. That name is a record of a
+/// measurement now, not a live proof: the crate lost `tests/` and every
+/// in-file `mod tests` when the three shader planes moved their numbers to
+/// the fire that reads them, and nothing in this workspace re-runs it. What
+/// it reported is still why the sentence above says what it says; what is
+/// gone is the thing that would notice if it stopped being true.
 pub struct Handles<'a> {
     /// The statement's arguments, as the lowering states them.
     args: &'a [Arg],
@@ -1132,15 +1139,14 @@ mod tests {
     /// the same length, so nothing downstream would see it.
     ///
     /// What makes this checkable without a second list: an entrypoint belongs
-    /// to the ROW or ROUTINE whose name is its longest prefix, and
-    /// `kernels-wgpu` already states both. So the claim is only correct when
-    /// the claiming stem IS that owner.
+    /// to the ROUTINE whose name is its longest prefix, and `kernels-wgpu`
+    /// states those. So the claim is only correct when the claiming stem IS
+    /// that owner.
     #[test]
     fn every_entrypoint_is_claimed_by_the_stem_that_owns_it() {
-        let owners: Vec<&str> = kernels_wgpu::KERNELS
-            .iter()
-            .map(|k| k.name)
-            .chain(kernels_wgpu::routines().into_iter().map(|r| r.name))
+        let owners: Vec<&str> = kernels_wgpu::routines()
+            .into_iter()
+            .map(|r| r.name)
             .collect();
 
         let mut claimed = 0u32;

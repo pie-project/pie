@@ -319,19 +319,20 @@ fn allowlists() -> Allowlists {
         // THIS file a transcription, which is exactly what the first draft of
         // this comment did and what the guard then reported.)
         //
-        // Empty, and left in place rather than deleted: the one entry was a
-        // Metal numerics test that went with the C++ driver, and nothing
-        // outside the contract writes this shift today. An empty list is the
-        // statement that the exemption is unused, which is worth more than
-        // the absence of a field.
-        shift: &[
-            // A test-local LCG that takes its top 24 bits, not a keyed-stream
-            // transcription: `fa4_fires` needs deterministic bf16 inputs and
-            // the crate does not depend on `rand`. Same shift, and the only
-            // thing it shares with the contract is arithmetic — it draws from
-            // its own multiplier and never touches a PTIR stream.
-            "crates/kernels-cuda/tests/fa4_fires.rs",
-        ],
+        // Empty AGAIN, and left in place rather than deleted for the reason
+        // it was left in place the first time: an empty list is the statement
+        // that the exemption is unused, which is worth more than the absence
+        // of a field.
+        //
+        // Twice now the one entry has been a test that went away rather than
+        // an exemption that was withdrawn -- first a Metal numerics test with
+        // the C++ driver, now `kernels-cuda`'s `fa4_fires`, whose whole
+        // `tests/` directory is gone. That is the pattern this field's
+        // companion gate is for: an allowlist keyed by path cannot tell "the
+        // file stopped needing the exemption" from "the file stopped
+        // existing", and only one of those is progress. Nothing outside the
+        // contract writes this shift today either way.
+        shift: &[],
     }
 }
 

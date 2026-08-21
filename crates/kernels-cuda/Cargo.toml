@@ -64,6 +64,7 @@ _cuda = ["dep:cudarc"]
 [dependencies]
 # The routine registry — see the workspace table for why this one.
 linkme = { workspace = true }
+inventory = { workspace = true }
 # The vocabulary a row is written in: `KernelSig`, `LaunchRule`, `Ty`,
 # `Source`. Layer 1 is this crate's re-export of it.
 kernels = { path = "../kernels" }

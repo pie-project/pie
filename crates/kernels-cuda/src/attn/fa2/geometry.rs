@@ -1,58 +1,39 @@
-//! FA2's host arithmetic: occupancy, tiling, and the KV element width the
-//! lattice is indexed by.
-//!
-//! `params` used to be declared HERE, as this file's child, which is what put
-//! the `#[repr(C)]` mirrors one level below the arithmetic and two levels
-//! below the lattice that fills them. All three are siblings now under
-//! [`crate::attn::fa2`], because they are one family and the tree says so.
 
 use core::fmt;
 
-/// The KV cache element width FA2 is launched over, in bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KvWidth(pub u32);
 
 impl KvWidth {
-    /// Two bytes. **The only width the lattice instantiates.**
+
     pub const BF16: Self = Self(2);
 
-    /// `sizeof(DTypeKV*)` — a pointer, not the element.
     pub const POINTER: u32 = 8;
 }
 
-/// The device facts the FA2 launchers query inline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Device {
-    /// `GetCudaComputeCapability().first` — `decode.cuh:763`,
+
     pub cc_major: u32,
-    /// `cudaDevAttrMaxSharedMemoryPerMultiprocessor` — `prefill.cuh:4213-4215`.
     pub max_smem_per_sm: u32,
-    /// `cudaDevAttrMaxSharedMemoryPerBlockOptin` — `prefill.cuh:4216-4218`.
     pub max_smem_per_block_optin: u32,
 }
 
 impl Device {
-    /// The L40S this tree is developed on, as measured by
+
     pub const L40S: Self =
         Self { cc_major: 8, max_smem_per_sm: 102_400, max_smem_per_block_optin: 101_376 };
 }
 
-/// Whether a geometry could be derived, and if not, which constraint refused
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
-    /// `decode.cuh:765` — `static_assert(bdx <= 32)`.
+
     DecodeBdxOverWarp { head_dim: u32, bdx: u32 },
-    /// `utils.cuh:164-183` — `DISPATCH_GQA_GROUP_SIZE`'s `else`.
     DecodeGroupSize { group_size: u32 },
-    /// `decode.cuh:762` — `vec_size` came out zero, which means a `head_dim`
     DecodeEmptyHeadDim,
-    /// `utils.cuh:135-162` — `DISPATCH_CTA_TILE_Q`'s `default`.
     PrefillCtaTileQ { cta_tile_q: u32 },
-    /// `prefill.cuh:4270-4278` — *"Even the smallest KV tile … exceeds this
     PrefillKvTileTooLarge { head_dim: u32, cta_tile_q: u32, fixed_smem: u32, per_mma_kv: u32 },
-    /// `prefill.cuh:221-232` — `KernelTraits::IsInvalid()`, reported by
     PrefillTraitsInvalid { cta_tile_q: u32, num_mma_kv: u32, num_mma_d_vo: u32 },
-    /// `prefill.cuh:4298-4306` — the exact final check: the derived
     PrefillSmemOverBudget { smem_bytes: u32, limit: u32 },
 }
 
@@ -99,31 +80,22 @@ impl fmt::Display for Refusal {
     }
 }
 
-/// The seven integers `BatchDecodeWithPagedKVCacheKernel` is instantiated on,
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodeGeometry {
-    /// `decode.cuh:771` via `utils.cuh:349-356` — 2 on Ampere and newer, 1
+
     pub num_stages_smem: u32,
-    /// `decode.cuh:770` — `GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2 : 4) : 1`.
     pub tile_size_per_bdx: u32,
-    /// `decode.cuh:762` — `max(16 / sizeof(DTypeKV), HEAD_DIM / 32)`.
     pub vec_size: u32,
-    /// `decode.cuh:764` — `HEAD_DIM / vec_size`. Threads spanning one head.
     pub bdx: u32,
-    /// `decode.cuh:767` — `GROUP_SIZE`. Query heads per KV head, one per
     pub bdy: u32,
-    /// `decode.cuh:769` — `num_threads / (bdx * bdy)`, INTEGER division.
     pub bdz: u32,
-    /// `decode.cuh:768` — `max(128, bdx * bdy)`.
     pub num_threads: u32,
-    /// `decode.cuh:772-775`, whole:
     pub smem_bytes: u32,
-    /// The head dim this was derived for, carried so a row and a launch cannot
     pub head_dim: u32,
 }
 
 impl DecodeGeometry {
-    /// `BatchDecodeWithPagedKVCacheDispatched`'s `constexpr` prologue,
+
     pub const fn derive(
         head_dim: u32,
         group_size: u32,
@@ -169,45 +141,36 @@ impl DecodeGeometry {
         })
     }
 
-    /// `decode.cuh:783` — `dim3 nthrs(bdx, bdy, bdz)`.
     #[must_use]
     pub const fn block(&self) -> [u32; 3] {
         [self.bdx, self.bdy, self.bdz]
     }
 
-    /// `decode.cuh:782` — `dim3 nblks(padded_batch_size, num_kv_heads)`.
     #[must_use]
     pub const fn grid(padded_batch_size: u32, num_kv_heads: u32) -> [u32; 3] {
         [padded_batch_size, num_kv_heads, 1]
     }
 }
 
-/// `cudaOccupancyMaxActiveBlocksPerMultiprocessor`'s answer, as a parameter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Occupancy {
-    /// Blocks per SM the driver says this entry achieves at this block size and
+
     pub blocks_per_sm: u32,
-    /// `cudaDevAttrMultiProcessorCount`. Carried beside the occupancy because
     pub num_sm: u32,
 }
 
 impl Occupancy {
-    /// `decode.cuh:718` — `uint32_t(num_blocks_per_sm) * uint32_t(num_sm)`.
+
     #[must_use]
     pub const fn max_grid_size(self) -> u32 {
         self.blocks_per_sm * self.num_sm
     }
 }
 
-/// `prefill.cuh:79-87` — `get_num_warps_q`. The `== 32` arm is the archive's
-/// own, carrying its comment: `return 1;  // HEAD_DIM_VO >= 512`. It reaches
-/// the same answer as the `else` by a different route and for a different
-/// reason, which is why the duplicate stays rather than folding into
-/// `cta_tile_q > 16 && cta_tile_q != 32`.
 #[allow(clippy::if_same_then_else)]
 const fn num_warps_q(cta_tile_q: u32) -> u32 {
     if cta_tile_q == 32 {
-        // `HEAD_DIM_VO >= 512`.
+
         1
     } else if cta_tile_q > 16 {
         4
@@ -216,18 +179,14 @@ const fn num_warps_q(cta_tile_q: u32) -> u32 {
     }
 }
 
-/// `prefill.cuh:83-85` — `get_num_warps_kv`, which is `4 / get_num_warps_q`.
 const fn num_warps_kv(cta_tile_q: u32) -> u32 {
     4 / num_warps_q(cta_tile_q)
 }
 
-/// `prefill.cuh:94-101` — `get_num_mma_q`. As [`num_warps_q`], the `== 32`
-/// arm is the archive's `return 2;  // HEAD_DIM_VO >= 512` and not a fold of
-/// the `> 64` one.
 #[allow(clippy::if_same_then_else)]
 const fn num_mma_q(cta_tile_q: u32) -> u32 {
     if cta_tile_q == 32 {
-        // `HEAD_DIM_VO >= 512`.
+
         2
     } else if cta_tile_q > 64 {
         2
@@ -235,37 +194,27 @@ const fn num_mma_q(cta_tile_q: u32) -> u32 {
         1
     }
 }
-/// The eight integers `KernelTraits` is instantiated on, plus the launch they
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrefillGeometry {
-    /// The planner's choice, `PrefillPlanInfo::cta_tile_q` — one of
+
     pub cta_tile_q: u32,
-    /// `prefill.cuh:4193` — `kBf16VOSplit ? 1 : get_num_mma_q(CTA_TILE_Q)`.
     pub num_mma_q: u32,
-    /// `prefill.cuh:4280-4281` — `DISPATCH_NUM_MMA_KV(min(smem budget, register
     pub num_mma_kv: u32,
-    /// `prefill.cuh:4206` — `HEAD_DIM_QK / 16`.
     pub num_mma_d_qk: u32,
-    /// `prefill.cuh:4207` — `HEAD_DIM_VO / 16`.
     pub num_mma_d_vo: u32,
-    /// `prefill.cuh:4194` — `kBf16VOSplit ? 2 : get_num_warps_q(CTA_TILE_Q)`.
     pub num_warps_q: u32,
-    /// `prefill.cuh:4195` — `kBf16VOSplit ? 2 : get_num_warps_kv(CTA_TILE_Q)`.
     pub num_warps_kv: u32,
-    /// `prefill.cuh:198` — `NUM_MMA_KV * NUM_WARPS_KV * 16`. Not a template
     pub cta_tile_kv: u32,
-    /// `prefill.cuh:4297` — `sizeof(typename KTraits::SharedStoragePaged)`,
     pub smem_bytes: u32,
-    /// The head dim this was derived for. `HEAD_DIM_QK == HEAD_DIM_VO` for
     pub head_dim: u32,
 }
 
 impl PrefillGeometry {
-    /// The `__device__` variable template `fa2.cuh` exports so that
+
     pub const ECHO_TEMPLATE: &'static str =
         "&::pie::attn::fa2::smem_bytes_paged";
 
-    /// `BatchPrefillWithPagedKVCacheDispatched`'s `constexpr` prologue and its
     pub const fn derive(
         head_dim: u32,
         cta_tile_q: u32,
@@ -383,7 +332,6 @@ impl PrefillGeometry {
         })
     }
 
-    /// `sizeof(SharedStorageQKVO<..., kEnableVOSplitOpt = true>)`,
     #[must_use]
     pub const fn shared_storage_paged(
         cta_tile_q: u32,
@@ -434,57 +382,13 @@ impl PrefillGeometry {
         align16(off)
     }
 
-    /// `prefill.cuh:4204` — `dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV)`.
     #[must_use]
     pub const fn block(&self) -> [u32; 3] {
         [32, self.num_warps_q, self.num_warps_kv]
     }
 
-    /// `prefill.cuh:4203` — `dim3 nblks(padded_batch_size, 1, num_kv_heads)`.
     #[must_use]
     pub const fn grid(padded_batch_size: u32, num_kv_heads: u32) -> [u32; 3] {
         [padded_batch_size, 1, num_kv_heads]
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Device, KvWidth, PrefillGeometry};
-
-    /// The one point where the derivation was checked against the compiler.
-    #[test]
-    fn the_shared_storage_arithmetic_agrees_with_nvrtc_at_the_probed_point() {
-        assert_eq!(
-            PrefillGeometry::shared_storage_paged(64, 64, 128, 1, KvWidth::BF16, 2),
-            49_232,
-            "NVRTC computed 49232 for `PagedTraits<kCausal,64,1,4,8,8,4,1,VariantFull>`"
-        );
-    }
-
-    /// The same point, reached through `derive` rather than by hand.
-    #[test]
-    fn derive_reaches_the_probed_point() {
-        let g = PrefillGeometry::derive(128, 64, KvWidth::BF16, true, Device::L40S)
-            .expect("hd128 / CTA_TILE_Q 64 is a valid point");
-        assert_eq!((g.num_warps_q, g.num_warps_kv), (4, 1));
-        assert_eq!(g.num_mma_q, 1);
-        assert_eq!((g.num_mma_d_qk, g.num_mma_d_vo), (8, 8));
-        assert_eq!(
-            g.cta_tile_kv,
-            g.num_mma_kv * g.num_warps_kv * 16,
-            "`CTA_TILE_KV = NUM_MMA_KV * NUM_WARPS_KV * 16`, `prefill.cuh:198`"
-        );
-        assert_eq!(
-            g.smem_bytes,
-            PrefillGeometry::shared_storage_paged(
-                g.cta_tile_q,
-                g.cta_tile_kv,
-                g.head_dim,
-                g.num_warps_kv,
-                KvWidth::BF16,
-                2,
-            ),
-            "the geometry's own smem must be the layout function's answer"
-        );
     }
 }

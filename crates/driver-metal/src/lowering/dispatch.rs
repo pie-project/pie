@@ -221,6 +221,9 @@ pub struct Dispatch<'a> {
     pub symbol: &'a str,
     /// The shader that defines `symbol`, from the family's `ENTRYPOINTS`.
     pub file: &'static str,
+    /// The line that makes `symbol` exist in `file`, or empty if the file
+    /// already declares it. See [`kernels::routine::Fire::stamp`].
+    pub stamp: &'static str,
     /// Total threads per axis.
     pub grid: [u32; 3],
     /// Threads per threadgroup per axis.
@@ -759,19 +762,24 @@ fn plan_routine<'a, S: Resolver>(
     Ok(plan)
 }
 
-/// The distinct `(file, entry point)` pairs a dispatch list needs compiled.
+/// The distinct `(file, entry point, stamp)` triples a dispatch list needs
+/// compiled.
 ///
 /// In first-use order, deduplicated: a fire naming one symbol 28 times
 /// compiles it once. This is what the device half hands to
 /// `Compiler::compile_batch`, and it is here rather than there because it is a
 /// property of the list, not of the GPU.
+///
+/// The stamp rides with the pair rather than being looked up later, because
+/// there is nowhere to look it up: it is composed at the fire, by the routine
+/// body, and this list is the only thing that survives the body.
 #[must_use]
-pub fn pipelines_needed<'a>(dispatches: &[Dispatch<'a>]) -> Vec<(&'static str, &'a str)> {
-    let mut out: Vec<(&'static str, &'a str)> = Vec::new();
+pub fn pipelines_needed<'a>(dispatches: &[Dispatch<'a>]) -> Vec<(&'static str, &'a str, &'static str)> {
+    let mut out: Vec<(&'static str, &'a str, &'static str)> = Vec::new();
     for d in dispatches {
-        let pair = (d.file, d.symbol);
-        if !out.contains(&pair) {
-            out.push(pair);
+        let point = (d.file, d.symbol, d.stamp);
+        if !out.contains(&point) {
+            out.push(point);
         }
     }
     out
@@ -1009,6 +1017,7 @@ mod tests {
         let d = Dispatch {
             symbol: "sized",
             file: "f.metal",
+            stamp: "",
             grid: [1, 1, 1],
             threadgroup: [1, 1, 1],
             args: Vec::new(),
@@ -1029,12 +1038,43 @@ mod tests {
             d.clone(),
             Dispatch {
                 symbol: "other",
-                ..d
+                ..d.clone()
             },
         ];
         assert_eq!(
             pipelines_needed(&list),
-            vec![("f.metal", "sized"), ("f.metal", "other")]
+            vec![("f.metal", "sized", ""), ("f.metal", "other", "")]
+        );
+
+        // AND THE STAMP IS PART OF THE POINT, not a decoration hanging off
+        // it. Two dispatches can name one symbol in one file and still be two
+        // things to compile: the stamp is the line that makes the symbol
+        // EXIST, so a list carrying two of them is a list asking for two
+        // different bodies under one name. Deduplicating on the pair alone
+        // would hand the compiler the first and let the second run against
+        // it.
+        let stamped = vec![
+            Dispatch {
+                stamp: "PIE_STAMP_f(\"sized\", 32)",
+                ..d.clone()
+            },
+            Dispatch {
+                stamp: "PIE_STAMP_f(\"sized\", 64)",
+                ..d.clone()
+            },
+            Dispatch {
+                stamp: "PIE_STAMP_f(\"sized\", 32)",
+                ..d.clone()
+            },
+        ];
+        assert_eq!(
+            pipelines_needed(&stamped),
+            vec![
+                ("f.metal", "sized", "PIE_STAMP_f(\"sized\", 32)"),
+                ("f.metal", "sized", "PIE_STAMP_f(\"sized\", 64)"),
+            ],
+            "one symbol under two stamps is two pipelines, and the repeat of \
+             the first is still one"
         );
     }
 

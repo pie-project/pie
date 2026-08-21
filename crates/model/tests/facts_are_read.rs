@@ -159,7 +159,15 @@ fn families() -> BTreeMap<String, PathBuf> {
         "the shared half of the crate contributed nothing; found {:?}",
         out.keys().collect::<Vec<_>>()
     );
-    assert!(out.len() >= 10, "found only {} families", out.len());
+    // 12, near enough to the old `>= 10` that the floor looked honest.
+    // Two families could still go quiet under it, and a family going quiet
+    // is the failure this whole helper exists to make impossible.
+    assert_eq!(
+        out.len(),
+        12,
+        "found {} families, not 12 -- name the one that arrived or left",
+        out.len()
+    );
     out
 }
 

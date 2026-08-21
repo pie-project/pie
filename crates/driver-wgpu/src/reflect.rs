@@ -248,7 +248,7 @@ impl Declared {
     /// `naga` deletes nothing, so a hole here is a binding that EXISTS and that
     /// this entry point happens not to read -- a body still asks for a real
     /// operand at it and the driver still binds one. Measured over the whole
-    /// tree, 19 of the 481 entrypoints have at least one: `kv_append_paged`
+    /// tree, 19 of the entrypoints have at least one: `kv_append_paged`
     /// keeps six ring-ABI placeholder slots and every `sdpa_paged_*` declares
     /// an attention-sink buffer its non-sink variants do not read.
     ///
@@ -1010,7 +1010,8 @@ fn main(@builtin(workgroup_id) w: vec3<u32>) { out_[w.x] = 1u; }
     /// `//#include` is `kernels-wgpu`'s failure and turning this suite red for
     /// it would have taught the next reader to ignore both.
     ///
-    /// The tree is complete: all 480 entrypoints expand and every one parses.
+    /// The tree is complete: every entrypoint the table names expands and
+    /// every one parses.
     /// So the floor is gone and the assertion is the whole set, which is a
     /// strictly stronger claim and a cheaper one to read. If a shader stops
     /// parsing, two suites go red and both are right -- `kernels-wgpu` because
@@ -1058,9 +1059,25 @@ fn main(@builtin(workgroup_id) w: vec3<u32>) { out_[w.x] = 1u; }
             kernels_wgpu::entrypoints().len(),
             "every entrypoint the table names has a source and reads"
         );
+        // A RATCHET, AND THE DIRECTION MATTERS. The literal is not a fact
+        // about this crate: `kernels-wgpu` owns the table and pins the same
+        // number in `tests/entrypoints.rs`, which is where a disagreement
+        // should be settled. It is repeated here because the two crates fail
+        // for different reasons -- that one because the table changed size,
+        // this one because a driver stopped being able to READ everything in
+        // it -- and a sweep whose total is not pinned silently covers less.
+        //
+        // UP is a family crossing and needs this line moved. It was 481 over
+        // 99 rows when this was written and is 489 over 100 now: the rows and
+        // the entrypoints both grew, which is the shape a crossing has.
+        //
+        // DOWN is a loss. An entrypoint that stops being named is a body that
+        // stopped being dispatchable, and the number falling on its own is
+        // the only thing that reports it.
         assert_eq!(
-            read, 481,
-            "99 rows and one retired family over 481 entrypoints"
+            read, 489,
+            "100 rows over 489 entrypoints, the count `kernels-wgpu`'s \
+             `tests/entrypoints.rs` pins from the other side"
         );
     }
 

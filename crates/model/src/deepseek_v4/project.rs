@@ -71,6 +71,17 @@ use super::spec::Dsv4Facts;
 /// names with no witnessed checkpoint spelling — the fixture ships
 /// neither. A manifest row for them would be a guess wearing a
 /// measurement's clothes.
+///
+/// **The hyper-connection's affine pairs.** Six more of the same:
+/// `layer.<L>.hc_{attn,mlp}_{scale,base}` and the tower-wide
+/// `hc_head_{scale,base}`. `norm/dsv4_hc.cuh` reads a `scale` and a
+/// `base` per mix and dereferences both per token, so they are weights
+/// and not facts — but this generation's checkpoints are not in hand and
+/// nothing here has seen how one spells them. The EXTENTS are known
+/// exactly (`[3]` and `[2M + M*M]` for a pre-mix, `[1]` and `[M]` for
+/// the head), which is what makes the omission a naming problem rather
+/// than a shape one, and what a later row will need when a spelling
+/// arrives. `tests/seam_names.rs` carries all six until then.
 #[must_use]
 pub fn manifest(f: &Dsv4Facts, tied_embeddings: bool) -> Manifest {
     let (hidden, vocab) = (u64::from(f.hidden), u64::from(f.vocab));

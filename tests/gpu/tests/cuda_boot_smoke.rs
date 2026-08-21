@@ -1,6 +1,7 @@
 //! cuda_native standalone boot smoke (lane L4 / echo, Phase-2 WS7).
 //!
-//! The cuda_native analogue of `boot_smoke.rs`: boots the embedded controller +
+//! The cuda_native analogue of the deleted driverless boot_smoke.rs: boots the
+//! embedded controller +
 //! gateway + worker in one process over loopback with the **real CUDA driver**
 //! (`type = "cuda_native"`) against **qwen-3-0.6b** on the 4090, then pings the
 //! full client path. This is the engine-boot half of the programmable-sampler

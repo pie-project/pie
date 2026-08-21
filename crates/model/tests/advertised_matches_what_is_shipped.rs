@@ -80,6 +80,23 @@ fn deployments() -> Vec<(&'static str, model::deployment::Deployment)> {
     let mut rows = Vec::new();
     let mut refused = Vec::new();
     for row in catalog::catalog() {
+        // NOT THE TEST ROWS, and the reason is that every number in this
+        // file must not depend on who else is in the build. `model`'s
+        // `test-rows` feature adds a row its own catalog calls "a row that
+        // is not a model"; cargo UNIFIES features across a workspace build,
+        // so `cargo test --workspace` handed this census one more row than
+        // `cargo test -p model` did and the two disagreed about a constant
+        // -- 54 against a written 53, in six tests at once, with a message
+        // saying a row had been added or dropped when none had.
+        //
+        // Filtering by the PREFIX rather than by the `cfg` is what
+        // `driver-metal/tests/catalog_coverage.rs` does for the same reason
+        // and against the same row: `a_shipped_catalog_has_no_test_rows` is
+        // what keeps the prefix meaningful, and a `cfg` here would have to
+        // be repeated at every count below.
+        if row.id().starts_with("test-") {
+            continue;
+        }
         let deployed = [1u32, 2, 4, 8].into_iter().find_map(|tp| {
             row.deployment(Deployed {
                 tp_size: tp,
@@ -102,9 +119,19 @@ fn deployments() -> Vec<(&'static str, model::deployment::Deployment)> {
          either way the list says which, and nothing else in this file \
          holds these rows at all"
     );
-    assert!(
-        rows.len() >= 50,
-        "only {} rows deployed, so this walk is too small to mean anything",
+    // 53, and it is 53 for a reason that is now written down: the catalog
+    // holds 58 rows and the list above names the five this build refuses,
+    // so this count is the other two numbers and cannot move on its own.
+    // It was `>= 50` -- three of slack under a subtraction that has no
+    // slack in it at all, which is to say it could not fire without the
+    // assertion directly above it having fired first and louder.
+    assert_eq!(
+        rows.len(),
+        53,
+        "{} rows deployed, not 53. The catalog was 58 and five of them were \
+         listed above as undeployable; if a row was added or dropped, move \
+         this and the census in `chat_surface_is_answered.rs` together, \
+         because they are the same number minus a list you can read.",
         rows.len()
     );
     rows

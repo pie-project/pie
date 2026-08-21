@@ -80,7 +80,15 @@ fn declaring_files() -> Vec<PathBuf> {
             .any(|p| p.components().any(|c| c.as_os_str() == "llama_like")),
         "the shared half of the crate contributed no shapes; found {out:?}"
     );
-    assert!(out.len() >= 10, "found only {} declaring files", out.len());
+    // 23 files declare shapes; the floor said ten. Thirteen could stop
+    // being read without a word, and a shape file that stops being read is
+    // a second home for a shape that nothing then objects to.
+    assert_eq!(
+        out.len(),
+        23,
+        "found {} declaring files, not 23 -- say which arrived or left",
+        out.len()
+    );
     out
 }
 

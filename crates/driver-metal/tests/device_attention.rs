@@ -360,6 +360,7 @@ fn fire(
     let dispatch = Dispatch {
         symbol: &arm.entrypoint,
         file: arm.file,
+        stamp: "",
         grid: [Q_HEADS as u32 * arm.threads, rows_or_tiles, 1],
         threadgroup: [arm.threads, 1, 1],
         // One dispatch, so nothing to order against.

@@ -39,6 +39,12 @@ use serde::Deserialize;
 struct MirostatResult {
     sampler: String,
     count: usize,
+    /// The τ the inferlet ECHOES back. Nothing reads it: the sweep asserts
+    /// against the τ it SENT, which is the only one that can catch the
+    /// inferlet ignoring the request. Kept because this struct is a
+    /// transcription of golf's locked schema and a field dropped from it
+    /// stops being a check that the schema still has it.
+    #[allow(dead_code)]
     tau: f32,
     final_mu: f32,
     #[allow(dead_code)]

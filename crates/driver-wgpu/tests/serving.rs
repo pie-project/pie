@@ -617,6 +617,33 @@ fn facts() -> LlamaLikeFacts {
 fn backend_facts() -> LlamaLikeMetalFacts {
     LlamaLikeMetalFacts {
         add_bias: true,
+        // MIRRORS THE DEPLOYMENT STAMP: `engine::driver::backend::wgpu`
+        // sets this `false` because the tiled GEMM does not read back what
+        // `cast_qmm_input` staged. A fixture that left `synthetic()`'s `true`
+        // here would put eleven real-model tests -- every one of which had
+        // SKIPPED for want of a checkpoint, and so had never said anything --
+        // on the broken path, and they fail exactly there:
+        // `a_weight_this_shell_was_never_given_is_a_different_answer`'s
+        // control reads argmax 220 where it states 88204.
+        qmm_fp16_precast: false,
+        // AND MIRRORS THE OTHER HALF OF THAT STAMP, which it did not until
+        // the tile sweep below was re-run and caught the divergence.
+        //
+        // `engine::driver::backend::wgpu` states `qmm_tile: Some((32, 64))`.
+        // This fixture took `synthetic()`'s `(32, 32)`, so every timing in
+        // this file -- the prefill tables, the per-rectangle attribution, the
+        // whole `PIE_TX` sweep -- was measured on a GEMM THIS BACKEND DOES
+        // NOT SHIP. At 512 rows the two read 464.3 ms and 376.3: the notebook
+        // was 23% pessimistic about its own product, and every ratio in it
+        // was taken against a denominator nobody runs.
+        //
+        // The comment above this one is the whole argument for why that
+        // matters and it was already written, one field earlier, about a
+        // fixture that put eleven tests on a path the deployment does not
+        // take. The same reasoning reaches `qmm_tile` and nobody carried it
+        // across. A fixture is only an answer sheet if it answers the
+        // question the shipping build asks.
+        qmm_tile: (32, 64),
         ..LlamaLikeMetalFacts::synthetic()
     }
 }
@@ -663,6 +690,13 @@ fn shelled_with(real: &BTreeMap<String, Vec<u8>>, pages: u32, vector: bool) -> S
 /// constant's reason may yet become this backend's reason too. See
 /// `kernels-wgpu`'s
 /// `whether_this_adapter_offers_the_cooperative_matrix_this_tree_calls_absent`.)
+///
+/// RETIRED WITH `kernels-wgpu`'s TEST TREE. That name is a record of a
+/// measurement now, not a live proof: the crate lost `tests/` and every
+/// in-file `mod tests` when the three shader planes moved their numbers to
+/// the fire that reads them, and nothing in this workspace re-runs it. What
+/// it reported is still why the sentence above says what it says; what is
+/// gone is the thing that would notice if it stopped being true.
 fn shelled_tuned(
     real: &BTreeMap<String, Vec<u8>>,
     pages: u32,
@@ -677,6 +711,23 @@ fn shelled_tuned(
         },
         None => backend_facts(),
     };
+    shelled_facts(real, pages, vector, &facts, &backend)
+}
+
+/// [`shelled_tuned`], with both fact sets handed in rather than derived.
+///
+/// A caller varying `qmm_partial_rows` needs this: that fact decides the
+/// projections' guard, and a guard that refuses the fire turns a comparison
+/// of two kernel families into a comparison of one with itself.
+fn shelled_facts(
+    real: &BTreeMap<String, Vec<u8>>,
+    pages: u32,
+    vector: bool,
+    facts: &LlamaLikeFacts,
+    backend: &LlamaLikeMetalFacts,
+) -> Shell {
+    let facts = facts.clone();
+    let backend = backend.clone();
     let text = Text {
         decode: llama_like_metal(&facts, &backend, FireClass::Decode),
         prefill: llama_like_metal(
@@ -784,6 +835,88 @@ fn argmax(row: &[f32]) -> u32 {
         .0 as u32
 }
 
+/// How far apart two routes to THE SAME ROW are allowed to be.
+///
+/// # Why this is not zero
+///
+/// Because a row's logits depend on how many OTHER rows were fired beside it,
+/// and that is the matvec's, not the cache's. `quant/qmv.wgsl`'s `reduce_store`
+/// gives one workgroup `PIE_MT` = 2 activation rows, so every row of an even
+/// batch is summed by `block_dot2` and the tail of an odd one by `block_dot1`.
+/// The two bodies multiply the same products into the same accumulators in the
+/// same order and STILL do not agree: the two-row body holds twice the
+/// accumulators live across the unpack, so the backend contracts a different
+/// subset of its `a + b * c` into fused multiply-adds.
+///
+/// Fired directly at the kernel, the two arms part by two bf16 ulps on about
+/// five outputs in a hundred thousand, and only at a projection as wide as an
+/// lm head. Twenty-eight layers turn that into 139561 of 151936 logits
+/// differing by **0.79% of the row's peak**, argmax unchanged — which is what
+/// these tests were reading when they demanded channel-exact equality and got
+/// it from every row but the last.
+/// [`a_seats_answer_does_not_depend_on_how_many_seats_fired_with_it`] has the
+/// sweep and the table.
+///
+/// # Why 2% and not 0.79%
+///
+/// Headroom for a different prompt and a different batch, and still an order of
+/// magnitude under anything that has ever been a real defect here: the staged
+/// fp16 GEMM this suite caught missed by 120% of the peak, and the guard that
+/// let a wrong kernel fire missed by 155%. A tolerance is only worth having if
+/// the failures it would have caught are the ones that happened.
+const BATCH_SPREAD: f32 = 0.02;
+
+/// Two routes to the same row answered the same thing.
+///
+/// The argmax EXACTLY -- a difference small enough to be the batch's is small
+/// enough not to reorder the peak -- and every channel to within
+/// [`BATCH_SPREAD`] of the row's peak. Peak-relative and not per element, for
+/// the reason `worst_disagreement_with` states: a logit near zero has no scale
+/// of its own, and a relative test on it reports a hundred percent for a
+/// difference of nothing.
+fn answers_the_same(a: &[f32], b: &[f32], what: &str) {
+    assert_eq!(a.len(), b.len(), "{what}: rows of different widths");
+    assert_eq!(
+        argmax(a),
+        argmax(b),
+        "{what}: different argmax, which no amount of batching accounts for"
+    );
+    let peak = a.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let worst = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        worst <= BATCH_SPREAD * peak,
+        "{what}: {:.2}% of the row's peak ({peak}), where the matvec's own \
+         batch spread is 0.79%",
+        100.0 * worst / peak
+    );
+}
+
+/// Two routes that must NOT answer the same thing.
+///
+/// The mirror of [`answers_the_same`], and every control in this file needs it:
+/// a control that only asks for a differing BIT is satisfied by the batch
+/// spread above, which would leave the claim untested by a test that passes.
+fn answers_differently(a: &[f32], b: &[f32], what: &str) {
+    assert_eq!(a.len(), b.len(), "{what}: rows of different widths");
+    let peak = a.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let worst = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        worst > BATCH_SPREAD * peak,
+        "{what}: the two rows are within {:.2}% of the peak ({peak}), which is \
+         inside what one fire's own batching costs, so this comparison cannot \
+         see what it is for",
+        100.0 * worst / peak
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The three feedings
 // ---------------------------------------------------------------------------
@@ -868,9 +1001,31 @@ fn continued(real: &BTreeMap<String, Vec<u8>>, how: Feeding) -> Continuation {
         );
         fires += 1;
         widest = widest.max(step.rows);
-        let vocab = step.logits.vocab;
-        let at = (a_rows - 1) * vocab;
-        let row = &step.logits.values[at..at + vocab];
+        // THROUGH `readout_of`, NOT BY FIRE ROW. This read used to slice
+        // `logits.values` at `(a_rows - 1) * vocab` -- the absolute fire row --
+        // and that stopped being where A's distribution is when the readback
+        // was narrowed: `Logits` now holds one row per SAMPLED row, and
+        // `turns.rs` puts `readout_of` through `frame.sampling_indices` for
+        // exactly this reason. `serve.rs`'s `Logits::rows` doc names this call
+        // site as one of the five that index by fire row and would each need
+        // reading. It had never run to say so -- the checkpoint was absent --
+        // and the first run panicked with `range start index 4710016 out of
+        // range for slice of length 151936`, which is 31 rows past a readback
+        // holding one.
+        //
+        // A IS THE LAST TURN IN EVERY BATCH THIS HELPER FIRES, which is the
+        // premise that makes `readout_of.last()` A's row, and `a_rows` is what
+        // states it: the caller passes A's last row's absolute index, so on a
+        // batch where A is last that number IS the batch's row count.
+        assert_eq!(
+            a_rows, step.rows,
+            "this helper reads the LAST turn's distribution, so A has to be \
+             the last turn"
+        );
+        let row = step
+            .logits
+            .row(*step.readout_of.last().expect("a readout row"))
+            .expect("the readout row");
         if first.is_empty() {
             first = row.to_vec();
         }
@@ -1641,12 +1796,20 @@ fn a_frame_the_engine_built_answers_what_the_drivers_own_turns_do() {
         "two requests in, two readouts out"
     );
     for (which, row) in both[0].readout_of.iter().enumerate() {
-        assert_eq!(
+        // To the BATCH SPREAD and not exactly: `want` was fired alone and
+        // these two were fired together, and `answers_the_same`'s doc has why
+        // that is a difference at all. The claim -- that the page CSR was
+        // split where it says -- survives it: a CSR split at the wrong
+        // boundary reads another request's pages, which is a different
+        // conversation and nowhere near 2% of the peak.
+        answers_the_same(
             both[0].logits.row(*row).expect("a readout row"),
-            want.as_slice(),
-            "request {which} of a two-request frame answered differently from \
-             the same prompt fired alone, so the page CSR was not split at the \
-             boundary it names"
+            &want,
+            &format!(
+                "request {which} of a two-request frame against the same prompt \
+                 fired alone, which is the page CSR not split at the boundary \
+                 it names"
+            ),
         );
     }
 
@@ -1803,37 +1966,15 @@ fn a_forked_seat_reads_the_history_it_was_given() {
     let original = row_of(&both, 0);
     let forked = row_of(&both, 1);
     let grandchild = row_of(&both, 2);
-    assert_eq!(
-        original.len(),
-        forked.len(),
-        "two seats of one fire read rows of different widths"
+    answers_the_same(
+        &original,
+        &forked,
+        "the forked seat against the seat it was forked from",
     );
-    let differing = original
-        .iter()
-        .zip(&forked)
-        .filter(|(a, b)| a.to_bits() != b.to_bits())
-        .count();
-    assert_eq!(
-        differing,
-        0,
-        "the forked seat disagrees with the seat it was forked from in {differing} \
-         of {} channels; argmax {} against {}",
-        original.len(),
-        argmax(&forked),
-        argmax(&original),
-    );
-
-    let differing_again = original
-        .iter()
-        .zip(&grandchild)
-        .filter(|(a, b)| a.to_bits() != b.to_bits())
-        .count();
-    assert_eq!(
-        differing_again,
-        0,
-        "a seat forked FROM a fork disagrees with the seat both came from in \
-         {differing_again} of {} channels",
-        original.len()
+    answers_the_same(
+        &original,
+        &grandchild,
+        "a seat forked FROM a fork against the seat both came from",
     );
 
     // THE CONTROL. Seat 3 was never forked, so it hears `next` with no history
@@ -1845,17 +1986,146 @@ fn a_forked_seat_reads_the_history_it_was_given() {
             tokens: vec![next],
         }])
         .expect("an empty seat fires");
-    let empty = row_of(&alone, 0);
-    let same = empty
-        .iter()
-        .zip(&forked)
-        .filter(|(a, b)| a.to_bits() == b.to_bits())
-        .count();
-    assert!(
-        same < empty.len(),
-        "a seat with NO history answered exactly what the forked seat did, so \
-         this test is comparing the fire with itself rather than the cache"
+    answers_differently(
+        &row_of(&alone, 0),
+        &forked,
+        "a seat with NO history against the forked seat, which is this test \
+         comparing the fire with itself rather than the cache",
     );
+}
+
+/// A seat's answer does not depend on how many OTHER seats fired with it --
+/// beyond what the matvec's own row tiling costs.
+///
+/// # The measurement this is the driver-level half of
+///
+/// `a_forked_seat_reads_the_history_it_was_given` fires three seats holding
+/// identical histories in one step. Two agreed to the bit and the third did
+/// not, and the third was not the forked one -- it was the LAST ROW. Forking
+/// never entered into it:
+///
+/// ```text
+///   rows in the fire    rows disagreeing with row 0
+///          1                       []
+///          2                       []
+///          3                       [2]
+///          4                       []
+///          5                       [4]
+///          6                       []
+///          7                       [6]
+///          8                       []
+/// ```
+///
+/// At an odd row count the last row disagrees with every other; at an even one
+/// nobody does; and there are only ever two answers. Reordering the seats moves
+/// the disagreement to whichever seat is last, so it is the ROW and not the
+/// seat.
+///
+/// # Why
+///
+/// `quant/qmv.wgsl`'s `reduce_store` gives one workgroup `PIE_MT` = 2
+/// activation rows, so every row of an even batch is summed by `block_dot2`
+/// and the tail of an odd one alone by `block_dot1`. Setting `PIE_MT` to 1
+/// makes every row count agree bit for bit, and so does calling `block_dot1`
+/// twice where the `mt == 2` arm calls `block_dot2` -- which puts the
+/// difference inside that body and not in the reduction tree or the grid.
+///
+/// Fired directly at the kernel, one row's activations repeated, the two arms
+/// part by two bf16 ulps on about five outputs in a hundred thousand, and only
+/// a projection as wide as the lm head rolls the dice often enough to show it:
+///
+/// ```text
+///   n_out    outputs differing from the lone row    worst
+///     2048          0 of      2048                  0
+///     8192          0 of      8192                  0
+///    16384          1 of     16384                  0.125 at -26.5
+///    32768          3 of     32768                  0.125
+///   131072          7 of    131072                  0.125
+///   151936          7 of    151936                  0.125
+/// ```
+///
+/// The rate is flat, so there is no threshold and no provoking shape. Two
+/// bf16 ulps at the head, twenty-eight layers deep, is 0.79% of the row's peak
+/// across 92% of the logits with the argmax unchanged -- which is
+/// [`BATCH_SPREAD`], and which is why that constant is not zero.
+///
+/// # What this asserts
+///
+/// That the parity of the batch is the ONLY thing that moves, and that it
+/// moves by no more than the spread. A kernel change that made the two arms
+/// compute different sums rather than round them differently would miss by
+/// far more, and would be read here as it was read the first time: as the last
+/// row of an odd fire.
+#[test]
+fn a_seats_answer_does_not_depend_on_how_many_seats_fired_with_it() {
+    let Some(_guard) = gpu() else {
+        return;
+    };
+    let Some(real) = weights() else {
+        return;
+    };
+    // A fork COPIES here, and the sweep below wants a fresh set of seats per
+    // row count -- a seat that has already heard `next` has moved on -- so
+    // this is 1 + (1 + 2 + ... + 6) copies of a two-page history.
+    let mut shell = shelled(real, 128);
+
+    let row_of = |step: &driver_wgpu::turns::Step, at: usize| -> Vec<f32> {
+        step.logits
+            .row(step.readout_of[at])
+            .expect("the fire read out the turn it was asked for")
+            .to_vec()
+    };
+
+    let first = shell
+        .step(&[Turn {
+            who: 1,
+            tokens: prompt(),
+        }])
+        .expect("the prompt fires");
+    let next = argmax(&row_of(&first, 0));
+
+    // The lone answer, which every batched row below is compared against --
+    // and which is the one arm the sweep would otherwise never fire, since a
+    // batch of one is the only fire whose FIRST row is also its tail.
+    let mut who = 100u64;
+    who += 1;
+    shell.fork(1, who).expect("the prompt can be forked");
+    let alone = row_of(
+        &shell
+            .step(&[Turn {
+                who,
+                tokens: vec![next],
+            }])
+            .expect("one seat fires"),
+        0,
+    );
+
+    for rows in 2..=6usize {
+        let seats: Vec<u64> = (0..rows)
+            .map(|_| {
+                who += 1;
+                shell
+                    .fork(1, who)
+                    .expect("the prompt can be forked again");
+                who
+            })
+            .collect();
+        let turns: Vec<Turn> = seats
+            .iter()
+            .map(|w| Turn {
+                who: *w,
+                tokens: vec![next],
+            })
+            .collect();
+        let fired = shell.step(&turns).expect("every seat fires");
+        for at in 0..rows {
+            answers_the_same(
+                &row_of(&fired, at),
+                &alone,
+                &format!("row {at} of a {rows}-row fire against the same seat fired alone"),
+            );
+        }
+    }
 }
 
 /// The prefix tree this driver is asked for, built seat by seat, against a
@@ -1960,21 +2230,14 @@ fn a_two_level_prefix_tree_reads_what_a_seat_that_never_forked_reads() {
         .expect("the leaf and the unforked seat fire");
     let tree = row_of(&both, 0);
     let flat = row_of(&both, 1);
-    let differing = tree
-        .iter()
-        .zip(&flat)
-        .filter(|(a, b)| a.to_bits() != b.to_bits())
-        .count();
-    assert_eq!(
-        differing,
-        0,
-        "a leaf of a two-level fork tree disagrees with a seat that heard the \
-         same {} tokens and was never forked, in {differing} of {} channels; \
-         argmax {} against {}",
-        whole.len(),
-        tree.len(),
-        argmax(&tree),
-        argmax(&flat),
+    answers_the_same(
+        &tree,
+        &flat,
+        &format!(
+            "a leaf of a two-level fork tree against a seat that heard the same \
+             {} tokens and was never forked",
+            whole.len()
+        ),
     );
 
     // THE CONTROL. A seat that heard only the ROOT must disagree, or the
@@ -1986,16 +2249,11 @@ fn a_two_level_prefix_tree_reads_what_a_seat_that_never_forked_reads() {
             tokens: vec![next],
         }])
         .expect("the short seat fires");
-    let rooted = row_of(&short, 0);
-    let same = rooted
-        .iter()
-        .zip(&tree)
-        .filter(|(a, b)| a.to_bits() == b.to_bits())
-        .count();
-    assert!(
-        same < rooted.len(),
-        "a seat holding only the root answered exactly what the leaf did, so \
-         this test cannot see what the appends wrote"
+    answers_differently(
+        &row_of(&short, 0),
+        &tree,
+        "a seat holding only the root against the leaf, which is this test \
+         unable to see what the appends wrote",
     );
 }
 
@@ -2235,11 +2493,39 @@ fn a_request_that_names_several_readout_rows_is_handed_exactly_those_rows() {
 
     // Three of its own rows, which is a speculative verifier's shape.
     let many = step(&mut shell, &frame(&[50, 51, 52], &[n - 3, n - 2, n - 1]));
+    // THREE ROWS, DISTINCT, AND ALL OF THEM HELD. This stated the fire rows
+    // themselves -- `vec![n - 3, n - 2, n - 1]` -- and cannot, since the
+    // readback was narrowed: `turns.rs` remaps `readouts_of` through
+    // `frame.sampling_indices`, so it names rows of `logits`. A request for
+    // fire rows 29, 30 and 31 whose sampling table holds exactly those three
+    // reads `[0, 1, 2]`, which is the remap working.
+    //
+    // The order claim survives in the only form still checkable here: the
+    // readback holds three distributions, the span names three distinct ones,
+    // and the value comparison below says they are three different rows of a
+    // real prompt rather than one row gathered three times.
     assert_eq!(
-        many.readouts_of[0],
-        vec![(n - 3) as usize, (n - 2) as usize, (n - 1) as usize],
-        "the span is the rows the request named, in the order it named them"
+        many.readouts_of[0].len(),
+        3,
+        "the span names {} rows where the request named three",
+        many.readouts_of[0].len()
     );
+    assert_eq!(
+        many.logits.rows, 3,
+        "the readback holds {} distributions where the request named three",
+        many.logits.rows
+    );
+    {
+        let mut seen = many.readouts_of[0].clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            3,
+            "the span names the same readback row more than once: {:?}",
+            many.readouts_of[0]
+        );
+    }
     // Every one of them is a row of this fire's own logits, and they are
     // DIFFERENT rows -- a gather that returned the last row three times would
     // otherwise pass the assertion above.
@@ -2256,8 +2542,13 @@ fn a_request_that_names_several_readout_rows_is_handed_exactly_those_rows() {
     // And the one-row case in the same shell still answers its LAST row, which
     // is what every decode asks for.
     let one = step(&mut shell, &frame(&[53, 54, 55], &[n - 1]));
-    assert_eq!(one.readouts_of[0], vec![(n - 1) as usize]);
-    assert_eq!(one.readout_of[0], (n - 1) as usize);
+    // Both name a row of the narrowed readback rather than of the fire, and a
+    // request naming ONE row narrows it to one -- so both are 0, and the claim
+    // worth making is that they agree with each other and with what the
+    // readback holds. Asking for `n - 1` here is still what makes the value
+    // comparison below a comparison of the LAST row.
+    assert_eq!(one.logits.rows, 1);
+    assert_eq!(one.readouts_of[0], vec![one.readout_of[0]]);
     assert_eq!(
         one.logits.row(one.readout_of[0]).expect("the row").to_vec(),
         rows[2],
@@ -2340,10 +2631,34 @@ fn a_rows_answer_does_not_depend_on_the_tokens_after_it() {
         match shell.launch(f).expect("the frame launches") {
             driver_wgpu::frames::Launched::Ran(steps) => {
                 let step = steps.into_iter().next().expect("one step");
+                // A COUNT AND A BOUND, NOT THE FIRE ROW. This asserted
+                // `readouts_of[0] == vec![want]` and could not, once the
+                // readback was narrowed: `turns.rs` puts `readouts_of`
+                // through `frame.sampling_indices`, so it names a row of
+                // `logits` and not a row of the fire. Asking for fire row 31
+                // when 31 is the only sampled row now reads `[0]`, which is
+                // the remap working rather than the wrong row.
+                //
+                // What survives is the claim that actually guards this test:
+                // ONE row was read out, and the readback holds exactly one.
+                // A sampling table that named a second row, or none, moves
+                // both numbers.
                 assert_eq!(
-                    step.readouts_of[0],
-                    vec![want as usize],
-                    "the fire read out a row this test did not ask for"
+                    step.readouts_of[0].len(),
+                    1,
+                    "the fire read out {} rows where this test asked for one \
+                     (fire row {want})",
+                    step.readouts_of[0].len()
+                );
+                assert_eq!(
+                    step.logits.rows, 1,
+                    "the readback holds {} distributions where the sampling \
+                     table named one (fire row {want})",
+                    step.logits.rows
+                );
+                assert!(
+                    step.logits.row(step.readouts_of[0][0]).is_some(),
+                    "the readout names a row the readback does not hold"
                 );
                 step.logits
                     .row(step.readouts_of[0][0])
@@ -2498,6 +2813,72 @@ fn a_rows_answer_does_not_depend_on_the_tokens_after_it() {
 /// The same prompt, the same rows, the same pages, read at the same row --
 /// and the plan in the prefill slot swapped. Anything else would put a second
 /// difference in a comparison that exists to isolate one.
+/// # WHAT IT FOUND THE FIRST TIME IT EVER RAN
+///
+/// It had never run: the fixture it needs is an unquantised `Qwen/Qwen3-0.6B`
+/// checkpoint and `weights()` returned `None`, so it SKIPPED, along with ten
+/// other real-model tests in this file. Downloading the checkpoint is the
+/// whole of what changed, and the first real run said:
+///
+/// ```text
+///   134533 of 151936 logits differ; the worst by 27.07 at token 41777
+///   (tiled 1.05 against vector 28.13), 155.8% of the row's peak
+/// ```
+///
+/// Not rounding, and not a near miss: 88% of the row was a different row.
+///
+/// ## Which family was wrong
+///
+/// Perturb ONE token of a 480-token prompt and read the worst change in the
+/// readout row. A causal model's last row attends to every token, so every
+/// position must move it and the last must move it most:
+///
+/// ```text
+///   position     0    64   128   256   320   384   448   470   479
+///   tiled     28.38  0.12  0.06  0.00  0.00  0.00  0.00  0.00  0.16
+///   vector     5.02  2.06  2.03  3.09  2.19  7.74  4.47  3.69 13.81
+/// ```
+///
+/// The vector family answers the way a transformer must. The tiled family
+/// answered a row that responds to token 0 and to nothing after position 128
+/// -- so the direction of blame was settled by measurement rather than
+/// assumed, which mattered, because the answer was not where it looked.
+///
+/// ## It was not the GEMM
+///
+/// `kernels-wgpu`'s
+/// `a_tiled_gemm_agrees_over_every_tile_shape_and_quantization_point` agrees
+/// with a host reference over all nine tiles and six codecs, and it still
+/// does at m = 32 and m = 64 as well as the 33 it fires by default -- so the
+/// tiling and the arithmetic are right at an aligned row count and a ragged
+/// one alike. The defect was the BUFFER: `qmm_fp16_precast` stages the
+/// activation through `cast_qmm_input` into `half_in` and the GEMM reads
+/// `half_in` instead of `x`. One fact flipped, nothing else:
+///
+/// ```text
+///   precast=true    120.4% of the row's peak, 134533/151936 logits differ
+///   precast=false     0.9% of the row's peak,      0/151936 logits differ
+/// ```
+///
+/// `engine::driver::backend::wgpu` therefore stamps `qmm_fp16_precast: false`
+/// and carries where to look when someone repairs it. `backend_facts()`
+/// mirrors that stamp, which is why this test passes.
+///
+/// ## The blast radius, and why the row bound is not to blame
+///
+/// It reproduced at `e9843424b` -- the commit before `Params` carried `m` --
+/// with the identical logit at the identical index, so it is older than the
+/// row bound. What `qmm_partial_rows` did was widen it, from one row count in
+/// thirty-two to thirty-one in thirty-two, which is how a defect that had sat
+/// under the aligned lengths became visible from the daemon.
+///
+///
+/// RETIRED WITH `kernels-wgpu`'s TEST TREE. That name is a record of a
+/// measurement now, not a live proof: the crate lost `tests/` and every
+/// in-file `mod tests` when the three shader planes moved their numbers to
+/// the fire that reads them, and nothing in this workspace re-runs it. What
+/// it reported is still why the sentence above says what it says; what is
+/// gone is the thing that would notice if it stopped being true.
 #[test]
 fn the_tiled_gemm_answers_the_way_the_vector_kernel_does() {
     the_two_families_agree(prompt());
@@ -2509,16 +2890,42 @@ fn the_tiled_gemm_answers_the_way_the_vector_kernel_does() {
 /// `params.m`. `qmm_grid` rounds the row axis up with `div_ceil`, so a fire
 /// of 495 rows launches 512 rows' worth of tiles and the last seventeen are
 /// arithmetic on whatever lies past the activation. Before the bound those
-/// rows were STORED, over the next value in the arena, and `Serving::prefill`
-/// records what that cost: an unrelated answer and a twelvefold slowdown.
-///
-/// A logit row is the right probe because it is downstream of every
-/// projection in the model -- if any one of them wrote past its rows, the
-/// value it landed on is read by a later layer and the readout moves.
+/// rows were STORED, over the next value in the arena.
 ///
 /// 495 and not 496: it is odd, it is not a multiple of 16, 32 or 64, and so
 /// it exercises the overhang at every tile this backend can pick rather than
 /// only the one it picks today.
+///
+/// # IT MUST SET `qmm_partial_rows` ITSELF, OR IT MEASURES NOTHING
+///
+/// `backend_facts()` is `LlamaLikeMetalFacts::synthetic()`, whose
+/// `qmm_partial_rows` is `false`. With it false the projections' guard is
+/// `TokensMultipleOf(32)`, which REFUSES 495 -- so the fire this test calls
+/// "the tiled GEMM" falls to the matvec, and the comparison it makes is the
+/// matvec against the matvec. It read 0.9% and looked like a pass.
+///
+/// Turning the flag on is what makes the two sides different kernels, and the
+/// number then reads the same as every aligned length does:
+///
+/// ```text
+///   n=480  partial_rows=false  1.5580   (aligned: the GEMM runs regardless)
+///   n=495  partial_rows=false  0.0092   (VACUOUS: matvec against matvec)
+///   n=495  partial_rows=true   1.4046
+///   n=496  partial_rows=true   1.0806
+///   n=512  partial_rows=true   1.7608
+/// ```
+///
+/// Which is the finding: the divergence tracks whether the GEMM RAN, and not
+/// whether its last tile was ragged. Varying the tile instead of the length
+/// says it from the other side -- `n=480` diverges at `bm=16` and `bm=32`,
+/// which divide it, and agrees at `bm=64`, which does not and therefore
+/// refuses the fire.
+///
+/// So the partial tile was never the defect -- the staged fp16 activation
+/// was, and the stamp that turns it off is what makes both of these pass.
+/// This one still earns its place: it is the only test in the tree that fires
+/// the GEMM at a row count no tile divides, which is the claim the `row >=
+/// params.m` bound in `write_out` exists to make.
 #[test]
 fn the_tiled_gemm_answers_the_way_the_vector_kernel_does_at_a_partial_tile() {
     let mut p = prompt();
@@ -2526,15 +2933,150 @@ fn the_tiled_gemm_answers_the_way_the_vector_kernel_does_at_a_partial_tile() {
         p.extend_from_slice(&PERIOD);
     }
     p.truncate(495);
-    the_two_families_agree(p);
+    let Some(worst) = worst_disagreement_with(p, true) else {
+        return;
+    };
+    assert!(
+        worst <= 0.05,
+        "at 495 rows -- a count no tile this backend can pick divides -- the \
+         tiled GEMM and the matvec part by {:.1}% of the row's peak",
+        100.0 * worst
+    );
+}
+
+/// THE READOUT MOVES WHEN THE LAST TOKEN MOVES, WITH THE TILED GEMM FIRING.
+///
+/// This is the property `e0a2f6e20` withdrew the GEMM over, and it is a
+/// different question from [`the_tiled_gemm_answers_the_way_the_vector_kernel_does`]
+/// even though both fire the same kernel. That one asks whether two families
+/// agree; this asks whether the answer is a function of the input at all. A
+/// GEMM that returned one fixed row would pass neither, but a GEMM that
+/// returned the WRONG row -- row 0's product where the readout row belongs --
+/// would agree with the matvec on row 0 and still answer the same thing to
+/// every prompt.
+///
+/// A causal model's last row attends to every token including the last, so
+/// changing the last token MUST change the readout. `e0a2f6e20` measured this
+/// against the daemon on Llama-3.2-1B q4 and read:
+///
+/// ```text
+///     n= 16  differs      (matvec: the projections' guard needs 32 rows)
+///     n= 31  differs      (matvec)
+///     n= 32  IDENTICAL    (tiled GEMM) -- and degenerate, `1494` x8
+///     n= 64  IDENTICAL    (tiled GEMM)
+///     n= 96  IDENTICAL    (tiled GEMM)
+/// ```
+///
+/// It is written here, in the tree, rather than left as a shell transcript,
+/// because the transcript is what let the defect be diagnosed once and then
+/// re-diagnosed from a commit message.
+#[test]
+fn the_tiled_gemms_readout_moves_when_the_last_token_moves() {
+    let Some(_held) = gpu() else { return };
+    let Some(real) = weights() else { return };
+    let facts = facts();
+    let backend = LlamaLikeMetalFacts {
+        qmm_multi_batch: true,
+        // Or 33 and 495 below measure the MATVEC: `backend_facts()` inherits
+        // `synthetic()`'s `false`, under which the projections' guard is
+        // `TokensMultipleOf(32)` and refuses every count no tile divides.
+        qmm_partial_rows: true,
+        ..backend_facts()
+    };
+
+    let read = |tokens: &[u32]| -> Vec<f32> {
+        let mut shell = shelled_facts(real, 96, false, &facts, &backend);
+        let step = shell
+            .step(&[Turn {
+                who: 1,
+                tokens: tokens.to_vec(),
+            }])
+            .unwrap_or_else(|e| panic!("the fire: {e}"));
+        step.logits
+            .row(step.readout_of[0])
+            .expect("the readout row")
+            .to_vec()
+    };
+
+    // Every length the GEMM's guard admits, including counts no tile divides:
+    // the withdrawn defect was invisible below 32 because the guard refused
+    // the fire there, so a sweep that stopped at one length would have read
+    // the matvec and called it the GEMM.
+    let base = prompt();
+    for n in [32usize, 33, 64, 96, 128, 255, 256, 495, 512] {
+        let mut a = Vec::new();
+        while a.len() < n {
+            a.extend_from_slice(&base);
+        }
+        a.truncate(n);
+        let mut b = a.clone();
+        // The LAST token, and to a value the prompt does not already end in.
+        let last = b.len() - 1;
+        b[last] = if a[last] == PERIOD[0] {
+            PERIOD[1]
+        } else {
+            PERIOD[0]
+        };
+        assert_ne!(a[last], b[last], "the perturbation must perturb");
+
+        let (ra, rb) = (read(&a), read(&b));
+        let peak = ra.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
+        let moved = ra
+            .iter()
+            .zip(&rb)
+            .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
+        eprintln!("  n={n:4} last token moved the readout by {:.3} ({:.1}% of peak)",
+            moved, 100.0 * moved / peak);
+        assert!(
+            moved > 0.01 * peak,
+            "at {n} rows the readout moved by {:.4} -- {:.3}% of its own peak \
+             -- when the LAST token changed. A causal model's last row attends \
+             to the last token, so this is the wrong row and not a near miss.",
+            moved,
+            100.0 * moved / peak
+        );
+    }
 }
 
 fn the_two_families_agree(prompt: Vec<u32>) {
-    let Some(_held) = gpu() else { return };
-    let Some(real) = weights() else { return };
+    let Some(worst) = worst_disagreement(prompt) else {
+        return;
+    };
+    assert!(
+        worst <= 0.05,
+        "the tiled GEMM and the matvec differ by {:.1}% of the row's peak \
+         -- too much to be bf16 rounding between two matmul orders",
+        100.0 * worst
+    );
+}
+
+/// The widest gap between the two families on one prompt, as a fraction of
+/// the tiled row's own peak. `None` when the fixture is not here.
+fn worst_disagreement(prompt: Vec<u32>) -> Option<f32> {
+    worst_disagreement_with(prompt, false)
+}
+
+/// [`worst_disagreement`], with `qmm_partial_rows` set -- which a caller
+/// firing a row count the tile does not divide MUST do, or the guard refuses
+/// the GEMM and both sides run the matvec.
+fn worst_disagreement_with(prompt: Vec<u32>, partial_rows: bool) -> Option<f32> {
+    let _held = gpu()?;
+    let real = weights()?;
+    let facts = facts();
+    let backend = LlamaLikeMetalFacts {
+        qmm_partial_rows: partial_rows,
+        // The point of these two tests: they compare the two FAMILIES, so the
+        // tiled one has to be reachable. `backend_facts()` inherits the
+        // deployment's `qmm_fp16_precast: false` with it.
+        qmm_multi_batch: true,
+        ..backend_facts()
+    };
 
     let answer = |vector: bool| -> Vec<f32> {
-        let mut shell = shelled_with(real, 24, vector);
+        // ENOUGH PAGES FOR THE LONGEST PROMPT THIS FILE FIRES, which is 495
+        // and not 32: 24 pages refused one with "this growth needs 31 more
+        // pages and 24 are free".
+        let mut shell = shelled_facts(real, 96, vector, &facts, &backend);
         let step = shell
             .step(&[Turn {
                 who: 1,
@@ -2585,11 +3127,9 @@ fn the_two_families_agree(prompt: Vec<u32>) {
             at = i;
         }
     }
-    assert!(
-        worst <= 0.05 * peak,
-        "the tiled GEMM and the matvec differ by {worst} at token {at} ({} vs \
-         {}), which is {:.1}% of the row's peak ({peak}) -- too much to be \
-         bf16 rounding between two matmul orders",
+    println!(
+        "the two families part by {worst} at token {at} ({} vs {}), which is \
+         {:.1}% of the row's peak ({peak})",
         tiled[at],
         vector[at],
         100.0 * worst / peak
@@ -2602,6 +3142,7 @@ fn the_two_families_agree(prompt: Vec<u32>) {
         "the two plans answered bit-identically, so the swap did not change \
          which kernels ran"
     );
+    Some(worst / peak)
 }
 
 /// A copy plan whose destination is above the pool GROWS it rather than being
@@ -2757,10 +3298,22 @@ fn a_copy_plan_that_names_a_page_past_the_pool_grows_it_instead_of_refusing() {
 ///   hundreds means the per-launch dedup is gone even if the cross-step cache
 ///   is still there.
 ///
-/// It also pins the cache against the pipelines' own, which must agree: every
-/// module read is a pipeline built, and a divergence means one of the two keys
-/// has drifted (they are keyed on the REQUESTED tier and the LANDED one, which
-/// differ whenever an adapter asks for a tier the tree has no variant of).
+/// It also pins the cache against the pipelines' own. Not by COUNT, which is
+/// what this used to do and which was wrong in the direction nobody checked:
+/// a fire reads a module for every symbol its LOWERING names and builds a
+/// pipeline only for the ones a guard lets dispatch, so twelve reads against
+/// eleven builds is a plan carrying both arms of the decode-attention switch
+/// and firing one. `sdpa_paged_decode_bfloat16_d_128` is the arm not taken --
+/// `sdpa_paged_decode_split` and `..._merge` are, because split-K wins at
+/// these key counts -- and its module is expanded and reflected all the same,
+/// since that happens before any guard has spoken.
+///
+/// What must hold is the SUBSET: every pipeline built came from a module this
+/// cache read. The other way round is the drift worth naming, because the two
+/// are keyed on the REQUESTED tier and the LANDED one -- which differ whenever
+/// an adapter asks for a tier the tree has no variant of, as this one does at
+/// every symbol: `Subgroup` asked, `Baseline` landed, twelve times out of
+/// twelve.
 #[test]
 fn a_shell_reads_each_module_once_however_many_steps_it_serves() {
     let Some(_held) = gpu() else { return };
@@ -2821,11 +3374,24 @@ fn a_shell_reads_each_module_once_however_many_steps_it_serves() {
          or so distinct kernels in a step and hundreds of launches, so this is \
          the per-launch lookup back again"
     );
-    assert_eq!(
-        shell.modules_read(),
-        shell.built(),
-        "the module cache and the pipeline cache hold different numbers of \
-         entries, so their keys have drifted apart"
+    let read = shell.read_symbols();
+    let built = shell.built_symbols();
+    let unread: Vec<&str> = built.difference(&read).copied().collect();
+    assert!(
+        unread.is_empty(),
+        "{unread:?} were compiled from modules this cache never read, so the \
+         module key and the pipeline key have drifted apart"
+    );
+    // The other direction is expected and BOUNDED: a guard may refuse an arm,
+    // and a plan that named a dozen symbols and fired none of them is a shell
+    // that is not serving.
+    let unfired: Vec<&str> = read.difference(&built).copied().collect();
+    assert!(
+        unfired.len() < read.len() / 2,
+        "{} of {} symbols this shell expanded were never dispatched ({unfired:?}), \
+         which is more arms than any guard in this plan refuses",
+        unfired.len(),
+        read.len()
     );
 }
 
@@ -3368,6 +3934,13 @@ fn a_run_of_decodes_derives_one_lowering_and_says_the_same_thing() {
 ///
 /// Falsified by restoring the per-segment encoder (735 buffers) and by
 /// restoring one `read` declaration (451 shadows).
+///
+/// RETIRED WITH `kernels-wgpu`'s TEST TREE. That name is a record of a
+/// measurement now, not a live proof: the crate lost `tests/` and every
+/// in-file `mod tests` when the three shader planes moved their numbers to
+/// the fire that reads them, and nothing in this workspace re-runs it. What
+/// it reported is still why the sentence above says what it says; what is
+/// gone is the thing that would notice if it stopped being true.
 #[test]
 fn a_real_fire_is_one_command_buffer_and_shadows_nothing() {
     let _lock = gpu();
@@ -3437,6 +4010,44 @@ fn a_real_fire_is_one_command_buffer_and_shadows_nothing() {
 /// reverted rather than kept on the strength of one sample.
 ///
 /// Run with `--ignored --nocapture`.
+///
+/// # WHERE A DECODE'S 10 ms GOES: NOWHERE IN PARTICULAR
+///
+/// The prefix sweep below steps the same knob
+/// [`where_a_prefills_time_goes_across_its_plan`] uses. On a 512-key decode
+/// of qwen3-0.6b, Apple M4 Pro, `--release`, 480 rectangles:
+///
+/// ```text
+///   first    0 rectangles    0.276 ms
+///   first   30 rectangles    1.027 ms   (+0.750)
+///   first  120 rectangles    2.687 ms   (+0.542)
+///   first  240 rectangles    5.023 ms   (+0.497)
+///   first  360 rectangles    7.224 ms   (+0.667)
+///   first  480 rectangles    9.665 ms   (+0.642)
+/// ```
+///
+/// **Flat.** Every block of thirty rectangles costs 0.45 to 0.75 ms wherever
+/// it sits, and one layer taken a rectangle at a time is flatter still --
+/// deltas of 0.03 to 0.2 ms against a per-point spread of 0.1, with no line
+/// standing out the way `sdpa_paged_tiled` stands out of a prefill's layer.
+///
+/// So: `(9.665 - 0.276) / 480` is **19.6 microseconds a rectangle**, and that
+/// number does not care what the rectangle computes. A 512-row prefill is
+/// 445 ms over 452 rectangles, 984 microseconds each, which is work. A decode
+/// is 480 dispatches of almost nothing. **The decode is dispatch-bound**, and
+/// the lever is the COUNT -- which is what [`fuse-qkv-quant`]-shaped work is
+/// for -- rather than any kernel in it.
+///
+/// ## The tail this first reported was the measurement drifting under itself
+///
+/// Taken in order, the same sweep read +1.635 and +1.540 ms over the last
+/// sixty rectangles and looked like a third of a decode sitting in the lm
+/// head. It was not. **Every fire appends a key**, so a sweep of sixteen
+/// points at fifteen fires each is hundreds of tokens of context growth from
+/// its first point to its last, and taken in order all of that growth lands
+/// on the last points. Visiting the points round-robin and keeping the
+/// fastest of three rounds makes the drift common to every point instead of
+/// ordered by it, and the tail disappears completely.
 #[test]
 #[ignore = "measurement"]
 fn what_a_decode_costs_at_length() {
@@ -3492,6 +4103,80 @@ fn what_a_decode_costs_at_length() {
         1000.0 / median
     );
     println!("  fastest {:.3}, slowest {:.3}", ms[0], ms[ms.len() - 1]);
+
+    // WHERE THE 10 ms GOES, by the same prefix knob the prefill uses.
+    //
+    // A decode is small enough that a whole sweep is seconds rather than a
+    // minute, so this takes the MEDIAN of many fires at each point rather than
+    // the fastest of two -- a 10 ms fire's noise is absolute, not
+    // proportional, and a median over 15 is steadier here than a minimum.
+    // EVERY FIRE APPENDS A KEY, so a sweep drifts under itself: by the end of
+    // one the context is hundreds of tokens longer than at the start and the
+    // attention rectangles cost more for that reason alone. Taken in order,
+    // the drift lands entirely on the last points and reads as a tail. So the
+    // points are visited ROUND-ROBIN and the fastest of the rounds is kept:
+    // the drift is then common to every point instead of ordered by it, which
+    // is the same reason the prefill's sweep rounds.
+    let mut decode_at = |shell: &mut Shell, n: Option<usize>, next: &mut u32| -> f64 {
+        shell.fire_prefix(n);
+        let mut ms = Vec::new();
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            let o = shell
+                .step(&[Turn {
+                    who: 1,
+                    tokens: vec![*next],
+                }])
+                .expect("a decode fires");
+            ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            if n.is_none() {
+                *next = argmax(o.logits.row(o.readout_of[0]).expect("it read out"));
+            }
+        }
+        shell.fire_prefix(None);
+        ms.sort_by(f64::total_cmp);
+        ms[ms.len() / 2]
+    };
+    let total = shell
+        .step(&[Turn {
+            who: 1,
+            tokens: vec![next],
+        }])
+        .expect("a decode fires")
+        .fired
+        .dispatches;
+    println!("  a decode records {total} rectangles");
+    let step = total.div_ceil(16);
+    let coarse: Vec<usize> = (0..=total).step_by(step).chain(std::iter::once(total)).collect();
+    let lo = step;
+    let hi = (step * 2).min(total);
+    let fine: Vec<usize> = (lo..=hi).collect();
+    let mut best = vec![f64::INFINITY; coarse.len() + fine.len()];
+    for _ in 0..3 {
+        for (i, &n) in coarse.iter().chain(fine.iter()).enumerate() {
+            let at = decode_at(&mut shell, Some(n), &mut next);
+            best[i] = best[i].min(at);
+        }
+    }
+    println!("  cumulative, fastest of 3 round-robin rounds:");
+    let mut prev = 0.0;
+    for (i, &n) in coarse.iter().enumerate() {
+        println!(
+            "    first {n:4} rectangles {:8.3} ms   (+{:6.3})",
+            best[i],
+            best[i] - prev
+        );
+        prev = best[i];
+    }
+    println!("  one layer, rectangle by rectangle, fastest of 3:");
+    for (j, &n) in fine.iter().enumerate().skip(1) {
+        let i = coarse.len() + j;
+        println!(
+            "    rectangle {n:4} {:8.3} ms   (+{:6.3})",
+            best[i],
+            best[i] - best[i - 1]
+        );
+    }
 }
 
 /// **What a 512-token prefill costs, which is the half a decode cannot show.**
@@ -3596,6 +4281,187 @@ fn what_a_decode_costs_at_length() {
 /// | 256 | 437.7 | 585 | 1.710 |
 /// | 512 | 815.3 | 628 | 1.592 |
 ///
+/// # ON AN APPLE M4 PRO, AND IT IS THE ATTENTION -- NOT THE GEMM
+///
+/// Everything above was taken on an RTX 4090 and none of it transfers. Same
+/// test, same checkpoint, `--release`, one sitting:
+///
+/// | rows | ms | tok/s | ms a row |
+/// | --- | --- | --- | --- |
+/// | 32 | 57.1 | 561 | 1.783 |
+/// | 64 | 130.0 | 492 | 2.031 |
+/// | 128 | 337.2 | 380 | 2.634 |
+/// | 256 | 975.6 | 262 | 3.811 |
+/// | 512 | 3031.1 | 169 | 5.920 |
+///
+/// The per-row cost RISES, where the 4090's fell. Fitting `t = a*n + b*n^2`
+/// to the ends puts `b*n^2` at **75% of a 512-row prefill**, so this is not a
+/// tuning gap, it is a quadratic term that the shorter lengths hide.
+///
+/// ## Three fires that say which kernel it is
+///
+/// The plan has two knobs that can be turned separately -- `qmm_multi_batch`
+/// picks the projections' family, and putting the DECODE text in the prefill
+/// slot ([`shelled_with`]'s `vector`) picks the attention's -- so the two can
+/// be told apart rather than argued about. At 512 rows:
+///
+/// | plan | projections | attention | ms |
+/// | --- | --- | --- | --- |
+/// | prefill | tiled GEMM | `sdpa_paged_tiled` | 3031 |
+/// | prefill | matvec | `sdpa_paged_tiled` | 3387 |
+/// | decode | matvec | `sdpa_paged_decode` | 932 |
+///
+/// Rows 2 and 3 share their projections exactly, so their difference is one
+/// kernel: **`sdpa_paged_tiled_bfloat16_d_128` costs 2455 ms of a 3387 ms
+/// prefill, 72% of it, and the decode attention does the same work 3.6x
+/// cheaper.** The same fit on the decode-attention plan puts its quadratic
+/// term at 23% rather than 75% -- a 10.6x smaller `b`.
+///
+/// And rows 1 and 2 say the thing that would otherwise have been assumed:
+/// **the tiled GEMM is 12% FASTER than the matvec here**, so it is not the
+/// prefill's problem and `qmm_multi_batch: true` is earning its stamp. The
+/// first reading of this session went the other way -- decode text against
+/// prefill text, 932 against 3031, "the matvec wins 3.3x" -- because that
+/// comparison moved both knobs at once. A two-way comparison over a plan with
+/// two knobs cannot attribute anything.
+///
+/// [`which_tile_a_512_row_prefill_wants`] closes the same door from the other
+/// side: nine tiles spanning a 16x range of area all read 156-173 tok/s. A
+/// GEMM whose cost moved with its tile would have moved more than 11%.
+///
+/// # AND THE ATTENTION'S COST WAS THIRTY-TWO LANES RECOMPUTING ONE DOT
+///
+/// `attn/sdpa_paged.wgsl`'s tiled arm ran `@workgroup_size(32, 8)` and every
+/// one of the 32 x-lanes of a query row called `dot_page` -- a full 128-term
+/// inner product at `d_128` -- for the same (row, key), to own two output
+/// channels. 128 multiply-adds recomputed 32 times against the 2 the
+/// accumulator costs. The decode arm had already fixed the same waste with a
+/// barrier tree; the tiled arm was left because it "cannot barrier", and it
+/// does not need to: shrinking the x extent and giving each lane more channel
+/// pairs cuts the redundancy with no synchronisation at all.
+///
+/// `PIE_TX` is that extent. Its sweep lives in the shader; at `d_128` the
+/// optimum is **2**, and this test then reads:
+///
+/// | rows | ms | tok/s | ms a row |
+/// | --- | --- | --- | --- |
+/// | 32 | 43.9 | 729 | 1.372 |
+/// | 64 | 73.2 | 875 | 1.143 |
+/// | 128 | 136.8 | 936 | 1.068 |
+/// | 256 | 263.4 | 972 | 1.029 |
+/// | 512 | 570.7 | 897 | 1.115 |
+///
+/// **169 -> 897 tok/s at 512, 5.3x**, and the shape is the finding rather
+/// than the factor: the per-row cost no longer RISES. It falls to 256 rows
+/// and turns over by 8% -- the quadratic term that was 75% of a 512-row
+/// prefill is now a minority of it, and whatever is next is not this.
+///
+/// # AND THE TABLE ABOVE IS OF A GEMM THIS BACKEND DOES NOT SHIP
+///
+/// Every number in this file up to here was taken through
+/// `affine_qmm_t_..._bm_32_bn_32`, because `backend_facts()` inherited
+/// `synthetic()`'s `qmm_tile` while `engine::driver::backend::wgpu` states
+/// `Some((32, 64))`. The fixture already mirrors that stamp on
+/// `qmm_fp16_precast`, with a comment explaining that a fixture off the
+/// deployment path puts eleven tests on a code path nobody runs; the same
+/// argument reaches the tile and nobody carried it across.
+///
+/// Mirrored, at 512 rows, and the whole curve moves:
+///
+/// | rows | ms | tok/s | ms a row |
+/// | --- | --- | --- | --- |
+/// | 32 | 40.0 | 800 | 1.249 |
+/// | 64 | 56.5 | 1133 | 0.882 |
+/// | 128 | 94.2 | 1359 | 0.736 |
+/// | 256 | 179.3 | 1428 | 0.700 |
+/// | 512 | 356.7 | **1436** | 0.697 |
+///
+/// **169 -> 1436 tok/s, 8.5x**, of which the last 1.24x was free: it was
+/// already shipping and the notebook could not see it. The SHAPE is the
+/// better news. Under the old tile the per-row cost fell to 256 rows and
+/// turned back up by 8%; here it falls to 256 and then does not move --
+/// 0.700 against 0.697 -- so the quadratic term that was 75% of a 512-row
+/// prefill when this file opened is now too small to read off this curve at
+/// all. The remaining cost is linear in rows, which is the shape of the
+/// projections rather than of the attention.
+///
+/// The lesson is not about GEMM tiles. A measurement fixture is only an
+/// answer sheet if it answers the question the shipping build asks, and this
+/// one had drifted on a field whose neighbour carried a comment about
+/// exactly that hazard. Every ratio taken in this file before now has a
+/// denominator nobody runs.
+///
+/// The first version of this measurement claimed 1623 tok/s and was wrong.
+/// `kernels-wgpu`'s `tiled_lanes` is a second copy of the shader's `PIE_TX`
+/// and had not been moved with it; a `Fire` divides the LANES `apply` is
+/// given by the module's real `@workgroup_size`, so the mismatch dispatched a
+/// quarter of the query heads and simply did not compute most of the
+/// attention. Fast, wrong, and invisible to a timing test. What caught it was
+/// `arena`'s workgroup census, which is the reason that number is pinned.
+///
+/// ## And it is STILL the attention, at a third rather than at 72%
+///
+/// The layer sweep below says every layer of the 28 costs the same ~30 ms, so
+/// there is no hot layer and it never named a kernel. Stepping the same
+/// prefix ONE rectangle at a time across a single layer does, and the layer
+/// is fifteen launches:
+///
+/// | rectangle | kernel | +ms |
+/// | --- | --- | --- |
+/// | 30 | `affine_qmm_t` (gate) | 1.9 |
+/// | 31 | `affine_qmm_t` (up) | 1.9 |
+/// | 32 | `silu_mul` | 0.3 |
+/// | 33 | `affine_qmm_t_residual` (down) | 1.7 |
+/// | 35 | `affine_qmm_t` (q) | 1.2 |
+/// | 36 | `affine_qmm_t` (k) | 0.7 |
+/// | 37 | `affine_qmm_t` (v) | 0.7 |
+/// | 39-40 | `neox_mb` x2 | 0.1 |
+/// | 42 | `kv_append_paged` | 0.1 |
+/// | **43** | **`sdpa_paged_tiled_bfloat16_d_128`** | **10.0** |
+/// | 44 | `affine_qmm_t_residual` (o) | 1.4 |
+/// | 29, 34, 38, 41 | `rms_single_row` x4 | 0.1-0.2 each |
+///
+/// One rectangle is a third of a layer and half of everything the sweep can
+/// name; the seven projections together are 9.5. So the lane narrowing moved
+/// the attention from 72% of the prefill to about a third of it and did not
+/// change which kernel is first.
+///
+/// The differences are of two ~500 ms fires, so a single rectangle's number
+/// is a difference of large numbers and single milliseconds are noise. It is
+/// read for the one line that stands out by 5x, not as a profile.
+///
+/// ## Then the dot went word-at-a-time, for another 28%
+///
+/// `q_at(i)` and `k_at(i)` each load `buf[i >> 1]` and select a half, so
+/// `dot_page`'s scalar loop over 128 channels issued 512 loads and fetched
+/// every word twice. The same loop over `PIE_PAIRS` words, keeping the two
+/// multiply-adds as two separate statements so the f32 rounding is
+/// unchanged, issues 128. The value accumulate had the same defect -- two
+/// `v_at` calls for one word -- and is one load now.
+///
+/// | rows | ms | tok/s | ms a row |
+/// | --- | --- | --- | --- |
+/// | 32 | 38.1 | 841 | 1.189 |
+/// | 64 | 60.6 | 1056 | 0.947 |
+/// | 128 | 113.5 | 1128 | 0.887 |
+/// | 256 | 214.6 | 1193 | 0.838 |
+/// | 512 | 445.0 | 1151 | 0.869 |
+///
+/// **897 -> 1151 tok/s**, and 169 -> 1151 over the two changes together,
+/// **6.8x**. Not one answer moved, which is what the same-order,
+/// same-rounding restatement was for.
+///
+/// The lane sweep was re-taken on top of it and the optimum did not move: 1
+/// and 2 now read the same (445 ms) where 2 used to win, and 4 is 541.
+///
+/// ## The 1064 tok/s this file used to be chasing was never measured here
+///
+/// It was an RTX 4090 figure, and `e0a2f6e20` withdrew the kernel that
+/// produced it as wrong. See
+/// [`the_tiled_gemms_readout_moves_when_the_last_token_moves`]: the defect it
+/// withdrew the GEMM over is gone, the stamp is back on, and the GEMM now
+/// agrees with the matvec to about 1% at every length from 31 to 512.
+///
 /// **Still falling at 512**, so a prefill has not yet reached its per-row cost
 /// and is carrying a fixed cost worth roughly 60 ms. It is nonetheless
 /// dominated by per-row work where the decode is dominated by fixed cost — the
@@ -3653,6 +4519,13 @@ fn what_a_decode_costs_at_length() {
 /// showed a 1.34x that neither survived release nor reached the shell.
 ///
 /// Run with `--ignored --nocapture`.
+///
+/// RETIRED WITH `kernels-wgpu`'s TEST TREE. That name is a record of a
+/// measurement now, not a live proof: the crate lost `tests/` and every
+/// in-file `mod tests` when the three shader planes moved their numbers to
+/// the fire that reads them, and nothing in this workspace re-runs it. What
+/// it reported is still why the sentence above says what it says; what is
+/// gone is the thing that would notice if it stopped being true.
 #[test]
 #[ignore = "measurement"]
 fn what_a_prefill_costs_at_length() {
@@ -3970,6 +4843,41 @@ fn where_a_prefills_time_goes_across_its_plan() {
         );
         prev = best[i];
     }
+
+    // ONE LAYER, ONE RECTANGLE AT A TIME.
+    //
+    // The sweep above steps by a whole layer and every layer costs the same,
+    // which is the answer to "is there a hot layer" (no) and no answer at all
+    // to "which kernel". A prefix is a prefix, so the same knob resolves as
+    // finely as it is asked to; the only reason it was not is that 452 points
+    // at three rounds is a minute of wall clock. One layer is 29 of them.
+    //
+    // The differences are of TWO fires each ~500 ms apart, so a single
+    // rectangle's cost is a difference of large numbers and the noise floor is
+    // whole milliseconds. It is read for the ONE rectangle that stands out of
+    // its layer, not as a profile.
+    let lo = step;
+    let hi = (step * 2).min(total);
+    let mut fine = vec![f64::INFINITY; hi - lo + 1];
+    for round in 0..ROUNDS {
+        for (i, n) in (lo..=hi).enumerate() {
+            let (took, _) = fire(&mut shell, 512, Some(n));
+            if round > 0 && took < fine[i] {
+                fine[i] = took;
+            }
+        }
+    }
+    println!("  one layer, rectangle by rectangle, fastest of {}:", ROUNDS - 1);
+    for (i, n) in (lo..=hi).enumerate() {
+        if i == 0 {
+            continue;
+        }
+        println!(
+            "    rectangle {n:4} {:8.1} ms   (+{:7.1})",
+            fine[i],
+            fine[i] - fine[i - 1]
+        );
+    }
 }
 
 /// **Which GEMM tile a 512-row prefill wants, fired through the whole shell.**
@@ -4046,7 +4954,49 @@ fn where_a_prefills_time_goes_across_its_plan() {
 /// lesson is the one it did not draw: a tile sweep over a kernel with a
 /// shape-conditional fast path measures the condition, not the shape.
 ///
+/// # RE-RUN, AND IT CAUGHT A DIVERGENCE RATHER THAN A TILE
+///
+/// Nine tiles, fastest of five interleaved rounds, M4 Pro, pp512, after the
+/// attention stopped being 72% of a prefill:
+///
+/// | tile | ms | tok/s |
+/// | --- | --- | --- |
+/// | 16x16 | 614.5 | 833 |
+/// | 16x32 | 694.5 | 737 |
+/// | 16x64 | 489.5 | 1046 |
+/// | 32x16 | 630.4 | 812 |
+/// | 32x32 | 464.3 | 1103 |
+/// | **32x64 (shipped)** | **376.3** | **1360** |
+/// | 64x16 | 443.6 | 1154 |
+/// | 64x32 | 369.8 | 1385 |
+/// | 64x64 | 362.4 | 1413 |
+///
+/// The spread the RTX run called "within 7%" is 1.9x here, and the reason
+/// the first run could not see it is the reason a tile sweep has to be run
+/// LAST: with the attention taking 72% of the fire, a 2x on the GEMM was a
+/// 20% on the total and sat inside the noise this harness has at that scale.
+/// A tile sweep measures the tile only once the tile is a majority of what
+/// is being timed.
+///
+/// What it found is not a better tile. `bn = 64` was already shipping; what
+/// was not shipping was the FIXTURE, which took `synthetic()`'s (32, 32) and
+/// so timed every number in this file on a GEMM the deployment does not
+/// build. See `backend_facts()`, which now mirrors the stamp.
+///
+/// (64, 64) does read a further 3.7%, and it is NOT taken. `bm` is the
+/// `TokensMultipleOf` guard: at 64 a prompt whose row count is 32 mod 64
+/// has no kernel that will accept it, and this backend would be trading the
+/// prompts it can serve for four percent on the ones it can. `bn` is free
+/// in that sense, which is why the shipped tile widens on `bn` alone.
+///
 /// Run with `--ignored --nocapture --release`.
+///
+/// RETIRED WITH `kernels-wgpu`'s TEST TREE. That name is a record of a
+/// measurement now, not a live proof: the crate lost `tests/` and every
+/// in-file `mod tests` when the three shader planes moved their numbers to
+/// the fire that reads them, and nothing in this workspace re-runs it. What
+/// it reported is still why the sentence above says what it says; what is
+/// gone is the thing that would notice if it stopped being true.
 #[test]
 #[ignore = "measurement"]
 fn which_tile_a_512_row_prefill_wants() {
@@ -4068,7 +5018,21 @@ fn which_tile_a_512_row_prefill_wants() {
     // Every `bm` here divides 512, so `TokensMultipleOf` admits this prompt
     // under all of them and the comparison is of speed rather than of who was
     // allowed to run.
-    let tiles: [(u32, u32); 4] = [(32, 32), (32, 64), (16, 32), (16, 64)];
+    // ALL NINE, not the four this started with. A four-tile sweep that moves
+    // 7% invites "the tile is nearly right"; nine tiles spanning a 16x range
+    // of area and moving 11% says the cost is not in the tile at all. See
+    // `what_a_prefill_costs_at_length` for where it is.
+    let tiles: [(u32, u32); 9] = [
+        (16, 16),
+        (16, 32),
+        (16, 64),
+        (32, 16),
+        (32, 32),
+        (32, 64),
+        (64, 16),
+        (64, 32),
+        (64, 64),
+    ];
     for (bm, _) in tiles {
         assert_eq!(
             long.len() % bm as usize,
@@ -4362,3 +5326,4 @@ fn a_prefill_longer_than_the_first_one_is_still_answered() {
         );
     }
 }
+

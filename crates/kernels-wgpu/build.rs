@@ -1,48 +1,10 @@
-//! Embed the shader tree, and refuse a tree the table does not describe.
-//!
-//! ## What this does NOT do
-//!
-//! It does not compile anything. That is the point of the backend: `naga` is a
-//! Rust WGSL front end and it ships inside `wgpu`, so a module is compiled by
-//! the process that dispatches it. There is no `glslc` to shell out to, no
-//! `nvcc`, no `OUT_DIR/spv`, and so no `native` feature to gate any of it.
-//!
-//! What is left is two jobs a build script is genuinely the right place for.
-//!
-//! **One: put the tree in the binary.** `include_str!` needs a literal path, so
-//! something has to enumerate `kernels/**/*.wgsl` and write the literals out.
-//! The generated `sources.rs` is a `&[(&str, &str)]` of (path relative to
-//! `kernels/`, text), which `src/source.rs` includes. A deployment then carries
-//! its shaders in its binary rather than beside it — see that module's own
-//! notes on why the sibling backends' directory handoff is worth not copying.
-//!
-//! **Two: fail the build on a tree that disagrees with itself.** Specifically
-//! on an ORPHAN TIER: a `@fp16` or `@subgroup` variant of an entrypoint that
-//! has no baseline. `capability.rs` states why that invariant matters — the
-//! failure it prevents is an entrypoint that resolves on the author's GPU and
-//! on no other — and it is enforced twice, here and in `tests/entrypoints.rs`,
-//! because a build failure is what a person sees first and a test is what runs
-//! on the machines that have no adapter at all.
-//!
-//! The directive parser is `src/preproc.rs`, pulled in with `#[path]` rather
-//! than reimplemented. `kernels-vulkan` has two parsers for this — one in its
-//! build script and one in a Python audit — and calls the duplication
-//! intentional, on the grounds that the build and the audit must not be able to
-//! disagree. They cannot disagree here because there is one of them.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-// The vocabulary the directives are written in. `#[path]` and not a dependency:
-// a build script cannot depend on the crate it builds, and a second copy of
-// `Capability` would be a second answer to "what tiers are there".
 #[path = "src/capability.rs"]
 #[allow(dead_code)]
 mod capability;
 
-// `preproc.rs` names the tier as `crate::Capability`, which is what it is
-// inside the library. Re-stating it at this script's own root is what lets one
-// file serve both without an `#[cfg]` in it.
 use crate::capability::Capability;
 
 #[path = "src/preproc.rs"]
@@ -59,8 +21,6 @@ fn main() {
     let kernels = root.join("kernels");
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets this"));
 
-    // Published for parity with the two siblings, and for a tool that wants the
-    // tree on disk. Nothing in the serving path reads either.
     println!("cargo::metadata=kernels_dir={}", kernels.display());
     println!(
         "cargo::metadata=include={}",
@@ -80,9 +40,6 @@ fn main() {
          pub static SOURCES: &[(&str, &str)] = &[\n",
     );
     for (rel, abs) in &sources {
-        // `rerun-if-changed=kernels` covers the directory, but a nested file
-        // edited without a directory mtime change has been known to slip past
-        // it on some filesystems. Naming each file is cheap and exact.
         println!("cargo::rerun-if-changed={}", abs.display());
         generated.push_str(&format!(
             "    ({:?}, include_str!({:?})),\n",
@@ -95,7 +52,6 @@ fn main() {
     std::fs::write(out.join("sources.rs"), generated).expect("OUT_DIR is writable");
 }
 
-/// Every `.wgsl` under `dir`, as (path relative to `root`, absolute path).
 fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -109,17 +65,13 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
                 .strip_prefix(root)
                 .expect("walked down from root")
                 .to_string_lossy()
-                // A generated Rust literal must not carry a Windows separator.
+
                 .replace('\\', "/");
             out.push((rel, path));
         }
     }
 }
 
-/// Fail the build on a tier with no baseline beneath it.
-///
-/// Panicking is the right shape for a build script: the message is what the
-/// person who added the directive reads, and it names the file and the line.
 fn check_tiers(sources: &[(String, PathBuf)]) {
     let mut baseline: BTreeSet<String> = BTreeSet::new();
     let mut tiered: BTreeMap<String, (String, usize, &'static str)> = BTreeMap::new();

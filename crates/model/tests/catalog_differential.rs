@@ -367,10 +367,14 @@ fn a_row_states_what_its_checkpoint_states() {
     }
 
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
-    assert!(
-        checked >= 10,
-        "only {checked} configs were compared; the map has gone stale and the \
-         net is not catching anything"
+    // 19 of the catalog's 58. That ratio is worth a reader's attention on
+    // its own, but it is not this assertion's business -- its business is
+    // that 19 was hiding behind a 10, with nine configs of room to stop
+    // being compared in silence.
+    assert_eq!(
+        checked, 19,
+        "{checked} configs were compared, not 19; the map has gone stale and \
+         the net is catching less than it did"
     );
 }
 

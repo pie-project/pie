@@ -720,96 +720,84 @@ template <typename T, int BM, int BK, int BN>
       simd_lid, loader_w);
 }
 
-#define instantiate_qmm_t(gs, bm, bk, bn, b)                                          \
-  template [[host_name("affine_qmm_t_routed_bfloat16_gs_" #gs "_b_" #b "_bm_" #bm "_bn_" #bn)]] \
+// ── THE FOUR FORMS THIS FILE CAN STAMP, AND NOT ONE POINT OF THEM ──────────
+//
+// `#define instantiate_qmm_t(gs, bm, bk, bn, b)` stood here with fifty-four
+// calls under it, stamping four entry points each: 216 pipelines codegen'd on
+// every load to reach the six a model actually fires.
+//
+// The calls are gone and the `#define`s are not, because they are two
+// different things. A `#define` declares WHAT CAN BE STAMPED -- and holds the
+// device signature, which is this file's to own and must stay written once. A
+// call declares WHICH POINT, and the host is the only party that knows: it is
+// the one that picked the tile.
+//
+// so the host composes one of these calls per fire and the driver appends it
+// to this source before compiling (`Fire::stamp`). A point is checked by the
+// host that picks it (`quant::qmm_point`), which is the party that knows the
+// tile, and reached by being asked for.
+//
+// WHAT THIS DELETED, beyond the fifty-four lines: `moe.rs`'s fifty-four-entry
+// table of these same names, and the fold that indexed it. What it did NOT
+// delete is `build.rs` -- see `kernels_metal::kernel_of`, whose census the
+// expander still feeds for the families that have not moved.
+//
+// `entry` IS A STRING LITERAL, composed host-side. The names are unchanged --
+// `affine_qmm_t_bfloat16_gs_64_b_4_bm_16_bn_32` is what `qmm_point` spells and
+// what the driver's stem table already knows. Renaming them is a separate
+// change and this one does not make it.
+
+#define PIE_STAMP_qmm_t_routed(entry, gs, b, bm, bk, bn)                       \
+  template [[host_name(entry)]]                                                \
   [[kernel]] void affine_qmm_t_routed<bfloat, gs, b, bm, bk, bn>(              \
       const device uint32_t*, const device bfloat*, const device bfloat*,      \
       const device bfloat*, device bfloat*, const constant int&,               \
-      const constant int&, const device int*, uint3, uint, uint);              \
-  template [[host_name("affine_qmm_t_bfloat16_gs_" #gs "_b_" #b "_bm_" #bm "_bn_" #bn)]] \
+      const constant int&, const device int*, uint3, uint, uint);
+
+#define PIE_STAMP_qmm_t(entry, gs, b, bm, bk, bn)                              \
+  template [[host_name(entry)]]                                                \
   [[kernel]] void affine_qmm_t_aligned<bfloat, gs, b, bm, bk, bn>(             \
       const device uint32_t*, const device bfloat*, const device bfloat*,      \
       const device bfloat*, device bfloat*, const constant int&,               \
-      const constant int&, uint3, uint, uint);                                 \
-  template [[host_name("affine_qmm_t_residual_bfloat16_gs_" #gs "_b_" #b "_bm_" #bm "_bn_" #bn)]] \
+      const constant int&, uint3, uint, uint);
+
+#define PIE_STAMP_qmm_t_residual(entry, gs, b, bm, bk, bn)                     \
+  template [[host_name(entry)]]                                                \
   [[kernel]] void affine_qmm_t_aligned_residual<bfloat, gs, b, bm, bk, bn>(    \
       const device uint32_t*, const device bfloat*, const device bfloat*,      \
       const device bfloat*, device bfloat*, const constant int&,               \
-      const constant int&, const device bfloat*, uint3, uint, uint);           \
-  template [[host_name("affine_qmm_t_bias_bfloat16_gs_" #gs "_b_" #b "_bm_" #bm "_bn_" #bn)]] \
+      const constant int&, const device bfloat*, uint3, uint, uint);
+
+#define PIE_STAMP_qmm_t_bias(entry, gs, b, bm, bk, bn)                         \
+  template [[host_name(entry)]]                                                \
   [[kernel]] void affine_qmm_t_aligned_bias<bfloat, gs, b, bm, bk, bn>(        \
       const device uint32_t*, const device bfloat*, const device bfloat*,      \
       const device bfloat*, device bfloat*, const constant int&,               \
       const constant int&, const device bfloat*, uint3, uint, uint);
 
-instantiate_qmm_t(64, 16, 32, 32, 4)
-instantiate_qmm_t(32, 16, 32, 32, 4)
-instantiate_qmm_t(128, 16, 32, 32, 4)
-instantiate_qmm_t(64, 16, 32, 32, 8)
-instantiate_qmm_t(32, 16, 32, 32, 8)
-instantiate_qmm_t(128, 16, 32, 32, 8)
-instantiate_qmm_t(64, 16, 32, 64, 4)
-instantiate_qmm_t(32, 16, 32, 64, 4)
-instantiate_qmm_t(128, 16, 32, 64, 4)
-instantiate_qmm_t(64, 16, 32, 64, 8)
-instantiate_qmm_t(32, 16, 32, 64, 8)
-instantiate_qmm_t(128, 16, 32, 64, 8)
-instantiate_qmm_t(64, 16, 32, 16, 4)
-instantiate_qmm_t(32, 16, 32, 16, 4)
-instantiate_qmm_t(128, 16, 32, 16, 4)
-instantiate_qmm_t(64, 16, 32, 16, 8)
-instantiate_qmm_t(32, 16, 32, 16, 8)
-instantiate_qmm_t(128, 16, 32, 16, 8)
-instantiate_qmm_t(64, 32, 32, 16, 4)
-instantiate_qmm_t(32, 32, 32, 16, 4)
-instantiate_qmm_t(128, 32, 32, 16, 4)
-instantiate_qmm_t(64, 32, 32, 16, 8)
-instantiate_qmm_t(32, 32, 32, 16, 8)
-instantiate_qmm_t(128, 32, 32, 16, 8)
-instantiate_qmm_t(64, 32, 32, 32, 4)
-instantiate_qmm_t(32, 32, 32, 32, 4)
-instantiate_qmm_t(128, 32, 32, 32, 4)
-instantiate_qmm_t(64, 32, 32, 32, 8)
-instantiate_qmm_t(32, 32, 32, 32, 8)
-instantiate_qmm_t(128, 32, 32, 32, 8)
-// The wide row block at the widest column tile. `qmm_bn` takes the widest tile
-// that DIVIDES the output, and every projection in these checkpoints is a
-// multiple of 64 -- so a 32-row batch asks for exactly this pair. It used to be
-// left out and aliased onto the BM=16 pipeline, which is not a crash: the grid
-// is built for 32 rows per block and the pipeline computes 16, so HALF the
-// batch is never written. At 32 rows gemma4's logits came back all zero.
-instantiate_qmm_t(64, 32, 32, 64, 4)
-instantiate_qmm_t(32, 32, 32, 64, 4)
-instantiate_qmm_t(128, 32, 32, 64, 4)
-instantiate_qmm_t(64, 32, 32, 64, 8)
-instantiate_qmm_t(32, 32, 32, 64, 8)
-instantiate_qmm_t(128, 32, 32, 64, 8)
+// ── WHAT THE DELETED CALL LIST KNEW, KEPT ──────────────────────────────────
+//
+// Two of the fifty-four lines carried findings rather than coordinates, and a
+// coordinate is the only thing the host took over.
+//
+// **`(bm 32, bn 64)` is not optional.** `qmm_bn` takes the widest tile that
+// DIVIDES the output and every projection in these checkpoints is a multiple
+// of 64, so a 32-row batch asks for exactly that pair. It was once left out
+// and ALIASED onto the BM=16 pipeline -- not a crash: the grid is built for 32
+// rows per block and the pipeline computes 16, so half the batch is never
+// written. At 32 rows gemma4's logits came back all zero.
+//
+// That failure is now unreachable rather than fixed. The host composes the
+// name and the stamp from ONE set of numbers (`quant::qmm_point`), so the
+// pipeline it gets is the pipeline it built the grid for; there is no list to
+// be missing from and nothing to fall back onto.
+//
+// **`bm 64` earns its rung.** A prompt is not a 32-row batch: 128 tokens at
+// BM=32 unpack every weight four times and the GEMM is memory-bound on exactly
+// that unpacking. BM=64 halves it again at no cost in accumulators -- 64x32
+// over 128 lanes is the same sixteen per lane that 32x64 already spends -- and
+// buys 20% on a llama-1B prefill. Reached only when the batch divides by 64.
 
-// The third row block. A prompt is not a 32-row batch: 128 tokens at BM=32
-// unpack every weight four times, and the GEMM is memory-bound on exactly that
-// unpacking. BM=64 halves it again at no cost in accumulators -- 64x32/128
-// lanes is the same sixteen per lane that 32x64 already spends -- and buys 20%
-// on a llama-1B prefill. It is a strict addition: `qmm_bm_index` only reaches
-// this rung when the batch divides by 64, so nothing that used to run at 32
-// moves.
-instantiate_qmm_t(64, 64, 32, 16, 4)
-instantiate_qmm_t(32, 64, 32, 16, 4)
-instantiate_qmm_t(128, 64, 32, 16, 4)
-instantiate_qmm_t(64, 64, 32, 16, 8)
-instantiate_qmm_t(32, 64, 32, 16, 8)
-instantiate_qmm_t(128, 64, 32, 16, 8)
-instantiate_qmm_t(64, 64, 32, 32, 4)
-instantiate_qmm_t(32, 64, 32, 32, 4)
-instantiate_qmm_t(128, 64, 32, 32, 4)
-instantiate_qmm_t(64, 64, 32, 32, 8)
-instantiate_qmm_t(32, 64, 32, 32, 8)
-instantiate_qmm_t(128, 64, 32, 32, 8)
-instantiate_qmm_t(64, 64, 32, 64, 4)
-instantiate_qmm_t(32, 64, 32, 64, 4)
-instantiate_qmm_t(128, 64, 32, 64, 4)
-instantiate_qmm_t(64, 64, 32, 64, 8)
-instantiate_qmm_t(32, 64, 32, 64, 8)
-instantiate_qmm_t(128, 64, 32, 64, 8)
 
 #define instantiate_mxfp4_qmm_t_routed(bm, bn)                              \
   template [[host_name("mxfp4_qmm_t_routed_bias_bfloat16_bm_" #bm           \

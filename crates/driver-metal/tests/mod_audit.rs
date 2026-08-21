@@ -18,9 +18,16 @@
 //!
 //! # What it does not check
 //!
-//! Whether a reachable module is *useful*. `dead_code` already answers that
-//! for items, and this answers the question `dead_code` structurally cannot:
-//! a file it never saw.
+//! Whether a reachable module is *useful*. This answers the question
+//! `dead_code` structurally cannot: a file it never saw.
+//!
+//! It used to say here that `dead_code` "already answers that for items".
+//! It does not, for the items this crate is mostly made of. The lint is
+//! silent on `pub` items in a library, because a library's public surface is
+//! reachable from outside the build and rustc cannot know that nothing
+//! outside the workspace links `driver-metal` — so `pub` switches the lint
+//! off, and nine `pub fn`s here had no caller anywhere when anyone finally
+//! counted. `every_public_function_has_a_reader.rs` is that count, kept.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

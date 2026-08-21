@@ -55,8 +55,10 @@ use kernels::KernelSig;
 /// quiet instead.
 ///
 /// Raise it when a kernel is added to all the planes that want it. Lowering
-/// it is what `retired_rows` is for -- and for a kernel that never shipped,
-/// which is not a retirement, lower it and leave nothing behind.
+/// it was what `retired_rows` was for, until all three planes deleted theirs;
+/// a departing kernel now leaves nothing behind but this number, so lower it
+/// and say in the commit what left -- which is also what to do for a kernel
+/// that never shipped, that never being a retirement in the first place.
 ///
 /// # It was 100, and 100 was measured over a merged list
 ///
@@ -98,7 +100,7 @@ const COMPARED: usize = 200;
 
 /// A kernel a backend does not have AT ALL, and the sentence saying why.
 ///
-/// Different from `retired_rows`, which is a name a backend gave up when it
+/// Different from a retirement, which is a name a backend gave up when it
 /// crossed: this is a name it never had. [`CENSUS`] counts the union of the
 /// three, so a kernel written for two planes leaves the third one short by
 /// exactly the names listed here.
@@ -135,7 +137,10 @@ const UNCROSSED: &[(&str, &str, &str)] = &[
 struct Table {
     what: &'static str,
     rows: &'static [KernelSig],
-    /// The names this backend's table used to hold. See [`retired_rows`].
+    /// The names this backend's table used to hold, and that no accessor of
+    /// its own reports any more. Stated here because this file was the only
+    /// reader `retired_rows` ever had, so deleting it moved the record
+    /// rather than ending it.
     retired: &'static [&'static str],
 }
 
@@ -143,18 +148,32 @@ fn tables() -> Vec<Table> {
     vec![
         Table {
             what: "metal",
-            rows: kernels_metal::KERNELS,
-            retired: kernels_metal::retired_rows(),
+            // METAL PUBLISHES NO TABLE AT ALL NOW. Its `KERNELS` was an empty
+            // slice kept for this file to read; every family crossed, so an
+            // absent table and an empty one say the same thing.
+            rows: &[],
+            // METAL NO LONGER PUBLISHES ITS RETIREMENTS. The hundred names it
+            // kept are inside `kernels-metal`'s own `kernel_of`, which was the
+            // only thing that read them, and its routines answer for all but
+            // one of them. `silu_mul_strided` is the one: DARK on this plane,
+            // with a shader the tree still stamps and no routine that fires
+            // it, so nothing else carries the name.
+            retired: &["silu_mul_strided"],
         },
+        // NEITHER SIBLING PUBLISHES A TABLE OR A RETIREMENT LIST NOW.
+        // Both crossed every family, so their `KERNELS` was an empty slice
+        // and `retired_rows` a hundred names no code read but this file.
+        // What each still has to account for is the kernel it retired and
+        // no routine of its own answers for.
         Table {
             what: "vulkan",
-            rows: kernels_vulkan::KERNELS,
-            retired: kernels_vulkan::retired_rows(),
+            rows: &[],
+            retired: &[],
         },
         Table {
             what: "wgpu",
-            rows: kernels_wgpu::KERNELS,
-            retired: kernels_wgpu::retired_rows(),
+            rows: &[],
+            retired: &["rms_rope"],
         },
     ]
 }
@@ -469,17 +488,17 @@ fn the_kernels_stated_twice_are_the_ones_written_down() {
         (
             "wgpu",
             kernels_wgpu::declared().iter().map(|d| d.name).collect(),
-            kernels_wgpu::KERNELS.iter().map(|r| r.name).collect(),
+            BTreeSet::new(),
         ),
         (
             "vulkan",
             kernels_vulkan::declared().iter().map(|d| d.name).collect(),
-            kernels_vulkan::KERNELS.iter().map(|r| r.name).collect(),
+            BTreeSet::new(),
         ),
         (
             "metal",
             kernels_metal::declared().iter().map(|d| d.name).collect(),
-            kernels_metal::KERNELS.iter().map(|r| r.name).collect(),
+            BTreeSet::new(),
         ),
     ];
 
@@ -607,11 +626,22 @@ fn the_kernels_stated_twice_are_the_ones_written_down() {
 /// that silently stopped compiling `argmax_logits_bfloat16` on a real adapter
 /// while passing, and the loss compounds to a sweep that builds nothing.
 ///
-/// Each crate answers it by folding a `RETIRED` list back in. This does not
-/// care how: it asks whether the three censuses are still the SAME 481, which
-/// is derivable from the crates as they are and needs no accessor any of them
-/// might not have. A backend that retires a family and forgets to state its
-/// entrypoints fails here, whichever backend goes first.
+/// Each crate answered it by folding a `RETIRED` list back in. None does
+/// now: `930fee2cb` deleted `retired_rows` on all three planes along with
+/// the empty `KERNELS` slices, and each backend's `entrypoints()` walks its
+/// own routine registry instead. That is a better answer -- the census is
+/// derived from what the crate can actually fire rather than from a ledger
+/// somebody has to remember to write -- and it has one new way to be short,
+/// which this test found within hours of the change. `930fee2cb` also put
+/// the quantised forms on STAMPS, and a stamped point is declared by no
+/// file, so a registry walk that reads only the file's declarations misses
+/// 216 points that a fire can still spell. Metal read 265 against wgpu's
+/// 481 until `75e4d9699` taught it to count the host's points too.
+///
+/// This does not care how any of them answers. It asks whether the three
+/// censuses are still the SAME 481, which is derivable from the crates as
+/// they are and needs no accessor any of them might not have. A backend
+/// that stops naming what it can fire fails here, whichever goes first.
 #[test]
 fn retiring_a_row_does_not_shrink_a_backends_census() {
     // Entrypoints ONE backend has and the others do not, named individually.
@@ -736,11 +766,15 @@ fn retiring_a_row_does_not_shrink_a_backends_census() {
             "`kernels-{what}`'s census is {} entrypoints and `kernels-{first}`'s \
              is {}, counting only what they share. The crossing moves who \
              NAMES an entrypoint, never whether it exists, so a backend \
-             part-way through Stage 3 must still name every one of them -- \
-             through its rows, or through a `RETIRED` list once those rows are \
-             gone. Whichever side is short has deleted rows without stating \
-             what they named, and every sweep keyed on `entrypoints()` there \
-             has stopped covering the difference in silence. A backend that \
+             part-way through Stage 3 must still name every one of them. \
+             Rows and `RETIRED` lists were how; neither exists on any plane \
+             now, and `entrypoints()` walks the routine registry instead -- \
+             so a short side is a registry that has stopped enumerating \
+             something it can still fire. The way that has actually happened \
+             is a point no file DECLARES: a stamped form exists only when a \
+             fire asks for it, and a census that reads the shader text alone \
+             will not see it. Every sweep keyed on `entrypoints()` there has \
+             stopped covering the difference in silence. A backend that \
              has GAINED a family the others lack states it in `EXCLUSIVE` \
              above.",
             shared(what, census).len(),

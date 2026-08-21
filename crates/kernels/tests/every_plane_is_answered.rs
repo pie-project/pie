@@ -200,15 +200,22 @@ const UNANSWERED: &[(&str, &str, &str)] = &[
          compressed-KV prefill this deepseek path states cannot fire on this \
          driver and could not before the marks either.",
     ),
-    (
-        "cuda",
-        "X",
-        "NOT A FACT AT ALL: `X` is the placeholder identifier in `Asks::ask`'s \
-         own doc comment, and `kernels-cuda/src/lib.rs` quotes that line. A \
-         scan of source text cannot tell a doc example from a call, and \
-         excusing it by name is cheaper than teaching it prose.",
-    ),
 ];
+
+// THE `X` EXCUSE IS GONE, AND IT WAS NEVER A DEBT.
+//
+// `X` is the placeholder identifier in `Asks::ask`'s own doc comment, and
+// `kernels-cuda/src/lib.rs` quoted that line. A scan of source text cannot
+// tell a doc example from a call, so the placeholder was excused by name --
+// cheaper than teaching the scan prose. The quotation went with the CUDA
+// comment sweep and the excuse became exactly what the gate below is for: an
+// entry that reads as a known debt while the thing it excused has gone.
+//
+// It is deleted rather than kept, unlike the budget lines in
+// `driver-cuda`'s family census: those record a permission a later file
+// could inherit, and this records a parsing artefact that either recurs
+// verbatim or does not. If some file quotes `ask::<_, keys::X>` again the
+// entry comes back with it.
 
 #[test]
 fn every_fact_a_plane_asks_for_is_one_its_driver_answers() {

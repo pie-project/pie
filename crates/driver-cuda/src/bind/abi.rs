@@ -232,8 +232,8 @@ pub fn seed_envelopes_empty(
     // `Unbound` because no fire exists yet: this runs at pool construction.
     let _ = kernels_cuda::layout::envelope_seed_empty(
         &ctx,
-        env_min.cast(),
-        env_max.cast(),
+        kernels::routine::Out { ptr: env_min.cast(), rows: 0, width: 0 },
+        kernels::routine::Out { ptr: env_max.cast(), rows: 0, width: 0 },
         num_pages,
         num_kv_heads,
         head_dim,

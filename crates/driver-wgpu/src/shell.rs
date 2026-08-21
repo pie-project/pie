@@ -487,13 +487,14 @@ impl Shell {
         // would be dropped and the merge would fold a stale state into a
         // plausible token.
         //
-        // `PIE_SPLIT_BELOW` is the widest fire that takes the split at all --
-        // anything wider fills the machine on its own and runs the single
-        // kernel -- and the state is a running maximum, a denominator and one
-        // f32 accumulator per channel of a head.
+        // 128 is the widest fire that takes the split at all -- anything
+        // wider fills the machine on its own and runs the single kernel -- and
+        // the state is a running maximum, a denominator and one f32
+        // accumulator per channel of a head. Both numbers are the ones
+        // `kernels-wgpu`'s `attn::sdpa_paged_decode` spells at its own fire.
         let state = 2 + u64::from(text.geometry.head_dim);
-        let slices = u64::from(kernels_wgpu::attn::PIE_SPLITS.unsigned_abs());
-        let widest = u64::from(kernels_wgpu::attn::PIE_SPLIT_BELOW.unsigned_abs());
+        let slices = 8u64;
+        let widest = 128u64;
         pool.scratch(&device, widest * slices * state * 4)
             .map_err(Unopened::Device)?;
         let mut weights = Weights::new();
@@ -1220,6 +1221,20 @@ impl Shell {
 
     /// How many distinct shader modules have been expanded and reflected.
     ///
+    /// The symbols the module cache has expanded. See
+    /// [`crate::device::Pipelines::read_symbols`].
+    #[must_use]
+    pub fn read_symbols(&self) -> std::collections::BTreeSet<&str> {
+        self.pipelines.read_symbols()
+    }
+
+    /// The symbols the pipeline cache has compiled. See
+    /// [`crate::device::Pipelines::built_symbols`].
+    #[must_use]
+    pub fn built_symbols(&self) -> std::collections::BTreeSet<&str> {
+        self.pipelines.built_symbols()
+    }
+
     /// See [`Pipelines::modules_read`]. Public for the same reason
     /// [`Self::built`] is: it is a number a test can hold across a run of
     /// steps, and the claim it holds is worth 25x on a decode.

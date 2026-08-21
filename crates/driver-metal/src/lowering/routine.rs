@@ -476,6 +476,7 @@ impl Encode for Planner<'_> {
         self.out.borrow_mut().push(Dispatch {
             symbol: fire.entrypoint,
             file: fire.file,
+            stamp: fire.stamp,
             grid: fire.lanes,
             threadgroup: fire.group,
             touches: directed(&bound, args),
